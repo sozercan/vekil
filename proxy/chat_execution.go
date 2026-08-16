@@ -51,21 +51,37 @@ type chatExecutionOptions struct {
 	ResponsesMinimumOutputTokens int
 	ResponsesDropSamplingParams  bool
 	ResponsesUsageOnly           bool
+	CarriedReasoning             map[string]carriedReplay
+	CarrierInbound               carrierInbound
+	// Set by the Anthropic surfaces only. See responsesChatRequestOptions.
+	DegradeUnrestorableReplay bool
 }
 
 type chatExecutionResult struct {
-	Response       *http.Response
-	Completion     *models.OpenAIResponse
-	CompletionBody []byte
-	Stream         *chatStreamEventStream
-	Headers        http.Header
-	Usage          *models.OpenAIUsage
-	IncludeUsage   bool
-	Backend        chatBackend
-	route          resolvedChatRoute
+	Response         *http.Response
+	Completion       *models.OpenAIResponse
+	CompletionBody   []byte
+	CarriedReasoning carriedTurn
+	Stream           *chatStreamEventStream
+	Headers          http.Header
+	Usage            *models.OpenAIUsage
+	IncludeUsage     bool
+	Backend          chatBackend
+	route            resolvedChatRoute
 	// Reduced from an upstream non-2xx body, which the surfaces see as a successful
 	// result. Rides here because the boundary that read it had no request summary.
 	upstreamError upstreamErrorClassifiers
+}
+
+// Non-streaming Anthropic is force-streamed, so its carrier lands on the stream.
+func (r chatExecutionResult) carrier() carriedTurn {
+	if r.CarriedReasoning.present() {
+		return r.CarriedReasoning
+	}
+	if r.Stream != nil {
+		return r.Stream.carriedReasoning
+	}
+	return carriedTurn{}
 }
 
 func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
@@ -189,10 +205,14 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	}
 	plan, err := translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 		UpstreamModel:       route.upstreamModel,
+		CarriedReasoning:    options.CarriedReasoning,
 		ReplayStore:         h.responsesChatReplayStore(),
 		ReplayRoute:         replayRoute,
+		Log:                 h.log,
 		MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
 		DropSamplingParams:  options.ResponsesDropSamplingParams,
+		// No candidate loop here, so the terminal translate is also the only one.
+		DegradeUnrestorableReplay: options.DegradeUnrestorableReplay,
 	})
 	if err != nil {
 		return chatExecutionResult{}, err
@@ -240,6 +260,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 			ReplayStore:        h.responsesChatReplayStore(),
 			ReplayRoute:        replayRoute,
 			ReplayToolDefaults: plan.ReplayToolDefaults,
+			Carrier:            carrierEmit{Inbound: options.CarrierInbound, Log: h.log},
 		})
 		if streamErr != nil {
 			attachChatExecutionErrorHeaders(streamErr, result.Headers)
@@ -265,6 +286,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 		ReplayRoute:        replayRoute,
 		ReplayToolDefaults: plan.ReplayToolDefaults,
 		UsageOnly:          options.ResponsesUsageOnly,
+		Carrier:            carrierEmit{Inbound: options.CarrierInbound, Log: h.log},
 	})
 	if err != nil {
 		attachChatExecutionErrorHeaders(err, result.Headers)
@@ -273,6 +295,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	result.Response = nil
 	result.Completion = converted.Response
 	result.CompletionBody = converted.Body
+	result.CarriedReasoning = converted.CarriedReasoning
 	result.Usage = converted.Usage
 	return result, nil
 }

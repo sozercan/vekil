@@ -1151,20 +1151,23 @@ func isMissingResponsesChatReplayError(err error) bool {
 	return errors.As(err, &executionErr) && executionErr.Code == responsesChatReplayMissingCode
 }
 
-func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOperation, route *modelRoute, chatBody []byte, options chatExecutionOptions) (responsesChatRequestPlan, targetBinding, error) {
-	translateForTarget := func(target targetBinding) (responsesChatRequestPlan, error) {
+func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOperation, route *modelRoute, chatBody []byte, options chatExecutionOptions, log *logger.Logger) (responsesChatRequestPlan, targetBinding, error) {
+	translateForTarget := func(target targetBinding, degrade bool) (responsesChatRequestPlan, error) {
 		return translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
-			UpstreamModel:       route.public.id,
-			ReplayStore:         h.responsesChatReplayStore(),
-			ReplayRoute:         explicitResponsesChatReplayRoute(route, target),
-			MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
-			DropSamplingParams:  options.ResponsesDropSamplingParams,
+			UpstreamModel:             route.public.id,
+			CarriedReasoning:          options.CarriedReasoning,
+			ReplayStore:               h.responsesChatReplayStore(),
+			ReplayRoute:               explicitResponsesChatReplayRoute(route, target),
+			Log:                       log,
+			MinimumOutputTokens:       options.ResponsesMinimumOutputTokens,
+			DropSamplingParams:        options.ResponsesDropSamplingParams,
+			DegradeUnrestorableReplay: degrade,
 		})
 	}
 
 	if !chatRequestContainsResponsesReplayID(chatBody) {
 		target, _ := route.primaryTarget()
-		plan, err := translateForTarget(target)
+		plan, err := translateForTarget(target, false)
 		return plan, target, err
 	}
 
@@ -1178,35 +1181,48 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 			}
 		}
 	}
-	var missing error
-	for _, target := range candidates {
-		if target.provider == nil || !target.provider.supportsEndpoint(providerEndpointResponses) {
-			continue
-		}
-		plan, err := translateForTarget(target)
-		if err == nil {
-			if operation != nil {
-				if pinErr := operation.forcePinnedTarget(target.id); pinErr != nil {
-					return responsesChatRequestPlan{}, target, pinErr
-				}
+	restoring := func(degrade bool) (responsesChatRequestPlan, targetBinding, error) {
+		var missing error
+		for _, target := range candidates {
+			if target.provider == nil || !target.provider.supportsEndpoint(providerEndpointResponses) {
+				continue
 			}
-			return plan, target, nil
+			plan, err := translateForTarget(target, degrade)
+			if err == nil {
+				if operation != nil {
+					if pinErr := operation.forcePinnedTarget(target.id); pinErr != nil {
+						return responsesChatRequestPlan{}, target, pinErr
+					}
+				}
+				return plan, target, nil
+			}
+			if isMissingResponsesChatReplayError(err) {
+				missing = err
+				continue
+			}
+			return responsesChatRequestPlan{}, target, err
 		}
-		if isMissingResponsesChatReplayError(err) {
-			missing = err
-			continue
+		if missing == nil {
+			missing = missingResponsesChatReplayError()
 		}
-		return responsesChatRequestPlan{}, target, err
+		return responsesChatRequestPlan{}, targetBinding{}, missing
 	}
-	if missing == nil {
-		missing = missingResponsesChatReplayError()
+	plan, target, err := restoring(false)
+	if err == nil || !options.DegradeUnrestorableReplay || !isMissingResponsesChatReplayError(err) {
+		return plan, target, err
 	}
-	return responsesChatRequestPlan{}, targetBinding{}, missing
+	// Every candidate refused the same transcript, so the refusal has stopped telling
+	// them apart and the probe is spent. Retry once, letting the turn come back from
+	// the transcript: on Anthropic the alternative is a conversation nobody can repair.
+	if degraded, degradedTarget, degradeErr := restoring(true); degradeErr == nil {
+		return degraded, degradedTarget, nil
+	}
+	return plan, target, err
 }
 
 func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *modelRoute, chatBody []byte, requestedModel string, options chatExecutionOptions) (chatExecutionResult, error) {
 	operation := routeOperationFromContext(ctx)
-	plan, plannedTarget, err := h.prepareExplicitResponsesChatRequest(operation, route, chatBody, options)
+	plan, plannedTarget, err := h.prepareExplicitResponsesChatRequest(operation, route, chatBody, options, h.log)
 	if err != nil {
 		attachExplicitChatExecutionErrorRoute(err, route, plannedTarget, providerEndpointResponses, chatBackendResponses)
 		return chatExecutionResult{}, err
@@ -1250,6 +1266,7 @@ func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *
 		ReplayRoute:        explicitResponsesChatReplayRoute(route, target),
 		ReplayToolDefaults: plan.ReplayToolDefaults,
 		UsageOnly:          options.ResponsesUsageOnly,
+		Carrier:            carrierEmit{Inbound: options.CarrierInbound, Log: h.log},
 	}
 	if plan.Stream {
 		stream, streamErr := translateResponsesSSEToChat(ctx, resp.Body, responseOptions)
@@ -1281,6 +1298,7 @@ func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *
 	result.Response = nil
 	result.Completion = converted.Response
 	result.CompletionBody = converted.Body
+	result.CarriedReasoning = converted.CarriedReasoning
 	result.Usage = converted.Usage
 	return result, nil
 }
@@ -2008,6 +2026,17 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic", req.Model, providerModel, req.Stream, providerEndpoint)
 
 	if directAnthropic {
+		// Anthropic is a different provider, so vekil's own carrier must not travel there.
+		// Extraction below this return never runs on this path, which is how ours got out.
+		if sanitized, stripped := stripVekilCarrierBlocks(body); stripped > 0 {
+			h.log.Warn("stripped vekil reasoning carriers before direct Anthropic forwarding",
+				logger.F("endpoint", "anthropic"), logger.F("model", req.Model), logger.F("carriers", stripped))
+			body = sanitized
+			if err := json.Unmarshal(body, &req); err != nil {
+				writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid request body")
+				return
+			}
+		}
 		h.forwardAnthropicMessagesDirect(w, r, body, &req)
 		return
 	}
@@ -2018,7 +2047,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))
 		return
 	}
-	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), req.Model, oaiBody)
+	carriedReasoning, inbound := extractCarriedReasoning(req.Messages)
+	logCarriedReasoningStarved(h.log, inbound.Starved, req.Model)
+	policyPlan, err := h.planOpenAIChatPolicyWithCarrier(r.Context(), req.Model, oaiBody, 0, carriedReasoning)
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
 			return
@@ -2095,7 +2126,11 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 	responseReq := req
 	responseReq.Model = publicModel
-	result, err := h.executeRoutedChatCompletions(upstreamCtx, oaiBody, mode, chatExecutionOptions{}, providerModel)
+	result, err := h.executeRoutedChatCompletions(upstreamCtx, oaiBody, mode, chatExecutionOptions{
+		CarriedReasoning:          carriedReasoning,
+		CarrierInbound:            inbound,
+		DegradeUnrestorableReplay: true,
+	}, providerModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -2259,7 +2294,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
-			anthropicResp := translateOpenAIToAnthropicForRequest(oaiResp, &responseReq)
+			anthropicResp := prependCarriedReasoning(
+				translateOpenAIToAnthropicForRequest(oaiResp, &responseReq), result.carrier())
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(anthropicResp)
 		},
@@ -2277,7 +2313,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &oaiResp, h.toolContexts, scope, false)
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			w.Header().Set("Content-Type", "application/json")
-			return json.NewEncoder(w).Encode(translateOpenAIToAnthropicForRequest(&oaiResp, &responseReq))
+			return json.NewEncoder(w).Encode(prependCarriedReasoning(
+				translateOpenAIToAnthropicForRequest(&oaiResp, &responseReq), result.carrier()))
 		},
 	})
 	if err != nil {
@@ -2355,6 +2392,8 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 	publicModel := req.Model
+	carriedReasoning, inbound := extractCarriedReasoning(req.Messages)
+	logCarriedReasoningStarved(h.log, inbound.Starved, req.Model)
 	if canonicalPolicyID, ok := h.policyPublicModelID(req.Model); ok {
 		publicModel = canonicalPolicyID
 		ensurePolicyLocalRequestIdentity(w, r, publicModel)
@@ -2382,6 +2421,12 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic_count_tokens", req.Model, providerModel, false, providerEndpoint)
 
 	if directAnthropic {
+		// Same reason as the messages path: a count-token probe carries the same transcript.
+		if sanitized, stripped := stripVekilCarrierBlocks(body); stripped > 0 {
+			h.log.Warn("stripped vekil reasoning carriers before direct Anthropic forwarding",
+				logger.F("endpoint", "anthropic_count_tokens"), logger.F("model", req.Model), logger.F("carriers", stripped))
+			body = sanitized
+		}
 		h.forwardAnthropicCountTokensDirect(w, r, body, req.Model)
 		return
 	}
@@ -2403,7 +2448,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "failed to prepare count_tokens policy request")
 		return
 	}
-	policyPlan, err := h.planOpenAIChatPolicy(r.Context(), req.Model, policyBody)
+	policyPlan, err := h.planOpenAIChatPolicyWithCarrier(r.Context(), req.Model, policyBody, 0, carriedReasoning)
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
 			return
@@ -2470,7 +2515,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
 	}
 
-	oaiResp, err := h.runAnthropicCountTokensProbeWithContext(upstreamCtx, oaiReq)
+	oaiResp, err := h.runAnthropicCountTokensProbeWithContext(upstreamCtx, oaiReq, carriedReasoning)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -2542,7 +2587,7 @@ func prepareAnthropicCountTokensProbeRequestWithModelOverride(req *models.Anthro
 	return oaiReq, nil
 }
 
-func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
+func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx context.Context, probeReq *models.OpenAIRequest, carried map[string]carriedReplay) (*models.OpenAIResponse, error) {
 	body, err := json.Marshal(probeReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal count_tokens probe request: %w", err)
@@ -2551,6 +2596,8 @@ func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx conte
 		ResponsesMinimumOutputTokens: responsesChatMinimumOutputTokens,
 		ResponsesDropSamplingParams:  true,
 		ResponsesUsageOnly:           true,
+		CarriedReasoning:             carried,
+		DegradeUnrestorableReplay:    true,
 	}
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, body, chatCompletionsMode{}, options, probeReq.Model)
 	if err != nil {

@@ -75,7 +75,7 @@ func collectResponsesChatStreamChunks(t *testing.T, stream *chatStreamEventStrea
 	if err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
 		chunks = append(chunks, chunk)
 		return nil
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("consumeChatStreamEvents() error = %v", err)
 	}
 	return chunks
@@ -281,7 +281,7 @@ func TestResponsesChatStream_PostcommitFailureCarriesUsageAndTypedError(t *testi
 	err = consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
 		chunks = append(chunks, chunk)
 		return nil
-	})
+	}, nil)
 	var streamErr *chatStreamError
 	if !errors.As(err, &streamErr) || streamErr.StatusCode != http.StatusTooManyRequests || streamErr.Code != "too_many_requests" {
 		t.Fatalf("stream error = %#v", err)
@@ -304,7 +304,7 @@ func TestResponsesChatStream_EOFBeforeTerminalIsTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = consumeChatStreamEvents(stream, nil)
+	err = consumeChatStreamEvents(stream, nil, nil)
 	var streamErr *chatStreamError
 	if !errors.As(err, &streamErr) || streamErr.Code != "responses_stream_truncated" {
 		t.Fatalf("error = %#v", err)

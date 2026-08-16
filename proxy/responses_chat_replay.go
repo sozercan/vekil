@@ -27,7 +27,95 @@ const (
 	responsesChatReplayRandomBytes   = 16
 	responsesChatReplayIDLength      = len(responsesChatReplayCallIDPrefix) + 22
 	responsesChatReplayMaxIDAttempts = 1024
+
+	// Anthropic caps tool_use ids at 64 characters and the client echoes a minted id
+	// back verbatim, so an id that embeds its upstream id has to fit that same budget.
+	responsesChatReplayMaxIDLength = 64
+	// Copilot issues function-call ids as "call_<opaque>". The marker is what keeps this
+	// mint narrow enough to stay backward compatible: without it any client string under
+	// the prefix reads as a replay id, so a customer's own native tool-call id such as
+	// "call_vekil_customer_job" gets pinned to the Responses backend, misses the store and
+	// 400s on every request. Removing it breaks 14 tests, measured. It narrows, but does not
+	// close, the overlap with a random legacy suffix -- base64url can spell "call_" once in
+	// 64^5 mints -- so the mint also refuses responsesChatReplayIDLength outright.
+	responsesChatReplayUpstreamIDMarker = "call_"
 )
+
+// A minted id that embeds its upstream id needs no lookup to resolve. The store expires
+// and the carrier only covers the turns a client chose to resend -- one 1190-message
+// session resent 12 of 516 -- but tool_use.id comes back on every turn by construction,
+// so the mapping travels in the one field that cannot go missing.
+func responsesChatReplaySelfDescribingID(upstreamCallID string) (string, bool) {
+	// No trimming: the charset check below rejects surrounding whitespace outright, so a
+	// padded ID falls back to the legacy form rather than minting one that resolves to a
+	// different string than the store and carrier hold. Mint and resolve stay inverses.
+	// Strictly longer than the marker: an ID that is nothing but "call_" names no upstream
+	// call to resolve back to, and the smoke's CALL_ID_PATTERN already models it that way.
+	if len(upstreamCallID) <= len(responsesChatReplayUpstreamIDMarker) ||
+		!strings.HasPrefix(upstreamCallID, responsesChatReplayUpstreamIDMarker) {
+		return "", false
+	}
+	if len(responsesChatReplayCallIDPrefix)+len(upstreamCallID) > responsesChatReplayMaxIDLength {
+		return "", false
+	}
+	// Refuse the one length the legacy form also occupies. base64url can spell "call_", so a
+	// random legacy suffix can read back as self-describing: the resolver would strip the
+	// prefix and hand a fabricated upstream call_id to the provider once the store expired,
+	// instead of the legacy missing-state 400. Skipping this length is what makes the two
+	// shapes disjoint rather than 64^-5 unlikely, and it is what lets the resolver's
+	// round-trip be exact. It costs nothing real: Copilot's call_ids are 29 characters.
+	if len(responsesChatReplayCallIDPrefix)+len(upstreamCallID) == responsesChatReplayIDLength {
+		return "", false
+	}
+	if !isResponsesChatReplayIDCharset(upstreamCallID) {
+		return "", false
+	}
+	return responsesChatReplayCallIDPrefix + upstreamCallID, true
+}
+
+// The inverse of responsesChatReplaySelfDescribingID, and pure: it reads the id alone, so
+// it answers after the store has expired and after the carrier went missing. Round-tripping
+// through the minter is what makes it exact -- it admits only what the minter can emit, and
+// the minter now refuses the legacy length, so a legacy random id cannot be mistaken for one
+// that carries an upstream id. Rejecting the ambiguous length here too would be redundant:
+// the round-trip already inherits it.
+func responsesChatReplayUpstreamCallID(proxyCallID string) (string, bool) {
+	proxyCallID = strings.TrimSpace(proxyCallID)
+	if !strings.HasPrefix(proxyCallID, responsesChatReplayCallIDPrefix) {
+		return "", false
+	}
+	upstreamCallID := proxyCallID[len(responsesChatReplayCallIDPrefix):]
+	if minted, ok := responsesChatReplaySelfDescribingID(upstreamCallID); !ok || minted != proxyCallID {
+		return "", false
+	}
+	return upstreamCallID, true
+}
+
+// Publish mints under the lock, after preparePublish has already accounted the group's
+// size, so the accounting has to predict the length the mint will choose rather than assume
+// the random one. It cannot know whether the self-describing ID will collide and fall back
+// to the random form, so it charges whichever is larger: an upstream ID under 22 characters
+// would otherwise be billed short by the fallback it cannot see coming.
+func responsesChatReplayMintedIDSize(upstreamCallID string) int {
+	if proxyCallID, ok := responsesChatReplaySelfDescribingID(upstreamCallID); ok {
+		return max(len(proxyCallID), responsesChatReplayIDLength)
+	}
+	return responsesChatReplayIDLength
+}
+
+// Anthropic's tool_use id charset, shared by both minted shapes.
+func isResponsesChatReplayIDCharset(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
 
 const (
 	responsesChatReplayMissingCode    = "responses_replay_state_missing"
@@ -344,7 +432,7 @@ func (s *responsesChatReplayStore) Publish(request responsesChatReplayPublishReq
 	proxyIDs := make([]string, len(prepared.calls))
 	reserved := make(map[string]struct{}, len(prepared.calls))
 	for i := range prepared.calls {
-		proxyID, generateErr := s.generateUniqueCallIDLocked(reserved)
+		proxyID, generateErr := s.generateUniqueCallIDLocked(reserved, prepared.calls[i].upstreamCallID)
 		if generateErr != nil {
 			return responsesChatReplayPublished{}, fmt.Errorf("generate Responses replay call ID: %w", generateErr)
 		}
@@ -477,12 +565,18 @@ func (s *responsesChatReplayStore) Resolve(route responsesChatReplayRoute, proje
 	}
 
 	match := responsesChatReplayProjectionMatch(0)
-	if group.matchesProjection(canonicalContent, projection.Calls, false) {
+	visible, reason := group.matchesProjection(canonicalContent, projection.Calls, false)
+	original := false
+	if !visible {
+		original, _ = group.matchesProjection(canonicalContent, projection.Calls, true)
+	}
+	switch {
+	case visible:
 		match = responsesChatReplayProjectionVisible
-	} else if group.matchesProjection(canonicalContent, projection.Calls, true) {
+	case original:
 		match = responsesChatReplayProjectionOriginal
-	} else {
-		return responsesChatReplayResolution{}, newResponsesChatReplayProjectionError("assistant projection mismatch")
+	default:
+		return responsesChatReplayResolution{}, newResponsesChatReplayProjectionError(reason)
 	}
 
 	if group.lruElement != nil {
@@ -662,7 +756,16 @@ func (s *responsesChatReplayStore) preparePublish(request responsesChatReplayPub
 	}, nil
 }
 
-func (s *responsesChatReplayStore) generateUniqueCallIDLocked(reserved map[string]struct{}) (string, error) {
+func (s *responsesChatReplayStore) generateUniqueCallIDLocked(reserved map[string]struct{}, upstreamCallID string) (string, error) {
+	// Prefer the id that describes itself; the random one below cannot be resolved
+	// without this store, which is exactly the state a long session loses.
+	if proxyID, ok := responsesChatReplaySelfDescribingID(upstreamCallID); ok {
+		_, stored := s.callsByID[proxyID]
+		_, taken := reserved[proxyID]
+		if !stored && !taken {
+			return proxyID, nil
+		}
+	}
 	for attempt := 0; attempt < responsesChatReplayMaxIDAttempts; attempt++ {
 		var randomBytes [responsesChatReplayRandomBytes]byte
 		if _, err := io.ReadFull(s.random, randomBytes[:]); err != nil {
@@ -751,18 +854,22 @@ func (r responsesChatReplayRoute) equal(other responsesChatReplayRoute) bool {
 	return r.ProviderID == other.ProviderID && r.PublicModel == other.PublicModel && r.UpstreamModel == other.UpstreamModel && r.RouteID == other.RouteID && r.PolicyTier == other.PolicyTier
 }
 
-func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected []responsesChatReplayProjectedCall, original bool) bool {
-	if !bytes.Equal(g.assistantContent, content) || len(g.calls) != len(projected) {
-		return false
+// Reports which side moved, so a degrade names it from the store, not from the client.
+func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected []responsesChatReplayProjectedCall, original bool) (bool, string) {
+	if !bytes.Equal(g.assistantContent, content) {
+		return false, "content"
+	}
+	if len(g.calls) != len(projected) {
+		return false, "calls"
 	}
 	for i, stored := range g.calls {
 		got := projected[i]
 		if stored.proxyCallID != got.ID || stored.name != got.Name {
-			return false
+			return false, "calls"
 		}
 		canonicalArguments, err := canonicalReplayArguments(got.Arguments)
 		if err != nil {
-			return false
+			return false, "arguments"
 		}
 		hash := sha256.Sum256(canonicalArguments)
 		matchesHash := func(want [sha256.Size]byte, defaults responsesChatReplayOptionalDefaults) bool {
@@ -774,13 +881,13 @@ func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected [
 		}
 		if original {
 			if !matchesHash(stored.originalHash, stored.originalOptionalDefaults) {
-				return false
+				return false, "arguments"
 			}
 		} else if !matchesHash(stored.visibleHash, stored.visibleOptionalDefaults) {
-			return false
+			return false, "arguments"
 		}
 	}
-	return true
+	return true, ""
 }
 
 func cloneResponsesChatReplayResolution(group *responsesChatReplayGroup, match responsesChatReplayProjectionMatch) responsesChatReplayResolution {
@@ -812,7 +919,7 @@ func replayGroupByteSize(route responsesChatReplayRoute, content []byte, outputI
 		size += len(item)
 	}
 	for _, call := range calls {
-		size += responsesChatReplayIDLength
+		size += responsesChatReplayMintedIDSize(call.upstreamCallID)
 		size += len(call.upstreamCallID) + len(call.name)
 		size += sha256.Size * 2
 		size += replayOptionalDefaultsByteSize(call.visibleOptionalDefaults)

@@ -50,7 +50,7 @@ func benchmarkResponsesChatStream(b *testing.B, fixture []byte, withReplay bool)
 		err = consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
 			chunkCount += len(chunk.Choices)
 			return nil
-		})
+		}, nil)
 		if err != nil {
 			b.Fatal(err)
 		}

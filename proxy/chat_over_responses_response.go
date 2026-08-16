@@ -20,12 +20,14 @@ type responsesChatResponseOptions struct {
 	ReplayRoute        responsesChatReplayRoute
 	ReplayToolDefaults responsesChatReplayToolDefaults
 	UsageOnly          bool
+	Carrier            carrierEmit
 }
 
 type responsesChatJSONResult struct {
-	Response *models.OpenAIResponse
-	Body     []byte
-	Usage    *models.OpenAIUsage
+	Response         *models.OpenAIResponse
+	Body             []byte
+	Usage            *models.OpenAIUsage
+	CarriedReasoning carriedTurn
 }
 
 type responsesChatJSONEnvelope struct {
@@ -141,6 +143,7 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 	if err != nil {
 		return responsesChatJSONResult{}, err
 	}
+	var carriedReasoning carriedTurn
 	chatToolCalls := make([]models.OpenAIToolCall, 0, len(functionCalls))
 	if len(functionCalls) > 0 {
 		if options.ReplayStore == nil {
@@ -171,6 +174,7 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 			attachChatExecutionErrorUsage(replayErr, usage)
 			return responsesChatJSONResult{}, replayErr
 		}
+		carriedReasoning = carriedTurnFromPublished(options.ReplayRoute, envelope.Output, published, options.Carrier)
 		for _, call := range published.Projection.Calls {
 			chatToolCalls = append(chatToolCalls, models.OpenAIToolCall{
 				ID:       call.ID,
@@ -208,7 +212,7 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 	if len(encoded) > responsesChatMaxJSONBodyBytes {
 		return responsesChatJSONResult{}, newChatServerError("chat_body_too_large", "converted Chat response exceeds the JSON limit")
 	}
-	return responsesChatJSONResult{Response: response, Body: encoded, Usage: usage}, nil
+	return responsesChatJSONResult{Response: response, Body: encoded, Usage: usage, CarriedReasoning: carriedReasoning}, nil
 }
 
 func validateResponsesChatMessageStatus(responseStatus, messageStatus string) error {

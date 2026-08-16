@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,14 +17,15 @@ import (
 type copilotResponsesPolicyUpstream struct {
 	server *httptest.Server
 
-	mu                 sync.Mutex
-	modelRequests      int
-	classifierRequests int
-	terminalModels     []string
-	paths              []string
-	classifierSignals  policyClassifierSignals
-	toolFailureModel   string
-	toolFailuresLeft   int
+	mu                     sync.Mutex
+	modelRequests          int
+	classifierRequests     int
+	terminalModels         []string
+	paths                  []string
+	responsesRequestBodies []string
+	classifierSignals      policyClassifierSignals
+	toolFailureModel       string
+	toolFailuresLeft       int
 }
 
 func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSignals) *copilotResponsesPolicyUpstream {
@@ -50,6 +53,17 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 			})
 		case providerEndpointResponses:
 			defer func() { _ = r.Body.Close() }()
+			// Read-and-restore: the decode below and every existing assertion still see an
+			// untouched body, so recording is invisible to the tests already using this fixture.
+			raw, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				http.Error(w, readErr.Error(), http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			upstream.mu.Lock()
+			upstream.responsesRequestBodies = append(upstream.responsesRequestBodies, string(raw))
+			upstream.mu.Unlock()
 			var request struct {
 				Model  string            `json:"model"`
 				Input  []json.RawMessage `json:"input"`
@@ -80,8 +94,9 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 				}
 				upstream.mu.Lock()
 				upstream.classifierRequests++
+				signals := upstream.classifierSignals
 				upstream.mu.Unlock()
-				arguments, _ := json.Marshal(upstream.classifierSignals)
+				arguments, _ := json.Marshal(signals)
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"id":         "resp-classifier",
 					"object":     "response",
@@ -191,11 +206,25 @@ func (u *copilotResponsesPolicyUpstream) snapshot() (int, int, []string, []strin
 	return u.modelRequests, u.classifierRequests, append([]string(nil), u.terminalModels...), append([]string(nil), u.paths...)
 }
 
+// Counts and model names cannot answer "did the reasoning actually travel" -- the question
+// every carrier continuation test was silently NOT asking. Bodies can.
+func (u *copilotResponsesPolicyUpstream) responsesBodies() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.responsesRequestBodies...)
+}
+
 func (u *copilotResponsesPolicyUpstream) failNextToolRequest(model string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.toolFailureModel = model
 	u.toolFailuresLeft = 1
+}
+
+func (u *copilotResponsesPolicyUpstream) setClassifierSignals(signals policyClassifierSignals) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.classifierSignals = signals
 }
 
 func directCopilotResponsesPolicyConfig(profileMode string) ProvidersConfig {
@@ -808,7 +837,7 @@ func TestPolicyResponsesReplayPreservesPowerfulTierWhenRoutesShareTerminal(t *te
 		t.Fatal(err)
 	}
 
-	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, body)
+	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, body, nil)
 	if err != nil {
 		t.Fatalf("resolvePolicyResponsesReplayRoute() error = %v", err)
 	}

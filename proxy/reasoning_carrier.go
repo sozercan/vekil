@@ -1,0 +1,728 @@
+package proxy
+
+import (
+	"bytes"
+	"compress/flate"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"strings"
+	"sync"
+
+	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
+)
+
+const reasoningCarrierPrefix = "vekil1."
+
+// A signature is client input, so a compression bomb is reachable, and one body holds many.
+// The per-carrier cap must cover a group the store itself accepts, or our own decoder
+// rejects a carrier we minted; the request budget is what actually bounds a bomb.
+const (
+	reasoningCarrierMaxDecodedBytes = responsesChatReplayMaxGroupBytes + (1 << 20)
+	reasoningCarrierRequestBudget   = 8 << 20
+	carriedDigestBytes              = 16
+)
+
+// Emit-side cap. Measured on session 4e6e968c: carriers were 78% of a 9.81 MB body at
+// 880 tool turns and 8.9 KB per turn, so the 10 MiB ingress gate closes near turn 940.
+// Past this the carrier keeps only its id mapping, ~300 B, and the wedge stays fixed.
+const reasoningCarrierInboundBudget = 2 << 20
+
+// What the client already replays. Counted off the wire signatures, so it is the weight
+// that returns on every later request no matter what vekil emits now.
+type carrierInbound struct {
+	Carriers int
+	Bytes    int
+	Starved  bool
+}
+
+func (i carrierInbound) mapOnly() bool { return i.Bytes >= reasoningCarrierInboundBudget }
+
+// Where the cap is decided and where to say so; the response path has no logger of its own.
+type carrierEmit struct {
+	Inbound carrierInbound
+	Log     *logger.Logger
+}
+
+// Carried, not inferred from item order: positional binding misattaches same-name parallel calls.
+type carriedCall struct {
+	ProxyID    string `json:"proxy_id"`
+	UpstreamID string `json:"upstream_id"`
+	Name       string `json:"name"`
+	ItemIndex  int    `json:"item_index"`
+}
+
+type reasoningCarrierPayload struct {
+	Items []json.RawMessage `json:"items"`
+	Calls []carriedCall     `json:"calls,omitempty"`
+	// Binds a carrier to the route that minted it: Copilot's ciphertext is model-bound,
+	// and on the policy path this re-picks the tier. RouteTag keys that second role;
+	// the digest stays unkeyed so a restart can still restore items.
+	RouteDigest      string `json:"route_digest,omitempty"`
+	RouteTag         string `json:"route_tag,omitempty"`
+	ProjectionDigest string `json:"projection_digest,omitempty"`
+}
+
+// A turn's Responses output and bindings, encoded into an Anthropic thinking block's
+// signature so the CLIENT holds it rather than the replay store, whose TTL, eviction
+// and restart each wedge a conversation. Chat has no such field, so it keeps the store.
+type carriedTurn struct {
+	Items      []json.RawMessage
+	Calls      []carriedCall
+	Route      responsesChatReplayRoute
+	Projection string
+}
+
+// The mapping alone is a carrier: it is what rebuilds a turn the store has forgotten.
+func (t carriedTurn) present() bool { return len(t.Items) > 0 || len(t.Calls) > 0 }
+
+type carriedReplay struct {
+	Items            []json.RawMessage
+	Calls            map[string]carriedCall
+	RouteDigest      string
+	RouteTagValid    bool
+	ProjectionDigest string
+}
+
+func (r carriedReplay) present() bool { return len(r.Items) > 0 || len(r.Calls) > 0 }
+
+func carriedRouteDigest(route responsesChatReplayRoute) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		route.ProviderID, route.PublicModel, route.UpstreamModel, route.RouteID, route.PolicyTier,
+	}, "\x00")))
+	return hex.EncodeToString(sum[:8])
+}
+
+// A carrier is client input, so its route claim is authority only if this process
+// minted the tag. Losing the key on restart fails closed, which is the old 400.
+var reasoningCarrierKey = sync.OnceValue(func() []byte {
+	key := make([]byte, sha256.Size)
+	if _, err := rand.Read(key); err != nil {
+		return nil
+	}
+	return key
+})
+
+// Per-process key, so a restart invalidates every tag. That costs tier pinning and
+// nothing else: routeSelectingCarriers is the only reader, and it is reached only
+// from the policy path, so the tag is inert unless policy routing is configured.
+func reasoningCarrierRouteTag(digest string) string {
+	key := reasoningCarrierKey()
+	if key == nil || digest == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(digest))
+	return hex.EncodeToString(mac.Sum(nil)[:16])
+}
+
+func reasoningCarrierRouteTagValid(digest, tag string) bool {
+	expected := reasoningCarrierRouteTag(digest)
+	return expected != "" && hmac.Equal([]byte(expected), []byte(tag))
+}
+
+// A tier is authority the store used to hold, so only a carrier this process tagged
+// may pick one; an untagged carrier still restores items under a route already decided.
+func routeSelectingCarriers(carried map[string]carriedReplay) map[string]carriedReplay {
+	selecting := make(map[string]carriedReplay, len(carried))
+	for id, replay := range carried {
+		if replay.RouteTagValid {
+			selecting[id] = replay
+		}
+	}
+	if len(selecting) == 0 {
+		return nil
+	}
+	return selecting
+}
+
+// Mirrors responsesChatReplayGroup.matchesProjection: same canonical assistant text,
+// same calls, same order. Arguments stay out -- the store accepts several normalised
+// forms of them, so binding them here would wedge a transcript the store allows.
+func carriedProjectionDigest(content []byte, calls []responsesChatReplayProjectedCall) string {
+	sum := sha256.New()
+	sum.Write(content)
+	for _, call := range calls {
+		sum.Write([]byte{0})
+		sum.Write([]byte(call.ID))
+		sum.Write([]byte{0})
+		sum.Write([]byte(call.Name))
+	}
+	return hex.EncodeToString(sum.Sum(nil)[:carriedDigestBytes])
+}
+
+// A digest is client input that keys a request-scoped map, so drop anything not ours.
+func carriedDigest(value string) string {
+	if len(value) != hex.EncodedLen(carriedDigestBytes) {
+		return ""
+	}
+	if _, err := hex.DecodeString(value); err != nil {
+		return ""
+	}
+	return value
+}
+
+func carriedTurnFromPublished(route responsesChatReplayRoute, outputItems []json.RawMessage, published responsesChatReplayPublished, emit carrierEmit) carriedTurn {
+	calls := make([]carriedCall, len(published.Calls))
+	for i, call := range published.Calls {
+		calls[i] = carriedCall{
+			ProxyID:    call.ProxyCallID,
+			UpstreamID: call.UpstreamCallID,
+			Name:       call.Name,
+			ItemIndex:  call.OutputItemIndex,
+		}
+	}
+	turn := carriedTurn{
+		Items:      outputItems,
+		Calls:      calls,
+		Route:      route,
+		Projection: carriedProjectionDigest(published.Projection.Content, published.Projection.Calls),
+	}
+	if emit.Inbound.mapOnly() {
+		turn.Items = nil
+		logCarrierMapOnly(emit, route, outputItems, len(calls))
+	}
+	return turn
+}
+
+// Debug, not warn: past the budget this is the steady state and fires every tool turn.
+// Counts and sizes only -- a reasoning item is Copilot ciphertext and never logged.
+func logCarrierMapOnly(emit carrierEmit, route responsesChatReplayRoute, dropped []json.RawMessage, calls int) {
+	if emit.Log == nil {
+		return
+	}
+	items, itemBytes := 0, 0
+	for _, item := range dropped {
+		if itemType, _ := carriedItemHeader(item); itemType == "reasoning" {
+			items++
+			itemBytes += len(item)
+		}
+	}
+	emit.Log.Debug("reasoning carrier capped to its id mapping; the client's replay is at budget",
+		logger.F("model", route.PublicModel),
+		logger.F("inbound_carriers", emit.Inbound.Carriers),
+		logger.F("inbound_carrier_bytes", emit.Inbound.Bytes),
+		logger.F("budget_bytes", reasoningCarrierInboundBudget),
+		logger.F("dropped_reasoning_items", items),
+		logger.F("dropped_reasoning_bytes", itemBytes),
+		logger.F("mapped_calls", calls),
+	)
+}
+
+func encodeReasoningCarrier(turn carriedTurn) (string, error) {
+	if !turn.present() {
+		return "", nil
+	}
+	digest := carriedRouteDigest(turn.Route)
+	payload, err := json.Marshal(reasoningCarrierPayload{
+		Items:            turn.Items,
+		Calls:            turn.Calls,
+		RouteDigest:      digest,
+		RouteTag:         reasoningCarrierRouteTag(digest),
+		ProjectionDigest: turn.Projection,
+	})
+	if err != nil {
+		return "", err
+	}
+	// Past the cap our own decoder drops this carrier, silently costing the turn the id
+	// mapping that prevents the wedge. Keep the mapping; reasoning is the quality bonus.
+	if len(payload) > reasoningCarrierMaxDecodedBytes {
+		payload, err = json.Marshal(reasoningCarrierPayload{
+			Calls:            turn.Calls,
+			RouteDigest:      digest,
+			RouteTag:         reasoningCarrierRouteTag(digest),
+			ProjectionDigest: turn.Projection,
+		})
+		if err != nil {
+			return "", err
+		}
+	}
+	var compressed bytes.Buffer
+	writer, err := flate.NewWriter(&compressed, flate.BestCompression)
+	if err != nil {
+		return "", err
+	}
+	if _, err := writer.Write(payload); err != nil {
+		_ = writer.Close()
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	return reasoningCarrierPrefix + base64.RawURLEncoding.EncodeToString(compressed.Bytes()), nil
+}
+
+// Unusable carriers return false, not error: failing turns lost continuity into a dead conversation.
+func decodeReasoningCarrier(signature string, budget *int) (carriedReplay, bool) {
+	if !strings.HasPrefix(signature, reasoningCarrierPrefix) {
+		return carriedReplay{}, false
+	}
+	compressed, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(signature, reasoningCarrierPrefix))
+	if err != nil || len(compressed) == 0 {
+		return carriedReplay{}, false
+	}
+	limit := reasoningCarrierMaxDecodedBytes
+	if budget != nil {
+		if *budget <= 0 {
+			return carriedReplay{}, false
+		}
+		limit = min(limit, *budget)
+	}
+	reader := flate.NewReader(bytes.NewReader(compressed))
+	defer func() { _ = reader.Close() }()
+	payload, err := io.ReadAll(io.LimitReader(reader, int64(limit)+1))
+	if budget != nil {
+		*budget -= len(payload)
+	}
+	if err != nil || len(payload) > limit {
+		return carriedReplay{}, false
+	}
+	var decoded reasoningCarrierPayload
+	if json.Unmarshal(payload, &decoded) != nil || (len(decoded.Items) == 0 && len(decoded.Calls) == 0) {
+		return carriedReplay{}, false
+	}
+	replay := carriedReplay{
+		Items:            decoded.Items,
+		Calls:            make(map[string]carriedCall, len(decoded.Calls)),
+		RouteDigest:      decoded.RouteDigest,
+		RouteTagValid:    reasoningCarrierRouteTagValid(decoded.RouteDigest, decoded.RouteTag),
+		ProjectionDigest: carriedDigest(decoded.ProjectionDigest),
+	}
+	for _, call := range decoded.Calls {
+		replay.Calls[call.ProxyID] = call
+	}
+	return replay, true
+}
+
+// `thinking` is empty on purpose: the block is transport, not content.
+func reasoningCarrierBlock(turn carriedTurn) (*models.ContentBlock, error) {
+	signature, err := encodeReasoningCarrier(turn)
+	if err != nil || signature == "" {
+		return nil, err
+	}
+	return &models.ContentBlock{Type: "thinking", Thinking: stringPtr(""), Signature: signature}, nil
+}
+
+// Keyed by tool_use id, not message index, because clients trim history. Every
+// tool_use in a message maps to that message's carrier: one output array per turn.
+// The budget is charged newest-first, so a long transcript keeps the reasoning that will
+// actually survive the outbound trim; precedence below is still oldest-first.
+func extractCarriedReasoning(messages []models.AnthropicMessage) (carried map[string]carriedReplay, inbound carrierInbound) {
+	carried = make(map[string]carriedReplay)
+	blocksByMessage := make(map[int][]models.ContentBlock, len(messages))
+	order := make([]int, 0, len(messages))
+	for index, msg := range messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		var blocks []models.ContentBlock
+		if json.Unmarshal(msg.Content, &blocks) != nil {
+			continue
+		}
+		blocksByMessage[index] = blocks
+		order = append(order, index)
+	}
+
+	// Spend the budget NEWEST-first. Charging oldest-first spent it on turns trimAgedReasoning
+	// then discards on the way out (see agedReasoningToolTurns), so a long transcript could
+	// pay its whole 8 MiB for reasoning that never left the process and send none from the
+	// retained window. Only the ORDER of spending changes here: the precedence below still
+	// runs oldest-first, so which carrier wins an id is exactly what it was.
+	decoded := make(map[int]carriedReplay, len(order))
+	budget := reasoningCarrierRequestBudget
+	for i := len(order) - 1; i >= 0; i-- {
+		index := order[i]
+		spent := false
+		for _, block := range blocksByMessage[index] {
+			if block.Type != "thinking" && block.Type != "redacted_thinking" {
+				continue
+			}
+			if !strings.HasPrefix(block.Signature, reasoningCarrierPrefix) {
+				continue
+			}
+			// Weighed before the budget decides, so a starved request still reports it all.
+			inbound.Carriers++
+			inbound.Bytes += len(block.Signature)
+			// Charged on the attempt, so corrupt blocks cannot each buy an inflate.
+			if spent {
+				continue
+			}
+			spent = true
+			if budget <= 0 {
+				inbound.Starved = true
+				continue
+			}
+			if replay, ok := decodeReasoningCarrier(block.Signature, &budget); ok {
+				decoded[index] = replay
+			} else if budget <= 0 {
+				// The attempt is charged before it fails, so the carrier that EXHAUSTS
+				// the budget starves as surely as one that found none left. Checking
+				// only before an attempt misses it whenever it is the last carrier.
+				inbound.Starved = true
+			}
+		}
+	}
+
+	for _, index := range order {
+		replay, ok := decoded[index]
+		if !ok || !replay.present() {
+			continue
+		}
+		var toolUseIDs []string
+		for _, block := range blocksByMessage[index] {
+			if block.Type == "tool_use" && block.ID != "" {
+				toolUseIDs = append(toolUseIDs, block.ID)
+			}
+		}
+		// A carrier names the calls it covers, so index by its OWN mapping and not only by
+		// tool_use blocks sitting beside it. Parallel calls interleaved with their results
+		// split one logical turn across several wire messages, and the carrier can land in
+		// a message holding no tool_use at all; requiring co-location discarded it and left
+		// those ids unresolvable, which is the wedge this carrier exists to prevent.
+		for id := range replay.Calls {
+			if _, taken := carried[id]; !taken {
+				carried[id] = replay
+			}
+		}
+		// Co-located ids still win: a turn's own carrier is the most specific answer for it.
+		for _, id := range toolUseIDs {
+			carried[id] = replay
+		}
+	}
+	if len(carried) == 0 {
+		return nil, inbound
+	}
+	return carried, inbound
+}
+
+// A mixed group hands Copilot a chain that does not match the calls beside it.
+func carriedReplayForCalls(carried map[string]carriedReplay, projected []responsesChatReplayProjectedCall) (carriedReplay, bool) {
+	if len(carried) == 0 || len(projected) == 0 {
+		return carriedReplay{}, false
+	}
+	var replay carriedReplay
+	for i, call := range projected {
+		found, ok := carried[call.ID]
+		if !ok || !found.present() {
+			return carriedReplay{}, false
+		}
+		if i == 0 {
+			replay = found
+			continue
+		}
+		if len(replay.Items) != len(found.Items) {
+			return carriedReplay{}, false
+		}
+		for j := range replay.Items {
+			if string(replay.Items[j]) != string(found.Items[j]) {
+				return carriedReplay{}, false
+			}
+		}
+	}
+	return replay, true
+}
+
+// A shape we did not mint, or that the transcript cannot rebuild, restores nothing.
+func carriedItemsWellShaped(items []json.RawMessage) bool {
+	messages := 0
+	for _, item := range items {
+		var header struct {
+			Type   string `json:"type"`
+			Role   string `json:"role"`
+			CallID string `json:"call_id"`
+			Name   string `json:"name"`
+		}
+		if json.Unmarshal(item, &header) != nil {
+			return false
+		}
+		switch strings.TrimSpace(header.Type) {
+		case "reasoning":
+		case "message":
+			messages++
+			if messages > 1 || strings.TrimSpace(header.Role) != "assistant" {
+				return false
+			}
+		case "function_call":
+			if strings.TrimSpace(header.CallID) == "" || strings.TrimSpace(header.Name) == "" {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// The store's binding without the store: route, projection and each call's own minted id
+// must match, and indices mirror Publish. "" means restored, else the guard that refused.
+func carriedRestoredCalls(carried map[string]carriedReplay, projected []responsesChatReplayProjectedCall, route responsesChatReplayRoute, projectionContent json.RawMessage) (responsesChatRestoredCalls, string) {
+	canonicalContent, err := canonicalReplayJSONValue(projectionContent)
+	if err != nil {
+		return responsesChatRestoredCalls{}, "projection"
+	}
+	replay, ok := carriedReplayForCalls(carried, projected)
+	switch {
+	case !ok:
+		return responsesChatRestoredCalls{}, "absent"
+	case replay.RouteDigest != carriedRouteDigest(route):
+		return responsesChatRestoredCalls{}, "route"
+	case replay.ProjectionDigest != carriedProjectionDigest(canonicalContent, projected):
+		return responsesChatRestoredCalls{}, "projection"
+	case !carriedItemsWellShaped(replay.Items):
+		return responsesChatRestoredCalls{}, "shape"
+	}
+	calls := make([]responsesChatReplayResolvedCall, len(projected))
+	// A capped carrier holds no items, so only the mapping's own ordering binds here.
+	mapped := len(replay.Items) == 0
+	lastItemIndex := -1
+	for i, projectedCall := range projected {
+		call, known := replay.Calls[projectedCall.ID]
+		upstreamID := strings.TrimSpace(call.UpstreamID)
+		if !known || upstreamID == "" || call.Name != strings.TrimSpace(projectedCall.Name) || call.ItemIndex <= lastItemIndex {
+			return responsesChatRestoredCalls{}, "binding"
+		}
+		var outputItem json.RawMessage
+		if !mapped {
+			if call.ItemIndex >= len(replay.Items) {
+				return responsesChatRestoredCalls{}, "binding"
+			}
+			itemType, itemCallID := carriedItemHeader(replay.Items[call.ItemIndex])
+			if itemType != "function_call" || itemCallID != upstreamID {
+				return responsesChatRestoredCalls{}, "binding"
+			}
+			outputItem = replay.Items[call.ItemIndex]
+		}
+		lastItemIndex = call.ItemIndex
+		calls[i] = responsesChatReplayResolvedCall{
+			ProxyCallID:     projectedCall.ID,
+			UpstreamCallID:  upstreamID,
+			Name:            call.Name,
+			OutputItemIndex: call.ItemIndex,
+			OutputItem:      outputItem,
+		}
+	}
+	digest := sha256.New()
+	for _, item := range replay.Items {
+		digest.Write(item)
+	}
+	return responsesChatRestoredCalls{
+		Key:         "carrier:" + replay.ProjectionDigest + ":" + hex.EncodeToString(digest.Sum(nil)),
+		OutputItems: replay.Items,
+		Calls:       calls,
+		Rebuild:     true,
+	}, ""
+}
+
+func carriedItemHeader(item json.RawMessage) (itemType, callID string) {
+	var header struct {
+		Type   string `json:"type"`
+		CallID string `json:"call_id"`
+	}
+	if json.Unmarshal(item, &header) != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(header.Type), strings.TrimSpace(header.CallID)
+}
+
+// A reasoning item keeps only its ciphertext and id -- Copilot's own, and the one thing
+// a transcript cannot rebuild. Text and calls come from the transcript the classifier read.
+func reconstructCarriedRestore(restored responsesChatRestoredCalls, projected []responsesChatReplayProjectedCall, assistantText string) responsesChatRestoredCalls {
+	visible := make(map[string]responsesChatReplayProjectedCall, len(projected))
+	for _, call := range projected {
+		visible[call.ID] = call
+	}
+	callByItemIndex := make(map[int]int, len(restored.Calls))
+	for i, call := range restored.Calls {
+		callByItemIndex[call.OutputItemIndex] = i
+	}
+	items := make([]json.RawMessage, 0, len(restored.OutputItems))
+	calls := make([]responsesChatReplayResolvedCall, len(restored.Calls))
+	copy(calls, restored.Calls)
+	rebuild := func(i int) {
+		call := visible[calls[i].ProxyCallID]
+		calls[i].OutputItem = responsesFunctionCallItem(calls[i].UpstreamCallID, call.Name, call.Arguments)
+		calls[i].OutputItemIndex = len(items)
+		items = append(items, calls[i].OutputItem)
+	}
+	// A capped carrier drops the reasoning, so the whole turn comes back from the
+	// transcript: the text it spoke, then its calls under their minted upstream ids.
+	if len(restored.OutputItems) == 0 {
+		if assistantText != "" {
+			items = appendAssistantHistoryMessage(items, assistantText)
+		}
+		for i := range calls {
+			rebuild(i)
+		}
+		restored.OutputItems = items
+		restored.Calls = calls
+		return restored
+	}
+	textSlot := carriedTextSlot(restored.OutputItems, callByItemIndex)
+	for index, item := range restored.OutputItems {
+		if index == textSlot && assistantText != "" {
+			items = appendAssistantHistoryMessage(items, assistantText)
+		}
+		if i, ok := callByItemIndex[index]; ok {
+			rebuild(i)
+			continue
+		}
+		if itemType, _ := carriedItemHeader(item); itemType == "reasoning" {
+			if reasoning := carriedReasoningCiphertext(item); reasoning != nil {
+				items = append(items, reasoning)
+			}
+		}
+	}
+	restored.OutputItems = items
+	restored.Calls = calls
+	return restored
+}
+
+// One flattened text replays where the turn first spoke: its message slot, or the first call.
+// The message slot wins even when a call precedes it, because a turn that emitted a call and
+// THEN spoke would otherwise have its text hoisted above the call and lose upstream's order.
+func carriedTextSlot(items []json.RawMessage, callByItemIndex map[int]int) int {
+	firstCall := -1
+	for index, item := range items {
+		if itemType, _ := carriedItemHeader(item); itemType == "message" {
+			return index
+		}
+		if _, isCall := callByItemIndex[index]; isCall && firstCall < 0 {
+			firstCall = index
+		}
+	}
+	return firstCall
+}
+
+// summary, content and every other field are plain text no policy check ever read.
+func carriedReasoningCiphertext(item json.RawMessage) json.RawMessage {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(item, &fields) != nil || rawJSONString(fields["encrypted_content"]) == "" {
+		return nil
+	}
+	narrowed := map[string]json.RawMessage{
+		"type":              json.RawMessage(`"reasoning"`),
+		"encrypted_content": fields["encrypted_content"],
+		"summary":           json.RawMessage(`[]`),
+		"content":           json.RawMessage(`[]`),
+	}
+	if id, ok := fields["id"]; ok {
+		narrowed["id"] = id
+	}
+	rebuilt, err := json.Marshal(narrowed)
+	if err != nil {
+		return nil
+	}
+	return rebuilt
+}
+
+func prependCarriedReasoning(resp *models.AnthropicResponse, turn carriedTurn) *models.AnthropicResponse {
+	if resp == nil || !turn.present() {
+		return resp
+	}
+	carrier, err := reasoningCarrierBlock(turn)
+	if err != nil || carrier == nil {
+		return resp
+	}
+	resp.Content = append([]models.ContentBlock{*carrier}, resp.Content...)
+	return resp
+}
+
+// stripVekilCarrierBlocks removes vekil's own carrier blocks from an Anthropic request body,
+// restoring the transcript to the shape it would have had if vekil had never injected one.
+//
+// A direct Anthropic route is another provider's endpoint. The carrier holds Copilot's opaque
+// reasoning ciphertext and a route tag keyed to this process, and Anthropic validates the
+// signature on thinking blocks it issued -- so forwarding one hands a third party another
+// provider's payload and invites a rejection on a signature Anthropic never wrote. A client
+// that switches models mid-conversation carries ours along without knowing it is ours.
+//
+// Operates on the raw body rather than the parsed request so every field vekil does not model
+// survives untouched. An assistant message left with no content is dropped: it existed only to
+// carry the block, which is exactly the shape the client would have sent without us.
+func stripVekilCarrierBlocks(body []byte) ([]byte, int) {
+	// No raw-bytes prefix scan before the parse, deliberately. A `bytes.Contains`
+	// fast path here was a correctness hole, not an optimization: JSON escapes are
+	// decoded by the parse but invisible to a byte scan, so a signature written as
+	// "\u0076ekil1...." left the raw body without the literal prefix, returned the
+	// body unchanged, and forwarded vekil's own Copilot reasoning to Anthropic --
+	// the exact leak this function exists to prevent. Any cheap pre-check over
+	// unparsed bytes has the same hole, because the escape can move to any
+	// character. The parse below is the only thing that sees what the peer sees,
+	// and the caller unmarshals this body immediately afterwards regardless.
+	var root map[string]json.RawMessage
+	if json.Unmarshal(body, &root) != nil {
+		return body, 0
+	}
+	var messages []json.RawMessage
+	if raw, ok := root["messages"]; !ok || json.Unmarshal(raw, &messages) != nil {
+		return body, 0
+	}
+	stripped := 0
+	kept := make([]json.RawMessage, 0, len(messages))
+	for _, raw := range messages {
+		var message map[string]json.RawMessage
+		if json.Unmarshal(raw, &message) != nil {
+			kept = append(kept, raw)
+			continue
+		}
+		var role string
+		if json.Unmarshal(message["role"], &role) != nil || role != "assistant" {
+			kept = append(kept, raw)
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(message["content"], &blocks) != nil {
+			kept = append(kept, raw)
+			continue
+		}
+		remaining := make([]json.RawMessage, 0, len(blocks))
+		for _, block := range blocks {
+			var header struct {
+				Type      string `json:"type"`
+				Signature string `json:"signature"`
+			}
+			if json.Unmarshal(block, &header) == nil &&
+				(header.Type == "thinking" || header.Type == "redacted_thinking") &&
+				strings.HasPrefix(header.Signature, reasoningCarrierPrefix) {
+				stripped++
+				continue
+			}
+			remaining = append(remaining, block)
+		}
+		if len(remaining) == len(blocks) {
+			kept = append(kept, raw)
+			continue
+		}
+		if len(remaining) == 0 {
+			continue
+		}
+		content, err := json.Marshal(remaining)
+		if err != nil {
+			return body, 0
+		}
+		message["content"] = content
+		rewritten, err := json.Marshal(message)
+		if err != nil {
+			return body, 0
+		}
+		kept = append(kept, rewritten)
+	}
+	if stripped == 0 {
+		return body, 0
+	}
+	rewrittenMessages, err := json.Marshal(kept)
+	if err != nil {
+		return body, 0
+	}
+	root["messages"] = rewrittenMessages
+	rewritten, err := json.Marshal(root)
+	if err != nil {
+		return body, 0
+	}
+	return rewritten, stripped
+}

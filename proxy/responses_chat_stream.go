@@ -28,6 +28,7 @@ type responsesChatStreamConfig struct {
 	ReplayStore        *responsesChatReplayStore
 	ReplayRoute        responsesChatReplayRoute
 	ReplayToolDefaults responsesChatReplayToolDefaults
+	Carrier            carrierEmit
 
 	PrecommitTimeout  time.Duration
 	PrecommitMaxBytes int
@@ -79,6 +80,7 @@ func translateResponsesSSEToChat(ctx context.Context, body io.ReadCloser, option
 		ReplayStore:        options.ReplayStore,
 		ReplayRoute:        options.ReplayRoute,
 		ReplayToolDefaults: options.ReplayToolDefaults,
+		Carrier:            options.Carrier,
 	})
 }
 
@@ -462,8 +464,9 @@ func (s *responsesChatStreamState) toolArgumentsChunk(tool *responsesChatToolSta
 }
 
 type responsesChatStreamTransition struct {
-	chunks   []models.OpenAIStreamChunk
-	terminal bool
+	chunks           []models.OpenAIStreamChunk
+	terminal         bool
+	carriedReasoning carriedTurn
 }
 
 func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (responsesChatStreamTransition, error) {
@@ -1161,6 +1164,7 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 			attachChatExecutionErrorUsage(replayErr, terminalUsage)
 			return usageFailureTransition, replayErr
 		}
+		transition.carriedReasoning = carriedTurnFromPublished(s.config.ReplayRoute, event.Response.Output, published, s.config.Carrier)
 		proxyByUpstream := make(map[string]string, len(published.Calls))
 		for _, call := range published.Calls {
 			proxyByUpstream[call.UpstreamCallID] = call.ProxyCallID
@@ -1185,7 +1189,9 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 		chunks = append(chunks, s.usageChunk(terminalUsage))
 	}
 	s.terminalSeen = true
-	return responsesChatStreamTransition{chunks: chunks, terminal: true}, nil
+	transition.chunks = chunks
+	transition.terminal = true
+	return transition, nil
 }
 
 func parseResponsesChatTopLevelError(data []byte) *chatExecutionError {
@@ -1389,6 +1395,11 @@ func runResponsesChatStream(writer *chatStreamEventWriter, control *responsesCha
 			if err := emitChunks(transition.chunks); err != nil {
 				return err
 			}
+		}
+		// Unguarded: the writer owns "worth emitting". An item count here drops a
+		// capped carrier, which holds only its mapping.
+		if err := writer.sendCarriedReasoning(transition.carriedReasoning); err != nil {
+			return err
 		}
 		if transition.terminal {
 			if !committed {

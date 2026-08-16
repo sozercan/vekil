@@ -38,7 +38,7 @@ func TestChatStreamEventPipeCarriesChunksToTerminalSuccess(t *testing.T) {
 	err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
 		got = append(got, chunk)
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("consumeChatStreamEvents() error = %v", err)
 	}
@@ -64,7 +64,7 @@ func TestChatStreamEventPipePropagatesTypedTerminalError(t *testing.T) {
 		producerDone <- writer.fail(want)
 	}()
 
-	err := consumeChatStreamEvents(stream, nil)
+	err := consumeChatStreamEvents(stream, nil, nil)
 	if err != want {
 		t.Fatalf("consumeChatStreamEvents() error = %#v, want same typed error %#v", err, want)
 	}
@@ -569,7 +569,7 @@ func BenchmarkChatStreamEventTransport(b *testing.B) {
 		if err := consumeChatStreamEvents(stream, func(models.OpenAIStreamChunk) error {
 			count++
 			return nil
-		}); err != nil {
+		}, nil); err != nil {
 			b.Fatalf("consumeChatStreamEvents() error = %v", err)
 		}
 		if err := <-producerDone; err != nil {
@@ -639,7 +639,7 @@ func TestChatStreamEventQueuedTerminalWinsConcurrentCancellation(t *testing.T) {
 	}
 	stream.stop(errProxyLifecycleShutdown)
 	var got []models.OpenAIStreamChunk
-	if err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error { got = append(got, chunk); return nil }); err != nil {
+	if err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error { got = append(got, chunk); return nil }, nil); err != nil {
 		t.Fatalf("consume error = %v", err)
 	}
 	if !reflect.DeepEqual(got, []models.OpenAIStreamChunk{want}) {
@@ -748,5 +748,26 @@ func TestAggregatePolicyChatStreamEventsEnforcesCumulativeResponseLimit(t *testi
 	_, err := aggregateChatStreamEventsWithOptions(stream, openAIResponseBuildOptions{maxAccumulatedBytes: 128})
 	if err == nil || !strings.Contains(err.Error(), "128-byte response limit") {
 		t.Fatalf("aggregation error = %v, want cumulative response limit", err)
+	}
+}
+
+// A failed carrier write must end the stream, not be swallowed. Swallowing it lets `finish`
+// report success while the client stores a transcript with no signature -- and the next
+// request cannot resolve its own minted ids, which is the wedge this carrier prevents.
+func TestCarrierWriteFailureEndsTheStream(t *testing.T) {
+	writer, stream := newChatStreamEventPipe(context.Background())
+	go func() {
+		_ = writer.sendCarriedReasoning(carriedTurn{
+			Calls: []carriedCall{{ProxyID: "call_vekil_x", UpstreamID: "fc_x", Name: "Read"}},
+		})
+		_ = writer.succeed()
+	}()
+
+	sentinel := errors.New("client write failed")
+	err := consumeChatStreamEvents(stream,
+		func(models.OpenAIStreamChunk) error { return nil },
+		func(carriedTurn) error { return sentinel })
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("consume error = %v, want the carrier write failure to propagate", err)
 	}
 }

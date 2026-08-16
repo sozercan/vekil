@@ -97,7 +97,9 @@ MODELS_JSON="${SMOKE_DIR}/models.json"
 SELECTED_MODEL_FILE="${SMOKE_DIR}/selected-model.txt"
 SUMMARY_FILE="${SMOKE_DIR}/summary.txt"
 PROXY_TOKEN_DIR="${PROXY_TOKEN_DIR:-${SMOKE_DIR}/token}"
-CALL_ID_PATTERN='^call_vekil_[A-Za-z0-9_-]{22}$'
+# Two minted shapes: the legacy random suffix, and the self-describing one that embeds
+# Copilot's own call id. 48 is what Anthropic's 64-char cap leaves after "call_vekil_call_".
+CALL_ID_PATTERN='^call_vekil_([A-Za-z0-9_-]{22}|call_[A-Za-z0-9_-]{1,48})$'
 
 TEXT_MARKER="VEKIL_CHAT_OVER_RESPONSES_TEXT_OK"
 STREAM_MARKER="VEKIL_CHAT_OVER_RESPONSES_STREAM_OK"
