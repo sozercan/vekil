@@ -36,6 +36,9 @@ type responsesChatJSONEnvelope struct {
 		Type    string `json:"type"`
 		Code    string `json:"code"`
 		Message string `json:"message"`
+		// Copilot puts the offending field here on a terminal failure. Without it a
+		// post-commit failure records a type and a code and no idea where.
+		Param string `json:"param"`
 	} `json:"error"`
 	IncompleteDetails *struct {
 		Reason string `json:"reason"`
@@ -423,8 +426,9 @@ func responsesChatFailedExecutionError(failure *struct {
 	Type    string `json:"type"`
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Param   string `json:"param"`
 }, usage *models.OpenAIUsage) *chatExecutionError {
-	errorType, code, message := "server_error", "response_failed", "upstream Responses generation failed"
+	errorType, code, message, param := "server_error", "response_failed", "upstream Responses generation failed", ""
 	if failure != nil {
 		if strings.TrimSpace(failure.Type) != "" {
 			errorType = strings.TrimSpace(failure.Type)
@@ -435,12 +439,13 @@ func responsesChatFailedExecutionError(failure *struct {
 		if strings.TrimSpace(failure.Message) != "" {
 			message = strings.TrimSpace(failure.Message)
 		}
+		param = strings.TrimSpace(failure.Param)
 	}
 	if failure == nil || strings.TrimSpace(failure.Type) == "" {
 		errorType = responsesChatErrorTypeForCode(code)
 	}
 	status := responsesChatFailureStatus(errorType, code)
-	return &chatExecutionError{StatusCode: status, Type: errorType, Code: code, Message: message, Usage: usage}
+	return &chatExecutionError{StatusCode: status, Type: errorType, Code: code, Param: param, Message: message, Usage: usage, upstreamAuthored: true}
 }
 
 func responsesChatErrorTypeForCode(code string) string {

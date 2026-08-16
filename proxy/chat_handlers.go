@@ -1236,9 +1236,11 @@ func (h *ProxyHandler) executeExplicitResponsesChat(ctx context.Context, route *
 		route:        resolved,
 	}
 	if resp.StatusCode != http.StatusOK {
-		if err := canonicalizeResponsesChatHTTPError(resp, safeHeaders); err != nil {
+		classifiers, err := canonicalizeResponsesChatHTTPError(resp, safeHeaders)
+		if err != nil {
 			return chatExecutionResult{}, err
 		}
+		result.upstreamError = classifiers
 		return result, nil
 	}
 
@@ -2128,6 +2130,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	result, oaiBody, mode = h.retryRoutedChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, oaiBody, mode, providerModel)
 	observeChatExecutionRoute(r.Context(), result)
+	observeUpstreamErrorClassifiers(r.Context(), result.upstreamError)
 	observeUpstreamHeaders(r.Context(), result.Headers)
 	if result.Backend == chatBackendResponses && len(result.Headers) > 0 {
 		if policyPlan.valid() {
@@ -2148,6 +2151,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			status = chatStreamErrorStatus(executionErr)
+			// The OpenAI aggregation branch already does this. Anthropic force-streams its
+			// non-streaming turns, so this is where its typed failure surfaces; without it the
+			// warn carries a stats_status and no reason.
+			observeChatExecutionError(r.Context(), executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
 			if policyPlan.valid() {
 				writePolicyAnthropicSanitizedError(w, status, executionErr.Headers, publicModel)
@@ -2173,6 +2180,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 	observeChatExecutionRoute(r.Context(), result)
+	observeUpstreamErrorClassifiers(r.Context(), result.upstreamError)
 	if len(result.Headers) > 0 {
 		observeUpstreamHeaders(r.Context(), result.Headers)
 	}
@@ -2186,6 +2194,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
+		// A non-200 arrives as a successful result here, so no execution error is built and
+		// nothing records WHY the turn failed. Classify off the body; the message stays out,
+		// because an upstream 400 quotes the rejected value and that is request content.
+		observeUpstreamErrorDetail(r.Context(), resp.StatusCode, errBody)
 		h.log.Error("upstream error",
 			logger.F("endpoint", "anthropic"),
 			logger.F("status", resp.StatusCode),
@@ -2232,8 +2244,13 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			var streamErr *chatExecutionError
 			if errors.As(err, &streamErr) {
 				observeOpenAIUsage(r.Context(), streamErr.Usage)
+				// A post-commit stream failure never reaches the execution-error path, so this
+				// is the only place the typed error is seen. Without it the warn carries a
+				// stats_status and no reason at all.
+				observeChatExecutionError(r.Context(), streamErr)
 				observeResponseFailureStatus(r.Context(), chatStreamErrorStatus(streamErr))
 			} else if terminalErr := chatExecutionErrorFromStreamTermination(err); terminalErr != nil {
+				observeChatExecutionError(r.Context(), terminalErr)
 				observeResponseFailureStatus(r.Context(), terminalErr.StatusCode)
 				_ = writeSSEEvent(tracked, "error", map[string]any{"type": "error", "error": map[string]any{"type": mapAnthropicUpstreamStatus(terminalErr.StatusCode), "message": terminalErr.Message}})
 			}
@@ -2272,6 +2289,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			status = chatStreamErrorStatus(executionErr)
+			// The OpenAI aggregation branch already does this. Anthropic force-streams its
+			// non-streaming turns, so this is where its typed failure surfaces; without it the
+			// warn carries a stats_status and no reason.
+			observeChatExecutionError(r.Context(), executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
 			if policyPlan.valid() {
 				writePolicyAnthropicSanitizedError(w, status, executionErr.Headers, publicModel)
@@ -2949,6 +2970,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	result, bodyBytes, mode = h.retryRoutedChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, bodyBytes, mode, requestedModel)
 	observeChatExecutionRoute(r.Context(), result)
+	observeUpstreamErrorClassifiers(r.Context(), result.upstreamError)
 	observeUpstreamHeaders(r.Context(), result.Headers)
 	if policyPlan.valid() && result.Backend == chatBackendResponses && len(result.Headers) > 0 {
 		// routeChatExecutionResult merges Responses-backed headers before its
@@ -2997,6 +3019,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 	observeChatExecutionRoute(r.Context(), result)
+	observeUpstreamErrorClassifiers(r.Context(), result.upstreamError)
 	if len(result.Headers) > 0 {
 		observeUpstreamHeaders(r.Context(), result.Headers)
 	}
@@ -3062,8 +3085,13 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			var streamErr *chatExecutionError
 			if errors.As(err, &streamErr) {
 				observeOpenAIUsage(r.Context(), streamErr.Usage)
+				// A post-commit stream failure never reaches the execution-error path, so this
+				// is the only place the typed error is seen. Without it the warn carries a
+				// stats_status and no reason at all.
+				observeChatExecutionError(r.Context(), streamErr)
 				observeResponseFailureStatus(r.Context(), chatStreamErrorStatus(streamErr))
 			} else if terminalErr := chatExecutionErrorFromStreamTermination(err); terminalErr != nil {
+				observeChatExecutionError(r.Context(), terminalErr)
 				observeResponseFailureStatus(r.Context(), terminalErr.StatusCode)
 				if tracked.committed {
 					_ = writeOpenAIChatSSEError(tracked, terminalErr)

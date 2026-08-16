@@ -25,6 +25,19 @@ type chatExecutionError struct {
 	Headers    http.Header
 	Usage      *models.OpenAIUsage
 	route      resolvedChatRoute
+	// Upstream prose quotes the request back, so only vekil's own Message is loggable.
+	upstreamAuthored bool
+	// vekil authored this, but interpolated client text into it: an unknown field's NAME
+	// becomes the param, an unsupported value is echoed into the message. Neither is ours.
+	clientDerived bool
+	// The parent path vekil built, without the client's field name appended.
+	safeParam string
+	// The Message is a compile-time constant with nothing interpolated, so it is vekil's own
+	// words and safe to log. Default is CLOSED: every other message is dropped. Validators
+	// interpolate client values ("Responses input item type %q is not supported") and
+	// upstream prose quotes the request back, so opting in per constructor is what keeps a
+	// newly added validator from silently putting request content in the logs.
+	staticMessage bool
 }
 
 func (e *chatExecutionError) Error() string {
@@ -50,6 +63,9 @@ type chatExecutionResult struct {
 	IncludeUsage   bool
 	Backend        chatBackend
 	route          resolvedChatRoute
+	// Reduced from an upstream non-2xx body, which the surfaces see as a successful
+	// result. Rides here because the boundary that read it had no request summary.
+	upstreamError upstreamErrorClassifiers
 }
 
 func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
@@ -211,9 +227,11 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 		route:        route,
 	}
 	if resp.StatusCode != http.StatusOK {
-		if err := canonicalizeResponsesChatHTTPError(resp, result.Headers); err != nil {
+		classifiers, err := canonicalizeResponsesChatHTTPError(resp, result.Headers)
+		if err != nil {
 			return chatExecutionResult{}, err
 		}
+		result.upstreamError = classifiers
 		return result, nil
 	}
 	if plan.Stream {
@@ -281,6 +299,27 @@ func parseResponsesChatErrorDetails(status int, body []byte) responsesChatErrorD
 			Param   json.RawMessage `json:"param"`
 		} `json:"error"`
 	}
+	// Copilot's Responses endpoint answers with the classifiers at the TOP level --
+	// {"code":"invalid_request_body","message":...} -- with no `error` wrapper. Probed
+	// against the live API; parsing only the nested form lost `code` for the very
+	// provider this path serves.
+	var flat struct {
+		Message string          `json:"message"`
+		Type    string          `json:"type"`
+		Code    string          `json:"code"`
+		Param   json.RawMessage `json:"param"`
+	}
+	if json.Unmarshal(body, &flat) == nil {
+		if trimmed := strings.TrimSpace(flat.Type); trimmed != "" {
+			details.errorType = trimmed
+		}
+		if trimmed := strings.TrimSpace(flat.Code); trimmed != "" {
+			details.code = trimmed
+		}
+		if len(flat.Param) > 0 {
+			_ = json.Unmarshal(flat.Param, &details.param)
+		}
+	}
 	if json.Unmarshal(body, &upstream) == nil && upstream.Error != nil {
 		if strings.TrimSpace(upstream.Error.Message) != "" {
 			details.message = strings.TrimSpace(upstream.Error.Message)
@@ -313,21 +352,33 @@ func responsesChatExecutionErrorFromUpstream(err error) error {
 		Param:      param,
 		Message:    details.message,
 		Headers:    convertedChatSafeHeaders(upstreamErr.headers),
+
+		upstreamAuthored: true,
 	}
 }
 
-func canonicalizeResponsesChatHTTPError(resp *http.Response, safeHeaders http.Header) error {
+// canonicalizeResponsesChatHTTPError rewrites an upstream non-2xx into vekil's canonical
+// envelope and returns the classifiers reduced from the body it consumed.
+//
+// It returns them rather than recording them because this runs on the lifecycle-rooted
+// upstream context, which deliberately carries no request summary (see
+// newInferenceUpstreamContextFrom). A non-2xx reaches the Chat surfaces as a SUCCESSFUL
+// chatExecutionResult, so no execution error is built and nothing else records WHY the turn
+// failed -- and this is the only place that sees the body. The caller carries them to a
+// surface holding the inbound context.
+func canonicalizeResponsesChatHTTPError(resp *http.Response, safeHeaders http.Header) (upstreamErrorClassifiers, error) {
 	if resp == nil || resp.Body == nil {
-		return fmt.Errorf("upstream Responses error body is unavailable")
+		return upstreamErrorClassifiers{}, fmt.Errorf("upstream Responses error body is unavailable")
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, responsesChatMaxErrorBodyBytes+1))
 	_ = resp.Body.Close()
 	if err != nil {
-		return fmt.Errorf("read upstream Responses error body: %w", err)
+		return upstreamErrorClassifiers{}, fmt.Errorf("read upstream Responses error body: %w", err)
 	}
 	if len(body) > responsesChatMaxErrorBodyBytes {
 		body = body[:responsesChatMaxErrorBodyBytes]
 	}
+	classifiers := safeUpstreamErrorClassifiers(resp.StatusCode, body)
 	details := parseResponsesChatErrorDetails(resp.StatusCode, body)
 	envelope, err := json.Marshal(map[string]any{"error": map[string]any{
 		"message": details.message,
@@ -336,7 +387,7 @@ func canonicalizeResponsesChatHTTPError(resp *http.Response, safeHeaders http.He
 		"code":    details.code,
 	}})
 	if err != nil {
-		return fmt.Errorf("marshal canonical upstream error: %w", err)
+		return upstreamErrorClassifiers{}, fmt.Errorf("marshal canonical upstream error: %w", err)
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(envelope))
 	resp.Header = safeHeaders.Clone()
@@ -346,7 +397,7 @@ func canonicalizeResponsesChatHTTPError(resp *http.Response, safeHeaders http.He
 	resp.Header.Set("Content-Type", "application/json")
 	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(envelope)))
 	resp.ContentLength = int64(len(envelope))
-	return nil
+	return classifiers, nil
 }
 
 func openAIErrorTypeForHTTPStatus(status int) string {
@@ -505,7 +556,23 @@ func chatExecutionErrorFromStreamTermination(err error) *chatExecutionError {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &chatExecutionError{StatusCode: http.StatusGatewayTimeout, Type: "server_error", Code: "gateway_timeout", Message: "upstream Responses stream timed out"}
 	}
-	return &chatExecutionError{StatusCode: http.StatusBadGateway, Type: "server_error", Code: "responses_stream_failed", Message: err.Error()}
+	return &chatExecutionError{StatusCode: http.StatusBadGateway, Type: "server_error", Code: "responses_stream_failed", Message: err.Error(), upstreamAuthored: true}
+}
+
+// Same as newChatInvalidRequest for a field the CLIENT named. The client-facing Param keeps
+// the full path -- they already know their own key -- but the summary records only
+// parentParam, which vekil built. Splitting the joined path on its last dot at log time does
+// NOT work: a JSON key may itself contain dots, so "metadata.customer_ssn.value" is
+// indistinguishable from a genuine two-level path and half the key survives.
+func newChatInvalidRequestClientField(parentParam, clientField, message string) *chatExecutionError {
+	param := clientField
+	if parentParam != "" {
+		param = parentParam + "." + clientField
+	}
+	err := newChatInvalidRequest(param, message)
+	err.clientDerived = true
+	err.safeParam = parentParam
+	return err
 }
 
 func attachChatExecutionErrorUsage(err error, usage *models.OpenAIUsage) {

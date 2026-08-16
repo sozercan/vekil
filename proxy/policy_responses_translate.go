@@ -385,7 +385,7 @@ func validatePolicyResponsesTopLevel(root map[string]json.RawMessage) error {
 		return nil
 	}
 	sort.Strings(unknown)
-	return newChatInvalidRequest(unknown[0], "unsupported JSON field")
+	return newChatInvalidRequestClientField("", unknown[0], "unsupported JSON field")
 }
 
 func validatePolicyResponsesStore(root map[string]json.RawMessage) error {
@@ -457,14 +457,14 @@ func validatePolicyResponsesMetadataObject(raw json.RawMessage, param string) er
 	}
 	for key, valueRaw := range object {
 		if len(key) == 0 || len(key) > policyResponsesMaxMetadataKeyLen {
-			return newChatInvalidRequest(param+"."+key, "metadata key is empty or too long")
+			return newChatInvalidRequestClientField(param, key, "metadata key is empty or too long")
 		}
 		var value string
 		if bytes.Equal(bytes.TrimSpace(valueRaw), []byte("null")) {
-			return newChatInvalidRequest(param+"."+key, "metadata values must be bounded strings")
+			return newChatInvalidRequestClientField(param, key, "metadata values must be bounded strings")
 		}
 		if err := json.Unmarshal(valueRaw, &value); err != nil || len(value) > policyResponsesMaxMetadataValue {
-			return newChatInvalidRequest(param+"."+key, "metadata values must be bounded strings")
+			return newChatInvalidRequestClientField(param, key, "metadata values must be bounded strings")
 		}
 	}
 	return nil
@@ -1287,7 +1287,7 @@ func validatePolicyResponsesObjectFields(object map[string]json.RawMessage, para
 		return nil
 	}
 	sort.Strings(unknown)
-	return newChatInvalidRequest(param+"."+unknown[0], "unsupported JSON field")
+	return newChatInvalidRequestClientField(param, unknown[0], "unsupported JSON field")
 }
 
 func prefixPolicyResponsesError(err error, prefix string) error {
@@ -1321,13 +1321,23 @@ func validatePolicyResponsesJSON(body []byte) error {
 	return nil
 }
 
+// Every segment walkPolicyResponsesJSON reports is a key from the CLIENT's own JSON -- it
+// walks the request body, so nothing in the path is vekil's to log, not even the parts that
+// spell schema field names. A segment allowlist cannot see that: a key like "user[123456789]"
+// spells an owned root with a numeric subscript and passes on looks alone, which is how nine
+// client-chosen digits reached error_param. The client keeps the whole path, since they wrote
+// it; the summary gets none of it.
+func newPolicyResponsesJSONPathError(path, message string) *chatExecutionError {
+	return newChatInvalidRequestClientField("", path, message)
+}
+
 func walkPolicyResponsesJSON(decoder *json.Decoder, path string, depth int) error {
 	if depth > policyResponsesMaxJSONDepth {
-		return newChatInvalidRequest(path, fmt.Sprintf("JSON nesting exceeds %d levels", policyResponsesMaxJSONDepth))
+		return newPolicyResponsesJSONPathError(path, fmt.Sprintf("JSON nesting exceeds %d levels", policyResponsesMaxJSONDepth))
 	}
 	token, err := decoder.Token()
 	if err != nil {
-		return newChatInvalidRequest(path, "invalid JSON in request body")
+		return newPolicyResponsesJSONPathError(path, "invalid JSON in request body")
 	}
 	delimiter, ok := token.(json.Delim)
 	if !ok {
@@ -1339,18 +1349,18 @@ func walkPolicyResponsesJSON(decoder *json.Decoder, path string, depth int) erro
 		for decoder.More() {
 			keyToken, err := decoder.Token()
 			if err != nil {
-				return newChatInvalidRequest(path, "invalid JSON object")
+				return newPolicyResponsesJSONPathError(path, "invalid JSON object")
 			}
 			key, ok := keyToken.(string)
 			if !ok {
-				return newChatInvalidRequest(path, "invalid JSON object key")
+				return newPolicyResponsesJSONPathError(path, "invalid JSON object key")
 			}
 			fieldPath := key
 			if path != "" {
 				fieldPath = path + "." + key
 			}
 			if _, duplicate := seen[key]; duplicate {
-				return newChatInvalidRequest(fieldPath, "duplicate JSON field")
+				return newPolicyResponsesJSONPathError(fieldPath, "duplicate JSON field")
 			}
 			seen[key] = struct{}{}
 			if err := walkPolicyResponsesJSON(decoder, fieldPath, depth+1); err != nil {
@@ -1359,7 +1369,7 @@ func walkPolicyResponsesJSON(decoder *json.Decoder, path string, depth int) erro
 		}
 		end, err := decoder.Token()
 		if err != nil || end != json.Delim('}') {
-			return newChatInvalidRequest(path, "invalid JSON object")
+			return newPolicyResponsesJSONPathError(path, "invalid JSON object")
 		}
 	case '[':
 		index := 0
@@ -1375,10 +1385,10 @@ func walkPolicyResponsesJSON(decoder *json.Decoder, path string, depth int) erro
 		}
 		end, err := decoder.Token()
 		if err != nil || end != json.Delim(']') {
-			return newChatInvalidRequest(path, "invalid JSON array")
+			return newPolicyResponsesJSONPathError(path, "invalid JSON array")
 		}
 	default:
-		return newChatInvalidRequest(path, "invalid JSON delimiter")
+		return newPolicyResponsesJSONPathError(path, "invalid JSON delimiter")
 	}
 	return nil
 }

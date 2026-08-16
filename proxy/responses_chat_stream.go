@@ -1241,7 +1241,7 @@ func parseResponsesChatTopLevelError(data []byte) *chatExecutionError {
 	if message == "" {
 		message = "upstream Responses stream reported an error"
 	}
-	return &chatExecutionError{StatusCode: status, Type: errorType, Code: code, Param: param, Message: message}
+	return &chatExecutionError{StatusCode: status, Type: errorType, Code: code, Param: param, Message: message, upstreamAuthored: true}
 }
 
 func (s *responsesChatStreamState) handleFailed(data []byte) (responsesChatStreamTransition, error) {

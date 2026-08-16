@@ -210,6 +210,9 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		if resp.StatusCode != http.StatusOK {
 			defer func() { _ = resp.Body.Close() }()
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			// A native Chat route never reaches canonicalizeResponsesChatHTTPError, so
+			// result.upstreamError is empty and this body is the only thing that says why.
+			observeUpstreamErrorDetail(r.Context(), resp.StatusCode, errBody)
 			detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
 			h.log.Error("upstream error",
 				logger.F("endpoint", "gemini"),
@@ -277,6 +280,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	result, oaiBody, mode = h.retryChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, oaiBody, mode)
 	observeChatExecutionRoute(r.Context(), result)
+	observeUpstreamErrorClassifiers(r.Context(), result.upstreamError)
 	observeUpstreamHeaders(r.Context(), result.Headers)
 	if result.Backend == chatBackendResponses && len(result.Headers) > 0 {
 		mergeHeaderValues(w.Header(), result.Headers)
@@ -286,6 +290,10 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		resp := result.Response
 		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		// Same gap as the branch above: observeUpstreamErrorClassifiers already ran, but a
+		// native Chat route left it nothing to record. setErrorDetail is first-wins, so a
+		// Responses-backed route that already classified keeps what it had.
+		observeUpstreamErrorDetail(r.Context(), resp.StatusCode, errBody)
 		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
 		h.log.Error("upstream error",
 			logger.F("endpoint", "gemini"),
@@ -330,6 +338,12 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 				status = streamErr.StatusCode
 				message = streamErr.Message
 				observeOpenAIUsage(r.Context(), streamErr.Usage)
+				// Usage and status alone left a `response.failed` here logging
+				// stats_status with no error_type/code/param, while the OpenAI and
+				// Anthropic stream paths recorded all three. setErrorDetail is
+				// first-wins, so observing here cannot clobber a classifier the
+				// upstream boundary already recorded.
+				observeChatExecutionError(r.Context(), streamErr)
 			} else {
 				var nativeStreamErr *openAIStreamError
 				if errors.As(aggregateErr, &nativeStreamErr) {
@@ -368,8 +382,10 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		if errors.As(err, &streamErr) {
 			observeOpenAIUsage(r.Context(), streamErr.Usage)
 			observeResponseFailureStatus(r.Context(), chatStreamErrorStatus(streamErr))
+			observeChatExecutionError(r.Context(), streamErr)
 		} else if terminalErr := chatExecutionErrorFromStreamTermination(err); terminalErr != nil {
 			observeResponseFailureStatus(r.Context(), terminalErr.StatusCode)
+			observeChatExecutionError(r.Context(), terminalErr)
 			_ = writeGeminiSSEData(tracked, models.GeminiErrorResponse{Error: models.GeminiError{Code: terminalErr.StatusCode, Message: terminalErr.Message, Status: mapGeminiUpstreamStatus(terminalErr.StatusCode)}})
 		}
 		return

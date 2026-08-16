@@ -506,8 +506,9 @@ func mapResponsesChatReplayResolveError(err error) error {
 	return replayChatExecutionError(responsesChatReplayProjectionCode, responsesChatReplayProjectionMessage)
 }
 
+// Every caller passes a package constant, so the message is vekil's own diagnosis.
 func replayChatExecutionError(code, message string) *chatExecutionError {
-	return &chatExecutionError{StatusCode: http.StatusBadRequest, Type: "invalid_request_error", Code: code, Param: "messages", Message: message}
+	return &chatExecutionError{StatusCode: http.StatusBadRequest, Type: "invalid_request_error", Code: code, Param: "messages", Message: message, staticMessage: true}
 }
 
 func translateChatAssistantRefusal(raw json.RawMessage, messageIndex int) (string, error) {
@@ -696,11 +697,12 @@ func compactChatToolOutput(raw json.RawMessage, messageIndex int) (string, error
 
 func missingResponsesChatReplayError() *chatExecutionError {
 	return &chatExecutionError{
-		StatusCode: http.StatusBadRequest,
-		Type:       "invalid_request_error",
-		Code:       "responses_replay_state_missing",
-		Param:      "messages",
-		Message:    "Responses-backed tool state is no longer available; restart the assistant tool-call turn.",
+		StatusCode:    http.StatusBadRequest,
+		Type:          "invalid_request_error",
+		Code:          "responses_replay_state_missing",
+		Param:         "messages",
+		Message:       "Responses-backed tool state is no longer available; restart the assistant tool-call turn.",
+		staticMessage: true,
 	}
 }
 
@@ -815,7 +817,7 @@ func parseChatStreamOptions(raw map[string]json.RawMessage) (bool, error) {
 	}
 	for field := range options {
 		if field != "include_usage" {
-			return false, newChatInvalidRequest("stream_options."+field, "unsupported stream option")
+			return false, newChatInvalidRequestClientField("stream_options", field, "unsupported stream option")
 		}
 	}
 	include := false
@@ -1138,7 +1140,9 @@ func validateChatResponsesTopLevel(raw map[string]json.RawMessage) error {
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
 		field := unknown[0]
-		return newChatInvalidRequest(field, field+" is not supported for Responses-backed Chat completions")
+		// field is the CLIENT's own unknown key, not a name vekil chose; the top level is its
+		// only trusted parent and there is nothing above that, so nothing of it is loggable.
+		return newChatInvalidRequestClientField("", field, field+" is not supported for Responses-backed Chat completions")
 	}
 	if stop, ok := raw["stop"]; ok {
 		empty, err := emptyChatStop(stop)
