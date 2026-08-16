@@ -112,17 +112,39 @@ Additional rules:
 
 ### Responses-backed tool continuation
 
-Function calls returned through the adapter use opaque IDs shaped as:
+Function calls returned through the adapter use IDs shaped as one of:
 
 ```text
-call_vekil_<22-character-base64url>
+call_vekil_<upstream-call-id>        # self-describing; total length never exceeds 64
+call_vekil_<22-character-base64url>  # legacy, and the fallback when the upstream ID cannot be embedded
 ```
 
-Clients must return these IDs unchanged. They are keys into process-local replay state that retains the exact hidden Responses output needed for tool continuation; upstream `call_id` values are never exposed as the authorization key.
+Clients must return these IDs unchanged. The self-describing form embeds the upstream `call_id`,
+so it is deliberately not opaque: the mapping travels inside the ID the client already echoes and
+resolves by stripping the prefix, with no server-side lookup. It is not an authorization key.
+Restoring the hidden Responses output still requires the process-local replay state or a valid
+reasoning carrier; an ID on its own can only rebuild the turn from the transcript the client itself
+sent. **The carrier is a client obligation, not just the ID.** On `/v1/messages` the reasoning rides
+in the `signature` of an assistant `thinking` block whose text is empty; a client that keeps tool-call
+IDs but drops that block, or rewrites its signature, loses reasoning continuity silently and the turn
+degrades. Return assistant `thinking` blocks in history unchanged, signature included. That ID-only rebuild is opt-in per surface, and only `/v1/messages` and the Anthropic
+count-token probe opt in: on `/v1/chat/completions` and `/v1/responses`, a self-describing ID whose
+replay state is gone still fails with `responses_replay_state_missing`, because a native Chat client
+owns its history and can repair it. Surface is not the only axis: a **policy profile** continuation
+fails on any surface once the originating process is gone, including `/v1/messages`. Its tier is
+recovered from a carrier tag keyed per process, so after a restart or on another replica no tier can
+be selected and the planner returns `responses_replay_state_missing` before the Anthropic rebuild is
+reached. The ID-only rebuild is therefore a direct-route behaviour. The legacy form carries no such
+mapping on any surface, so
+without that replay state its upstream call ID is not recovered at all. The turn is not lost on
+the surfaces that opt in: Anthropic ingress still degrades it, rebuilding from the transcript and
+forwarding the proxy `call_vekil_...` ID upstream as the `call_id`. That is sound only because the
+whole turn is replayed in one request with `store: false`, so a `call_id` needs to agree with its
+own `function_call_output` and nothing else. The other surfaces return the missing-state error.
 
 For a parallel call group, the assistant `tool_calls` projection must remain complete and in its original order. A complete set of tool-result messages may arrive in any order. If only a non-empty subset of results is available, Vekil replays only the matching prior function calls plus their outputs; this partial projection is required because the verified Responses backend rejected a complete parallel call group paired with only partial outputs. The missing calls may consequently be reissued by the model.
 
-Replay state has an absolute one-hour lifetime and is bounded to 2,048 groups, 2 MiB per group, 64 MiB total, 256 output items per group, and 128 calls per group, with LRU eviction under group/byte pressure. It is memory-only and is lost on restart. Expired, evicted, forged, cross-route, or post-restart `call_vekil_...` IDs fail locally with:
+Replay state has an absolute one-hour lifetime and is bounded to 2,048 groups, 2 MiB per group, 64 MiB total, 256 output items per group, and 128 calls per group, with LRU eviction under group/byte pressure. It is memory-only and is lost on restart. On the surfaces that do not opt into degradation -- `/v1/chat/completions` and `/v1/responses` -- an expired, evicted, forged, cross-route, or post-restart `call_vekil_...` ID fails locally with:
 
 ```text
 HTTP 400
