@@ -1,5 +1,5 @@
-// Package auth implements GitHub OAuth device code flow authentication
-// and Copilot API token management with automatic caching and refresh.
+// Package auth implements GitHub OAuth device code flow authentication and
+// resolves GitHub credentials into Copilot API bearers.
 package auth
 
 import (
@@ -25,9 +25,8 @@ const (
 	deviceCodeURL       = "https://github.com/login/device/code"
 	accessTokenURL      = "https://github.com/login/oauth/access_token"
 	copilotTokenURL     = "https://api.github.com/copilot_internal/v2/token"
-	copilotUserURL      = "https://api.github.com/copilot_internal/user"
 	defaultTokenDir     = "~/.config/vekil"
-	githubCLITokenTTL   = 15 * time.Minute
+	directBearerTTL     = 15 * time.Minute
 	signedOutMarkerFile = "signed-out"
 	authPreferencesFile = "auth-preferences.json"
 )
@@ -37,6 +36,12 @@ var accessTokenEnvVars = []string{
 }
 
 var (
+	supportedCopilotBearerPrefixes = [...]string{
+		"gho_",
+		"ghu_",
+		"github_pat_",
+	}
+
 	githubCLITokenTimeout = 5 * time.Second
 
 	githubCLICommonPaths = []string{
@@ -50,12 +55,12 @@ var (
 	ErrNotAuthenticated = errors.New("not authenticated")
 
 	// ErrInvalidAccessToken indicates that a stored GitHub access token exists
-	// but can no longer be exchanged for a Copilot token.
+	// but can no longer be used for Copilot authentication.
 	ErrInvalidAccessToken = errors.New("invalid access token")
 )
 
-// Authenticator manages GitHub OAuth and Copilot API tokens.
-// It handles the device code flow, token caching to disk, and shared automatic
+// Authenticator manages GitHub OAuth credentials and Copilot API bearers. It
+// handles the device code flow, legacy token-cache migration, and shared
 // refreshes whose waiters can stop independently when their contexts expire.
 type Authenticator struct {
 	tokenDir     string
@@ -82,7 +87,7 @@ type Authenticator struct {
 
 	client         *http.Client
 	directClient   *http.Client
-	copilotBaseURL string // overridable for tests; defaults to https://api.github.com
+	copilotBaseURL string // legacy exchange base override for tests; defaults to https://api.github.com
 	githubCLIPath  string // optional override for tests; defaults to gh lookup/common paths
 
 	// DisableAutoDeviceFlow prevents refreshToken from falling through to the
@@ -124,23 +129,11 @@ type AccessTokenResponse struct {
 	ErrorDescription string `json:"error_description,omitempty"`
 }
 
-// CopilotTokenResponse is the response from the Copilot token exchange endpoint.
+// CopilotTokenResponse is the response from the legacy Copilot token exchange
+// endpoint and the on-disk format of the legacy bearer cache.
 type CopilotTokenResponse struct {
 	Token        string `json:"token"`
 	ExpiresAt    int64  `json:"expires_at"`
-	ErrorDetails string `json:"error_details,omitempty"`
-}
-
-// CopilotUserResponse is the response from the Copilot user endpoint used to
-// validate GitHub CLI tokens. Only the fields needed for validation are modeled.
-type CopilotUserResponse struct {
-	Login       string `json:"login,omitempty"`
-	ChatEnabled *bool  `json:"chat_enabled,omitempty"`
-}
-
-type githubAPIErrorResponse struct {
-	Message      string `json:"message,omitempty"`
-	Status       string `json:"status,omitempty"`
 	ErrorDetails string `json:"error_details,omitempty"`
 }
 
@@ -285,7 +278,7 @@ func (a *Authenticator) hasValidCopilotTokenOnDisk() bool {
 	return ctResp.Token != "" && time.Now().Unix() < ctResp.ExpiresAt-300
 }
 
-// GetToken returns a valid Copilot API token, refreshing it if necessary.
+// GetToken returns a usable Copilot API bearer, refreshing it if necessary.
 // It is safe for concurrent use.
 func (a *Authenticator) GetToken(ctx context.Context) (string, error) {
 	return a.getToken(ctx, !a.DisableAutoDeviceFlow)
@@ -297,10 +290,9 @@ func (a *Authenticator) GetTokenNonInteractive(ctx context.Context) (string, err
 	return a.getToken(ctx, false)
 }
 
-// RefreshTokenNonInteractive refreshes the Copilot API token using existing
-// GitHub authentication without falling back to the interactive device-code
-// flow. Unlike GetTokenNonInteractive, it bypasses any cached Copilot token so
-// callers can verify that the underlying GitHub auth is still refreshable.
+// RefreshTokenNonInteractive reloads existing GitHub authentication without
+// falling back to the interactive device-code flow. Unlike
+// GetTokenNonInteractive, it bypasses any cached Copilot bearer.
 func (a *Authenticator) RefreshTokenNonInteractive(ctx context.Context) (string, error) {
 	envToken, _ := lookupAccessTokenFromEnv()
 	return a.runSharedRefresh(ctx, envToken, true)
@@ -607,10 +599,8 @@ func (a *Authenticator) performRefresh(ctx context.Context, envToken string, for
 			a.copilotToken = ""
 			a.tokenExpiry = time.Time{}
 		}
-		if err := a.exchangeForCopilotToken(ctx); err != nil {
-			if bearerErr := a.useEnvAccessTokenAsBearer(ctx, envToken); bearerErr != nil {
-				return "", err
-			}
+		if err := a.useGitHubCredential(ctx, envToken, true); err != nil {
+			return "", err
 		}
 		return a.copilotToken, nil
 	}
@@ -621,41 +611,46 @@ func (a *Authenticator) performRefresh(ctx context.Context, envToken string, for
 	return a.copilotToken, nil
 }
 
-// useEnvAccessTokenAsBearer accepts environment-provided tokens that the
-// Copilot API takes directly as bearer tokens — for example fine-grained
-// personal access tokens with the Copilot Requests permission — but that the
-// legacy Copilot token exchange endpoint rejects with 404. Like GitHub CLI
-// tokens, they are validated against the Copilot user endpoint, kept in memory
-// only, never written to the Copilot token cache, and revalidated on the
-// normal refresh cadence.
-func (a *Authenticator) useEnvAccessTokenAsBearer(ctx context.Context, envToken string) error {
-	if err := a.validateGitHubCLIToken(ctx, envToken); err != nil {
-		return err
-	}
+// useGitHubCredential keeps supported GitHub credentials on the direct path
+// while preserving the legacy exchange for unrecognized older credentials.
+func (a *Authenticator) useGitHubCredential(ctx context.Context, accessToken string, persistLegacyToken bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	a.copilotToken = envToken
-	a.tokenExpiry = time.Now().Add(githubCLITokenTTL)
-	return nil
+
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return ErrNotAuthenticated
+	}
+	if isSupportedCopilotBearer(accessToken) {
+		a.copilotToken = accessToken
+		a.tokenExpiry = time.Now().Add(directBearerTTL)
+		return nil
+	}
+
+	return a.exchangeLegacyCopilotToken(ctx, accessToken, persistLegacyToken)
+}
+
+func isSupportedCopilotBearer(token string) bool {
+	for _, prefix := range supportedCopilotBearerPrefixes {
+		if strings.HasPrefix(token, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) error {
 	if envToken, _ := lookupAccessTokenFromEnv(); envToken != "" {
 		a.accessToken = envToken
-		if err := a.exchangeForCopilotToken(ctx); err != nil {
-			if bearerErr := a.useEnvAccessTokenAsBearer(ctx, envToken); bearerErr != nil {
-				return err
-			}
-		}
-		return nil
+		return a.useGitHubCredential(ctx, envToken, true)
 	}
 
 	currentAccessToken := a.accessToken
 	var refreshErr error
 
 	if currentAccessToken != "" {
-		if err := a.exchangeForCopilotToken(ctx); err == nil {
+		if err := a.useGitHubCredential(ctx, currentAccessToken, true); err == nil {
 			return nil
 		} else {
 			refreshErr = err
@@ -664,7 +659,7 @@ func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) 
 
 	if err := a.loadAccessToken(); err == nil {
 		if a.accessToken != currentAccessToken || currentAccessToken == "" {
-			if err := a.exchangeForCopilotToken(ctx); err == nil {
+			if err := a.useGitHubCredential(ctx, a.accessToken, true); err == nil {
 				return nil
 			} else {
 				refreshErr = err
@@ -833,7 +828,7 @@ func (a *Authenticator) completeDeviceAuthorization(ctx context.Context, accessT
 	if err := a.saveAccessToken(); err != nil {
 		return fmt.Errorf("saving access token: %w", err)
 	}
-	if err := a.exchangeForCopilotToken(ctx); err != nil {
+	if err := a.useGitHubCredential(ctx, accessToken, true); err != nil {
 		return err
 	}
 	if err := a.clearSignedOutMarker(); err != nil {
@@ -947,20 +942,13 @@ func (a *Authenticator) getCopilotTokenURL() string {
 	return copilotTokenURL
 }
 
-func (a *Authenticator) getCopilotUserURL() string {
-	if a.copilotBaseURL != "" {
-		return a.copilotBaseURL + "/copilot_internal/user"
-	}
-	return copilotUserURL
-}
-
 func (a *Authenticator) useGitHubCLICopilotToken(ctx context.Context) error {
 	accessToken, err := a.gitHubCLIAccessToken(ctx)
 	if err != nil {
 		return err
 	}
 
-	if err := a.validateGitHubCLIToken(ctx, accessToken); err != nil {
+	if err := a.useGitHubCredential(ctx, accessToken, false); err != nil {
 		return err
 	}
 
@@ -968,81 +956,19 @@ func (a *Authenticator) useGitHubCLICopilotToken(ctx context.Context) error {
 		return err
 	}
 
-	// GitHub CLI OAuth tokens are accepted directly by the Copilot API as bearer
-	// tokens. Keep them in memory only: do not persist them as Vekil-managed
-	// GitHub access tokens, do not write them to the Copilot token cache, and do
-	// not feed them through the legacy Copilot token exchange endpoint. Some
-	// GitHub CLI OAuth tokens can validate against Copilot but return 404 from
-	// that exchange.
+	// GitHub CLI credentials stay in memory only. Supported GitHub credential
+	// types are used directly; unknown legacy credentials may still use the
+	// exchange fallback, but its result is not persisted for this source.
 	a.accessToken = ""
-	a.copilotToken = accessToken
-	a.tokenExpiry = time.Now().Add(githubCLITokenTTL)
 	return nil
 }
 
-func (a *Authenticator) validateGitHubCLIToken(ctx context.Context, accessToken string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.getCopilotUserURL(), nil)
-	if err != nil {
-		return fmt.Errorf("creating copilot user request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "GitHubCopilotChat/0.26.7")
-
-	resp, err := a.do(req)
-	if err != nil {
-		return fmt.Errorf("validating github cli copilot access: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		detail := readGitHubAPIErrorDetail(resp.Body)
-		if detail != "" {
-			detail = ": " + detail
-		}
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
-			return fmt.Errorf("%w: github cli token cannot access Copilot (status %d%s)", ErrInvalidAccessToken, resp.StatusCode, detail)
-		}
-		return fmt.Errorf("github cli copilot validation failed with status %d%s", resp.StatusCode, detail)
-	}
-
-	var user CopilotUserResponse
-	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
-		return fmt.Errorf("decoding copilot user response: %w", err)
-	}
-	if user.ChatEnabled != nil && !*user.ChatEnabled {
-		return fmt.Errorf("%w: github cli account does not have Copilot Chat enabled", ErrInvalidAccessToken)
-	}
-	return nil
-}
-
-func readGitHubAPIErrorDetail(body io.Reader) string {
-	data, err := io.ReadAll(io.LimitReader(body, 4096))
-	if err != nil {
-		return ""
-	}
-	text := strings.TrimSpace(string(data))
-	if text == "" {
-		return ""
-	}
-
-	var apiErr githubAPIErrorResponse
-	if err := json.Unmarshal(data, &apiErr); err == nil {
-		for _, detail := range []string{apiErr.ErrorDetails, apiErr.Message, apiErr.Status} {
-			if strings.TrimSpace(detail) != "" {
-				return strings.TrimSpace(detail)
-			}
-		}
-	}
-	return text
-}
-
-func (a *Authenticator) exchangeForCopilotToken(ctx context.Context) error {
+func (a *Authenticator) exchangeLegacyCopilotToken(ctx context.Context, accessToken string, persist bool) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.getCopilotTokenURL(), nil)
 	if err != nil {
 		return fmt.Errorf("creating copilot token request: %w", err)
 	}
-	req.Header.Set("Authorization", "token "+a.accessToken)
+	req.Header.Set("Authorization", "token "+accessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "GitHubCopilotChat/0.26.7")
 
@@ -1082,8 +1008,10 @@ func (a *Authenticator) exchangeForCopilotToken(ctx context.Context) error {
 	a.copilotToken = ctResp.Token
 	a.tokenExpiry = time.Unix(ctResp.ExpiresAt-300, 0)
 
-	if err := a.saveCopilotToken(); err != nil {
-		return fmt.Errorf("saving copilot token: %w", err)
+	if persist {
+		if err := a.saveCopilotToken(); err != nil {
+			return fmt.Errorf("saving copilot token: %w", err)
+		}
 	}
 	return nil
 }

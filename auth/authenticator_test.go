@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -72,6 +71,9 @@ func TestGetToken_LoadsPersistedCopilotToken(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), data, 0o600); err != nil {
 		t.Fatalf("write token file: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("ghu_migration-token"), 0o600); err != nil {
+		t.Fatalf("write access token: %v", err)
+	}
 
 	a := &Authenticator{tokenDir: dir}
 
@@ -85,16 +87,10 @@ func TestGetToken_LoadsPersistedCopilotToken(t *testing.T) {
 }
 
 func TestGetToken_EnvAccessTokenOverridesPersistedState(t *testing.T) {
-	t.Setenv("COPILOT_GITHUB_TOKEN", "env-access-token")
+	t.Setenv("COPILOT_GITHUB_TOKEN", "ghu_env-access-token")
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "token env-access-token" {
-			t.Errorf("expected 'token env-access-token', got %q", got)
-		}
-		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
-			Token:     "env-copilot-token",
-			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
-		})
+		t.Fatalf("supported environment credential unexpectedly called %s", r.URL.Path)
 	}))
 	defer server.Close()
 
@@ -123,21 +119,18 @@ func TestGetToken_EnvAccessTokenOverridesPersistedState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if token != "env-copilot-token" {
-		t.Errorf("expected env-copilot-token, got %q", token)
+	if token != "ghu_env-access-token" {
+		t.Errorf("expected direct environment credential, got %q", token)
 	}
 }
 
 func TestGetToken_EnvAccessTokenCachesInMemory(t *testing.T) {
-	t.Setenv("COPILOT_GITHUB_TOKEN", "env-access-token")
+	t.Setenv("COPILOT_GITHUB_TOKEN", "gho_env-access-token")
 
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
-			Token:     "env-copilot-token",
-			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
-		})
+		t.Fatalf("supported environment credential unexpectedly called %s", r.URL.Path)
 	}))
 	defer server.Close()
 
@@ -152,16 +145,16 @@ func TestGetToken_EnvAccessTokenCachesInMemory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if token != "env-copilot-token" {
-			t.Errorf("expected env-copilot-token, got %q", token)
+		if token != "gho_env-access-token" {
+			t.Errorf("expected direct environment credential, got %q", token)
 		}
 	}
-	if calls != 1 {
-		t.Fatalf("expected exactly 1 token exchange, got %d", calls)
+	if calls != 0 {
+		t.Fatalf("expected no auth-plane requests, got %d", calls)
 	}
 }
 
-func TestGetToken_EnvAccessTokenFallsBackToDirectBearer(t *testing.T) {
+func TestGetToken_FineGrainedPATUsesDirectBearer(t *testing.T) {
 	t.Setenv("COPILOT_GITHUB_TOKEN", "github_pat_fine_grained")
 
 	var exchangeCalls, userCalls int
@@ -198,13 +191,52 @@ func TestGetToken_EnvAccessTokenFallsBackToDirectBearer(t *testing.T) {
 	if token != "github_pat_fine_grained" {
 		t.Errorf("expected the env token used as a direct bearer, got %q", token)
 	}
-	if exchangeCalls != 1 || userCalls != 1 {
-		t.Fatalf("exchange calls = %d, user validation calls = %d, want 1 and 1", exchangeCalls, userCalls)
+	if exchangeCalls != 0 || userCalls != 0 {
+		t.Fatalf("exchange calls = %d, user validation calls = %d, want 0 and 0", exchangeCalls, userCalls)
 	}
 }
 
-func TestGetToken_EnvAccessTokenBearerRejectionKeepsExchangeError(t *testing.T) {
-	t.Setenv("COPILOT_GITHUB_TOKEN", "rejected-token")
+func TestGetToken_SupportedEnvAccessTokensUseDirectBearer(t *testing.T) {
+	tests := map[string]string{
+		"oauth":    "gho_oauth-token",
+		"app-user": "ghu_user-token",
+	}
+	for name, accessToken := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("COPILOT_GITHUB_TOKEN", accessToken)
+			tokenDir := t.TempDir()
+			a := &Authenticator{
+				tokenDir: tokenDir,
+				client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					t.Fatalf("supported credential unexpectedly called %s", req.URL)
+					return nil, nil
+				})},
+			}
+
+			token, err := a.GetToken(context.Background())
+			if err != nil {
+				t.Fatalf("GetToken() error = %v", err)
+			}
+			if token != accessToken {
+				t.Fatalf("GetToken() = %q, want the original credential", token)
+			}
+			if a.accessToken != accessToken || a.copilotToken != accessToken {
+				t.Fatal("direct credential was not retained in memory")
+			}
+			if !a.tokenExpiry.After(time.Now()) {
+				t.Fatalf("direct bearer expiry = %v, want a future refresh deadline", a.tokenExpiry)
+			}
+			for _, filename := range []string{"access-token", "api-key.json"} {
+				if _, err := os.Stat(filepath.Join(tokenDir, filename)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("direct environment credential unexpectedly persisted %s: %v", filename, err)
+				}
+			}
+		})
+	}
+}
+
+func TestGetToken_UnsupportedEnvAccessTokenKeepsLegacyExchangeError(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "legacy-access-token")
 
 	var exchangeCalls, userCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -237,28 +269,58 @@ func TestGetToken_EnvAccessTokenBearerRejectionKeepsExchangeError(t *testing.T) 
 	if got, want := err.Error(), "copilot token request failed with status 404: exchange rejected"; got != want {
 		t.Fatalf("GetToken() error = %q, want %q", got, want)
 	}
-	if exchangeCalls != 1 || userCalls != 1 {
-		t.Fatalf("exchange calls = %d, user validation calls = %d, want 1 and 1", exchangeCalls, userCalls)
+	if exchangeCalls != 1 || userCalls != 0 {
+		t.Fatalf("exchange calls = %d, user validation calls = %d, want 1 and 0", exchangeCalls, userCalls)
 	}
 }
 
-func TestUseEnvAccessTokenAsBearer_CanceledAfterValidationDoesNotCommit(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	previousExpiry := time.Now().Add(time.Hour)
+func TestGetToken_LegacyEnvCredentialUsesExchangeFallback(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "ghp_legacy-token")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/copilot_internal/v2/token" {
+			t.Fatalf("legacy credential request path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "token ghp_legacy-token" {
+			t.Fatalf("legacy credential authorization = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			Token:     "legacy-copilot-token",
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+	}))
+	defer server.Close()
+
+	tokenDir := t.TempDir()
 	a := &Authenticator{
-		copilotToken:   "previous-token",
-		tokenExpiry:    previousExpiry,
-		copilotBaseURL: "http://copilot.test",
-		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       &cancelAfterJSONReadCloser{cancel: cancel},
-			}, nil
-		})},
+		tokenDir:       tokenDir,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
 	}
 
-	if err := a.useEnvAccessTokenAsBearer(ctx, "environment-token"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("useEnvAccessTokenAsBearer() error = %v, want context.Canceled", err)
+	token, err := a.GetToken(context.Background())
+	if err != nil {
+		t.Fatalf("GetToken() error = %v", err)
+	}
+	if token != "legacy-copilot-token" {
+		t.Fatalf("GetToken() = %q, want legacy-copilot-token", token)
+	}
+	if _, err := os.Stat(filepath.Join(tokenDir, "api-key.json")); err != nil {
+		t.Fatalf("legacy exchange did not persist its cache: %v", err)
+	}
+}
+
+func TestUseGitHubCredential_CanceledDoesNotCommit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	previousExpiry := time.Now().Add(time.Hour)
+	a := &Authenticator{
+		copilotToken: "previous-token",
+		tokenExpiry:  previousExpiry,
+	}
+
+	if err := a.useGitHubCredential(ctx, "ghu_environment-token", true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("useGitHubCredential() error = %v, want context.Canceled", err)
 	}
 	if a.copilotToken != "previous-token" {
 		t.Fatalf("copilot token = %q, want previous-token", a.copilotToken)
@@ -373,7 +435,7 @@ func TestGetTokenNonInteractiveReturnsWhileDeviceFlowPending(t *testing.T) {
 	}
 }
 
-func TestExchangeForCopilotToken(t *testing.T) {
+func TestExchangeLegacyCopilotToken(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "token test-access" {
 			t.Errorf("expected 'token test-access', got %q", r.Header.Get("Authorization"))
@@ -387,13 +449,12 @@ func TestExchangeForCopilotToken(t *testing.T) {
 
 	dir := t.TempDir()
 	a := &Authenticator{
-		accessToken:    "test-access",
 		client:         server.Client(),
 		copilotBaseURL: server.URL,
 		tokenDir:       dir,
 	}
 
-	err := a.exchangeForCopilotToken(context.Background())
+	err := a.exchangeLegacyCopilotToken(context.Background(), "test-access", true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -402,7 +463,7 @@ func TestExchangeForCopilotToken(t *testing.T) {
 	}
 }
 
-func TestExchangeForCopilotToken_EmptyToken(t *testing.T) {
+func TestExchangeLegacyCopilotToken_EmptyToken(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
 			ErrorDetails: "invalid access token",
@@ -411,13 +472,12 @@ func TestExchangeForCopilotToken_EmptyToken(t *testing.T) {
 	defer server.Close()
 
 	a := &Authenticator{
-		accessToken:    "bad-token",
 		client:         server.Client(),
 		copilotBaseURL: server.URL,
 		tokenDir:       t.TempDir(),
 	}
 
-	err := a.exchangeForCopilotToken(context.Background())
+	err := a.exchangeLegacyCopilotToken(context.Background(), "bad-token", true)
 	if err == nil {
 		t.Fatal("expected error for empty copilot token")
 	}
@@ -459,6 +519,24 @@ func TestLookupAccessTokenFromEnv_UsesCopilotTokenVar(t *testing.T) {
 	}
 	if name != "COPILOT_GITHUB_TOKEN" {
 		t.Fatalf("expected COPILOT_GITHUB_TOKEN, got %q", name)
+	}
+}
+
+func TestIsSupportedCopilotBearer(t *testing.T) {
+	tests := map[string]bool{
+		"gho_oauth":          true,
+		"ghu_user":           true,
+		"github_pat_fine":    true,
+		"ghp_classic":        false,
+		"ghs_server":         false,
+		"legacy-token":       false,
+		"":                   false,
+		"GHU_not-normalized": false,
+	}
+	for token, want := range tests {
+		if got := isSupportedCopilotBearer(token); got != want {
+			t.Errorf("isSupportedCopilotBearer(%q) = %v, want %v", token, got, want)
+		}
 	}
 }
 
@@ -825,23 +903,6 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-type cancelAfterJSONReadCloser struct {
-	cancel context.CancelFunc
-	read   bool
-}
-
-func (r *cancelAfterJSONReadCloser) Read(p []byte) (int, error) {
-	if r.read {
-		return 0, io.EOF
-	}
-	r.read = true
-	n := copy(p, `{}`)
-	r.cancel()
-	return n, io.EOF
-}
-
-func (*cancelAfterJSONReadCloser) Close() error { return nil }
-
 func writeAuthPreferencesForTest(t *testing.T, dir string, enabled bool) {
 	t.Helper()
 	data, err := json.Marshal(AuthPreferences{GitHubCLIAutoSignIn: enabled})
@@ -1039,10 +1100,7 @@ func TestPollForAuthorization_Success(t *testing.T) {
 				})
 			}
 		case "/copilot_internal/v2/token":
-			_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
-				Token:     "copilot-tok-poll",
-				ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
-			})
+			t.Fatal("supported device credential unexpectedly used the legacy exchange")
 		default:
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
@@ -1076,8 +1134,8 @@ func TestPollForAuthorization_Success(t *testing.T) {
 	if a.accessToken != "ghu_success" {
 		t.Errorf("expected ghu_success, got %q", a.accessToken)
 	}
-	if a.copilotToken != "copilot-tok-poll" {
-		t.Errorf("expected copilot-tok-poll, got %q", a.copilotToken)
+	if a.copilotToken != "ghu_success" {
+		t.Errorf("expected direct ghu_success bearer, got %q", a.copilotToken)
 	}
 
 	// Verify access token was saved to disk
@@ -1087,6 +1145,9 @@ func TestPollForAuthorization_Success(t *testing.T) {
 	}
 	if string(data) != "ghu_success" {
 		t.Errorf("expected ghu_success on disk, got %q", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(dir, "api-key.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected no legacy Copilot token cache, got err=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, signedOutMarkerFile)); !os.IsNotExist(err) {
 		t.Fatalf("expected signed-out marker to be cleared, got err=%v", err)
@@ -1152,17 +1213,11 @@ func TestRefreshToken_DisableAutoDeviceFlow(t *testing.T) {
 	}
 }
 
-func TestRefreshToken_UsesEnvAccessTokenWithoutSavingAccessToken(t *testing.T) {
-	t.Setenv("COPILOT_GITHUB_TOKEN", "env-access-token")
+func TestRefreshToken_UsesSupportedEnvAccessTokenDirectly(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "gho_env-access-token")
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "token env-access-token" {
-			t.Errorf("expected 'token env-access-token', got %q", got)
-		}
-		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
-			Token:     "env-copilot-token",
-			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
-		})
+		t.Fatalf("supported environment credential unexpectedly called %s", r.URL.Path)
 	}))
 	defer server.Close()
 
@@ -1179,11 +1234,17 @@ func TestRefreshToken_UsesEnvAccessTokenWithoutSavingAccessToken(t *testing.T) {
 	if err := a.refreshToken(context.Background(), false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if a.accessToken != "env-access-token" {
+	if a.accessToken != "gho_env-access-token" {
 		t.Fatalf("expected access token to be loaded from env, got %q", a.accessToken)
+	}
+	if a.copilotToken != "gho_env-access-token" {
+		t.Fatalf("expected environment credential to be used directly, got %q", a.copilotToken)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "access-token")); !os.IsNotExist(err) {
 		t.Fatalf("expected no access-token file to be written, got err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "api-key.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected no legacy Copilot token cache, got err=%v", err)
 	}
 }
 
@@ -1197,7 +1258,7 @@ func TestRefreshTokenNonInteractive_MissingPreferenceSkipsGitHubCLI(t *testing.T
 	calledPath := filepath.Join(dir, "gh-called")
 	script := `#!/bin/sh
 printf 'called\n' > "$CALLED_FILE"
-printf 'gh-cli-access-token\n'
+printf 'gho_gh-cli-access-token\n'
 `
 	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
@@ -1238,7 +1299,7 @@ fi
 if [ "$GH_PROMPT_DISABLED" != "1" ]; then
   exit 4
 fi
-printf 'gh-cli-access-token\n'
+printf 'gho_gh-cli-access-token\n'
 `
 	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
@@ -1249,16 +1310,14 @@ printf 'gh-cli-access-token\n'
 
 	chatEnabled := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("supported GitHub CLI credential unexpectedly called %s", r.URL.Path)
 		if r.URL.Path != "/copilot_internal/user" {
 			t.Errorf("expected copilot user validation request, got %s", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer gh-cli-access-token" {
 			t.Errorf("expected 'Bearer gh-cli-access-token', got %q", got)
 		}
-		_ = json.NewEncoder(w).Encode(CopilotUserResponse{
-			Login:       "test-user",
-			ChatEnabled: &chatEnabled,
-		})
+		_ = json.NewEncoder(w).Encode(map[string]any{"chat_enabled": chatEnabled})
 	}))
 	defer server.Close()
 
@@ -1275,8 +1334,8 @@ printf 'gh-cli-access-token\n'
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if token != "gh-cli-access-token" {
-		t.Fatalf("expected gh-cli-access-token, got %q", token)
+	if token != "gho_gh-cli-access-token" {
+		t.Fatalf("expected direct GitHub CLI credential, got %q", token)
 	}
 	if a.accessToken != "" {
 		t.Fatalf("expected GitHub CLI token not to be stored as access token, got %q", a.accessToken)
@@ -1342,7 +1401,7 @@ if [ "$GH_PROMPT_DISABLED" != "1" ]; then
   exit 4
 fi
 printf 'called\n' > "$CALLED_FILE"
-printf 'gh-cli-access-token\n'
+printf 'gho_gh-cli-access-token\n'
 `
 	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
@@ -1353,16 +1412,14 @@ printf 'gh-cli-access-token\n'
 
 	chatEnabled := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("supported GitHub CLI credential unexpectedly called %s", r.URL.Path)
 		if r.URL.Path != "/copilot_internal/user" {
 			t.Errorf("expected copilot user validation request, got %s", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer gh-cli-access-token" {
 			t.Errorf("expected 'Bearer gh-cli-access-token', got %q", got)
 		}
-		_ = json.NewEncoder(w).Encode(CopilotUserResponse{
-			Login:       "test-user",
-			ChatEnabled: &chatEnabled,
-		})
+		_ = json.NewEncoder(w).Encode(map[string]any{"chat_enabled": chatEnabled})
 	}))
 	defer server.Close()
 
@@ -1401,7 +1458,7 @@ printf 'gh-cli-access-token\n'
 	if a.accessToken != "" {
 		t.Fatalf("expected GitHub CLI token not to be stored as access token, got %q", a.accessToken)
 	}
-	if a.copilotToken != "gh-cli-access-token" {
+	if a.copilotToken != "gho_gh-cli-access-token" {
 		t.Fatalf("expected GitHub CLI bearer token in memory, got %q", a.copilotToken)
 	}
 	if _, err := os.Stat(filepath.Join(tokenDir, signedOutMarkerFile)); !os.IsNotExist(err) {
@@ -1419,7 +1476,7 @@ printf 'gh-cli-access-token\n'
 	}
 }
 
-func TestSignInWithGitHubCLI_ValidationFailureRestoresPreviousState(t *testing.T) {
+func TestSignInWithGitHubCLI_LegacyExchangeFailureRestoresPreviousState(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake gh shell script test is Unix-only")
 	}
@@ -1427,18 +1484,18 @@ func TestSignInWithGitHubCLI_ValidationFailureRestoresPreviousState(t *testing.T
 	dir := t.TempDir()
 	ghPath := filepath.Join(dir, "gh")
 	script := `#!/bin/sh
-printf 'gh-cli-access-token\n'
+printf 'legacy-gh-cli-access-token\n'
 `
 	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/copilot_internal/user" {
-			t.Errorf("expected copilot user validation request, got %s", r.URL.Path)
+		if r.URL.Path != "/copilot_internal/v2/token" {
+			t.Errorf("expected legacy Copilot token exchange, got %s", r.URL.Path)
 		}
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(githubAPIErrorResponse{Message: "Not Found", Status: "404"})
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{ErrorDetails: "invalid access token"})
 	}))
 	defer server.Close()
 
@@ -1512,18 +1569,12 @@ exit 7
 
 func TestRefreshTokenNonInteractive_UsesPersistedAccessToken(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "token valid-access-token" {
-			t.Errorf("expected 'token valid-access-token', got %q", got)
-		}
-		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
-			Token:     "refreshed-copilot-token",
-			ExpiresAt: time.Now().Add(1 * time.Hour).Unix(),
-		})
+		t.Fatalf("supported persisted credential unexpectedly called %s", r.URL.Path)
 	}))
 	defer server.Close()
 
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("valid-access-token"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("ghu_persisted-access-token"), 0o600); err != nil {
 		t.Fatalf("write access token: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, signedOutMarkerFile), []byte("signed out\n"), 0o600); err != nil {
@@ -1540,8 +1591,11 @@ func TestRefreshTokenNonInteractive_UsesPersistedAccessToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if token != "refreshed-copilot-token" {
-		t.Fatalf("expected refreshed-copilot-token, got %q", token)
+	if token != "ghu_persisted-access-token" {
+		t.Fatalf("expected direct persisted credential, got %q", token)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "api-key.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected no legacy Copilot token cache, got err=%v", err)
 	}
 }
 

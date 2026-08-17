@@ -1,13 +1,11 @@
 name: Live Copilot Direct Bearer Smoke
 
-# Credentialed live coverage for the environment-token fallback used by
-# fine-grained PATs with Copilot Requests permission. The dedicated credential
-# must naturally receive 404 from the legacy Copilot token exchange while being
-# accepted by the Copilot user endpoint as a bearer. The test fails if either
-# side of that live contract changes, if Vekil does not return the environment
-# token directly, or if it persists the token. It deliberately runs only from
-# the trusted default branch so the repository PAT is never exposed to
-# pull-request-controlled code.
+# Credentialed live coverage for direct GitHub credential authentication. The
+# test verifies that Vekil returns the fine-grained PAT without calling the
+# legacy GitHub auth endpoints, then proves the credential reaches Copilot's
+# /models endpoint successfully. It deliberately runs only from the trusted
+# default branch so the repository PAT is never exposed to pull-request-
+# controlled code.
 
 on:
   push:
@@ -43,7 +41,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Verify live fine-grained PAT direct-bearer fallback
+      - name: Verify live fine-grained PAT direct bearer
         env:
           LIVE_COPILOT_DIRECT_BEARER_TEST: "1"
-        run: go test ./auth -run '^TestLiveEnvAccessTokenDirectBearerFallback$' -count=1 -v -timeout=2m
+        run: go test ./auth -run '^TestLiveEnvAccessTokenDirectBearer$' -count=1 -v -timeout=2m
