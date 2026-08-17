@@ -134,13 +134,13 @@ class Handler(BaseHTTPRequestHandler):
             errors.append("model_invalid")
         if is_classifier and effort is not None:
             errors.append("classifier_effort_present")
-        if is_classifier and "store" in body:
-            errors.append("classifier_store_present")
+        if is_classifier and body.get("store") is not False:
+            errors.append("classifier_store_not_false")
         if not is_classifier and effort not in {"low", "max"}:
             errors.append("terminal_effort_invalid")
         with lock:
             state["errors"].extend(errors)
-            state["requests"].append({"kind": "classifier" if is_classifier else "terminal", "path": self.path, "effort": effort, "model": body.get("model")})
+            state["requests"].append({"kind": "classifier" if is_classifier else "terminal", "path": self.path, "effort": effort, "store": body.get("store"), "model": body.get("model")})
             save()
         if errors:
             self.send_json(422, {"error": errors})
@@ -236,6 +236,7 @@ main() {
   jq -e '
     (.errors | length) == 0
     and ([.requests[] | select(.kind == "classifier" and .effort != null)] | length) == 0
+    and ([.requests[] | select(.kind == "classifier" and .store != false)] | length) == 0
     and ([.requests[] | select(.kind == "terminal") | .effort] | sort) == ["low", "max"]
     and ([.requests[] | select(.path != "/v1/responses")] | length) == 0
     and ([.requests[] | select(.model != "gpt-5.6-sol")] | length) == 0

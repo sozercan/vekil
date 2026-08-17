@@ -831,6 +831,11 @@ func (a *Authenticator) completeDeviceAuthorization(ctx context.Context, accessT
 	if err := a.useGitHubCredential(ctx, accessToken, true); err != nil {
 		return err
 	}
+	if isSupportedCopilotBearer(accessToken) {
+		if err := os.Remove(filepath.Join(a.tokenDir, "api-key.json")); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing stale Copilot token cache: %w", err)
+		}
+	}
 	if err := a.clearSignedOutMarker(); err != nil {
 		return fmt.Errorf("clearing signed-out marker: %w", err)
 	}

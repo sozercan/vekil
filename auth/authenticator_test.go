@@ -1108,6 +1108,16 @@ func TestPollForAuthorization_Success(t *testing.T) {
 	defer server.Close()
 
 	dir := t.TempDir()
+	staleCopilotCache, err := json.Marshal(CopilotTokenResponse{
+		Token:     "previous-account-copilot-token",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal stale Copilot cache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api-key.json"), staleCopilotCache, 0o600); err != nil {
+		t.Fatalf("write stale Copilot cache: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, signedOutMarkerFile), []byte("signed out\n"), 0o600); err != nil {
 		t.Fatalf("write signed-out marker: %v", err)
 	}
@@ -1127,7 +1137,7 @@ func TestPollForAuthorization_Success(t *testing.T) {
 		Interval:   1,
 	}
 
-	err := a.PollForAuthorization(context.Background(), dcResp)
+	err = a.PollForAuthorization(context.Background(), dcResp)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

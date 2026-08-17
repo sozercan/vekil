@@ -6274,6 +6274,44 @@ func TestSetCopilotHeadersWithConfig(t *testing.T) {
 	}
 }
 
+func TestSetCopilotHeadersWithConfigUsesCredentialIntegrationDefault(t *testing.T) {
+	tests := []struct {
+		name        string
+		token       string
+		config      CopilotHeaderConfig
+		integration string
+	}{
+		{
+			name:        "direct GitHub App credential",
+			token:       "ghu_direct-credential",
+			integration: directGitHubAppIntegrationID,
+		},
+		{
+			name:        "OAuth credential",
+			token:       "gho_direct-credential",
+			integration: defaultCopilotIntegrationID,
+		},
+		{
+			name:  "explicit override",
+			token: "ghu_direct-credential",
+			config: CopilotHeaderConfig{
+				IntegrationID: "configured-integration",
+			},
+			integration: "configured-integration",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/test", nil)
+			setCopilotHeadersWithConfig(req, tt.token, tt.config)
+			if got := req.Header.Get("copilot-integration-id"); got != tt.integration {
+				t.Fatalf("copilot-integration-id = %q, want %q", got, tt.integration)
+			}
+		})
+	}
+}
+
 func TestCopilotHeaderProfilesConfigProfileForEndpointRawDoesNotApplyDefaults(t *testing.T) {
 	profiles := CopilotHeaderProfilesConfig{
 		Default: CopilotHeaderConfig{
@@ -6472,6 +6510,61 @@ func TestNewProviderJSONRequest_CopilotModelsOmitsIntentAndContentTypeByDefault(
 	}
 	if got := req.Header.Get("Content-Type"); got != "" {
 		t.Fatalf("Content-Type = %q, want omitted for GET /models", got)
+	}
+}
+
+func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesLanguageServerIntegration(t *testing.T) {
+	tests := []struct {
+		name            string
+		endpoint        string
+		copilotHeaders  CopilotHeaderConfig
+		wantIntegration string
+	}{
+		{
+			name:            "models credential default",
+			endpoint:        "/models",
+			wantIntegration: directGitHubAppIntegrationID,
+		},
+		{
+			name:            "chat credential default",
+			endpoint:        "/chat/completions",
+			wantIntegration: directGitHubAppIntegrationID,
+		},
+		{
+			name:            "responses credential default",
+			endpoint:        "/responses",
+			wantIntegration: defaultCopilotIntegrationID,
+		},
+		{
+			name:     "explicit override",
+			endpoint: "/responses",
+			copilotHeaders: CopilotHeaderConfig{
+				IntegrationID: "configured-integration",
+			},
+			wantIntegration: "configured-integration",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := &ProxyHandler{
+				auth:           auth.NewTestAuthenticator("ghu_direct-credential"),
+				copilotHeaders: tt.copilotHeaders,
+			}
+			provider := &providerRuntime{
+				id:      "copilot",
+				kind:    providerTypeCopilot,
+				baseURL: "https://copilot.example.test",
+			}
+
+			req, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodGet, tt.endpoint, nil, nil, "")
+			if err != nil {
+				t.Fatalf("newProviderJSONRequest() error = %v", err)
+			}
+			if got := req.Header.Get("copilot-integration-id"); got != tt.wantIntegration {
+				t.Fatalf("copilot-integration-id = %q, want %q", got, tt.wantIntegration)
+			}
+		})
 	}
 }
 
