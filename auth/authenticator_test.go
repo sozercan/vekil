@@ -1878,6 +1878,24 @@ func waitForAuthDeviceWaiters(t *testing.T, a *Authenticator, want int) {
 	t.Fatalf("timed out waiting for %d auth device-flow waiters", want)
 }
 
+func waitForAuthResponsesWaiters(t *testing.T, a *Authenticator, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		a.responsesMu.Lock()
+		got := 0
+		if a.responsesCall != nil {
+			got = a.responsesCall.waiters
+		}
+		a.responsesMu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d Responses token waiters", want)
+}
+
 func TestGetTokenRefreshWaiterHonorsContextDeadline(t *testing.T) {
 	var calls atomic.Int32
 	refreshStarted := make(chan struct{})
@@ -2288,6 +2306,79 @@ func TestGetTokenRefreshLeaderCancellationDoesNotCancelLiveWaiter(t *testing.T) 
 	}
 }
 
+func TestGetResponsesTokenLeaderCancellationDoesNotCancelLiveWaiter(t *testing.T) {
+	responsesStarted := make(chan struct{})
+	releaseResponses := make(chan struct{})
+	responsesCanceled := make(chan struct{})
+	var startOnce sync.Once
+	var cancelOnce sync.Once
+
+	a := &Authenticator{
+		tokenDir:       t.TempDir(),
+		copilotToken:   "ghu_responses-source",
+		tokenExpiry:    time.Now().Add(time.Hour),
+		copilotBaseURL: "http://copilot.test",
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			startOnce.Do(func() { close(responsesStarted) })
+			select {
+			case <-releaseResponses:
+				return copilotTokenResponseForTest(t, "responses-waiter-token"), nil
+			case <-req.Context().Done():
+				cancelOnce.Do(func() { close(responsesCanceled) })
+				return nil, req.Context().Err()
+			}
+		})},
+	}
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := a.GetResponsesToken(leaderCtx)
+		leaderDone <- err
+	}()
+	<-responsesStarted
+
+	waiterDone := make(chan struct {
+		token string
+		err   error
+	}, 1)
+	go func() {
+		token, err := a.GetResponsesToken(context.Background())
+		waiterDone <- struct {
+			token string
+			err   error
+		}{token: token, err: err}
+	}()
+	waitForAuthResponsesWaiters(t, a, 2)
+	cancelLeader()
+
+	if err := <-leaderDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader error = %v, want context.Canceled", err)
+	}
+	a.responsesMu.Lock()
+	activeCall := a.responsesCall
+	a.responsesMu.Unlock()
+	if activeCall == nil {
+		t.Fatal("shared Responses exchange disappeared while a waiter remained")
+	}
+	select {
+	case <-activeCall.ctx.Done():
+		t.Fatal("shared Responses exchange context was canceled while a waiter remained")
+	default:
+	}
+	select {
+	case <-responsesCanceled:
+		t.Fatal("shared Responses exchange was canceled while a waiter remained")
+	default:
+	}
+
+	close(releaseResponses)
+	waiter := <-waiterDone
+	if waiter.err != nil || waiter.token != "responses-waiter-token" {
+		t.Fatalf("waiter result = (%q, %v), want responses-waiter-token", waiter.token, waiter.err)
+	}
+}
+
 func TestGetTokenRefreshCancelsWhenAllWaitersLeave(t *testing.T) {
 	refreshStarted := make(chan struct{})
 	refreshCanceled := make(chan struct{})
@@ -2323,6 +2414,47 @@ func TestGetTokenRefreshCancelsWhenAllWaitersLeave(t *testing.T) {
 	case <-refreshCanceled:
 	case <-time.After(time.Second):
 		t.Fatal("underlying Copilot refresh was not canceled after its last waiter left")
+	}
+}
+
+func TestGetResponsesTokenCancelsWhenAllWaitersLeave(t *testing.T) {
+	responsesStarted := make(chan struct{})
+	responsesCanceled := make(chan struct{})
+
+	a := &Authenticator{
+		tokenDir:       t.TempDir(),
+		copilotToken:   "ghu_responses-source",
+		tokenExpiry:    time.Now().Add(time.Hour),
+		copilotBaseURL: "http://copilot.test",
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			close(responsesStarted)
+			<-req.Context().Done()
+			close(responsesCanceled)
+			return nil, req.Context().Err()
+		})},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.GetResponsesToken(ctx)
+		done <- err
+	}()
+	<-responsesStarted
+	cancel()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetResponsesToken() error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-responsesCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("underlying Responses exchange was not canceled after its last waiter left")
+	}
+	a.responsesMu.Lock()
+	defer a.responsesMu.Unlock()
+	if a.responsesCall != nil || a.responsesToken != "" {
+		t.Fatal("abandoned Responses exchange remained active or cached a token")
 	}
 }
 
@@ -2478,6 +2610,62 @@ func TestSignOutInvalidatesInFlightNonInteractiveResults(t *testing.T) {
 	}
 }
 
+func TestSignOutInvalidatesInFlightResponsesResults(t *testing.T) {
+	responsesStarted := make(chan struct{})
+	responsesCanceled := make(chan struct{})
+	var startOnce sync.Once
+	var cancelOnce sync.Once
+
+	a := &Authenticator{
+		tokenDir:       t.TempDir(),
+		copilotToken:   "ghu_responses-source",
+		tokenExpiry:    time.Now().Add(time.Hour),
+		copilotBaseURL: "http://copilot.test",
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			startOnce.Do(func() { close(responsesStarted) })
+			<-req.Context().Done()
+			cancelOnce.Do(func() { close(responsesCanceled) })
+			return nil, req.Context().Err()
+		})},
+	}
+
+	results := make(chan struct {
+		token string
+		err   error
+	}, 2)
+	for range 2 {
+		go func() {
+			token, err := a.GetResponsesToken(context.Background())
+			results <- struct {
+				token string
+				err   error
+			}{token: token, err: err}
+		}()
+	}
+	<-responsesStarted
+	waitForAuthResponsesWaiters(t, a, 2)
+
+	if err := a.SignOut(); err != nil {
+		t.Fatalf("SignOut() error = %v", err)
+	}
+	select {
+	case <-responsesCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("SignOut did not cancel the in-flight Responses exchange")
+	}
+	for range 2 {
+		result := <-results
+		if result.token != "" || result.err == nil {
+			t.Fatalf("post-sign-out Responses result = (%q, %v), want no token and an error", result.token, result.err)
+		}
+	}
+	a.responsesMu.Lock()
+	defer a.responsesMu.Unlock()
+	if a.responsesCall != nil || a.responsesSourceToken != "" || a.responsesToken != "" || !a.responsesTokenExpiry.IsZero() {
+		t.Fatal("SignOut left Responses exchange state attached or cached")
+	}
+}
+
 func TestSignOutInvalidatesInFlightDeviceResults(t *testing.T) {
 	dir := t.TempDir()
 	data, err := json.Marshal(CopilotTokenResponse{
@@ -2552,8 +2740,16 @@ func TestSignOutInvalidatesCompletedSharedResults(t *testing.T) {
 		completed:  true,
 		generation: generation,
 	}
+	responses := &authTokenCall{
+		done:       make(chan struct{}),
+		token:      "stale-responses-token",
+		waiters:    1,
+		completed:  true,
+		generation: generation,
+	}
 	close(refresh.done)
 	close(device.done)
+	close(responses.done)
 
 	if err := a.SignOut(); err != nil {
 		t.Fatalf("SignOut() error = %v", err)
@@ -2563,6 +2759,9 @@ func TestSignOutInvalidatesCompletedSharedResults(t *testing.T) {
 	}
 	if token, err := a.waitForDeviceCall(context.Background(), device); token != "" || !errors.Is(err, ErrNotAuthenticated) {
 		t.Fatalf("completed device result = (%q, %v), want ErrNotAuthenticated", token, err)
+	}
+	if token, err, _ := a.waitForResponsesCall(context.Background(), responses); token != "" || !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("completed Responses result = (%q, %v), want ErrNotAuthenticated", token, err)
 	}
 }
 
