@@ -6533,7 +6533,7 @@ func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesLanguageServerInteg
 		{
 			name:            "responses credential default",
 			endpoint:        "/responses",
-			wantIntegration: defaultCopilotIntegrationID,
+			wantIntegration: directGitHubAppIntegrationID,
 		},
 		{
 			name:     "explicit override",

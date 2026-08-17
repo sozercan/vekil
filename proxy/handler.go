@@ -992,7 +992,7 @@ func setCopilotHeaders(req *http.Request, token string) {
 }
 
 func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHeaderConfig) {
-	cfg = cfg.withCredentialDefaults(token, "")
+	cfg = cfg.withCredentialDefaults(token)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("editor-version", cfg.EditorVersion)
 	req.Header.Set("editor-plugin-version", cfg.EditorPluginVersion)
@@ -1004,8 +1004,8 @@ func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHea
 	req.Header.Set("Content-Type", "application/json")
 }
 
-func (c CopilotHeaderConfig) withCredentialDefaults(token, endpoint string) CopilotHeaderConfig {
-	if c.IntegrationID == "" && strings.HasPrefix(strings.TrimSpace(token), "ghu_") && strings.TrimSpace(endpoint) != "/responses" {
+func (c CopilotHeaderConfig) withCredentialDefaults(token string) CopilotHeaderConfig {
+	if c.IntegrationID == "" && strings.HasPrefix(strings.TrimSpace(token), "ghu_") {
 		c.IntegrationID = directGitHubAppIntegrationID
 	}
 	return c.withDefaults()
@@ -1037,7 +1037,7 @@ func copilotEndpointUsesDefaultOpenAIIntent(endpoint string) bool {
 
 func setCopilotHeadersForEndpoint(req *http.Request, token string, cfg CopilotHeaderConfig, endpoint string) {
 	explicitOpenAIIntent := cfg.OpenAIIntent != ""
-	cfg = cfg.withCredentialDefaults(token, endpoint)
+	cfg = cfg.withCredentialDefaults(token)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("editor-version", cfg.EditorVersion)
 	req.Header.Set("editor-plugin-version", cfg.EditorPluginVersion)
