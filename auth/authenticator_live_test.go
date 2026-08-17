@@ -45,7 +45,7 @@ func (r *liveCopilotAuthRecorder) snapshot() []liveCopilotAuthObservation {
 	return append([]liveCopilotAuthObservation(nil), r.observations...)
 }
 
-func TestLiveEnvAccessTokenDirectBearerFallback(t *testing.T) {
+func TestLiveEnvAccessTokenDirectBearer(t *testing.T) {
 	if os.Getenv("LIVE_COPILOT_DIRECT_BEARER_TEST") != "1" {
 		t.Skip("set LIVE_COPILOT_DIRECT_BEARER_TEST=1 to run the credentialed live check")
 	}
@@ -79,7 +79,7 @@ func TestLiveEnvAccessTokenDirectBearerFallback(t *testing.T) {
 	defer cancel()
 	token, err := a.GetToken(ctx)
 	if err != nil {
-		t.Fatalf("GetToken() live direct-bearer fallback failed: %v", err)
+		t.Fatalf("GetToken() live direct bearer failed: %v", err)
 	}
 	if token != envToken {
 		t.Fatal("GetToken() returned a different token instead of the environment bearer")
@@ -93,33 +93,52 @@ func TestLiveEnvAccessTokenDirectBearerFallback(t *testing.T) {
 		t.Fatal("GetToken() returned a different cached token")
 	}
 
-	observations := recorder.snapshot()
-	if len(observations) != 2 {
-		t.Fatalf("live auth requests = %d, want exactly exchange plus user validation", len(observations))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.githubcopilot.com/models", nil)
+	if err != nil {
+		t.Fatalf("create live Copilot models request: %v", err)
 	}
-	assertLiveCopilotAuthObservation(t, observations[0], "/copilot_internal/v2/token", http.StatusNotFound)
-	assertLiveCopilotAuthObservation(t, observations[1], "/copilot_internal/user", http.StatusOK)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "GitHubCopilotChat/0.26.7")
+	req.Header.Set("Editor-Version", "vscode/1.95.0")
+	req.Header.Set("Editor-Plugin-Version", "copilot-chat/0.26.7")
+	req.Header.Set("Copilot-Integration-Id", "vscode-chat")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		t.Fatalf("live Copilot models request failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("live Copilot models request returned status %d", resp.StatusCode)
+	}
+
+	observations := recorder.snapshot()
+	if len(observations) != 1 {
+		t.Fatalf("live Copilot requests = %d, want exactly one models request", len(observations))
+	}
+	assertLiveCopilotAuthObservation(t, observations[0], "api.githubcopilot.com", "/models", http.StatusOK)
 
 	if a.accessToken != envToken || a.copilotToken != envToken {
 		t.Fatal("authenticator did not retain the environment token as the in-memory direct bearer")
 	}
 	if !a.tokenExpiry.After(time.Now()) {
-		t.Fatalf("direct-bearer expiry = %v, want a future revalidation deadline", a.tokenExpiry)
+		t.Fatalf("direct-bearer expiry = %v, want a future refresh deadline", a.tokenExpiry)
 	}
 	for _, name := range []string{"access-token", "api-key.json"} {
 		if _, err := os.Stat(filepath.Join(tokenDir, name)); !errors.Is(err, os.ErrNotExist) {
 			if err == nil {
-				t.Fatalf("live direct-bearer fallback unexpectedly persisted %s", name)
+				t.Fatalf("live direct bearer unexpectedly persisted %s", name)
 			}
 			t.Fatalf("stat %s: %v", name, err)
 		}
 	}
 }
 
-func assertLiveCopilotAuthObservation(t *testing.T, got liveCopilotAuthObservation, wantPath string, wantStatus int) {
+func assertLiveCopilotAuthObservation(t *testing.T, got liveCopilotAuthObservation, wantHost, wantPath string, wantStatus int) {
 	t.Helper()
-	if got.host != "api.github.com" || got.path != wantPath || got.statusCode != wantStatus {
-		t.Fatalf("live auth request = host %q path %q status %d, want api.github.com %s status %d",
-			got.host, got.path, got.statusCode, wantPath, wantStatus)
+	if got.host != wantHost || got.path != wantPath || got.statusCode != wantStatus {
+		t.Fatalf("live auth request = host %q path %q status %d, want %s %s status %d",
+			got.host, got.path, got.statusCode, wantHost, wantPath, wantStatus)
 	}
 }

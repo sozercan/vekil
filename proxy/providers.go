@@ -2323,7 +2323,13 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 
 	switch provider.kind {
 	case providerTypeCopilot:
-		token, err := h.auth.GetToken(req.Context())
+		var token string
+		var err error
+		if endpoint == providerEndpointResponses {
+			token, err = h.auth.GetResponsesToken(req.Context())
+		} else {
+			token, err = h.auth.GetToken(req.Context())
+		}
 		if err != nil {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 		}

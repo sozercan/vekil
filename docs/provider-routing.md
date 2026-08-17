@@ -6,15 +6,19 @@ Use this file when editing provider credentials, model ownership, JSON/YAML prov
 
 ### GitHub Copilot
 
-For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly, and it overrides cached Vekil login state. Vekil first attempts to exchange it for a short-lived Copilot token. If that legacy exchange rejects a token that the Copilot user endpoint accepts directly, such as a fine-grained PAT with the Copilot Requests permission, Vekil instead uses the environment token as the Copilot bearer. That direct bearer is kept only in memory, is never written to the Copilot token cache, and is revalidated on the normal refresh cadence.
+For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly, and it overrides cached Vekil login state. Supported GitHub credentials are `gho_` OAuth user tokens, `ghu_` GitHub App user tokens, and `github_pat_` fine-grained PATs with the Copilot Requests permission. Vekil uses them directly where the Copilot upstream accepts them. The current exception is `/responses` with a `ghu_` credential: Copilot rejects that app-user bearer directly, so Vekil exchanges it through `/copilot_internal/v2/token` and caches the short-lived result in memory only. Vekil does not call the private Copilot user endpoint. Revoked, expired, unlicensed, or under-permissioned credentials surface as upstream authentication or permission failures.
+
+Unless explicitly overridden, direct `ghu_` credentials use the `copilot-language-server` integration ID for catalog and native Chat requests. Their exchanged Responses token uses `vscode-chat`; other direct credential types also use `vscode-chat`.
 
 Vekil intentionally ignores generic GitHub token variables such as `GH_TOKEN` and `GITHUB_TOKEN`. If you want Vekil to use an authenticated GitHub CLI account, opt in explicitly with `vekil login --github-cli` or `vekil login --gh`; Vekil then runs `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only, without copying it into Vekil's `access-token` or `api-key.json` caches.
 
-Plain `vekil login` refreshes an existing Vekil-managed login when possible, otherwise starts GitHub's device-code flow. Use `vekil login --force` to force a new device-code flow even if an existing login can still refresh. A device-code sign-in disables GitHub CLI auto sign-in because the active account is then managed by Vekil rather than by `gh`.
+Plain `vekil login` reloads an existing Vekil-managed credential when possible, otherwise starts GitHub's device-code flow. The resulting supported GitHub credential is stored in `access-token` and used directly; Vekil no longer creates a short-lived `api-key.json` entry for that normal path. Use `vekil login --force` to force a new device-code flow even if an existing credential is present. A device-code sign-in disables GitHub CLI auto sign-in because the active account is then managed by Vekil rather than by `gh`.
+
+For migration compatibility, Vekil still reads an unexpired legacy `api-key.json` cache. An unrecognized older GitHub credential can also use the legacy token exchange; only a successful legacy exchange writes that cache. This fallback is not used for the supported credential types above.
 
 After `vekil logout` or menubar Sign Out, Vekil clears its cached credentials, disables GitHub CLI auto sign-in, and suppresses automatic GitHub CLI reuse until you explicitly opt back in with `vekil login --github-cli` or `vekil login --gh`. `COPILOT_GITHUB_TOKEN` remains an explicit override and still works while signed out.
 
-Concurrent Copilot-token refresh callers share one refresh attempt, but each caller still honors its own context deadline. The same rule applies to callers waiting for an interactive device flow.
+Concurrent Copilot credential refresh callers share one refresh attempt, but each caller still honors its own context deadline. The same rule applies to callers waiting for an interactive device flow.
 
 ### OpenAI Codex
 

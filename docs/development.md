@@ -255,7 +255,7 @@ Fork and Dependabot pull requests neutral-skip because GitHub withholds reposito
 
 ## Live Semantic Policy Routing Smoke Workflows
 
-The default pull-request check is [`Live Copilot Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-copilot-smoke.yaml), whose uniquely named job is `semantic-policy-e2e`. It reuses the repository's existing `COPILOT_GITHUB_TOKEN` rather than requiring a second set of provider credentials. [`scripts/live-policy-routing-copilot-smoke.sh`](../scripts/live-policy-routing-copilot-smoke.sh) starts a private zero-config Vekil bridge backed by Copilot, reads its `/v1/models` catalog, selects native-Chat models, and delegates to the common [`scripts/live-policy-routing-smoke.sh`](../scripts/live-policy-routing-smoke.sh) acceptance harness. It then runs [`scripts/live-policy-routing-sol-effort-smoke.sh`](../scripts/live-policy-routing-sol-effort-smoke.sh) against the same bridge with both policy tiers pinned to Responses-native `gpt-5.6-sol`: a simple prompt carries conflicting client `max` but must execute with tier `low`, while a complex prompt carries conflicting client `low` but must execute with tier `max`. The capture shim records only endpoint/model/effort metadata and verifies classifier requests never receive terminal reasoning effort.
+The default pull-request check is [`Live Copilot Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-copilot-smoke.yaml), whose uniquely named job is `semantic-policy-e2e`. It reuses the repository's existing `COPILOT_GITHUB_TOKEN` rather than requiring a second set of provider credentials. [`scripts/live-policy-routing-copilot-smoke.sh`](../scripts/live-policy-routing-copilot-smoke.sh) starts a private zero-config Vekil bridge backed by Copilot, reads its `/v1/models` catalog, selects native-Chat models, and delegates to the common [`scripts/live-policy-routing-smoke.sh`](../scripts/live-policy-routing-smoke.sh) acceptance harness. It then runs [`scripts/live-policy-routing-sol-effort-smoke.sh`](../scripts/live-policy-routing-sol-effort-smoke.sh) against the same bridge with both policy tiers pinned to Responses-native `gpt-5.6-sol`: a simple prompt carries conflicting client `max` but must execute with tier `low`, while a complex prompt carries conflicting client `low` but must execute with tier `max`. The capture shim records only endpoint/model/effort/store metadata and verifies classifier requests never receive terminal reasoning effort and retain `store: false`.
 
 The bridge is intentional even though production schema-v2 policy profiles can target pinned models on a dynamic `type: copilot` provider directly, including Responses-backed Chat models. It gives the common smoke harness independently controllable static targets and fault injection, keeps the real Copilot token in one private bridge process, and permits metadata-only capture of the exact terminal `/responses` request without exposing credentials or request content. The wrapper removes `COPILOT_GITHUB_TOKEN` from delegated harness environments, gives the bridge a private token directory, auto-selects a non-default loopback port, and verifies bridge/process-group cleanup.
 
@@ -277,7 +277,7 @@ Optional repository variables pin a model instead of using dynamic selection:
 - `LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL`
 - `LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL`
 
-Because Vekil cannot independently attest Copilot's retention behavior, the Copilot wrapper declares `classifier_no_store_supported: false`, strips the classifier `store` field, and sets the synthetic test profile's explicit `allow_provider_retention: true` acknowledgement. The test sends only fixed synthetic content. This acknowledgement is not evidence of a provider retention guarantee.
+Because Vekil cannot independently attest Copilot's retention behavior, the broad native-Chat wrapper declares `classifier_no_store_supported: false`, strips the classifier `store` field, and sets the synthetic test profile's explicit `allow_provider_retention: true` acknowledgement. The focused Sol Responses harness declares the observed provider capability instead and verifies every classifier request retains `store: false`; it keeps the same conservative retention acknowledgement. Both tests send only fixed synthetic content. Neither the acknowledgement nor acceptance of `store: false` proves an external retention guarantee.
 
 The common native-Chat live matrix covers:
 
@@ -363,30 +363,30 @@ SMOKE_PROVIDER=zen PROVIDERS_CONFIG=examples/opencode-zen-free.yaml \
 
 ## Live Copilot Direct-Bearer Smoke Workflow
 
-The [`Live Copilot Direct Bearer Smoke`](../.github/workflows/live-copilot-direct-bearer-smoke.yaml) workflow is focused credentialed coverage for `COPILOT_GITHUB_TOKEN` values that GitHub accepts directly as Copilot bearers but rejects at the legacy Copilot token exchange. It uses a dedicated fine-grained PAT to verify the live sequence exactly: `/copilot_internal/v2/token` returns `404`, `/copilot_internal/user` returns `200`, Vekil returns the original environment token from `GetToken`, a second call uses the in-memory cache, and neither `access-token` nor `api-key.json` is written.
+The [`Live Copilot Direct Bearer Smoke`](../.github/workflows/live-copilot-direct-bearer-smoke.yaml) workflow is focused credentialed coverage for direct `COPILOT_GITHUB_TOKEN` authentication. It uses a dedicated fine-grained PAT to verify that Vekil returns the original environment token from `GetToken` without contacting `api.github.com`, a second call uses the in-memory cache, the credential succeeds against Copilot's `/models` endpoint, and neither `access-token` nor `api-key.json` is written.
 
-The credentialed workflow runs only from trusted default-branch code: on pushes to `main` and on its weekly schedule. It intentionally has no `pull_request` or ref-selectable manual trigger, because package initialization and `TestMain` in pull-request-controlled code could otherwise read the repository PAT before the focused test runs. Pull requests instead exercise the same fallback and error-preservation logic through deterministic local-provider tests in `auth/authenticator_test.go`; the live workflow validates the merged implementation and GitHub's current `404`-then-`200` endpoint contract.
+The credentialed workflow runs only from trusted default-branch code: on pushes to `main` and on its weekly schedule. It intentionally has no `pull_request` or ref-selectable manual trigger, because package initialization and `TestMain` in pull-request-controlled code could otherwise read the repository PAT before the focused test runs. Pull requests instead exercise direct credential classification, zero-request resolution, legacy fallback, and persistence rules through deterministic tests in `auth/authenticator_test.go`; the live workflow validates the merged implementation against Copilot.
 
-Configure the repository secret `COPILOT_FINE_GRAINED_PAT` with a fine-grained personal access token for an account with Copilot access and the **Copilot Requests** permission. Do not reuse an exchange-compatible OAuth or classic token: the workflow intentionally fails unless the credential itself exercises the `404`-then-`200` fallback contract. A missing secret is a hard workflow failure.
+Configure the repository secret `COPILOT_FINE_GRAINED_PAT` with a fine-grained personal access token for an account with Copilot access and the **Copilot Requests** permission. A missing secret is a hard workflow failure.
 
 Run the exact check locally without printing the credential:
 
 ```bash
 LIVE_COPILOT_DIRECT_BEARER_TEST=1 \
   COPILOT_GITHUB_TOKEN=... \
-  go test ./auth -run '^TestLiveEnvAccessTokenDirectBearerFallback$' -count=1 -v
+  go test ./auth -run '^TestLiveEnvAccessTokenDirectBearer$' -count=1 -v
 ```
 
 ## Live Copilot workflows setup
 
-The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workflows share one exchange-compatible credential:
+The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workflows share one supported direct GitHub credential:
 
 1. Create a GitHub token for a user that has GitHub Copilot access.
 2. Grant that token the `Copilot Requests` permission.
 3. Save it as the repository secret `COPILOT_GITHUB_TOKEN`.
 4. Run either workflow from the Actions tab; same-repository pull requests run both automatically.
 
-The direct-bearer workflow deliberately uses the separate `COPILOT_FINE_GRAINED_PAT` credential described above so the regular exchange path and the fine-grained-PAT fallback remain independently covered.
+The direct-bearer workflow deliberately uses the separate `COPILOT_FINE_GRAINED_PAT` credential described above so fine-grained-PAT authentication remains independently covered.
 
 The two pull-request-triggered Copilot workflows remain separate from deterministic core CI. Both neutral-skip fork pull requests because GitHub does not expose repository secrets to untrusted pull-request code. The semantic-policy workflow also neutral-skips Dependabot runs; `Live Copilot Smoke` neutral-skips Dependabot only when `COPILOT_GITHUB_TOKEN` is unavailable. In other contexts, a missing token fails the workflow. The direct-bearer workflow is default-branch-only as described above.
 
