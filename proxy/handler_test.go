@@ -6513,27 +6513,31 @@ func TestNewProviderJSONRequest_CopilotModelsOmitsIntentAndContentTypeByDefault(
 	}
 }
 
-func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesLanguageServerIntegration(t *testing.T) {
+func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesEndpointCompatibleAuth(t *testing.T) {
 	tests := []struct {
 		name            string
 		endpoint        string
 		copilotHeaders  CopilotHeaderConfig
+		wantAuth        string
 		wantIntegration string
 	}{
 		{
 			name:            "models credential default",
 			endpoint:        "/models",
+			wantAuth:        "Bearer ghu_direct-credential",
 			wantIntegration: directGitHubAppIntegrationID,
 		},
 		{
 			name:            "chat credential default",
 			endpoint:        "/chat/completions",
+			wantAuth:        "Bearer ghu_direct-credential",
 			wantIntegration: directGitHubAppIntegrationID,
 		},
 		{
 			name:            "responses credential default",
 			endpoint:        "/responses",
-			wantIntegration: directGitHubAppIntegrationID,
+			wantAuth:        "Bearer responses-compatible-token",
+			wantIntegration: defaultCopilotIntegrationID,
 		},
 		{
 			name:     "explicit override",
@@ -6541,6 +6545,7 @@ func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesLanguageServerInteg
 			copilotHeaders: CopilotHeaderConfig{
 				IntegrationID: "configured-integration",
 			},
+			wantAuth:        "Bearer responses-compatible-token",
 			wantIntegration: "configured-integration",
 		},
 	}
@@ -6548,7 +6553,7 @@ func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesLanguageServerInteg
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			handler := &ProxyHandler{
-				auth:           auth.NewTestAuthenticator("ghu_direct-credential"),
+				auth:           auth.NewTestAuthenticatorWithResponsesToken("ghu_direct-credential", "responses-compatible-token"),
 				copilotHeaders: tt.copilotHeaders,
 			}
 			provider := &providerRuntime{
@@ -6560,6 +6565,9 @@ func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesLanguageServerInteg
 			req, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodGet, tt.endpoint, nil, nil, "")
 			if err != nil {
 				t.Fatalf("newProviderJSONRequest() error = %v", err)
+			}
+			if got := req.Header.Get("Authorization"); got != tt.wantAuth {
+				t.Fatalf("Authorization = %q, want %q", got, tt.wantAuth)
 			}
 			if got := req.Header.Get("copilot-integration-id"); got != tt.wantIntegration {
 				t.Fatalf("copilot-integration-id = %q, want %q", got, tt.wantIntegration)

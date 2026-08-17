@@ -235,6 +235,104 @@ func TestGetToken_SupportedEnvAccessTokensUseDirectBearer(t *testing.T) {
 	}
 }
 
+func TestGetResponsesToken_GitHubAppUsesInMemoryLegacyFallback(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "ghu_responses-source")
+
+	var exchangeCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		exchangeCalls.Add(1)
+		if r.URL.Path != "/copilot_internal/v2/token" {
+			t.Fatalf("responses fallback path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "token ghu_responses-source" {
+			t.Fatalf("responses fallback authorization = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+			Token:     "responses-compatible-token",
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+	}))
+	defer server.Close()
+
+	tokenDir := t.TempDir()
+	a := &Authenticator{
+		tokenDir:       tokenDir,
+		client:         server.Client(),
+		copilotBaseURL: server.URL,
+	}
+
+	const callers = 8
+	results := make(chan string, callers)
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			token, err := a.GetResponsesToken(context.Background())
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- token
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("GetResponsesToken() error = %v", err)
+	}
+	for token := range results {
+		if token != "responses-compatible-token" {
+			t.Errorf("GetResponsesToken() = %q, want responses-compatible-token", token)
+		}
+	}
+	if got := exchangeCalls.Load(); got != 1 {
+		t.Fatalf("responses fallback exchanges = %d, want 1", got)
+	}
+	if a.copilotToken != "ghu_responses-source" {
+		t.Fatalf("direct token = %q, want source credential retained", a.copilotToken)
+	}
+	if _, err := os.Stat(filepath.Join(tokenDir, "api-key.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("responses fallback unexpectedly persisted api-key.json: %v", err)
+	}
+
+	if err := a.SignOut(); err != nil {
+		t.Fatalf("SignOut() error = %v", err)
+	}
+	if a.responsesSourceToken != "" || a.responsesToken != "" || !a.responsesTokenExpiry.IsZero() {
+		t.Fatal("SignOut() did not clear the in-memory Responses fallback")
+	}
+}
+
+func TestGetResponsesToken_OtherSupportedCredentialsStayDirect(t *testing.T) {
+	for name, token := range map[string]string{
+		"oauth":            "gho_responses-direct",
+		"fine-grained PAT": "github_pat_responses-direct",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("COPILOT_GITHUB_TOKEN", token)
+			a := &Authenticator{
+				tokenDir: t.TempDir(),
+				client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					t.Fatalf("direct Responses credential unexpectedly called %s", req.URL)
+					return nil, nil
+				})},
+			}
+
+			got, err := a.GetResponsesToken(context.Background())
+			if err != nil {
+				t.Fatalf("GetResponsesToken() error = %v", err)
+			}
+			if got != token {
+				t.Fatalf("GetResponsesToken() = %q, want %q", got, token)
+			}
+		})
+	}
+}
+
 func TestGetToken_UnsupportedEnvAccessTokenKeepsLegacyExchangeError(t *testing.T) {
 	t.Setenv("COPILOT_GITHUB_TOKEN", "legacy-access-token")
 

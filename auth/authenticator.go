@@ -72,6 +72,12 @@ type Authenticator struct {
 	refreshMu   sync.Mutex
 	refreshCall *authTokenCall
 
+	responsesMu          sync.Mutex
+	responsesCall        *authTokenCall
+	responsesSourceToken string
+	responsesToken       string
+	responsesTokenExpiry time.Time
+
 	deviceCallMu sync.Mutex
 	deviceCall   *authTokenCall
 
@@ -288,6 +294,22 @@ func (a *Authenticator) GetToken(ctx context.Context) (string, error) {
 // back to the interactive device-code flow.
 func (a *Authenticator) GetTokenNonInteractive(ctx context.Context) (string, error) {
 	return a.getToken(ctx, false)
+}
+
+// GetResponsesToken returns the credential used for Copilot /responses
+// requests. GitHub App user credentials are accepted directly by the catalog
+// and Chat endpoints but require the short-lived Copilot token exchange for
+// Responses. That fallback is cached in memory only and keyed to the active
+// GitHub credential. Other supported credentials remain direct bearers.
+func (a *Authenticator) GetResponsesToken(ctx context.Context) (string, error) {
+	token, err := a.GetToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(strings.TrimSpace(token), "ghu_") {
+		return token, nil
+	}
+	return a.runSharedResponsesToken(ctx, token)
 }
 
 // RefreshTokenNonInteractive reloads existing GitHub authentication without
@@ -537,6 +559,115 @@ func (a *Authenticator) waitForRefreshCall(ctx context.Context, call *authTokenC
 	return token, err, true
 }
 
+func (a *Authenticator) runSharedResponsesToken(ctx context.Context, sourceToken string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a.signingOut.Load() {
+		return "", ErrNotAuthenticated
+	}
+
+	for {
+		a.responsesMu.Lock()
+		if err := ctx.Err(); err != nil {
+			a.responsesMu.Unlock()
+			return "", err
+		}
+		if a.signingOut.Load() {
+			a.responsesMu.Unlock()
+			return "", ErrNotAuthenticated
+		}
+		if a.responsesSourceToken == sourceToken && a.responsesToken != "" && time.Now().Before(a.responsesTokenExpiry) {
+			token := a.responsesToken
+			a.responsesMu.Unlock()
+			return token, nil
+		}
+		if call := a.responsesCall; call != nil && !call.abandoned {
+			call.waiters++
+			compatible := call.envToken == sourceToken
+			a.responsesMu.Unlock()
+			token, err, completed := a.waitForResponsesCall(ctx, call)
+			if compatible || !completed {
+				return token, err
+			}
+			continue
+		}
+
+		callCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		call := &authTokenCall{
+			ctx:        callCtx,
+			cancel:     cancel,
+			done:       make(chan struct{}),
+			waiters:    1,
+			generation: a.generation.Load(),
+			envToken:   sourceToken,
+		}
+		a.responsesCall = call
+		a.responsesMu.Unlock()
+
+		go a.executeResponsesCall(call)
+		token, err, _ := a.waitForResponsesCall(ctx, call)
+		return token, err
+	}
+}
+
+func (a *Authenticator) executeResponsesCall(call *authTokenCall) {
+	ctResp, err := a.requestLegacyCopilotToken(call.ctx, call.envToken)
+	token := ctResp.Token
+	expires := time.Unix(ctResp.ExpiresAt-300, 0)
+
+	a.responsesMu.Lock()
+	if call.abandoned {
+		token = ""
+		if err == nil {
+			err = context.Canceled
+		}
+	}
+	if err == nil && !call.abandoned && !a.signingOut.Load() && call.generation == a.generation.Load() {
+		a.responsesSourceToken = call.envToken
+		a.responsesToken = token
+		a.responsesTokenExpiry = expires
+	}
+	call.token = token
+	call.err = err
+	call.completed = true
+	if a.responsesCall == call {
+		a.responsesCall = nil
+	}
+	close(call.done)
+	call.cancel()
+	a.responsesMu.Unlock()
+}
+
+func (a *Authenticator) waitForResponsesCall(ctx context.Context, call *authTokenCall) (string, error, bool) {
+	completed := false
+	select {
+	case <-call.done:
+		completed = true
+	case <-ctx.Done():
+	}
+
+	a.responsesMu.Lock()
+	call.waiters--
+	if !completed && call.waiters == 0 && !call.completed {
+		call.abandoned = true
+		if a.responsesCall == call {
+			a.responsesCall = nil
+		}
+		call.cancel()
+	}
+	token, err := call.token, call.err
+	a.responsesMu.Unlock()
+
+	if !completed {
+		return "", ctx.Err(), false
+	}
+	if a.signingOut.Load() || call.generation != a.generation.Load() {
+		return "", ErrNotAuthenticated, false
+	}
+	return token, err, true
+}
+
 func (a *Authenticator) cancelSharedAuthCalls() {
 	a.refreshMu.Lock()
 	if call := a.refreshCall; call != nil {
@@ -549,6 +680,12 @@ func (a *Authenticator) cancelSharedAuthCalls() {
 		call.cancel()
 	}
 	a.deviceCallMu.Unlock()
+
+	a.responsesMu.Lock()
+	if call := a.responsesCall; call != nil {
+		call.cancel()
+	}
+	a.responsesMu.Unlock()
 }
 
 func (a *Authenticator) abandonSharedAuthCalls() {
@@ -567,6 +704,17 @@ func (a *Authenticator) abandonSharedAuthCalls() {
 		call.cancel()
 	}
 	a.deviceCallMu.Unlock()
+
+	a.responsesMu.Lock()
+	if call := a.responsesCall; call != nil {
+		call.abandoned = true
+		a.responsesCall = nil
+		call.cancel()
+	}
+	a.responsesSourceToken = ""
+	a.responsesToken = ""
+	a.responsesTokenExpiry = time.Time{}
+	a.responsesMu.Unlock()
 }
 
 func (a *Authenticator) performRefresh(ctx context.Context, envToken string, force bool) (string, error) {
@@ -969,47 +1117,11 @@ func (a *Authenticator) useGitHubCLICopilotToken(ctx context.Context) error {
 }
 
 func (a *Authenticator) exchangeLegacyCopilotToken(ctx context.Context, accessToken string, persist bool) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.getCopilotTokenURL(), nil)
+	ctResp, err := a.requestLegacyCopilotToken(ctx, accessToken)
 	if err != nil {
-		return fmt.Errorf("creating copilot token request: %w", err)
-	}
-	req.Header.Set("Authorization", "token "+accessToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "GitHubCopilotChat/0.26.7")
-
-	resp, err := a.do(req)
-	if err != nil {
-		return fmt.Errorf("requesting copilot token: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var ctResp CopilotTokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&ctResp); err != nil {
-		return fmt.Errorf("decoding copilot token response: %w", err)
-	}
-
-	if ctResp.Token == "" {
-		if resp.StatusCode == http.StatusUnauthorized || isInvalidAccessTokenDetail(ctResp.ErrorDetails) {
-			if strings.TrimSpace(ctResp.ErrorDetails) == "" {
-				return ErrInvalidAccessToken
-			}
-			return fmt.Errorf("%w: %s", ErrInvalidAccessToken, ctResp.ErrorDetails)
-		}
-		if resp.StatusCode != http.StatusOK {
-			if strings.TrimSpace(ctResp.ErrorDetails) != "" {
-				return fmt.Errorf("copilot token request failed with status %d: %s", resp.StatusCode, ctResp.ErrorDetails)
-			}
-			return fmt.Errorf("copilot token request failed with status %d", resp.StatusCode)
-		}
-		if strings.TrimSpace(ctResp.ErrorDetails) == "" {
-			return fmt.Errorf("empty copilot token")
-		}
-		return fmt.Errorf("empty copilot token: %s", ctResp.ErrorDetails)
-	}
-
-	if err := ctx.Err(); err != nil {
 		return err
 	}
+
 	a.copilotToken = ctResp.Token
 	a.tokenExpiry = time.Unix(ctResp.ExpiresAt-300, 0)
 
@@ -1019,6 +1131,51 @@ func (a *Authenticator) exchangeLegacyCopilotToken(ctx context.Context, accessTo
 		}
 	}
 	return nil
+}
+
+func (a *Authenticator) requestLegacyCopilotToken(ctx context.Context, accessToken string) (CopilotTokenResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.getCopilotTokenURL(), nil)
+	if err != nil {
+		return CopilotTokenResponse{}, fmt.Errorf("creating copilot token request: %w", err)
+	}
+	req.Header.Set("Authorization", "token "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "GitHubCopilotChat/0.26.7")
+
+	resp, err := a.do(req)
+	if err != nil {
+		return CopilotTokenResponse{}, fmt.Errorf("requesting copilot token: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var ctResp CopilotTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ctResp); err != nil {
+		return CopilotTokenResponse{}, fmt.Errorf("decoding copilot token response: %w", err)
+	}
+
+	if ctResp.Token == "" {
+		if resp.StatusCode == http.StatusUnauthorized || isInvalidAccessTokenDetail(ctResp.ErrorDetails) {
+			if strings.TrimSpace(ctResp.ErrorDetails) == "" {
+				return CopilotTokenResponse{}, ErrInvalidAccessToken
+			}
+			return CopilotTokenResponse{}, fmt.Errorf("%w: %s", ErrInvalidAccessToken, ctResp.ErrorDetails)
+		}
+		if resp.StatusCode != http.StatusOK {
+			if strings.TrimSpace(ctResp.ErrorDetails) != "" {
+				return CopilotTokenResponse{}, fmt.Errorf("copilot token request failed with status %d: %s", resp.StatusCode, ctResp.ErrorDetails)
+			}
+			return CopilotTokenResponse{}, fmt.Errorf("copilot token request failed with status %d", resp.StatusCode)
+		}
+		if strings.TrimSpace(ctResp.ErrorDetails) == "" {
+			return CopilotTokenResponse{}, fmt.Errorf("empty copilot token")
+		}
+		return CopilotTokenResponse{}, fmt.Errorf("empty copilot token: %s", ctResp.ErrorDetails)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return CopilotTokenResponse{}, err
+	}
+	return ctResp, nil
 }
 
 func newAuthHTTPClient(timeout time.Duration, useProxy bool) *http.Client {
