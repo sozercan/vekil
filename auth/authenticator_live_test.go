@@ -41,6 +41,9 @@ type liveCopilotModel struct {
 	ID                 string   `json:"id"`
 	SupportedEndpoints []string `json:"supported_endpoints"`
 	ModelPickerEnabled *bool    `json:"model_picker_enabled"`
+	Policy             struct {
+		State string `json:"state"`
+	} `json:"policy"`
 }
 
 type liveCopilotModelsResponse struct {
@@ -164,7 +167,7 @@ func TestLiveEnvAccessTokenDirectBearer(t *testing.T) {
 	}{
 		Model:           model,
 		Input:           "Reply with one word: OK.",
-		MaxOutputTokens: 256,
+		MaxOutputTokens: 1024,
 		Store:           false,
 		Stream:          false,
 	})
@@ -246,6 +249,14 @@ func TestSelectLiveCopilotResponsesModel(t *testing.T) {
 			want: "future-responses-model",
 		},
 		{
+			name: "skips policy-disabled model",
+			models: []liveCopilotModel{
+				liveCopilotModelWithPolicyState("gpt-5.6-luna", "disabled"),
+				{ID: "future-responses-model", SupportedEndpoints: []string{"/responses"}},
+			},
+			want: "future-responses-model",
+		},
+		{
 			name: "rejects missing responses support",
 			models: []liveCopilotModel{
 				{ID: "chat-only", SupportedEndpoints: []string{"/chat/completions"}},
@@ -304,6 +315,7 @@ func selectLiveCopilotResponsesModel(models []liveCopilotModel) string {
 	for _, model := range models {
 		id := strings.TrimSpace(model.ID)
 		if id == "" || (model.ModelPickerEnabled != nil && !*model.ModelPickerEnabled) ||
+			strings.EqualFold(strings.TrimSpace(model.Policy.State), "disabled") ||
 			!slices.Contains(model.SupportedEndpoints, responsesEndpoint) {
 			continue
 		}
@@ -318,6 +330,12 @@ func selectLiveCopilotResponsesModel(models []liveCopilotModel) string {
 		}
 	}
 	return fallback
+}
+
+func liveCopilotModelWithPolicyState(id, state string) liveCopilotModel {
+	model := liveCopilotModel{ID: id, SupportedEndpoints: []string{"/responses"}}
+	model.Policy.State = state
+	return model
 }
 
 func hasLiveCopilotOutputText(response liveCopilotResponsesResponse) bool {
