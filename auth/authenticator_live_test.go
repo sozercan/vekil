@@ -1,15 +1,27 @@
 package auth
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+)
+
+const (
+	liveCopilotBaseURL       = "https://api.githubcopilot.com"
+	liveCopilotIntegrationID = "vscode-chat"
 )
 
 type liveCopilotAuthObservation struct {
@@ -23,6 +35,29 @@ type liveCopilotAuthRecorder struct {
 
 	mu           sync.Mutex
 	observations []liveCopilotAuthObservation
+}
+
+type liveCopilotModel struct {
+	ID                 string   `json:"id"`
+	SupportedEndpoints []string `json:"supported_endpoints"`
+	ModelPickerEnabled *bool    `json:"model_picker_enabled"`
+}
+
+type liveCopilotModelsResponse struct {
+	Data []liveCopilotModel `json:"data"`
+}
+
+type liveCopilotResponsesResponse struct {
+	Object string `json:"object"`
+	Status string `json:"status"`
+	Output []struct {
+		Type    string `json:"type"`
+		Role    string `json:"role"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"output"`
 }
 
 func (r *liveCopilotAuthRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -75,7 +110,7 @@ func TestLiveEnvAccessTokenDirectBearer(t *testing.T) {
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel()
 	token, err := a.GetToken(ctx)
 	if err != nil {
@@ -93,31 +128,83 @@ func TestLiveEnvAccessTokenDirectBearer(t *testing.T) {
 		t.Fatal("GetToken() returned a different cached token")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.githubcopilot.com/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, liveCopilotBaseURL+"/models", nil)
 	if err != nil {
 		t.Fatalf("create live Copilot models request: %v", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "GitHubCopilotChat/0.26.7")
-	req.Header.Set("Editor-Version", "vscode/1.95.0")
-	req.Header.Set("Editor-Plugin-Version", "copilot-chat/0.26.7")
-	req.Header.Set("Copilot-Integration-Id", "vscode-chat")
+	setLiveCopilotRequestHeaders(req, token)
 
 	resp, err := a.client.Do(req)
 	if err != nil {
 		t.Fatalf("live Copilot models request failed: %v", err)
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("live Copilot models request returned status %d", resp.StatusCode)
+	var modelsResponse liveCopilotModelsResponse
+	if err := decodeLiveCopilotJSONResponse(resp, &modelsResponse); err != nil {
+		t.Fatalf("live Copilot models request failed: %v", err)
+	}
+	model := selectLiveCopilotResponsesModel(modelsResponse.Data)
+	if model == "" {
+		t.Fatal("live Copilot catalog did not advertise a /responses model")
+	}
+
+	responsesToken, err := a.GetResponsesToken(ctx)
+	if err != nil {
+		t.Fatalf("GetResponsesToken() live direct bearer failed: %v", err)
+	}
+	if responsesToken != envToken {
+		t.Fatal("GetResponsesToken() exchanged the fine-grained PAT instead of returning it directly")
+	}
+
+	requestBody, err := json.Marshal(struct {
+		Model           string `json:"model"`
+		Input           string `json:"input"`
+		MaxOutputTokens int    `json:"max_output_tokens"`
+		Store           bool   `json:"store"`
+		Stream          bool   `json:"stream"`
+	}{
+		Model:           model,
+		Input:           "Reply with one word: OK.",
+		MaxOutputTokens: 256,
+		Store:           false,
+		Stream:          false,
+	})
+	if err != nil {
+		t.Fatalf("encode live Copilot Responses request: %v", err)
+	}
+	responsesReq, err := http.NewRequestWithContext(ctx, http.MethodPost, liveCopilotBaseURL+"/responses", bytes.NewReader(requestBody))
+	if err != nil {
+		t.Fatalf("create live Copilot Responses request: %v", err)
+	}
+	setLiveCopilotRequestHeaders(responsesReq, responsesToken)
+
+	responsesHTTPResp, err := a.client.Do(responsesReq)
+	if err != nil {
+		t.Fatalf("live Copilot Responses request failed: %v", err)
+	}
+	var responsesResponse liveCopilotResponsesResponse
+	if err := decodeLiveCopilotJSONResponse(responsesHTTPResp, &responsesResponse); err != nil {
+		t.Fatalf("live Copilot Responses request failed: %v", err)
+	}
+	if responsesResponse.Object != "response" || responsesResponse.Status != "completed" {
+		t.Fatalf("live Copilot Responses object/status = %q/%q, want response/completed",
+			responsesResponse.Object, responsesResponse.Status)
+	}
+	if !hasLiveCopilotOutputText(responsesResponse) {
+		t.Fatal("live Copilot Responses request returned no non-empty output text")
 	}
 
 	observations := recorder.snapshot()
-	if len(observations) != 1 {
-		t.Fatalf("live Copilot requests = %d, want exactly one models request", len(observations))
+	wantObservations := []liveCopilotAuthObservation{
+		{host: "api.githubcopilot.com", path: "/models", statusCode: http.StatusOK},
+		{host: "api.githubcopilot.com", path: "/responses", statusCode: http.StatusOK},
 	}
-	assertLiveCopilotAuthObservation(t, observations[0], "api.githubcopilot.com", "/models", http.StatusOK)
+	if len(observations) != len(wantObservations) {
+		t.Fatalf("live Copilot requests = %d, want exactly one models request and one Responses request", len(observations))
+	}
+	for i := range wantObservations {
+		assertLiveCopilotAuthObservation(t, observations[i], wantObservations[i].host,
+			wantObservations[i].path, wantObservations[i].statusCode)
+	}
 
 	if a.accessToken != envToken || a.copilotToken != envToken {
 		t.Fatal("authenticator did not retain the environment token as the in-memory direct bearer")
@@ -133,6 +220,118 @@ func TestLiveEnvAccessTokenDirectBearer(t *testing.T) {
 			t.Fatalf("stat %s: %v", name, err)
 		}
 	}
+}
+
+func TestSelectLiveCopilotResponsesModel(t *testing.T) {
+	disabled := false
+	tests := []struct {
+		name   string
+		models []liveCopilotModel
+		want   string
+	}{
+		{
+			name: "prefers lightweight model",
+			models: []liveCopilotModel{
+				{ID: "gpt-5.6-sol", SupportedEndpoints: []string{"/responses"}},
+				{ID: "gpt-5.6-luna", SupportedEndpoints: []string{"/responses"}},
+			},
+			want: "gpt-5.6-luna",
+		},
+		{
+			name: "falls back to advertised model",
+			models: []liveCopilotModel{
+				{ID: "gpt-5.6-luna", SupportedEndpoints: []string{"/responses"}, ModelPickerEnabled: &disabled},
+				{ID: "future-responses-model", SupportedEndpoints: []string{"/responses"}},
+			},
+			want: "future-responses-model",
+		},
+		{
+			name: "rejects missing responses support",
+			models: []liveCopilotModel{
+				{ID: "chat-only", SupportedEndpoints: []string{"/chat/completions"}},
+				{ID: "", SupportedEndpoints: []string{"/responses"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := selectLiveCopilotResponsesModel(tt.models); got != tt.want {
+				t.Fatalf("selectLiveCopilotResponsesModel() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func setLiveCopilotRequestHeaders(req *http.Request, token string) {
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "GitHubCopilotChat/0.26.7")
+	req.Header.Set("Editor-Version", "vscode/1.95.0")
+	req.Header.Set("Editor-Plugin-Version", "copilot-chat/0.26.7")
+	req.Header.Set("Copilot-Integration-Id", liveCopilotIntegrationID)
+	req.Header.Set("X-GitHub-Api-Version", "2025-05-01")
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	if req.Method != http.MethodGet {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Openai-Intent", "conversation-panel")
+	}
+}
+
+func decodeLiveCopilotJSONResponse(resp *http.Response, target any) error {
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		detail, err := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		if err != nil {
+			return fmt.Errorf("status %d (reading error detail: %w)", resp.StatusCode, err)
+		}
+		if trimmed := strings.TrimSpace(string(detail)); trimmed != "" {
+			return fmt.Errorf("status %d: %s", resp.StatusCode, trimmed)
+		}
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(target); err != nil {
+		return fmt.Errorf("decoding status 200 response: %w", err)
+	}
+	return nil
+}
+
+func selectLiveCopilotResponsesModel(models []liveCopilotModel) string {
+	const responsesEndpoint = "/responses"
+	preferred := []string{"gpt-5.6-luna", "gpt-5.4-mini", "gpt-5-mini"}
+	available := make(map[string]struct{}, len(models))
+	fallback := ""
+	for _, model := range models {
+		id := strings.TrimSpace(model.ID)
+		if id == "" || (model.ModelPickerEnabled != nil && !*model.ModelPickerEnabled) ||
+			!slices.Contains(model.SupportedEndpoints, responsesEndpoint) {
+			continue
+		}
+		available[id] = struct{}{}
+		if fallback == "" {
+			fallback = id
+		}
+	}
+	for _, model := range preferred {
+		if _, ok := available[model]; ok {
+			return model
+		}
+	}
+	return fallback
+}
+
+func hasLiveCopilotOutputText(response liveCopilotResponsesResponse) bool {
+	for _, output := range response.Output {
+		if output.Type != "message" || output.Role != "assistant" {
+			continue
+		}
+		for _, content := range output.Content {
+			if content.Type == "output_text" && strings.TrimSpace(content.Text) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func assertLiveCopilotAuthObservation(t *testing.T, got liveCopilotAuthObservation, wantHost, wantPath string, wantStatus int) {
