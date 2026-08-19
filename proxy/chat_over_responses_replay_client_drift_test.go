@@ -76,7 +76,7 @@ func requireStoreRejectsArguments(t *testing.T, store *responsesChatReplayStore,
 	}
 }
 
-// A carrier must not restore reasoning or upstream call bindings for arguments the replay
+// A carrier must not restore reasoning or opaque call bindings for arguments the replay
 // store itself rejects. These edits were observed from clients, but they are not equivalent
 // to the call Vekil published unless the publication explicitly recorded a schema default.
 func TestClientRewrittenArgumentsAreRejectedByCarrier(t *testing.T) {
@@ -147,8 +147,8 @@ func TestCarrierAcceptsPublishedOptionalDefaultNormalization(t *testing.T) {
 	if !strings.Contains(input, `"encrypted_content":"OPAQUE"`) {
 		t.Fatalf("carrier lost reasoning for an accepted normalization: %s", input)
 	}
-	if got := restoredFunctionCall(t, input); got["call_id"] != "upstream-call-1" || got["arguments"] != returned {
-		t.Fatalf("restored call = %#v, want upstream binding and normalized arguments", got)
+	if got := restoredFunctionCall(t, input); got["call_id"] != callID || got["arguments"] != returned {
+		t.Fatalf("restored call = %#v, want opaque binding and normalized arguments", got)
 	}
 }
 

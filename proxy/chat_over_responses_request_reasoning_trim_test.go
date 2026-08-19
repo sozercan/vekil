@@ -64,21 +64,25 @@ func publishTrimmableTurns(t *testing.T, store *responsesChatReplayStore, route 
 				`{"content":[],"encrypted_content":"cipher-%d-%d-%s","id":"rs-%d-%d","summary":[],"type":"reasoning"}`,
 				i, j, strings.Repeat("z", 64), i, j)))
 		}
+		expectedCallID := upstreamID
+		if carrier {
+			expectedCallID = projected.ID
+		}
 		turn.call = json.RawMessage(fmt.Sprintf(
-			`{"arguments":%q,"call_id":%q,"name":"probe","type":"function_call"}`, arguments, upstreamID))
+			`{"arguments":%q,"call_id":%q,"name":"probe","type":"function_call"}`, arguments, expectedCallID))
 		if !carrier {
 			turn.reasoning = append([]json.RawMessage{}, outputItems[:callIndex]...)
 			turn.call = outputItems[callIndex]
 		}
 		turn.tail = []json.RawMessage{
-			json.RawMessage(fmt.Sprintf(`{"call_id":%q,"output":"tool-output-%d","type":"function_call_output"}`, upstreamID, i)),
+			json.RawMessage(fmt.Sprintf(`{"call_id":%q,"output":"tool-output-%d","type":"function_call_output"}`, expectedCallID, i)),
 			json.RawMessage(fmt.Sprintf(`{"content":[{"text":"ping-%d","type":"input_text"}],"role":"user","type":"message"}`, i)),
 			json.RawMessage(fmt.Sprintf(`{"content":"note-%d","role":"assistant"}`, i)),
 		}
 		if carrier {
 			carried[projected.ID] = carriedReplay{
-				Items:            outputItems,
-				Calls:            map[string]carriedCall{projected.ID: {ProxyID: projected.ID, UpstreamID: upstreamID, Name: "probe", ItemIndex: callIndex}},
+				Items:            clientSafeCarrierItems(outputItems),
+				Calls:            map[string]carriedCall{projected.ID: {ProxyID: projected.ID, Name: "probe", ItemIndex: callIndex}},
 				RouteDigest:      carriedRouteDigest(route),
 				ProjectionDigest: carriedProjectionDigest([]byte(`""`), published.Projection.Calls),
 			}
@@ -230,10 +234,34 @@ func TestTranslateChatMessagesToResponsesKeepsUpstreamInputPrefixStableWithinBlo
 	forEachReasoningSource(t, func(t *testing.T, carrier bool) {
 		for _, sweep := range sweeps {
 			t.Run(fmt.Sprintf("from-%d-step-%d", sweep.first, sweep.step), func(t *testing.T) {
+				store, route := newCarrierReplayFixture(t)
+				messages, _, carried := publishTrimmableTurns(t, store, route, sweep.last, carrier)
+				options := responsesChatRequestOptions{
+					UpstreamModel: "gpt-upstream",
+					ReplayRoute:   route,
+				}
+				if carrier {
+					// Use one forgotten store for every prefix. A growing real transcript
+					// reuses the opaque IDs it was originally handed; reminting each prefix
+					// would make byte-prefix comparison meaningless.
+					expired := newResponsesChatReplayStore()
+					t.Cleanup(func() { _ = expired.Close() })
+					options.CarriedReasoning = carried
+					options.ReplayStore = expired
+				} else {
+					options.ReplayStore = store
+				}
 				var previous []byte
 				previousCount := 0
 				for count := sweep.first; count <= sweep.last; count += sweep.step {
-					encoded, _ := trimmableTurnsUpstreamInput(t, count, carrier, nil)
+					input, err := translateChatMessagesToResponses(messages[:count*4], options)
+					if err != nil {
+						t.Fatalf("translateChatMessagesToResponses() error = %v", err)
+					}
+					encoded, err := json.Marshal(input)
+					if err != nil {
+						t.Fatal(err)
+					}
 					if previous != nil {
 						// "[a,b]" extends to "[a,b,c]": drop the close, require the separator, so a
 						// break can only land where a whole new item starts.

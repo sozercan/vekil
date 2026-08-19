@@ -554,19 +554,18 @@ for signature in shared_carriers:
     for call in calls:
         if call.get("proxy_id") != tool_id or call.get("name") != "Bash":
             continue
-        upstream_id = call.get("upstream_id", "")
         item_index = call.get("item_index")
         items = payload.get("items") or []
-        if not upstream_id or not isinstance(item_index, int) or not (0 <= item_index < len(items)):
+        if "upstream_id" in call or not isinstance(item_index, int) or not (0 <= item_index < len(items)):
             continue
         item = items[item_index]
-        if item.get("type") == "function_call" and item.get("call_id") == upstream_id and item.get("name") == "Bash":
+        if item.get("type") == "function_call" and "call_id" not in item and "name" not in item:
             carrier_matches_tool = True
             break
     if carrier_matches_tool:
         break
 if not carrier_matches_tool:
-    fail("the carrier did not bind the returned proxy and upstream tool ids")
+    fail("the carrier did not bind the returned opaque tool id without provider state")
 
 if mode == "first":
     raise SystemExit(0)
@@ -594,7 +593,7 @@ if assistant_text != [final_marker]:
 
 print("PASS isolated-api-key-settings")
 print("PASS carrier-signature-preserved")
-print("PASS carrier-tool-ids-match")
+print("PASS carrier-opaque-id-only")
 print("PASS exact-final-sentinel")
 PY_VALIDATE
 }

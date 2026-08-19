@@ -119,19 +119,22 @@ call_vekil_<22-character-base64url>
 ```
 
 Clients must return the ID unchanged and must not construct, edit, or parse it. It never embeds the
-upstream provider's `call_id`; that mapping remains in Vekil's bounded process-local replay state or,
-for Anthropic ingress, in the reasoning carrier returned with the assistant turn.
+upstream provider's `call_id`; that mapping remains only in Vekil's bounded process-local replay
+state. An Anthropic reasoning carrier contains encrypted reasoning, ordering placeholders, and the
+opaque public call bindings needed to validate the visible transcript, but no provider call ID.
 
 Restoring hidden Responses output requires that replay state or a valid reasoning carrier. **The
 carrier is a client obligation, not just the ID.** On `/v1/messages`, reasoning rides in the
 `signature` of an assistant `thinking` block whose text is empty. Return assistant `thinking` blocks
 in history unchanged, signature included. A direct-route continuation can use a valid carrier after
-the replay store is lost to restore both hidden reasoning and the upstream call mapping. If the
-client drops or rewrites the carrier, Anthropic ingress and its count-token probe may instead rebuild
-only the visible transcript and forward the opaque `call_vekil_...` ID upstream as the `call_id`,
-losing reasoning continuity. That fallback is sound only because the whole turn is replayed in one
-request with `store: false`, so a `call_id` needs to agree with its own `function_call_output` and
-nothing else.
+the replay store is lost to restore hidden reasoning while rebuilding both the function call and its
+output under the opaque `call_vekil_...` ID. If the client drops or rewrites the carrier, Anthropic
+ingress and its count-token probe may instead rebuild only the visible transcript under that same
+opaque ID, losing reasoning continuity. Both paths are sound only because the whole turn is replayed
+in one request with `store: false`, so a `call_id` needs to agree with its own
+`function_call_output` and nothing else. Carrier signatures are cumulatively capped at 2 MiB of the
+client's replayed wire bytes; once the budget is full, or the next complete carrier would cross it,
+Vekil emits no new carrier and later state loss uses the visible-transcript fallback.
 
 `/v1/chat/completions` and `/v1/responses` do not opt into that visible-transcript fallback; when the
 replay state is unavailable, they return `responses_replay_state_missing`. A **policy profile** also

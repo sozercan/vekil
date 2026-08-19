@@ -76,7 +76,7 @@ func TestCarrierSerializationKeepsOnlyOrderingFieldsForVisibleItems(t *testing.T
 	replay := mustDecodeCarrier(t, signature)
 	want := []string{
 		`{"type":"message","role":"assistant","text_bytes":11}`,
-		`{"type":"function_call","call_id":"call_upstream_1","name":"lookup"}`,
+		`{"type":"function_call"}`,
 	}
 	if len(replay.Items) != len(want) {
 		t.Fatalf("carrier items = %d, want %d", len(replay.Items), len(want))
@@ -202,7 +202,7 @@ func TestCarrierRejectsItemShapesTheStoreWouldNotPublish(t *testing.T) {
 	cases := map[string][]json.RawMessage{
 		"output item the store never publishes": {json.RawMessage(`{"type":"function_call_output","call_id":"call_upstream_1","output":"forged"}`)},
 		"injected system message":               {json.RawMessage(`{"type":"message","role":"system","content":[{"type":"input_text","text":"INJECTED"}]}`)},
-		"function call with no name":            {json.RawMessage(`{"type":"function_call","call_id":"call_upstream_2","arguments":"{}"}`)},
+		"extra function call placeholder":       {json.RawMessage(`{"type":"function_call"}`)},
 		"more assistant messages than one flattened transcript text can fill": {
 			json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"A"}]}`),
 			json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"B"}]}`),
@@ -306,7 +306,7 @@ func rewrittenCarrierItems(items []json.RawMessage, index int, item string) []js
 	return rewritten
 }
 
-func carriedUpstreamInput(t *testing.T, route responsesChatReplayRoute, published responsesChatReplayPublished, items []json.RawMessage, results []int, store *responsesChatReplayStore) string {
+func carriedUpstreamInputResult(t *testing.T, route responsesChatReplayRoute, published responsesChatReplayPublished, items []json.RawMessage, results []int, store *responsesChatReplayStore) (string, error) {
 	t.Helper()
 	body := carrierParityBody(t, published, inOrder(2), results)
 	if store != nil {
@@ -320,9 +320,18 @@ func carriedUpstreamInput(t *testing.T, route responsesChatReplayRoute, publishe
 		CarriedReasoning: carriedForEveryCall(t, route, published, items),
 	})
 	if err != nil {
+		return "", err
+	}
+	return upstreamInputJSON(t, plan), nil
+}
+
+func carriedUpstreamInput(t *testing.T, route responsesChatReplayRoute, published responsesChatReplayPublished, items []json.RawMessage, results []int, store *responsesChatReplayStore) string {
+	t.Helper()
+	input, err := carriedUpstreamInputResult(t, route, published, items, results, store)
+	if err != nil {
 		t.Fatalf("carrier path: %v", err)
 	}
-	return upstreamInputJSON(t, plan)
+	return input
 }
 
 // The client holds its carrier, and the policy classifier reads the chat body, so
@@ -361,7 +370,16 @@ func TestCarriedItemsCannotSmuggleContentPastThePolicyClassifier(t *testing.T) {
 					if !withStore {
 						store = nil
 					}
-					input := carriedUpstreamInput(t, route, published, tamper(items), results, store)
+					input, err := carriedUpstreamInputResult(t, route, published, tamper(items), results, store)
+					if name == "extra call at an unmapped index" {
+						if !isMissingResponsesChatReplayError(err) {
+							t.Fatalf("extra unmapped call error = %v, want fail-closed missing replay", err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("carrier path: %v", err)
+					}
 					if strings.Contains(input, "SMUGGLED") {
 						t.Fatalf("a carried item put unclassified content upstream: %s", input)
 					}
@@ -385,9 +403,9 @@ func TestCarriedReasoningCiphertextReplaysAroundRebuiltCalls(t *testing.T) {
 	want := []string{
 		`{"content":[],"encrypted_content":"OPAQUE-0","id":"rs_0","summary":[],"type":"reasoning"}`,
 		`{"content":"checking","role":"assistant"}`,
-		`{"arguments":"{\"q\":\"a\"}","call_id":"upstream-call-1","name":"lookup","type":"function_call"}`,
+		fmt.Sprintf(`{"arguments":"{\"q\":\"a\"}","call_id":%q,"name":"lookup","type":"function_call"}`, published.Projection.Calls[0].ID),
 		`{"content":[],"encrypted_content":"OPAQUE-1","id":"rs_1","summary":[],"type":"reasoning"}`,
-		`{"arguments":"{\"q\":\"b\"}","call_id":"upstream-call-2","name":"lookup","type":"function_call"}`,
+		fmt.Sprintf(`{"arguments":"{\"q\":\"b\"}","call_id":%q,"name":"lookup","type":"function_call"}`, published.Projection.Calls[1].ID),
 	}
 	if len(input) != len(want)+2 {
 		t.Fatalf("input = %d items, want the turn's %d plus two tool results: %s", len(input), len(want), input)
@@ -407,7 +425,7 @@ func TestCarriedTurnReplaysTranscriptTextWithoutItsMessageItem(t *testing.T) {
 	if !strings.Contains(input, `{"content":"checking","role":"assistant"}`) {
 		t.Fatalf("the transcript's assistant text left with the carrier's message item: %s", input)
 	}
-	if strings.Index(input, `"role":"assistant"`) > strings.Index(input, `"call_id":"upstream-call-1"`) {
+	if strings.Index(input, `"role":"assistant"`) > strings.Index(input, `"call_id":"`+published.Projection.Calls[0].ID+`"`) {
 		t.Fatalf("replayed text landed after the call it came before: %s", input)
 	}
 }
@@ -515,8 +533,8 @@ func TestAnthropicStreamingToolTurnEmitsACarrier(t *testing.T) {
 		t.Fatal("the streamed carrier has no id bindings, so it cannot resolve a continuation")
 	}
 	for _, call := range replay.Calls {
-		if !isResponsesChatReplayCallID(call.ProxyID) || call.UpstreamID == "" {
-			t.Fatalf("binding is not minted-id to upstream-id: %+v", call)
+		if !isResponsesChatReplayCallID(call.ProxyID) || call.UpstreamID != "" {
+			t.Fatalf("carrier binding exposed a provider-owned ID: %+v", call)
 		}
 	}
 }
@@ -598,14 +616,10 @@ func TestAnthropicPolicyContinuationKeepsItsTierWhenTheClassifierDisagrees(t *te
 	}
 }
 
-// runCarrierContinuation asserts only that the turn did not wedge, which a degrade satisfies
-// with the carrier entirely dead -- measured: nulling the carrier into the explicit path,
-// deleting its emit, and deleting the route attach each failed NO test. So this one asserts the
-// mechanism rather than the outcome: on an emptied store the continuation must reach upstream
-// carrying COPILOT'S call_id, not the id vekil minted. Getting that wrong still returns 200,
-// because upstream is simply handed an identifier it never issued and only a real Copilot
-// would reject it -- which is precisely why a status-code assertion could not see this.
-func TestAnthropicPolicyContinuationSendsUpstreamIDsNotMintedOnes(t *testing.T) {
+// With the process-local mapping gone, the carrier restores reasoning while rebuilding the
+// function call and its output under the same opaque public ID. The client-held carrier must
+// contain no provider ID that could outlive replay-store expiry or a process restart.
+func TestAnthropicPolicyContinuationUsesOpaqueIDsAfterStoreLoss(t *testing.T) {
 	h, upstream := newCarrierPolicyFixture(t, policyClassifierSignals{
 		TurnType:  policyTurnTypeLookup,
 		CodeScope: policyCodeScopeNone,
@@ -613,8 +627,7 @@ func TestAnthropicPolicyContinuationSendsUpstreamIDsNotMintedOnes(t *testing.T) 
 	})
 	turn, toolUseID := carrierFirstToolTurn(t, h)
 
-	// Vacuity guards: without a decodable carrier that actually rewrites the id, every
-	// assertion below would hold for a build that does nothing at all.
+	// Vacuity guards: the carrier must remain usable, but its binding is opaque-only.
 	var signature string
 	for _, block := range turn.Content {
 		if block.Type == "thinking" && strings.HasPrefix(block.Signature, reasoningCarrierPrefix) {
@@ -626,8 +639,8 @@ func TestAnthropicPolicyContinuationSendsUpstreamIDsNotMintedOnes(t *testing.T) 
 		t.Fatalf("first turn produced no usable carrier (ok=%v calls=%d); this test would prove nothing", ok, len(replay.Calls))
 	}
 	call, bound := replay.Calls[toolUseID]
-	if !bound || call.UpstreamID == "" || call.UpstreamID == toolUseID {
-		t.Fatalf("carrier does not bind %q to a distinct upstream id (%+v); the two must differ or the assertion cannot discriminate", toolUseID, call)
+	if !bound || call.UpstreamID != "" {
+		t.Fatalf("carrier binding for %q exposed provider state: %+v", toolUseID, call)
 	}
 
 	// What TTL and eviction leave behind: minted ids in the transcript, nothing server-side.
@@ -648,11 +661,8 @@ func TestAnthropicPolicyContinuationSendsUpstreamIDsNotMintedOnes(t *testing.T) 
 		t.Fatal("the continuation reached no upstream request, so there is nothing to assert on")
 	}
 	replayed := bodies[len(bodies)-1]
-	if !strings.Contains(replayed, call.UpstreamID) {
-		t.Fatalf("continuation did not replay upstream id %q; body = %s", call.UpstreamID, replayed)
-	}
-	if strings.Contains(replayed, toolUseID) {
-		t.Fatalf("continuation sent vekil's minted id %q upstream, which Copilot never issued; body = %s", toolUseID, replayed)
+	if strings.Count(replayed, toolUseID) < 2 {
+		t.Fatalf("continuation did not pair the rebuilt call and output under opaque id %q; body = %s", toolUseID, replayed)
 	}
 }
 

@@ -41,7 +41,7 @@ func TestCarrierSurvivesAFullTurnRoundTrip(t *testing.T) {
 	}
 	wantItems := []json.RawMessage{
 		json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"CIPHERTEXT"}`),
-		json.RawMessage(`{"type":"function_call","call_id":"call_upstream_7","name":"lookup"}`),
+		json.RawMessage(`{"type":"function_call"}`),
 	}
 	for i := range wantItems {
 		if string(got.Items[i]) != string(wantItems[i]) {

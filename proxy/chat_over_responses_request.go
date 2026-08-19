@@ -634,8 +634,7 @@ func logCarriedReasoningStarved(log *logger.Logger, starved bool, model string) 
 
 // One line per request, not per turn. Measured on a live session: the per-turn form emitted
 // 509 warnings in a single request and 15,779 in half an hour, which buries the anomaly the
-// reason-logging exists to surface. Counts and enumerated reasons only -- never content, and
-// never the IDs, which now carry Copilot's own ID verbatim.
+// reason-logging exists to surface. Counts and enumerated reasons only -- never content or IDs.
 type responsesChatRestoreTally struct {
 	turns       int
 	calls       int

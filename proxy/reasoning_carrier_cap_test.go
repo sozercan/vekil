@@ -93,48 +93,44 @@ func emittedSignature(t *testing.T, turn carriedTurn) string {
 	return blocks[0].Signature
 }
 
-// Past the budget the carrier is the id mapping and nothing else: the reasoning
-// ciphertext is the whole of what it stops carrying.
-func TestCarrierPastBudgetKeepsOnlyTheIdMapping(t *testing.T) {
+// The wire budget is cumulative. Once it is saturated, or the next complete carrier
+// would cross it, the response must not add another client-held blob.
+func TestCarrierBudgetSuppressesNewCarrier(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
 	route, items, published := capFixture(t, store)
 
-	payload := string(carrierPayloadBytes(t, emittedSignature(t, carriedTurnFromPublished(route, items, published, atBudget()))))
-	for _, forbidden := range []string{carrierCapCiphertext, "encrypted_content", `"type":"reasoning"`, "secret-prompt-text"} {
-		if strings.Contains(payload, forbidden) {
-			t.Fatalf("capped carrier still carries %q: %s", forbidden, payload)
-		}
+	if signature, err := encodeReasoningCarrier(carriedTurnFromPublished(route, items, published, atBudget())); err != nil || signature != "" {
+		t.Fatalf("carrier at a saturated budget = %q, %v; want no carrier", signature, err)
 	}
-	for _, want := range []string{`"upstream_id":"upstream-call-1"`, `"name":"lookup"`, `"proxy_id":"` + published.Projection.Calls[0].ID + `"`} {
-		if !strings.Contains(payload, want) {
-			t.Fatalf("capped carrier dropped the mapping field %s: %s", want, payload)
-		}
+
+	baseline, err := encodeReasoningCarrier(carriedTurnFromPublished(route, items, published, carrierEmit{}))
+	if err != nil || baseline == "" {
+		t.Fatalf("baseline carrier = %q, %v", baseline, err)
 	}
-	var decoded reasoningCarrierPayload
-	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if len(decoded.Items) != 0 {
-		t.Fatalf("capped carrier carried %d items, want none: %s", len(decoded.Items), payload)
-	}
-	if len(decoded.Calls) != 1 || decoded.Calls[0].ItemIndex != 1 {
-		t.Fatalf("capped carrier lost the call ordering: %#v", decoded.Calls)
-	}
-	if decoded.ProjectionDigest == "" || decoded.RouteDigest == "" || decoded.RouteTag == "" {
-		t.Fatalf("capped carrier dropped a binding the restore checks: %s", payload)
+	remaining := len(baseline) - 1
+	emit := carrierEmit{Inbound: carrierInbound{Carriers: 1, Bytes: reasoningCarrierInboundBudget - remaining}}
+	if signature, err := encodeReasoningCarrier(carriedTurnFromPublished(route, items, published, emit)); err != nil || signature != "" {
+		t.Fatalf("carrier crossing the cumulative budget = %q, %v; want no carrier", signature, err)
 	}
 }
 
-// The wedge this prevents: the store forgot the group, and without a usable carrier the
-// turn cannot be rebuilt at all. The mapping alone has to be enough.
-func TestMappingOnlyCarrierRebuildsAForgottenTurn(t *testing.T) {
+// After store loss, the carrier restores only the reasoning ciphertext and ordering.
+// Both sides of the visible call/result pair are rebuilt under the public opaque ID;
+// the provider-owned ID never leaves process-local replay state.
+func TestCarrierRebuildsAForgottenTurnWithOpaqueCallID(t *testing.T) {
 	minting := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = minting.Close() })
 	route, items, published := capFixture(t, minting)
 	callID := published.Projection.Calls[0].ID
 
-	signature := emittedSignature(t, carriedTurnFromPublished(route, items, published, atBudget()))
+	signature := emittedSignature(t, carriedTurnFromPublished(route, items, published, carrierEmit{}))
+	payload := string(carrierPayloadBytes(t, signature))
+	for _, forbidden := range []string{`"upstream_id"`, `"call_id"`, "upstream-call-1", "secret-prompt-text"} {
+		if strings.Contains(payload, forbidden) {
+			t.Fatalf("client carrier exposed %q: %s", forbidden, payload)
+		}
+	}
 	blocks, err := json.Marshal([]models.ContentBlock{
 		{Type: "thinking", Thinking: stringPtr(""), Signature: signature},
 		{Type: "tool_use", ID: callID, Name: "lookup", Input: json.RawMessage(`{"q":"secret-prompt-text"}`)},
@@ -144,7 +140,7 @@ func TestMappingOnlyCarrierRebuildsAForgottenTurn(t *testing.T) {
 	}
 	carried, _ := extractCarriedReasoning([]models.AnthropicMessage{{Role: "assistant", Content: blocks}})
 	if _, ok := carried[callID]; !ok {
-		t.Fatal("a mapping-only carrier was discarded on the way back in")
+		t.Fatal("the carrier was discarded on the way back in")
 	}
 
 	body, err := json.Marshal(map[string]any{
@@ -166,7 +162,7 @@ func TestMappingOnlyCarrierRebuildsAForgottenTurn(t *testing.T) {
 		UpstreamModel: "gpt-upstream", ReplayStore: forgotten, ReplayRoute: route, CarriedReasoning: carried,
 	})
 	if err != nil {
-		t.Fatalf("a forgotten group wedged instead of rebuilding from the mapping: %v", err)
+		t.Fatalf("a forgotten group wedged instead of rebuilding from the carrier: %v", err)
 	}
 
 	input := upstreamInputJSON(t, plan)
@@ -186,8 +182,8 @@ func TestMappingOnlyCarrierRebuildsAForgottenTurn(t *testing.T) {
 	if call == nil || output == nil {
 		t.Fatalf("rebuilt turn lost its mandatory call/result pair: %s", input)
 	}
-	if call["call_id"] != "upstream-call-1" || output["call_id"] != "upstream-call-1" {
-		t.Fatalf("rebuilt turn lost the minted upstream binding: %s", input)
+	if call["call_id"] != callID || output["call_id"] != callID {
+		t.Fatalf("rebuilt turn did not use the opaque proxy ID consistently: %s", input)
 	}
 	if call["name"] != "lookup" || call["arguments"] != `{"q":"secret-prompt-text"}` {
 		t.Fatalf("rebuilt call = %#v, want the visible tool call", call)
@@ -195,12 +191,15 @@ func TestMappingOnlyCarrierRebuildsAForgottenTurn(t *testing.T) {
 	if !strings.Contains(input, "checking") {
 		t.Fatalf("rebuilt turn dropped the visible assistant text: %s", input)
 	}
-	if strings.Contains(input, carrierCapCiphertext) {
-		t.Fatalf("a capped carrier must not resurrect reasoning: %s", input)
+	if !strings.Contains(input, carrierCapCiphertext) {
+		t.Fatalf("the carrier lost its reasoning ciphertext: %s", input)
+	}
+	if strings.Contains(input, "upstream-call-1") {
+		t.Fatalf("the restored request reused a provider-owned call ID: %s", input)
 	}
 }
 
-func TestMappingOnlyCarrierPreservesTextAfterCallOrder(t *testing.T) {
+func TestCarrierPreservesTextAfterCallOrder(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
@@ -220,9 +219,9 @@ func TestMappingOnlyCarrierPreservesTextAfterCallOrder(t *testing.T) {
 		t.Fatalf("Publish() error = %v", err)
 	}
 	callID := published.Projection.Calls[0].ID
-	replay := mustDecodeCarrier(t, emittedSignature(t, carriedTurnFromPublished(route, items, published, atBudget())))
-	if len(replay.Items) != 0 || replay.TextItemIndex == nil || *replay.TextItemIndex != 1 {
-		t.Fatalf("mapping-only carrier = items %d text slot %v, want no items and slot 1", len(replay.Items), replay.TextItemIndex)
+	replay := mustDecodeCarrier(t, emittedSignature(t, carriedTurnFromPublished(route, items, published, carrierEmit{})))
+	if len(replay.Items) != 2 || replay.TextItemIndex == nil || *replay.TextItemIndex != 1 {
+		t.Fatalf("carrier = items %d text slot %v, want two items and slot 1", len(replay.Items), replay.TextItemIndex)
 	}
 
 	body, err := json.Marshal(map[string]any{
@@ -266,6 +265,9 @@ func TestMappingOnlyCarrierPreservesTextAfterCallOrder(t *testing.T) {
 	if callIndex < 0 || textIndex < 0 || callIndex >= textIndex {
 		t.Fatalf("rebuilt order call=%d text=%d, want call before text: %#v", callIndex, textIndex, restored)
 	}
+	if restored[callIndex]["call_id"] != callID {
+		t.Fatalf("rebuilt call ID = %#v, want opaque proxy ID %q", restored[callIndex]["call_id"], callID)
+	}
 }
 
 // Below the budget the carrier keeps ciphertext and bindings but no hidden reasoning text.
@@ -276,11 +278,10 @@ func TestCarrierBelowBudgetIsByteIdentical(t *testing.T) {
 	route, items, published := capFixture(t, store)
 	safeItems := []json.RawMessage{
 		json.RawMessage(`{"type":"reasoning","id":"rs_cap","encrypted_content":"` + carrierCapCiphertext + `"}`),
-		json.RawMessage(`{"type":"function_call","call_id":"upstream-call-1","name":"lookup"}`),
+		json.RawMessage(`{"type":"function_call"}`),
 	}
 	calls := []carriedCall{{
-		ProxyID: published.Calls[0].ProxyCallID, UpstreamID: published.Calls[0].UpstreamCallID,
-		Name: published.Calls[0].Name, ItemIndex: published.Calls[0].OutputItemIndex,
+		ProxyID: published.Calls[0].ProxyCallID, Name: published.Calls[0].Name, ItemIndex: published.Calls[0].OutputItemIndex,
 		VisibleArgumentDigest:  hex.EncodeToString(published.Calls[0].visibleArgumentHash[:]),
 		OriginalArgumentDigest: hex.EncodeToString(published.Calls[0].originalArgumentHash[:]),
 	}}
@@ -292,16 +293,16 @@ func TestCarrierBelowBudgetIsByteIdentical(t *testing.T) {
 	}
 
 	want := precapCarrierSignature(t, fmt.Sprintf(
-		`{"items":[%s,%s],"calls":[{"proxy_id":%q,"upstream_id":%q,"name":%q,"item_index":%d,`+
+		`{"items":[%s,%s],"calls":[{"proxy_id":%q,"name":%q,"item_index":%d,`+
 			`"visible_argument_digest":%q,"original_argument_digest":%q}],`+
 			`"route_digest":%q,"route_tag":%q,"projection_digest":%q,"original_projection_digest":%q}`,
 		safeItems[0], safeItems[1],
-		published.Calls[0].ProxyCallID, published.Calls[0].UpstreamCallID, published.Calls[0].Name, published.Calls[0].OutputItemIndex,
+		published.Calls[0].ProxyCallID, published.Calls[0].Name, published.Calls[0].OutputItemIndex,
 		calls[0].VisibleArgumentDigest, calls[0].OriginalArgumentDigest,
 		precapFixtureRouteDigest, reasoningCarrierRouteTag(unsigned), projectionDigest, originalProjectionDigest,
 	))
 
-	for _, emit := range []carrierEmit{{}, {Inbound: carrierInbound{Carriers: 1, Bytes: reasoningCarrierInboundBudget - 1}}} {
+	for _, emit := range []carrierEmit{{}, {Inbound: carrierInbound{Carriers: 1, Bytes: reasoningCarrierInboundBudget - len(want)}}} {
 		got := emittedSignature(t, carriedTurnFromPublished(route, items, published, emit))
 		if got != want {
 			t.Fatalf("below-budget carrier changed shape at %d inbound bytes:\n got %s\nwant %s\npayload %s",
@@ -309,6 +310,11 @@ func TestCarrierBelowBudgetIsByteIdentical(t *testing.T) {
 		}
 		if !strings.Contains(string(carrierPayloadBytes(t, got)), carrierCapCiphertext) {
 			t.Fatalf("below-budget carrier stopped carrying reasoning at %d inbound bytes", emit.Inbound.Bytes)
+		}
+		for _, forbidden := range []string{`"upstream_id"`, `"call_id"`, "upstream-call-1"} {
+			if strings.Contains(string(carrierPayloadBytes(t, got)), forbidden) {
+				t.Fatalf("below-budget carrier exposed %q: %s", forbidden, carrierPayloadBytes(t, got))
+			}
 		}
 	}
 }
@@ -357,26 +363,26 @@ func precapCarrierSignature(t *testing.T, payload string) string {
 
 // A silent degrade is the failure mode this project keeps paying for, so the cap says
 // what it dropped -- and says it in counts and bytes, never in ciphertext or prompt text.
-func TestCarrierMapOnlyDegradeIsLogged(t *testing.T) {
+func TestCarrierSuppressionIsLogged(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
 	route, items, published := capFixture(t, store)
 
 	var logs bytes.Buffer
 	log := logger.NewWithWriter(logger.LevelDebug, &logs)
-	carriedTurnFromPublished(route, items, published, carrierEmit{Log: log})
+	_, _ = encodeReasoningCarrier(carriedTurnFromPublished(route, items, published, carrierEmit{Log: log}))
 	if logs.Len() != 0 {
 		t.Fatalf("a below-budget carrier logged a degrade: %s", logs.String())
 	}
 
 	emit := atBudget()
 	emit.Log = log
-	carriedTurnFromPublished(route, items, published, emit)
+	_, _ = encodeReasoningCarrier(carriedTurnFromPublished(route, items, published, emit))
 	var entry map[string]any
 	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
 		t.Fatalf("unmarshal %q: %v", logs.String(), err)
 	}
-	if entry["level"] != "debug" || entry["msg"] != "reasoning carrier capped to its id mapping; the client's replay is at budget" {
+	if entry["level"] != "debug" || entry["msg"] != "reasoning carrier omitted; the client's replay reached its byte budget" {
 		t.Fatalf("degrade log = %#v", entry)
 	}
 	if entry["model"] != "gpt-public" {
@@ -388,7 +394,8 @@ func TestCarrierMapOnlyDegradeIsLogged(t *testing.T) {
 		"budget_bytes":            float64(reasoningCarrierInboundBudget),
 		"dropped_reasoning_items": 1,
 		"dropped_reasoning_bytes": float64(len(items[0])),
-		"mapped_calls":            1,
+		"dropped_calls":           1,
+		"candidate_carrier_bytes": 0,
 	} {
 		if got, ok := entry[field].(float64); !ok || got != want {
 			t.Fatalf("log[%s] = %#v, want %v in %#v", field, entry[field], want, entry)
@@ -472,11 +479,29 @@ func carrierThinkingBlockFrames(t *testing.T, body string) {
 
 // The carrier as the client receives it. Streaming builds a thinking block from frames;
 // the aggregate path returns one block in the JSON body. Both are wire bytes.
-func carrierFromAnthropicTurn(t *testing.T, stream bool, body string) string {
+func carrierFromAnthropicTurn(t *testing.T, stream bool, body string) (string, bool) {
 	t.Helper()
 	if stream {
+		var signature string
+		for _, line := range strings.Split(body, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var event struct {
+				Delta *struct {
+					Type      string `json:"type"`
+					Signature string `json:"signature"`
+				} `json:"delta"`
+			}
+			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event) == nil && event.Delta != nil && event.Delta.Type == "signature_delta" {
+				signature = event.Delta.Signature
+			}
+		}
+		if signature == "" {
+			return "", false
+		}
 		carrierThinkingBlockFrames(t, body)
-		return carrierSignatureFromStream(t, body)
+		return signature, true
 	}
 	var response models.AnthropicResponse
 	if err := json.Unmarshal([]byte(body), &response); err != nil {
@@ -484,11 +509,10 @@ func carrierFromAnthropicTurn(t *testing.T, stream bool, body string) string {
 	}
 	for _, block := range response.Content {
 		if block.Type == "thinking" && strings.HasPrefix(block.Signature, reasoningCarrierPrefix) {
-			return block.Signature
+			return block.Signature, true
 		}
 	}
-	t.Fatalf("no carrier block reached the client: %s", body)
-	return ""
+	return "", false
 }
 
 // A declared model_routes deployment reaches the same emit site down a different execution
@@ -517,10 +541,10 @@ func newDeclaredRouteTestHandler(t *testing.T, baseURL string) *ProxyHandler {
 	return h
 }
 
-// ~89% of real traffic is streaming, and a mapping-only carrier has zero items, so an
-// item-count gate anywhere on this path stops carriers entirely. Drive every client-facing
-// path and assert on the bytes each one delivers, including whether ciphertext still ships.
-func TestCappedCarrierStillReachesTheClient(t *testing.T) {
+// ~89% of real traffic is streaming, so drive both response modes and both route shapes.
+// Below the ceiling a complete private carrier reaches the client; at the ceiling no new
+// carrier is emitted at all.
+func TestCarrierBudgetAppliedOnEveryClientPath(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_reasoning_tool_call.sse")
 	if err != nil {
 		t.Fatal(err)
@@ -541,15 +565,16 @@ func TestCappedCarrierStillReachesTheClient(t *testing.T) {
 		{"declared route", func(t *testing.T) *ProxyHandler { return newDeclaredRouteTestHandler(t, upstream.URL) }},
 	} {
 		for _, tc := range []struct {
-			name      string
-			stream    bool
-			ballast   int
-			wantItems int
+			name        string
+			stream      bool
+			ballast     int
+			wantCarrier bool
+			wantItems   int
 		}{
-			{"streaming below budget keeps its items", true, 0, 3},
-			{"streaming at budget carries its mapping", true, reasoningCarrierInboundBudget, 0},
-			{"aggregate below budget keeps its items", false, 0, 3},
-			{"aggregate at budget carries its mapping", false, reasoningCarrierInboundBudget, 0},
+			{"streaming below budget keeps its carrier", true, 0, true, 3},
+			{"streaming at budget omits its carrier", true, reasoningCarrierInboundBudget, false, 0},
+			{"aggregate below budget keeps its carrier", false, 0, true, 3},
+			{"aggregate at budget omits its carrier", false, reasoningCarrierInboundBudget, false, 0},
 		} {
 			t.Run(surface.name+"/"+tc.name, func(t *testing.T) {
 				recorder := httptest.NewRecorder()
@@ -559,10 +584,24 @@ func TestCappedCarrierStillReachesTheClient(t *testing.T) {
 					t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 				}
 				body := recorder.Body.String()
-				signature := carrierFromAnthropicTurn(t, tc.stream, body)
-				// The ciphertext is the weight the cap exists to stop shipping.
-				if carried := strings.Contains(string(carrierPayloadBytes(t, signature)), carrierFixtureCiphertext); carried != (tc.ballast == 0) {
-					t.Fatalf("delivered carrier carries reasoning ciphertext = %v at %d inbound bytes", carried, tc.ballast)
+				signature, present := carrierFromAnthropicTurn(t, tc.stream, body)
+				if present != tc.wantCarrier {
+					t.Fatalf("carrier present = %v, want %v at %d inbound bytes:\n%s", present, tc.wantCarrier, tc.ballast, body)
+				}
+				if !present {
+					if strings.Contains(body, reasoningCarrierPrefix) || strings.Contains(body, "signature_delta") {
+						t.Fatalf("suppressed carrier left wire fragments:\n%s", body)
+					}
+					return
+				}
+				payload := string(carrierPayloadBytes(t, signature))
+				if !strings.Contains(payload, carrierFixtureCiphertext) {
+					t.Fatalf("delivered carrier lost reasoning ciphertext: %s", payload)
+				}
+				for _, forbidden := range []string{`"upstream_id"`, `"call_id"`, "call_synth_lookup_stream_001"} {
+					if strings.Contains(payload, forbidden) {
+						t.Fatalf("delivered carrier exposed %q: %s", forbidden, payload)
+					}
 				}
 				replay, ok := decodeReasoningCarrier(signature, nil)
 				if !ok {
@@ -572,12 +611,11 @@ func TestCappedCarrierStillReachesTheClient(t *testing.T) {
 					t.Fatalf("delivered carrier items = %d, want %d", len(replay.Items), tc.wantItems)
 				}
 				if len(replay.Calls) != 1 {
-					t.Fatalf("delivered carrier calls = %d, want the id mapping", len(replay.Calls))
+					t.Fatalf("delivered carrier calls = %d, want one opaque binding", len(replay.Calls))
 				}
 				for proxyID, call := range replay.Calls {
-					if !isResponsesChatReplayCallID(proxyID) || call.UpstreamID != "call_synth_lookup_stream_001" ||
-						call.Name != "lookup_synthetic_widget" {
-						t.Fatalf("mapping does not bind a minted id to the upstream call: %s -> %+v", proxyID, call)
+					if !isResponsesChatReplayCallID(proxyID) || call.UpstreamID != "" || call.Name != "lookup_synthetic_widget" {
+						t.Fatalf("carrier binding is not opaque-only: %s -> %+v", proxyID, call)
 					}
 				}
 			})
@@ -634,8 +672,8 @@ func TestInboundCarrierBytesAreCountedFromTheWire(t *testing.T) {
 		if inbound.Bytes != size {
 			t.Fatalf("counted %d bytes off a %d-byte carrier", inbound.Bytes, size)
 		}
-		if inbound.mapOnly() != want {
-			t.Fatalf("%d inbound bytes decided mapOnly = %v, want %v", inbound.Bytes, inbound.mapOnly(), want)
+		if inbound.saturated() != want {
+			t.Fatalf("%d inbound bytes decided saturated = %v, want %v", inbound.Bytes, inbound.saturated(), want)
 		}
 	}
 }

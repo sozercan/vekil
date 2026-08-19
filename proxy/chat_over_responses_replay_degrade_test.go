@@ -262,8 +262,8 @@ func TestAnthropicOpaqueIDDegradesWhileNativeChatStillRefuses(t *testing.T) {
 }
 
 // Claude Code may retain a newer carrier while dropping one from an older tool turn. After a
-// restart the newer turn must still recover its upstream mapping and reasoning, while the older
-// turn independently falls back to its visible transcript instead of wedging the whole request.
+// restart the newer turn must still recover its reasoning under the opaque public call ID, while
+// the older turn independently falls back to its visible transcript instead of wedging the request.
 func TestDroppedOlderCarrierDegradesAlongsideNewerCarrierAfterRestart(t *testing.T) {
 	_, route, items, published := publishCarrierParityTurn(t, "upstream-recent")
 	recent := published.Projection.Calls[0]
@@ -314,20 +314,23 @@ func TestDroppedOlderCarrierDegradesAlongsideNewerCarrierAfterRestart(t *testing
 			outputs[callID] = true
 		}
 	}
-	for _, callID := range []string{oldID, "upstream-recent"} {
+	for _, callID := range []string{oldID, recent.ID} {
 		if !calls[callID] || !outputs[callID] {
 			t.Fatalf("call %q was not paired after mixed recovery: calls=%v outputs=%v input=%s", callID, calls, outputs, input)
 		}
 	}
 	for _, want := range []string{
 		`"call_id":"` + oldID + `"`,
-		`"call_id":"upstream-recent"`,
+		`"call_id":"` + recent.ID + `"`,
 		`"encrypted_content":"OPAQUE"`,
 		`"arguments":"{\"key\":\"old\"}"`,
 	} {
 		if !strings.Contains(input, want) {
 			t.Fatalf("mixed recovery lost %s: %s", want, input)
 		}
+	}
+	if strings.Contains(input, `"call_id":"upstream-recent"`) {
+		t.Fatalf("mixed recovery exposed the provider-owned call ID: %s", input)
 	}
 
 	var entry map[string]any

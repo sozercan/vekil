@@ -476,7 +476,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	oaiResp, err := h.runGeminiCountTokensProbeWithContext(upstreamCtx, oaiReq)
+	oaiResp, err := h.runGeminiCountTokensProbeWithContext(upstreamCtx, r.Context(), oaiReq)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -640,10 +640,10 @@ func geminiContentHasInlineMedia(content *models.GeminiContent) bool {
 func (h *ProxyHandler) runGeminiCountTokensProbe(baseReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
 	defer upstreamCancel()
-	return h.runGeminiCountTokensProbeWithContext(upstreamCtx, baseReq)
+	return h.runGeminiCountTokensProbeWithContext(upstreamCtx, context.Background(), baseReq)
 }
 
-func (h *ProxyHandler) runGeminiCountTokensProbeWithContext(upstreamCtx context.Context, baseReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
+func (h *ProxyHandler) runGeminiCountTokensProbeWithContext(upstreamCtx, observationCtx context.Context, baseReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
 	probeReq := copyOpenAIRequestForGeminiCountTokensProbe(baseReq)
 
 	streamFlag := false
@@ -657,11 +657,11 @@ func (h *ProxyHandler) runGeminiCountTokensProbeWithContext(upstreamCtx context.
 	probeReq.MaxTokens = nil
 
 	if routeOperationFromContext(upstreamCtx) != nil {
-		oaiResp, fallback, err := h.executeGeminiCountTokensProbe(upstreamCtx, probeReq)
+		oaiResp, fallback, err := h.executeGeminiCountTokensProbe(upstreamCtx, observationCtx, probeReq)
 		if fallback {
 			probeReq.MaxCompletionTokens = nil
 			probeReq.MaxTokens = &one
-			return h.executeGeminiCountTokensProbeFinal(withRouteAttemptKind(upstreamCtx, routeAttemptProtocolRecovery), probeReq)
+			return h.executeGeminiCountTokensProbeFinal(withRouteAttemptKind(upstreamCtx, routeAttemptProtocolRecovery), observationCtx, probeReq)
 		}
 		return oaiResp, err
 	}
@@ -687,7 +687,7 @@ func (h *ProxyHandler) runGeminiCountTokensProbeWithContext(upstreamCtx context.
 			return nil, mapGeminiCountTokensTransportError(err)
 		}
 	}
-	return h.decodeGeminiProbeExecution(result)
+	return h.decodeGeminiProbeExecution(observationCtx, result)
 }
 
 func copyOpenAIRequestForGeminiCountTokensProbe(baseReq *models.OpenAIRequest) *models.OpenAIRequest {
@@ -701,7 +701,7 @@ func copyOpenAIRequestForGeminiCountTokensProbe(baseReq *models.OpenAIRequest) *
 	return &probeReq
 }
 
-func (h *ProxyHandler) executeGeminiCountTokensProbe(upstreamCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, bool, error) {
+func (h *ProxyHandler) executeGeminiCountTokensProbe(upstreamCtx, observationCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, bool, error) {
 	body, err := json.Marshal(probeReq)
 	if err != nil {
 		return nil, false, &geminiProtocolError{
@@ -721,10 +721,10 @@ func (h *ProxyHandler) executeGeminiCountTokensProbe(upstreamCtx context.Context
 		return nil, true, nil
 	}
 
-	return h.decodeGeminiProbeResponse(resp)
+	return h.decodeGeminiProbeResponse(observationCtx, resp)
 }
 
-func (h *ProxyHandler) executeGeminiCountTokensProbeFinal(upstreamCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
+func (h *ProxyHandler) executeGeminiCountTokensProbeFinal(upstreamCtx, observationCtx context.Context, probeReq *models.OpenAIRequest) (*models.OpenAIResponse, error) {
 	body, err := json.Marshal(probeReq)
 	if err != nil {
 		return nil, &geminiProtocolError{
@@ -739,27 +739,28 @@ func (h *ProxyHandler) executeGeminiCountTokensProbeFinal(upstreamCtx context.Co
 		return nil, mapGeminiCountTokensTransportError(err)
 	}
 
-	oaiResp, _, err := h.decodeGeminiProbeResponse(resp)
+	oaiResp, _, err := h.decodeGeminiProbeResponse(observationCtx, resp)
 	return oaiResp, err
 }
 
-func (h *ProxyHandler) decodeGeminiProbeExecution(result chatExecutionResult) (*models.OpenAIResponse, error) {
+func (h *ProxyHandler) decodeGeminiProbeExecution(observationCtx context.Context, result chatExecutionResult) (*models.OpenAIResponse, error) {
 	if result.Completion != nil {
 		result.Completion.Usage = result.Usage
 		return result.Completion, nil
 	}
 	if result.Response != nil {
-		oaiResp, _, err := h.decodeGeminiProbeResponse(result.Response)
+		oaiResp, _, err := h.decodeGeminiProbeResponse(observationCtx, result.Response)
 		return oaiResp, err
 	}
 	return nil, &geminiProtocolError{statusCode: http.StatusInternalServerError, status: "INTERNAL", message: "countTokens probe returned no Chat completion"}
 }
 
-func (h *ProxyHandler) decodeGeminiProbeResponse(resp *http.Response) (*models.OpenAIResponse, bool, error) {
+func (h *ProxyHandler) decodeGeminiProbeResponse(observationCtx context.Context, resp *http.Response) (*models.OpenAIResponse, bool, error) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		observeUpstreamErrorDetail(observationCtx, resp.StatusCode, errBody)
 		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
 		h.log.Error("upstream error",
 			logger.F("endpoint", "gemini_count_tokens"),

@@ -118,6 +118,13 @@ func upstreamTurnShape(t *testing.T, plan responsesChatRequestPlan) string {
 	return shape.String()
 }
 
+func opaqueStoreTurnShape(shape string, published responsesChatReplayPublished) string {
+	for _, call := range published.Calls {
+		shape = strings.ReplaceAll(shape, call.UpstreamCallID, call.ProxyCallID)
+	}
+	return shape
+}
+
 func assistantItemText(t *testing.T, item map[string]any) string {
 	t.Helper()
 	switch content := item["content"].(type) {
@@ -160,7 +167,8 @@ func TestCarriedTurnTranslatesEquivalentlyToTheStore(t *testing.T) {
 		t.Fatalf("carrier path: %v", err)
 	}
 
-	got, want := upstreamTurnShape(t, fromCarrier), upstreamTurnShape(t, fromStore)
+	got := upstreamTurnShape(t, fromCarrier)
+	want := opaqueStoreTurnShape(upstreamTurnShape(t, fromStore), published)
 	if got != want {
 		t.Fatalf("carrier turn differs from store turn:\ncarrier %s\n  store %s", got, want)
 	}
@@ -191,7 +199,8 @@ func TestCarriedPartialParallelTurnMatchesTheStore(t *testing.T) {
 		t.Fatalf("carrier path: %v", err)
 	}
 
-	got, want := upstreamTurnShape(t, fromCarrier), upstreamTurnShape(t, fromStore)
+	got := upstreamTurnShape(t, fromCarrier)
+	want := opaqueStoreTurnShape(upstreamTurnShape(t, fromStore), published)
 	if got != want {
 		t.Fatalf("carrier turn differs from store turn:\ncarrier %s\n  store %s", got, want)
 	}
@@ -223,10 +232,10 @@ func TestCarriedParallelResultsBindByIDNotPosition(t *testing.T) {
 			outputs[item["call_id"].(string)], _ = item["output"].(string)
 		}
 	}
-	for i, upstreamID := range []string{"upstream-call-1", "upstream-call-2"} {
+	for i, call := range published.Projection.Calls {
 		want := "result-for-" + published.Projection.Calls[i].ID
-		if got := outputs[upstreamID]; !strings.Contains(got, want) {
-			t.Fatalf("%s carries %q, want the result the client attached to %s", upstreamID, got, want)
+		if got := outputs[call.ID]; !strings.Contains(got, want) {
+			t.Fatalf("%s carries %q, want the result the client attached to %s", call.ID, got, want)
 		}
 	}
 }
@@ -314,7 +323,7 @@ func TestCarrierDoesNotCrossRoutes(t *testing.T) {
 }
 
 // The carrier mirrors the replay store's argument binding. A rewrite must not recover either
-// stored reasoning or a client-supplied carrier under the original upstream call binding.
+// stored reasoning or a client-supplied carrier under the original opaque call binding.
 func TestRewrittenArgumentsAreRejectedByCarrier(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string
@@ -423,11 +432,11 @@ func TestNonStreamingResponsesTurnBuildsACompleteCarrier(t *testing.T) {
 	minted := result.Response.Choices[0].Message.ToolCalls[0].ID
 	found := false
 	for _, call := range turn.Calls {
-		if call.ProxyID == minted && call.UpstreamID != "" {
+		if call.ProxyID == minted && call.UpstreamID == "" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("carrier does not bind the minted id %q it handed the client: %+v", minted, turn.Calls)
+		t.Fatalf("carrier does not bind only the opaque id %q it handed the client: %+v", minted, turn.Calls)
 	}
 }

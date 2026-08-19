@@ -201,19 +201,106 @@ func TestGeminiUpstreamErrorLogsOnlyMetadata(t *testing.T) {
 
 func TestGeminiCountTokensUpstreamErrorLogsOnlyMetadata(t *testing.T) {
 	const secret = "quoted private countTokens prompt"
-	body := `{"error":{"message":"Invalid value: ` + secret + `"}}`
+	body := `{"error":{"message":"Invalid value: ` + secret + `","type":"invalid_request_error","code":"bad_value","param":"messages[0].content"}}`
 	var logs bytes.Buffer
 	handler := &ProxyHandler{log: logger.NewWithWriter(logger.LevelDebug, &logs)}
 	resp := &http.Response{
 		StatusCode: http.StatusBadRequest,
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
+	ctx, summary := WithRequestSummary(context.Background())
 
-	_, _, err := handler.decodeGeminiProbeResponse(resp)
+	_, _, err := handler.decodeGeminiProbeResponse(ctx, resp)
 	if err == nil || !strings.Contains(err.Error(), secret) {
 		t.Fatalf("client error = %v, want upstream detail", err)
 	}
 	assertUpstreamErrorLogMetadata(t, logs.Bytes(), "gemini_count_tokens", http.StatusBadRequest, secret)
+	got := map[string]string{}
+	for _, field := range summary.LoggerFields() {
+		if value, ok := field.Value.(string); ok && strings.HasPrefix(field.Key, "error_") {
+			got[field.Key] = value
+		}
+	}
+	if got["error_type"] != "invalid_request_error" || got["error_code"] != "bad_value" || got["error_param"] != "messages" {
+		t.Fatalf("classifiers = %#v", got)
+	}
+	for key, value := range got {
+		if strings.Contains(value, secret) {
+			t.Fatalf("%s leaked upstream prose: %q", key, value)
+		}
+	}
+}
+
+func TestGeminiCountTokensFinalErrorRecordsClassifiersThroughHandler(t *testing.T) {
+	const secret = "quoted private countTokens value"
+	backend := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"message":"Invalid value: `+secret+`","type":"invalid_request_error","code":"permission_denied","param":"messages[0].content"}}`)
+	})
+
+	for _, tc := range []struct {
+		name  string
+		model string
+		build func(*testing.T) *ProxyHandler
+	}{
+		{
+			name:  "legacy route",
+			model: "gemini-2.5-pro",
+			build: func(t *testing.T) *ProxyHandler {
+				h := newTestProxyHandler(t, backend)
+				h.log = logger.NewWithWriter(logger.LevelError, io.Discard)
+				return h
+			},
+		},
+		{
+			name:  "declared route",
+			model: "public-model",
+			build: func(t *testing.T) *ProxyHandler {
+				upstream := httptest.NewServer(backend)
+				t.Cleanup(upstream.Close)
+				return newGeminiCountTokensRouteTestHandler(t,
+					[]ProviderConfig{{
+						ID: "provider-a", Type: string(providerTypeOpenAICompatible), Default: true,
+						BaseURL: upstream.URL, AuthType: string(providerAuthTypeNone),
+					}},
+					[]ModelRouteTargetConfig{{ID: "primary", Provider: "provider-a", UpstreamModel: "physical-model"}},
+					ModelRouteRoutingConfig{Mode: string(routeModePrimaryOnly), MaxTargetAttempts: 1, MaxUpstreamSends: 1},
+				)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, summary := WithRequestSummary(context.Background())
+			req := httptest.NewRequest(http.MethodPost, "/v1beta/models/"+tc.model+":countTokens", strings.NewReader(
+				`{"contents":[{"role":"user","parts":[{"text":"count this"}]}]}`)).WithContext(ctx)
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+
+			tc.build(t).HandleGeminiModels(recorder, req)
+
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body = %s", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), secret) {
+				t.Fatalf("client response lost upstream detail: %s", recorder.Body.String())
+			}
+			got := map[string]string{}
+			for _, field := range summary.LoggerFields() {
+				if value, ok := field.Value.(string); ok && strings.HasPrefix(field.Key, "error_") {
+					got[field.Key] = value
+				}
+			}
+			if got["error_type"] != "invalid_request_error" || got["error_code"] != "permission_denied" || got["error_param"] != "messages" {
+				t.Fatalf("classifiers = %#v", got)
+			}
+			for key, value := range got {
+				if strings.Contains(value, secret) {
+					t.Fatalf("%s leaked upstream prose: %q", key, value)
+				}
+			}
+		})
+	}
 }
 
 func assertUpstreamErrorLogMetadata(t *testing.T, raw []byte, endpoint string, status int, secret string) {

@@ -36,7 +36,7 @@ func TestReasoningCarrierRoundTrip(t *testing.T) {
 	// encrypted_content stays exact; visible items keep only reconstruction metadata.
 	want := []json.RawMessage{
 		items[0],
-		json.RawMessage(`{"type":"function_call","call_id":"call_upstream_1","name":"lookup"}`),
+		json.RawMessage(`{"type":"function_call"}`),
 	}
 	for i := range want {
 		if string(replay.Items[i]) != string(want[i]) {
@@ -439,16 +439,14 @@ func TestCarrierDecodesEveryGroupTheStoreWillPublish(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 	replay := mustDecodeCarrier(t, signature)
-	// Reasoning may be dropped to stay decodable, but the mapping never may: it is what
-	// resolves the minted ids the client replays forever.
-	if call, ok := replay.Calls["call_vekil_a"]; !ok || call.UpstreamID != "fc_a" {
-		t.Fatalf("id mapping lost: %+v", replay.Calls)
+	if call, ok := replay.Calls["call_vekil_a"]; !ok || call.UpstreamID != "" {
+		t.Fatalf("opaque call binding lost or exposed a provider ID: %+v", replay.Calls)
 	}
 }
 
-// The backstop: whatever the caps are, a minted carrier must decode. Dropping reasoning
-// is a quality loss; dropping the id mapping is the wedge, so the mapping always rides.
-func TestCarrierPastTheCapKeepsItsMappingAndStillDecodes(t *testing.T) {
+// A payload beyond the decoder's safety cap is omitted rather than replaced with a
+// client-held provider mapping.
+func TestCarrierPastTheCapIsNotEmitted(t *testing.T) {
 	ciphertext := make([]byte, reasoningCarrierMaxDecodedBytes)
 	for i := range ciphertext {
 		ciphertext[i] = byte(i*17 + i/97)
@@ -463,12 +461,8 @@ func TestCarrierPastTheCapKeepsItsMappingAndStillDecodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	replay := mustDecodeCarrier(t, signature)
-	if call, ok := replay.Calls["call_vekil_b"]; !ok || call.UpstreamID != "fc_b" {
-		t.Fatalf("id mapping lost past the cap: %+v", replay.Calls)
-	}
-	if len(replay.Items) != 0 {
-		t.Fatalf("reasoning should have been dropped to stay decodable, kept %d", len(replay.Items))
+	if signature != "" {
+		t.Fatalf("oversized carrier was emitted: %d bytes", len(signature))
 	}
 }
 
@@ -607,8 +601,8 @@ func TestOrphanedCarrierStillResolvesTheCallsItNames(t *testing.T) {
 	if !ok {
 		t.Fatal("the orphaned carrier is unreachable, so this turn wedges")
 	}
-	if call := replay.Calls["call_vekil_orphan"]; call.UpstreamID != "upstream-1" {
-		t.Fatalf("mapping lost: %+v", replay.Calls)
+	if call := replay.Calls["call_vekil_orphan"]; call.ProxyID != "call_vekil_orphan" || call.UpstreamID != "" {
+		t.Fatalf("opaque binding lost or provider mapping leaked: %+v", replay.Calls)
 	}
 }
 
