@@ -14,7 +14,7 @@ import (
 
 func sampleReasoningItems() []json.RawMessage {
 	return []json.RawMessage{
-		json.RawMessage(`{"type":"reasoning","id":"rs_abc","encrypted_content":"OPAQUE-CIPHERTEXT","content":[],"summary":[]}`),
+		json.RawMessage(`{"type":"reasoning","id":"rs_abc","encrypted_content":"OPAQUE-CIPHERTEXT"}`),
 		json.RawMessage(`{"type":"function_call","call_id":"call_upstream_1","name":"lookup","arguments":"{}"}`),
 	}
 }
@@ -33,10 +33,14 @@ func TestReasoningCarrierRoundTrip(t *testing.T) {
 	if len(replay.Items) != len(items) {
 		t.Fatalf("item count = %d, want %d", len(replay.Items), len(items))
 	}
-	// encrypted_content is ciphertext Copilot will try to decrypt.
-	for i := range items {
-		if string(replay.Items[i]) != string(items[i]) {
-			t.Fatalf("item %d not byte-identical:\n got %s\nwant %s", i, replay.Items[i], items[i])
+	// encrypted_content stays exact; visible items keep only reconstruction metadata.
+	want := []json.RawMessage{
+		items[0],
+		json.RawMessage(`{"type":"function_call","call_id":"call_upstream_1","name":"lookup"}`),
+	}
+	for i := range want {
+		if string(replay.Items[i]) != string(want[i]) {
+			t.Fatalf("item %d changed unexpectedly:\n got %s\nwant %s", i, replay.Items[i], want[i])
 		}
 	}
 }
@@ -85,16 +89,14 @@ func TestReasoningCarrierBoundsDecompression(t *testing.T) {
 	// Random filler, so flate cannot shrink it into a different test.
 	carrierOfDecodedSize := func(t *testing.T, delta int) string {
 		t.Helper()
-		base, err := encodeReasoningCarrier(carriedTurn{Items: []json.RawMessage{json.RawMessage(`{"encrypted_content":""}`)}})
-		if err != nil || base == "" {
-			t.Fatalf("encode: %v", err)
-		}
-		overhead := len(`{"items":[{"encrypted_content":""}]}`) + len(`,"route_digest":""`)
+		overhead := len(`{"items":[{"type":"reasoning","encrypted_content":""}]}`)
 		filler := make([]byte, reasoningCarrierMaxDecodedBytes+delta-overhead)
 		if _, err := rand.Read(filler); err != nil {
 			t.Fatal(err)
 		}
-		item, err := json.Marshal(map[string]string{"encrypted_content": base64.RawStdEncoding.EncodeToString(filler)[:len(filler)]})
+		item, err := json.Marshal(map[string]string{
+			"type": "reasoning", "encrypted_content": base64.RawStdEncoding.EncodeToString(filler)[:len(filler)],
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -371,11 +373,13 @@ func TestCarrierBudgetSpendsOnTheTurnsThatSurviveTheTrim(t *testing.T) {
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public"}
 	message := func(index int) models.AnthropicMessage {
 		id := "call_vekil_budget" + string(rune('a'+index))
-		items := []json.RawMessage{json.RawMessage(`{"type":"function_call","call_id":"upstream-1","name":"lookup","arguments":"{}","pad":"` +
-			strings.Repeat("A", 900_000) + `"}`)}
+		items := []json.RawMessage{
+			json.RawMessage(`{"type":"reasoning","encrypted_content":"` + strings.Repeat("A", 900_000) + `"}`),
+			json.RawMessage(`{"type":"function_call","call_id":"upstream-1","name":"lookup","arguments":"{}"}`),
+		}
 		signature, err := encodeReasoningCarrier(carriedTurn{
 			Items: items, Route: route,
-			Calls: []carriedCall{{ProxyID: id, UpstreamID: "upstream-1", Name: "lookup"}},
+			Calls: []carriedCall{{ProxyID: id, UpstreamID: "upstream-1", Name: "lookup", ItemIndex: 1}},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -495,11 +499,13 @@ func TestCarrierExhaustingTheBudgetSaysSoEvenWhenItIsLast(t *testing.T) {
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public"}
 	message := func(index int) models.AnthropicMessage {
 		id := "call_vekil_exhaust" + string(rune('a'+index))
-		items := []json.RawMessage{json.RawMessage(`{"type":"function_call","call_id":"upstream-1",` +
-			`"name":"lookup","arguments":"` + strings.Repeat("A", 900_000) + `"}`)}
+		items := []json.RawMessage{
+			json.RawMessage(`{"type":"reasoning","encrypted_content":"` + strings.Repeat("A", 900_000) + `"}`),
+			json.RawMessage(`{"type":"function_call","call_id":"upstream-1","name":"lookup","arguments":"{}"}`),
+		}
 		signature, err := encodeReasoningCarrier(carriedTurn{
 			Items: items, Route: route,
-			Calls: []carriedCall{{ProxyID: id, UpstreamID: "upstream-1", Name: "lookup"}},
+			Calls: []carriedCall{{ProxyID: id, UpstreamID: "upstream-1", Name: "lookup", ItemIndex: 1}},
 		})
 		if err != nil {
 			t.Fatal(err)

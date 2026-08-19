@@ -31,21 +31,42 @@ const (
 	// Anthropic caps tool_use ids at 64 characters and the client echoes a minted id
 	// back verbatim, so an id that embeds its upstream id has to fit that same budget.
 	responsesChatReplayMaxIDLength = 64
-	// Copilot issues function-call ids as "call_<opaque>". The marker is what keeps this
-	// mint narrow enough to stay backward compatible: without it any client string under
-	// the prefix reads as a replay id, so a customer's own native tool-call id such as
-	// "call_vekil_customer_job" gets pinned to the Responses backend, misses the store and
-	// 400s on every request. Removing it breaks 14 tests, measured. It narrows, but does not
-	// close, the overlap with a random legacy suffix -- base64url can spell "call_" once in
-	// 64^5 mints -- so the mint also refuses responsesChatReplayIDLength outright.
-	responsesChatReplayUpstreamIDMarker = "call_"
+	// Copilot issues function-call ids as "call_<opaque>". The marker and version keep the
+	// self-describing namespace narrow; the 88-bit nonce prevents an upstream call ID reused after
+	// eviction or restart from resolving against a newer group's hidden state. The checksum
+	// is public integrity rather than authority: route/projection authority stays in the
+	// store and carrier bindings.
+	responsesChatReplayUpstreamIDMarker     = "call_"
+	responsesChatReplaySelfIDVersion        = "v2_"
+	responsesChatReplayLegacySelfIDVersion  = "v1_"
+	responsesChatReplaySelfIDNonceBytes     = 11
+	responsesChatReplaySelfIDNonceChars     = 15
+	responsesChatReplaySelfIDChecksumBytes  = 3
+	responsesChatReplaySelfIDChecksumChars  = 4
+	responsesChatReplayLegacyChecksumBytes  = 6
+	responsesChatReplayLegacyChecksumChars  = 8
+	responsesChatReplaySelfIDCanonicalNonce = "AAAAAAAAAAAAAAA"
 )
+
+func responsesChatReplaySelfIDChecksum(nonce, upstreamCallID string) string {
+	sum := sha256.Sum256([]byte("vekil-responses-chat-replay-v2\x00" + nonce + "\x00" + upstreamCallID))
+	return base64.RawURLEncoding.EncodeToString(sum[:responsesChatReplaySelfIDChecksumBytes])
+}
+
+func responsesChatReplayLegacySelfIDChecksum(upstreamCallID string) string {
+	sum := sha256.Sum256([]byte("vekil-responses-chat-replay-v1\x00" + upstreamCallID))
+	return base64.RawURLEncoding.EncodeToString(sum[:responsesChatReplayLegacyChecksumBytes])
+}
 
 // A minted id that embeds its upstream id needs no lookup to resolve. The store expires
 // and the carrier only covers the turns a client chose to resend -- one 1190-message
 // session resent 12 of 516 -- but tool_use.id comes back on every turn by construction,
 // so the mapping travels in the one field that cannot go missing.
 func responsesChatReplaySelfDescribingID(upstreamCallID string) (string, bool) {
+	return responsesChatReplaySelfDescribingIDWithNonce(upstreamCallID, responsesChatReplaySelfIDCanonicalNonce)
+}
+
+func responsesChatReplaySelfDescribingIDWithNonce(upstreamCallID, nonce string) (string, bool) {
 	// No trimming: the charset check below rejects surrounding whitespace outright, so a
 	// padded ID falls back to the legacy form rather than minting one that resolves to a
 	// different string than the store and carrier hold. Mint and resolve stay inverses.
@@ -55,37 +76,61 @@ func responsesChatReplaySelfDescribingID(upstreamCallID string) (string, bool) {
 		!strings.HasPrefix(upstreamCallID, responsesChatReplayUpstreamIDMarker) {
 		return "", false
 	}
-	if len(responsesChatReplayCallIDPrefix)+len(upstreamCallID) > responsesChatReplayMaxIDLength {
+	if len(nonce) != responsesChatReplaySelfIDNonceChars || !isResponsesChatReplayIDCharset(nonce) ||
+		!isResponsesChatReplayIDCharset(upstreamCallID) {
 		return "", false
 	}
-	// Refuse the one length the legacy form also occupies. base64url can spell "call_", so a
-	// random legacy suffix can read back as self-describing: the resolver would strip the
-	// prefix and hand a fabricated upstream call_id to the provider once the store expired,
-	// instead of the legacy missing-state 400. Skipping this length is what makes the two
-	// shapes disjoint rather than 64^-5 unlikely, and it is what lets the resolver's
-	// round-trip be exact. It costs nothing real: Copilot's call_ids are 29 characters.
-	if len(responsesChatReplayCallIDPrefix)+len(upstreamCallID) == responsesChatReplayIDLength {
+	proxyCallID := responsesChatReplayCallIDPrefix + responsesChatReplaySelfIDVersion + nonce + "_" + upstreamCallID + "_" + responsesChatReplaySelfIDChecksum(nonce, upstreamCallID)
+	if len(proxyCallID) > responsesChatReplayMaxIDLength {
 		return "", false
 	}
-	if !isResponsesChatReplayIDCharset(upstreamCallID) {
-		return "", false
-	}
-	return responsesChatReplayCallIDPrefix + upstreamCallID, true
+	return proxyCallID, true
 }
 
-// The inverse of responsesChatReplaySelfDescribingID, and pure: it reads the id alone, so
-// it answers after the store has expired and after the carrier went missing. Round-tripping
-// through the minter is what makes it exact -- it admits only what the minter can emit, and
-// the minter now refuses the legacy length, so a legacy random id cannot be mistaken for one
-// that carries an upstream id. Rejecting the ambiguous length here too would be redundant:
-// the round-trip already inherits it.
-func responsesChatReplayUpstreamCallID(proxyCallID string) (string, bool) {
-	proxyCallID = strings.TrimSpace(proxyCallID)
-	if !strings.HasPrefix(proxyCallID, responsesChatReplayCallIDPrefix) {
+func responsesChatReplayLegacySelfDescribingID(upstreamCallID string) (string, bool) {
+	if len(upstreamCallID) <= len(responsesChatReplayUpstreamIDMarker) ||
+		!strings.HasPrefix(upstreamCallID, responsesChatReplayUpstreamIDMarker) ||
+		!isResponsesChatReplayIDCharset(upstreamCallID) {
 		return "", false
 	}
-	upstreamCallID := proxyCallID[len(responsesChatReplayCallIDPrefix):]
-	if minted, ok := responsesChatReplaySelfDescribingID(upstreamCallID); !ok || minted != proxyCallID {
+	proxyCallID := responsesChatReplayCallIDPrefix + responsesChatReplayLegacySelfIDVersion + upstreamCallID + "_" + responsesChatReplayLegacySelfIDChecksum(upstreamCallID)
+	if len(proxyCallID) > responsesChatReplayMaxIDLength || len(proxyCallID) == responsesChatReplayIDLength {
+		return "", false
+	}
+	return proxyCallID, true
+}
+
+// The inverse of the self-describing minters, and pure: it reads the id alone, so it answers
+// after the store has expired and after the carrier went missing. V2 is disjoint from the
+// fixed-width random namespace by construction; the V1 compatibility decoder retains its
+// original ambiguous-length guard for transcripts minted before the nonce was added.
+func responsesChatReplayUpstreamCallID(proxyCallID string) (string, bool) {
+	proxyCallID = strings.TrimSpace(proxyCallID)
+	prefix := responsesChatReplayCallIDPrefix + responsesChatReplaySelfIDVersion
+	if strings.HasPrefix(proxyCallID, prefix) {
+		body := proxyCallID[len(prefix):]
+		minimum := responsesChatReplaySelfIDNonceChars + 1 + len(responsesChatReplayUpstreamIDMarker) + 1 + responsesChatReplaySelfIDChecksumChars
+		if len(body) < minimum || body[responsesChatReplaySelfIDNonceChars] != '_' || body[len(body)-responsesChatReplaySelfIDChecksumChars-1] != '_' {
+			return "", false
+		}
+		nonce := body[:responsesChatReplaySelfIDNonceChars]
+		upstreamCallID := body[responsesChatReplaySelfIDNonceChars+1 : len(body)-responsesChatReplaySelfIDChecksumChars-1]
+		if minted, ok := responsesChatReplaySelfDescribingIDWithNonce(upstreamCallID, nonce); !ok || minted != proxyCallID {
+			return "", false
+		}
+		return upstreamCallID, true
+	}
+
+	legacyPrefix := responsesChatReplayCallIDPrefix + responsesChatReplayLegacySelfIDVersion
+	if !strings.HasPrefix(proxyCallID, legacyPrefix) {
+		return "", false
+	}
+	body := proxyCallID[len(legacyPrefix):]
+	if len(body) <= responsesChatReplayLegacyChecksumChars || body[len(body)-responsesChatReplayLegacyChecksumChars-1] != '_' {
+		return "", false
+	}
+	upstreamCallID := body[:len(body)-responsesChatReplayLegacyChecksumChars-1]
+	if minted, ok := responsesChatReplayLegacySelfDescribingID(upstreamCallID); !ok || minted != proxyCallID {
 		return "", false
 	}
 	return upstreamCallID, true
@@ -429,10 +474,14 @@ func (s *responsesChatReplayStore) Publish(request responsesChatReplayPublishReq
 	now := s.now()
 	s.expireLocked(now)
 
+	selfIDNonce, err := s.generateSelfIDNonceLocked(prepared.calls)
+	if err != nil {
+		return responsesChatReplayPublished{}, fmt.Errorf("generate Responses replay group nonce: %w", err)
+	}
 	proxyIDs := make([]string, len(prepared.calls))
 	reserved := make(map[string]struct{}, len(prepared.calls))
 	for i := range prepared.calls {
-		proxyID, generateErr := s.generateUniqueCallIDLocked(reserved, prepared.calls[i].upstreamCallID)
+		proxyID, generateErr := s.generateUniqueCallIDLocked(reserved, prepared.calls[i].upstreamCallID, selfIDNonce)
 		if generateErr != nil {
 			return responsesChatReplayPublished{}, fmt.Errorf("generate Responses replay call ID: %w", generateErr)
 		}
@@ -756,10 +805,32 @@ func (s *responsesChatReplayStore) preparePublish(request responsesChatReplayPub
 	}, nil
 }
 
-func (s *responsesChatReplayStore) generateUniqueCallIDLocked(reserved map[string]struct{}, upstreamCallID string) (string, error) {
+func (s *responsesChatReplayStore) generateSelfIDNonceLocked(calls []responsesChatReplayPreparedCall) (string, error) {
+	needsNonce := false
+	for _, call := range calls {
+		if _, ok := responsesChatReplaySelfDescribingID(call.upstreamCallID); ok {
+			needsNonce = true
+			break
+		}
+	}
+	if !needsNonce {
+		return "", nil
+	}
+	var randomBytes [responsesChatReplaySelfIDNonceBytes]byte
+	if _, err := io.ReadFull(s.random, randomBytes[:]); err != nil {
+		return "", err
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(randomBytes[:])
+	if len(nonce) != responsesChatReplaySelfIDNonceChars {
+		return "", fmt.Errorf("unexpected replay nonce length %d", len(nonce))
+	}
+	return nonce, nil
+}
+
+func (s *responsesChatReplayStore) generateUniqueCallIDLocked(reserved map[string]struct{}, upstreamCallID, selfIDNonce string) (string, error) {
 	// Prefer the id that describes itself; the random one below cannot be resolved
 	// without this store, which is exactly the state a long session loses.
-	if proxyID, ok := responsesChatReplaySelfDescribingID(upstreamCallID); ok {
+	if proxyID, ok := responsesChatReplaySelfDescribingIDWithNonce(upstreamCallID, selfIDNonce); ok {
 		_, stored := s.callsByID[proxyID]
 		_, taken := reserved[proxyID]
 		if !stored && !taken {

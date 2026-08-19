@@ -28,7 +28,7 @@ func TestSmokeCallIDPatternMatchesTheMinter(t *testing.T) {
 	// Every upstream shape the minter has an opinion about, including the edges.
 	for _, upstream := range []string{
 		copilotUpstreamCallID,
-		"call_a", "call_" + strings.Repeat("x", 48), "call_" + strings.Repeat("x", 49),
+		"call_a", "call_" + strings.Repeat("x", 24), "call_" + strings.Repeat("x", 25),
 		"call_", "call", "upstream-call-1", "call_a:b", "",
 	} {
 		minted, embedded := responsesChatReplaySelfDescribingID(upstream)
@@ -46,11 +46,38 @@ func TestSmokeCallIDPatternMatchesTheMinter(t *testing.T) {
 	}
 	// The other direction: the pattern must not admit what the minter would never emit.
 	for _, rejected := range []string{
-		"call_vekil_customer_job", "call_vekil_x", "call_vekil_",
-		responsesChatReplayCallIDPrefix + "call_" + strings.Repeat("z", 49),
+		"call_vekil_customer_job", "call_vekil_call_customer_job", "call_vekil_x", "call_vekil_",
+		responsesChatReplayCallIDPrefix + responsesChatReplaySelfIDVersion + responsesChatReplaySelfIDCanonicalNonce + "_call_" + strings.Repeat("z", 25) + "_AAAA",
 	} {
 		if pattern.MatchString(rejected) && !isResponsesChatReplayCallID(rejected) {
 			t.Errorf("smoke pattern %q admits %q, which is not a minted replay ID", declared[1], rejected)
+		}
+	}
+}
+
+func TestClaudeCarrierSmokeRestrictsBashToTheHarnessCommand(t *testing.T) {
+	script, err := os.ReadFile("../scripts/live-claude-reasoning-carrier-smoke.sh")
+	if err != nil {
+		t.Fatalf("read Claude carrier smoke: %v", err)
+	}
+	text := string(script)
+	for _, forbidden := range []string{"--dangerously-skip-permissions", "--allowedTools=Bash"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("Claude carrier smoke still contains unrestricted permission form %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		`CLAUDE_BASH_ALLOW_RULE="Bash(${EXPECTED_TOOL_COMMAND})"`,
+		`--permission-mode dontAsk`,
+		`--allowedTools="${CLAUDE_BASH_ALLOW_RULE}"`,
+		`-u CLAUDE_CODE_USE_BEDROCK`,
+		`-u CLAUDE_CODE_USE_VERTEX`,
+		`-u CLAUDE_CODE_USE_FOUNDRY`,
+		`PROXY_HOST="$(url_host)"`,
+		`PROXY_BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}"`,
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("Claude carrier smoke is missing exact permission guard %q", required)
 		}
 	}
 }
@@ -67,8 +94,8 @@ func TestSelfDescribingCallIDRoundTrip(t *testing.T) {
 		{name: "marker plus one character", upstream: "call_x", embedded: true},
 		{name: "nothing after the marker", upstream: "call_", embedded: false},
 		{name: "marker without its separator", upstream: "call", embedded: false},
-		{name: "exactly fills Anthropic's limit", upstream: "call_" + strings.Repeat("x", 48), embedded: true},
-		{name: "one over Anthropic's limit", upstream: "call_" + strings.Repeat("x", 49), embedded: false},
+		{name: "exactly fills Anthropic's limit", upstream: "call_" + strings.Repeat("x", 24), embedded: true},
+		{name: "one over Anthropic's limit", upstream: "call_" + strings.Repeat("x", 25), embedded: false},
 		{name: "no Copilot marker", upstream: "upstream-call-1", embedded: false},
 		{name: "illegal character for Anthropic", upstream: "call_a:b", embedded: false},
 		{name: "empty", upstream: "", embedded: false},
@@ -110,18 +137,25 @@ func TestLegacyRandomIDsDoNotResolveAsSelfDescribing(t *testing.T) {
 	if upstream, ok := responsesChatReplayUpstreamCallID(callID); ok {
 		t.Fatalf("legacy ID %q resolved to a fabricated upstream ID %q", callID, upstream)
 	}
-	// The one shape that could be confused: a legacy-length ID whose suffix spells the marker.
-	// base64url can spell "call_", so this is a legacy ID the mint can really produce.
-	forged := responsesChatReplayCallIDPrefix + "call_" + strings.Repeat("z", 17)
+	// The one shape that could be confused: a legacy-length ID whose random suffix happens
+	// to spell the version, a valid upstream ID, and its checksum. The legacy mint can emit
+	// every base64url character here, so the fixed-width namespace must remain disjoint.
+	ambiguousUpstream := "call_abcde"
+	forged := responsesChatReplayCallIDPrefix + responsesChatReplayLegacySelfIDVersion + ambiguousUpstream + "_" + responsesChatReplayLegacySelfIDChecksum(ambiguousUpstream)
 	if len(forged) != responsesChatReplayIDLength {
 		t.Fatalf("forged ID is %d chars, want the legacy %d so the two shapes actually collide", len(forged), responsesChatReplayIDLength)
 	}
 	if upstream, ok := responsesChatReplayUpstreamCallID(forged); ok {
-		t.Fatalf("legacy-length ID %q resolved to a fabricated upstream ID %q; the mint must skip this length so the two shapes are disjoint by construction rather than 64^-5 unlikely", forged, upstream)
+		t.Fatalf("legacy-length ID %q resolved to a fabricated upstream ID %q; the mint must skip this length so the two shapes are disjoint by construction", forged, upstream)
 	}
 	// Disjoint by skipping exactly one length, not by narrowing the shape: one character
 	// longer is still self-describing, so the guard cannot be passing for a broader reason.
-	if _, ok := responsesChatReplayUpstreamCallID(forged + "z"); !ok {
+	longerUpstream := ambiguousUpstream + "z"
+	longer, ok := responsesChatReplayLegacySelfDescribingID(longerUpstream)
+	if !ok {
+		t.Fatalf("one-character-longer fixture %q was not minted", longerUpstream)
+	}
+	if _, ok := responsesChatReplayUpstreamCallID(longer); !ok {
 		t.Fatal("one character past the legacy length must still resolve; the guard is meant to skip a length, not a shape")
 	}
 }
@@ -152,7 +186,7 @@ func TestRecogniserVerdictIsUnchangedForEveryPreExistingIDShape(t *testing.T) {
 		"call_vekil_x", "call_vekil_y", "call_vekil_a", "call_vekil_b",
 		"call_vekil_orphan", "call_vekil_absent", "call_vekil_customer_job",
 		"call_vekil_exhaust", "call_vekil_budget", "call_vekil_budgeta", "call_vekil_budgetl",
-		"call_vekil_", "call_vekil_call", "call_vekil_notcall_x",
+		"call_vekil_", "call_vekil_call", "call_vekil_call_customer_job", "call_vekil_notcall_x",
 		"call_upstream_1", "upstream-call-1", "", "   ",
 		"call_vekil_AAAAAAAAAAAAAAAAAAAAA",   // one short of legacy
 		"call_vekil_AAAAAAAAAAAAAAAAAAAAAAA", // one over legacy

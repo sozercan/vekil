@@ -200,21 +200,99 @@ func TestMappingOnlyCarrierRebuildsAForgottenTurn(t *testing.T) {
 	}
 }
 
-// Below the budget nothing moves. The expectation is the pre-cap wire shape written out
-// by hand -- field names, order, tags and digests read off 623d890 -- because reading any
-// of them back from the code under test passes on a rename: both sides move together.
+func TestMappingOnlyCarrierPreservesTextAfterCallOrder(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	t.Cleanup(func() { _ = store.Close() })
+	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+	items := []json.RawMessage{
+		responsesFunctionCallItem("call_upstream_order", "lookup", `{}`),
+		json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"spoken"}]}`),
+	}
+	published, err := store.Publish(responsesChatReplayPublishRequest{
+		Route:            route,
+		AssistantContent: json.RawMessage(`"spoken"`),
+		OutputItems:      items,
+		Calls: []responsesChatReplayPublishCall{{
+			UpstreamCallID: "call_upstream_order", Name: "lookup", VisibleArguments: `{}`, OutputItemIndex: 0,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	callID := published.Projection.Calls[0].ID
+	replay := mustDecodeCarrier(t, emittedSignature(t, carriedTurnFromPublished(route, items, published, atBudget())))
+	if len(replay.Items) != 0 || replay.TextItemIndex == nil || *replay.TextItemIndex != 1 {
+		t.Fatalf("mapping-only carrier = items %d text slot %v, want no items and slot 1", len(replay.Items), replay.TextItemIndex)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-public",
+		"messages": []any{
+			map[string]any{"role": "assistant", "content": "spoken", "tool_calls": []any{map[string]any{
+				"id": callID, "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{}`},
+			}}},
+			map[string]any{"role": "tool", "tool_call_id": callID, "content": "done"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgotten := newResponsesChatReplayStore()
+	t.Cleanup(func() { _ = forgotten.Close() })
+	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+		UpstreamModel: "gpt-upstream",
+		ReplayStore:   forgotten,
+		ReplayRoute:   route,
+		CarriedReasoning: map[string]carriedReplay{
+			callID: replay,
+		},
+	})
+	if err != nil {
+		t.Fatalf("translateChatRequestToResponses() error = %v", err)
+	}
+	var restored []map[string]any
+	if err := json.Unmarshal([]byte(upstreamInputJSON(t, plan)), &restored); err != nil {
+		t.Fatal(err)
+	}
+	callIndex, textIndex := -1, -1
+	for index, item := range restored {
+		if item["type"] == "function_call" {
+			callIndex = index
+		}
+		if item["role"] == "assistant" && item["content"] == "spoken" {
+			textIndex = index
+		}
+	}
+	if callIndex < 0 || textIndex < 0 || callIndex >= textIndex {
+		t.Fatalf("rebuilt order call=%d text=%d, want call before text: %#v", callIndex, textIndex, restored)
+	}
+}
+
+// Below the budget the carrier keeps ciphertext and bindings but no hidden reasoning text.
+// The expected wire shape is written out so field or envelope drift remains visible.
 func TestCarrierBelowBudgetIsByteIdentical(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
 	route, items, published := capFixture(t, store)
+	safeItems := []json.RawMessage{
+		json.RawMessage(`{"type":"reasoning","id":"rs_cap","encrypted_content":"` + carrierCapCiphertext + `"}`),
+		json.RawMessage(`{"type":"function_call","call_id":"upstream-call-1","name":"lookup"}`),
+	}
+	calls := []carriedCall{{
+		ProxyID: published.Calls[0].ProxyCallID, UpstreamID: published.Calls[0].UpstreamCallID,
+		Name: published.Calls[0].Name, ItemIndex: published.Calls[0].OutputItemIndex,
+	}}
+	projectionDigest := precapProjectionDigest(published.Projection)
+	unsigned := reasoningCarrierPayload{
+		Items: safeItems, Calls: calls, RouteDigest: precapFixtureRouteDigest, ProjectionDigest: projectionDigest,
+	}
 
 	want := precapCarrierSignature(t, fmt.Sprintf(
 		`{"items":[%s,%s],"calls":[{"proxy_id":%q,"upstream_id":%q,"name":%q,"item_index":%d}],`+
 			`"route_digest":%q,"route_tag":%q,"projection_digest":%q}`,
-		items[0], items[1],
+		safeItems[0], safeItems[1],
 		published.Calls[0].ProxyCallID, published.Calls[0].UpstreamCallID, published.Calls[0].Name, published.Calls[0].OutputItemIndex,
-		precapFixtureRouteDigest, reasoningCarrierRouteTag(precapFixtureRouteDigest),
-		precapProjectionDigest(published.Projection),
+		precapFixtureRouteDigest, reasoningCarrierRouteTag(unsigned), projectionDigest,
 	))
 
 	for _, emit := range []carrierEmit{{}, {Inbound: carrierInbound{Carriers: 1, Bytes: reasoningCarrierInboundBudget - 1}}} {

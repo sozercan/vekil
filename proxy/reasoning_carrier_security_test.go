@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -42,6 +43,155 @@ var mintedCallSeq int
 
 func toolUseBlock(id string) map[string]any {
 	return map[string]any{"type": "tool_use", "id": id, "name": "lookup", "input": map[string]any{}}
+}
+
+func TestCarrierSerializationOmitsHiddenReasoningText(t *testing.T) {
+	signature, err := encodeReasoningCarrier(carriedTurn{Items: []json.RawMessage{
+		json.RawMessage(`{"type":"reasoning","id":"rs_hidden","encrypted_content":"OPAQUE",` +
+			`"content":[{"type":"reasoning_text","text":"SECRET-CONTENT"}],` +
+			`"summary":[{"type":"summary_text","text":"SECRET-SUMMARY"}],` +
+			`"instructions":"SECRET-FUTURE-FIELD","status":"completed"}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := mustDecodeCarrier(t, signature)
+	if len(replay.Items) != 1 {
+		t.Fatalf("carrier items = %d, want 1", len(replay.Items))
+	}
+	want := `{"type":"reasoning","id":"rs_hidden","encrypted_content":"OPAQUE"}`
+	if got := string(replay.Items[0]); got != want {
+		t.Fatalf("client-visible reasoning item = %s, want %s", got, want)
+	}
+}
+
+func TestCarrierSerializationKeepsOnlyOrderingFieldsForVisibleItems(t *testing.T) {
+	signature, err := encodeReasoningCarrier(carriedTurn{Items: []json.RawMessage{
+		json.RawMessage(`{"type":"message","id":"msg_internal","status":"completed","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"SECRET-TEXT","annotations":["SECRET-ANNOTATION"],"logprobs":["SECRET-LOGPROB"]}]}`),
+		json.RawMessage(`{"type":"function_call","id":"fc_internal","call_id":"call_upstream_1","name":"lookup","arguments":"{\"secret\":true}","status":"completed","future":"SECRET-FUTURE"}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := mustDecodeCarrier(t, signature)
+	want := []string{
+		`{"type":"message","role":"assistant"}`,
+		`{"type":"function_call","call_id":"call_upstream_1","name":"lookup"}`,
+	}
+	if len(replay.Items) != len(want) {
+		t.Fatalf("carrier items = %d, want %d", len(replay.Items), len(want))
+	}
+	for i := range want {
+		if got := string(replay.Items[i]); got != want[i] {
+			t.Fatalf("client-visible item %d = %s, want %s", i, got, want[i])
+		}
+	}
+}
+
+func TestCarrierDecodeBoundsItemAndCallCounts(t *testing.T) {
+	base, err := encodeReasoningCarrier(carriedTurn{Items: []json.RawMessage{
+		json.RawMessage(`{"type":"reasoning","encrypted_content":"OPAQUE"}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		count    int
+		accepted bool
+		mutate   func(*reasoningCarrierPayload, int)
+	}{
+		{name: "items at limit", count: responsesChatReplayMaxItems, accepted: true, mutate: func(payload *reasoningCarrierPayload, count int) {
+			payload.Calls = nil
+			payload.Items = make([]json.RawMessage, count)
+			for i := range payload.Items {
+				payload.Items[i] = json.RawMessage(`{"type":"reasoning","encrypted_content":"x"}`)
+			}
+		}},
+		{name: "items over limit", count: responsesChatReplayMaxItems + 1, mutate: func(payload *reasoningCarrierPayload, count int) {
+			payload.Calls = nil
+			payload.Items = make([]json.RawMessage, count)
+			for i := range payload.Items {
+				payload.Items[i] = json.RawMessage(`{"type":"reasoning","encrypted_content":"x"}`)
+			}
+		}},
+		{name: "calls at limit", count: responsesChatReplayMaxCalls, accepted: true, mutate: func(payload *reasoningCarrierPayload, count int) {
+			payload.Items = nil
+			payload.Calls = make([]carriedCall, count)
+			for i := range payload.Calls {
+				payload.Calls[i] = carriedCall{ProxyID: fmt.Sprintf("call_vekil_%d", i), UpstreamID: fmt.Sprintf("call_%d", i), Name: "lookup", ItemIndex: i}
+			}
+		}},
+		{name: "calls over limit", count: responsesChatReplayMaxCalls + 1, mutate: func(payload *reasoningCarrierPayload, count int) {
+			payload.Items = nil
+			payload.Calls = make([]carriedCall, count)
+			for i := range payload.Calls {
+				payload.Calls[i] = carriedCall{ProxyID: fmt.Sprintf("call_vekil_%d", i), UpstreamID: fmt.Sprintf("call_%d", i), Name: "lookup", ItemIndex: i}
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			signature := rewriteCarrierPayload(t, base, func(payload *reasoningCarrierPayload) {
+				tc.mutate(payload, tc.count)
+			})
+			replay, ok := decodeReasoningCarrier(signature, nil)
+			if ok != tc.accepted {
+				t.Fatalf("decode accepted = %v, want %v", ok, tc.accepted)
+			}
+			if ok && len(replay.Items)+len(replay.Calls) != tc.count {
+				t.Fatalf("decoded count = %d, want %d", len(replay.Items)+len(replay.Calls), tc.count)
+			}
+		})
+	}
+}
+
+func TestCarrierRouteTagBindsTheReplayPayload(t *testing.T) {
+	route := responsesChatReplayRoute{
+		ProviderID: "copilot", PublicModel: "gpt-public", UpstreamModel: "gpt-5.6-sol",
+		RouteID: "sol-route", PolicyTier: "powerful",
+	}
+	projection := carriedProjectionDigest(json.RawMessage(`"checking"`), []responsesChatReplayProjectedCall{{
+		ID: "call_vekil_x", Name: "lookup", Arguments: `{}`,
+	}})
+	signature, err := encodeReasoningCarrier(carriedTurn{
+		Items: []json.RawMessage{
+			json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"OPAQUE"}`),
+			json.RawMessage(`{"type":"function_call","call_id":"call_upstream_1","name":"lookup","arguments":"{}"}`),
+		},
+		Calls:      []carriedCall{{ProxyID: "call_vekil_x", UpstreamID: "call_upstream_1", Name: "lookup", ItemIndex: 1}},
+		Route:      route,
+		Projection: projection,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*reasoningCarrierPayload)
+	}{
+		{name: "items", mutate: func(payload *reasoningCarrierPayload) {
+			payload.Items[0] = json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"FORGED"}`)
+		}},
+		{name: "calls", mutate: func(payload *reasoningCarrierPayload) {
+			payload.Calls[0].UpstreamID = "call_upstream_forged"
+		}},
+		{name: "projection", mutate: func(payload *reasoningCarrierPayload) {
+			payload.ProjectionDigest = strings.Repeat("0", hex.EncodedLen(carriedDigestBytes))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tampered := rewriteCarrierPayload(t, signature, tc.mutate)
+			replay := mustDecodeCarrier(t, tampered)
+			if replay.RouteTagValid {
+				t.Fatal("tampered replay payload retained tier authority")
+			}
+			if selecting := routeSelectingCarriers(map[string]carriedReplay{"call_vekil_x": replay}); selecting != nil {
+				t.Fatalf("tampered carrier still selected a route: %+v", selecting)
+			}
+		})
+	}
 }
 
 // A shape we did not mint, or that the transcript cannot rebuild, must not restore a turn.
@@ -729,25 +879,25 @@ func TestCarrierHasNoLifetime(t *testing.T) {
 	}
 }
 
-// Decode, rewrite only the route digest, re-encode: all of it client-side.
-func restampCarrierRoute(t *testing.T, signature, digest string) string {
+// Decode, rewrite, and re-encode without the process key: all of it client-side.
+func rewriteCarrierPayload(t *testing.T, signature string, mutate func(*reasoningCarrierPayload)) string {
 	t.Helper()
 	compressed, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(signature, reasoningCarrierPrefix))
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := io.ReadAll(flate.NewReader(bytes.NewReader(compressed)))
+	reader := flate.NewReader(bytes.NewReader(compressed))
+	payloadBytes, err := io.ReadAll(reader)
+	_ = reader.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &fields); err != nil {
+	var payload reasoningCarrierPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if fields["route_digest"], err = json.Marshal(digest); err != nil {
-		t.Fatal(err)
-	}
-	restamped, err := json.Marshal(fields)
+	mutate(&payload)
+	rewritten, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -756,13 +906,21 @@ func restampCarrierRoute(t *testing.T, signature, digest string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := writer.Write(restamped); err != nil {
+	if _, err := writer.Write(rewritten); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
 	return reasoningCarrierPrefix + base64.RawURLEncoding.EncodeToString(out.Bytes())
+}
+
+// Decode, rewrite only the route digest, re-encode: all of it client-side.
+func restampCarrierRoute(t *testing.T, signature, digest string) string {
+	t.Helper()
+	return rewriteCarrierPayload(t, signature, func(payload *reasoningCarrierPayload) {
+		payload.RouteDigest = digest
+	})
 }
 
 // A separate execution path, and the only one a pre-restart carrier still completes.

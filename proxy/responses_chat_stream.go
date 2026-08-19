@@ -1396,6 +1396,14 @@ func runResponsesChatStream(writer *chatStreamEventWriter, control *responsesCha
 				return err
 			}
 		}
+		// The carrier is trailing client state. If a future terminal transition carries
+		// no chunks of its own, commit and flush the role/chunk path before enqueuing it;
+		// otherwise short precommit responses can put the carrier ahead of visible output.
+		if transition.carriedReasoning.present() && !committed {
+			if err := emitChunks(nil); err != nil {
+				return err
+			}
+		}
 		// Unguarded: the writer owns "worth emitting". An item count here drops a
 		// capped carrier, which holds only its mapping.
 		if err := writer.sendCarriedReasoning(transition.carriedReasoning); err != nil {

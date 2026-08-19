@@ -112,7 +112,7 @@ func TestAnthropicUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T)
 		value, _ := field.Value.(string)
 		got[field.Key] = value
 	}
-	if got["error_code"] != "invalid_value" || got["error_param"] != "tools[0]" {
+	if got["error_code"] != "invalid_value" || got["error_param"] != "tools" {
 		t.Fatalf("classifiers not recorded through the handler: %#v", got)
 	}
 	for key, value := range got {
@@ -131,11 +131,12 @@ func TestUpstreamClassifiersMatchTheirGrammarNotJustTheirCharacters(t *testing.T
 		wantParam         string
 	}{
 		{name: "copilot top-level code", code: "invalid_request_body", param: "", wantCode: "invalid_request_body"},
-		{name: "json path keeps only its root", code: "invalid_value", param: "tools[0].input_schema", wantCode: "invalid_value", wantParam: "tools[0]"},
+		{name: "json path keeps only its root", code: "invalid_value", param: "tools[0].input_schema", wantCode: "invalid_value", wantParam: "tools"},
 		// The whole reason the root is not enough on its own: a client-chosen key is a
 		// perfectly ordinary lower-snake identifier, so the grammar cannot tell it apart.
 		{name: "a client's metadata key is not part of the path", code: "", param: "metadata.customer_ssn", wantParam: "metadata"},
-		{name: "a client key under a tool schema is not part of the path", code: "", param: "tools[0].input_schema.properties.customer_ssn", wantParam: "tools[0]"},
+		{name: "a client key under a tool schema is not part of the path", code: "", param: "tools[0].input_schema.properties.customer_ssn", wantParam: "tools"},
+		{name: "a client-controlled numeric suffix is not logged", code: "", param: "user[123456789]", wantParam: "user"},
 		{name: "a bare client key has no recognised root at all", code: "", param: "customer_ssn", wantParam: ""},
 		{name: "an unrecognised root is dropped rather than guessed", code: "", param: "not_a_request_field.id", wantParam: ""},
 		{name: "uppercase is not a code", code: "SSN_123-45-6789", param: "", wantCode: ""},
@@ -353,7 +354,7 @@ func TestChatUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T) {
 		value, _ := field.Value.(string)
 		got[field.Key] = value
 	}
-	if got["error_code"] != "invalid_value" || got["error_param"] != "tools[0]" {
+	if got["error_code"] != "invalid_value" || got["error_param"] != "tools" {
 		t.Fatalf("classifiers not recorded through the Chat handler: %#v", got)
 	}
 	for key, value := range got {
@@ -423,7 +424,7 @@ func TestGeminiUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T) {
 				value, _ := field.Value.(string)
 				got[field.Key] = value
 			}
-			if got["error_code"] != "invalid_value" || got["error_param"] != "tools[0]" {
+			if got["error_code"] != "invalid_value" || got["error_param"] != "tools" {
 				t.Fatalf("classifiers not recorded through the Gemini handler: %#v", got)
 			}
 			for key, value := range got {
@@ -620,7 +621,7 @@ func TestPostCommitStreamFailureRecordsClassifiers(t *testing.T) {
 			if got["error_code"] != "invalid_value" || got["error_type"] != "invalid_request_error" {
 				t.Fatalf("post-commit failure recorded no classifiers: %#v (status %d)", got, rec.Code)
 			}
-			if got["error_param"] != "tools[0]" {
+			if got["error_param"] != "tools" {
 				t.Fatalf("error_param = %q, want the owned root", got["error_param"])
 			}
 			for key, value := range got {

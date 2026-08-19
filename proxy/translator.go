@@ -220,7 +220,8 @@ func parseSystemMessage(raw json.RawMessage) (*models.OpenAIMessage, error) {
 			if text == "" {
 				continue
 			}
-			if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") && !strings.HasPrefix(text, "\n") {
+			if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") && !strings.HasSuffix(sb.String(), "\r") &&
+				!strings.HasPrefix(text, "\n") && !strings.HasPrefix(text, "\r") {
 				sb.WriteString("\n")
 			}
 			sb.WriteString(text)

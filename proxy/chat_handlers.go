@@ -1152,13 +1152,13 @@ func isMissingResponsesChatReplayError(err error) bool {
 }
 
 func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOperation, route *modelRoute, chatBody []byte, options chatExecutionOptions, log *logger.Logger) (responsesChatRequestPlan, targetBinding, error) {
-	translateForTarget := func(target targetBinding, degrade bool) (responsesChatRequestPlan, error) {
+	translateForTarget := func(target targetBinding, degrade bool, passLog *logger.Logger) (responsesChatRequestPlan, error) {
 		return translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
 			UpstreamModel:             route.public.id,
 			CarriedReasoning:          options.CarriedReasoning,
 			ReplayStore:               h.responsesChatReplayStore(),
 			ReplayRoute:               explicitResponsesChatReplayRoute(route, target),
-			Log:                       log,
+			Log:                       passLog,
 			MinimumOutputTokens:       options.ResponsesMinimumOutputTokens,
 			DropSamplingParams:        options.ResponsesDropSamplingParams,
 			DegradeUnrestorableReplay: degrade,
@@ -1167,7 +1167,7 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 
 	if !chatRequestContainsResponsesReplayID(chatBody) {
 		target, _ := route.primaryTarget()
-		plan, err := translateForTarget(target, false)
+		plan, err := translateForTarget(target, false, log)
 		return plan, target, err
 	}
 
@@ -1181,13 +1181,13 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 			}
 		}
 	}
-	restoring := func(degrade bool) (responsesChatRequestPlan, targetBinding, error) {
+	restoring := func(degrade bool, passLog *logger.Logger) (responsesChatRequestPlan, targetBinding, error) {
 		var missing error
 		for _, target := range candidates {
 			if target.provider == nil || !target.provider.supportsEndpoint(providerEndpointResponses) {
 				continue
 			}
-			plan, err := translateForTarget(target, degrade)
+			plan, err := translateForTarget(target, degrade, passLog)
 			if err == nil {
 				if operation != nil {
 					if pinErr := operation.forcePinnedTarget(target.id); pinErr != nil {
@@ -1207,14 +1207,33 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 		}
 		return responsesChatRequestPlan{}, targetBinding{}, missing
 	}
-	plan, target, err := restoring(false)
-	if err == nil || !options.DegradeUnrestorableReplay || !isMissingResponsesChatReplayError(err) {
+	// Candidate selection deliberately expects missing replay state. Keep those probes
+	// silent; the terminal degrade pass below emits the one request-level outcome.
+	plan, target, err := restoring(false, nil)
+	if err == nil || !options.DegradeUnrestorableReplay {
+		return plan, target, err
+	}
+	// A projection mismatch proves this target owns the live replay group, even though the
+	// client's visible turn drifted. Retry that exact target so the route cannot jump to an
+	// earlier candidate whose store-missing self-ID fallback would also accept the turn.
+	if isResponsesChatReplayProjectionError(err) {
+		if degraded, degradeErr := translateForTarget(target, true, log); degradeErr == nil {
+			if operation != nil {
+				if pinErr := operation.forcePinnedTarget(target.id); pinErr != nil {
+					return responsesChatRequestPlan{}, target, pinErr
+				}
+			}
+			return degraded, target, nil
+		}
+		return plan, target, err
+	}
+	if !isMissingResponsesChatReplayError(err) {
 		return plan, target, err
 	}
 	// Every candidate refused the same transcript, so the refusal has stopped telling
 	// them apart and the probe is spent. Retry once, letting the turn come back from
 	// the transcript: on Anthropic the alternative is a conversation nobody can repair.
-	if degraded, degradedTarget, degradeErr := restoring(true); degradeErr == nil {
+	if degraded, degradedTarget, degradeErr := restoring(true, log); degradeErr == nil {
 		return degraded, degradedTarget, nil
 	}
 	return plan, target, err
@@ -2392,8 +2411,6 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 	publicModel := req.Model
-	carriedReasoning, inbound := extractCarriedReasoning(req.Messages)
-	logCarriedReasoningStarved(h.log, inbound.Starved, req.Model)
 	if canonicalPolicyID, ok := h.policyPublicModelID(req.Model); ok {
 		publicModel = canonicalPolicyID
 		ensurePolicyLocalRequestIdentity(w, r, publicModel)
@@ -2431,6 +2448,8 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 
+	carriedReasoning, inbound := extractCarriedReasoning(req.Messages)
+	logCarriedReasoningStarved(h.log, inbound.Starved, req.Model)
 	oaiReq, err := prepareAnthropicCountTokensProbeRequestWithModelOverride(&req, providerModel)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("translation error: %v", err))

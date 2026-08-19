@@ -333,6 +333,9 @@ func parseResponsesChatErrorDetails(status int, body []byte) responsesChatErrorD
 		Param   json.RawMessage `json:"param"`
 	}
 	if json.Unmarshal(body, &flat) == nil {
+		if trimmed := strings.TrimSpace(flat.Message); trimmed != "" {
+			details.message = trimmed
+		}
 		if trimmed := strings.TrimSpace(flat.Type); trimmed != "" {
 			details.errorType = trimmed
 		}

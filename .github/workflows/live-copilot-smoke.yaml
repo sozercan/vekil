@@ -87,6 +87,12 @@ jobs:
           curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 https://claude.ai/install.sh | bash -s stable
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      - name: Run live Claude reasoning-carrier restart smoke
+        if: steps.gate.outputs.run == 'true'
+        env:
+          LIVE_CLAUDE_REASONING_CARRIER_SMOKE_DIR: ${{ runner.temp }}/live-claude-reasoning-carrier-smoke
+        run: scripts/live-claude-reasoning-carrier-smoke.sh
+
       - name: Install Gemini CLI
         if: steps.gate.outputs.run == 'true'
         run: npm install -g @google/gemini-cli@latest
@@ -115,11 +121,14 @@ jobs:
               -e 's/("access_token":"[^"]*")/"access_token":"[REDACTED]"/g' \
               -e 's/("token":"[^"]*")/"token":"[REDACTED]"/g' \
               -e 's/("encrypted_content"[[:space:]]*:[[:space:]]*")[^"]*(")/\1[REDACTED]\2/g' \
+              -e 's/vekil1\.[A-Za-z0-9_-]+/[REDACTED_VEKIL_CARRIER]/g' \
               -e 's/(Please visit https:\/\/github\.com\/login\/device and enter code: )[A-Z0-9-]+/\1[REDACTED]/g'
           }
           for log in \
             "$RUNNER_TEMP/live-compact-smoke/proxy.log" \
             "$RUNNER_TEMP/live-chat-over-responses-smoke/proxy.log" \
+            "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/proxy-initial.log" \
+            "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/proxy-restarted.log" \
             "$RUNNER_TEMP/live-cli-smoke/proxy.log"; do
             if [ -f "$log" ]; then
               echo "--- $log ---"
@@ -138,6 +147,7 @@ jobs:
               -e 's/("access_token":"[^"]*")/"access_token":"[REDACTED]"/g' \
               -e 's/("token":"[^"]*")/"token":"[REDACTED]"/g' \
               -e 's/("encrypted_content"[[:space:]]*:[[:space:]]*")[^"]*(")/\1[REDACTED]\2/g' \
+              -e 's/vekil1\.[A-Za-z0-9_-]+/[REDACTED_VEKIL_CARRIER]/g' \
               -e 's/(Please visit https:\/\/github\.com\/login\/device and enter code: )[A-Z0-9-]+/\1[REDACTED]/g'
           }
           if [ -d "$RUNNER_TEMP/live-compact-smoke" ]; then
@@ -151,7 +161,19 @@ jobs:
             find "$RUNNER_TEMP/live-chat-over-responses-smoke" -maxdepth 1 -type f \
               \( -name '*.json' -o -name '*.txt' -o -name '*.err' \) -print0 | while IFS= read -r -d '' file; do
               echo "--- $file ---"
-              head -c 32768 "$file" | redact
+              redact < "$file" | { head -c 32768; cat >/dev/null; }
+            done
+          fi
+          if [ -d "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke" ]; then
+            for file in \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/summary.txt" \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/selected-model.txt" \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/claude.err" \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/claude-sanitized.json"; do
+              if [ -f "$file" ]; then
+                echo "--- $file ---"
+                redact < "$file" | { head -c 32768; cat >/dev/null; }
+              fi
             done
           fi
           if [ -d "$RUNNER_TEMP/live-cli-smoke/outputs" ]; then

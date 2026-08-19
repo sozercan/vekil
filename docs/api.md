@@ -115,13 +115,14 @@ Additional rules:
 Function calls returned through the adapter use IDs shaped as one of:
 
 ```text
-call_vekil_<upstream-call-id>        # self-describing; total length never exceeds 64
-call_vekil_<22-character-base64url>  # legacy, and the fallback when the upstream ID cannot be embedded
+call_vekil_v1_<upstream-call-id>_<8-character-checksum>  # self-describing; total length never exceeds 64
+call_vekil_<22-character-base64url>                       # legacy, and the fallback when the upstream ID cannot be embedded
 ```
 
-Clients must return these IDs unchanged. The self-describing form embeds the upstream `call_id`,
-so it is deliberately not opaque: the mapping travels inside the ID the client already echoes and
-resolves by stripping the prefix, with no server-side lookup. It is not an authorization key.
+Clients must return these IDs unchanged. The self-describing form embeds the upstream `call_id`
+behind a version marker and deterministic checksum, so it is deliberately not opaque: the mapping
+travels inside the ID the client already echoes and resolves without server-side lookup. The
+checksum separates minted replay IDs from plausible native call IDs; it is not an authorization key.
 Restoring the hidden Responses output still requires the process-local replay state or a valid
 reasoning carrier; an ID on its own can only rebuild the turn from the transcript the client itself
 sent. **The carrier is a client obligation, not just the ID.** On `/v1/messages` the reasoning rides

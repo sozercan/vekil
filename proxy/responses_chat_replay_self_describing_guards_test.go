@@ -212,9 +212,9 @@ func TestMixedLegacyAndSelfDescribingIDsInOneRequest(t *testing.T) {
 func TestUpstreamIDTooLongToEmbedFallsBackInsteadOfOverflowing(t *testing.T) {
 	route := selfDescribingRoute()
 	store := forgottenReplayStore(t)
-	// 54 characters: one past what the 11-character prefix leaves inside the 64 limit.
-	oversized := "call_" + strings.Repeat("L", 49)
-	if len(responsesChatReplayCallIDPrefix)+len(oversized) <= responsesChatReplayMaxIDLength {
+	// 30 characters: one past what the versioned/nonced/checksummed envelope leaves inside 64.
+	oversized := "call_" + strings.Repeat("L", 25)
+	if len(responsesChatReplayCallIDPrefix)+len(responsesChatReplaySelfIDVersion)+responsesChatReplaySelfIDNonceChars+1+len(oversized)+1+responsesChatReplaySelfIDChecksumChars <= responsesChatReplayMaxIDLength {
 		t.Fatalf("fixture upstream ID is %d chars, which still fits; the test would prove nothing", len(oversized))
 	}
 	callID, body := selfDescribingFixture(t, store, route, oversized)
@@ -499,17 +499,115 @@ func TestSelfDescribingIDDoesNotPreemptTheTargetHoldingTheGroup(t *testing.T) {
 	}
 }
 
+func TestExplicitRouteProjectionMismatchDegradesOnOwningTarget(t *testing.T) {
+	first := explicitRouteTestProvider("first", "http://first.invalid", "k1")
+	second := explicitRouteTestProvider("second", "http://second.invalid", "k2")
+	h, route := explicitRouteTestHandler(t, http.DefaultClient, routeModePriorityFailover, 2, 2, first, second)
+	t.Cleanup(h.BeginShutdown)
+
+	holder := route.targets[1]
+	published, err := h.responsesChatReplayStore().Publish(responsesChatReplayPublishRequest{
+		Route:            explicitResponsesChatReplayRoute(route, holder),
+		AssistantContent: json.RawMessage(`"checking"`),
+		OutputItems: []json.RawMessage{
+			json.RawMessage(`{"type":"reasoning","id":"rs_owner","encrypted_content":"OPAQUE","content":[],"summary":[]}`),
+			responsesFunctionCallItem(copilotUpstreamCallID, "lookup", `{"q":"original"}`),
+		},
+		Calls: []responsesChatReplayPublishCall{{
+			UpstreamCallID: copilotUpstreamCallID, Name: "lookup", VisibleArguments: `{"q":"original"}`, OutputItemIndex: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	call := published.Projection.Calls[0]
+	body := selfDescribingReplayBody(t, explicitResponsesChatReplayRoute(route, holder), call, `{"q":"rewritten"}`)
+
+	plan, target, err := h.prepareExplicitResponsesChatRequest(nil, route, body, chatExecutionOptions{DegradeUnrestorableReplay: true}, nil)
+	if err != nil {
+		t.Fatalf("prepareExplicitResponsesChatRequest() error = %v", err)
+	}
+	if target.id != holder.id {
+		t.Fatalf("selected target %q, want projection-owning target %q", target.id, holder.id)
+	}
+	input := upstreamInputJSON(t, plan)
+	if strings.Contains(input, `"encrypted_content":"OPAQUE"`) {
+		t.Fatalf("projection mismatch retained stale reasoning: %s", input)
+	}
+	if got := restoredFunctionCall(t, input); got["call_id"] != copilotUpstreamCallID {
+		t.Fatalf("degraded call_id = %q, want %q", got["call_id"], copilotUpstreamCallID)
+	}
+}
+
+func TestTargetSelectionProbesDoNotLogSuccessfulSelfIDDegradeAsWarnings(t *testing.T) {
+	first := explicitRouteTestProvider("first", "http://first.invalid", "k1")
+	second := explicitRouteTestProvider("second", "http://second.invalid", "k2")
+	h, route := explicitRouteTestHandler(t, http.DefaultClient, routeModePriorityFailover, 2, 2, first, second)
+	t.Cleanup(h.BeginShutdown)
+
+	callID, ok := responsesChatReplaySelfDescribingID(copilotUpstreamCallID)
+	if !ok {
+		t.Fatal("fixture upstream ID did not mint a self-describing replay ID")
+	}
+	body, err := json.Marshal(map[string]any{
+		"model": route.public.id,
+		"messages": []any{
+			map[string]any{"role": "assistant", "content": "checking", "tool_calls": []any{map[string]any{
+				"id": callID, "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{"q":"a"}`},
+			}}},
+			map[string]any{"role": "tool", "tool_call_id": callID, "content": "result-1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	_, _, err = h.prepareExplicitResponsesChatRequest(
+		nil,
+		route,
+		body,
+		chatExecutionOptions{DegradeUnrestorableReplay: true},
+		logger.NewWithWriter(logger.LevelInfo, &logs),
+	)
+	if err != nil {
+		t.Fatalf("prepareExplicitResponsesChatRequest() error = %v", err)
+	}
+	if strings.Contains(logs.String(), "responses replay unavailable and the carrier could not answer") {
+		t.Fatalf("successful request logged candidate-probe warnings: %s", logs.String())
+	}
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("logs = %d lines, want one terminal outcome: %s", len(lines), logs.String())
+	}
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("decode log: %v: %s", err, logs.String())
+	}
+	if entry["level"] != "info" || entry["msg"] != "responses replay resolved from self-describing tool-call IDs" {
+		t.Fatalf("terminal log = %#v", entry)
+	}
+}
+
 // chatRequestContainsResponsesReplayID drives endpoint selection off ID SHAPE alone, so a
 // customer's own native tool-call ID that happens to start with the prefix must keep routing
 // to native Chat. Dropping the shape constraint pins it to the Responses backend, where it
 // misses the store and 400s on every request.
 func TestNativeClientIDsKeepTheirEndpoint(t *testing.T) {
-	for _, nativeID := range []string{"call_vekil_customer_job", "call_vekil_x", "call_vekil_orphan", "call_vekil_"} {
+	for _, nativeID := range []string{
+		"call_vekil_customer_job",
+		"call_vekil_call_customer_job",
+		"call_vekil_v1_call_customer_job_AAAAAAAA",
+		"call_vekil_x",
+		"call_vekil_orphan",
+		"call_vekil_",
+	} {
 		if isResponsesChatReplayCallID(nativeID) {
 			t.Errorf("native client ID %q reads as a replay ID; its endpoint would be switched", nativeID)
 		}
 	}
-	if !isResponsesChatReplayCallID(responsesChatReplayCallIDPrefix + copilotUpstreamCallID) {
+	selfDescribing, ok := responsesChatReplaySelfDescribingID(copilotUpstreamCallID)
+	if !ok || !isResponsesChatReplayCallID(selfDescribing) {
 		t.Error("a genuinely self-describing ID is not recognised")
 	}
 	if !isResponsesChatReplayCallID(responsesChatReplayCallIDPrefix + strings.Repeat("A", 22)) {

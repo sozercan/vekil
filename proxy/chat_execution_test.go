@@ -139,6 +139,15 @@ func TestExecuteChatCompletionsCanonicalErrorRetainsSafeHeaders(t *testing.T) {
 	}
 }
 
+func TestParseResponsesChatErrorDetailsCopiesFlatCopilotMessage(t *testing.T) {
+	details := parseResponsesChatErrorDetails(http.StatusBadRequest, []byte(
+		`{"code":"invalid_request_body","message":"  invalid reasoning effort  "}`,
+	))
+	if details.message != "invalid reasoning effort" || details.code != "invalid_request_body" {
+		t.Fatalf("flat error details = %#v", details)
+	}
+}
+
 func TestExecuteChatCompletionsDoesNotRerouteReplayLikeNativeIDs(t *testing.T) {
 	upstreamCalls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -151,7 +160,7 @@ func TestExecuteChatCompletionsDoesNotRerouteReplayLikeNativeIDs(t *testing.T) {
 	}))
 	defer upstream.Close()
 	h := newChatExecutionTestHandler(t, upstream.URL, []string{providerEndpointChatCompletions, providerEndpointResponses})
-	body := []byte(`{"model":"gpt-public","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_customer_job","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_customer_job","content":"ok"}]}`)
+	body := []byte(`{"model":"gpt-public","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_call_customer_job","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_call_customer_job","content":"ok"}]}`)
 	result, err := h.executeChatCompletions(context.Background(), body, chatExecutionOptions{})
 	if err != nil {
 		t.Fatal(err)

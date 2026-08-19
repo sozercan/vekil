@@ -960,6 +960,10 @@ func TestParseSystemMessageDoesNotDoubleExistingNewlines(t *testing.T) {
 	}{
 		{"previous block ends in a newline", `[{"type":"text","text":"first\n"},{"type":"text","text":"second"}]`, "first\nsecond"},
 		{"next block begins with a newline", `[{"type":"text","text":"first"},{"type":"text","text":"\nsecond"}]`, "first\nsecond"},
+		{"previous block ends in CRLF", `[{"type":"text","text":"first\r\n"},{"type":"text","text":"second"}]`, "first\r\nsecond"},
+		{"next block begins with CRLF", `[{"type":"text","text":"first"},{"type":"text","text":"\r\nsecond"}]`, "first\r\nsecond"},
+		{"previous block ends in bare CR", `[{"type":"text","text":"first\r"},{"type":"text","text":"second"}]`, "first\rsecond"},
+		{"next block begins with bare CR", `[{"type":"text","text":"first"},{"type":"text","text":"\rsecond"}]`, "first\rsecond"},
 		{"neither boundary supplies one", `[{"type":"text","text":"first"},{"type":"text","text":"second"}]`, "first\nsecond"},
 		{"a deliberate blank line is preserved", `[{"type":"text","text":"first\n\n"},{"type":"text","text":"second"}]`, "first\n\nsecond"},
 	} {

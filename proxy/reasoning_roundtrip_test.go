@@ -9,8 +9,8 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// What vekil emits on turn N must decode as carried reasoning on turn N+1 with the
-// items byte-identical, or Copilot receives ciphertext it cannot decrypt.
+// What vekil emits on turn N must preserve the opaque reasoning fields and ordering
+// placeholders needed on turn N+1 while stripping every field the transcript rebuilds.
 func TestCarrierSurvivesAFullTurnRoundTrip(t *testing.T) {
 	outputItems := []json.RawMessage{
 		json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"CIPHERTEXT","content":[],"summary":[]}`),
@@ -39,9 +39,13 @@ func TestCarrierSurvivesAFullTurnRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("turn N+1 could not recover the carrier vekil emitted on turn N")
 	}
-	for i := range outputItems {
-		if string(got.Items[i]) != string(outputItems[i]) {
-			t.Fatalf("item %d changed in transit:\n got %s\nwant %s", i, got.Items[i], outputItems[i])
+	wantItems := []json.RawMessage{
+		json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"CIPHERTEXT"}`),
+		json.RawMessage(`{"type":"function_call","call_id":"call_upstream_7","name":"lookup"}`),
+	}
+	for i := range wantItems {
+		if string(got.Items[i]) != string(wantItems[i]) {
+			t.Fatalf("item %d changed in transit:\n got %s\nwant %s", i, got.Items[i], wantItems[i])
 		}
 	}
 }

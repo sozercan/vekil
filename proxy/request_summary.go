@@ -923,7 +923,7 @@ var upstreamClassifierParamRoots = map[string]struct{}{
 // schema -- or as a root that is not a request field at all, so keeping a recognised root
 // and dropping the rest admits neither.
 //
-// The cost is precision: "tools[0].input_schema" logs as "tools[0]". An unrecognised root
+// The cost is precision: "tools[0].input_schema" logs as "tools". An unrecognised root
 // drops the param entirely rather than logging a name vekil cannot vouch for.
 func safeUpstreamClassifierParam(value string) string {
 	if value == "" || len(value) > maxUpstreamClassifierBytes {
@@ -946,7 +946,7 @@ func safeUpstreamClassifierParam(value string) string {
 			return ""
 		}
 	}
-	return root
+	return name
 }
 
 // Nested field names vekil's own request validators enumerate, derived from the field lists

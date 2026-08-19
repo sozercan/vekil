@@ -143,6 +143,40 @@ func TestResponsesChatStream_OneToolPublishesReplayBeforeProxyID(t *testing.T) {
 	}
 }
 
+func TestResponsesChatStream_TrailingCarrierFollowsPrecommitChunks(t *testing.T) {
+	fixture := readResponsesChatStreamFixture(t, "stream_one_tool_call.sse")
+	store := newResponsesChatReplayStore()
+	t.Cleanup(func() { _ = store.Close() })
+	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{
+		PublicModel:       "gpt-public",
+		ReplayStore:       store,
+		ReplayRoute:       responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+		PrecommitTimeout:  time.Hour,
+		PrecommitMaxBytes: len(fixture) + 1,
+	})
+	if err != nil {
+		t.Fatalf("prepareResponsesChatStream() error = %v", err)
+	}
+	lastChunk, carrier := -1, -1
+	for position := 0; ; position++ {
+		event, nextErr := stream.next()
+		if nextErr != nil {
+			t.Fatalf("stream.next() error = %v", nextErr)
+		}
+		switch event.kind {
+		case chatStreamEventChunk:
+			lastChunk = position
+		case chatStreamEventCarriedReasoning:
+			carrier = position
+		case chatStreamEventSuccess:
+			if lastChunk < 0 || carrier < 0 || carrier <= lastChunk {
+				t.Fatalf("event order last chunk=%d carrier=%d, want every precommit chunk before trailing carrier", lastChunk, carrier)
+			}
+			return
+		}
+	}
+}
+
 func TestResponsesChatStream_ImmediateFailureBeforeCommit(t *testing.T) {
 	fixture := readResponsesChatStreamFixture(t, "stream_immediate_failure.sse")
 	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{

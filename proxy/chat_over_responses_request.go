@@ -509,9 +509,10 @@ func logTrimmedReasoning(options responsesChatRequestOptions, toolTurns, agedTur
 }
 
 type responsesChatRestoredCalls struct {
-	Key         string
-	OutputItems []json.RawMessage
-	Calls       []responsesChatReplayResolvedCall
+	Key           string
+	OutputItems   []json.RawMessage
+	Calls         []responsesChatReplayResolvedCall
+	TextItemIndex *int
 	// Rebuild marks a restore whose items are not upstream's own and have to be rebuilt
 	// from the transcript before use -- the capped carrier and the self-describing tier.
 	Rebuild bool
