@@ -12,6 +12,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
@@ -286,10 +287,16 @@ func clientSafeCarrierItems(items []json.RawMessage) []json.RawMessage {
 				EncryptedContent string `json:"encrypted_content,omitempty"`
 			}{Type: "reasoning", ID: fields.ID, EncryptedContent: fields.EncryptedContent})
 		case "message":
+			text, refusal, parseErr := responsesChatMessageContent(item)
+			if parseErr != nil || refusal != "" {
+				safe[i] = json.RawMessage(`{}`)
+				continue
+			}
 			narrowed, err = json.Marshal(struct {
-				Type string `json:"type"`
-				Role string `json:"role"`
-			}{Type: "message", Role: fields.Role})
+				Type      string `json:"type"`
+				Role      string `json:"role"`
+				TextBytes int    `json:"text_bytes"`
+			}{Type: "message", Role: fields.Role, TextBytes: len(text)})
 		case "function_call":
 			narrowed, err = json.Marshal(struct {
 				Type   string `json:"type"`
@@ -603,12 +610,15 @@ func carriedReplayForCalls(carried map[string]carriedReplay, projected []respons
 // A shape we did not mint, or that the transcript cannot rebuild, restores nothing.
 func carriedItemsWellShaped(items []json.RawMessage) bool {
 	messages := 0
+	messageWithoutLength := false
+	messageBytes := 0
 	for _, item := range items {
 		var header struct {
-			Type   string `json:"type"`
-			Role   string `json:"role"`
-			CallID string `json:"call_id"`
-			Name   string `json:"name"`
+			Type      string `json:"type"`
+			Role      string `json:"role"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			TextBytes *int   `json:"text_bytes"`
 		}
 		if json.Unmarshal(item, &header) != nil {
 			return false
@@ -617,9 +627,17 @@ func carriedItemsWellShaped(items []json.RawMessage) bool {
 		case "reasoning":
 		case "message":
 			messages++
-			if messages > 1 || strings.TrimSpace(header.Role) != "assistant" {
+			if strings.TrimSpace(header.Role) != "assistant" {
 				return false
 			}
+			if header.TextBytes == nil {
+				messageWithoutLength = true
+				continue
+			}
+			if *header.TextBytes < 0 || *header.TextBytes > reasoningCarrierMaxDecodedBytes-messageBytes {
+				return false
+			}
+			messageBytes += *header.TextBytes
 		case "function_call":
 			if strings.TrimSpace(header.CallID) == "" || strings.TrimSpace(header.Name) == "" {
 				return false
@@ -628,7 +646,52 @@ func carriedItemsWellShaped(items []json.RawMessage) bool {
 			return false
 		}
 	}
-	return true
+	return messages <= 1 || !messageWithoutLength
+}
+
+func carriedMessageSegments(items []json.RawMessage, assistantText string) (map[int]string, bool) {
+	type messageSlot struct {
+		index int
+		bytes *int
+	}
+	var slots []messageSlot
+	for index, item := range items {
+		var header struct {
+			Type      string `json:"type"`
+			TextBytes *int   `json:"text_bytes"`
+		}
+		if json.Unmarshal(item, &header) != nil {
+			return nil, false
+		}
+		if strings.TrimSpace(header.Type) == "message" {
+			slots = append(slots, messageSlot{index: index, bytes: header.TextBytes})
+		}
+	}
+	if len(slots) == 0 {
+		return nil, true
+	}
+	if len(slots) == 1 && slots[0].bytes == nil {
+		return map[int]string{slots[0].index: assistantText}, true
+	}
+
+	segments := make(map[int]string, len(slots))
+	offset := 0
+	for _, slot := range slots {
+		if slot.bytes == nil || *slot.bytes < 0 || *slot.bytes > len(assistantText)-offset {
+			return nil, false
+		}
+		end := offset + *slot.bytes
+		segment := assistantText[offset:end]
+		if !utf8.ValidString(segment) {
+			return nil, false
+		}
+		segments[slot.index] = segment
+		offset = end
+	}
+	if offset != len(assistantText) {
+		return nil, false
+	}
+	return segments, true
 }
 
 func carriedArgumentDigest(value string) ([sha256.Size]byte, bool) {
@@ -704,6 +767,13 @@ func carriedRestoredCalls(carried map[string]carriedReplay, projected []response
 		return responsesChatRestoredCalls{}, "projection"
 	case !carriedItemsWellShaped(replay.Items):
 		return responsesChatRestoredCalls{}, "shape"
+	}
+	var assistantText string
+	if json.Unmarshal(canonicalContent, &assistantText) != nil {
+		return responsesChatRestoredCalls{}, "projection"
+	}
+	if _, ok := carriedMessageSegments(replay.Items, assistantText); !ok {
+		return responsesChatRestoredCalls{}, "projection"
 	}
 	calls := make([]responsesChatReplayResolvedCall, len(projected))
 	// A capped carrier holds no items, so only the mapping and compact text slot bind here.
@@ -825,9 +895,15 @@ func reconstructCarriedRestore(restored responsesChatRestoredCalls, projected []
 		restored.Calls = calls
 		return restored
 	}
-	textSlot := carriedTextSlot(restored.OutputItems, callByItemIndex)
+	messageSegments, _ := carriedMessageSegments(restored.OutputItems, assistantText)
+	textSlot := -1
+	if len(messageSegments) == 0 {
+		textSlot = carriedTextSlot(restored.OutputItems, callByItemIndex)
+	}
 	for index, item := range restored.OutputItems {
-		if index == textSlot && assistantText != "" {
+		if segment, ok := messageSegments[index]; ok {
+			items = appendAssistantHistoryMessage(items, segment)
+		} else if index == textSlot && assistantText != "" {
 			items = appendAssistantHistoryMessage(items, assistantText)
 		}
 		if i, ok := callByItemIndex[index]; ok {
@@ -845,9 +921,8 @@ func reconstructCarriedRestore(restored responsesChatRestoredCalls, projected []
 	return restored
 }
 
-// One flattened text replays where the turn first spoke: its message slot, or the first call.
-// The message slot wins even when a call precedes it, because a turn that emitted a call and
-// THEN spoke would otherwise have its text hoisted above the call and lose upstream's order.
+// Legacy or map-only carriers have one flattened text slot. Prefer their message placeholder,
+// then the first call, so text that followed a call is not hoisted ahead of it.
 func carriedTextSlot(items []json.RawMessage, callByItemIndex map[int]int) int {
 	firstCall := -1
 	for index, item := range items {

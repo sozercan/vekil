@@ -75,7 +75,7 @@ func TestCarrierSerializationKeepsOnlyOrderingFieldsForVisibleItems(t *testing.T
 	}
 	replay := mustDecodeCarrier(t, signature)
 	want := []string{
-		`{"type":"message","role":"assistant"}`,
+		`{"type":"message","role":"assistant","text_bytes":11}`,
 		`{"type":"function_call","call_id":"call_upstream_1","name":"lookup"}`,
 	}
 	if len(replay.Items) != len(want) {

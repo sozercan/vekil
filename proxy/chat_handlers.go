@@ -1375,10 +1375,10 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 		return chatExecutionResult{}, err
 	}
 	result := chatExecutionResult{
-		Response:      resp,
-		Headers:       convertedExplicitChatSafeHeaders(resp, operation.route.public.id),
-		Backend:       chatBackendNativeChat,
-		upstreamError: captureNativeChatHTTPErrorClassifiers(resp),
+		Response:             resp,
+		Headers:              convertedExplicitChatSafeHeaders(resp, operation.route.public.id),
+		Backend:              chatBackendNativeChat,
+		upstreamErrorCapture: captureNativeChatHTTPErrorClassifiers(resp),
 	}
 	if resolved, _, ok := explicitResolvedChatRouteForResponse(operation, resp, providerEndpointChatCompletions, chatBackendNativeChat); ok {
 		result.route = resolved
@@ -1423,7 +1423,8 @@ func (h *ProxyHandler) retryRoutedChatExecutionWithoutInjectedStreamOptions(ctx 
 	resp, retryBody, retryMode := h.retryChatCompletionsWithoutInjectedStreamOptionsForModel(ctx, result.Response, body, mode, requestedModel)
 	result.Response = resp
 	result.Headers = convertedExplicitChatSafeHeaders(resp, operation.route.public.id)
-	result.upstreamError = captureNativeChatHTTPErrorClassifiers(resp)
+	result.upstreamError = upstreamErrorClassifiers{}
+	result.upstreamErrorCapture = captureNativeChatHTTPErrorClassifiers(resp)
 	if resolved, _, ok := explicitResolvedChatRouteForResponse(operation, resp, providerEndpointChatCompletions, chatBackendNativeChat); ok {
 		result.route = resolved
 	}
@@ -1445,6 +1446,8 @@ func (h *ProxyHandler) aggregateExplicitRoutedChatExecution(ctx context.Context,
 		result.Completion = nil
 		result.Usage = nil
 		result.Headers = convertedExplicitChatSafeHeaders(finalResp, operation.route.public.id)
+		result.upstreamError = upstreamErrorClassifiers{}
+		result.upstreamErrorCapture = captureNativeChatHTTPErrorClassifiers(finalResp)
 		if resolved, _, ok := explicitResolvedChatRouteForResponse(operation, finalResp, providerEndpointChatCompletions, chatBackendNativeChat); ok {
 			result.route = resolved
 		}
@@ -2186,7 +2189,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	result, oaiBody, mode = h.retryRoutedChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, oaiBody, mode, providerModel)
 	observeChatExecutionRoute(r.Context(), result)
-	observeUpstreamErrorClassifiers(r.Context(), result.upstreamError)
+	result.observeUpstreamError(r.Context())
 	observeUpstreamHeaders(r.Context(), result.Headers)
 	if result.Backend == chatBackendResponses && len(result.Headers) > 0 {
 		if policyPlan.valid() {
@@ -2236,7 +2239,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 	observeChatExecutionRoute(r.Context(), result)
-	observeUpstreamErrorClassifiers(r.Context(), result.upstreamError)
+	result.observeUpstreamError(r.Context())
 	if len(result.Headers) > 0 {
 		observeUpstreamHeaders(r.Context(), result.Headers)
 	}
@@ -2536,7 +2539,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
 	}
 
-	oaiResp, err := h.runAnthropicCountTokensProbeWithContext(upstreamCtx, oaiReq, carriedReasoning)
+	oaiResp, err := h.runAnthropicCountTokensProbeWithContext(upstreamCtx, r.Context(), oaiReq, carriedReasoning)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -2557,7 +2560,12 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 			return
 		}
 		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
-		h.log.Error("upstream request failed", logger.F("endpoint", "anthropic_count_tokens"), logger.Err(err))
+		var upstreamErr *upstreamError
+		if errors.As(err, &upstreamErr) {
+			h.log.Error("upstream request failed", logger.F("endpoint", "anthropic_count_tokens"), logger.F("status", upstreamErr.statusCode))
+		} else {
+			h.log.Error("upstream request failed", logger.F("endpoint", "anthropic_count_tokens"), logger.Err(err))
+		}
 		if policyPlan.valid() {
 			writePolicyAnthropicSanitizedError(w, statusCode, policyChatErrorHeaders(err), publicModel)
 			return
@@ -2608,7 +2616,7 @@ func prepareAnthropicCountTokensProbeRequestWithModelOverride(req *models.Anthro
 	return oaiReq, nil
 }
 
-func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx context.Context, probeReq *models.OpenAIRequest, carried map[string]carriedReplay) (*models.OpenAIResponse, error) {
+func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx, observationCtx context.Context, probeReq *models.OpenAIRequest, carried map[string]carriedReplay) (*models.OpenAIResponse, error) {
 	body, err := json.Marshal(probeReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal count_tokens probe request: %w", err)
@@ -2630,6 +2638,7 @@ func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx conte
 			captured, cleanupDone := captureRouteResponse(original)
 			original = captured.response()
 			if !cleanupDone {
+				result.observeUpstreamError(observationCtx)
 				return h.decodeAnthropicCountTokensProbeResponse(original)
 			}
 		} else if original.Body != nil {
@@ -2652,6 +2661,7 @@ func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx conte
 			return nil, err
 		}
 	}
+	result.observeUpstreamError(observationCtx)
 	return h.decodeAnthropicCountTokensExecution(result)
 }
 
@@ -2671,9 +2681,6 @@ func (h *ProxyHandler) decodeAnthropicCountTokensProbeResponse(resp *http.Respon
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
-		h.log.Error("upstream error", logger.F("endpoint", "anthropic_count_tokens"), logger.F("status", resp.StatusCode), logger.F("detail", detail))
-		h.log.Debug("upstream error body", logger.F("endpoint", "anthropic_count_tokens"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
 		return nil, &upstreamError{
 			statusCode: resp.StatusCode,
 			body:       errBody,
@@ -3038,7 +3045,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 
 	result, bodyBytes, mode = h.retryRoutedChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, bodyBytes, mode, requestedModel)
 	observeChatExecutionRoute(r.Context(), result)
-	observeUpstreamErrorClassifiers(r.Context(), result.upstreamError)
+	result.observeUpstreamError(r.Context())
 	observeUpstreamHeaders(r.Context(), result.Headers)
 	if policyPlan.valid() && result.Backend == chatBackendResponses && len(result.Headers) > 0 {
 		// routeChatExecutionResult merges Responses-backed headers before its
@@ -3087,7 +3094,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 	observeChatExecutionRoute(r.Context(), result)
-	observeUpstreamErrorClassifiers(r.Context(), result.upstreamError)
+	result.observeUpstreamError(r.Context())
 	if len(result.Headers) > 0 {
 		observeUpstreamHeaders(r.Context(), result.Headers)
 	}

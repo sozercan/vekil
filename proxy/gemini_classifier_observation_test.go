@@ -51,22 +51,12 @@ func TestStreamErrorBranchesRecordClassifiers(t *testing.T) {
 			if !ok {
 				return true
 			}
-			// Only branches that observe something -- a pure control-flow check
-			// (status mapping, shutdown) is not an observation site.
-			body := nodeText(fset, src, stmt.Body)
-			if !strings.Contains(body, "errors.As") && !strings.Contains(nodeText(fset, src, stmt.Cond), "errors.As") {
-				return true
-			}
-			cond := nodeText(fset, src, stmt.Cond)
-			if !strings.Contains(cond, "chatExecutionErrorFromStreamTermination") &&
-				(!strings.Contains(cond, "errors.As") || !strings.Contains(body, "observe")) {
-				return true
-			}
-			if !strings.Contains(body, "observe") {
+			candidate, observesClassifiers := streamErrorObservationBranch(fset, src, stmt)
+			if !candidate {
 				return true
 			}
 			checked++
-			if !strings.Contains(body, "observeChatExecutionError") {
+			if !observesClassifiers {
 				offenders = append(offenders,
 					fset.Position(stmt.Pos()).String()+": observes usage/status but not classifiers")
 			}
@@ -80,6 +70,53 @@ func TestStreamErrorBranchesRecordClassifiers(t *testing.T) {
 	for _, o := range offenders {
 		t.Errorf("%s -- call observeChatExecutionError, as the OpenAI and Anthropic paths do", o)
 	}
+}
+
+func TestStreamErrorBranchDetectionIncludesIfInit(t *testing.T) {
+	src := []byte(`package proxy
+func sample(err error) {
+	if terminalErr := chatExecutionErrorFromStreamTermination(err); terminalErr != nil {
+		observeOpenAIUsage(nil, nil)
+	}
+}`)
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "sample.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stmt *ast.IfStmt
+	ast.Inspect(file, func(n ast.Node) bool {
+		if found, ok := n.(*ast.IfStmt); ok {
+			stmt = found
+			return false
+		}
+		return true
+	})
+	if stmt == nil {
+		t.Fatal("fixture has no if statement")
+	}
+	candidate, observesClassifiers := streamErrorObservationBranch(fset, src, stmt)
+	if !candidate || observesClassifiers {
+		t.Fatalf("branch detection = candidate %v classifiers %v, want true/false", candidate, observesClassifiers)
+	}
+}
+
+func streamErrorObservationBranch(fset *token.FileSet, src []byte, stmt *ast.IfStmt) (bool, bool) {
+	if stmt == nil {
+		return false, false
+	}
+	// Only branches that observe something -- a pure control-flow check
+	// (status mapping, shutdown) is not an observation site.
+	body := nodeText(fset, src, stmt.Body)
+	if !strings.Contains(body, "observe") {
+		return false, false
+	}
+	guard := nodeText(fset, src, stmt.Init) + "\n" + nodeText(fset, src, stmt.Cond)
+	if !strings.Contains(guard, "chatExecutionErrorFromStreamTermination") &&
+		!strings.Contains(guard, "errors.As") {
+		return false, false
+	}
+	return true, strings.Contains(body, "observeChatExecutionError")
 }
 
 func nodeText(fset *token.FileSet, src []byte, n ast.Node) string {

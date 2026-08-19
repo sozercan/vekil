@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
@@ -71,7 +71,15 @@ type chatExecutionResult struct {
 	route            resolvedChatRoute
 	// Reduced from an upstream non-2xx body, which the surfaces see as a successful
 	// result. Rides here because the boundary that read it had no request summary.
-	upstreamError upstreamErrorClassifiers
+	upstreamError        upstreamErrorClassifiers
+	upstreamErrorCapture *upstreamErrorClassifierCapture
+}
+
+func (r chatExecutionResult) observeUpstreamError(ctx context.Context) {
+	observeUpstreamErrorClassifiers(ctx, r.upstreamError)
+	if r.upstreamErrorCapture != nil {
+		r.upstreamErrorCapture.observe(ctx)
+	}
 }
 
 // Non-streaming Anthropic is force-streamed, so its carrier lands on the stream.
@@ -184,27 +192,106 @@ func (h *ProxyHandler) executeResolvedNativeChat(ctx context.Context, route reso
 		return chatExecutionResult{}, err
 	}
 	return chatExecutionResult{
-		Response:      resp,
-		Headers:       convertedChatSafeHeaders(resp.Header),
-		Backend:       chatBackendNativeChat,
-		route:         route,
-		upstreamError: captureNativeChatHTTPErrorClassifiers(resp),
+		Response:             resp,
+		Headers:              convertedChatSafeHeaders(resp.Header),
+		Backend:              chatBackendNativeChat,
+		route:                route,
+		upstreamErrorCapture: captureNativeChatHTTPErrorClassifiers(resp),
 	}, nil
 }
 
-// captureNativeChatHTTPErrorClassifiers inspects a bounded prefix without consuming it
-// from the public passthrough body. bufio.Reader retains both the peeked bytes and any
-// terminal read error, so the client observes the same body and read outcome it would
-// have seen before classification.
-func captureNativeChatHTTPErrorClassifiers(resp *http.Response) upstreamErrorClassifiers {
-	if resp == nil || resp.Body == nil || resp.StatusCode < http.StatusBadRequest {
-		return upstreamErrorClassifiers{}
+type upstreamErrorClassifierCapture struct {
+	mu          sync.Mutex
+	status      int
+	prefix      []byte
+	complete    bool
+	classifiers upstreamErrorClassifiers
+	summaries   map[*RequestSummary]struct{}
+}
+
+func (c *upstreamErrorClassifierCapture) observe(ctx context.Context) {
+	if c == nil {
+		return
 	}
-	body := resp.Body
-	buffered := bufio.NewReaderSize(body, upstreamErrorDetailMaxBodyBytes)
-	prefix, _ := buffered.Peek(upstreamErrorDetailMaxBodyBytes)
-	resp.Body = prefixedReadCloser{Reader: buffered, close: body.Close}
-	return safeUpstreamErrorClassifiers(resp.StatusCode, prefix)
+	summary := RequestSummaryFromContext(ctx)
+	if summary == nil {
+		return
+	}
+
+	c.mu.Lock()
+	if !c.complete {
+		if c.summaries == nil {
+			c.summaries = make(map[*RequestSummary]struct{})
+		}
+		c.summaries[summary] = struct{}{}
+		c.mu.Unlock()
+		return
+	}
+	classifiers := c.classifiers
+	c.mu.Unlock()
+	if !classifiers.empty() {
+		summary.setErrorDetail(classifiers.errorType, classifiers.code, classifiers.param, "")
+	}
+}
+
+func (c *upstreamErrorClassifierCapture) add(data []byte, terminal bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.complete {
+		c.mu.Unlock()
+		return
+	}
+	remaining := upstreamErrorDetailMaxBodyBytes - len(c.prefix)
+	if remaining > 0 && len(data) > 0 {
+		c.prefix = append(c.prefix, data[:min(remaining, len(data))]...)
+	}
+	if len(c.prefix) < upstreamErrorDetailMaxBodyBytes && !terminal {
+		c.mu.Unlock()
+		return
+	}
+	c.classifiers = safeUpstreamErrorClassifiers(c.status, c.prefix)
+	c.complete = true
+	summaries := c.summaries
+	c.summaries = nil
+	classifiers := c.classifiers
+	c.mu.Unlock()
+
+	if classifiers.empty() {
+		return
+	}
+	for summary := range summaries {
+		summary.setErrorDetail(classifiers.errorType, classifiers.code, classifiers.param, "")
+	}
+}
+
+type upstreamErrorClassifyingReadCloser struct {
+	io.ReadCloser
+	capture *upstreamErrorClassifierCapture
+}
+
+func (r *upstreamErrorClassifyingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.capture.add(p[:n], err != nil)
+	return n, err
+}
+
+func (r *upstreamErrorClassifyingReadCloser) Close() error {
+	r.capture.add(nil, true)
+	return r.ReadCloser.Close()
+}
+
+// captureNativeChatHTTPErrorClassifiers observes a bounded prefix only while the response
+// body is naturally consumed. It must not read here: status and headers should be available
+// to the client even when a short chunked error body is slow or never closes.
+func captureNativeChatHTTPErrorClassifiers(resp *http.Response) *upstreamErrorClassifierCapture {
+	if resp == nil || resp.Body == nil || resp.StatusCode < http.StatusBadRequest {
+		return nil
+	}
+	capture := &upstreamErrorClassifierCapture{status: resp.StatusCode}
+	resp.Body = &upstreamErrorClassifyingReadCloser{ReadCloser: resp.Body, capture: capture}
+	return capture
 }
 
 func (h *ProxyHandler) retryResolvedNativeChat(ctx context.Context, prior chatExecutionResult, chatBody []byte) (chatExecutionResult, error) {

@@ -224,7 +224,7 @@ To publish Sparkle updates, configure both `SPARKLE_PUBLIC_ED_KEY` and `SPARKLE_
 
 ## Live Copilot Smoke Workflow
 
-The repository also includes a `Live Copilot Smoke` workflow in [`.github/workflows/live-copilot-smoke.yaml`](../.github/workflows/live-copilot-smoke.yaml). It runs on pull requests targeting `main` and can also be started manually from the Actions tab.
+The repository also includes a `Live Copilot Smoke` workflow in [`.github/workflows/live-copilot-smoke.yaml`](../.github/workflows/live-copilot-smoke.yaml). It runs after pushes to `main` and can also be started manually from the Actions tab. It does not run pull-request-controlled code automatically because the job exposes a live Copilot credential while building the checked-out revision and running repository scripts.
 
 It builds the proxy, runs [`scripts/live-compact-smoke.sh`](../scripts/live-compact-smoke.sh) and [`scripts/live-chat-over-responses-smoke.sh`](../scripts/live-chat-over-responses-smoke.sh), installs Codex and Claude Code, runs [`scripts/live-claude-reasoning-carrier-smoke.sh`](../scripts/live-claude-reasoning-carrier-smoke.sh), installs Gemini CLI, and then runs [`scripts/live-cli-smoke.sh`](../scripts/live-cli-smoke.sh).
 
@@ -386,11 +386,11 @@ The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workfl
 1. Create a GitHub token for a user that has GitHub Copilot access.
 2. Grant that token the `Copilot Requests` permission.
 3. Save it as the repository secret `COPILOT_GITHUB_TOKEN`.
-4. Run either workflow from the Actions tab; same-repository pull requests run both automatically.
+4. Run either workflow from the Actions tab. Pushes to `main` run `Live Copilot Smoke` automatically; same-repository pull requests run only the semantic-policy workflow automatically.
 
 The direct-bearer workflow deliberately uses the separate `COPILOT_FINE_GRAINED_PAT` credential described above so fine-grained-PAT authentication remains independently covered.
 
-The two pull-request-triggered Copilot workflows remain separate from deterministic core CI. Both neutral-skip fork pull requests because GitHub does not expose repository secrets to untrusted pull-request code. The semantic-policy workflow also neutral-skips Dependabot runs; `Live Copilot Smoke` neutral-skips Dependabot only when `COPILOT_GITHUB_TOKEN` is unavailable. In other contexts, a missing token fails the workflow. The direct-bearer workflow is default-branch-only as described above.
+The credentialed Copilot workflows remain separate from deterministic core CI. `Live Copilot Smoke` runs only from a trusted `main` push or an explicit manual dispatch and fails when `COPILOT_GITHUB_TOKEN` is unavailable. The pull-request-triggered semantic-policy workflow neutral-skips forks and Dependabot because GitHub withholds repository secrets there; a same-repository run without the token fails. The direct-bearer workflow is default-branch-only as described above.
 
 You can also run the same smoke scripts locally after building `vekil`; the CLI smoke script additionally requires those three CLIs to be installed.
 

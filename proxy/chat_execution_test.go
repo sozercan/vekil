@@ -11,6 +11,7 @@ import (
 	"os"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
@@ -152,10 +153,9 @@ func TestCaptureNativeChatHTTPErrorClassifiersPreservesBodyReadError(t *testing.
 		)),
 	}
 
-	classifiers := captureNativeChatHTTPErrorClassifiers(resp)
-	if classifiers.errorType != "invalid_request_error" || classifiers.code != "bad_value" || classifiers.param != "messages" {
-		t.Fatalf("classifiers = %#v", classifiers)
-	}
+	ctx, summary := WithRequestSummary(context.Background())
+	capture := captureNativeChatHTTPErrorClassifiers(resp)
+	capture.observe(ctx)
 	replayed, err := io.ReadAll(resp.Body)
 	if string(replayed) != body {
 		t.Fatalf("replayed body = %q, want %q", replayed, body)
@@ -163,7 +163,80 @@ func TestCaptureNativeChatHTTPErrorClassifiersPreservesBodyReadError(t *testing.
 	if !errors.Is(err, readErr) {
 		t.Fatalf("replayed error = %v, want %v", err, readErr)
 	}
+	classifiers := map[string]string{}
+	for _, field := range summary.LoggerFields() {
+		if value, ok := field.Value.(string); ok {
+			classifiers[field.Key] = value
+		}
+	}
+	if classifiers["error_type"] != "invalid_request_error" || classifiers["error_code"] != "bad_value" || classifiers["error_param"] != "messages" {
+		t.Fatalf("classifiers = %#v", classifiers)
+	}
 }
+
+func TestCaptureNativeChatHTTPErrorClassifiersDoesNotReadAhead(t *testing.T) {
+	const body = `{"error":{"type":"invalid_request_error","code":"bad_value","param":"messages"}}`
+	started := make(chan struct{})
+	release := make(chan struct{})
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body: &gatedErrorBody{
+			Reader:  bytes.NewBufferString(body),
+			started: started,
+			release: release,
+		},
+	}
+	done := make(chan *upstreamErrorClassifierCapture, 1)
+	go func() { done <- captureNativeChatHTTPErrorClassifiers(resp) }()
+	var capture *upstreamErrorClassifierCapture
+	select {
+	case capture = <-done:
+	case <-time.After(200 * time.Millisecond):
+		close(release)
+		t.Fatal("classifier capture blocked waiting for the upstream error body")
+	}
+	select {
+	case <-started:
+		close(release)
+		t.Fatal("classifier capture read the body before passthrough consumption")
+	default:
+	}
+
+	ctx, summary := WithRequestSummary(context.Background())
+	capture.observe(ctx)
+	close(release)
+	replayed, err := io.ReadAll(resp.Body)
+	if err != nil || string(replayed) != body {
+		t.Fatalf("replayed body = %q, err = %v", replayed, err)
+	}
+	fields := map[string]string{}
+	for _, field := range summary.LoggerFields() {
+		if value, ok := field.Value.(string); ok {
+			fields[field.Key] = value
+		}
+	}
+	if fields["error_type"] != "invalid_request_error" || fields["error_code"] != "bad_value" || fields["error_param"] != "messages" {
+		t.Fatalf("classifiers = %#v", fields)
+	}
+}
+
+type gatedErrorBody struct {
+	io.Reader
+	started chan struct{}
+	release chan struct{}
+	read    bool
+}
+
+func (b *gatedErrorBody) Read(p []byte) (int, error) {
+	if !b.read {
+		b.read = true
+		close(b.started)
+		<-b.release
+	}
+	return b.Reader.Read(p)
+}
+
+func (*gatedErrorBody) Close() error { return nil }
 
 func TestParseResponsesChatErrorDetailsCopiesFlatCopilotMessage(t *testing.T) {
 	details := parseResponsesChatErrorDetails(http.StatusBadRequest, []byte(

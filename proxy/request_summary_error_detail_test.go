@@ -1,16 +1,20 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/sozercan/vekil/logger"
 )
 
 // Upstream error prose quotes the offending request value back, so it must not
@@ -120,6 +124,41 @@ func TestAnthropicUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T)
 		if strings.Contains(value, "not-a-real-type") || strings.Contains(value, "Invalid schema") {
 			t.Fatalf("%s leaked upstream prose: %q", key, value)
 		}
+	}
+}
+
+func TestAnthropicCountTokensErrorLogsOnlySafeClassifiers(t *testing.T) {
+	const secret = "SSN 123-45-6789 and the user prompt"
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"Invalid value quoted from request: ` + secret + `","code":"bad_value","param":"messages[0].content","type":"invalid_request_error"}}`))
+	})
+	var logs bytes.Buffer
+	handler.log = logger.NewWithWriter(logger.LevelDebug, &logs)
+
+	ctx, summary := WithRequestSummary(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(
+		`{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessagesCountTokens(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(logs.String(), secret) || strings.Contains(logs.String(), "Invalid value quoted") {
+		t.Fatalf("count_tokens logs exposed the upstream error body: %s", logs.String())
+	}
+	got := map[string]string{}
+	for _, field := range summary.LoggerFields() {
+		if value, ok := field.Value.(string); ok && strings.HasPrefix(field.Key, "error_") {
+			got[field.Key] = value
+		}
+	}
+	if got["error_type"] != "invalid_request_error" || got["error_code"] != "bad_value" || got["error_param"] != "messages" {
+		t.Fatalf("classifiers = %#v", got)
 	}
 }
 
@@ -492,6 +531,43 @@ func TestExplicitNativeChatStreamOptionsRecoveryClearsDiscardedClassifiers(t *te
 		if strings.HasPrefix(field.Key, "error_") {
 			t.Fatalf("successful recovery retained discarded classifier %s=%#v", field.Key, field.Value)
 		}
+	}
+}
+
+func TestExplicitForcedStreamFailoverRecapturesFinalResponseClassifiers(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: error\ndata: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n")
+	}))
+	defer primary.Close()
+
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = io.WriteString(w, `{"error":{"message":"invalid client tool schema","type":"invalid_request_error","code":"bad_value","param":"tools[0].function.parameters"}}`)
+	}))
+	defer secondary.Close()
+
+	handler := newExplicitRouteSurfaceHandler(t, providerTypeAzureOpenAI, providerEndpointChatCompletions, primary.URL, secondary.URL)
+	ctx, summary := WithRequestSummary(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+		`{"model":"public-model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(recorder, req)
+
+	if recorder.Code != http.StatusTeapot {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusTeapot, recorder.Body.String())
+	}
+	got := map[string]string{}
+	for _, field := range summary.LoggerFields() {
+		if value, ok := field.Value.(string); ok && strings.HasPrefix(field.Key, "error_") {
+			got[field.Key] = value
+		}
+	}
+	if got["error_type"] != "invalid_request_error" || got["error_code"] != "bad_value" || got["error_param"] != "tools" {
+		t.Fatalf("final response classifiers = %#v", got)
 	}
 }
 

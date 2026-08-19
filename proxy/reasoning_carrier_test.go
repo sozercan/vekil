@@ -674,6 +674,43 @@ func TestCarriedRestoreKeepsTextAfterACallThatPrecededIt(t *testing.T) {
 	}
 }
 
+func TestCarriedRestorePreservesMultipleMessageItemBoundaries(t *testing.T) {
+	items := []json.RawMessage{
+		json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"before "}]}`),
+		json.RawMessage(`{"type":"reasoning","id":"rs_between","encrypted_content":"OPAQUE"}`),
+		json.RawMessage(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"after"}]}`),
+		json.RawMessage(`{"type":"function_call","call_id":"upstream-1","name":"lookup","arguments":"{}"}`),
+	}
+	signature, err := encodeReasoningCarrier(carriedTurn{Items: items})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	replay := mustDecodeCarrier(t, signature)
+	if !carriedItemsWellShaped(replay.Items) {
+		t.Fatal("decoder rejected the multiple message placeholders emitted by the carrier")
+	}
+
+	out := reconstructCarriedRestore(
+		responsesChatRestoredCalls{
+			OutputItems: replay.Items,
+			Calls: []responsesChatReplayResolvedCall{{
+				ProxyCallID: "call_vekil_x", UpstreamCallID: "upstream-1", OutputItemIndex: 3,
+			}},
+		},
+		[]responsesChatReplayProjectedCall{{ID: "call_vekil_x", Name: "lookup", Arguments: "{}"}},
+		"before after",
+	)
+	if len(out.OutputItems) != 4 {
+		t.Fatalf("restored items = %d, want 4: %s", len(out.OutputItems), mustJSON(t, out.OutputItems))
+	}
+	wantFragments := []string{`"content":"before "`, `"encrypted_content":"OPAQUE"`, `"content":"after"`, `"call_id":"upstream-1"`}
+	for i, fragment := range wantFragments {
+		if !strings.Contains(string(out.OutputItems[i]), fragment) {
+			t.Fatalf("item %d = %s, want fragment %s", i, out.OutputItems[i], fragment)
+		}
+	}
+}
+
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)
