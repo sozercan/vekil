@@ -198,7 +198,8 @@ func TestHandleOpenAIChatCompletionsProjectionMismatchIsRejected(t *testing.T) {
 // the call_id. That is safe only because the whole turn is rebuilt from the transcript in the
 // same request, where call_id needs to be internally consistent and nothing more; vekil sends
 // `store: false` and replays the history every turn, so there is no server-side registry of
-// call ids to contradict. Untested against live Copilot, like everything else here.
+// call ids to contradict. scripts/live-claude-reasoning-carrier-smoke.sh asserts this against
+// live Copilot after an actual proxy restart.
 //
 // The alternative -- refusing to degrade an opaque id -- reinstates the permanent wedge this
 // branch exists to remove, so this is deliberate and the contract says so.
@@ -257,5 +258,92 @@ func TestAnthropicOpaqueIDDegradesWhileNativeChatStillRefuses(t *testing.T) {
 	}
 	if len(upstreamBodies) != 1 {
 		t.Fatalf("native Chat reached upstream for a turn it should have refused locally: %s", upstreamBodies[1])
+	}
+}
+
+// Claude Code may retain a newer carrier while dropping one from an older tool turn. After a
+// restart the newer turn must still recover its upstream mapping and reasoning, while the older
+// turn independently falls back to its visible transcript instead of wedging the whole request.
+func TestDroppedOlderCarrierDegradesAlongsideNewerCarrierAfterRestart(t *testing.T) {
+	_, route, items, published := publishCarrierParityTurn(t, "upstream-recent")
+	recent := published.Projection.Calls[0]
+	oldID := responsesChatReplayCallIDPrefix + strings.Repeat("D", 22)
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-public",
+		"messages": []any{
+			map[string]any{"role": "assistant", "content": "older visible turn", "tool_calls": []any{map[string]any{
+				"id": oldID, "type": "function", "function": map[string]any{"name": "lookup", "arguments": `{"key":"old"}`},
+			}}},
+			map[string]any{"role": "tool", "tool_call_id": oldID, "content": "old-result"},
+			map[string]any{"role": "assistant", "content": "checking", "tool_calls": []any{map[string]any{
+				"id": recent.ID, "type": "function", "function": map[string]any{"name": recent.Name, "arguments": recent.Arguments},
+			}}},
+			map[string]any{"role": "tool", "tool_call_id": recent.ID, "content": "recent-result"},
+			map[string]any{"role": "user", "content": "continue"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+		UpstreamModel: "gpt-upstream",
+		ReplayRoute:   route,
+		// No ReplayStore models expiry, eviction, or restart. Only the newer turn's
+		// carrier survived in the client transcript.
+		CarriedReasoning:          carriedForEveryCall(t, route, published, items),
+		DegradeUnrestorableReplay: true,
+		Log:                       logger.NewWithWriter(logger.LevelInfo, &logs),
+	})
+	if err != nil {
+		t.Fatalf("translate mixed carrier history: %v", err)
+	}
+	input := upstreamInputJSON(t, plan)
+	var upstreamItems []map[string]any
+	if err := json.Unmarshal([]byte(input), &upstreamItems); err != nil {
+		t.Fatal(err)
+	}
+	calls, outputs := map[string]bool{}, map[string]bool{}
+	for _, item := range upstreamItems {
+		callID, _ := item["call_id"].(string)
+		switch item["type"] {
+		case "function_call":
+			calls[callID] = true
+		case "function_call_output":
+			outputs[callID] = true
+		}
+	}
+	for _, callID := range []string{oldID, "upstream-recent"} {
+		if !calls[callID] || !outputs[callID] {
+			t.Fatalf("call %q was not paired after mixed recovery: calls=%v outputs=%v input=%s", callID, calls, outputs, input)
+		}
+	}
+	for _, want := range []string{
+		`"call_id":"` + oldID + `"`,
+		`"call_id":"upstream-recent"`,
+		`"encrypted_content":"OPAQUE"`,
+		`"arguments":"{\"key\":\"old\"}"`,
+	} {
+		if !strings.Contains(input, want) {
+			t.Fatalf("mixed recovery lost %s: %s", want, input)
+		}
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
+		t.Fatalf("unmarshal degrade log %q: %v", logs.String(), err)
+	}
+	for key, want := range map[string]any{
+		"carrier":        "absent",
+		"diverged":       "store_missing",
+		"carried_turns":  float64(1),
+		"degraded_turns": float64(1),
+		"tool_turns":     float64(1),
+		"tool_calls":     float64(1),
+	} {
+		if got := entry[key]; got != want {
+			t.Fatalf("log[%s] = %#v, want %#v in %#v", key, got, want, entry)
+		}
 	}
 }

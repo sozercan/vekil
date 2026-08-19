@@ -150,7 +150,9 @@ jobs:
               "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/summary.txt" \
               "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/selected-model.txt" \
               "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/claude.err" \
-              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/claude-sanitized.json"; do
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/claude-sanitized.json" \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/missing-carrier-single-response.json" \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/missing-carrier-complex-response.json"; do
               if [ -f "$file" ]; then
                 echo "--- $file ---"
                 redact < "$file" | { head -c 32768; cat >/dev/null; }

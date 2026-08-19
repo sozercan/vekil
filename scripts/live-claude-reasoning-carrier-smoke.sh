@@ -130,6 +130,8 @@ SUMMARY_FILE="${SMOKE_DIR}/summary.txt"
 SANITIZED_TRACE="${SMOKE_DIR}/claude-sanitized.json"
 CLAUDE_RAW="${SMOKE_DIR}/claude.stream.jsonl"
 CLAUDE_ERR="${SMOKE_DIR}/claude.err"
+MISSING_CARRIER_SINGLE_RESPONSE="${SMOKE_DIR}/missing-carrier-single-response.json"
+MISSING_CARRIER_COMPLEX_RESPONSE="${SMOKE_DIR}/missing-carrier-complex-response.json"
 CLAUDE_HOME="${SMOKE_DIR}/claude-home"
 CLAUDE_SETTINGS="${CLAUDE_HOME}/.claude/settings.json"
 CASE_DIR="${SMOKE_DIR}/case"
@@ -137,6 +139,11 @@ TOOL_STARTED_MARKER="${CASE_DIR}/.vekil-carrier-tool-started"
 PROXY_READY_MARKER="${CASE_DIR}/.vekil-carrier-proxy-ready"
 TOOL_RESULT_MARKER="VEKIL_CARRIER_TOOL_RESULT"
 FINAL_MARKER="VEKIL_CARRIER_RESTART_OK"
+MISSING_CARRIER_SINGLE_MARKER="VEKIL_MISSING_CARRIER_SINGLE_OK"
+MISSING_CARRIER_COMPLEX_MARKER="VEKIL_MISSING_CARRIER_COMPLEX_OK"
+OPAQUE_CALL_OLD="call_vekil_DDDDDDDDDDDDDDDDDDDDDD"
+OPAQUE_CALL_PARALLEL_ONE="call_vekil_EEEEEEEEEEEEEEEEEEEEEE"
+OPAQUE_CALL_PARALLEL_TWO="call_vekil_FFFFFFFFFFFFFFFFFFFFFF"
 # Expanded by the Bash tool inside Claude, not by this harness.
 # shellcheck disable=SC2016
 EXPECTED_TOOL_COMMAND='test -z "${COPILOT_GITHUB_TOKEN+x}" && printf started > .vekil-carrier-tool-started; while [ ! -f .vekil-carrier-proxy-ready ]; do sleep 0.1; done; printf VEKIL_CARRIER_TOOL_RESULT'
@@ -325,6 +332,8 @@ cleanup() {
     dump_redacted_file "proxy-restarted.log" "${RESTARTED_PROXY_LOG}"
     dump_redacted_file "claude.err" "${CLAUDE_ERR}"
     dump_redacted_file "claude-sanitized.json" "${SANITIZED_TRACE}"
+    dump_redacted_file "missing-carrier-single-response.json" "${MISSING_CARRIER_SINGLE_RESPONSE}"
+    dump_redacted_file "missing-carrier-complex-response.json" "${MISSING_CARRIER_COMPLEX_RESPONSE}"
   fi
   exit "${rc}"
 }
@@ -696,6 +705,112 @@ assert_restarted_proxy_used_carrier() {
   fi
 }
 
+validate_fixed_text_response() {
+  local path="$1"
+  local marker="$2"
+  jq -e --arg model "${CHAT_MODEL}" --arg marker "${marker}" '
+    .type == "message"
+    and .model == $model
+    and .stop_reason == "end_turn"
+    and ([.content[]? | select(.type == "text") | .text] == [$marker])
+    and ([.content[]? | select(.type == "tool_use")] | length == 0)
+  ' "${path}" >/dev/null || die "live missing-carrier fallback returned an unexpected response: ${path}"
+}
+
+post_anthropic_request() {
+  local response_path="$1"
+  if ! curl --fail --silent --show-error \
+    --connect-timeout "${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS}" \
+    --max-time "${SMOKE_CURL_MAX_TIME_SECONDS}" \
+    -H 'content-type: application/json' \
+    -H 'anthropic-version: 2023-06-01' \
+    --data-binary @- \
+    "${PROXY_BASE_URL}/v1/messages" > "${response_path}"; then
+    die "POST ${PROXY_BASE_URL}/v1/messages failed for missing-carrier fallback"
+  fi
+  chmod 600 "${response_path}"
+}
+
+# Reproduce the review's three-way-empty case against the restarted live proxy: the replay
+# store is gone, the client sends no carrier for the old turn, and an opaque ID remains in
+# the transcript. The second request adds two old tool turns, parallel calls, and reversed
+# result order so the check is not limited to the smallest internally-consistent pair.
+assert_missing_carrier_falls_back_live() {
+  log "Validating carrier-absent opaque-ID fallback against live Copilot"
+
+  jq -n \
+    --arg model "${CHAT_MODEL}" \
+    --arg call "${OPAQUE_CALL_OLD}" \
+    --arg marker "${MISSING_CARRIER_SINGLE_MARKER}" '
+    {
+      model: $model,
+      max_tokens: 128,
+      messages: [
+        {role: "user", content: "A synthetic tool was used."},
+        {role: "assistant", content: [{type: "tool_use", id: $call, name: "lookup_synthetic_widget", input: {id: "widget-1"}}]},
+        {role: "user", content: [{type: "tool_result", tool_use_id: $call, content: "widget status is green"}]},
+        {role: "user", content: ("Reply with exactly " + $marker + " and do not call tools.")}
+      ],
+      tools: [{
+        name: "lookup_synthetic_widget",
+        description: "Look up a synthetic test widget.",
+        input_schema: {type: "object", properties: {id: {type: "string"}}, required: ["id"]}
+      }]
+    }
+  ' | post_anthropic_request "${MISSING_CARRIER_SINGLE_RESPONSE}"
+  validate_fixed_text_response "${MISSING_CARRIER_SINGLE_RESPONSE}" "${MISSING_CARRIER_SINGLE_MARKER}"
+
+  jq -n \
+    --arg model "${CHAT_MODEL}" \
+    --arg old "${OPAQUE_CALL_OLD}" \
+    --arg parallel_one "${OPAQUE_CALL_PARALLEL_ONE}" \
+    --arg parallel_two "${OPAQUE_CALL_PARALLEL_TWO}" \
+    --arg marker "${MISSING_CARRIER_COMPLEX_MARKER}" '
+    {
+      model: $model,
+      max_tokens: 128,
+      messages: [
+        {role: "user", content: "Collect the synthetic facts."},
+        {role: "assistant", content: [{type: "tool_use", id: $old, name: "lookup_alpha", input: {key: "a"}}]},
+        {role: "user", content: [{type: "tool_result", tool_use_id: $old, content: "alpha=1"}]},
+        {role: "assistant", content: [
+          {type: "text", text: "I need the remaining facts."},
+          {type: "tool_use", id: $parallel_one, name: "lookup_beta", input: {key: "b"}},
+          {type: "tool_use", id: $parallel_two, name: "lookup_gamma", input: {key: "c"}}
+        ]},
+        {role: "user", content: [
+          {type: "tool_result", tool_use_id: $parallel_two, content: "gamma=3"},
+          {type: "tool_result", tool_use_id: $parallel_one, content: "beta=2"}
+        ]},
+        {role: "user", content: ("Reply with exactly " + $marker + " and do not call tools.")}
+      ],
+      tools: [
+        {name: "lookup_alpha", description: "Synthetic lookup.", input_schema: {type: "object", properties: {key: {type: "string"}}, required: ["key"]}},
+        {name: "lookup_beta", description: "Synthetic lookup.", input_schema: {type: "object", properties: {key: {type: "string"}}, required: ["key"]}},
+        {name: "lookup_gamma", description: "Synthetic lookup.", input_schema: {type: "object", properties: {key: {type: "string"}}, required: ["key"]}}
+      ]
+    }
+  ' | post_anthropic_request "${MISSING_CARRIER_COMPLEX_RESPONSE}"
+  validate_fixed_text_response "${MISSING_CARRIER_COMPLEX_RESPONSE}" "${MISSING_CARRIER_COMPLEX_MARKER}"
+
+  jq -R -s -e --arg model "${CHAT_MODEL}" '
+    [
+      split("\n")[]
+      | fromjson?
+      | select(
+          .level == "warn"
+          and .model == $model
+          and .carrier == "absent"
+          and .diverged == "store_missing"
+          and .carried_turns == 0
+        )
+    ] as $degrades
+    | ($degrades | length) == 2
+      and any($degrades[]; .tool_turns == 1 and .tool_calls == 1 and .degraded_turns == 1)
+      and any($degrades[]; .tool_turns == 2 and .tool_calls == 3 and .degraded_turns == 2)
+  ' "${RESTARTED_PROXY_LOG}" >/dev/null || die "restarted proxy did not log both carrier-absent fallback shapes"
+}
+
 main() {
   require_cmd curl
   require_cmd jq
@@ -746,11 +861,14 @@ EOF
 
   wait_for_claude
   assert_restarted_proxy_used_carrier
+  assert_missing_carrier_falls_back_live
   {
     printf 'PASS proxy-restarted-before-tool-result\n'
     validate_claude_stream final
     printf 'PASS claude-copilot-secret-isolated\n'
     printf 'PASS carrier-restored-after-restart\n'
+    printf 'PASS opaque-id-single-turn-degrade-after-restart\n'
+    printf 'PASS opaque-id-old-parallel-turns-degrade-after-restart\n'
     printf 'PASS responses-only-gpt-selected\n'
   } >> "${SUMMARY_FILE}"
   write_sanitized_trace

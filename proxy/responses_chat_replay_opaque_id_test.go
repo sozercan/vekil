@@ -112,3 +112,31 @@ func TestClaudeCarrierSmokeRestrictsBashToTheHarnessCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeCarrierSmokeCoversDroppedCarrierFallbackAfterRestart(t *testing.T) {
+	script, err := os.ReadFile("../scripts/live-claude-reasoning-carrier-smoke.sh")
+	if err != nil {
+		t.Fatalf("read Claude carrier smoke: %v", err)
+	}
+	text := string(script)
+	for _, name := range []string{"OPAQUE_CALL_OLD", "OPAQUE_CALL_PARALLEL_ONE", "OPAQUE_CALL_PARALLEL_TWO"} {
+		declared := regexp.MustCompile(`(?m)^` + name + `="([^"]+)"$`).FindStringSubmatch(text)
+		if declared == nil {
+			t.Fatalf("Claude carrier smoke no longer declares %s", name)
+		}
+		if !isResponsesChatReplayCallID(declared[1]) {
+			t.Fatalf("Claude carrier smoke %s = %q, want a contract replay ID", name, declared[1])
+		}
+	}
+	for _, required := range []string{
+		"assert_missing_carrier_falls_back_live",
+		`and .carrier == "absent"`,
+		`and .diverged == "store_missing"`,
+		"PASS opaque-id-single-turn-degrade-after-restart",
+		"PASS opaque-id-old-parallel-turns-degrade-after-restart",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("Claude carrier smoke is missing dropped-carrier assertion %q", required)
+		}
+	}
+}

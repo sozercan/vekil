@@ -361,13 +361,13 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			}
 			restored, err := restoreResponsesChatCalls(options, projected, content, &tally)
 			if err != nil {
-				// Erroring here wedged the conversation: a client cannot repair a transcript it
-				// already sent. Gated, because native Chat owns its history and can repair it --
-				// only the surfaces that opt in trade the 400 for a turn without reasoning.
-				if !options.DegradeUnrestorableReplay || !isResponsesChatReplayProjectionError(err) {
-					return nil, err
-				}
-				recordResponsesChatReplayDegrade(&tally, projected, content, err)
+				return nil, err
+			}
+			if restored.VisibleTranscriptFallback != nil {
+				// A client cannot repair a transcript it already sent. Direct Anthropic ingress
+				// explicitly trades the missing-state 400 for a turn without hidden reasoning;
+				// native Chat never receives this successful fallback result.
+				recordResponsesChatReplayDegrade(&tally, projected, content, restored.VisibleTranscriptFallback)
 				input, err = appendVisibleAssistantTurn(input, calls, resultIndices, projected, syntheticItems, assistantHistoryText(content)+refusal, index)
 				if err != nil {
 					return nil, err
@@ -509,13 +509,21 @@ func logTrimmedReasoning(options responsesChatRequestOptions, toolTurns, agedTur
 }
 
 type responsesChatRestoredCalls struct {
-	Key           string
-	OutputItems   []json.RawMessage
-	Calls         []responsesChatReplayResolvedCall
-	TextItemIndex *int
-	// Rebuild marks a restore whose items are not upstream's own and have to be rebuilt
-	// from the transcript before use -- either a capped carrier or explicit degradation.
+	Key                       string
+	OutputItems               []json.RawMessage
+	Calls                     []responsesChatReplayResolvedCall
+	TextItemIndex             *int
+	VisibleTranscriptFallback *responsesChatVisibleTranscriptFallback
+	// Rebuild marks a carrier restore whose items are not upstream's own and have to be
+	// rebuilt from the transcript before use.
 	Rebuild bool
+}
+
+// A successful, opt-in recovery outcome rather than an error. The caller rebuilds this
+// turn from the visible transcript, using each opaque proxy ID as its stateless call_id.
+type responsesChatVisibleTranscriptFallback struct {
+	diverged string
+	carrier  string
 }
 
 // The store is authoritative while it holds the group and its arguments still match.
@@ -526,7 +534,7 @@ func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []
 	if err != nil {
 		return responsesChatRestoredCalls{}, replayChatExecutionError(responsesChatReplayProjectionCode, responsesChatReplayProjectionMessage)
 	}
-	var degradable *responsesChatDegradableError
+	var projectionMismatch *responsesChatReplayProjectionMismatchError
 	if options.ReplayStore != nil {
 		resolution, err := resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
 		if err == nil {
@@ -541,26 +549,29 @@ func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []
 			if !errors.As(err, &projection) {
 				return responsesChatRestoredCalls{}, mapped
 			}
-			degradable = &responsesChatDegradableError{error: mapped, diverged: projection.Reason}
+			projectionMismatch = &responsesChatReplayProjectionMismatchError{error: mapped, diverged: projection.Reason}
 		}
 	}
 	restored, carrier := carriedRestoredCalls(options.CarriedReasoning, projected, options.ReplayRoute, projectionContent)
 	if carrier == "" {
 		return restored, nil
 	}
-	if degradable != nil {
-		degradable.carrier = carrier
-		return responsesChatRestoredCalls{}, degradable
+	if projectionMismatch != nil {
+		if options.DegradeUnrestorableReplay {
+			return responsesChatRestoredCalls{VisibleTranscriptFallback: &responsesChatVisibleTranscriptFallback{
+				diverged: projectionMismatch.diverged,
+				carrier:  carrier,
+			}}, nil
+		}
+		return responsesChatRestoredCalls{}, projectionMismatch
 	}
 	if options.DegradeUnrestorableReplay {
-		// Nothing the carrier claimed travels: the caller rebuilds the turn from the
+		// Nothing the carrier claimed travels. The caller rebuilds the turn from the
 		// transcript, so a refused carrier is discarded rather than merely tolerated.
-		// logResponsesChatReplayDegrade names the guard on the way out.
-		return responsesChatRestoredCalls{}, &responsesChatDegradableError{
-			error:    missingResponsesChatReplayError(),
+		return responsesChatRestoredCalls{VisibleTranscriptFallback: &responsesChatVisibleTranscriptFallback{
 			diverged: "store_missing",
 			carrier:  carrier,
-		}
+		}}, nil
 	}
 	// The reason is known here and was previously discarded, so the wedge this whole
 	// mechanism exists to prevent arrived with no way to tell WHICH guard rejected it.
@@ -596,18 +607,19 @@ func appendVisibleAssistantTurn(input []json.RawMessage, calls map[string]string
 	return input, nil
 }
 
-// Only a store-reported mismatch degrades; the mapper reuses this code as its catch-all.
-type responsesChatDegradableError struct {
+// Candidate routing needs to distinguish a store-owned projection mismatch from a plain
+// miss so it can retry the exact target. Direct Anthropic fallback converts this error into
+// a successful responsesChatVisibleTranscriptFallback inside restoreResponsesChatCalls.
+type responsesChatReplayProjectionMismatchError struct {
 	error
 	diverged string
-	carrier  string
 }
 
-func (e *responsesChatDegradableError) Unwrap() error { return e.error }
+func (e *responsesChatReplayProjectionMismatchError) Unwrap() error { return e.error }
 
 func isResponsesChatReplayProjectionError(err error) bool {
-	var degradable *responsesChatDegradableError
-	return errors.As(err, &degradable)
+	var mismatch *responsesChatReplayProjectionMismatchError
+	return errors.As(err, &mismatch)
 }
 
 func logCarriedReasoningStarved(log *logger.Logger, starved bool, model string) {
@@ -712,13 +724,8 @@ func logResponsesChatCarrierWedge(options responsesChatRequestOptions, projected
 	)
 }
 
-func recordResponsesChatReplayDegrade(tally *responsesChatRestoreTally, projected []responsesChatReplayProjectedCall, content []map[string]any, err error) {
-	diverged, carrier := "unknown", "unknown"
-	var degradable *responsesChatDegradableError
-	if errors.As(err, &degradable) {
-		diverged, carrier = degradable.diverged, degradable.carrier
-	}
-	tally.record(diverged, carrier, responsesChatReplayProjectionFingerprint(projected, content), len(projected))
+func recordResponsesChatReplayDegrade(tally *responsesChatRestoreTally, projected []responsesChatReplayProjectedCall, content []map[string]any, fallback *responsesChatVisibleTranscriptFallback) {
+	tally.record(fallback.diverged, fallback.carrier, responsesChatReplayProjectionFingerprint(projected, content), len(projected))
 }
 
 // Vekil's own digest, never the projection itself: that is prompt data.
