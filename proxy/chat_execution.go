@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -183,11 +184,27 @@ func (h *ProxyHandler) executeResolvedNativeChat(ctx context.Context, route reso
 		return chatExecutionResult{}, err
 	}
 	return chatExecutionResult{
-		Response: resp,
-		Headers:  convertedChatSafeHeaders(resp.Header),
-		Backend:  chatBackendNativeChat,
-		route:    route,
+		Response:      resp,
+		Headers:       convertedChatSafeHeaders(resp.Header),
+		Backend:       chatBackendNativeChat,
+		route:         route,
+		upstreamError: captureNativeChatHTTPErrorClassifiers(resp),
 	}, nil
+}
+
+// captureNativeChatHTTPErrorClassifiers inspects a bounded prefix without consuming it
+// from the public passthrough body. bufio.Reader retains both the peeked bytes and any
+// terminal read error, so the client observes the same body and read outcome it would
+// have seen before classification.
+func captureNativeChatHTTPErrorClassifiers(resp *http.Response) upstreamErrorClassifiers {
+	if resp == nil || resp.Body == nil || resp.StatusCode < http.StatusBadRequest {
+		return upstreamErrorClassifiers{}
+	}
+	body := resp.Body
+	buffered := bufio.NewReaderSize(body, upstreamErrorDetailMaxBodyBytes)
+	prefix, _ := buffered.Peek(upstreamErrorDetailMaxBodyBytes)
+	resp.Body = prefixedReadCloser{Reader: buffered, close: body.Close}
+	return safeUpstreamErrorClassifiers(resp.StatusCode, prefix)
 }
 
 func (h *ProxyHandler) retryResolvedNativeChat(ctx context.Context, prior chatExecutionResult, chatBody []byte) (chatExecutionResult, error) {

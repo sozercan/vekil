@@ -1375,9 +1375,10 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 		return chatExecutionResult{}, err
 	}
 	result := chatExecutionResult{
-		Response: resp,
-		Headers:  convertedExplicitChatSafeHeaders(resp, operation.route.public.id),
-		Backend:  chatBackendNativeChat,
+		Response:      resp,
+		Headers:       convertedExplicitChatSafeHeaders(resp, operation.route.public.id),
+		Backend:       chatBackendNativeChat,
+		upstreamError: captureNativeChatHTTPErrorClassifiers(resp),
 	}
 	if resolved, _, ok := explicitResolvedChatRouteForResponse(operation, resp, providerEndpointChatCompletions, chatBackendNativeChat); ok {
 		result.route = resolved

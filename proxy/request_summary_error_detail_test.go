@@ -364,11 +364,82 @@ func TestChatUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T) {
 	}
 }
 
-// A native Chat route never reaches canonicalizeResponsesChatHTTPError, so result.upstreamError
-// is empty and the observe call beside observeChatExecutionRoute records nothing. Both Gemini
-// non-200 branches read the body anyway to build their detail line, so they classify off that
-// same body -- otherwise the warn entry carries a status and no reason. The two cases below are
-// the two branches: the explicit-route operation, and the path taken when there is none.
+func TestNativeChatUpstreamErrorRecordsClassifiersAndPreservesBody(t *testing.T) {
+	errorJSON := `{"error":{"message":"Invalid schema for function 't': 'not-a-real-type' is not valid",` +
+		`"code":"invalid_value","param":"tools[0].input_schema","type":"invalid_request_error"}}`
+	upstreamBody := errorJSON + strings.Repeat(" ", upstreamErrorDetailMaxBodyBytes)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != providerEndpointChatCompletions {
+			t.Errorf("upstream path = %q, want %q", r.URL.Path, providerEndpointChatCompletions)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	for _, testCase := range []struct {
+		name  string
+		model string
+		new   func(*testing.T) *ProxyHandler
+	}{
+		{
+			name:  "default provider route",
+			model: "gpt-public",
+			new: func(t *testing.T) *ProxyHandler {
+				return newChatExecutionTestHandler(t, upstream.URL, []string{providerEndpointChatCompletions})
+			},
+		},
+		{
+			name:  "declared model route",
+			model: "public-model",
+			new: func(t *testing.T) *ProxyHandler {
+				return newGeminiCountTokensRouteTestHandler(t,
+					[]ProviderConfig{{ID: "primary", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.URL, AuthType: "none"}},
+					[]ModelRouteTargetConfig{{ID: "target-primary", Provider: "primary", UpstreamModel: "physical-primary"}},
+					ModelRouteRoutingConfig{Mode: string(routeModePriorityFailover), MaxTargetAttempts: 1, MaxUpstreamSends: 1},
+				)
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx, summary := WithRequestSummary(context.Background())
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+				`{"model":"`+testCase.model+`","messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+
+			testCase.new(t).HandleOpenAIChatCompletions(recorder, req)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", recorder.Code, recorder.Body.String())
+			}
+			if recorder.Body.String() != upstreamBody {
+				t.Fatalf("passthrough body changed: got %d bytes, want %d", recorder.Body.Len(), len(upstreamBody))
+			}
+			got := map[string]string{}
+			for _, field := range summary.LoggerFields() {
+				if !strings.HasPrefix(field.Key, "error_") {
+					continue
+				}
+				value, _ := field.Value.(string)
+				got[field.Key] = value
+			}
+			if got["error_type"] != "invalid_request_error" || got["error_code"] != "invalid_value" || got["error_param"] != "tools" {
+				t.Fatalf("classifiers = %#v", got)
+			}
+			for key, value := range got {
+				if strings.Contains(value, "not-a-real-type") || strings.Contains(value, "Invalid schema") {
+					t.Fatalf("%s leaked upstream prose: %q", key, value)
+				}
+			}
+		})
+	}
+}
+
+// Gemini's non-200 branches read the body to build their detail line in addition to the shared
+// execution-boundary classification. Keep both route shapes covered so refactoring either
+// translation branch cannot silently drop the safe classifiers again.
 func TestGeminiUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T) {
 	upstreamFail := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

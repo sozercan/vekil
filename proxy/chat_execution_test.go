@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"testing/iotest"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
@@ -136,6 +138,30 @@ func TestExecuteChatCompletionsCanonicalErrorRetainsSafeHeaders(t *testing.T) {
 	defer func() { _ = result.Response.Body.Close() }()
 	if result.Headers.Get("Retry-After") != "4" || result.Headers.Get("X-Request-Id") != "req-error" {
 		t.Fatalf("headers = %#v response headers=%#v", result.Headers, result.Response.Header)
+	}
+}
+
+func TestCaptureNativeChatHTTPErrorClassifiersPreservesBodyReadError(t *testing.T) {
+	const body = `{"error":{"type":"invalid_request_error","code":"bad_value","param":"messages"}}`
+	readErr := errors.New("upstream body failed")
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body: io.NopCloser(io.MultiReader(
+			bytes.NewBufferString(body),
+			iotest.ErrReader(readErr),
+		)),
+	}
+
+	classifiers := captureNativeChatHTTPErrorClassifiers(resp)
+	if classifiers.errorType != "invalid_request_error" || classifiers.code != "bad_value" || classifiers.param != "messages" {
+		t.Fatalf("classifiers = %#v", classifiers)
+	}
+	replayed, err := io.ReadAll(resp.Body)
+	if string(replayed) != body {
+		t.Fatalf("replayed body = %q, want %q", replayed, body)
+	}
+	if !errors.Is(err, readErr) {
+		t.Fatalf("replayed error = %v, want %v", err, readErr)
 	}
 }
 
