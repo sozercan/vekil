@@ -310,12 +310,10 @@ func carriedUpstreamInput(t *testing.T, route responsesChatReplayRoute, publishe
 	t.Helper()
 	body := carrierParityBody(t, published, inOrder(2), results)
 	if store != nil {
-		// Drift one argument so the store rejects and the carrier answers instead.
-		drifted := strings.Replace(string(body), `"arguments":"{\"q\":\"a\"}"`, `"arguments":"{\"q\":\"a\",\"replace_all\":false}"`, 1)
-		if drifted == string(body) {
-			t.Fatal("fixture no longer carries the arguments this drift rewrites")
-		}
-		body = []byte(drifted)
+		// Keep a non-nil store in the matrix, but model expiry/eviction rather than
+		// corrupting the projection merely to force the carrier path.
+		store = newResponsesChatReplayStore()
+		t.Cleanup(func() { _ = store.Close() })
 	}
 	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
 		UpstreamModel: "gpt-upstream", ReplayRoute: route, ReplayStore: store,
@@ -353,8 +351,8 @@ func TestCarriedItemsCannotSmuggleContentPastThePolicyClassifier(t *testing.T) {
 		},
 	}
 	// Answering every call splices the whole turn; answering one takes the subset branch.
-	// Both store states reach carriedRestoredCalls: absent, and holding a group whose
-	// arguments the client rewrote, which is the live case this branch was added for.
+	// Both store states reach carriedRestoredCalls: no store, and a non-nil store that no
+	// longer holds the group after expiry, eviction, or restart.
 	for _, results := range [][]int{inOrder(2), {0}} {
 		for _, withStore := range []bool{false, true} {
 			for name, tamper := range cases {

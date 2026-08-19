@@ -112,41 +112,33 @@ Additional rules:
 
 ### Responses-backed tool continuation
 
-Function calls returned through the adapter use one of two newly emitted ID shapes:
+Function calls returned through the adapter use one opaque ID shape:
 
 ```text
-call_vekil_v2_<15-character-base64url-nonce>_<upstream-call-id>_<4-character-checksum>  # self-describing; total length never exceeds 64
-call_vekil_<22-character-base64url>                                              # opaque fallback when self-description is unavailable
+call_vekil_<22-character-base64url>
 ```
 
-Existing transcripts may also contain the accepted legacy
-`call_vekil_v1_<upstream-call-id>_<8-character-checksum>` self-describing form, but Vekil no
-longer emits it. Clients must return every shape unchanged. The v2 self-describing form embeds the
-upstream `call_id` behind a version marker, random per-group nonce, and checksum, so it is
-deliberately not opaque: the mapping travels inside the ID the client already echoes and resolves
-without server-side lookup. Only the checksum is deterministic for a given nonce and upstream ID.
-It separates minted replay IDs from plausible native call IDs; it is not an authorization key. The
-opaque form is used when the upstream ID is ineligible, would exceed the 64-character limit, or the
-preferred self-describing ID collides.
-Restoring the hidden Responses output still requires the process-local replay state or a valid
-reasoning carrier; an ID on its own can only rebuild the turn from the transcript the client itself
-sent. **The carrier is a client obligation, not just the ID.** On `/v1/messages` the reasoning rides
-in the `signature` of an assistant `thinking` block whose text is empty; a client that keeps tool-call
-IDs but drops that block, or rewrites its signature, loses reasoning continuity silently and the turn
-degrades. Return assistant `thinking` blocks in history unchanged, signature included. That ID-only rebuild is opt-in per surface, and only `/v1/messages` and the Anthropic
-count-token probe opt in: on `/v1/chat/completions` and `/v1/responses`, a self-describing ID whose
-replay state is gone still fails with `responses_replay_state_missing`, because a native Chat client
-owns its history and can repair it. Surface is not the only axis: a **policy profile** continuation
-fails on any surface once the originating process is gone, including `/v1/messages`. Its tier is
-recovered from a carrier tag keyed per process, so after a restart or on another replica no tier can
-be selected and the planner returns `responses_replay_state_missing` before the Anthropic rebuild is
-reached. The ID-only rebuild is therefore a direct-route behaviour. The opaque form carries no such
-mapping on any surface, so
-without that replay state its upstream call ID is not recovered at all. The turn is not lost on
-the surfaces that opt in: Anthropic ingress still degrades it, rebuilding from the transcript and
-forwarding the proxy `call_vekil_...` ID upstream as the `call_id`. That is sound only because the
-whole turn is replayed in one request with `store: false`, so a `call_id` needs to agree with its
-own `function_call_output` and nothing else. The other surfaces return the missing-state error.
+Clients must return the ID unchanged and must not construct, edit, or parse it. It never embeds the
+upstream provider's `call_id`; that mapping remains in Vekil's bounded process-local replay state or,
+for Anthropic ingress, in the reasoning carrier returned with the assistant turn.
+
+Restoring hidden Responses output requires that replay state or a valid reasoning carrier. **The
+carrier is a client obligation, not just the ID.** On `/v1/messages`, reasoning rides in the
+`signature` of an assistant `thinking` block whose text is empty. Return assistant `thinking` blocks
+in history unchanged, signature included. A direct-route continuation can use a valid carrier after
+the replay store is lost to restore both hidden reasoning and the upstream call mapping. If the
+client drops or rewrites the carrier, Anthropic ingress and its count-token probe may instead rebuild
+only the visible transcript and forward the opaque `call_vekil_...` ID upstream as the `call_id`,
+losing reasoning continuity. That fallback is sound only because the whole turn is replayed in one
+request with `store: false`, so a `call_id` needs to agree with its own `function_call_output` and
+nothing else.
+
+`/v1/chat/completions` and `/v1/responses` do not opt into that visible-transcript fallback; when the
+replay state is unavailable, they return `responses_replay_state_missing`. A **policy profile** also
+fails on every surface once the originating process is gone, including `/v1/messages`: its tier is
+recovered from a carrier tag keyed per process, so after a restart or on another replica the planner
+cannot select the original tier. Carrier-backed restoration and visible-transcript degradation are
+therefore direct-route Anthropic behaviors.
 
 For a parallel call group, the assistant `tool_calls` projection must remain complete and in its original order. A complete set of tool-result messages may arrive in any order. If only a non-empty subset of results is available, Vekil replays only the matching prior function calls plus their outputs; this partial projection is required because the verified Responses backend rejected a complete parallel call group paired with only partial outputs. The missing calls may consequently be reissued by the model.
 

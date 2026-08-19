@@ -192,42 +192,7 @@ func TestHandleOpenAIChatCompletionsProjectionMismatchIsRejected(t *testing.T) {
 	}
 }
 
-// The other half of the promise docs/api.md and docs/architecture.md now make: the ID-only
-// rebuild is opt-in per surface, and native Chat does not opt in. The continuation below is
-// minted in a store this handler never sees -- the replica case docs/clients.md describes --
-// so the self-describing ID is the only thing that could answer, and on this surface it must
-// not. HandleOpenAIChatCompletions passes no chatExecutionOptions, so the flag stays false.
-func TestHandleOpenAIChatCompletionsDoesNotRebuildFromASelfDescribingID(t *testing.T) {
-	var upstreamBodies [][]byte
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		upstreamBodies = append(upstreamBodies, body)
-		http.Error(w, "unexpected", http.StatusInternalServerError)
-	}))
-	defer upstream.Close()
-
-	route := responsesChatReplayRoute{ProviderID: "test-provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
-	callID, body := selfDescribingFixture(t, forgottenReplayStore(t), route, copilotUpstreamCallID)
-	if _, ok := responsesChatReplayUpstreamCallID(callID); !ok {
-		t.Fatalf("fixture minted %q, which is not self-describing; this test would prove nothing", callID)
-	}
-
-	h := newChatExecutionTestHandler(t, upstream.URL, []string{providerEndpointResponses})
-	rec := httptest.NewRecorder()
-	h.HandleOpenAIChatCompletions(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; native Chat must not rebuild from the ID alone: %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), responsesChatReplayMissingCode) {
-		t.Fatalf("body = %s, want the deterministic %s", rec.Body.String(), responsesChatReplayMissingCode)
-	}
-	if len(upstreamBodies) != 0 {
-		t.Fatalf("upstream was called %d time(s) for a turn that must fail locally: %s", len(upstreamBodies), string(upstreamBodies[0]))
-	}
-}
-
-// A legacy ID carries no upstream mapping, so when the store is gone and no carrier answers
+// An opaque ID carries no upstream mapping, so when the store is gone and no carrier answers
 // there is nothing to recover it from. The degrade still applies -- a client cannot repair a
 // transcript it already sent -- so the turn continues with the PROXY id forwarded upstream as
 // the call_id. That is safe only because the whole turn is rebuilt from the transcript in the
@@ -235,19 +200,16 @@ func TestHandleOpenAIChatCompletionsDoesNotRebuildFromASelfDescribingID(t *testi
 // `store: false` and replays the history every turn, so there is no server-side registry of
 // call ids to contradict. Untested against live Copilot, like everything else here.
 //
-// The alternative -- refusing to degrade a legacy id -- reinstates the permanent wedge this
+// The alternative -- refusing to degrade an opaque id -- reinstates the permanent wedge this
 // branch exists to remove, so this is deliberate and the contract says so.
-func TestAnthropicLegacyIDDegradesWhileNativeChatStillRefuses(t *testing.T) {
+func TestAnthropicOpaqueIDDegradesWhileNativeChatStillRefuses(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_reasoning_tool_call.sse")
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy := responsesChatReplayCallIDPrefix + strings.Repeat("A", 22)
-	if _, selfDescribing := responsesChatReplayUpstreamCallID(legacy); selfDescribing {
-		t.Fatalf("%q resolves as self-describing; this test would prove the opposite of its name", legacy)
-	}
-	if !isResponsesChatReplayCallID(legacy) {
-		t.Fatalf("%q is not recognised as a replay ID, so no replay path runs at all", legacy)
+	opaqueID := responsesChatReplayCallIDPrefix + strings.Repeat("A", 22)
+	if !isResponsesChatReplayCallID(opaqueID) {
+		t.Fatalf("%q is not recognised as a replay ID, so no replay path runs at all", opaqueID)
 	}
 
 	var upstreamBodies []string
@@ -262,29 +224,29 @@ func TestAnthropicLegacyIDDegradesWhileNativeChatStillRefuses(t *testing.T) {
 
 	anthropic := `{"model":"gpt-public","max_tokens":128,"messages":[
 		{"role":"user","content":"run it"},
-		{"role":"assistant","content":[{"type":"tool_use","id":"` + legacy + `","name":"lookup_synthetic_widget","input":{}}]},
-		{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + legacy + `","content":"ok"}]},
+		{"role":"assistant","content":[{"type":"tool_use","id":"` + opaqueID + `","name":"lookup_synthetic_widget","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + opaqueID + `","content":"ok"}]},
 		{"role":"user","content":"and again"}],
 		"tools":[{"name":"lookup_synthetic_widget","input_schema":{"type":"object"}}]}`
 	rec := httptest.NewRecorder()
 	h.HandleAnthropicMessages(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(anthropic)))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("Anthropic legacy continuation wedged: status = %d body = %s", rec.Code, rec.Body.String())
+		t.Fatalf("Anthropic opaque continuation wedged: status = %d body = %s", rec.Code, rec.Body.String())
 	}
 	if len(upstreamBodies) != 1 {
 		t.Fatalf("upstream saw %d requests, want 1", len(upstreamBodies))
 	}
-	if !strings.Contains(upstreamBodies[0], `"call_id":"`+legacy+`"`) {
+	if !strings.Contains(upstreamBodies[0], `"call_id":"`+opaqueID+`"`) {
 		t.Fatalf("degraded turn did not forward the proxy id upstream: %s", upstreamBodies[0])
 	}
 	if strings.Contains(upstreamBodies[0], orphanFixtureCiphertext) {
-		t.Fatalf("a legacy id recovered reasoning it never had a mapping for: %s", upstreamBodies[0])
+		t.Fatalf("an opaque id recovered reasoning it never had a mapping for: %s", upstreamBodies[0])
 	}
 
 	// Same lost state, native Chat: it owns its history and can repair it, so it stays loud.
 	chat := `{"model":"gpt-public","messages":[
-		{"role":"assistant","tool_calls":[{"id":"` + legacy + `","type":"function","function":{"name":"lookup_synthetic_widget","arguments":"{}"}}]},
-		{"role":"tool","tool_call_id":"` + legacy + `","content":"ok"}]}`
+		{"role":"assistant","tool_calls":[{"id":"` + opaqueID + `","type":"function","function":{"name":"lookup_synthetic_widget","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"` + opaqueID + `","content":"ok"}]}`
 	chatRec := httptest.NewRecorder()
 	h.HandleOpenAIChatCompletions(chatRec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chat)))
 	if chatRec.Code != http.StatusBadRequest {

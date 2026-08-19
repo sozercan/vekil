@@ -1423,6 +1423,7 @@ func (h *ProxyHandler) retryRoutedChatExecutionWithoutInjectedStreamOptions(ctx 
 	resp, retryBody, retryMode := h.retryChatCompletionsWithoutInjectedStreamOptionsForModel(ctx, result.Response, body, mode, requestedModel)
 	result.Response = resp
 	result.Headers = convertedExplicitChatSafeHeaders(resp, operation.route.public.id)
+	result.upstreamError = captureNativeChatHTTPErrorClassifiers(resp)
 	if resolved, _, ok := explicitResolvedChatRouteForResponse(operation, resp, providerEndpointChatCompletions, chatBackendNativeChat); ok {
 		result.route = resolved
 	}

@@ -13,19 +13,23 @@ import (
 
 // clientDriftFixture publishes one turn, hands back the carrier the client would hold,
 // and a Chat body replaying that turn with `returned` as the call's arguments.
-func clientDriftFixture(t *testing.T, store *responsesChatReplayStore, route responsesChatReplayRoute, name, emitted, returned string) (map[string]carriedReplay, []byte, string) {
+func clientDriftFixture(t *testing.T, store *responsesChatReplayStore, route responsesChatReplayRoute, name, emitted, returned string, optionalDefaults ...responsesChatReplayOptionalDefaults) (map[string]carriedReplay, []byte, string) {
 	t.Helper()
 	items := []json.RawMessage{
 		json.RawMessage(`{"type":"reasoning","id":"rs_drift","encrypted_content":"OPAQUE","content":[],"summary":[]}`),
 		responsesFunctionCallItem("upstream-call-1", name, emitted),
 	}
+	publishCall := responsesChatReplayPublishCall{
+		UpstreamCallID: "upstream-call-1", Name: name, VisibleArguments: emitted, OutputItemIndex: 1,
+	}
+	if len(optionalDefaults) > 0 {
+		publishCall.OptionalDefaults = optionalDefaults[0]
+	}
 	published, err := store.Publish(responsesChatReplayPublishRequest{
 		Route:            route,
 		AssistantContent: json.RawMessage(`"checking"`),
 		OutputItems:      items,
-		Calls: []responsesChatReplayPublishCall{{
-			UpstreamCallID: "upstream-call-1", Name: name, VisibleArguments: emitted, OutputItemIndex: 1,
-		}},
+		Calls:            []responsesChatReplayPublishCall{publishCall},
 	})
 	if err != nil {
 		t.Fatalf("Publish() error = %v", err)
@@ -72,21 +76,16 @@ func requireStoreRejectsArguments(t *testing.T, store *responsesChatReplayStore,
 	}
 }
 
-// Claude Code rewrites tool_use.input between turns and returns the rewrite. Every case
-// below is taken from a live gpt-5.6-sol session; the store binds arguments and rejects
-// all of them, so reasoning continuity has to come from the carrier, which does not.
-func TestClientRewrittenArgumentsStillRestoreCarriedReasoning(t *testing.T) {
+// A carrier must not restore reasoning or upstream call bindings for arguments the replay
+// store itself rejects. These edits were observed from clients, but they are not equivalent
+// to the call Vekil published unless the publication explicitly recorded a schema default.
+func TestClientRewrittenArgumentsAreRejectedByCarrier(t *testing.T) {
 	for _, testCase := range []struct {
 		name     string
 		tool     string
 		emitted  string
 		returned string
 	}{{
-		name:     "materialised schema default",
-		tool:     "Edit",
-		emitted:  `{"file_path":"/tmp/a","new_string":"b","old_string":"a"}`,
-		returned: `{"file_path":"/tmp/a","new_string":"b","old_string":"a","replace_all":false}`,
-	}, {
 		name:     "client-invented alias keys",
 		tool:     "SendMessage",
 		emitted:  `{"message":"go","summary":"s","to":"agent"}`,
@@ -109,26 +108,47 @@ func TestClientRewrittenArgumentsStillRestoreCarriedReasoning(t *testing.T) {
 			carried, body, callID := clientDriftFixture(t, store, route, testCase.tool, testCase.emitted, testCase.returned)
 			requireStoreRejectsArguments(t, store, route, callID, testCase.tool, testCase.returned)
 
-			plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+			_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
 				UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route, CarriedReasoning: carried,
 			})
-			if err != nil {
-				t.Fatalf("translate: %v", err)
+			if err == nil {
+				t.Fatal("carrier accepted arguments rejected by the replay store")
 			}
-			// Assert on the wire bytes: a decoded item cannot show an omitempty field
-			// dropped on the way out, and the ciphertext is exactly such a field.
-			input := upstreamInputJSON(t, plan)
-			if !strings.Contains(input, `"encrypted_content":"OPAQUE"`) {
-				t.Fatalf("client argument drift threw away reasoning continuity: %s", input)
-			}
-			// The output item carries the same call_id, so read the binding off the call itself.
-			if got := restoredFunctionCall(t, input); got["call_id"] != "upstream-call-1" {
-				t.Fatalf("restored turn lost its upstream call binding: %s", input)
-			} else if got["arguments"] != testCase.returned {
-				// The client's arguments are what upstream must see, not the stored ones.
-				t.Fatalf("restored call forwarded %q, want the client's %q", got["arguments"], testCase.returned)
+			var executionErr *chatExecutionError
+			if !errors.As(err, &executionErr) || executionErr.Code != responsesChatReplayProjectionCode {
+				t.Fatalf("err = %v, want %s", err, responsesChatReplayProjectionCode)
 			}
 		})
+	}
+}
+
+func TestCarrierAcceptsPublishedOptionalDefaultNormalization(t *testing.T) {
+	store := newResponsesChatReplayStore()
+	t.Cleanup(func() { _ = store.Close() })
+	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+	emitted := `{"file_path":"/tmp/a","new_string":"b","old_string":"a"}`
+	returned := `{"file_path":"/tmp/a","new_string":"b","old_string":"a","replace_all":false}`
+	carried, body, callID := clientDriftFixture(t, store, route, "Edit", emitted, returned,
+		responsesChatReplayOptionalDefaults{"replace_all": json.RawMessage("false")})
+
+	if _, err := resolveResponsesChatReplay(store, route, responsesChatReplayAssistantProjection{
+		Content: json.RawMessage(`"checking"`),
+		Calls:   []responsesChatReplayProjectedCall{{ID: callID, Name: "Edit", Arguments: returned}},
+	}); err != nil {
+		t.Fatalf("store rejected its published optional-default normalization: %v", err)
+	}
+	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+		UpstreamModel: "gpt-upstream", ReplayRoute: route, CarriedReasoning: carried,
+	})
+	if err != nil {
+		t.Fatalf("carrier rejected its published optional-default normalization: %v", err)
+	}
+	input := upstreamInputJSON(t, plan)
+	if !strings.Contains(input, `"encrypted_content":"OPAQUE"`) {
+		t.Fatalf("carrier lost reasoning for an accepted normalization: %s", input)
+	}
+	if got := restoredFunctionCall(t, input); got["call_id"] != "upstream-call-1" || got["arguments"] != returned {
+		t.Fatalf("restored call = %#v, want upstream binding and normalized arguments", got)
 	}
 }
 
@@ -167,7 +187,7 @@ func TestDegradeLogNamesBothSidesFromVekilsOwnGuards(t *testing.T) {
 		},
 		diverged:    "arguments",
 		wantCarrier: "route",
-		published:   true,
+		published:   false,
 	}, {
 		name: "arguments rewritten, no carrier at all",
 		carrier: func(*testing.T, map[string]carriedReplay, responsesChatReplayRoute) map[string]carriedReplay {
@@ -175,7 +195,7 @@ func TestDegradeLogNamesBothSidesFromVekilsOwnGuards(t *testing.T) {
 		},
 		diverged:    "arguments",
 		wantCarrier: "absent",
-		published:   true,
+		published:   false,
 	}, {
 		name:        "assistant text rewritten",
 		body:        func(b string) string { return strings.Replace(b, `"content":"checking"`, `"content":"CHANGED"`, 1) },
@@ -223,7 +243,7 @@ func TestDegradeLogNamesBothSidesFromVekilsOwnGuards(t *testing.T) {
 			}
 			// Only an untouched projection reproduces the digest the turn was published under.
 			fingerprint, _ := entry["projection"].(string)
-			published := carriedProjectionDigest(canonicalDriftContent(t), []responsesChatReplayProjectedCall{{ID: callID, Name: "Edit", Arguments: returned}})
+			published := carriedProjectionDigest(canonicalDriftContent(t), []responsesChatReplayProjectedCall{{ID: callID, Name: "Edit", Arguments: emitted}})
 			if fingerprint == "" || (fingerprint == published) != testCase.published {
 				t.Fatalf("projection hash %q matches published = %v, want %v in %#v", fingerprint, fingerprint == published, testCase.published, entry)
 			}

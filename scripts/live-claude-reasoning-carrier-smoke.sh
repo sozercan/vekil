@@ -686,8 +686,7 @@ assert_restarted_proxy_used_carrier() {
         split("\n")[]
         | fromjson?
         | select(
-            .msg == "responses replay resolved from self-describing tool-call IDs"
-            or .msg == "responses replay projection mismatch; continuing without reasoning continuity"
+            .msg == "responses replay projection mismatch; continuing without reasoning continuity"
             or .msg == "responses replay unavailable and the carrier could not answer"
           )
       ]

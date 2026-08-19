@@ -514,37 +514,8 @@ type responsesChatRestoredCalls struct {
 	Calls         []responsesChatReplayResolvedCall
 	TextItemIndex *int
 	// Rebuild marks a restore whose items are not upstream's own and have to be rebuilt
-	// from the transcript before use -- the capped carrier and the self-describing tier.
+	// from the transcript before use -- either a capped carrier or explicit degradation.
 	Rebuild bool
-}
-
-// The last tier that can still name the upstream calls: the store has expired and the
-// carrier is not in the request, but a self-describing ID answers from itself, so the turn
-// comes back under the IDs Copilot issued rather than the proxy IDs degrading invents.
-// It carries no items on purpose -- reconstructCarriedRestore rebuilds the turn from the
-// transcript, the same material the degrade path uses and no more.
-func selfDescribingRestoredCalls(projected []responsesChatReplayProjectedCall, projectionDigest string) (responsesChatRestoredCalls, bool) {
-	if len(projected) == 0 {
-		return responsesChatRestoredCalls{}, false
-	}
-	calls := make([]responsesChatReplayResolvedCall, len(projected))
-	for i, projectedCall := range projected {
-		upstreamCallID, ok := responsesChatReplayUpstreamCallID(projectedCall.ID)
-		if !ok {
-			return responsesChatRestoredCalls{}, false
-		}
-		calls[i] = responsesChatReplayResolvedCall{
-			ProxyCallID:     projectedCall.ID,
-			UpstreamCallID:  upstreamCallID,
-			Name:            strings.TrimSpace(projectedCall.Name),
-			OutputItemIndex: i,
-		}
-	}
-	return responsesChatRestoredCalls{
-		Key:     "selfid:" + projectionDigest,
-		Calls:   calls,
-		Rebuild: true,
-	}, true
 }
 
 // The store is authoritative while it holds the group and its arguments still match.
@@ -576,21 +547,6 @@ func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []
 	restored, carrier := carriedRestoredCalls(options.CarriedReasoning, projected, options.ReplayRoute, projectionContent)
 	if carrier == "" {
 		return restored, nil
-	}
-	// Route-agnostic by construction, so it must not answer while another candidate target
-	// might still hold the group: prepareExplicitResponsesChatRequest tells targets apart by
-	// which one refuses the transcript, and this tier refuses for none. The degrade flag
-	// marks the retry that runs only once every candidate has already refused, which is the
-	// first moment answering from the ID alone costs nothing that was still reachable.
-	if options.DegradeUnrestorableReplay {
-		diverged := "store_missing"
-		if degradable != nil {
-			diverged = degradable.diverged
-		}
-		if selfDescribed, ok := selfDescribingRestoredCalls(projected, carriedProjectionDigest(projectionContent, projected)); ok {
-			tally.record(diverged, carrier, responsesChatReplayProjectionFingerprint(projected, content), len(projected), false)
-			return selfDescribed, nil
-		}
 	}
 	if degradable != nil {
 		degradable.carrier = carrier
@@ -672,17 +628,12 @@ type responsesChatRestoreTally struct {
 	turns       int
 	calls       int
 	degraded    int
-	selfID      int
 	diverged    map[string]int
 	carrier     map[string]int
 	fingerprint string
-	// A turn that lost reasoning, or one whose stored state disagreed with the transcript,
-	// is the operator's problem. A self-describing ID answering after the store simply
-	// expired is the expected steady state and must not page anyone.
-	anomalous bool
 }
 
-func (t *responsesChatRestoreTally) record(diverged, carrier, fingerprint string, calls int, degraded bool) {
+func (t *responsesChatRestoreTally) record(diverged, carrier, fingerprint string, calls int) {
 	if t.diverged == nil {
 		t.diverged, t.carrier = map[string]int{}, map[string]int{}
 	}
@@ -696,16 +647,9 @@ func (t *responsesChatRestoreTally) record(diverged, carrier, fingerprint string
 	t.calls += calls
 	t.diverged[diverged]++
 	t.carrier[carrier]++
-	if degraded {
-		t.degraded++
-	} else {
-		t.selfID++
-	}
+	t.degraded++
 	if t.fingerprint == "" {
 		t.fingerprint = fingerprint
-	}
-	if degraded || diverged != "store_missing" {
-		t.anomalous = true
 	}
 }
 
@@ -731,7 +675,6 @@ func (t *responsesChatRestoreTally) flush(options responsesChatRequestOptions) {
 		logger.F("tool_turns", t.turns),
 		logger.F("tool_calls", t.calls),
 		logger.F("degraded_turns", t.degraded),
-		logger.F("self_describing_turns", t.selfID),
 		logger.F("diverged", t.sole(t.diverged)),
 		logger.F("carrier", t.sole(t.carrier)),
 		logger.F("projection", t.fingerprint),
@@ -747,11 +690,7 @@ func (t *responsesChatRestoreTally) flush(options responsesChatRequestOptions) {
 	if routeID := options.ReplayRoute.RouteID; routeID != "" {
 		fields = append(fields, logger.F("route_id", routeID))
 	}
-	if t.anomalous {
-		options.Log.Warn("responses replay projection mismatch; continuing without reasoning continuity", fields...)
-		return
-	}
-	options.Log.Info("responses replay resolved from self-describing tool-call IDs", fields...)
+	options.Log.Warn("responses replay projection mismatch; continuing without reasoning continuity", fields...)
 }
 
 // Names the guard that rejected the carrier: absent (not in the request at all),
@@ -779,7 +718,7 @@ func recordResponsesChatReplayDegrade(tally *responsesChatRestoreTally, projecte
 	if errors.As(err, &degradable) {
 		diverged, carrier = degradable.diverged, degradable.carrier
 	}
-	tally.record(diverged, carrier, responsesChatReplayProjectionFingerprint(projected, content), len(projected), true)
+	tally.record(diverged, carrier, responsesChatReplayProjectionFingerprint(projected, content), len(projected))
 }
 
 // Vekil's own digest, never the projection itself: that is prompt data.
@@ -894,20 +833,14 @@ func responsesFunctionCallItem(callID, name, arguments string) json.RawMessage {
 	return item
 }
 
-// Two shapes are minted, so exactly two are recognised: the legacy random id, whose fixed
-// width is its whole identity, and the self-describing id, admitted only if the minter
-// could have produced it. Accepting the prefix and a length range instead would widen this
-// to any client string starting with it, pulling plain tool calls onto the replay path.
+// Replay IDs are fixed-width and opaque. Accepting the prefix with any other length would
+// pull client-owned tool-call IDs onto the replay path and expose an unsupported contract.
 func isResponsesChatReplayCallID(id string) bool {
 	id = strings.TrimSpace(id)
-	if !strings.HasPrefix(id, responsesChatReplayCallIDPrefix) {
+	if len(id) != responsesChatReplayIDLength || !strings.HasPrefix(id, responsesChatReplayCallIDPrefix) {
 		return false
 	}
-	if len(id) == responsesChatReplayIDLength {
-		return isResponsesChatReplayIDCharset(id[len(responsesChatReplayCallIDPrefix):])
-	}
-	_, selfDescribing := responsesChatReplayUpstreamCallID(id)
-	return selfDescribing
+	return isResponsesChatReplayIDCharset(id[len(responsesChatReplayCallIDPrefix):])
 }
 
 type translatedSyntheticChatToolCall struct {

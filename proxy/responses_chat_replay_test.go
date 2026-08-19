@@ -836,8 +836,8 @@ func TestResponsesChatReplayRetriesStoredAndInFlightIDCollisions(t *testing.T) {
 func TestResponsesChatReplayReusedUpstreamIDCannotResolveToNewerGroup(t *testing.T) {
 	now := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	randomBytes := append(
-		bytes.Repeat([]byte{1}, responsesChatReplaySelfIDNonceBytes),
-		bytes.Repeat([]byte{2}, responsesChatReplaySelfIDNonceBytes)...,
+		bytes.Repeat([]byte{1}, responsesChatReplayRandomBytes),
+		bytes.Repeat([]byte{2}, responsesChatReplayRandomBytes)...,
 	)
 	store := newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{
 		TTL:    time.Second,
@@ -847,7 +847,7 @@ func TestResponsesChatReplayReusedUpstreamIDCannotResolveToNewerGroup(t *testing
 	defer func() { _ = store.Close() }()
 
 	request := newResponsesChatReplayTestRequest("reused", replayTestCallSpec{
-		upstreamID: copilotUpstreamCallID,
+		upstreamID: "call_REUSEDaaaaaaaaaaaaaaaa",
 		name:       "lookup",
 		visible:    `{"q":"same-visible-projection"}`,
 	})

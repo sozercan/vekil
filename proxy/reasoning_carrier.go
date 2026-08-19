@@ -51,10 +51,14 @@ type carrierEmit struct {
 
 // Carried, not inferred from item order: positional binding misattaches same-name parallel calls.
 type carriedCall struct {
-	ProxyID    string `json:"proxy_id"`
-	UpstreamID string `json:"upstream_id"`
-	Name       string `json:"name"`
-	ItemIndex  int    `json:"item_index"`
+	ProxyID                  string                              `json:"proxy_id"`
+	UpstreamID               string                              `json:"upstream_id"`
+	Name                     string                              `json:"name"`
+	ItemIndex                int                                 `json:"item_index"`
+	VisibleArgumentDigest    string                              `json:"visible_argument_digest,omitempty"`
+	OriginalArgumentDigest   string                              `json:"original_argument_digest,omitempty"`
+	VisibleOptionalDefaults  responsesChatReplayOptionalDefaults `json:"visible_optional_defaults,omitempty"`
+	OriginalOptionalDefaults responsesChatReplayOptionalDefaults `json:"original_optional_defaults,omitempty"`
 }
 
 type reasoningCarrierPayload struct {
@@ -64,32 +68,35 @@ type reasoningCarrierPayload struct {
 	// Binds a carrier to the route that minted it: Copilot's ciphertext is model-bound,
 	// and on the policy path this re-picks the tier. RouteTag keys that second role;
 	// the digest stays unkeyed so a restart can still restore items.
-	RouteDigest      string `json:"route_digest,omitempty"`
-	RouteTag         string `json:"route_tag,omitempty"`
-	ProjectionDigest string `json:"projection_digest,omitempty"`
+	RouteDigest              string `json:"route_digest,omitempty"`
+	RouteTag                 string `json:"route_tag,omitempty"`
+	ProjectionDigest         string `json:"projection_digest,omitempty"`
+	OriginalProjectionDigest string `json:"original_projection_digest,omitempty"`
 }
 
 // A turn's Responses output and bindings, encoded into an Anthropic thinking block's
 // signature so the CLIENT holds it rather than the replay store, whose TTL, eviction
 // and restart each wedge a conversation. Chat has no such field, so it keeps the store.
 type carriedTurn struct {
-	Items         []json.RawMessage
-	Calls         []carriedCall
-	TextItemIndex *int
-	Route         responsesChatReplayRoute
-	Projection    string
+	Items              []json.RawMessage
+	Calls              []carriedCall
+	TextItemIndex      *int
+	Route              responsesChatReplayRoute
+	Projection         string
+	OriginalProjection string
 }
 
 // The mapping alone is a carrier: it is what rebuilds a turn the store has forgotten.
 func (t carriedTurn) present() bool { return len(t.Items) > 0 || len(t.Calls) > 0 }
 
 type carriedReplay struct {
-	Items            []json.RawMessage
-	Calls            map[string]carriedCall
-	TextItemIndex    *int
-	RouteDigest      string
-	RouteTagValid    bool
-	ProjectionDigest string
+	Items                    []json.RawMessage
+	Calls                    map[string]carriedCall
+	TextItemIndex            *int
+	RouteDigest              string
+	RouteTagValid            bool
+	ProjectionDigest         string
+	OriginalProjectionDigest string
 }
 
 func (r carriedReplay) present() bool { return len(r.Items) > 0 || len(r.Calls) > 0 }
@@ -154,16 +161,32 @@ func routeSelectingCarriers(carried map[string]carriedReplay) map[string]carried
 }
 
 // Mirrors responsesChatReplayGroup.matchesProjection: same canonical assistant text,
-// same calls, same order. Arguments stay out -- the store accepts several normalised
-// forms of them, so binding them here would wedge a transcript the store allows.
+// same calls, same order, and the same canonical arguments.
 func carriedProjectionDigest(content []byte, calls []responsesChatReplayProjectedCall) string {
+	argumentDigests := make([][sha256.Size]byte, len(calls))
+	for i, call := range calls {
+		canonical, err := canonicalReplayArguments(call.Arguments)
+		if err != nil {
+			canonical = []byte(call.Arguments)
+		}
+		argumentDigests[i] = sha256.Sum256(canonical)
+	}
+	return carriedProjectionDigestWithArguments(content, calls, argumentDigests)
+}
+
+func carriedProjectionDigestWithArguments(content []byte, calls []responsesChatReplayProjectedCall, argumentDigests [][sha256.Size]byte) string {
+	if len(calls) != len(argumentDigests) {
+		return ""
+	}
 	sum := sha256.New()
 	sum.Write(content)
-	for _, call := range calls {
+	for i, call := range calls {
 		sum.Write([]byte{0})
 		sum.Write([]byte(call.ID))
 		sum.Write([]byte{0})
 		sum.Write([]byte(call.Name))
+		sum.Write([]byte{0})
+		sum.Write(argumentDigests[i][:])
 	}
 	return hex.EncodeToString(sum.Sum(nil)[:carriedDigestBytes])
 }
@@ -183,18 +206,23 @@ func carriedTurnFromPublished(route responsesChatReplayRoute, outputItems []json
 	calls := make([]carriedCall, len(published.Calls))
 	for i, call := range published.Calls {
 		calls[i] = carriedCall{
-			ProxyID:    call.ProxyCallID,
-			UpstreamID: call.UpstreamCallID,
-			Name:       call.Name,
-			ItemIndex:  call.OutputItemIndex,
+			ProxyID:                  call.ProxyCallID,
+			UpstreamID:               call.UpstreamCallID,
+			Name:                     call.Name,
+			ItemIndex:                call.OutputItemIndex,
+			VisibleArgumentDigest:    hex.EncodeToString(call.visibleArgumentHash[:]),
+			OriginalArgumentDigest:   hex.EncodeToString(call.originalArgumentHash[:]),
+			VisibleOptionalDefaults:  cloneReplayOptionalDefaults(call.visibleOptionalDefaults),
+			OriginalOptionalDefaults: cloneReplayOptionalDefaults(call.originalOptionalDefaults),
 		}
 	}
 	turn := carriedTurn{
-		Items:         outputItems,
-		Calls:         calls,
-		TextItemIndex: carriedMessageItemIndex(outputItems),
-		Route:         route,
-		Projection:    carriedProjectionDigest(published.Projection.Content, published.Projection.Calls),
+		Items:              outputItems,
+		Calls:              calls,
+		TextItemIndex:      carriedMessageItemIndex(outputItems),
+		Route:              route,
+		Projection:         carriedProjectionDigest(published.Projection.Content, published.Projection.Calls),
+		OriginalProjection: carriedProjectionDigest(published.OriginalProjection.Content, published.OriginalProjection.Calls),
 	}
 	if emit.Inbound.mapOnly() {
 		turn.Items = nil
@@ -282,12 +310,13 @@ func clientSafeCarrierItems(items []json.RawMessage) []json.RawMessage {
 }
 
 type reasoningCarrierWirePayload struct {
-	Items            json.RawMessage `json:"items"`
-	Calls            json.RawMessage `json:"calls"`
-	TextItemIndex    *int            `json:"text_item_index"`
-	RouteDigest      string          `json:"route_digest"`
-	RouteTag         string          `json:"route_tag"`
-	ProjectionDigest string          `json:"projection_digest"`
+	Items                    json.RawMessage `json:"items"`
+	Calls                    json.RawMessage `json:"calls"`
+	TextItemIndex            *int            `json:"text_item_index"`
+	RouteDigest              string          `json:"route_digest"`
+	RouteTag                 string          `json:"route_tag"`
+	ProjectionDigest         string          `json:"projection_digest"`
+	OriginalProjectionDigest string          `json:"original_projection_digest"`
 }
 
 // Decode attacker-controlled arrays without first allocating one element per entry.
@@ -337,12 +366,13 @@ func decodeReasoningCarrierPayload(payload []byte) (reasoningCarrierPayload, boo
 		return reasoningCarrierPayload{}, false
 	}
 	return reasoningCarrierPayload{
-		Items:            items,
-		Calls:            calls,
-		TextItemIndex:    wire.TextItemIndex,
-		RouteDigest:      wire.RouteDigest,
-		RouteTag:         wire.RouteTag,
-		ProjectionDigest: wire.ProjectionDigest,
+		Items:                    items,
+		Calls:                    calls,
+		TextItemIndex:            wire.TextItemIndex,
+		RouteDigest:              wire.RouteDigest,
+		RouteTag:                 wire.RouteTag,
+		ProjectionDigest:         wire.ProjectionDigest,
+		OriginalProjectionDigest: wire.OriginalProjectionDigest,
 	}, true
 }
 
@@ -352,11 +382,12 @@ func encodeReasoningCarrier(turn carriedTurn) (string, error) {
 	}
 	digest := carriedRouteDigest(turn.Route)
 	carrierPayload := reasoningCarrierPayload{
-		Items:            clientSafeCarrierItems(turn.Items),
-		Calls:            turn.Calls,
-		TextItemIndex:    turn.TextItemIndex,
-		RouteDigest:      digest,
-		ProjectionDigest: turn.Projection,
+		Items:                    clientSafeCarrierItems(turn.Items),
+		Calls:                    turn.Calls,
+		TextItemIndex:            turn.TextItemIndex,
+		RouteDigest:              digest,
+		ProjectionDigest:         turn.Projection,
+		OriginalProjectionDigest: turn.OriginalProjection,
 	}
 	carrierPayload.RouteTag = reasoningCarrierRouteTag(carrierPayload)
 	payload, err := json.Marshal(carrierPayload)
@@ -367,10 +398,11 @@ func encodeReasoningCarrier(turn carriedTurn) (string, error) {
 	// mapping that prevents the wedge. Keep the mapping; reasoning is the quality bonus.
 	if len(payload) > reasoningCarrierMaxDecodedBytes {
 		carrierPayload = reasoningCarrierPayload{
-			Calls:            turn.Calls,
-			TextItemIndex:    turn.TextItemIndex,
-			RouteDigest:      digest,
-			ProjectionDigest: turn.Projection,
+			Calls:                    turn.Calls,
+			TextItemIndex:            turn.TextItemIndex,
+			RouteDigest:              digest,
+			ProjectionDigest:         turn.Projection,
+			OriginalProjectionDigest: turn.OriginalProjection,
 		}
 		carrierPayload.RouteTag = reasoningCarrierRouteTag(carrierPayload)
 		payload, err = json.Marshal(carrierPayload)
@@ -423,12 +455,13 @@ func decodeReasoningCarrier(signature string, budget *int) (carriedReplay, bool)
 		return carriedReplay{}, false
 	}
 	replay := carriedReplay{
-		Items:            decoded.Items,
-		Calls:            make(map[string]carriedCall, len(decoded.Calls)),
-		TextItemIndex:    decoded.TextItemIndex,
-		RouteDigest:      decoded.RouteDigest,
-		RouteTagValid:    reasoningCarrierRouteTagValid(decoded),
-		ProjectionDigest: carriedDigest(decoded.ProjectionDigest),
+		Items:                    decoded.Items,
+		Calls:                    make(map[string]carriedCall, len(decoded.Calls)),
+		TextItemIndex:            decoded.TextItemIndex,
+		RouteDigest:              decoded.RouteDigest,
+		RouteTagValid:            reasoningCarrierRouteTagValid(decoded),
+		ProjectionDigest:         carriedDigest(decoded.ProjectionDigest),
+		OriginalProjectionDigest: carriedDigest(decoded.OriginalProjectionDigest),
 	}
 	for _, call := range decoded.Calls {
 		replay.Calls[call.ProxyID] = call
@@ -598,6 +631,62 @@ func carriedItemsWellShaped(items []json.RawMessage) bool {
 	return true
 }
 
+func carriedArgumentDigest(value string) ([sha256.Size]byte, bool) {
+	var digest [sha256.Size]byte
+	if len(value) != hex.EncodedLen(len(digest)) {
+		return digest, false
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != len(digest) {
+		return digest, false
+	}
+	copy(digest[:], decoded)
+	return digest, true
+}
+
+func carriedArgumentsMatch(arguments, digestValue string, defaults responsesChatReplayOptionalDefaults) ([sha256.Size]byte, bool) {
+	want, ok := carriedArgumentDigest(digestValue)
+	if !ok {
+		return want, false
+	}
+	canonical, err := canonicalReplayArguments(arguments)
+	if err != nil {
+		return want, false
+	}
+	if sha256.Sum256(canonical) == want {
+		return want, true
+	}
+	normalized, changed, err := canonicalReplayArgumentsWithoutOptionalDefaults(arguments, defaults)
+	return want, err == nil && changed && sha256.Sum256(normalized) == want
+}
+
+func carriedProjectionMatches(replay carriedReplay, content []byte, projected []responsesChatReplayProjectedCall) bool {
+	direct := carriedProjectionDigest(content, projected)
+	if direct != "" && (direct == replay.ProjectionDigest || direct == replay.OriginalProjectionDigest) {
+		return true
+	}
+
+	visible := make([][sha256.Size]byte, len(projected))
+	original := make([][sha256.Size]byte, len(projected))
+	visibleOK, originalOK := true, replay.OriginalProjectionDigest != ""
+	for i, projectedCall := range projected {
+		call, ok := replay.Calls[projectedCall.ID]
+		if !ok || call.Name != strings.TrimSpace(projectedCall.Name) {
+			return false
+		}
+		if visibleOK {
+			visible[i], visibleOK = carriedArgumentsMatch(projectedCall.Arguments, call.VisibleArgumentDigest, call.VisibleOptionalDefaults)
+		}
+		if originalOK {
+			original[i], originalOK = carriedArgumentsMatch(projectedCall.Arguments, call.OriginalArgumentDigest, call.OriginalOptionalDefaults)
+		}
+	}
+	if visibleOK && carriedProjectionDigestWithArguments(content, projected, visible) == replay.ProjectionDigest {
+		return true
+	}
+	return originalOK && carriedProjectionDigestWithArguments(content, projected, original) == replay.OriginalProjectionDigest
+}
+
 // The store's binding without the store: route, projection and each call's own minted id
 // must match, and indices mirror Publish. "" means restored, else the guard that refused.
 func carriedRestoredCalls(carried map[string]carriedReplay, projected []responsesChatReplayProjectedCall, route responsesChatReplayRoute, projectionContent json.RawMessage) (responsesChatRestoredCalls, string) {
@@ -611,7 +700,7 @@ func carriedRestoredCalls(carried map[string]carriedReplay, projected []response
 		return responsesChatRestoredCalls{}, "absent"
 	case replay.RouteDigest != carriedRouteDigest(route):
 		return responsesChatRestoredCalls{}, "route"
-	case replay.ProjectionDigest != carriedProjectionDigest(canonicalContent, projected):
+	case !carriedProjectionMatches(replay, canonicalContent, projected):
 		return responsesChatRestoredCalls{}, "projection"
 	case !carriedItemsWellShaped(replay.Items):
 		return responsesChatRestoredCalls{}, "shape"

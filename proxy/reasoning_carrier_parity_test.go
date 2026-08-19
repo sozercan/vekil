@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -312,10 +313,9 @@ func TestCarrierDoesNotCrossRoutes(t *testing.T) {
 	}
 }
 
-// Argument binding is not a confidentiality boundary: the carrier never bound arguments, so
-// a client can already pair rewritten arguments with restored reasoning by waiting out the
-// TTL. What must hold is that a rewrite yields no state the client did not already hold.
-func TestRewrittenArgumentsNeverReturnStateTheClientDidNotSupply(t *testing.T) {
+// The carrier mirrors the replay store's argument binding. A rewrite must not recover either
+// stored reasoning or a client-supplied carrier under the original upstream call binding.
+func TestRewrittenArgumentsAreRejectedByCarrier(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string
 		withStore bool
@@ -336,16 +336,20 @@ func TestRewrittenArgumentsNeverReturnStateTheClientDidNotSupply(t *testing.T) {
 				options.ReplayStore = store
 			}
 
-			plan, err := translateChatRequestToResponses([]byte(tampered), options)
-			if err != nil {
-				t.Fatalf("translate: %v", err)
+			_, err := translateChatRequestToResponses([]byte(tampered), options)
+			if err == nil {
+				t.Fatal("rewritten arguments restored replay state")
 			}
-			input := upstreamInputJSON(t, plan)
-			if strings.Contains(input, "OPAQUE") {
-				t.Fatalf("a rewrite returned the store's own ciphertext: %s", input)
+			var executionErr *chatExecutionError
+			if !errors.As(err, &executionErr) {
+				t.Fatalf("err = %T %v, want chatExecutionError", err, err)
 			}
-			if !strings.Contains(input, "CLIENT_HELD") {
-				t.Fatalf("the client's own carrier was not restored: %s", input)
+			wantCode := responsesChatReplayMissingCode
+			if testCase.withStore {
+				wantCode = responsesChatReplayProjectionCode
+			}
+			if executionErr.Code != wantCode {
+				t.Fatalf("error code = %q, want %q", executionErr.Code, wantCode)
 			}
 		})
 	}

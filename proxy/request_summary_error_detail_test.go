@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -434,6 +435,63 @@ func TestNativeChatUpstreamErrorRecordsClassifiersAndPreservesBody(t *testing.T)
 				}
 			}
 		})
+	}
+}
+
+func TestExplicitNativeChatStreamOptionsRecoveryClearsDiscardedClassifiers(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream request %d: %v", call, err)
+			http.Error(w, "invalid test request", http.StatusInternalServerError)
+			return
+		}
+		switch call {
+		case 1:
+			if _, ok := payload["stream_options"]; !ok {
+				t.Errorf("first request is missing injected stream_options: %v", payload)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"unknown field stream_options","type":"invalid_request_error","code":"unsupported_parameter","param":"stream_options"}}`))
+		case 2:
+			if _, ok := payload["stream_options"]; ok {
+				t.Errorf("protocol recovery retained stream_options: %v", payload)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-recovery\",\"object\":\"chat.completion.chunk\",\"model\":\"physical-primary\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+		default:
+			t.Errorf("unexpected upstream request %d", call)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer upstream.Close()
+
+	handler := newGeminiCountTokensRouteTestHandler(t,
+		[]ProviderConfig{{ID: "primary", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.URL, AuthType: "none"}},
+		[]ModelRouteTargetConfig{{ID: "target-primary", Provider: "primary", UpstreamModel: "physical-primary"}},
+		ModelRouteRoutingConfig{Mode: string(routeModePriorityFailover), MaxTargetAttempts: 1, MaxUpstreamSends: 2},
+	)
+	ctx, summary := WithRequestSummary(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+		`{"model":"public-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	handler.HandleOpenAIChatCompletions(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after protocol recovery; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls.Load())
+	}
+	for _, field := range summary.LoggerFields() {
+		if strings.HasPrefix(field.Key, "error_") {
+			t.Fatalf("successful recovery retained discarded classifier %s=%#v", field.Key, field.Value)
+		}
 	}
 }
 

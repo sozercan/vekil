@@ -281,18 +281,24 @@ func TestCarrierBelowBudgetIsByteIdentical(t *testing.T) {
 	calls := []carriedCall{{
 		ProxyID: published.Calls[0].ProxyCallID, UpstreamID: published.Calls[0].UpstreamCallID,
 		Name: published.Calls[0].Name, ItemIndex: published.Calls[0].OutputItemIndex,
+		VisibleArgumentDigest:  hex.EncodeToString(published.Calls[0].visibleArgumentHash[:]),
+		OriginalArgumentDigest: hex.EncodeToString(published.Calls[0].originalArgumentHash[:]),
 	}}
 	projectionDigest := precapProjectionDigest(published.Projection)
+	originalProjectionDigest := precapProjectionDigest(published.OriginalProjection)
 	unsigned := reasoningCarrierPayload{
-		Items: safeItems, Calls: calls, RouteDigest: precapFixtureRouteDigest, ProjectionDigest: projectionDigest,
+		Items: safeItems, Calls: calls, RouteDigest: precapFixtureRouteDigest,
+		ProjectionDigest: projectionDigest, OriginalProjectionDigest: originalProjectionDigest,
 	}
 
 	want := precapCarrierSignature(t, fmt.Sprintf(
-		`{"items":[%s,%s],"calls":[{"proxy_id":%q,"upstream_id":%q,"name":%q,"item_index":%d}],`+
-			`"route_digest":%q,"route_tag":%q,"projection_digest":%q}`,
+		`{"items":[%s,%s],"calls":[{"proxy_id":%q,"upstream_id":%q,"name":%q,"item_index":%d,`+
+			`"visible_argument_digest":%q,"original_argument_digest":%q}],`+
+			`"route_digest":%q,"route_tag":%q,"projection_digest":%q,"original_projection_digest":%q}`,
 		safeItems[0], safeItems[1],
 		published.Calls[0].ProxyCallID, published.Calls[0].UpstreamCallID, published.Calls[0].Name, published.Calls[0].OutputItemIndex,
-		precapFixtureRouteDigest, reasoningCarrierRouteTag(unsigned), projectionDigest,
+		calls[0].VisibleArgumentDigest, calls[0].OriginalArgumentDigest,
+		precapFixtureRouteDigest, reasoningCarrierRouteTag(unsigned), projectionDigest, originalProjectionDigest,
 	))
 
 	for _, emit := range []carrierEmit{{}, {Inbound: carrierInbound{Carriers: 1, Bytes: reasoningCarrierInboundBudget - 1}}} {
@@ -311,16 +317,24 @@ func TestCarrierBelowBudgetIsByteIdentical(t *testing.T) {
 // a build of 623d890. A constant, so renaming what feeds the digest fails here.
 const precapFixtureRouteDigest = "e6a4db7f32a55779"
 
-// The pre-cap digest and envelope, restated rather than called: sha256 over the projected
-// content and each id/name behind a NUL, then flate BestCompression, raw-url base64, prefix.
+// The projection digest and envelope, restated rather than called: sha256 over the projected
+// content and each id/name/canonical-argument digest behind a NUL, then flate
+// BestCompression, raw-url base64, prefix.
 func precapProjectionDigest(projection responsesChatReplayAssistantProjection) string {
 	sum := sha256.New()
 	sum.Write(projection.Content)
 	for _, call := range projection.Calls {
+		canonical, err := canonicalReplayArguments(call.Arguments)
+		if err != nil {
+			canonical = []byte(call.Arguments)
+		}
+		arguments := sha256.Sum256(canonical)
 		sum.Write([]byte{0})
 		sum.Write([]byte(call.ID))
 		sum.Write([]byte{0})
 		sum.Write([]byte(call.Name))
+		sum.Write([]byte{0})
+		sum.Write(arguments[:])
 	}
 	return hex.EncodeToString(sum.Sum(nil)[:16])
 }
