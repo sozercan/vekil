@@ -59,7 +59,7 @@ func TestStreamErrorBranchesRecordClassifiers(t *testing.T) {
 			}
 			cond := nodeText(fset, src, stmt.Cond)
 			if !strings.Contains(cond, "chatExecutionErrorFromStreamTermination") &&
-				!(strings.Contains(cond, "errors.As") && strings.Contains(body, "observe")) {
+				(!strings.Contains(cond, "errors.As") || !strings.Contains(body, "observe")) {
 				return true
 			}
 			if !strings.Contains(body, "observe") {

@@ -727,17 +727,21 @@ func TestRequestLogWarnsOnInboundAuthRejection(t *testing.T) {
 }
 
 func requestLogEntry(t *testing.T, logs string, wantMsg string) map[string]any {
+	return requestLogEntryForPath(t, logs, wantMsg, "")
+}
+
+func requestLogEntryForPath(t *testing.T, logs string, wantMsg, wantPath string) map[string]any {
 	t.Helper()
 	for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
 		var entry map[string]any
 		if json.Unmarshal([]byte(line), &entry) != nil {
 			continue
 		}
-		if entry["msg"] == wantMsg {
+		if entry["msg"] == wantMsg && (wantPath == "" || entry["path"] == wantPath) {
 			return entry
 		}
 	}
-	t.Fatalf("no %q log entry in %q", wantMsg, logs)
+	t.Fatalf("no %q log entry for path %q in %q", wantMsg, wantPath, logs)
 	return nil
 }
 
@@ -2190,9 +2194,48 @@ func TestInboundAuthProtectsLaunchRoutes(t *testing.T) {
 	}
 }
 
+type blockingStatusWriter struct {
+	header      http.Header
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	releaseOnce sync.Once
+	status      int
+}
+
+func newBlockingStatusWriter() *blockingStatusWriter {
+	return &blockingStatusWriter{
+		header:  make(http.Header),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (w *blockingStatusWriter) Header() http.Header { return w.header }
+
+func (w *blockingStatusWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.startedOnce.Do(func() { close(w.started) })
+	<-w.release
+	w.status = status
+}
+
+func (w *blockingStatusWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return len(body), nil
+}
+
+func (w *blockingStatusWriter) unblock() {
+	w.releaseOnce.Do(func() { close(w.release) })
+}
+
 // Auth runs inside withRequestLog so the rejection is logged. It must not also be counted:
 // an unauthenticated caller reached no inference handler, and letting it move request-rate,
-// latency and error dashboards hands a stats lever to anyone who can open a socket.
+// latency, error, or live in-flight dashboards hands a stats lever to anyone who can open a socket.
 func TestInboundAuthRejectionIsLoggedButNotCounted(t *testing.T) {
 	var logs bytes.Buffer
 	srv, err := New(
@@ -2205,36 +2248,61 @@ func TestInboundAuthRejectionIsLoggedButNotCounted(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	rejected := httptest.NewRecorder()
-	srv.httpServer.Handler.ServeHTTP(rejected,
-		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}")))
-	if rejected.Code != http.StatusUnauthorized {
-		t.Fatalf("StatusCode = %d, want 401", rejected.Code)
+	readStats := func() map[string]any {
+		t.Helper()
+		statsReq := httptest.NewRequest(http.MethodGet, "/stats.json", nil)
+		statsReq.Header.Set("x-api-key", "secret-token")
+		stats := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(stats, statsReq)
+		body := stats.Body.String()
+		if stats.Code != http.StatusOK {
+			t.Fatalf("stats.json = %d, want 200: %s", stats.Code, body)
+		}
+		var snap map[string]any
+		if err := json.Unmarshal([]byte(body), &snap); err != nil {
+			t.Fatalf("decode stats.json: %v (%s)", err, body)
+		}
+		return snap
+	}
+
+	rejected := newBlockingStatusWriter()
+	t.Cleanup(rejected.unblock)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.httpServer.Handler.ServeHTTP(rejected,
+			httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}")))
+	}()
+	select {
+	case <-rejected.started:
+	case <-time.After(time.Second):
+		t.Fatal("unauthorized response did not reach WriteHeader")
+	}
+	if inflight, ok := readStats()["inflight"].(float64); !ok || inflight != 0 {
+		t.Fatalf("inflight during blocked unauthorized response = %v, want 0", inflight)
+	}
+	rejected.unblock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("unauthorized request did not finish after response release")
+	}
+	if rejected.status != http.StatusUnauthorized {
+		t.Fatalf("StatusCode = %d, want 401", rejected.status)
 	}
 	// Guard: if the rejection stopped being logged this test would pass for the wrong reason.
-	if entry := requestLogEntry(t, logs.String(), "request completed"); entry["status"].(float64) != 401 {
+	if entry := requestLogEntryForPath(t, logs.String(), "request completed", "/v1/chat/completions"); entry["status"].(float64) != 401 {
 		t.Fatalf("the 401 was not logged: %#v", entry)
 	}
 
-	statsReq := httptest.NewRequest(http.MethodGet, "/stats.json", nil)
-	statsReq.Header.Set("x-api-key", "secret-token")
-	stats := httptest.NewRecorder()
-	srv.httpServer.Handler.ServeHTTP(stats, statsReq)
-	body := stats.Body.String()
-	if stats.Code != http.StatusOK {
-		t.Fatalf("stats.json = %d, want 200: %s", stats.Code, body)
-	}
-	var snap map[string]any
-	if err := json.Unmarshal([]byte(body), &snap); err != nil {
-		t.Fatalf("decode stats.json: %v (%s)", err, body)
-	}
+	snap := readStats()
 	totals, ok := snap["totals"].(map[string]any)
 	if !ok {
-		t.Fatalf("stats.json has no totals object; this test would assert nothing: %s", body)
+		t.Fatalf("stats.json has no totals object; this test would assert nothing: %#v", snap)
 	}
 	total, ok := totals["requests"].(float64)
 	if !ok {
-		t.Fatalf("totals.requests missing or not a number; this test would assert nothing: %s", body)
+		t.Fatalf("totals.requests missing or not a number; this test would assert nothing: %#v", snap)
 	}
 	if total != 0 {
 		t.Fatalf("totals.requests = %v, want 0: an unauthenticated request was counted", total)

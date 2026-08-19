@@ -2,8 +2,10 @@ package proxy
 
 import (
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +43,7 @@ func TestClientKeysDoNotReachNewChatInvalidRequest(t *testing.T) {
 	fset := token.NewFileSet()
 	checked := 0
 	var offenders []string
+	parsedFiles := make([]*ast.File, 0, len(files))
 
 	for _, name := range files {
 		if strings.HasSuffix(name, "_test.go") {
@@ -54,12 +57,17 @@ func TestClientKeysDoNotReachNewChatInvalidRequest(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
+		parsedFiles = append(parsedFiles, file)
+	}
+	bindings := typeInfoForFiles(fset, parsedFiles)
+
+	for _, file := range parsedFiles {
 		ast.Inspect(file, func(n ast.Node) bool {
 			fn, ok := n.(*ast.FuncDecl)
 			if !ok || fn.Body == nil {
 				return true
 			}
-			tainted := clientTaintedNames(fn)
+			tainted := clientTaintedNames(fn, bindings)
 			if len(tainted) == 0 {
 				return true
 			}
@@ -73,9 +81,9 @@ func TestClientKeysDoNotReachNewChatInvalidRequest(t *testing.T) {
 					return true
 				}
 				checked++
-				if ident := taintedIdentIn(call.Args[0], tainted); ident != "" {
+				if ident := taintedIdentIn(call.Args[0], tainted, bindings); ident != nil {
 					offenders = append(offenders, fset.Position(call.Pos()).String()+
-						": param derives from client-supplied key via "+ident)
+						": param derives from client-supplied key via "+ident.Name)
 				}
 				return true
 			})
@@ -92,40 +100,39 @@ func TestClientKeysDoNotReachNewChatInvalidRequest(t *testing.T) {
 	}
 }
 
-// clientTaintedNames returns every local name in fn that can hold a client-chosen
-// map key, propagated to a fixpoint.
+// clientTaintedNames returns every local binding in fn that can hold a
+// client-chosen map key, propagated to a fixpoint. Bindings, rather than names,
+// matter because separate range statements commonly reuse names such as index.
 //
-// The seed is the KEY of a key-only range over anything not provably a slice.
-// That is fail-closed on purpose: proving map-ness instead missed
+// The seed is the KEY of a range over anything not provably a slice, whether or
+// not the range also binds a value. That is fail-closed on purpose: proving map-ness instead missed
 // `object, err := decodeChatJSONObject(raw, param)`, where the map arrives from
 // a call and no literal names it. The slice exemption is what keeps
 // `fmt.Sprintf("messages[%d]", i)` quiet -- an integer index is vekil's own
 // structure, not the client's spelling, and flagging it produced 40 false
 // positives in an earlier version. Measured at zero false positives here.
-func clientTaintedNames(fn *ast.FuncDecl) map[string]bool {
-	slices := sliceTypedNames(fn)
-	tainted := map[string]bool{}
+func clientTaintedNames(fn *ast.FuncDecl, bindings *types.Info) map[types.Object]bool {
+	slices := sliceTypedNames(fn, bindings)
+	tainted := map[types.Object]bool{}
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		rng, ok := n.(*ast.RangeStmt)
 		if !ok {
 			return true
 		}
-		// Key-only range. Over a map that key is the client's field name; over a
-		// slice it is an integer index. FAIL CLOSED: taint unless the operand is
+		// Over a map the key is the client's field name; over a slice it is an
+		// integer index. Binding the map value as a second range variable does not
+		// change the key's provenance. FAIL CLOSED: taint unless the operand is
 		// provably a slice. Requiring proof of map-ness instead is what let the
 		// `object, err := decodeChatJSONObject(raw, param)` shape through -- the
 		// map arrives from a call, so no literal or make() names it.
-		if rng.Value != nil {
-			return true
-		}
-		if src, ok := rng.X.(*ast.Ident); ok && slices[src.Name] {
+		if src, ok := rng.X.(*ast.Ident); ok && slices[bindings.ObjectOf(src)] {
 			return true
 		}
 		if _, ok := rng.X.(*ast.CompositeLit); ok {
 			return true
 		}
-		if key, ok := rng.Key.(*ast.Ident); ok && key.Name != "_" {
-			tainted[key.Name] = true
+		if key, ok := rng.Key.(*ast.Ident); ok && key.Name != "_" && bindings.ObjectOf(key) != nil {
+			tainted[bindings.ObjectOf(key)] = true
 		}
 		return true
 	})
@@ -144,7 +151,7 @@ func clientTaintedNames(fn *ast.FuncDecl) map[string]bool {
 			}
 			carries := false
 			for _, rhs := range assign.Rhs {
-				if taintedIdentIn(rhs, tainted) != "" {
+				if taintedIdentIn(rhs, tainted, bindings) != nil {
 					carries = true
 					break
 				}
@@ -153,8 +160,8 @@ func clientTaintedNames(fn *ast.FuncDecl) map[string]bool {
 				return true
 			}
 			for _, lhs := range assign.Lhs {
-				if ident, ok := lhs.(*ast.Ident); ok && ident.Name != "_" && !tainted[ident.Name] {
-					tainted[ident.Name] = true
+				if ident, ok := lhs.(*ast.Ident); ok && ident.Name != "_" && bindings.ObjectOf(ident) != nil && !tainted[bindings.ObjectOf(ident)] {
+					tainted[bindings.ObjectOf(ident)] = true
 					changed = true
 				}
 			}
@@ -164,13 +171,77 @@ func clientTaintedNames(fn *ast.FuncDecl) map[string]bool {
 	return tainted
 }
 
+func typeInfoForFiles(fset *token.FileSet, files []*ast.File) *types.Info {
+	info := &types.Info{
+		Defs: make(map[*ast.Ident]types.Object),
+		Uses: make(map[*ast.Ident]types.Object),
+	}
+	config := types.Config{
+		Importer: importer.Default(),
+		// The test needs only local binding identity. Package-level type errors
+		// are covered by the normal build and test gates and should not stop this
+		// syntactic policy scan from inspecting the rest of the package.
+		Error: func(error) {},
+	}
+	_, _ = config.Check("github.com/sozercan/vekil/proxy", fset, files, info)
+	return info
+}
+
+func TestClientTaintedNamesClassifiesTwoVariableRanges(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want bool
+	}{
+		{
+			name: "map key is client-controlled",
+			src:  `package p; func inspect(object map[string]string) { for key, value := range object { _, _ = key, value } }`,
+			want: true,
+		},
+		{
+			name: "slice index is structural",
+			src:  `package p; func inspect(values []string) { for key, value := range values { _, _ = key, value } }`,
+			want: false,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "range.go", testCase.src, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bindings := typeInfoForFiles(fset, []*ast.File{file})
+			fn, ok := file.Decls[0].(*ast.FuncDecl)
+			if !ok {
+				t.Fatalf("first declaration = %T, want *ast.FuncDecl", file.Decls[0])
+			}
+			var key *ast.Ident
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				if rng, ok := node.(*ast.RangeStmt); ok {
+					key, _ = rng.Key.(*ast.Ident)
+					return false
+				}
+				return true
+			})
+			if key == nil || bindings.ObjectOf(key) == nil {
+				t.Fatal("range key binding not found")
+			}
+			if got := clientTaintedNames(fn, bindings)[bindings.ObjectOf(key)]; got != testCase.want {
+				t.Fatalf("key tainted = %v, want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
 // sliceTypedNames returns the names in fn provably holding a slice or array:
 // variadic and slice parameters, `make([]T, ...)`, slice composite literals, and
 // `var x []T`. Anything not on this list is treated as possibly a map, because a
 // missed map key is a leak while a spurious integer index is only noise a
 // reviewer resolves once.
-func sliceTypedNames(fn *ast.FuncDecl) map[string]bool {
-	names := map[string]bool{}
+func sliceTypedNames(fn *ast.FuncDecl, bindings *types.Info) map[types.Object]bool {
+	names := map[types.Object]bool{}
 	markType := func(idents []*ast.Ident, typ ast.Expr) {
 		switch typ.(type) {
 		case *ast.ArrayType, *ast.Ellipsis:
@@ -178,7 +249,9 @@ func sliceTypedNames(fn *ast.FuncDecl) map[string]bool {
 			return
 		}
 		for _, ident := range idents {
-			names[ident.Name] = true
+			if object := bindings.ObjectOf(ident); object != nil {
+				names[object] = true
+			}
 		}
 	}
 	if fn.Type.Params != nil {
@@ -203,8 +276,8 @@ func sliceTypedNames(fn *ast.FuncDecl) map[string]bool {
 				if !isSliceValued(rhs) || i >= len(stmt.Lhs) {
 					continue
 				}
-				if ident, ok := stmt.Lhs[i].(*ast.Ident); ok {
-					names[ident.Name] = true
+				if ident, ok := stmt.Lhs[i].(*ast.Ident); ok && bindings.ObjectOf(ident) != nil {
+					names[bindings.ObjectOf(ident)] = true
 				}
 			}
 		}
@@ -229,17 +302,17 @@ func isSliceValued(expr ast.Expr) bool {
 	return false
 }
 
-// taintedIdentIn reports the first tainted name appearing anywhere in expr, or "".
+// taintedIdentIn reports the first tainted binding appearing anywhere in expr.
 // Whole-expression search is the point: `unknown[0]`, `unknown[i]`, `p + unknown[0]`
 // and `fmt.Sprintf("%s", unknown[0])` are the same leak wearing different syntax.
-func taintedIdentIn(expr ast.Expr, tainted map[string]bool) string {
-	found := ""
+func taintedIdentIn(expr ast.Expr, tainted map[types.Object]bool, bindings *types.Info) *ast.Ident {
+	var found *ast.Ident
 	ast.Inspect(expr, func(n ast.Node) bool {
-		if found != "" {
+		if found != nil {
 			return false
 		}
-		if ident, ok := n.(*ast.Ident); ok && tainted[ident.Name] {
-			found = ident.Name
+		if ident, ok := n.(*ast.Ident); ok && tainted[bindings.ObjectOf(ident)] {
+			found = ident
 			return false
 		}
 		return true

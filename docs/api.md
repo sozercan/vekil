@@ -112,17 +112,22 @@ Additional rules:
 
 ### Responses-backed tool continuation
 
-Function calls returned through the adapter use IDs shaped as one of:
+Function calls returned through the adapter use one of two newly emitted ID shapes:
 
 ```text
-call_vekil_v1_<upstream-call-id>_<8-character-checksum>  # self-describing; total length never exceeds 64
-call_vekil_<22-character-base64url>                       # legacy, and the fallback when the upstream ID cannot be embedded
+call_vekil_v2_<15-character-base64url-nonce>_<upstream-call-id>_<4-character-checksum>  # self-describing; total length never exceeds 64
+call_vekil_<22-character-base64url>                                              # opaque fallback when self-description is unavailable
 ```
 
-Clients must return these IDs unchanged. The self-describing form embeds the upstream `call_id`
-behind a version marker and deterministic checksum, so it is deliberately not opaque: the mapping
-travels inside the ID the client already echoes and resolves without server-side lookup. The
-checksum separates minted replay IDs from plausible native call IDs; it is not an authorization key.
+Existing transcripts may also contain the accepted legacy
+`call_vekil_v1_<upstream-call-id>_<8-character-checksum>` self-describing form, but Vekil no
+longer emits it. Clients must return every shape unchanged. The v2 self-describing form embeds the
+upstream `call_id` behind a version marker, random per-group nonce, and checksum, so it is
+deliberately not opaque: the mapping travels inside the ID the client already echoes and resolves
+without server-side lookup. Only the checksum is deterministic for a given nonce and upstream ID.
+It separates minted replay IDs from plausible native call IDs; it is not an authorization key. The
+opaque form is used when the upstream ID is ineligible, would exceed the 64-character limit, or the
+preferred self-describing ID collides.
 Restoring the hidden Responses output still requires the process-local replay state or a valid
 reasoning carrier; an ID on its own can only rebuild the turn from the transcript the client itself
 sent. **The carrier is a client obligation, not just the ID.** On `/v1/messages` the reasoning rides
@@ -135,7 +140,7 @@ owns its history and can repair it. Surface is not the only axis: a **policy pro
 fails on any surface once the originating process is gone, including `/v1/messages`. Its tier is
 recovered from a carrier tag keyed per process, so after a restart or on another replica no tier can
 be selected and the planner returns `responses_replay_state_missing` before the Anthropic rebuild is
-reached. The ID-only rebuild is therefore a direct-route behaviour. The legacy form carries no such
+reached. The ID-only rebuild is therefore a direct-route behaviour. The opaque form carries no such
 mapping on any surface, so
 without that replay state its upstream call ID is not recovered at all. The turn is not lost on
 the surfaces that opt in: Anthropic ingress still degrades it, rebuilding from the transcript and

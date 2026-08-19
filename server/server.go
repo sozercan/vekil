@@ -170,18 +170,7 @@ func withInboundAuth(next http.Handler, token string) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		provided := strings.TrimSpace(r.Header.Get("x-api-key"))
-		if provided == "" {
-			authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-			if len(authorization) > len("Bearer ") && strings.EqualFold(authorization[:len("Bearer ")], "Bearer ") {
-				provided = strings.TrimSpace(authorization[len("Bearer "):])
-			}
-		}
-		if len(provided) != len(token) || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+		if !requestPassesInboundAuth(r, token) {
 			// Auth sits inside withRequestLog so the rejection is logged, but no inference
 			// handler ran: counting it would let an unauthenticated caller move request-rate,
 			// latency and error dashboards.
@@ -194,6 +183,20 @@ func withInboundAuth(next http.Handler, token string) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func requestPassesInboundAuth(r *http.Request, token string) bool {
+	if token == "" || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+		return true
+	}
+	provided := strings.TrimSpace(r.Header.Get("x-api-key"))
+	if provided == "" {
+		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+		if len(authorization) > len("Bearer ") && strings.EqualFold(authorization[:len("Bearer ")], "Bearer ") {
+			provided = strings.TrimSpace(authorization[len("Bearer "):])
+		}
+	}
+	return len(provided) == len(token) && subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
 }
 
 func withProviderValidationGate(next http.Handler, handler startupReadinessGate) http.Handler {
@@ -221,14 +224,16 @@ func withProviderValidationGate(next http.Handler, handler startupReadinessGate)
 	})
 }
 
-func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyHandler) http.Handler {
+func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyHandler, inboundAuthToken string) http.Handler {
+	inboundAuthToken = strings.TrimSpace(inboundAuthToken)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		recorder := &responseRecorder{ResponseWriter: w}
 		ctx, summary := proxy.WithRequestSummary(r.Context())
 
 		admitted := handler == nil || !handler.ShuttingDown() || r.URL.Path == "/healthz"
-		tracked := admitted && handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
+		authenticated := requestPassesInboundAuth(r, inboundAuthToken)
+		tracked := admitted && authenticated && handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
 		if tracked {
 			handler.IncInflight()
 			defer handler.DecInflight()
@@ -239,7 +244,7 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		// (not derived inside the upstream call) because newInferenceUpstreamContext
 		// rebuilds the upstream context from the detached proxy lifecycle root;
 		// only an explicitly propagated positive marker survives.
-		if handler != nil && admitted {
+		if handler != nil && admitted && authenticated {
 			ctx = handler.MarkRetryStatsTrackedIfInference(ctx, r.Method, r.URL.Path)
 		}
 
@@ -349,7 +354,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("GET /favicon.ico", handler.HandleFavicon)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
-	httpHandler := withRequestLog(withInboundAuth(withProviderValidationGate(mux, handler), cfg.inboundAuthToken), log, handler)
+	httpHandler := withRequestLog(withInboundAuth(withProviderValidationGate(mux, handler), cfg.inboundAuthToken), log, handler, cfg.inboundAuthToken)
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
