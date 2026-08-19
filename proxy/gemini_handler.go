@@ -217,10 +217,9 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 			h.log.Error("upstream error",
 				logger.F("endpoint", "gemini"),
 				logger.F("status", resp.StatusCode),
-				logger.F("detail", detail),
 				logger.F("request_bytes", len(oaiBody)),
+				logger.F("response_bytes", len(errBody)),
 			)
-			h.log.Debug("upstream error body", logger.F("endpoint", "gemini"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
 			writeGeminiError(w, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), detail)
 			return
 		}
@@ -298,10 +297,9 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		h.log.Error("upstream error",
 			logger.F("endpoint", "gemini"),
 			logger.F("status", resp.StatusCode),
-			logger.F("detail", detail),
 			logger.F("request_bytes", len(oaiBody)),
+			logger.F("response_bytes", len(errBody)),
 		)
-		h.log.Debug("upstream error body", logger.F("endpoint", "gemini"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
 		writeGeminiError(w, resp.StatusCode, mapGeminiUpstreamStatus(resp.StatusCode), detail)
 		return
 	}
@@ -763,8 +761,11 @@ func (h *ProxyHandler) decodeGeminiProbeResponse(resp *http.Response) (*models.O
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
-		h.log.Error("upstream error", logger.F("endpoint", "gemini_count_tokens"), logger.F("status", resp.StatusCode), logger.F("detail", detail))
-		h.log.Debug("upstream error body", logger.F("endpoint", "gemini_count_tokens"), logger.F("status", resp.StatusCode), logger.F("body", string(errBody)))
+		h.log.Error("upstream error",
+			logger.F("endpoint", "gemini_count_tokens"),
+			logger.F("status", resp.StatusCode),
+			logger.F("response_bytes", len(errBody)),
+		)
 		protocolErr := &geminiProtocolError{
 			statusCode: resp.StatusCode,
 			status:     mapGeminiUpstreamStatus(resp.StatusCode),

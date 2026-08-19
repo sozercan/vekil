@@ -88,6 +88,7 @@ func TestUpstreamAuthoredErrorMessageStaysOutOfTheLog(t *testing.T) {
 // it. Probed against Copilot before this existed: a real 400 logged the prose and recorded
 // no classifier at all.
 func TestAnthropicUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T) {
+	const secret = "not-a-real-type"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -96,6 +97,8 @@ func TestAnthropicUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T)
 			`'not-a-real-type' is not valid","code":"invalid_value",` +
 			`"param":"tools[0].input_schema","type":"invalid_request_error"}}`))
 	})
+	var logs bytes.Buffer
+	handler.log = logger.NewWithWriter(logger.LevelDebug, &logs)
 
 	ctx, summary := WithRequestSummary(context.Background())
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(
@@ -109,6 +112,10 @@ func TestAnthropicUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", recorder.Code, recorder.Body.String())
 	}
+	if !strings.Contains(recorder.Body.String(), secret) {
+		t.Fatalf("client response lost upstream detail: %s", recorder.Body.String())
+	}
+	assertUpstreamErrorLogMetadata(t, logs.Bytes(), "anthropic", http.StatusBadRequest, secret)
 	got := map[string]string{}
 	for _, field := range summary.LoggerFields() {
 		if !strings.HasPrefix(field.Key, "error_") {
@@ -124,6 +131,119 @@ func TestAnthropicUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T)
 		if strings.Contains(value, "not-a-real-type") || strings.Contains(value, "Invalid schema") {
 			t.Fatalf("%s leaked upstream prose: %q", key, value)
 		}
+	}
+}
+
+func TestGeminiUpstreamErrorLogsOnlyMetadata(t *testing.T) {
+	const secret = "SSN 123-45-6789 quoted from the user prompt"
+	upstreamBody := `{"error":{"message":"Invalid value: ` + secret + `","code":"bad_value","param":"messages[0].content","type":"invalid_request_error"}}`
+	backend := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, upstreamBody)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		model string
+		new   func(*testing.T) *ProxyHandler
+	}{
+		{
+			name:  "legacy route",
+			model: "gemini-2.5-pro",
+			new: func(t *testing.T) *ProxyHandler {
+				return newTestProxyHandler(t, backend)
+			},
+		},
+		{
+			name:  "explicit route",
+			model: "public-model",
+			new: func(t *testing.T) *ProxyHandler {
+				upstream := httptest.NewServer(http.HandlerFunc(backend))
+				t.Cleanup(upstream.Close)
+				return newExplicitRouteSurfaceHandler(t, providerTypeOpenAICompatible, providerEndpointChatCompletions, upstream.URL, upstream.URL)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := tc.new(t)
+			var logs bytes.Buffer
+			handler.log = logger.NewWithWriter(logger.LevelDebug, &logs)
+
+			ctx, summary := WithRequestSummary(context.Background())
+			req := httptest.NewRequest(http.MethodPost, "/v1beta/models/"+tc.model+":generateContent", strings.NewReader(
+				`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)).WithContext(ctx)
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+
+			handler.HandleGeminiModels(recorder, req)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), secret) {
+				t.Fatalf("client response lost upstream detail: %s", recorder.Body.String())
+			}
+			assertUpstreamErrorLogMetadata(t, logs.Bytes(), "gemini", http.StatusBadRequest, secret)
+
+			got := map[string]string{}
+			for _, field := range summary.LoggerFields() {
+				if value, ok := field.Value.(string); ok && strings.HasPrefix(field.Key, "error_") {
+					got[field.Key] = value
+				}
+			}
+			if got["error_type"] != "invalid_request_error" || got["error_code"] != "bad_value" || got["error_param"] != "messages" {
+				t.Fatalf("classifiers = %#v", got)
+			}
+		})
+	}
+}
+
+func TestGeminiCountTokensUpstreamErrorLogsOnlyMetadata(t *testing.T) {
+	const secret = "quoted private countTokens prompt"
+	body := `{"error":{"message":"Invalid value: ` + secret + `"}}`
+	var logs bytes.Buffer
+	handler := &ProxyHandler{log: logger.NewWithWriter(logger.LevelDebug, &logs)}
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	_, _, err := handler.decodeGeminiProbeResponse(resp)
+	if err == nil || !strings.Contains(err.Error(), secret) {
+		t.Fatalf("client error = %v, want upstream detail", err)
+	}
+	assertUpstreamErrorLogMetadata(t, logs.Bytes(), "gemini_count_tokens", http.StatusBadRequest, secret)
+}
+
+func assertUpstreamErrorLogMetadata(t *testing.T, raw []byte, endpoint string, status int, secret string) {
+	t.Helper()
+	if strings.Contains(string(raw), secret) || strings.Contains(string(raw), `"detail"`) || strings.Contains(string(raw), `"body"`) {
+		t.Fatalf("upstream prose reached the log: %s", raw)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	var upstreamEntries []map[string]any
+	for {
+		var entry map[string]any
+		if err := decoder.Decode(&entry); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("decode upstream error logs %q: %v", raw, err)
+		}
+		if entry["msg"] == "upstream error" && entry["endpoint"] == endpoint {
+			upstreamEntries = append(upstreamEntries, entry)
+		}
+	}
+	if len(upstreamEntries) != 1 {
+		t.Fatalf("upstream error entries = %#v, want one for %q in %s", upstreamEntries, endpoint, raw)
+	}
+	entry := upstreamEntries[0]
+	if entry["endpoint"] != endpoint || entry["status"] != float64(status) {
+		t.Fatalf("log metadata = %#v, want endpoint %q status %d", entry, endpoint, status)
+	}
+	if responseBytes, ok := entry["response_bytes"].(float64); !ok || responseBytes <= 0 {
+		t.Fatalf("response_bytes = %#v, want positive size metadata in %#v", entry["response_bytes"], entry)
 	}
 }
 
