@@ -823,14 +823,22 @@ run_harness_iterated() {
     ZEN_ANY_CLIENT_EXERCISED=1
     client_reachable=1
     run_zen_harness_once "${client}" "${model}"
-    if [[ "${ATTEMPT_STATUS}" == "PASS" ]]; then
-      log "[${client}] PASS ${model}"
-      return 0
-    fi
+    case "${ATTEMPT_STATUS}" in
+      PASS)
+        log "[${client}] PASS ${model}"
+        return 0
+        ;;
+      INCOMPATIBLE|CLIENT_FAILURE)
+        ;;
+      *)
+        die "[${client}] internal error: unrecognized attempt status ${ATTEMPT_STATUS}"
+        ;;
+    esac
 
     # A reachable model followed by a bad CLI result is not skippable on its own.
-    # Give the upstream one bounded re-check; only an explicitly recognized
-    # transient may excuse this attempt.
+    # Give the upstream one bounded re-check. A recognized transient may excuse
+    # either outcome, but a healthy upstream permits candidate fallback only for
+    # model/output incompatibility, never for a client process failure.
     second_verdict="$(zen_canary "${model}" "${client}-after")"
     second_status="${second_verdict%% *}"
     case "${second_status}" in
@@ -839,8 +847,11 @@ run_harness_iterated() {
         continue
         ;;
       OK)
-        log "[${client}] ${model} remained reachable after CLI ${ATTEMPT_DETAIL}; trying next candidate"
-        continue
+        if [[ "${ATTEMPT_STATUS}" == "INCOMPATIBLE" ]]; then
+          log "[${client}] ${model} remained reachable after CLI ${ATTEMPT_DETAIL}; trying next candidate"
+          continue
+        fi
+        die "[${client}] ${model} remained reachable after CLI ${ATTEMPT_DETAIL}; refusing candidate fallback for client failure"
         ;;
       FAIL)
         die "[${client}] ${model} CLI ${ATTEMPT_DETAIL}; second canary failed: ${second_verdict#* }"
@@ -859,7 +870,8 @@ run_harness_iterated() {
   return 2
 }
 
-# run_zen_harness_once <client> <model> -> ATTEMPT_STATUS=PASS|INVALID.
+# run_zen_harness_once <client> <model> ->
+#   ATTEMPT_STATUS=PASS|INCOMPATIBLE|CLIENT_FAILURE.
 run_zen_harness_once() {
   local client="$1"
   local model="$2"
@@ -881,12 +893,12 @@ run_zen_harness_once() {
     rc=$?
   fi
   if [[ "${rc}" -ne 0 ]]; then
-    ATTEMPT_STATUS="INVALID"
+    ATTEMPT_STATUS="CLIENT_FAILURE"
     ATTEMPT_DETAIL="exited ${rc}"
     return 0
   fi
   if [[ ! -f "${output_file}" ]]; then
-    ATTEMPT_STATUS="INVALID"
+    ATTEMPT_STATUS="CLIENT_FAILURE"
     ATTEMPT_DETAIL="produced no output file"
     return 0
   fi
@@ -897,7 +909,7 @@ run_zen_harness_once() {
     actual="$(read_normalized_output "${output_file}")"
   fi
   if [[ -z "${actual}" ]]; then
-    ATTEMPT_STATUS="INVALID"
+    ATTEMPT_STATUS="INCOMPATIBLE"
     ATTEMPT_DETAIL="produced empty output"
     return 0
   fi
@@ -910,7 +922,7 @@ run_zen_harness_once() {
 
   printf 'expected %s output: %s\n' "${client}" "${expected}" >&2
   printf 'actual %s output:   %s\n' "${client}" "${actual}" >&2
-  ATTEMPT_STATUS="INVALID"
+  ATTEMPT_STATUS="INCOMPATIBLE"
   ATTEMPT_DETAIL="returned mismatched output"
   return 0
 }

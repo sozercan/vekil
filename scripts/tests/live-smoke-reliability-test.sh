@@ -316,6 +316,14 @@ PY_WRAPPED_OUTPUT
     done
     printf '%s\n' "\${expected}"
     ;;
+  exit-first-model)
+    for arg in "\$@"; do
+      if [[ "\${arg}" == "deepseek-v4-flash-free" ]]; then
+        exit 42
+      fi
+    done
+    printf '%s\n' "\${expected}"
+    ;;
   fork-sleeper)
     sleep 300 &
     child=\$!
@@ -935,6 +943,7 @@ expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 
 run_zen_case_expect_success "Gemini strict JSON wrapper around complete result normalizes to exact text" pass pass json-wrapped-whole
 run_zen_case_expect_success "Gemini strict JSON wrapper sequence normalizes to exact text" pass pass json-wrapped
 run_zen_case_expect_success "model-specific output mismatch falls through to another candidate" fail-first-model fail-first-model fail-first-model
+run_zen_case_expect_failure "client process failure does not fall through to another model" 200 pass exit-first-model pass
 run_zen_case_expect_failure "Gemini dangling JSON wrapper separator is rejected" 200 pass pass json-wrapped-trailing-separator
 run_zen_case_expect_failure "Gemini three-wrapper sequence is rejected" 200 pass pass json-wrapped-three
 
@@ -962,7 +971,8 @@ start_mock_server "${case_dir}/server" 200
 port="${MOCK_SERVER_PORT}"
 write_fake_clients "${case_dir}/bin" fork-sleeper pass pass
 child_pid_file="${case_dir}/child.pid"
-expect_hard_failure "fake CLI forks sleeper" 8 \
+expect_hard_failure_with_stderr "fake CLI forks sleeper" 8 \
+  'remained reachable after CLI exited 42; refusing candidate fallback for client failure' \
   env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" \
     FAKE_CLI_CHILD_PID_FILE="${child_pid_file}" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
