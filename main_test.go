@@ -913,6 +913,33 @@ func TestRunConfigValidateSuccess(t *testing.T) {
 	}
 }
 
+func TestRunConfigValidateSuccessRedactsRemoteSource(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	source := "https://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret"
+
+	code := runConfigWithDeps([]string{"validate", "--providers-config", source}, configValidateDeps{
+		stdout: &stdout,
+		stderr: &stderr,
+		validateProvidersConfigFile: func(got string) error {
+			if got != source {
+				t.Fatalf("ValidateProvidersConfigFile source = %q, want original source", got)
+			}
+			return nil
+		},
+	})
+
+	if code != 0 {
+		t.Fatalf("runConfigWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if got := stdout.String(); got != "Providers config is valid: https://example.com/providers.yaml\n" {
+		t.Fatalf("stdout = %q, want sanitized success message", got)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty", got)
+	}
+}
+
 func TestRunConfigValidateLive(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

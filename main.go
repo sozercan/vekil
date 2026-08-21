@@ -300,7 +300,7 @@ func runConfigValidateWithDeps(args []string, deps configValidateDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(deps.stdout, "Providers config is valid: %s\n", opts.providersConfigPath)
+	_, _ = fmt.Fprintf(deps.stdout, "Providers config is valid: %s\n", proxy.ProvidersConfigSourceDisplay(opts.providersConfigPath))
 	return 0
 }
 

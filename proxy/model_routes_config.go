@@ -190,7 +190,7 @@ func ValidateProvidersConfigFile(source string) error {
 		return err
 	}
 	if err := ValidateProvidersConfig(cfg); err != nil {
-		return fmt.Errorf("validate providers config %q: %w", source, err)
+		return fmt.Errorf("validate providers config %q: %w", ProvidersConfigSourceDisplay(source), err)
 	}
 	return nil
 }
