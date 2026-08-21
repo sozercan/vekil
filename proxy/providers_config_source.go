@@ -98,7 +98,7 @@ func ProvidersConfigSourceDisplay(source string) string {
 	}
 
 	parsed, err := url.Parse(source)
-	if err != nil {
+	if err != nil || parsed.Host == "" {
 		return strings.ToLower(scheme) + "://<invalid>"
 	}
 	parsed.User = nil
@@ -115,12 +115,18 @@ func providersConfigSourceScheme(source string) (string, bool) {
 		return "", false
 	}
 
-	scheme, _, found := strings.Cut(source, "://")
-	if !found {
+	colon := strings.IndexByte(source, ':')
+	if colon <= 0 {
 		return "", false
 	}
+	scheme := source[:colon]
 	schemeURL, err := url.Parse(scheme + ":")
 	if err != nil || schemeURL.Scheme == "" {
+		return "", false
+	}
+	if !strings.EqualFold(scheme, "http") &&
+		!strings.EqualFold(scheme, "https") &&
+		!strings.HasPrefix(source[colon+1:], "//") {
 		return "", false
 	}
 	return scheme, true

@@ -1000,6 +1000,7 @@ func TestProvidersConfigSourceDisplay(t *testing.T) {
 		},
 		{name: "local path containing URL delimiter", source: "/tmp/http://providers.yaml", want: "/tmp/http://providers.yaml"},
 		{name: "Windows drive path", source: "C://providers.yaml", want: "C://providers.yaml"},
+		{name: "hostless HTTPS URL", source: "https:/config.example/providers.yaml?signature=signed-secret", want: "https://<invalid>"},
 		{name: "malformed remote", source: "https://source-user:source-password@example.com/%zz?signature=signed-secret", want: "https://<invalid>"},
 	}
 	for _, tc := range testCases {
@@ -1014,14 +1015,34 @@ func TestProvidersConfigSourceDisplay(t *testing.T) {
 func TestLoadProvidersConfigFileMalformedURLRedactsSensitiveSourceParts(t *testing.T) {
 	t.Parallel()
 
-	_, err := LoadProvidersConfigFile("https://source-user:source-password@example.com/%zz?signature=signed-secret#fragment-secret")
-	if err == nil || !strings.Contains(err.Error(), `parse providers config URL "https://<invalid>"`) {
-		t.Fatalf("LoadProvidersConfigFile() error = %v, want sanitized parse failure", err)
+	testCases := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{
+			name:   "invalid escape",
+			source: "https://source-user:source-password@example.com/%zz?signature=signed-secret#fragment-secret",
+			want:   `parse providers config URL "https://<invalid>"`,
+		},
+		{
+			name:   "hostless HTTPS",
+			source: "https:/config.example/providers.yaml?signature=signed-secret#fragment-secret",
+			want:   `providers config URL "https://<invalid>" has no host`,
+		},
 	}
-	for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
-		if strings.Contains(err.Error(), secret) {
-			t.Fatalf("LoadProvidersConfigFile() error exposes %q: %v", secret, err)
-		}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadProvidersConfigFile(tc.source)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want %q", err, tc.want)
+			}
+			for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("LoadProvidersConfigFile() error exposes %q: %v", secret, err)
+				}
+			}
+		})
 	}
 }
 
