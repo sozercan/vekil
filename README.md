@@ -31,14 +31,38 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 
 ## Quick Start
 
-Grab a binary from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), or run the container from GHCR:
+Try Vekil with OpenCode Zen's free models without creating an account or a
+local config file:
+
+```bash
+docker run --rm -p 127.0.0.1:1337:1337 \
+  ghcr.io/sozercan/vekil:latest \
+  --providers-config \
+  https://raw.githubusercontent.com/sozercan/vekil/main/examples/opencode-zen-free.yaml
+```
+
+In another terminal, inspect the available public model IDs:
+
+```bash
+curl -s http://127.0.0.1:1337/v1/models
+```
+
+The config URL is fetched once at startup. Pin the URL to a Vekil commit instead
+of `main` for reproducible deployments. Zen's free tier is shared and
+rate-limited, its models rotate, and data handling varies by promotion; do not
+send sensitive prompts. See [OpenCode Zen Free Tier](docs/provider-routing.md#opencode-zen-free-tier).
+
+For zero-config GitHub Copilot mode, persist Vekil's authentication state:
 
 ```bash
 mkdir -p ~/.config/vekil
-docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot \
+  -p 127.0.0.1:1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   ghcr.io/sozercan/vekil:latest
 ```
+
+Native binaries are available from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest).
 
 On Apple Silicon Macs, install the native tray app via Homebrew:
 
