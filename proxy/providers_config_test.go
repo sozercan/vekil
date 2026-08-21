@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -820,6 +821,56 @@ func TestLoadProvidersConfigFileURL(t *testing.T) {
 	}
 }
 
+func TestParseProvidersConfigURLTreatsFilesystemPathsAsLocal(t *testing.T) {
+	t.Parallel()
+
+	for _, source := range []string{
+		"/tmp/http://providers.yaml",
+		"relative/http://providers.yaml",
+		"C://providers.yaml",
+	} {
+		source := source
+		t.Run(source, func(t *testing.T) {
+			t.Parallel()
+
+			parsed, remote, err := parseProvidersConfigURL(source)
+			if err != nil {
+				t.Fatalf("parseProvidersConfigURL(%q) error = %v", source, err)
+			}
+			if remote || parsed != nil {
+				t.Fatalf("parseProvidersConfigURL(%q) = (%v, %v), want local source", source, parsed, remote)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileLocalPathContainingURLDelimiter(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not permit a colon in this path component")
+	}
+
+	configDir := filepath.Join(t.TempDir(), "http:")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	configPath := filepath.Join(configDir, "providers.yaml")
+	if err := os.WriteFile(configPath, []byte("providers:\n  - id: copilot\n    type: copilot\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	source := configDir + "//providers.yaml"
+	if !strings.Contains(source, "://") {
+		t.Fatalf("test source %q does not contain URL delimiter", source)
+	}
+	cfg, err := LoadProvidersConfigFile(source)
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile(%q) error = %v", source, err)
+	}
+	if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "copilot" {
+		t.Fatalf("providers = %+v, want local Copilot provider", cfg.Providers)
+	}
+}
+
 func TestLoadProvidersConfigFileURLDoesNotRestrictContentNegotiation(t *testing.T) {
 	t.Parallel()
 
@@ -947,6 +998,8 @@ func TestProvidersConfigSourceDisplay(t *testing.T) {
 			source: "HTTPS://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret",
 			want:   "https://example.com/providers.yaml",
 		},
+		{name: "local path containing URL delimiter", source: "/tmp/http://providers.yaml", want: "/tmp/http://providers.yaml"},
+		{name: "Windows drive path", source: "C://providers.yaml", want: "C://providers.yaml"},
 		{name: "malformed remote", source: "https://source-user:source-password@example.com/%zz?signature=signed-secret", want: "https://<invalid>"},
 	}
 	for _, tc := range testCases {

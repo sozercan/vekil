@@ -65,7 +65,7 @@ func readProvidersConfigSource(source string) ([]byte, error) {
 }
 
 func parseProvidersConfigURL(source string) (*url.URL, bool, error) {
-	if !strings.Contains(source, "://") {
+	if _, remote := providersConfigSourceScheme(source); !remote {
 		return nil, false, nil
 	}
 
@@ -92,13 +92,13 @@ func parseProvidersConfigURL(source string) (*url.URL, bool, error) {
 // are omitted so signed URLs and userinfo are not exposed in logs or errors.
 func ProvidersConfigSourceDisplay(source string) string {
 	source = strings.TrimSpace(source)
-	if !strings.Contains(source, "://") {
+	scheme, remote := providersConfigSourceScheme(source)
+	if !remote {
 		return source
 	}
 
 	parsed, err := url.Parse(source)
 	if err != nil {
-		scheme, _, _ := strings.Cut(source, "://")
 		return strings.ToLower(scheme) + "://<invalid>"
 	}
 	parsed.User = nil
@@ -108,6 +108,29 @@ func ProvidersConfigSourceDisplay(source string) string {
 	parsed.Fragment = ""
 	parsed.RawFragment = ""
 	return parsed.String()
+}
+
+func providersConfigSourceScheme(source string) (string, bool) {
+	if filepath.VolumeName(source) != "" || hasWindowsDrivePathPrefix(source) {
+		return "", false
+	}
+
+	scheme, _, found := strings.Cut(source, "://")
+	if !found {
+		return "", false
+	}
+	schemeURL, err := url.Parse(scheme + ":")
+	if err != nil || schemeURL.Scheme == "" {
+		return "", false
+	}
+	return scheme, true
+}
+
+func hasWindowsDrivePathPrefix(source string) bool {
+	return len(source) >= 3 &&
+		(source[0] >= 'a' && source[0] <= 'z' || source[0] >= 'A' && source[0] <= 'Z') &&
+		source[1] == ':' &&
+		(source[2] == '/' || source[2] == '\\')
 }
 
 func providersConfigRequestError(err error) error {
