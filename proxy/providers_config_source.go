@@ -51,7 +51,11 @@ func readProvidersConfigSource(source string) ([]byte, error) {
 	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("fetch providers config %q: unexpected HTTP status %s", displaySource, response.Status)
+		status := fmt.Sprintf("%d", response.StatusCode)
+		if statusText := http.StatusText(response.StatusCode); statusText != "" {
+			status += " " + statusText
+		}
+		return nil, fmt.Errorf("fetch providers config %q: unexpected HTTP status %s", displaySource, status)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxRemoteProvidersConfigBodySize+1))

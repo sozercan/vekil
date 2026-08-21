@@ -1060,6 +1060,38 @@ func TestLoadProvidersConfigFileURLRejectsHTTPFailure(t *testing.T) {
 	}
 }
 
+func TestLoadProvidersConfigFileURLCanonicalizesHTTPStatus(t *testing.T) {
+	t.Parallel()
+
+	const reflectedSecret = "signed-query-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("ResponseWriter does not support hijacking")
+			return
+		}
+		connection, response, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("Hijack() error = %v", err)
+			return
+		}
+		defer func() { _ = connection.Close() }()
+		_, _ = io.WriteString(response, "HTTP/1.1 503 "+reflectedSecret+"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		if err := response.Flush(); err != nil {
+			t.Errorf("Flush() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml?signature=" + reflectedSecret)
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 503 Service Unavailable") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want canonical HTTP status failure", err)
+	}
+	if strings.Contains(err.Error(), reflectedSecret) {
+		t.Fatalf("LoadProvidersConfigFile() error exposes reflected query secret: %v", err)
+	}
+}
+
 func TestLoadProvidersConfigFileURLRejectsOversizedBody(t *testing.T) {
 	t.Parallel()
 
