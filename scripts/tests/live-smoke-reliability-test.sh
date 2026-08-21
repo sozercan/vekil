@@ -874,6 +874,8 @@ run_zen_classification_case "canary 404 plus transient text is hard" 404 \
   "service temporarily unavailable" 0
 run_zen_classification_case "canary 400 unknown error is hard" 400 \
   "invalid request" 0
+run_zen_classification_case "canary 401 model unavailable is hard" 401 \
+  "Model is unavailable." 0
 run_zen_classification_case "canary 200 bad shape plus transient text is hard" 200 \
   "service temporarily unavailable" 1
 

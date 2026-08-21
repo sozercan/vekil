@@ -297,9 +297,6 @@ zen_model_unavailable_is_transient() {
 
 zen_error_is_transient() {
   local message="$1"
-  if zen_model_unavailable_is_transient "${message}"; then
-    return 0
-  fi
   printf '%s' "${message}" | grep -qiE \
     'promotion (has )?ended|free promotion[^[:alnum:]]+ended|^model [[:alnum:]_.:/-]+ is not supported$|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'
 }
