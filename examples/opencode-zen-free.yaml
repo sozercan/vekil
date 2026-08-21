@@ -17,16 +17,17 @@
 #
 # Use model_discovery: static (not openai): dynamic /models also lists PAID Zen
 # models that reject the "public" key with HTTP 401, and there is no cost filter.
-# Static discovery also skips the upstream readiness probe. This is a curated
-# set with verified routes; live CI intersects it with Zen's current Free price
-# labels rather than inferring eligibility from model IDs.
+# Static discovery also skips the upstream readiness probe. The marked model
+# block is generated from Zen's published endpoint and pricing tables by
+# scripts/update-opencode-zen-free-config.sh; do not edit it by hand. Live CI
+# still intersects it with current Free price labels before exercising models.
 #
 # Do NOT set default: true here. Under static discovery, unlisted models return
 # HTTP 400, so making this the default catch-all only risks routing unknown
 # models to a revocable trial gateway.
 #
-# Endpoint allowlists are per model. Muse Spark Contributor is advertised as
-# /responses-only; the others below are advertised as /chat/completions only.
+# Endpoint allowlists are per model and copied exactly from Zen's published
+# table. Do not add an endpoint merely because Vekil can translate to it.
 # Note: the GitHub Copilot CLI and Codex CLI use /responses with built-in tools
 # that Zen free upstreams may reject; use COPILOT_PROVIDER_WIRE_API=completions
 # for the Copilot CLI.
@@ -42,26 +43,31 @@
 providers:
   - id: opencode-zen
     type: openai-compatible
-    base_url: https://opencode.ai/zen/v1   # proxy appends "/chat/completions"
+    base_url: https://opencode.ai/zen/v1   # proxy appends each model's endpoint
     auth_type: bearer
     api_key: public                         # shared anonymous sentinel, not a secret
     model_discovery: static
+    # BEGIN GENERATED: OpenCode Zen free models
     models:
-      - public_id: big-pickle
+      - public_id: "big-pickle"
         endpoints:
           - /chat/completions
-      - public_id: x-preview-f-free          # Ox Alpha Free
+      - public_id: "hy3-free"
         endpoints:
           - /chat/completions
-      - public_id: hy3-free
+      - public_id: "mimo-v2.5-free"
         endpoints:
           - /chat/completions
-      - public_id: mimo-v2.5-free
-        endpoints:
-          - /chat/completions
-      - public_id: muse-spark-1.2-contributor-free
+      - public_id: "muse-spark-1.2-contributor-free"
         endpoints:
           - /responses
-      - public_id: nemotron-3.5-lightning-free
+      - public_id: "nemotron-3-ultra-free"
         endpoints:
           - /chat/completions
+      - public_id: "nemotron-3.5-lightning-free"
+        endpoints:
+          - /chat/completions
+      - public_id: "x-preview-f-free"
+        endpoints:
+          - /chat/completions
+    # END GENERATED: OpenCode Zen free models

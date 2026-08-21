@@ -1,0 +1,100 @@
+name: Update OpenCode Zen Free Models
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "43 9 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-opencode-zen-free-models
+  cancel-in-progress: true
+
+jobs:
+  update:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Render current OpenCode Zen free models
+        id: zen
+        run: |
+          set -euo pipefail
+
+          source_sha="$(git ls-remote https://github.com/anomalyco/opencode.git refs/heads/dev | awk 'NR == 1 { print $1 }')"
+          [[ "${source_sha}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "invalid OpenCode dev SHA: ${source_sha:-<empty>}" >&2
+            exit 1
+          }
+
+          source_url="https://raw.githubusercontent.com/anomalyco/opencode/${source_sha}/packages/web/src/content/docs/zen.mdx"
+          source_doc="$RUNNER_TEMP/opencode-zen-${source_sha}.mdx"
+          curl --fail --silent --show-error --location --retry 3 \
+            --connect-timeout 10 --max-time 60 --max-filesize 2097152 \
+            "$source_url" > "$source_doc"
+
+          scripts/update-opencode-zen-free-config.sh "$source_doc"
+          echo "source-sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Stop when already current
+        if: ${{ steps.zen.outputs.changed != 'true' }}
+        run: echo "The OpenCode Zen free-model example is already current."
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: ${{ steps.zen.outputs.changed == 'true' }}
+        with:
+          go-version-file: go.mod
+
+      - name: Validate generated config
+        if: ${{ steps.zen.outputs.changed == 'true' }}
+        run: |
+          set -euo pipefail
+          bash -n scripts/parse-opencode-zen-free-models.sh scripts/update-opencode-zen-free-config.sh
+          make build
+          ./vekil config validate --providers-config examples/opencode-zen-free.yaml
+          git diff --check
+
+      - name: Open update pull request
+        if: ${{ steps.zen.outputs.changed == 'true' }}
+        env:
+          OPENCODE_ZEN_SOURCE_SHA: ${{ steps.zen.outputs['source-sha'] }}
+        run: |
+          set -euo pipefail
+
+          branch="chore/update-opencode-zen-free-models"
+          title="chore(examples): refresh OpenCode Zen free models"
+          body_file="$(mktemp)"
+
+          cat > "$body_file" <<EOF_BODY
+          ## Summary
+          - refresh the generated OpenCode Zen free-model list and native endpoint allowlists
+          - source [OpenCode Zen documentation at ${OPENCODE_ZEN_SOURCE_SHA}](https://github.com/anomalyco/opencode/blob/${OPENCODE_ZEN_SOURCE_SHA}/packages/web/src/content/docs/zen.mdx)
+
+          ## Validation
+          - \`bash -n scripts/parse-opencode-zen-free-models.sh scripts/update-opencode-zen-free-config.sh\`
+          - \`make build\`
+          - \`./vekil config validate --providers-config examples/opencode-zen-free.yaml\`
+          - \`git diff --check\`
+          EOF_BODY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add examples/opencode-zen-free.yaml
+          git commit -s -m "$title"
+          git push --force origin "$branch"
+
+          pr_number="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // ""')"
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" --title "$title" --body-file "$body_file"
+          else
+            gh pr create --base main --head "$branch" --title "$title" --body-file "$body_file"
+          fi

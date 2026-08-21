@@ -38,7 +38,7 @@ jobs:
 
       - name: Shell smoke reliability tests
         run: |
-          bash -n scripts/parse-opencode-zen-free-models.sh scripts/live-cli-smoke.sh scripts/live-zen-smoke.sh scripts/live-compact-smoke.sh scripts/live-chat-over-responses-smoke.sh scripts/live-provider-routing-smoke.sh scripts/live-policy-routing-smoke.sh scripts/live-policy-routing-copilot-smoke.sh scripts/live-policy-routing-sol-effort-smoke.sh scripts/k8s-kind-smoke.sh scripts/tests/live-smoke-reliability-test.sh scripts/tests/live-chat-over-responses-smoke-test.sh scripts/tests/live-provider-routing-smoke-test.sh scripts/tests/live-policy-routing-smoke-test.sh scripts/tests/live-policy-routing-copilot-smoke-test.sh scripts/tests/live-policy-routing-sol-effort-smoke-test.sh
+          bash -n scripts/parse-opencode-zen-free-models.sh scripts/update-opencode-zen-free-config.sh scripts/live-cli-smoke.sh scripts/live-zen-smoke.sh scripts/live-compact-smoke.sh scripts/live-chat-over-responses-smoke.sh scripts/live-provider-routing-smoke.sh scripts/live-policy-routing-smoke.sh scripts/live-policy-routing-copilot-smoke.sh scripts/live-policy-routing-sol-effort-smoke.sh scripts/k8s-kind-smoke.sh scripts/tests/live-smoke-reliability-test.sh scripts/tests/live-chat-over-responses-smoke-test.sh scripts/tests/live-provider-routing-smoke-test.sh scripts/tests/live-policy-routing-smoke-test.sh scripts/tests/live-policy-routing-copilot-smoke-test.sh scripts/tests/live-policy-routing-sol-effort-smoke-test.sh
           scripts/tests/live-smoke-reliability-test.sh
           scripts/tests/live-chat-over-responses-smoke-test.sh
 

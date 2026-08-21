@@ -720,6 +720,76 @@ expect_hard_failure_with_stderr "Zen free-label parser rejects paid/free duplica
   "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
   "${zen_parser_dir}/duplicate-pricing-label.mdx"
 
+cat > "${zen_parser_dir}/render-config.yaml" <<'EOF_ZEN_RENDER_CONFIG'
+header: preserved
+provider:
+    # BEGIN GENERATED: OpenCode Zen free models
+    models:
+      - public_id: stale-model
+        endpoints:
+          - /chat/completions
+    # END GENERATED: OpenCode Zen free models
+footer: preserved
+EOF_ZEN_RENDER_CONFIG
+cat > "${zen_parser_dir}/expected-config.yaml" <<'EOF_ZEN_EXPECTED_CONFIG'
+header: preserved
+provider:
+    # BEGIN GENERATED: OpenCode Zen free models
+    models:
+      - public_id: "big-pickle"
+        endpoints:
+          - /chat/completions
+      - public_id: "muse-spark-free"
+        endpoints:
+          - /responses
+      - public_id: "x-preview-f-free"
+        endpoints:
+          - /chat/completions
+    # END GENERATED: OpenCode Zen free models
+footer: preserved
+EOF_ZEN_EXPECTED_CONFIG
+zen_render_outputs="${zen_parser_dir}/render-outputs"
+: > "${zen_render_outputs}"
+if GITHUB_OUTPUT="${zen_render_outputs}" \
+  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
+  "${zen_parser_dir}/zen.mdx" "${zen_parser_dir}/render-config.yaml" \
+  && cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" \
+  && grep -Fxq 'changed=true' "${zen_render_outputs}"; then
+  record_success "Zen config updater replaces only the generated block with sorted endpoints"
+else
+  record_failure "Zen config updater replaces only the generated block with sorted endpoints" \
+    "$(diff -u "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" 2>&1 || true)"
+fi
+
+: > "${zen_render_outputs}"
+if GITHUB_OUTPUT="${zen_render_outputs}" \
+  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
+  "${zen_parser_dir}/zen.mdx" "${zen_parser_dir}/render-config.yaml" \
+  && cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" \
+  && grep -Fxq 'changed=false' "${zen_render_outputs}"; then
+  record_success "Zen config updater is idempotent"
+else
+  record_failure "Zen config updater is idempotent" "second render changed the generated config"
+fi
+
+cat > "${zen_parser_dir}/messages-free.mdx" <<'EOF_ZEN_MESSAGES'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Claude Free | claude-free | `https://opencode.ai/zen/v1/messages` | `@ai-sdk/anthropic` |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Claude Free | Free | Free | Free | - |
+EOF_ZEN_MESSAGES
+expect_hard_failure_with_stderr "Zen config updater rejects endpoints outside openai-compatible routing" 4 \
+  'unsupported endpoint for openai-compatible Zen example: claude-free -> /messages' \
+  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
+  "${zen_parser_dir}/messages-free.mdx" "${zen_parser_dir}/render-config.yaml"
+
 claude_contract_dir="${TMP_ROOT}/setup/claude-defaults-and-model-preference"
 start_mock_server "${claude_contract_dir}/server" 200
 claude_contract_port="${MOCK_SERVER_PORT}"
