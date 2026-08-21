@@ -10,19 +10,23 @@
 #     models return HTTP 401 messages such as "Free promotion has ended for
 #     <model>" or "Model <model> is not supported". Re-check the live set:
 #     curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'
-#   - Free models are NOT zero-retention ("collected data may be used to improve
-#     the model"). Do not route proprietary or sensitive prompts through them.
+#   - Data handling varies by promotion. Ox Alpha's provider is documented as
+#     zero-retention with no training use, while other free models may retain
+#     prompts or use them for improvement. Check the current Zen terms before
+#     routing proprietary or sensitive prompts.
 #
 # Use model_discovery: static (not openai): dynamic /models also lists PAID Zen
 # models that reject the "public" key with HTTP 401, and there is no cost filter.
-# Static discovery also skips the upstream readiness probe.
+# Static discovery also skips the upstream readiness probe. This is a curated
+# set with verified routes; live CI intersects it with Zen's current Free price
+# labels rather than inferring eligibility from model IDs.
 #
 # Do NOT set default: true here. Under static discovery, unlisted models return
 # HTTP 400, so making this the default catch-all only risks routing unknown
 # models to a revocable trial gateway.
 #
-# Endpoint allowlists are per model. /responses is currently verified only for
-# deepseek-v4-flash-free; the others are advertised as /chat/completions only.
+# Endpoint allowlists are per model. Muse Spark Contributor is advertised as
+# /responses-only; the others below are advertised as /chat/completions only.
 # Note: the GitHub Copilot CLI and Codex CLI use /responses with built-in tools
 # that Zen free upstreams may reject; use COPILOT_PROVIDER_WIRE_API=completions
 # for the Copilot CLI.
@@ -43,19 +47,21 @@ providers:
     api_key: public                         # shared anonymous sentinel, not a secret
     model_discovery: static
     models:
-      - public_id: deepseek-v4-flash-free
+      - public_id: big-pickle
         endpoints:
           - /chat/completions
-          - /responses
+      - public_id: x-preview-f-free          # Ox Alpha Free
+        endpoints:
+          - /chat/completions
       - public_id: hy3-free
-        endpoints:
-          - /chat/completions
-      - public_id: ling-3.0-tiny-free
         endpoints:
           - /chat/completions
       - public_id: mimo-v2.5-free
         endpoints:
           - /chat/completions
+      - public_id: muse-spark-1.2-contributor-free
+        endpoints:
+          - /responses
       - public_id: nemotron-3.5-lightning-free
         endpoints:
           - /chat/completions

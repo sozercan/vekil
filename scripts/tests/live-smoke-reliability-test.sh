@@ -100,6 +100,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"data": [
                 {"id": MODEL, "supported_endpoints": ["/chat/completions", "/responses"]},
                 {"id": "mimo-v2.5-free", "supported_endpoints": ["/chat/completions"]},
+                {"id": "hy3-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
                 {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
                 {"id": "claude-sonnet-5", "supported_endpoints": ["/chat/completions"]},
@@ -632,6 +633,59 @@ run_zen_classification_case() {
 
 log "Running deterministic smoke reliability regressions"
 
+zen_parser_dir="${TMP_ROOT}/setup/zen-free-label-parser"
+mkdir -p "${zen_parser_dir}"
+cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Paid Model | paid-model | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
+| Big Pickle | big-pickle | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+| Ox Alpha Free | x-preview-f-free | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+| Muse Spark Free | muse-spark-free | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Paid Model | $1.00 | $2.00 | - | - |
+| Big Pickle | Free | Free | Free | - |
+| Ox Alpha Free | Free | Free | Free | - |
+| Muse Spark Free | Free | Free | Free | - |
+EOF_ZEN_DOC
+cat > "${zen_parser_dir}/expected.tsv" <<'EOF_ZEN_EXPECTED'
+big-pickle	Big Pickle	/chat/completions
+x-preview-f-free	Ox Alpha Free	/chat/completions
+muse-spark-free	Muse Spark Free	/responses
+EOF_ZEN_EXPECTED
+if "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/zen.mdx" > "${zen_parser_dir}/actual.tsv" \
+  && cmp -s "${zen_parser_dir}/expected.tsv" "${zen_parser_dir}/actual.tsv"; then
+  record_success "Zen free-label parser joins pricing labels to endpoint aliases"
+else
+  record_failure "Zen free-label parser joins pricing labels to endpoint aliases" \
+    "$(diff -u "${zen_parser_dir}/expected.tsv" "${zen_parser_dir}/actual.tsv" 2>&1 || true)"
+fi
+
+cat > "${zen_parser_dir}/missing-endpoint.mdx" <<'EOF_ZEN_MISSING'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Paid Model | paid-model | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Missing Free Model | Free | Free | Free | - |
+EOF_ZEN_MISSING
+expect_hard_failure_with_stderr "Zen free-label parser rejects an unmapped free label" 4 \
+  'free pricing label has no endpoint-table entry: Missing Free Model' \
+  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/missing-endpoint.mdx"
+
 claude_contract_dir="${TMP_ROOT}/setup/claude-defaults-and-model-preference"
 start_mock_server "${claude_contract_dir}/server" 200
 claude_contract_port="${MOCK_SERVER_PORT}"
@@ -809,6 +863,45 @@ expect_success "neutral skip only before any client is exercised" 8 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${neutral_port}" LIVE_CLI_SMOKE_DIR="${neutral_dir}/smoke" \
     SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+free_filter_dir="${TMP_ROOT}/setup/free-label-filter"
+start_mock_server "${free_filter_dir}/server" 200
+free_filter_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${free_filter_dir}/bin" pass pass pass
+printf 'mimo-v2.5-free\tMiMo V2.5 Free\t/chat/completions\n' \
+  > "${free_filter_dir}/free-models.tsv"
+free_filter_name="Zen candidates honor parsed free labels"
+if expect_success "${free_filter_name}" 8 \
+  env PATH="${free_filter_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${free_filter_port}" \
+    LIVE_CLI_SMOKE_DIR="${free_filter_dir}/smoke" \
+    ZEN_FREE_MODELS_FILE="${free_filter_dir}/free-models.tsv" \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
+  free_filter_stderr="${TMP_ROOT}/cases/${free_filter_name//[^a-zA-Z0-9_.-]/_}/stderr"
+  if grep -q '^==> Zen candidate models: mimo-v2\.5-free$' "${free_filter_stderr}" \
+    && ! grep -q '^==> Zen candidate models: .*hy3-free' "${free_filter_stderr}"; then
+    record_success "Zen candidate filtering excludes models without a current Free label"
+  else
+    record_failure "Zen candidate filtering excludes models without a current Free label" \
+      "$(cat "${free_filter_stderr}" 2>/dev/null || true)"
+  fi
+fi
+
+no_free_intersection_dir="${TMP_ROOT}/setup/no-free-label-intersection"
+start_mock_server "${no_free_intersection_dir}/server" 200
+no_free_intersection_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${no_free_intersection_dir}/bin" pass pass pass
+printf 'x-preview-f-free\tOx Alpha Free\t/chat/completions\n' \
+  > "${no_free_intersection_dir}/free-models.tsv"
+expect_hard_failure_with_stderr "Zen smoke rejects a stale example with no free-label intersection" 8 \
+  'the Zen example exposes no model currently carrying Free price labels' \
+  env PATH="${no_free_intersection_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${no_free_intersection_port}" \
+    LIVE_CLI_SMOKE_DIR="${no_free_intersection_dir}/smoke" \
+    ZEN_FREE_MODELS_FILE="${no_free_intersection_dir}/free-models.tsv" \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
 retry_dir="${TMP_ROOT}/setup/second-canary-transient"
