@@ -78,8 +78,11 @@ func saveMenubarConfig(cfg menubarConfig) error {
 	}
 
 	body = append(body, '\n')
-	if err := os.WriteFile(path, body, 0o644); err != nil {
+	if err := os.WriteFile(path, body, 0o600); err != nil {
 		return fmt.Errorf("write menubar config %q: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("secure menubar config %q: %w", path, err)
 	}
 
 	return nil

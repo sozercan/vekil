@@ -286,6 +286,30 @@ func TestServePolicyRoutingHelpDescribesConfigFollowingDefault(t *testing.T) {
 	}
 }
 
+func TestServeProvidersConfigHelpRedactsEnvironmentDefault(t *testing.T) {
+	source := "https://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret"
+	t.Setenv("PROVIDERS_CONFIG", source)
+
+	var output bytes.Buffer
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(&output)
+	serve := registerServeFlags(fs)
+	if got := *serve.providersConfigPath; got != source {
+		t.Fatalf("providers config default = %q, want original source", got)
+	}
+	fs.PrintDefaults()
+
+	help := output.String()
+	if !strings.Contains(help, "https://example.com/providers.yaml") {
+		t.Fatalf("serve help missing sanitized providers config default:\n%s", help)
+	}
+	for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+		if strings.Contains(help, secret) {
+			t.Fatalf("serve help exposes %q:\n%s", secret, help)
+		}
+	}
+}
+
 func TestServeFlagsRejectInvalidPolicyRoutingMode(t *testing.T) {
 	serve := parseServeFlagsForTest(t, "--policy-routing", "sometimes")
 	if _, err := serve.parsedPolicyRoutingMode(); err == nil {
@@ -1187,6 +1211,35 @@ func TestLaunchPolicyRoutingHelpDescribesConfigFollowingDefault(t *testing.T) {
 	}
 	if !strings.Contains(help, `(default "config")`) {
 		t.Fatalf("launch policy-routing help did not show config default:\n%s", help)
+	}
+}
+
+func TestLaunchProvidersConfigHelpRedactsEnvironmentDefault(t *testing.T) {
+	source := "https://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret"
+	t.Setenv("PROVIDERS_CONFIG", source)
+	target, _ := launchTarget("codex")
+
+	opts, err := parseLaunchAgentOptions(target, nil, io.Discard)
+	if err != nil {
+		t.Fatalf("parseLaunchAgentOptions() error = %v", err)
+	}
+	if opts.providersConfigPath != source {
+		t.Fatalf("providers config default = %q, want original source", opts.providersConfigPath)
+	}
+
+	var stderr bytes.Buffer
+	_, err = parseLaunchAgentOptions(target, []string{"--help"}, &stderr)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("parseLaunchAgentOptions(--help) error = %v, want flag.ErrHelp", err)
+	}
+	help := stderr.String()
+	if !strings.Contains(help, "https://example.com/providers.yaml") {
+		t.Fatalf("launch help missing sanitized providers config default:\n%s", help)
+	}
+	for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+		if strings.Contains(help, secret) {
+			t.Fatalf("launch help exposes %q:\n%s", secret, help)
+		}
 	}
 }
 

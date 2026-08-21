@@ -231,6 +231,14 @@ type configValidateOptions struct {
 	live                bool
 }
 
+func registerProvidersConfigFlag(fs *flag.FlagSet, defaultValue string) *string {
+	value := fs.String("providers-config", defaultValue, "Path or HTTP(S) URL to JSON or YAML provider configuration")
+	if registered := fs.Lookup("providers-config"); registered != nil {
+		registered.DefValue = proxy.ProvidersConfigSourceDisplay(defaultValue)
+	}
+	return value
+}
+
 type configValidateDeps struct {
 	stdout                          io.Writer
 	stderr                          io.Writer
@@ -325,7 +333,7 @@ func parseConfigValidateOptions(args []string) (configValidateOptions, error) {
 	var opts configValidateOptions
 	fs := flag.NewFlagSet("config validate", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	providersConfigPath := fs.String("providers-config", "", "Path or HTTP(S) URL to JSON or YAML provider configuration")
+	providersConfigPath := registerProvidersConfigFlag(fs, "")
 	live := fs.Bool("live", false, "Run live policy-classifier protocol preflight for configured policy routes")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
@@ -390,7 +398,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
-		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path or HTTP(S) URL to JSON or YAML provider configuration"),
+		providersConfigPath:             registerProvidersConfigFlag(fs, getEnv("PROVIDERS_CONFIG", "")),
 		policyRoutingMode:               fs.String("policy-routing", getPolicyRoutingModeEnv(), "Policy routing mode: config (follow providers YAML), off, observe, or enforce"),
 		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),

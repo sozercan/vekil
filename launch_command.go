@@ -144,7 +144,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	binary := fs.String("binary", "", "Path or command name for "+target.displayName)
 	port := fs.String("port", "0", "Ephemeral proxy listen port (0 lets the OS choose)")
 	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
-	providersConfig := fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path or HTTP(S) URL to JSON or YAML provider configuration")
+	providersConfig := registerProvidersConfigFlag(fs, getEnv("PROVIDERS_CONFIG", ""))
 	logLevel := fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Proxy log level")
 	proxyLog := fs.String("proxy-log", "", fmt.Sprintf("Proxy JSON log path (default: ~/.config/vekil/logs/launch-%s-*.jsonl)", target.name))
 	startupTimeout := fs.Duration("startup-timeout", getEnvDuration("LAUNCH_STARTUP_TIMEOUT", 2*time.Minute), "Maximum time to authenticate and become ready")
