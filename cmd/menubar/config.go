@@ -78,11 +78,26 @@ func saveMenubarConfig(cfg menubarConfig) error {
 	}
 
 	body = append(body, '\n')
-	if err := os.WriteFile(path, body, 0o600); err != nil {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
 		return fmt.Errorf("write menubar config %q: %w", path, err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	// Existing installations may have created this file with broader permissions.
+	// Secure the open inode before replacing contents that can include a signed URL.
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
 		return fmt.Errorf("secure menubar config %q: %w", path, err)
+	}
+	if err := file.Truncate(0); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("truncate menubar config %q: %w", path, err)
+	}
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write menubar config %q: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close menubar config %q: %w", path, err)
 	}
 
 	return nil

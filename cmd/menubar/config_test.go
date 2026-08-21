@@ -62,6 +62,40 @@ func TestSaveMenubarConfigRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSaveMenubarConfigSecuresExistingFile(t *testing.T) {
+	configDir := stubUserConfigDir(t)
+	configPath := filepath.Join(configDir, "vekil", menubarConfigFilename)
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte("legacy config\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.Chmod(configPath, 0o644); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+
+	wantPath := "https://config.example/providers.yaml?token=secret"
+	if err := saveMenubarConfig(menubarConfig{ProvidersConfigPath: wantPath}); err != nil {
+		t.Fatalf("saveMenubarConfig() error = %v", err)
+	}
+
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("saved config permissions = %#o, want 0600", got)
+	}
+	cfg, err := loadMenubarConfig()
+	if err != nil {
+		t.Fatalf("loadMenubarConfig() error = %v", err)
+	}
+	if cfg.ProvidersConfigPath != wantPath {
+		t.Fatalf("loadMenubarConfig() ProvidersConfigPath = %q, want %q", cfg.ProvidersConfigPath, wantPath)
+	}
+}
+
 func TestSaveMenubarConfigClearsFile(t *testing.T) {
 	configDir := stubUserConfigDir(t)
 	configPath := filepath.Join(configDir, "vekil", menubarConfigFilename)
