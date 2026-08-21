@@ -721,10 +721,12 @@ validate_zen_free_models_file() {
     || die "ZEN_FREE_MODELS_FILE is malformed: ${ZEN_FREE_MODELS_FILE}"
 }
 
-zen_model_is_labeled_free() {
+zen_model_is_labeled_free_for_endpoint() {
   local model="$1"
+  local endpoint="$2"
   [[ -n "${ZEN_FREE_MODELS_FILE}" ]] || return 0
-  awk -F '\t' -v model="${model}" '$1 == model { found=1 } END { exit !found }' \
+  awk -F '\t' -v model="${model}" -v endpoint="${endpoint}" \
+    '$1 == model && $3 == endpoint { found=1 } END { exit !found }' \
     "${ZEN_FREE_MODELS_FILE}"
 }
 
@@ -1044,7 +1046,9 @@ main_zen() {
 
   local candidates=() model
   for model in "${ZEN_MODEL_PREFS[@]}"; do
-    if model_exists "${model}" && zen_model_is_labeled_free "${model}"; then
+    if model_exists "${model}" \
+      && model_supports_endpoint "${model}" "/chat/completions" \
+      && zen_model_is_labeled_free_for_endpoint "${model}" "/chat/completions"; then
       candidates+=("${model}")
     fi
   done
@@ -1054,7 +1058,10 @@ main_zen() {
   # a second preference-list update.
   if [[ -n "${ZEN_FREE_MODELS_FILE}" ]]; then
     while IFS=$'\t' read -r model _label _endpoint; do
-      if model_exists "${model}" && ! zen_candidates_contain "${model}" "${candidates[@]}"; then
+      if [[ "${_endpoint}" == "/chat/completions" ]] \
+        && model_exists "${model}" \
+        && model_supports_endpoint "${model}" "/chat/completions" \
+        && ! zen_candidates_contain "${model}" "${candidates[@]}"; then
         candidates+=("${model}")
       fi
     done < "${ZEN_FREE_MODELS_FILE}"

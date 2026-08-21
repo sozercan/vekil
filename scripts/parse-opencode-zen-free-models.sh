@@ -45,7 +45,7 @@ function fail(message) {
   next
 }
 
-/^##[[:space:]]+/ {
+/^##+[[:space:]]+/ {
   section = ""
   next
 }
@@ -76,11 +76,12 @@ section == "pricing" && /^\|/ {
   if (label == "Model" || label ~ /^-+$/) {
     next
   }
+  if (label in pricing_label) {
+    fail("duplicate pricing label: " label)
+    next
+  }
+  pricing_label[label] = 1
   if (input_price == "Free" && output_price == "Free") {
-    if (label in free_label) {
-      fail("duplicate free pricing label: " label)
-      next
-    }
     free_label[label] = 1
     free_order[++free_count] = label
   }

@@ -102,6 +102,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": "mimo-v2.5-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "hy3-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
+                {"id": "muse-spark-1.2-contributor-free", "supported_endpoints": ["/responses"]},
                 {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
                 {"id": "claude-sonnet-5", "supported_endpoints": ["/chat/completions"]},
             ]})
@@ -110,11 +111,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
-        if length:
-            self.rfile.read(length)
+        body = self.rfile.read(length) if length else b""
         if self.path == "/v1/chat/completions":
             if args.hang_chat:
                 time.sleep(300)
+                return
+            try:
+                model = json.loads(body).get("model")
+            except (AttributeError, json.JSONDecodeError):
+                model = None
+            if model in {"gpt-5.4", "muse-spark-1.2-contributor-free"}:
+                self.send_json(400, {
+                    "error": {"message": f"model {model} does not support /chat/completions"},
+                })
                 return
             global canary_index
             status = CANARY_STATUSES[min(canary_index, len(CANARY_STATUSES) - 1)]
@@ -653,6 +662,12 @@ cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
 | Big Pickle | Free | Free | Free | - |
 | Ox Alpha Free | Free | Free | Free | - |
 | Muse Spark Free | Free | Free | Free | - |
+
+### Retirement dates
+
+| Model | Date |
+| ----- | ---- |
+| Big Pickle | August 31, 2026 |
 EOF_ZEN_DOC
 cat > "${zen_parser_dir}/expected.tsv" <<'EOF_ZEN_EXPECTED'
 big-pickle	Big Pickle	/chat/completions
@@ -685,6 +700,25 @@ expect_hard_failure_with_stderr "Zen free-label parser rejects an unmapped free 
   'free pricing label has no endpoint-table entry: Missing Free Model' \
   "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
   "${zen_parser_dir}/missing-endpoint.mdx"
+
+cat > "${zen_parser_dir}/duplicate-pricing-label.mdx" <<'EOF_ZEN_DUPLICATE'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Ambiguous Model | ambiguous-model | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Ambiguous Model | $1.00 | $2.00 | - | - |
+| Ambiguous Model | Free | Free | Free | - |
+EOF_ZEN_DUPLICATE
+expect_hard_failure_with_stderr "Zen free-label parser rejects paid/free duplicate labels" 4 \
+  'duplicate pricing label: Ambiguous Model' \
+  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/duplicate-pricing-label.mdx"
 
 claude_contract_dir="${TMP_ROOT}/setup/claude-defaults-and-model-preference"
 start_mock_server "${claude_contract_dir}/server" 200
@@ -869,7 +903,9 @@ free_filter_dir="${TMP_ROOT}/setup/free-label-filter"
 start_mock_server "${free_filter_dir}/server" 200
 free_filter_port="${MOCK_SERVER_PORT}"
 write_fake_clients "${free_filter_dir}/bin" pass pass pass
-printf 'mimo-v2.5-free\tMiMo V2.5 Free\t/chat/completions\n' \
+printf '%s\n' \
+  $'mimo-v2.5-free\tMiMo V2.5 Free\t/chat/completions' \
+  $'muse-spark-1.2-contributor-free\tMuse Spark Free\t/responses' \
   > "${free_filter_dir}/free-models.tsv"
 free_filter_name="Zen candidates honor parsed free labels"
 if expect_success "${free_filter_name}" 8 \
@@ -881,10 +917,11 @@ if expect_success "${free_filter_name}" 8 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
   free_filter_stderr="${TMP_ROOT}/cases/${free_filter_name//[^a-zA-Z0-9_.-]/_}/stderr"
   if grep -q '^==> Zen candidate models: mimo-v2\.5-free$' "${free_filter_stderr}" \
-    && ! grep -q '^==> Zen candidate models: .*hy3-free' "${free_filter_stderr}"; then
-    record_success "Zen candidate filtering excludes models without a current Free label"
+    && ! grep -q '^==> Zen candidate models: .*hy3-free' "${free_filter_stderr}" \
+    && ! grep -q '^==> Zen candidate models: .*muse-spark' "${free_filter_stderr}"; then
+    record_success "Zen candidate filtering requires current Free and Chat labels"
   else
-    record_failure "Zen candidate filtering excludes models without a current Free label" \
+    record_failure "Zen candidate filtering requires current Free and Chat labels" \
       "$(cat "${free_filter_stderr}" 2>/dev/null || true)"
   fi
 fi
