@@ -866,6 +866,12 @@ func TestConfigValidateUsageDescribesNarrowLivePreflight(t *testing.T) {
 	var usage bytes.Buffer
 	writeConfigValidateUsage(&usage)
 	got := usage.String()
+	if !strings.Contains(got, "Path or HTTP(S) URL") {
+		t.Fatalf("config validate usage missing URL source support: %q", got)
+	}
+	if !strings.Contains(got, "URL sources are fetched") {
+		t.Fatalf("config validate usage hides remote source fetches: %q", got)
+	}
 	if !strings.Contains(got, "Run fixed policy-classifier protocol preflights") {
 		t.Fatalf("config validate usage missing narrow live preflight: %q", got)
 	}
@@ -986,7 +992,7 @@ func TestRunConfigValidateUsageErrorsDoNotValidate(t *testing.T) {
 		{
 			name:     "missing providers config",
 			args:     []string{"validate"},
-			wantText: "--providers-config PATH is required",
+			wantText: "--providers-config SOURCE is required",
 		},
 		{
 			name:     "unknown flag",
@@ -1025,7 +1031,7 @@ func TestRunConfigValidateUsageErrorsDoNotValidate(t *testing.T) {
 				t.Fatalf("stdout = %q, want empty", got)
 			}
 			output := stderr.String()
-			for _, want := range []string{tc.wantText, "Usage: vekil config validate --providers-config PATH"} {
+			for _, want := range []string{tc.wantText, "Usage: vekil config validate --providers-config SOURCE"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("stderr missing %q:\n%s", want, output)
 				}
@@ -1071,7 +1077,7 @@ func TestRunConfigHelpDoesNotValidate(t *testing.T) {
 				t.Fatalf("stdout = %q, want empty", got)
 			}
 			output := stderr.String()
-			for _, want := range []string{"Usage: vekil config validate --providers-config PATH", "validate"} {
+			for _, want := range []string{"Usage: vekil config validate --providers-config SOURCE", "validate"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("help output missing %q:\n%s", want, output)
 				}
@@ -1109,7 +1115,7 @@ func TestRunConfigRejectsMissingOrUnknownCommand(t *testing.T) {
 				t.Fatal("invalid config command called ValidateProvidersConfigFile")
 			}
 			output := stderr.String()
-			for _, want := range []string{tc.wantText, "Usage: vekil config validate --providers-config PATH"} {
+			for _, want := range []string{tc.wantText, "Usage: vekil config validate --providers-config SOURCE"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("stderr missing %q:\n%s", want, output)
 				}

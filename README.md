@@ -48,7 +48,9 @@ brew install --cask sozercan/repo/vekil
 
 > The app is not signed. Clear quarantine with `xattr -cr /Applications/Vekil.app`. Manual `vekil-macos-arm64.zip` downloads are also on [Releases](https://github.com/sozercan/vekil/releases/latest). See [Tray App (macOS/Linux)](docs/menubar.md).
 
-For explicit provider routing, start the proxy with `--providers-config /path/to/providers.{json,yaml}`.
+For explicit provider routing, pass a local file or HTTP(S) URL with
+`--providers-config`, such as `/path/to/providers.yaml` or
+`https://config.example.com/providers.yaml`.
 
 Schema-v2 policy routing follows each profile's YAML `mode` by default; an explicit process mode can still lower it for rollout or emergency rollback. Policy profiles use a text/function-tool canonical Chat contract with translated Anthropic and bounded stateless Responses ingress for managed agents, and support one trusted user/tenant per deployment; see [Semantic Policy Routing](docs/policy-routing.md) before enabling `observe` or `enforce`.
 
@@ -68,8 +70,8 @@ vekil launch copilot --model gpt-5.4-mini
 Pass `--model` to Claude Code or Codex CLI when you want Vekil to validate,
 scope, and pin the session to one public model.
 
-Use `--providers-config` with the same JSON/YAML routing file accepted by the
-server. Arguments after `--` are forwarded to the agent:
+Use `--providers-config` with the same local or HTTP(S) JSON/YAML routing source
+accepted by the server. Arguments after `--` are forwarded to the agent:
 
 ```bash
 vekil launch codex \

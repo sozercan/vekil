@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -248,6 +247,9 @@ func (e *providerRequestError) Unwrap() error {
 	return e.err
 }
 
+// LoadProvidersConfigFile loads a provider configuration from a local path or
+// an HTTP(S) URL. Remote sources are fetched once per call with a bounded body
+// and timeout; Vekil does not poll them for changes.
 func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 	var cfg ProvidersConfig
 	path = strings.TrimSpace(path)
@@ -255,9 +257,9 @@ func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 		return cfg, nil
 	}
 
-	body, err := os.ReadFile(path)
+	body, err := readProvidersConfigSource(path)
 	if err != nil {
-		return cfg, fmt.Errorf("read providers config %q: %w", path, err)
+		return cfg, err
 	}
 	if err := decodeProvidersConfigFile(path, body, &cfg); err != nil {
 		return cfg, err
@@ -420,7 +422,7 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		return fmt.Errorf("providers config %q is empty", path)
 	}
 
-	switch strings.ToLower(filepath.Ext(path)) {
+	switch providersConfigSourceExtension(path) {
 	case ".yaml", ".yml":
 		allowMergeKeys := !providersConfigSchemaUsesStrictDecoding(sniffProvidersConfigSchemaVersionYAML(body))
 		if err := rejectDuplicateYAMLMappingKeys(body, allowMergeKeys); err != nil {

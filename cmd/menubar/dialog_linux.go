@@ -14,7 +14,7 @@ import (
 const dbusNotifyDest = "org.freedesktop.Notifications"
 const dbusNotifyPath = "/org/freedesktop/Notifications"
 const dbusNotifyIface = "org.freedesktop.Notifications"
-const providersConfigSelectionGuidance = "install and run a desktop portal backend, run vekil --providers-config PATH, or edit the saved menubar config file directly"
+const providersConfigSelectionGuidance = "install and run a desktop portal backend, run vekil --providers-config SOURCE, or edit the saved menubar config file directly"
 
 var (
 	errNotificationDismissed = errors.New("notification dismissed")

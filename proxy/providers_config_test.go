@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -775,6 +776,84 @@ func TestLoadProvidersConfigFileRejectsEmptyBody(t *testing.T) {
 				t.Fatalf("LoadProvidersConfigFile() error = %v, want empty config error", err)
 			}
 		})
+	}
+}
+
+func TestLoadProvidersConfigFileURL(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "JSON",
+			path: "/providers.json?revision=1",
+			body: `{"providers":[{"id":"remote","type":"openai-compatible","base_url":"http://localhost:1234","auth_type":"none","models":[{"public_id":"remote-model"}]}]}`,
+		},
+		{
+			name: "YAML with query",
+			path: "/providers.yaml?revision=1",
+			body: "providers:\n  - id: remote\n    type: openai-compatible\n    base_url: http://localhost:1234\n    auth_type: none\n    models:\n      - public_id: remote-model\n",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+
+			cfg, err := LoadProvidersConfigFile(server.URL + tc.path)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+			if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "remote" {
+				t.Fatalf("providers = %+v, want one remote provider", cfg.Providers)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsHTTPFailure(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 503 Service Unavailable") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want HTTP status failure", err)
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsOversizedBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat(" ", maxRemoteProvidersConfigBodySize+1))
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), "response exceeds 4194304 bytes") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want response-size failure", err)
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsUnsupportedScheme(t *testing.T) {
+	t.Parallel()
+
+	_, err := LoadProvidersConfigFile("ftp://example.com/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), `unsupported scheme "ftp"`) {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want unsupported-scheme failure", err)
 	}
 }
 
