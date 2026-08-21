@@ -672,7 +672,8 @@ EOF
 #
 # The free tier rotates and is rate-limited per IP, so the contract is strict:
 #   - an initial canary may skip only specifically recognized transient upstream
-#     conditions evidenced by HTTP (promotion ended, 408/425/429, or 5xx);
+#     conditions evidenced by HTTP (listed model unavailable, promotion ended,
+#     408/425/429, or 5xx);
 #   - after a 200 canary, any CLI nonzero/timeout/invalid output is a hard failure
 #     unless one bounded second canary proves such a transient appeared;
 #   - every installed client must pass independently;
@@ -699,8 +700,17 @@ ATTEMPT_STATUS=""
 ATTEMPT_DETAIL=""
 ZEN_ANY_CLIENT_EXERCISED=0
 
+zen_model_unavailable_is_transient() {
+  local message="$1"
+  printf '%s' "${message}" | grep -qiE \
+    'model( [[:alnum:]_.:/-]+)? is unavailable[.]?$'
+}
+
 zen_error_is_transient() {
   local message="$1"
+  if zen_model_unavailable_is_transient "${message}"; then
+    return 0
+  fi
   printf '%s' "${message}" | grep -qiE \
     'promotion (has )?ended|free promotion[^[:alnum:]]+ended|^model [[:alnum:]_.:/-]+ is not supported$|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'
 }
@@ -754,7 +764,14 @@ zen_canary() {
         printf 'FAIL http-200-bad-shape\n'
       fi
       ;;
-    400|404|405)
+    400)
+      if zen_model_unavailable_is_transient "${errmsg}"; then
+        printf 'TRANSIENT message:%s\n' "${errmsg:0:80}"
+      else
+        printf 'FAIL http-%s:%s\n' "${code}" "${errmsg:0:80}"
+      fi
+      ;;
+    404|405)
       printf 'FAIL http-%s:%s\n' "${code}" "${errmsg:0:80}"
       ;;
     408|425|429|5??)

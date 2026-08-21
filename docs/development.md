@@ -348,7 +348,7 @@ After Claude Code 2.1.212 regressed headless output, the workflow pins a verifie
 
 For each client/model attempt, a bounded raw chat-completions canary runs first:
 
-- Only upstream conditions evidenced by an HTTP response are skippable: a promotion-ended, exact model-no-longer-supported, rate-limit, or temporary-capacity message on an eligible response, HTTP 408/425/429, or HTTP 5xx. Local curl transport failures and timeouts are hard failures because they can indicate a stuck Vekil handler. Unknown statuses, including 404 and 405, are also hard failures.
+- Only upstream conditions evidenced by an HTTP response are skippable: an exact listed-model-unavailable HTTP 400, a promotion-ended, exact model-no-longer-supported, rate-limit, or temporary-capacity message on an eligible response, HTTP 408/425/429, or HTTP 5xx. Local curl transport failures and timeouts are hard failures because they can indicate a stuck Vekil handler. Other HTTP 400 responses and unknown statuses, including 404 and 405, are hard failures.
 - After a 200 canary, any CLI nonzero exit, timeout, empty result, or mismatched result is a hard failure unless one bounded second canary on that same model proves that a recognized transient appeared between the first probe and the CLI run.
 - A neutral exit 0 is allowed only when no model was reachable **before any client was exercised**. Once a reachable model has exercised a client, every installed client must pass.
 

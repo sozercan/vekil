@@ -863,8 +863,29 @@ fi
 
 run_zen_classification_case "canary 404 plus transient text is hard" 404 \
   "service temporarily unavailable" 0
+run_zen_classification_case "canary 400 unknown error is hard" 400 \
+  "invalid request" 0
 run_zen_classification_case "canary 200 bad shape plus transient text is hard" 200 \
   "service temporarily unavailable" 1
+
+unavailable_model_dir="${TMP_ROOT}/setup/unavailable-zen-model"
+unavailable_model_message="Error from provider (Console): Upstream request failed: Model is unavailable."
+start_mock_server "${unavailable_model_dir}/cli-server" 200 "400,200" "${unavailable_model_message}"
+unavailable_model_cli_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${unavailable_model_dir}/bin" pass pass pass
+expect_success "listed Zen model unavailable falls through to another model" 8 \
+  env PATH="${unavailable_model_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${unavailable_model_cli_port}" \
+    LIVE_CLI_SMOKE_DIR="${unavailable_model_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+start_mock_server "${unavailable_model_dir}/raw-server" 200 "400,200" "${unavailable_model_message}"
+unavailable_model_raw_port="${MOCK_SERVER_PORT}"
+mkdir -p "${unavailable_model_dir}/raw-smoke"
+expect_success "raw Zen smoke treats listed model unavailability as transient" 8 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${unavailable_model_raw_port}" \
+    LIVE_ZEN_SMOKE_DIR="${unavailable_model_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
 
 removed_model_dir="${TMP_ROOT}/setup/removed-zen-model"
 start_mock_server "${removed_model_dir}/server" 401 "" "Model deepseek-v4-flash-free is not supported"
