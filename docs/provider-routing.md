@@ -446,24 +446,7 @@ providers:
 
 #### OpenCode Zen Free Tier
 
-OpenCode Zen is an OpenAI-compatible gateway at `https://opencode.ai/zen/v1`. Its free models can be reached anonymously with the literal sentinel key `public` (the same value the opencode client sends when no real key is configured). No signup, OAuth, or token refresh is involved, so this maps directly onto an `openai-compatible` provider with `auth_type: bearer` and `api_key: public`. A ready-to-run config is in [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml):
-
-```yaml
-providers:
-  - id: opencode-zen
-    type: openai-compatible
-    base_url: https://opencode.ai/zen/v1
-    auth_type: bearer
-    api_key: public                  # shared anonymous sentinel, not a secret
-    model_discovery: static
-    models:
-      - public_id: deepseek-v4-flash-free
-        endpoints:
-          - /chat/completions
-      - public_id: hy3-free
-        endpoints:
-          - /chat/completions
-```
+OpenCode Zen is an OpenAI-compatible gateway at `https://opencode.ai/zen/v1`. Its free models can be reached anonymously with the literal sentinel key `public` (the same value the opencode client sends when no real key is configured). No signup, OAuth, or token refresh is involved, so this maps directly onto an `openai-compatible` provider with `auth_type: bearer` and `api_key: public`. Use the ready-to-run [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml); its marked model block is generated from OpenCode's current endpoint and pricing tables rather than duplicated here.
 
 Operational notes for the free tier:
 
@@ -471,9 +454,9 @@ Operational notes for the free tier:
 - Do not set `default: true`. Under static discovery, unlisted models return `400`, so making this the catch-all only risks routing unknown models to a revocable trial gateway.
 - The free set rotates and individual promotions end without notice. Removed models have returned `401` messages such as `Free promotion has ended for <model>` and `Model <model> is not supported`. Re-check the live set before relying on it: `curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'`.
 - `public` is a shared anonymous credential, rate-limited server-side per IP. It suits personal, low-volume use, not fan-out or automation.
-- Free models are not zero-retention ("collected data may be used to improve the model"). Do not route proprietary or sensitive prompts through them.
-- `/responses` support is per model. It is currently verified for `deepseek-v4-flash-free`; add `/responses` to another model's `endpoints` only after confirming it, and keep the others `/chat/completions`-only.
-- Client compatibility: Claude Code (`/v1/messages`) and Gemini CLI translate to `/chat/completions` and work against the free tier. The GitHub Copilot CLI works in offline BYOK mode with `COPILOT_PROVIDER_WIRE_API=completions`. The OpenAI Codex CLI does not work against Zen free models: it is `/responses`-only and always sends a built-in `web_search` tool with no `name`, which the free upstreams reject during responses→chat translation.
+- Data handling varies by promotion. Ox Alpha's provider is documented as zero-retention with no training use, while other free models may retain prompts or use them for improvement. Check the current Zen terms before routing proprietary or sensitive prompts.
+- `/responses` support is per model. The generated example copies each free model's documented native endpoint and does not infer `/responses` from model family or client compatibility.
+- Client compatibility: Claude Code (`/v1/messages`) and Gemini CLI translate to `/chat/completions` and work against the free tier. The GitHub Copilot CLI works in offline BYOK mode with `COPILOT_PROVIDER_WIRE_API=completions`. OpenAI Codex CLI requires a model advertising native `/responses`; with the generated example, `muse-spark-1.2-contributor-free` is routed directly to Zen's `/responses` endpoint. Codex cannot use the Chat-only free entries through its Responses wire API, and the automated Zen CLI smoke remains intentionally Chat-oriented.
 
 For the full (paid) Zen catalog or higher limits, sign in at [opencode.ai/auth](https://opencode.ai/auth) and swap `api_key: public` for `api_key_env: OPENCODE_API_KEY` (still a static key, still no refresh). Swapping the key alone is not enough to route paid models: under `model_discovery: static` only the listed `models:` entries are routable, so add each paid model's `public_id` (and `endpoints`) you want to use, or switch to `model_discovery: openai` with `include_models` to opt into specific discovered paid IDs. Validate the free tier end to end with [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) (a quick `curl`/`jq` check), or with the CLI-driven [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow described in [Development](development.md#live-opencode-zen-cli-smoke-workflow).
 

@@ -4,7 +4,7 @@
 #
 # Starts the proxy with examples/opencode-zen-free.yaml on a NON-default port,
 # waits for /readyz, lists /v1/models, then sends one tiny chat completion per
-# configured free model.
+# configured free model that advertises /chat/completions.
 #
 # The OpenCode Zen free set rotates and individual promotions end without notice
 # (ended models currently return either "Free promotion has ended ..." or
@@ -377,9 +377,18 @@ main() {
 
   fetch_models
 
-  local models
-  models="$(jq -r '.data[].id' "${MODELS_JSON}")"
+  local listed_models models
+  listed_models="$(jq -r '.data[].id' "${MODELS_JSON}")"
   log "Models listed by proxy:"
+  printf '%s\n' "${listed_models}" | sed 's/^/    /' >&2
+
+  models="$(jq -r '
+    .data[]?
+    | select((.supported_endpoints // []) | index("/chat/completions"))
+    | .id
+  ' "${MODELS_JSON}")"
+  [[ -n "${models}" ]] || die "no models advertising /chat/completions were returned by ${PROXY_BASE_URL}/v1/models"
+  log "Models selected for Chat smoke:"
   printf '%s\n' "${models}" | sed 's/^/    /' >&2
 
   local total=0 ok=0 transient=0 failed=0

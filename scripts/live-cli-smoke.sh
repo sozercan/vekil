@@ -36,6 +36,7 @@ SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS="${SMOKE_READINESS_REQUEST_MAX_TIME_SEC
 SMOKE_CLI_TIMEOUT_SECONDS="${SMOKE_CLI_TIMEOUT_SECONDS:-240}"
 SMOKE_PROCESS_TERM_GRACE_SECONDS="${SMOKE_PROCESS_TERM_GRACE_SECONDS:-5}"
 SMOKE_PORT_RELEASE_TIMEOUT_SECONDS="${SMOKE_PORT_RELEASE_TIMEOUT_SECONDS:-5}"
+ZEN_FREE_MODELS_FILE="${ZEN_FREE_MODELS_FILE:-}"
 
 python_command() {
   if command -v python3 >/dev/null 2>&1; then
@@ -688,16 +689,56 @@ EOF
 
 # Preference order for free models; intersected with the live /v1/models catalog.
 ZEN_MODEL_PREFS=(
-  deepseek-v4-flash-free
+  x-preview-f-free
+  big-pickle
   mimo-v2.5-free
   hy3-free
-  ling-3.0-tiny-free
   nemotron-3.5-lightning-free
+  muse-spark-1.2-contributor-free
 )
 
 ATTEMPT_STATUS=""
 ATTEMPT_DETAIL=""
 ZEN_ANY_CLIENT_EXERCISED=0
+
+validate_zen_free_models_file() {
+  [[ -n "${ZEN_FREE_MODELS_FILE}" ]] || return 0
+  [[ -s "${ZEN_FREE_MODELS_FILE}" ]] || die "ZEN_FREE_MODELS_FILE is missing or empty: ${ZEN_FREE_MODELS_FILE}"
+
+  awk -F '\t' '
+    NF != 3 ||
+    length($1) > 128 ||
+    $1 !~ /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/ ||
+    $2 == "" ||
+    ($3 != "/chat/completions" && $3 != "/responses" && $3 != "/messages") ||
+    seen[$1]++ {
+      exit 1
+    }
+    END {
+      if (NR == 0) exit 1
+    }
+  ' "${ZEN_FREE_MODELS_FILE}" \
+    || die "ZEN_FREE_MODELS_FILE is malformed: ${ZEN_FREE_MODELS_FILE}"
+}
+
+zen_model_is_labeled_free_for_endpoint() {
+  local model="$1"
+  local endpoint="$2"
+  [[ -n "${ZEN_FREE_MODELS_FILE}" ]] || return 0
+  awk -F '\t' -v model="${model}" -v endpoint="${endpoint}" \
+    '$1 == model && $3 == endpoint { found=1 } END { exit !found }' \
+    "${ZEN_FREE_MODELS_FILE}"
+}
+
+zen_candidates_contain() {
+  local wanted="$1"
+  shift
+  local candidate
+  for candidate in "$@"; do
+    [[ "${candidate}" == "${wanted}" ]] && return 0
+  done
+  return 1
+}
 
 zen_error_is_transient() {
   local message="$1"
@@ -997,13 +1038,41 @@ main_zen() {
 
   fetch_models
 
+  validate_zen_free_models_file
+  if [[ -n "${ZEN_FREE_MODELS_FILE}" ]]; then
+    log "Zen models currently carrying Free price labels:"
+    awk -F '\t' '{ printf "    %s (%s)\n", $1, $2 }' "${ZEN_FREE_MODELS_FILE}" >&2
+  fi
+
   local candidates=() model
   for model in "${ZEN_MODEL_PREFS[@]}"; do
-    if model_exists "${model}"; then
+    if model_exists "${model}" \
+      && model_supports_endpoint "${model}" "/chat/completions" \
+      && zen_model_is_labeled_free_for_endpoint "${model}" "/chat/completions"; then
       candidates+=("${model}")
     fi
   done
-  [[ "${#candidates[@]}" -gt 0 ]] || die "zen config lists no usable models (checked: ${ZEN_MODEL_PREFS[*]})"
+
+  # Once CI supplies the parsed upstream labels, automatically include any
+  # additional free model that the checked-in example exposes without requiring
+  # a second preference-list update.
+  if [[ -n "${ZEN_FREE_MODELS_FILE}" ]]; then
+    while IFS=$'\t' read -r model _label _endpoint; do
+      if [[ "${_endpoint}" == "/chat/completions" ]] \
+        && model_exists "${model}" \
+        && model_supports_endpoint "${model}" "/chat/completions" \
+        && ! zen_candidates_contain "${model}" "${candidates[@]}"; then
+        candidates+=("${model}")
+      fi
+    done < "${ZEN_FREE_MODELS_FILE}"
+  fi
+
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    if [[ -n "${ZEN_FREE_MODELS_FILE}" ]]; then
+      die "the Zen example exposes no model currently carrying Free price labels"
+    fi
+    die "zen config lists no usable models (checked: ${ZEN_MODEL_PREFS[*]})"
+  fi
   log "Zen candidate models: ${candidates[*]}"
 
   local rc
