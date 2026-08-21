@@ -8,7 +8,8 @@
 #   - "public" is a SHARED ANONYMOUS key, rate-limited server-side per IP.
 #   - The free set ROTATES and individual promotions END without notice. Removed
 #     models return HTTP 401 messages such as "Free promotion has ended for
-#     <model>" or "Model <model> is not supported". Re-check the live set:
+#     <model>" or "Model <model> is not supported", or HTTP 400 with "Model is
+#     unavailable". Re-check the live set:
 #     curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'
 #   - Data handling varies by promotion. Ox Alpha's provider is documented as
 #     zero-retention with no training use, while other free models may retain

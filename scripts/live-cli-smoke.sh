@@ -673,10 +673,12 @@ EOF
 #
 # The free tier rotates and is rate-limited per IP, so the contract is strict:
 #   - an initial canary may skip only specifically recognized transient upstream
-#     conditions evidenced by HTTP (promotion ended, 408/425/429, or 5xx);
-#   - after a 200 canary, any CLI nonzero/timeout/invalid output is a hard failure
-#     unless one bounded second canary proves such a transient appeared;
-#   - every installed client must pass independently;
+#     conditions evidenced by HTTP (listed model unavailable, promotion ended,
+#     408/425/429, or 5xx);
+#   - after a 200 canary, a CLI nonzero/timeout/invalid output gets one bounded
+#     second canary; a still-reachable model is recorded as incompatible and the
+#     client must pass another candidate;
+#   - every installed client must pass independently on at least one candidate;
 #   - neutral exit 0 is allowed only if no model was reachable before any client
 #     was exercised.
 # Zen's configured free models advertise text Chat support, not reliable coding
@@ -740,6 +742,12 @@ zen_candidates_contain() {
   return 1
 }
 
+zen_model_unavailable_is_transient() {
+  local message="$1"
+  printf '%s' "${message}" | grep -qiE \
+    'model( [[:alnum:]_.:/-]+)? is unavailable[.]?$'
+}
+
 zen_error_is_transient() {
   local message="$1"
   printf '%s' "${message}" | grep -qiE \
@@ -795,7 +803,14 @@ zen_canary() {
         printf 'FAIL http-200-bad-shape\n'
       fi
       ;;
-    400|404|405)
+    400)
+      if zen_model_unavailable_is_transient "${errmsg}"; then
+        printf 'TRANSIENT message:%s\n' "${errmsg:0:80}"
+      else
+        printf 'FAIL http-%s:%s\n' "${code}" "${errmsg:0:80}"
+      fi
+      ;;
+    404|405)
       printf 'FAIL http-%s:%s\n' "${code}" "${errmsg:0:80}"
       ;;
     408|425|429|5??)
@@ -820,11 +835,13 @@ zen_canary() {
   esac
 }
 
-# run_harness_iterated <client> <model>... -> 0 pass, 2 no initial reachability.
+# run_harness_iterated <client> <model>... ->
+#   0 pass, 2 no initial reachability, 3 reachable candidates all incompatible.
 run_harness_iterated() {
   local client="$1"
   shift
   local model verdict status second_verdict second_status
+  local client_reachable=0
 
   for model in "$@"; do
     verdict="$(zen_canary "${model}" "${client}-before")"
@@ -845,15 +862,24 @@ run_harness_iterated() {
     esac
 
     ZEN_ANY_CLIENT_EXERCISED=1
+    client_reachable=1
     run_zen_harness_once "${client}" "${model}"
-    if [[ "${ATTEMPT_STATUS}" == "PASS" ]]; then
-      log "[${client}] PASS ${model}"
-      return 0
-    fi
+    case "${ATTEMPT_STATUS}" in
+      PASS)
+        log "[${client}] PASS ${model}"
+        return 0
+        ;;
+      INCOMPATIBLE|CLIENT_FAILURE)
+        ;;
+      *)
+        die "[${client}] internal error: unrecognized attempt status ${ATTEMPT_STATUS}"
+        ;;
+    esac
 
     # A reachable model followed by a bad CLI result is not skippable on its own.
-    # Give the upstream one bounded re-check; only an explicitly recognized
-    # transient may excuse this attempt.
+    # Give the upstream one bounded re-check. A recognized transient may excuse
+    # either outcome, but a healthy upstream permits candidate fallback only for
+    # model/output incompatibility, never for a client process failure.
     second_verdict="$(zen_canary "${model}" "${client}-after")"
     second_status="${second_verdict%% *}"
     case "${second_status}" in
@@ -862,7 +888,11 @@ run_harness_iterated() {
         continue
         ;;
       OK)
-        die "[${client}] ${model} canary remained reachable after CLI ${ATTEMPT_DETAIL}"
+        if [[ "${ATTEMPT_STATUS}" == "INCOMPATIBLE" ]]; then
+          log "[${client}] ${model} remained reachable after CLI ${ATTEMPT_DETAIL}; trying next candidate"
+          continue
+        fi
+        die "[${client}] ${model} remained reachable after CLI ${ATTEMPT_DETAIL}; refusing candidate fallback for client failure"
         ;;
       FAIL)
         die "[${client}] ${model} CLI ${ATTEMPT_DETAIL}; second canary failed: ${second_verdict#* }"
@@ -873,11 +903,16 @@ run_harness_iterated() {
     esac
   done
 
+  if [[ "${client_reachable}" == "1" ]]; then
+    log "[${client}] no reachable candidate produced the exact expected output"
+    return 3
+  fi
   log "[${client}] no model was initially reachable"
   return 2
 }
 
-# run_zen_harness_once <client> <model> -> ATTEMPT_STATUS=PASS|INVALID.
+# run_zen_harness_once <client> <model> ->
+#   ATTEMPT_STATUS=PASS|INCOMPATIBLE|CLIENT_FAILURE.
 run_zen_harness_once() {
   local client="$1"
   local model="$2"
@@ -899,12 +934,12 @@ run_zen_harness_once() {
     rc=$?
   fi
   if [[ "${rc}" -ne 0 ]]; then
-    ATTEMPT_STATUS="INVALID"
+    ATTEMPT_STATUS="CLIENT_FAILURE"
     ATTEMPT_DETAIL="exited ${rc}"
     return 0
   fi
   if [[ ! -f "${output_file}" ]]; then
-    ATTEMPT_STATUS="INVALID"
+    ATTEMPT_STATUS="CLIENT_FAILURE"
     ATTEMPT_DETAIL="produced no output file"
     return 0
   fi
@@ -915,7 +950,7 @@ run_zen_harness_once() {
     actual="$(read_normalized_output "${output_file}")"
   fi
   if [[ -z "${actual}" ]]; then
-    ATTEMPT_STATUS="INVALID"
+    ATTEMPT_STATUS="INCOMPATIBLE"
     ATTEMPT_DETAIL="produced empty output"
     return 0
   fi
@@ -928,7 +963,7 @@ run_zen_harness_once() {
 
   printf 'expected %s output: %s\n' "${client}" "${expected}" >&2
   printf 'actual %s output:   %s\n' "${client}" "${actual}" >&2
-  ATTEMPT_STATUS="INVALID"
+  ATTEMPT_STATUS="INCOMPATIBLE"
   ATTEMPT_DETAIL="returned mismatched output"
   return 0
 }
@@ -1108,6 +1143,9 @@ main_zen() {
           return 0
         fi
         die "[${client}] did not pass after the smoke had already exercised a reachable model"
+        ;;
+      3)
+        die "[${client}] no reachable Zen model produced the exact expected output"
         ;;
       *)
         die "[${client}] harness returned unexpected status ${rc}"

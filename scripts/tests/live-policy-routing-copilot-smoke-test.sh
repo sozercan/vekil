@@ -59,6 +59,11 @@ SOL_RECORD="${TMP_ROOT}/sol-harness-env.json"
 CHILD_PID_FILE="${TMP_ROOT}/bridge-child.pid"
 STDOUT_FILE="${TMP_ROOT}/wrapper.stdout"
 STDERR_FILE="${TMP_ROOT}/wrapper.stderr"
+QUOTA_SMOKE_DIR="${TMP_ROOT}/quota-smoke"
+QUOTA_RECORD="${TMP_ROOT}/quota-harness-env.json"
+QUOTA_SOL_RECORD="${TMP_ROOT}/quota-sol-harness-env.json"
+QUOTA_STDOUT_FILE="${TMP_ROOT}/quota-wrapper.stdout"
+QUOTA_STDERR_FILE="${TMP_ROOT}/quota-wrapper.stderr"
 TOKEN="synthetic-copilot-token-must-not-leak"
 
 cleanup() {
@@ -181,6 +186,19 @@ set -euo pipefail
 [[ -n "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY}" ]]
 [[ -n "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY}" ]]
 
+case "${FAKE_POLICY_HARNESS_MODE:-pass}" in
+  pass) ;;
+  quota)
+    printf '%s\n' '{"level":"info","msg":"request completed","provider_kind":"copilot","status":402}' \
+      >> "${LIVE_POLICY_ROUTING_SMOKE_DIR}/copilot-bridge.log"
+    exit 42
+    ;;
+  *)
+    echo "unknown fake policy harness mode: ${FAKE_POLICY_HARNESS_MODE}" >&2
+    exit 99
+    ;;
+esac
+
 jq -n \
   --arg base "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" \
   --arg lightweight "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" \
@@ -286,6 +304,44 @@ PY
 
   grep -Fq 'Copilot-backed semantic policy-routing and Sol low/max effort smokes passed.' "${STDERR_FILE}" || \
     fail "wrapper did not emit success marker"
+
+  log "Running deterministic Copilot quota-unavailable classification"
+  local quota_rc=0 quota_port
+  set +e
+  env \
+    COPILOT_GITHUB_TOKEN="${TOKEN}" \
+    PROXY_BIN=/usr/bin/true \
+    LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN="${BRIDGE_BIN}" \
+    LIVE_POLICY_ROUTING_HARNESS="${HARNESS}" \
+    LIVE_POLICY_ROUTING_SOL_EFFORT_HARNESS="${SOL_HARNESS}" \
+    LIVE_POLICY_ROUTING_SMOKE_DIR="${QUOTA_SMOKE_DIR}" \
+    LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=1 \
+    FAKE_POLICY_HARNESS_MODE=quota \
+    FAKE_BRIDGE_CHILD_PID_FILE="${CHILD_PID_FILE}" \
+    FAKE_HARNESS_RECORD="${QUOTA_RECORD}" \
+    FAKE_SOL_HARNESS_RECORD="${QUOTA_SOL_RECORD}" \
+    "${WRAPPER}" >"${QUOTA_STDOUT_FILE}" 2>"${QUOTA_STDERR_FILE}"
+  quota_rc=$?
+  set -e
+
+  [[ "${quota_rc}" -eq 75 ]] || fail "quota-unavailable wrapper exit=${quota_rc}, want 75"
+  [[ ! -e "${QUOTA_SOL_RECORD}" ]] || fail "Sol harness ran after Copilot billing became unavailable"
+  grep -Fq 'Copilot returned HTTP 402; live policy-routing coverage is temporarily unavailable.' \
+    "${QUOTA_STDERR_FILE}" || fail "wrapper did not emit quota-unavailable marker"
+  quota_port="$(sed -nE 's/.*Starting Copilot bridge at http:\/\/127\.0\.0\.1:([0-9]+).*/\1/p' "${QUOTA_STDERR_FILE}" | head -1)"
+  [[ -n "${quota_port}" ]] || fail "quota-unavailable run did not report its bridge port"
+  wait_for_port_release "${quota_port}" || fail "quota-unavailable bridge port ${quota_port} remained open"
+  child_pid="$(cat "${CHILD_PID_FILE}")"
+  if process_is_running "${child_pid}"; then
+    fail "quota-unavailable bridge descendant ${child_pid} remained alive"
+  fi
+  for path in "${QUOTA_STDOUT_FILE}" "${QUOTA_STDERR_FILE}" "${QUOTA_SMOKE_DIR}/copilot-bridge.log"; do
+    [[ -f "${path}" ]] || continue
+    if grep -Fq -- "${TOKEN}" "${path}"; then
+      fail "Copilot token leaked into ${path}"
+    fi
+  done
+
   log "Deterministic Copilot semantic-policy wrapper smoke passed"
 }
 

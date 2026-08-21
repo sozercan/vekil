@@ -7,10 +7,10 @@
 # configured free model that advertises /chat/completions.
 #
 # The OpenCode Zen free set rotates and individual promotions end without notice
-# (ended models currently return either "Free promotion has ended ..." or
-# "Model ... is not supported"). This script treats only HTTP-evidenced
-# transient conditions (promotion ended, model removed, rate limits, or 5xx
-# capacity failures) as unavailable and
+# (ended models currently return "Free promotion has ended ...", "Model ... is
+# not supported", or HTTP 400 with "Model is unavailable"). This script treats
+# only HTTP-evidenced transient conditions (promotion ended, model removed or
+# unavailable, rate limits, or 5xx capacity failures) as unavailable and
 # passes as long as at least one configured free model returns a completion.
 # Unknown statuses such as 404/405, invalid response shapes, proxy faults, and
 # local transport errors and timeouts are hard failures.
@@ -289,6 +289,18 @@ fetch_models() {
   jq -e '.data | length > 0' "${MODELS_JSON}" >/dev/null || die "no models returned by ${PROXY_BASE_URL}/v1/models"
 }
 
+zen_model_unavailable_is_transient() {
+  local message="$1"
+  printf '%s' "${message}" | grep -qiE \
+    'model( [[:alnum:]_.:/-]+)? is unavailable[.]?$'
+}
+
+zen_error_is_transient() {
+  local message="$1"
+  printf '%s' "${message}" | grep -qiE \
+    'promotion (has )?ended|free promotion[^[:alnum:]]+ended|^model [[:alnum:]_.:/-]+ is not supported$|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'
+}
+
 # Probe one model. Echoes one of: OK | TRANSIENT | FAIL plus a reason.
 probe_model() {
   local model="$1"
@@ -338,7 +350,14 @@ probe_model() {
         printf 'FAIL http-200-bad-shape\n'
       fi
       ;;
-    400|404|405)
+    400)
+      if zen_model_unavailable_is_transient "${errmsg}"; then
+        printf 'TRANSIENT message:%s\n' "${errmsg:0:70}"
+      else
+        printf 'FAIL http-%s %s\n' "${code}" "${errmsg:0:60}"
+      fi
+      ;;
+    404|405)
       printf 'FAIL http-%s %s\n' "${code}" "${errmsg:0:60}"
       ;;
     408|425|429|5??)
@@ -351,8 +370,7 @@ probe_model() {
     401|403)
       if printf '%s' "${errmsg}" | grep -qiE 'does not support /|unknown model|no upstream'; then
         printf 'FAIL proxy:%s\n' "${errmsg:0:70}"
-      elif printf '%s' "${errmsg}" | grep -qiE \
-        'promotion (has )?ended|free promotion[^[:alnum:]]+ended|^model [[:alnum:]_.:/-]+ is not supported$|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'; then
+      elif zen_error_is_transient "${errmsg}"; then
         printf 'TRANSIENT message:%s\n' "${errmsg:0:70}"
       else
         printf 'FAIL http-%s %s\n' "${code}" "${errmsg:0:60}"

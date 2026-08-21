@@ -69,6 +69,10 @@ parser.add_argument("--canary-status-sequence", default="")
 parser.add_argument("--canary-message", default="")
 parser.add_argument("--canary-bad-shape", action="store_true")
 parser.add_argument("--hang-chat", action="store_true")
+parser.add_argument("--compact-status", type=int, default=200)
+parser.add_argument("--compact-code", default="")
+parser.add_argument("--replay-status", type=int, default=200)
+parser.add_argument("--replay-code", default="")
 args = parser.parse_args()
 
 MODEL = "deepseek-v4-flash-free"
@@ -138,9 +142,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(status, {"error": {"message": message}})
             return
         if self.path == "/v1/responses/compact":
+            if args.compact_status != 200:
+                self.send_json(args.compact_status, {
+                    "error": {
+                        "message": f"mock HTTP {args.compact_status}",
+                        "code": args.compact_code or "mock_error",
+                    }
+                })
+                return
             self.send_json(200, {"output": [{"type": "compaction", "encrypted_content": "opaque"}]})
             return
         if self.path == "/v1/responses":
+            if args.replay_status != 200:
+                self.send_json(args.replay_status, {
+                    "error": {
+                        "message": f"mock HTTP {args.replay_status}",
+                        "code": args.replay_code or "mock_error",
+                    }
+                })
+                return
             self.send_json(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": "VEKIL_COMPACTION_REPLAY_OK"}]}]})
             return
         self.send_json(404, {"error": {"message": "not found"}})
@@ -193,8 +213,17 @@ start_mock_server() {
   local message="${4:-}"
   local bad_shape="${5:-0}"
   local hang_chat="${6:-0}"
+  local compact_status="${7:-200}"
+  local compact_code="${8:-}"
+  local replay_status="${9:-200}"
+  local replay_code="${10:-}"
   local port_file="${case_dir}/port"
-  local args=(--port-file "${port_file}" --canary-status "${status}")
+  local args=(
+    --port-file "${port_file}"
+    --canary-status "${status}"
+    --compact-status "${compact_status}"
+    --replay-status "${replay_status}"
+  )
   if [[ -n "${sequence}" ]]; then
     args+=(--canary-status-sequence "${sequence}")
   fi
@@ -206,6 +235,12 @@ start_mock_server() {
   fi
   if [[ "${hang_chat}" == "1" ]]; then
     args+=(--hang-chat)
+  fi
+  if [[ -n "${compact_code}" ]]; then
+    args+=(--compact-code "${compact_code}")
+  fi
+  if [[ -n "${replay_code}" ]]; then
+    args+=(--replay-code "${replay_code}")
   fi
   mkdir -p "${case_dir}"
   python3 "${TMP_ROOT}/mock_server.py" "${args[@]}" \
@@ -313,6 +348,23 @@ PY_WRAPPED_OUTPUT
     printf '%s
 ' "\${count}" > "\${state_file}"
     if [[ "\${count}" -eq 1 ]]; then
+      exit 42
+    fi
+    printf '%s\n' "\${expected}"
+    ;;
+  fail-first-model)
+    state_file="\$(dirname "\$0")/.\$(basename "\$0").first-model-seen"
+    if [[ ! -e "\${state_file}" ]]; then
+      : > "\${state_file}"
+      printf '%s\n' "\${left}"
+      exit 0
+    fi
+    printf '%s\n' "\${expected}"
+    ;;
+  exit-first-model)
+    state_file="\$(dirname "\$0")/.\$(basename "\$0").first-model-seen"
+    if [[ ! -e "\${state_file}" ]]; then
+      : > "\${state_file}"
       exit 42
     fi
     printf '%s\n' "\${expected}"
@@ -545,6 +597,23 @@ expect_success() {
   run_bounded "${timeout_seconds}" "${case_dir}/stdout" "${case_dir}/stderr" "$@" || rc=$?
   if [[ "${rc}" -ne 0 ]]; then
     record_failure "${name}" "command failed with ${rc}"
+    cat "${case_dir}/stderr" >&2 || true
+    return 1
+  fi
+  record_success "${name}"
+}
+
+expect_exit_code() {
+  local name="$1"
+  local timeout_seconds="$2"
+  local expected="$3"
+  shift 3
+  local case_dir="${TMP_ROOT}/cases/${name//[^a-zA-Z0-9_.-]/_}"
+  mkdir -p "${case_dir}"
+  local rc=0
+  run_bounded "${timeout_seconds}" "${case_dir}/stdout" "${case_dir}/stderr" "$@" || rc=$?
+  if [[ "${rc}" -ne "${expected}" ]]; then
+    record_failure "${name}" "command exited ${rc}, want ${expected}"
     cat "${case_dir}/stderr" >&2 || true
     return 1
   fi
@@ -947,6 +1016,27 @@ if expect_success "compact listener tolerates mixed JSON and plain-text logs" 10
   :
 fi
 
+compact_quota_dir="${TMP_ROOT}/setup/compact-quota"
+start_mock_server "${compact_quota_dir}/server" 200 "" "" 0 0 402 quota_exceeded
+expect_exit_code "compact smoke reports exact Copilot quota exhaustion" 8 75 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${compact_quota_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
+compact_unknown_402_dir="${TMP_ROOT}/setup/compact-unknown-402"
+start_mock_server "${compact_unknown_402_dir}/server" 200 "" "" 0 0 402 payment_required
+expect_exit_code "compact smoke keeps unknown HTTP 402 errors hard" 8 1 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${compact_unknown_402_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
+replay_quota_dir="${TMP_ROOT}/setup/replay-quota"
+start_mock_server "${replay_quota_dir}/server" 200 "" "" 0 0 200 "" 402 quota_exceeded
+expect_exit_code "compact replay keeps quota errors hard" 8 1 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${replay_quota_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
 mixed_raw_dir="${TMP_ROOT}/setup/mixed-log-raw-zen"
 write_healthy_proxy "${mixed_raw_dir}/healthy-proxy"
 if expect_success "raw Zen listener tolerates mixed JSON and plain-text logs" 10 \
@@ -1063,8 +1153,31 @@ fi
 
 run_zen_classification_case "canary 404 plus transient text is hard" 404 \
   "service temporarily unavailable" 0
+run_zen_classification_case "canary 400 unknown error is hard" 400 \
+  "invalid request" 0
+run_zen_classification_case "canary 401 model unavailable is hard" 401 \
+  "Model is unavailable." 0
 run_zen_classification_case "canary 200 bad shape plus transient text is hard" 200 \
   "service temporarily unavailable" 1
+
+unavailable_model_dir="${TMP_ROOT}/setup/unavailable-zen-model"
+unavailable_model_message="Error from provider (Console): Upstream request failed: Model is unavailable."
+start_mock_server "${unavailable_model_dir}/cli-server" 200 "400,200" "${unavailable_model_message}"
+unavailable_model_cli_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${unavailable_model_dir}/bin" pass pass pass
+expect_success "listed Zen model unavailable falls through to another model" 8 \
+  env PATH="${unavailable_model_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${unavailable_model_cli_port}" \
+    LIVE_CLI_SMOKE_DIR="${unavailable_model_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+start_mock_server "${unavailable_model_dir}/raw-server" 200 "400,200" "${unavailable_model_message}"
+unavailable_model_raw_port="${MOCK_SERVER_PORT}"
+mkdir -p "${unavailable_model_dir}/raw-smoke"
+expect_success "raw Zen smoke treats listed model unavailability as transient" 8 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${unavailable_model_raw_port}" \
+    LIVE_ZEN_SMOKE_DIR="${unavailable_model_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
 
 removed_model_dir="${TMP_ROOT}/setup/removed-zen-model"
 start_mock_server "${removed_model_dir}/server" 401 "" "Model deepseek-v4-flash-free is not supported"
@@ -1102,6 +1215,8 @@ expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 
 
 run_zen_case_expect_success "Gemini strict JSON wrapper around complete result normalizes to exact text" pass pass json-wrapped-whole
 run_zen_case_expect_success "Gemini strict JSON wrapper sequence normalizes to exact text" pass pass json-wrapped
+run_zen_case_expect_success "model-specific output mismatch falls through to another candidate" fail-first-model fail-first-model fail-first-model
+run_zen_case_expect_failure "client process failure does not fall through to another model" 200 pass exit-first-model pass
 run_zen_case_expect_failure "Gemini dangling JSON wrapper separator is rejected" 200 pass pass json-wrapped-trailing-separator
 run_zen_case_expect_failure "Gemini three-wrapper sequence is rejected" 200 pass pass json-wrapped-three
 
@@ -1129,7 +1244,8 @@ start_mock_server "${case_dir}/server" 200
 port="${MOCK_SERVER_PORT}"
 write_fake_clients "${case_dir}/bin" fork-sleeper pass pass
 child_pid_file="${case_dir}/child.pid"
-expect_hard_failure "fake CLI forks sleeper" 8 \
+expect_hard_failure_with_stderr "fake CLI forks sleeper" 8 \
+  'remained reachable after CLI exited 42; refusing candidate fallback for client failure' \
   env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" \
     FAKE_CLI_CHILD_PID_FILE="${child_pid_file}" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \

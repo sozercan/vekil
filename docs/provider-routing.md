@@ -54,7 +54,9 @@ When `auth_type` is omitted, Vekil uses `bearer` if `api_key` or `api_key_env` i
 
 ## Provider Routing
 
-Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, OpenAI Codex, or generic OpenAI-compatible and Anthropic-compatible upstreams. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
+Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, OpenAI Codex, or generic OpenAI-compatible and Anthropic-compatible upstreams. The JSON (`.json`) or YAML (`.yaml`/`.yml`) config source may be a local path or an HTTP(S) URL.
+
+Remote sources are fetched once per server startup, validation command, or managed launcher invocation with a 15-second total timeout and a 4 MiB response-body limit. Vekil does not poll for changes or follow redirects. The URL path extension selects YAML; query parameters do not affect format detection, and other extensions use JSON decoding. Prefer HTTPS and use environment-backed credentials instead of putting secrets in a remotely hosted config. Any fetch, non-2xx response, decode, or validation failure stops startup. User-visible diagnostics omit URL userinfo, query parameters, and fragments so credentials and signed query values are not printed.
 
 Provider config decoding is strict. Unknown fields and duplicate JSON/YAML mapping keys are rejected so typos or ambiguous values do not silently change routing. A JSON file must contain exactly one value, and a YAML file must contain exactly one document. Schema-version-2 YAML also rejects merge keys (`<<`); expand anchors into explicit fields before migrating a version-1 file.
 
@@ -171,13 +173,13 @@ Route-level `drop_sampling_params` and `drop_stop_sequences` likewise apply unif
 
 The binary validates a compiled provider/native-endpoint/surface/mode feature matrix. A provider kind, native endpoint, public translation surface, or routing mode that the running binary does not implement is rejected during validation rather than accepted with degraded behavior. Native route endpoints remain `/responses`, `/chat/completions`, and `/v1/messages`. OpenAI Chat plus translated Anthropic and Gemini requests enter canonical Chat execution, which prefers a route's `/chat/completions` endpoint and otherwise uses `/responses`; direct `anthropic-compatible` Messages uses `/v1/messages`. See [Supported route surfaces](#supported-route-surfaces) below.
 
-Validate a file without serving or modifying it:
+Validate a local or remote config source without serving or modifying it:
 
 ```bash
 vekil config validate --providers-config /path/to/providers.yaml
 ```
 
-The command performs strict JSON/YAML decoding, provider/target reference checks, collision and limit checks, adapter compatibility checks, route-budget validation, and catalog compilation. It does not start the HTTP server or contact model/inference endpoints. Local auth configuration must still be usable: for example, a referenced `api_key_env` must be populated, and local credential construction may fail validation before any network request.
+The command performs strict JSON/YAML decoding, provider/target reference checks, collision and limit checks, adapter compatibility checks, route-budget validation, and catalog compilation. It does not start the HTTP server or contact model/inference endpoints; when given a URL, it only fetches the config source itself. Local auth configuration must still be usable: for example, a referenced `api_key_env` must be populated, and local credential construction may fail validation before any provider request.
 
 For schema-v2 policies, explicitly request classifier protocol preflight with:
 

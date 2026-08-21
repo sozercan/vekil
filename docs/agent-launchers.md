@@ -100,7 +100,7 @@ normal global policy-controller startup behavior.
 | Flag | Purpose |
 |------|---------|
 | `--model ID` | Public Vekil model ID to validate, scope, and pin. Optional for Claude Code and Codex CLI; required for GitHub Copilot CLI. |
-| `--providers-config PATH` | JSON or YAML provider configuration. |
+| `--providers-config SOURCE` | Local path or HTTP(S) URL to JSON or YAML provider configuration. |
 | `--token-dir PATH` | Copilot token storage directory used by Vekil. |
 | `--port PORT` | Local proxy port. Default `0` lets the OS allocate one. |
 | `--binary PATH` | Agent executable override. |

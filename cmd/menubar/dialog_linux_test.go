@@ -834,7 +834,7 @@ func requireProvidersConfigSelectionGuidance(t *testing.T, err error) {
 	t.Helper()
 
 	for _, want := range []string{
-		"vekil --providers-config PATH",
+		"vekil --providers-config SOURCE",
 		"edit the saved menubar config file directly",
 	} {
 		if !strings.Contains(err.Error(), want) {
