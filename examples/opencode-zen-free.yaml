@@ -28,9 +28,9 @@
 #
 # Endpoint allowlists are per model and copied exactly from Zen's published
 # table. Do not add an endpoint merely because Vekil can translate to it.
-# Note: the GitHub Copilot CLI and Codex CLI use /responses with built-in tools
-# that Zen free upstreams may reject; use COPILOT_PROVIDER_WIRE_API=completions
-# for the Copilot CLI.
+# Note: the GitHub Copilot CLI defaults to /responses, while Codex CLI requires
+# a model advertising /responses. The shared Zen CLI smoke sets
+# COPILOT_PROVIDER_WIRE_API=completions and tests only Chat-capable entries.
 #
 # For the full (paid) Zen catalog or higher limits, sign in at
 # https://opencode.ai/auth and swap `api_key: public` for

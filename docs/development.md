@@ -356,7 +356,7 @@ make build
 ./vekil config validate --providers-config examples/opencode-zen-free.yaml
 ```
 
-The Zen harness runs the **GitHub Copilot CLI** (offline BYOK mode, `COPILOT_PROVIDER_WIRE_API=completions`), **Claude Code**, and **Gemini CLI**. Copilot is required; Claude and Gemini become required gates whenever they are installed. Each client must independently produce its exact client-specific prompt sentinel—one passing client cannot mask another. Zen uses a direct text-only prompt because the configured free models advertise Chat text support, not reliable coding-tool execution; the credentialed Copilot smoke retains the file-reading fixture that exercises tools.
+The Zen harness runs the **GitHub Copilot CLI** (offline BYOK mode, `COPILOT_PROVIDER_WIRE_API=completions`), **Claude Code**, and **Gemini CLI**. Copilot is required; Claude and Gemini become required gates whenever they are installed. Each client must independently produce its exact client-specific prompt sentinel—one passing client cannot mask another. Zen uses a direct text-only prompt and selects only configured free models whose parsed and proxy metadata both advertise `/chat/completions`; Responses-only entries remain routable but are not candidates for this shared Chat-oriented harness. The selected free Chat models are not assumed to support reliable coding-tool execution; the credentialed Copilot smoke retains the file-reading fixture that exercises tools.
 
 After Claude Code 2.1.212 regressed headless output, the workflow pins a verified Claude Code version. Move the pin only after the candidate version passes the live smoke.
 
@@ -366,7 +366,7 @@ For each client/model attempt, a bounded raw chat-completions canary runs first:
 - After a 200 canary, any CLI nonzero exit, timeout, empty result, or mismatched result is a hard failure unless one bounded second canary on that same model proves that a recognized transient appeared between the first probe and the CLI run.
 - A neutral exit 0 is allowed only when no model was reachable **before any client was exercised**. Once a reachable model has exercised a client, every installed client must pass.
 
-OpenAI Codex CLI is intentionally excluded from Zen mode: current Codex is `/responses`-only and always sends a built-in `web_search` tool with no `name`, which the Zen free upstreams reject during the responses→chat translation. The Copilot CLI covers the same `/responses`-style client via its `completions` wire API. Codex remains covered by the Copilot smoke, where it works against the Copilot upstream.
+OpenAI Codex CLI is intentionally excluded from this Zen harness because its native wire API requires `/responses`, while the shared Copilot/Claude/Gemini matrix deliberately tests `/chat/completions`. Codex can use a configured Zen free model that advertises native `/responses` (currently `muse-spark-1.2-contributor-free`), and Vekil forwards that request directly rather than using Responses-to-Chat translation. Codex remains covered by the Copilot smoke, where it works against the Copilot upstream.
 
 Run it locally after `make build` (requires GitHub Copilot CLI; installed Claude/Gemini CLIs are also enforced):
 
