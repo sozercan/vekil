@@ -230,6 +230,8 @@ It builds the proxy, runs [`scripts/live-compact-smoke.sh`](../scripts/live-comp
 
 The compaction smoke script starts the proxy with a non-interactive GitHub token, waits for `/readyz`, selects a currently available OpenAI/Codex model from `/v1/models`, posts to `/v1/responses/compact`, verifies that the response contains a non-empty compaction item, and replays that compaction item through `/v1/responses`.
 
+The compaction request is also the workflow's availability probe. An exact HTTP 402 response with `error.code: quota_exceeded` makes the script return the dedicated temporary-unavailability status 75; the workflow records a neutral skip and does not install clients or run the remaining credentialed checks. Authentication failures, transport failures, malformed responses, other HTTP 402 errors, and every unknown status remain hard failures.
+
 The Chat-over-Responses smoke selects a model whose native metadata advertises `/responses` but not `/chat/completions` (preferring `gpt-5.6-sol`), so the public Chat request cannot silently use native Chat. It verifies non-streaming and streaming text, terminal usage and `[DONE]`, omitted-`strict` function tools, exact `call_vekil_<22-character-base64url>` IDs, single-call replay, reversed parallel results, and partial continuation that reissues only the missing call. The workflow hard-fails if no Responses-only model is available rather than falling back to a dual-protocol model.
 
 The CLI smoke script starts the proxy with the same token pattern, waits for `/readyz`, selects currently available OpenAI, Anthropic, and Gemini models from `/v1/models`, and runs one file-reading headless check per CLI using isolated temp-home config directories. It prefers `claude-sonnet-5` over older Claude model IDs and defaults `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` for the isolated Claude process because Copilot does not accept the Advisor Tool beta header. When a smoke script starts Vekil and `PROXY_PORT` is not set, it allocates an isolated non-default port. Readiness is accepted only after the spawned PID is still live and its log contains the exact `vekil listening` address; every HTTP request and CLI has a deadline, and EXIT/INT/TERM cleanup terminates the whole process group and verifies that the port was released.
@@ -322,6 +324,8 @@ The generated temporary schema-v2 config references `api_key_env` names and neve
 
 Both workflows use isolated loopback ports, reject port `1337`, retry bounded address-in-use races, and verify that every proxy, bridge, and shim listener is released. Do not change either workflow to `pull_request_target`: executing pull-request code with provider credentials would expose secrets to untrusted code. Fork PRs and Dependabot neutral-skip the Copilot check because GitHub withholds secrets; a same-repository run without `COPILOT_GITHUB_TOKEN` fails instead of looking like completed coverage. The manual multi-provider workflow fails when its configuration is missing.
 
+If the private Copilot bridge records HTTP 402 while either delegated Copilot policy harness is failing, the wrapper returns temporary-unavailability status 75 and the PR workflow neutral-skips that live coverage. Other harness failures, including 401/403 credentials, protocol mismatches, timeouts, and unknown upstream statuses, remain hard failures.
+
 These smokes incur real provider cost and are bounded acceptance coverage, not the 75-task pilot/holdout or 5,000-observation production-enforcement evaluation described in the policy-routing release gate. Failure diagnostics are allowlisted, redacted, and truncated; raw generated provider configs are not uploaded.
 
 Run the Copilot-backed gate locally after `make build`:
@@ -389,6 +393,8 @@ The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workfl
 The direct-bearer workflow deliberately uses the separate `COPILOT_FINE_GRAINED_PAT` credential described above so fine-grained-PAT authentication remains independently covered.
 
 The two pull-request-triggered Copilot workflows remain separate from deterministic core CI. Both neutral-skip fork pull requests because GitHub does not expose repository secrets to untrusted pull-request code. The semantic-policy workflow also neutral-skips Dependabot runs; `Live Copilot Smoke` neutral-skips Dependabot only when `COPILOT_GITHUB_TOKEN` is unavailable. In other contexts, a missing token fails the workflow. The direct-bearer workflow is default-branch-only as described above.
+
+The pull-request workflows also neutral-skip only explicitly detected Copilot billing unavailability: the general smoke requires the exact `quota_exceeded` response described above, while the semantic-policy wrapper requires a bridge-recorded HTTP 402 concurrent with a harness failure. This prevents an exhausted repository account from presenting as a code regression without weakening credential, transport, or protocol failures.
 
 You can also run the same smoke scripts locally after building `vekil`; the CLI smoke script additionally requires those three CLIs to be installed.
 

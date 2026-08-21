@@ -69,6 +69,8 @@ parser.add_argument("--canary-status-sequence", default="")
 parser.add_argument("--canary-message", default="")
 parser.add_argument("--canary-bad-shape", action="store_true")
 parser.add_argument("--hang-chat", action="store_true")
+parser.add_argument("--compact-status", type=int, default=200)
+parser.add_argument("--compact-code", default="")
 args = parser.parse_args()
 
 MODEL = "deepseek-v4-flash-free"
@@ -128,6 +130,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(status, {"error": {"message": message}})
             return
         if self.path == "/v1/responses/compact":
+            if args.compact_status != 200:
+                self.send_json(args.compact_status, {
+                    "error": {
+                        "message": f"mock HTTP {args.compact_status}",
+                        "code": args.compact_code or "mock_error",
+                    }
+                })
+                return
             self.send_json(200, {"output": [{"type": "compaction", "encrypted_content": "opaque"}]})
             return
         if self.path == "/v1/responses":
@@ -183,8 +193,10 @@ start_mock_server() {
   local message="${4:-}"
   local bad_shape="${5:-0}"
   local hang_chat="${6:-0}"
+  local compact_status="${7:-200}"
+  local compact_code="${8:-}"
   local port_file="${case_dir}/port"
-  local args=(--port-file "${port_file}" --canary-status "${status}")
+  local args=(--port-file "${port_file}" --canary-status "${status}" --compact-status "${compact_status}")
   if [[ -n "${sequence}" ]]; then
     args+=(--canary-status-sequence "${sequence}")
   fi
@@ -196,6 +208,9 @@ start_mock_server() {
   fi
   if [[ "${hang_chat}" == "1" ]]; then
     args+=(--hang-chat)
+  fi
+  if [[ -n "${compact_code}" ]]; then
+    args+=(--compact-code "${compact_code}")
   fi
   mkdir -p "${case_dir}"
   python3 "${TMP_ROOT}/mock_server.py" "${args[@]}" \
@@ -558,6 +573,23 @@ expect_success() {
   record_success "${name}"
 }
 
+expect_exit_code() {
+  local name="$1"
+  local timeout_seconds="$2"
+  local expected="$3"
+  shift 3
+  local case_dir="${TMP_ROOT}/cases/${name//[^a-zA-Z0-9_.-]/_}"
+  mkdir -p "${case_dir}"
+  local rc=0
+  run_bounded "${timeout_seconds}" "${case_dir}/stdout" "${case_dir}/stderr" "$@" || rc=$?
+  if [[ "${rc}" -ne "${expected}" ]]; then
+    record_failure "${name}" "command exited ${rc}, want ${expected}"
+    cat "${case_dir}/stderr" >&2 || true
+    return 1
+  fi
+  record_success "${name}"
+}
+
 port_accepts_tcp() {
   python3 - "$1" <<'PY_PORT_CHECK'
 import socket
@@ -805,6 +837,20 @@ if expect_success "compact listener tolerates mixed JSON and plain-text logs" 10
     SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"; then
   :
 fi
+
+compact_quota_dir="${TMP_ROOT}/setup/compact-quota"
+start_mock_server "${compact_quota_dir}/server" 200 "" "" 0 0 402 quota_exceeded
+expect_exit_code "compact smoke reports exact Copilot quota exhaustion" 8 75 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${compact_quota_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
+compact_unknown_402_dir="${TMP_ROOT}/setup/compact-unknown-402"
+start_mock_server "${compact_unknown_402_dir}/server" 200 "" "" 0 0 402 payment_required
+expect_exit_code "compact smoke keeps unknown HTTP 402 errors hard" 8 1 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${compact_unknown_402_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
 
 mixed_raw_dir="${TMP_ROOT}/setup/mixed-log-raw-zen"
 write_healthy_proxy "${mixed_raw_dir}/healthy-proxy"
