@@ -360,7 +360,8 @@ post_json() {
     || die "${endpoint} request failed before an HTTP response"
 
   if [[ "${status}" != "200" ]]; then
-    if [[ "${status}" == "402" ]] && jq -e '.error.code == "quota_exceeded"' "${response_file}" >/dev/null 2>&1; then
+    if [[ "${endpoint}" == "/v1/responses/compact" && "${status}" == "402" ]] \
+      && jq -e '.error.code == "quota_exceeded"' "${response_file}" >/dev/null 2>&1; then
       log "Copilot monthly quota is exhausted; live coverage is temporarily unavailable."
       exit "${COPILOT_QUOTA_UNAVAILABLE_EXIT}"
     fi

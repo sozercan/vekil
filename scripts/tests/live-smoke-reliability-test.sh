@@ -71,6 +71,8 @@ parser.add_argument("--canary-bad-shape", action="store_true")
 parser.add_argument("--hang-chat", action="store_true")
 parser.add_argument("--compact-status", type=int, default=200)
 parser.add_argument("--compact-code", default="")
+parser.add_argument("--replay-status", type=int, default=200)
+parser.add_argument("--replay-code", default="")
 args = parser.parse_args()
 
 MODEL = "deepseek-v4-flash-free"
@@ -141,6 +143,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"output": [{"type": "compaction", "encrypted_content": "opaque"}]})
             return
         if self.path == "/v1/responses":
+            if args.replay_status != 200:
+                self.send_json(args.replay_status, {
+                    "error": {
+                        "message": f"mock HTTP {args.replay_status}",
+                        "code": args.replay_code or "mock_error",
+                    }
+                })
+                return
             self.send_json(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": "VEKIL_COMPACTION_REPLAY_OK"}]}]})
             return
         self.send_json(404, {"error": {"message": "not found"}})
@@ -195,8 +205,15 @@ start_mock_server() {
   local hang_chat="${6:-0}"
   local compact_status="${7:-200}"
   local compact_code="${8:-}"
+  local replay_status="${9:-200}"
+  local replay_code="${10:-}"
   local port_file="${case_dir}/port"
-  local args=(--port-file "${port_file}" --canary-status "${status}" --compact-status "${compact_status}")
+  local args=(
+    --port-file "${port_file}"
+    --canary-status "${status}"
+    --compact-status "${compact_status}"
+    --replay-status "${replay_status}"
+  )
   if [[ -n "${sequence}" ]]; then
     args+=(--canary-status-sequence "${sequence}")
   fi
@@ -211,6 +228,9 @@ start_mock_server() {
   fi
   if [[ -n "${compact_code}" ]]; then
     args+=(--compact-code "${compact_code}")
+  fi
+  if [[ -n "${replay_code}" ]]; then
+    args+=(--replay-code "${replay_code}")
   fi
   mkdir -p "${case_dir}"
   python3 "${TMP_ROOT}/mock_server.py" "${args[@]}" \
@@ -850,6 +870,13 @@ start_mock_server "${compact_unknown_402_dir}/server" 200 "" "" 0 0 402 payment_
 expect_exit_code "compact smoke keeps unknown HTTP 402 errors hard" 8 1 \
   env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
     LIVE_COMPACT_SMOKE_DIR="${compact_unknown_402_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
+replay_quota_dir="${TMP_ROOT}/setup/replay-quota"
+start_mock_server "${replay_quota_dir}/server" 200 "" "" 0 0 200 "" 402 quota_exceeded
+expect_exit_code "compact replay keeps quota errors hard" 8 1 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${replay_quota_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
 
 mixed_raw_dir="${TMP_ROOT}/setup/mixed-log-raw-zen"
