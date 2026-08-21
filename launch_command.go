@@ -471,6 +471,7 @@ func launchLoopbackBaseURL(port string) string {
 func launchSensitiveEnvironment(cfg proxy.ProvidersConfig) []string {
 	keys := map[string]struct{}{
 		"COPILOT_GITHUB_TOKEN": {},
+		"PROVIDERS_CONFIG":     {},
 	}
 	for _, provider := range cfg.Providers {
 		if key := strings.TrimSpace(provider.APIKeyEnv); key != "" {

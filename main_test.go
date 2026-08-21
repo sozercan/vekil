@@ -1710,6 +1710,7 @@ func TestLaunchSensitiveEnvironment(t *testing.T) {
 		"MSI_SECRET",
 		"COPILOT_GITHUB_TOKEN",
 		"OPENAI_API_KEY",
+		"PROVIDERS_CONFIG",
 	} {
 		if !slices.Contains(got, want) {
 			t.Fatalf("sensitive env = %#v, missing %q", got, want)
@@ -1745,6 +1746,7 @@ func TestRunLaunchClaudeEndToEndWithStaticProvider(t *testing.T) {
 	t.Setenv("MAIN_LAUNCH_HELPER_CAPTURE", capturePath)
 	t.Setenv("MAIN_LAUNCH_HELPER_TARGET", "claude")
 	t.Setenv("TEST_LAUNCH_PROVIDER_SECRET", "redacted")
+	t.Setenv("PROVIDERS_CONFIG", "https://config.example/providers.yaml?signature=launch-secret")
 
 	var stderr bytes.Buffer
 	code := runLaunchClaude([]string{
@@ -1774,6 +1776,9 @@ func TestRunLaunchClaudeEndToEndWithStaticProvider(t *testing.T) {
 	}
 	if capture["removed_value"] != "" {
 		t.Fatalf("provider secret leaked to child: %q", capture["removed_value"])
+	}
+	if capture["providers_config"] != "" {
+		t.Fatalf("providers config source leaked to child: %q", capture["providers_config"])
 	}
 	if !strings.HasPrefix(capture["base_url"], "http://127.0.0.1:") {
 		t.Fatalf("child base URL = %q", capture["base_url"])
@@ -2190,6 +2195,7 @@ func TestMainLaunchHelperProcess(t *testing.T) {
 		"copilot_wire_api": os.Getenv("COPILOT_PROVIDER_WIRE_API"),
 		"github_token":     os.Getenv("GITHUB_TOKEN"),
 		"removed_value":    os.Getenv("TEST_LAUNCH_PROVIDER_SECRET"),
+		"providers_config": os.Getenv("PROVIDERS_CONFIG"),
 	}
 	body, err := json.Marshal(capture)
 	if err != nil {
