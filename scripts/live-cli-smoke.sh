@@ -674,9 +674,10 @@ EOF
 #   - an initial canary may skip only specifically recognized transient upstream
 #     conditions evidenced by HTTP (listed model unavailable, promotion ended,
 #     408/425/429, or 5xx);
-#   - after a 200 canary, any CLI nonzero/timeout/invalid output is a hard failure
-#     unless one bounded second canary proves such a transient appeared;
-#   - every installed client must pass independently;
+#   - after a 200 canary, a CLI nonzero/timeout/invalid output gets one bounded
+#     second canary; a still-reachable model is recorded as incompatible and the
+#     client must pass another candidate;
+#   - every installed client must pass independently on at least one candidate;
 #   - neutral exit 0 is allowed only if no model was reachable before any client
 #     was exercised.
 # Zen's configured free models advertise text Chat support, not reliable coding
@@ -796,11 +797,13 @@ zen_canary() {
   esac
 }
 
-# run_harness_iterated <client> <model>... -> 0 pass, 2 no initial reachability.
+# run_harness_iterated <client> <model>... ->
+#   0 pass, 2 no initial reachability, 3 reachable candidates all incompatible.
 run_harness_iterated() {
   local client="$1"
   shift
   local model verdict status second_verdict second_status
+  local client_reachable=0
 
   for model in "$@"; do
     verdict="$(zen_canary "${model}" "${client}-before")"
@@ -821,6 +824,7 @@ run_harness_iterated() {
     esac
 
     ZEN_ANY_CLIENT_EXERCISED=1
+    client_reachable=1
     run_zen_harness_once "${client}" "${model}"
     if [[ "${ATTEMPT_STATUS}" == "PASS" ]]; then
       log "[${client}] PASS ${model}"
@@ -838,7 +842,8 @@ run_harness_iterated() {
         continue
         ;;
       OK)
-        die "[${client}] ${model} canary remained reachable after CLI ${ATTEMPT_DETAIL}"
+        log "[${client}] ${model} remained reachable after CLI ${ATTEMPT_DETAIL}; trying next candidate"
+        continue
         ;;
       FAIL)
         die "[${client}] ${model} CLI ${ATTEMPT_DETAIL}; second canary failed: ${second_verdict#* }"
@@ -849,6 +854,10 @@ run_harness_iterated() {
     esac
   done
 
+  if [[ "${client_reachable}" == "1" ]]; then
+    log "[${client}] no reachable candidate produced the exact expected output"
+    return 3
+  fi
   log "[${client}] no model was initially reachable"
   return 2
 }
@@ -1056,6 +1065,9 @@ main_zen() {
           return 0
         fi
         die "[${client}] did not pass after the smoke had already exercised a reachable model"
+        ;;
+      3)
+        die "[${client}] no reachable Zen model produced the exact expected output"
         ;;
       *)
         die "[${client}] harness returned unexpected status ${rc}"

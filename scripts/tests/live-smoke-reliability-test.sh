@@ -307,6 +307,15 @@ PY_WRAPPED_OUTPUT
     fi
     printf '%s\n' "\${expected}"
     ;;
+  fail-first-model)
+    for arg in "\$@"; do
+      if [[ "\${arg}" == "deepseek-v4-flash-free" ]]; then
+        printf '%s\n' "\${left}"
+        exit 0
+      fi
+    done
+    printf '%s\n' "\${expected}"
+    ;;
   fork-sleeper)
     sleep 300 &
     child=\$!
@@ -923,6 +932,7 @@ expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 
 
 run_zen_case_expect_success "Gemini strict JSON wrapper around complete result normalizes to exact text" pass pass json-wrapped-whole
 run_zen_case_expect_success "Gemini strict JSON wrapper sequence normalizes to exact text" pass pass json-wrapped
+run_zen_case_expect_success "model-specific output mismatch falls through to another candidate" fail-first-model fail-first-model fail-first-model
 run_zen_case_expect_failure "Gemini dangling JSON wrapper separator is rejected" 200 pass pass json-wrapped-trailing-separator
 run_zen_case_expect_failure "Gemini three-wrapper sequence is rejected" 200 pass pass json-wrapped-three
 
