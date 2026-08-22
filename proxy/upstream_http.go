@@ -709,6 +709,9 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 		return newResponseBodyWriteError(resp, err, false, true, body.canceledAtFailure())
 	}
 	copyPassthroughHeaders(w.Header(), resp.Header)
+	if resp.ContentLength >= 0 && int64(len(prefix)) > resp.ContentLength {
+		w.Header().Del("Content-Length")
+	}
 
 	if len(prefix) <= usageSniffMaxBuffer {
 		// Whole body fits: parse/transform it, then write the result.
@@ -729,8 +732,8 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 	}
 
 	// Oversized: skip the usage parse and stream prefix + remainder so memory
-	// stays bounded. Total bytes written equal the full body, so any
-	// Content-Length header copied above remains correct.
+	// stays bounded. A proven length mismatch above removes the stale advertised
+	// length before the larger body is written.
 	w.WriteHeader(resp.StatusCode)
 	if _, err := w.Write(prefix); err != nil {
 		return newResponseBodyWriteError(resp, err, true, false, false)
@@ -754,11 +757,13 @@ func writeSmallKnownLengthPassthroughSniffingUsage(w http.ResponseWriter, resp *
 	defer releaseUsageSniffBuffer(pooledBuffer)
 	prefix := (*pooledBuffer)[:int(resp.ContentLength)+1]
 	n, canceledAtFailure, err := readFullObservingLifecycle(resp.Body, ctx, prefix)
+	longerThanAdvertised := false
 	if canceledAtFailure {
 		return newResponseBodyWriteError(resp, context.Canceled, false, true, true)
 	}
 	switch err {
 	case nil:
+		longerThanAdvertised = true
 		// The body exceeded its advertised length. Continue to the normal cap so
 		// a malformed Content-Length cannot truncate the downstream response.
 		body := newLifecycleAwareReadCloser(resp.Body, ctx)
@@ -772,6 +777,7 @@ func writeSmallKnownLengthPassthroughSniffingUsage(w http.ResponseWriter, resp *
 		}
 		if len(prefix) > usageSniffMaxBuffer {
 			copyPassthroughHeaders(w.Header(), resp.Header)
+			w.Header().Del("Content-Length")
 			w.WriteHeader(resp.StatusCode)
 			if _, writeErr := w.Write(prefix); writeErr != nil {
 				return newResponseBodyWriteError(resp, writeErr, true, false, false)
@@ -796,6 +802,9 @@ func writeSmallKnownLengthPassthroughSniffingUsage(w http.ResponseWriter, resp *
 	}
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
+	if longerThanAdvertised {
+		w.Header().Del("Content-Length")
+	}
 	out := prefix
 	changed := false
 	if transform != nil {

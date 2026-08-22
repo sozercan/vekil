@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1218,6 +1219,7 @@ func TestWriteSmallKnownLengthPassthroughSniffingUsageHandlesLengthMismatches(t 
 		t.Run(tt.name, func(t *testing.T) {
 			resp := fakeBodyResponse(tt.body)
 			resp.ContentLength = tt.contentLength
+			resp.Header.Set("Content-Length", strconv.FormatInt(tt.contentLength, 10))
 			w := httptest.NewRecorder()
 			err := writePassthroughSniffingUsage(w, resp, nil)
 			if tt.wantErr {
@@ -1234,6 +1236,50 @@ func TestWriteSmallKnownLengthPassthroughSniffingUsageHandlesLengthMismatches(t 
 			}
 			if got := w.Body.String(); got != tt.body {
 				t.Fatalf("body = %q, want %q", got, tt.body)
+			}
+			if int64(len(tt.body)) > tt.contentLength && w.Header().Get("Content-Length") != "" {
+				t.Fatalf("Content-Length = %q, want removed after mismatch", w.Header().Get("Content-Length"))
+			}
+		})
+	}
+}
+
+func TestWritePassthroughSniffingUsageClearsStaleContentLengthOnRealServer(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		body          string
+		contentLength int64
+	}{
+		{name: "small", body: `{"ok":true}`, contentLength: 4},
+		{name: "general", body: strings.Repeat("x", usageSniffSmallBufferSize+32), contentLength: usageSniffSmallBufferSize},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			writeErr := make(chan error, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				resp := fakeBodyResponse(tt.body)
+				resp.ContentLength = tt.contentLength
+				resp.Header.Set("Content-Length", strconv.FormatInt(tt.contentLength, 10))
+				writeErr <- writePassthroughSniffingUsage(w, resp, nil)
+			}))
+			defer server.Close()
+
+			resp, err := server.Client().Get(server.URL)
+			if err != nil {
+				t.Fatalf("GET downstream response: %v", err)
+			}
+			got, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err := <-writeErr; err != nil {
+				t.Fatalf("writePassthroughSniffingUsage() error = %v", err)
+			}
+			if readErr != nil {
+				t.Fatalf("read downstream response: %v", readErr)
+			}
+			if string(got) != tt.body {
+				t.Fatalf("body length = %d, want %d", len(got), len(tt.body))
+			}
+			if resp.ContentLength == tt.contentLength {
+				t.Fatalf("downstream ContentLength = %d, stale advertised length was retained", resp.ContentLength)
 			}
 		})
 	}
