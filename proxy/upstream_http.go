@@ -222,17 +222,6 @@ func prepareResolvedProviderRequestBody(
 	provider *providerRuntime,
 	owner providerModel,
 ) ([]byte, error) {
-	return prepareResolvedProviderRequestBodyWithOwnership(body, requestModel, endpoint, provider, owner, false)
-}
-
-func prepareResolvedProviderRequestBodyWithOwnership(
-	body []byte,
-	requestModel string,
-	endpoint string,
-	provider *providerRuntime,
-	owner providerModel,
-	mutable bool,
-) ([]byte, error) {
 	if provider == nil {
 		return nil, fmt.Errorf("provider is required")
 	}
@@ -240,39 +229,12 @@ func prepareResolvedProviderRequestBodyWithOwnership(
 	rewrittenBody := body
 	if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
 		var err error
-		if mutable {
-			rewrittenBody, _, err = rewriteRequestModelForProviderFromModelJSONInPlace(body, requestModel, owner.upstreamModel, owner.upstreamModelJSON)
-		} else {
-			rewrittenBody, _, err = rewriteRequestModelForProviderFromModelJSON(body, requestModel, owner.upstreamModel, owner.upstreamModelJSON)
-		}
+		rewrittenBody, _, err = rewriteRequestModelForProviderFromModelJSON(body, requestModel, owner.upstreamModel, owner.upstreamModelJSON)
 		if err != nil {
 			return nil, err
 		}
 	}
 	return applyProviderModelRequestPolicy(rewrittenBody, endpoint, owner), nil
-}
-
-func rewriteRequestModelForProviderFromModelJSONInPlace(body []byte, currentModel string, upstreamModel string, rawModel json.RawMessage) ([]byte, bool, error) {
-	upstreamModel = strings.TrimSpace(upstreamModel)
-	if upstreamModel == "" {
-		return body, false, nil
-	}
-
-	currentModel = strings.TrimSpace(currentModel)
-	if currentModel == "" || currentModel == upstreamModel {
-		return body, false, nil
-	}
-	if len(rawModel) == 0 {
-		var err error
-		rawModel, err = json.Marshal(upstreamModel)
-		if err != nil {
-			return nil, false, err
-		}
-	}
-	if rewritten, ok := replaceSingleTopLevelRawJSONFieldInPlace(body, "model", rawModel); ok {
-		return rewritten, true, nil
-	}
-	return rewriteRequestModelForProviderFromModelJSON(body, currentModel, upstreamModel, rawModel)
 }
 
 func applyProviderModelRequestPolicy(body []byte, endpoint string, owner providerModel) []byte {
@@ -346,19 +308,6 @@ func (h *ProxyHandler) postResolvedProviderRequestForModel(
 	extraHeaders http.Header,
 	requestModel string,
 ) (*http.Response, error) {
-	return h.postResolvedProviderRequestForModelWithOwnership(ctx, provider, owner, endpoint, body, extraHeaders, requestModel, false)
-}
-
-func (h *ProxyHandler) postResolvedProviderRequestForModelWithOwnership(
-	ctx context.Context,
-	provider *providerRuntime,
-	owner providerModel,
-	endpoint string,
-	body []byte,
-	extraHeaders http.Header,
-	requestModel string,
-	mutable bool,
-) (*http.Response, error) {
 	if provider == nil {
 		return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
 	}
@@ -366,7 +315,7 @@ func (h *ProxyHandler) postResolvedProviderRequestForModelWithOwnership(
 		ctx = context.Background()
 	}
 
-	preparedBody, err := prepareResolvedProviderRequestBodyWithOwnership(body, requestModel, endpoint, provider, owner, mutable)
+	preparedBody, err := prepareResolvedProviderRequestBody(body, requestModel, endpoint, provider, owner)
 	if err != nil {
 		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}

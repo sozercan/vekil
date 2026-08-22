@@ -691,6 +691,25 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(inferenceBody, body) {
 		t.Fatalf("inference body = %q, %v; want %q", inferenceBody, err, body)
 	}
+	fallbackInference, err := handler.newProviderJSONInferenceRequest(
+		context.Background(),
+		provider,
+		http.MethodPost,
+		providerEndpointChatCompletions,
+		body,
+		http.Header{"Idempotency-Key": []string{"request-1"}},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("fallback newProviderJSONInferenceRequest() error = %v", err)
+	}
+	if fallbackInference.GetBody != nil {
+		t.Fatal("fallback inference request GetBody is non-nil; transport replay must remain disabled")
+	}
+	if got := fallbackInference.Header.Get("Idempotency-Key"); got != "request-1" {
+		t.Fatalf("fallback inference Idempotency-Key = %q, want request-1", got)
+	}
+	_ = fallbackInference.Body.Close()
 
 	bodyless, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, nil, nil, "")
 	if err != nil {

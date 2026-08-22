@@ -2644,7 +2644,14 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 // must not mutate requests, and inference retries call the factory again, so the
 // common path does not need a per-attempt header-map clone.
 func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
-	return h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
+	req, err := h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
+	if err == nil && req != nil {
+		// Inference retries reserve every physical send explicitly. Disable the
+		// transparent transport replay that NewRequest enables for byte readers,
+		// including fallback paths that cannot use a sealed request template.
+		req.GetBody = nil
+	}
+	return req, err
 }
 
 func (h *ProxyHandler) newProviderJSONRequestWithTemplateHeaders(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, reuseSealedHeaders bool, owners ...providerModel) (*http.Request, error) {

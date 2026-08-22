@@ -1308,7 +1308,7 @@ func (h *ProxyHandler) executeChatCompletionsForRequestedModel(ctx context.Conte
 
 	var result chatExecutionResult
 	if route.backend == chatBackendNativeChat {
-		result, err = h.executeResolvedNativeChat(ctx, route, body, options)
+		result, err = h.executeResolvedNativeChat(ctx, route, body)
 	} else {
 		result, err = h.executeResolvedResponsesChat(ctx, route, body, options)
 	}
@@ -3245,8 +3245,13 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 
 	responseModel := explicitRoutePublicModel(route, publicModel)
-	mutableRequestBody := pooledBody != nil && len(bodyBytes) > 0 && len(*pooledBody) > 0 && &bodyBytes[0] == &(*pooledBody)[0]
-	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, chatExecutionOptions{MutableRequestBody: mutableRequestBody}, requestedModel)
+	// RoundTripper may finish closing or reading a request body asynchronously
+	// after RoundTrip returns. Detach a borrowed inbound buffer before handing it
+	// to upstream code so the handler can safely return that buffer to its pool.
+	if pooledBody != nil && len(bodyBytes) > 0 && len(*pooledBody) > 0 && &bodyBytes[0] == &(*pooledBody)[0] {
+		bodyBytes = bytes.Clone(bodyBytes)
+	}
+	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, chatExecutionOptions{}, requestedModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return

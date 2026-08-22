@@ -78,6 +78,28 @@ func TestInspectOpenAIChatRequestFastStrictJSON(t *testing.T) {
 	}
 }
 
+func TestRawJSONStringScannersRejectInvalidUTF8(t *testing.T) {
+	rawString := []byte{'"', 0xff, '"'}
+	if _, _, _, _, ok := scanRawJSONString(rawString, 0); ok {
+		t.Fatal("non-strict string scanner accepted invalid UTF-8")
+	}
+	if _, _, _, _, ok := scanStrictRawJSONString(rawString, 0); ok {
+		t.Fatal("strict string scanner accepted invalid UTF-8")
+	}
+
+	body := append([]byte(`{"model":"`), 0xff)
+	body = append(body, []byte(`","messages":[]}`)...)
+	if !json.Valid(body) {
+		t.Fatal("encoding/json compatibility fixture is not valid JSON")
+	}
+	if _, ok := inspectOpenAIChatRequestFast(body); ok {
+		t.Fatal("fast request inspection accepted invalid UTF-8 instead of falling back")
+	}
+	if got, want := extractOpenAIChatCompletionsRequestModel(body), "\ufffd"; got != want {
+		t.Fatalf("decoded model = %q, want replacement-rune model %q", got, want)
+	}
+}
+
 func FuzzInspectOpenAIChatRequestFastStrictJSON(f *testing.F) {
 	for _, seed := range [][]byte{
 		[]byte(`{"model":"model","messages":[{"role":"user","content":"hello"}],"stream":false}`),
@@ -105,69 +127,6 @@ func FuzzInspectOpenAIChatRequestFastStrictJSON(f *testing.F) {
 			t.Fatalf("strict inspection = %+v, validated = %+v for %q", strict, validated, body)
 		}
 	})
-}
-
-func TestReplaceSingleTopLevelRawJSONFieldInPlace(t *testing.T) {
-	tests := []struct {
-		name        string
-		body        string
-		replacement string
-		capacity    int
-		want        string
-		wantOK      bool
-	}{
-		{
-			name:        "shrinks",
-			body:        `{"model":"public-long","messages":[]}`,
-			replacement: `"short"`,
-			capacity:    128,
-			want:        `{"model":"short","messages":[]}`,
-			wantOK:      true,
-		},
-		{
-			name:        "grows within capacity",
-			body:        `{"model":"short","messages":[]}`,
-			replacement: `"upstream-model-long"`,
-			capacity:    128,
-			want:        `{"model":"upstream-model-long","messages":[]}`,
-			wantOK:      true,
-		},
-		{
-			name:        "insufficient capacity",
-			body:        `{"model":"short","messages":[]}`,
-			replacement: `"upstream-model-long"`,
-			want:        `{"model":"short","messages":[]}`,
-		},
-		{
-			name:        "duplicate field",
-			body:        `{"model":"first","model":"second"}`,
-			replacement: `"upstream"`,
-			capacity:    128,
-			want:        `{"model":"first","model":"second"}`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			capacity := tt.capacity
-			if capacity == 0 {
-				capacity = len(tt.body)
-			}
-			buffer := make([]byte, len(tt.body), capacity)
-			copy(buffer, tt.body)
-			original := append([]byte(nil), buffer...)
-			got, ok := replaceSingleTopLevelRawJSONFieldInPlace(buffer, "model", []byte(tt.replacement))
-			if ok != tt.wantOK {
-				t.Fatalf("ok = %t, want %t", ok, tt.wantOK)
-			}
-			if string(got) != tt.want {
-				t.Fatalf("body = %s, want %s", got, tt.want)
-			}
-			if !tt.wantOK && !bytes.Equal(buffer, original) {
-				t.Fatalf("failed replacement mutated input: got %s, want %s", buffer, original)
-			}
-		})
-	}
 }
 
 func TestInspectCanonicalOpenAIChatCompletionResponseFast(t *testing.T) {
@@ -223,6 +182,16 @@ func TestInspectCanonicalOpenAIChatCompletionResponseFast(t *testing.T) {
 			name:           "null created falls back",
 			requestedModel: "public-model",
 			body:           `{"id":"chat-1","object":"chat.completion","created":null,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
+		},
+		{
+			name:           "zero created falls back",
+			requestedModel: "public-model",
+			body:           `{"id":"chat-1","object":"chat.completion","created":0,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
+		},
+		{
+			name:           "zero total with nonzero components falls back",
+			requestedModel: "public-model",
+			body:           `{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":0}}`,
 		},
 		{
 			name:           "missing message role falls back",

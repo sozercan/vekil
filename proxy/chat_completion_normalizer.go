@@ -238,7 +238,8 @@ func normalizeOpenAIChatCompletionResponse(body []byte, requestedModel string, n
 		payload["object"] = mustMarshalRaw(openAIChatCompletionObject)
 		changed = true
 	}
-	if !hasNonNullJSONField(payload, "created") {
+	created, createdOK := jsonRawNumberAsInt64(payload["created"])
+	if !hasNonNullJSONField(payload, "created") || createdOK && created == 0 {
 		created := now.Unix()
 		if created <= 0 {
 			created = time.Now().Unix()
@@ -349,7 +350,7 @@ func inspectCanonicalOpenAIChatCompletionResponseWithDecoder(body []byte, reques
 				return nil, false
 			}
 		case "created":
-			createdOK = decodeCanonicalNonNullScalar(decoder)
+			createdOK = decodeCanonicalCreated(decoder)
 			if !createdOK {
 				return nil, false
 			}
@@ -407,6 +408,22 @@ func decodeCanonicalNonNullScalar(decoder *json.Decoder) bool {
 	}
 	_, delimited := token.(json.Delim)
 	return !delimited
+}
+
+func decodeCanonicalCreated(decoder *json.Decoder) bool {
+	token, err := decoder.Token()
+	if err != nil || token == nil {
+		return false
+	}
+	if _, delimited := token.(json.Delim); delimited {
+		return false
+	}
+	number, ok := token.(json.Number)
+	if !ok {
+		return true
+	}
+	value, err := number.Int64()
+	return err != nil || value != 0
 }
 
 func inspectCanonicalOpenAIUsage(decoder *json.Decoder) (*models.OpenAIUsage, bool) {
@@ -474,7 +491,8 @@ func inspectCanonicalOpenAIUsage(decoder *json.Decoder) (*models.OpenAIUsage, bo
 	if delim, ok := end.(json.Delim); !ok || delim != '}' {
 		return nil, false
 	}
-	return usage, promptOK && completionOK && totalOK
+	canonicalTotal := usage.TotalTokens != 0 || usage.PromptTokens == 0 && usage.CompletionTokens == 0
+	return usage, promptOK && completionOK && totalOK && canonicalTotal
 }
 
 func decodeCanonicalInt(decoder *json.Decoder) (int, bool) {
@@ -486,11 +504,11 @@ func decodeCanonicalInt(decoder *json.Decoder) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	value, err := number.Int64()
-	if err != nil || int64(int(value)) != value {
+	value, err := strconv.Atoi(number.String())
+	if err != nil {
 		return 0, false
 	}
-	return int(value), true
+	return value, true
 }
 
 func inspectCanonicalOpenAIChatChoices(decoder *json.Decoder) bool {
@@ -870,7 +888,8 @@ func normalizeOpenAIChatCompletionUsage(raw json.RawMessage) (json.RawMessage, b
 		completion = 0
 		changed = true
 	}
-	if _, hasTotal := jsonRawNumberAsInt64(usage["total_tokens"]); !hasTotal {
+	total, hasTotal := jsonRawNumberAsInt64(usage["total_tokens"])
+	if !hasTotal || total == 0 && (prompt != 0 || completion != 0) {
 		if hasPrompt || hasCompletion {
 			usage["total_tokens"] = json.RawMessage(strconv.FormatInt(prompt+completion, 10))
 		} else {

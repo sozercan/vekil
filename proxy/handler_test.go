@@ -40,6 +40,12 @@ func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
 	return h
 }
 
+type handlerTestRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f handlerTestRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func TestCopyPassthroughHeadersBorrowsImmutableValues(t *testing.T) {
 	src := http.Header{
 		"Connection":   []string{"X-Hop"},
@@ -6909,6 +6915,44 @@ func TestHandleOpenAIChatCompletions_RetriesWithoutInjectedStreamOptions(t *test
 	}
 }
 
+func TestHandleOpenAIChatCompletionsDetachesBorrowedBodyBeforeUpstream(t *testing.T) {
+	const responseBody = `{"id":"chatcmpl-native","object":"chat.completion","created":1,"model":"gpt-upstream","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+	capturedBody := make(chan io.ReadCloser, 1)
+	h := newChatExecutionTestHandler(t, "http://upstream.example", []string{providerEndpointChatCompletions})
+	h.client = &http.Client{Transport: handlerTestRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		capturedBody <- req.Body
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			Body:          io.NopCloser(strings.NewReader(responseBody)),
+			ContentLength: int64(len(responseBody)),
+			Request:       req,
+		}, nil
+	})}
+
+	reqBody := `{"model":"gpt-public","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	upstreamBody := <-capturedBody
+	defer func() { _ = upstreamBody.Close() }()
+	gotBody, err := io.ReadAll(upstreamBody)
+	if err != nil {
+		t.Fatalf("read asynchronously retained upstream body: %v", err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("upstream body was recycled before asynchronous close: %q: %v", gotBody, err)
+	}
+	if got := rawJSONString(payload["model"]); got != "gpt-upstream" {
+		t.Fatalf("upstream model = %q, want gpt-upstream; body=%s", got, gotBody)
+	}
+}
+
 func TestHandleOpenAIChatCompletionsUpstreamError(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -12863,6 +12907,34 @@ func TestOpenAIChatCompletionsNormalizesMissingTopLevelFields(t *testing.T) {
 
 	if _, ok := raw["copilot_usage"]; !ok {
 		t.Fatal("copilot_usage was not preserved")
+	}
+}
+
+func TestOpenAIChatCompletionsRepairsZeroCreatedAndTotalTokens(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-zeroes","object":"chat.completion","created":0,"model":"gpt-4","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":0}}`)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`))
+	w := httptest.NewRecorder()
+	handler.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	var response struct {
+		Created int64              `json:"created"`
+		Usage   models.OpenAIUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Created == 0 {
+		t.Fatal("created = 0, want normalized timestamp")
+	}
+	if response.Usage.PromptTokens != 2 || response.Usage.CompletionTokens != 3 || response.Usage.TotalTokens != 5 {
+		t.Fatalf("usage = %+v, want 2/3/5", response.Usage)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/sozercan/vekil/models"
 )
@@ -293,6 +294,7 @@ func scanRawJSONString(data []byte, pos int) (contentStart, contentEnd, end int,
 		return 0, 0, 0, false, false
 	}
 	contentStart = pos + 1
+	nonASCII := false
 	for pos = contentStart; pos < len(data); pos++ {
 		switch data[pos] {
 		case '\\':
@@ -301,8 +303,14 @@ func scanRawJSONString(data []byte, pos int) (contentStart, contentEnd, end int,
 			if pos >= len(data) {
 				return 0, 0, 0, false, false
 			}
+			nonASCII = nonASCII || data[pos] >= utf8.RuneSelf
 		case '"':
+			if nonASCII && !utf8.Valid(data[contentStart:pos]) {
+				return 0, 0, 0, false, false
+			}
 			return contentStart, pos, pos + 1, escaped, true
+		default:
+			nonASCII = nonASCII || data[pos] >= utf8.RuneSelf
 		}
 	}
 	return 0, 0, 0, false, false
@@ -315,6 +323,7 @@ func scanStrictRawJSONString(data []byte, pos int) (contentStart, contentEnd, en
 		return 0, 0, 0, false, false
 	}
 	contentStart = pos + 1
+	nonASCII := false
 	for pos = contentStart; pos < len(data); pos++ {
 		switch data[pos] {
 		case '\\':
@@ -323,6 +332,7 @@ func scanStrictRawJSONString(data []byte, pos int) (contentStart, contentEnd, en
 			if pos >= len(data) {
 				return 0, 0, 0, false, false
 			}
+			nonASCII = nonASCII || data[pos] >= utf8.RuneSelf
 			switch data[pos] {
 			case 'b', 'f', 'n', 'r', 't', '\\', '/', '"':
 			case 'u':
@@ -339,11 +349,15 @@ func scanStrictRawJSONString(data []byte, pos int) (contentStart, contentEnd, en
 				return 0, 0, 0, false, false
 			}
 		case '"':
+			if nonASCII && !utf8.Valid(data[contentStart:pos]) {
+				return 0, 0, 0, false, false
+			}
 			return contentStart, pos, pos + 1, escaped, true
 		default:
 			if data[pos] < 0x20 {
 				return 0, 0, 0, false, false
 			}
+			nonASCII = nonASCII || data[pos] >= utf8.RuneSelf
 		}
 	}
 	return 0, 0, 0, false, false
@@ -610,11 +624,20 @@ func rawJSONHasNonEmptyArrayFast(raw []byte) (bool, bool) {
 
 func rawJSONInt(raw []byte) (int, bool) {
 	raw = bytes.TrimSpace(raw)
-	value, err := strconv.ParseInt(string(raw), 10, 64)
-	if err != nil || int64(int(value)) != value {
+	value, err := strconv.Atoi(string(raw))
+	if err != nil {
 		return 0, false
 	}
-	return int(value), true
+	return value, true
+}
+
+func rawJSONCreatedUnchangedByNormalizer(raw []byte) bool {
+	raw = bytes.TrimSpace(raw)
+	if !rawJSONNonNull(raw) {
+		return false
+	}
+	value, err := strconv.ParseInt(string(raw), 10, 64)
+	return err != nil || value != 0
 }
 
 // extractTopLevelJSONStringFast returns an exact top-level string field without
@@ -727,7 +750,7 @@ func inspectCanonicalOpenAIChatCompletionObjectSingleWalk(data []byte, pos int, 
 			ok = objectOK
 		case rawJSONKeyEqual(key, "created"):
 			valueEnd, ok = walk.valueEnd(data, valueStart)
-			createdOK = ok && rawJSONNonNull(data[valueStart:valueEnd])
+			createdOK = ok && rawJSONCreatedUnchangedByNormalizer(data[valueStart:valueEnd])
 			ok = createdOK
 		case rawJSONKeyEqual(key, "model"):
 			valueEnd, ok = walk.valueEnd(data, valueStart)
@@ -802,7 +825,7 @@ func inspectCanonicalOpenAIUsageSingleWalk(data []byte, pos int, walk rawJSONSin
 		}
 	}
 
-	if !promptOK || !completionOK || !totalOK {
+	if !promptOK || !completionOK || !totalOK || usage.TotalTokens == 0 && (usage.PromptTokens != 0 || usage.CompletionTokens != 0) {
 		return models.OpenAIUsage{}, 0, false
 	}
 	return usage, object.pos, true
@@ -953,51 +976,17 @@ func replaceSingleTopLevelRawJSONField(body []byte, field string, replacement js
 	if matchStart < 0 {
 		return body, false
 	}
-	out := make([]byte, len(body)-(matchEnd-matchStart)+len(replacement))
+	if matchEnd < matchStart || matchEnd > len(body) {
+		return body, false
+	}
+	retainedLength := len(body) - (matchEnd - matchStart)
+	maxInt := int(^uint(0) >> 1)
+	if len(replacement) > maxInt-retainedLength {
+		return body, false
+	}
+	out := make([]byte, retainedLength+len(replacement))
 	copy(out, body[:matchStart])
 	n := matchStart + copy(out[matchStart:], replacement)
 	copy(out[n:], body[matchEnd:])
-	return out, true
-}
-
-func replaceSingleTopLevelRawJSONFieldInPlace(body []byte, field string, replacement json.RawMessage) ([]byte, bool) {
-	if !json.Valid(body) || !json.Valid(replacement) {
-		return body, false
-	}
-	object, ok := newRawJSONObjectScanner(body)
-	if !ok {
-		return body, false
-	}
-	matchStart := -1
-	matchEnd := -1
-	for {
-		key, start, end, done, scanOK := object.next()
-		if !scanOK {
-			return body, false
-		}
-		if done {
-			break
-		}
-		if !rawJSONKeyEqual(key, field) {
-			continue
-		}
-		if matchStart >= 0 {
-			return body, false
-		}
-		matchStart = start
-		matchEnd = end
-	}
-	if matchStart < 0 {
-		return body, false
-	}
-
-	originalLength := len(body)
-	newLength := originalLength - (matchEnd - matchStart) + len(replacement)
-	if newLength > cap(body) {
-		return body, false
-	}
-	out := body[:newLength]
-	copy(out[matchStart+len(replacement):], body[matchEnd:originalLength])
-	copy(out[matchStart:], replacement)
 	return out, true
 }
