@@ -104,6 +104,53 @@ func TestRequestBodyLifecycleBindingReleaseAndRecycleRestoresOriginalBody(t *tes
 	}
 }
 
+func TestRequestBodyLifecycleBindingReleaseAndRecycleIsLeaseScoped(t *testing.T) {
+	handler := &ProxyHandler{}
+	firstOriginal := io.NopCloser(strings.NewReader("first request"))
+	firstRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	firstRequest.Body = firstOriginal
+	firstBinding := handler.BindRequestBodyToLifecycle(firstRequest, nil)
+	staleBinding := firstBinding
+	body := firstBinding.body
+
+	recycled := 0
+	recycle := func(*lifecycleRequestBody) { recycled++ }
+	firstBinding.releaseAndRecycle(firstRequest, recycle)
+	staleBinding.releaseAndRecycle(firstRequest, recycle)
+	if recycled != 1 {
+		t.Fatalf("recycle calls = %d, want 1 after duplicate release", recycled)
+	}
+	if firstRequest.Body != firstOriginal {
+		t.Fatal("duplicate release changed the restored first request body")
+	}
+
+	secondOriginal := io.NopCloser(strings.NewReader("second request"))
+	secondRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	secondRequest.Body = secondOriginal
+	secondLease := body.beginLease(secondOriginal, secondRequest.Context(), handler, nil)
+	secondRequest.Body = body
+	if !handler.registerLifecycleRequestBody(body) {
+		t.Fatal("registerLifecycleRequestBody() = false for reused wrapper")
+	}
+	secondBinding := RequestBodyLifecycleBinding{body: body, lease: secondLease}
+
+	staleBinding.releaseAndRecycle(firstRequest, recycle)
+	if body.released.Load() {
+		t.Fatal("stale binding released a reused request body")
+	}
+	if secondRequest.Body != body {
+		t.Fatal("stale binding replaced the reused request body")
+	}
+
+	secondBinding.releaseAndRecycle(secondRequest, recycle)
+	if recycled != 2 {
+		t.Fatalf("recycle calls = %d, want 2 after current lease release", recycled)
+	}
+	if secondRequest.Body != secondOriginal {
+		t.Fatal("current lease release did not restore the second request body")
+	}
+}
+
 func TestWaitLifecycleWorkersCompletedWinsExpiredContext(t *testing.T) {
 	handler := &ProxyHandler{}
 	if !handler.beginLifecycleWorker() {

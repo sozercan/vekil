@@ -400,6 +400,10 @@ var lifecycleRequestBodyPool = sync.Pool{New: func() any {
 	return new(lifecycleRequestBody)
 }}
 
+func recycleLifecycleRequestBody(body *lifecycleRequestBody) {
+	lifecycleRequestBodyPool.Put(body)
+}
+
 // BindRequestBodyToLifecycle makes a request body read interruptible by proxy
 // shutdown without changing the inbound request context. A small atomic cause
 // state preserves whether client cancellation or lifecycle shutdown happened
@@ -410,29 +414,25 @@ func (h *ProxyHandler) BindRequestBodyToLifecycle(r *http.Request, forceClose io
 	}
 
 	body := lifecycleRequestBodyPool.Get().(*lifecycleRequestBody)
-	*body = lifecycleRequestBody{
-		ReadCloser: r.Body,
-		requestCtx: r.Context(),
-		owner:      h,
-		forceClose: forceClose,
-	}
+	lease := body.beginLease(r.Body, r.Context(), h, forceClose)
 	r.Body = body
 	if !h.registerLifecycleRequestBody(body) {
 		body.cancelForShutdown()
 	}
-	return RequestBodyLifecycleBinding{body: body}
+	return RequestBodyLifecycleBinding{body: body, lease: lease}
 }
 
 // RequestBodyLifecycleBinding releases a request body from shutdown tracking.
 // The value handle avoids allocating a closure on every admitted HTTP request.
 type RequestBodyLifecycleBinding struct {
-	body *lifecycleRequestBody
+	body  *lifecycleRequestBody
+	lease uint64
 }
 
 // Release stops lifecycle tracking without closing the underlying request body.
 func (b RequestBodyLifecycleBinding) Release() {
 	if b.body != nil {
-		b.body.release()
+		b.body.releaseLease(b.lease)
 	}
 }
 
@@ -442,19 +442,33 @@ func (b RequestBodyLifecycleBinding) Release() {
 // A wrapper captured by the shutdown cancellation snapshot is deliberately not
 // pooled because that snapshot may still call cancelForShutdown asynchronously.
 func (b RequestBodyLifecycleBinding) ReleaseAndRecycle(r *http.Request) {
+	b.releaseAndRecycle(r, recycleLifecycleRequestBody)
+}
+
+func (b RequestBodyLifecycleBinding) releaseAndRecycle(r *http.Request, recycle func(*lifecycleRequestBody)) {
 	body := b.body
 	if body == nil {
 		return
 	}
+	body.leaseMu.Lock()
+	if body.lease != b.lease || body.recycleClaimed {
+		body.leaseMu.Unlock()
+		return
+	}
+	body.recycleClaimed = true
 	if r != nil && r.Body == body {
 		r.Body = body.ReadCloser
 	}
 	body.release()
-	if body.shutdownScheduled.Load() || !body.recycled.CompareAndSwap(false, true) {
+	if body.shutdownScheduled.Load() {
+		body.leaseMu.Unlock()
 		return
 	}
-	*body = lifecycleRequestBody{}
-	lifecycleRequestBodyPool.Put(body)
+	body.clearForPool()
+	body.leaseMu.Unlock()
+	if recycle != nil {
+		recycle(body)
+	}
 }
 
 type lifecycleRequestBodyCause uint32
@@ -467,6 +481,9 @@ const (
 
 type lifecycleRequestBody struct {
 	io.ReadCloser
+	leaseMu           sync.Mutex
+	lease             uint64
+	recycleClaimed    bool
 	requestCtx        context.Context
 	owner             *ProxyHandler
 	forceClose        io.Closer
@@ -475,9 +492,46 @@ type lifecycleRequestBody struct {
 	closeErr          error
 	complete          atomic.Bool
 	released          atomic.Bool
-	recycled          atomic.Bool
 	shutdownScheduled atomic.Bool
 	cause             atomic.Uint32
+}
+
+func (b *lifecycleRequestBody) beginLease(readCloser io.ReadCloser, requestCtx context.Context, owner *ProxyHandler, forceClose io.Closer) uint64 {
+	b.leaseMu.Lock()
+	b.lease++
+	lease := b.lease
+	b.recycleClaimed = false
+	b.ReadCloser = readCloser
+	b.requestCtx = requestCtx
+	b.owner = owner
+	b.forceClose = forceClose
+	b.closeMu = sync.Mutex{}
+	b.closed = false
+	b.closeErr = nil
+	b.complete.Store(false)
+	b.released.Store(false)
+	b.shutdownScheduled.Store(false)
+	b.cause.Store(uint32(lifecycleRequestBodyCauseOpen))
+	b.leaseMu.Unlock()
+	return lease
+}
+
+func (b *lifecycleRequestBody) clearForPool() {
+	b.ReadCloser = nil
+	b.requestCtx = nil
+	b.owner = nil
+	b.forceClose = nil
+	b.closeMu = sync.Mutex{}
+	b.closed = false
+	b.closeErr = nil
+}
+
+func (b *lifecycleRequestBody) releaseLease(lease uint64) {
+	b.leaseMu.Lock()
+	if b.lease == lease && !b.recycleClaimed {
+		b.release()
+	}
+	b.leaseMu.Unlock()
 }
 
 func (b *lifecycleRequestBody) Read(p []byte) (int, error) {
