@@ -184,7 +184,10 @@ func observeAnthropicUsageBody(ctx context.Context, body []byte) {
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return
 	}
-	u := parsed.Usage
+	observeAnthropicUsage(ctx, parsed.Usage)
+}
+
+func observeAnthropicUsage(ctx context.Context, u models.AnthropicUsage) {
 	if u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadInputTokens == 0 && u.CacheCreationInputTokens == 0 {
 		return
 	}

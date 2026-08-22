@@ -2166,6 +2166,14 @@ func rewriteRequestModelForProviderFromModel(body []byte, currentModel string, u
 }
 
 func rewriteRequestModelForProviderFromModelJSON(body []byte, currentModel string, upstreamModel string, rawModel json.RawMessage) ([]byte, bool, error) {
+	return rewriteRequestModelForProviderFromModelJSONWithValidation(body, currentModel, upstreamModel, rawModel, false)
+}
+
+func rewriteRequestModelForProviderFromModelJSONValidated(body []byte, currentModel string, upstreamModel string, rawModel json.RawMessage) ([]byte, bool, error) {
+	return rewriteRequestModelForProviderFromModelJSONWithValidation(body, currentModel, upstreamModel, rawModel, true)
+}
+
+func rewriteRequestModelForProviderFromModelJSONWithValidation(body []byte, currentModel string, upstreamModel string, rawModel json.RawMessage, bodyValidated bool) ([]byte, bool, error) {
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
 		return body, false, nil
@@ -2182,7 +2190,14 @@ func rewriteRequestModelForProviderFromModelJSON(body []byte, currentModel strin
 			return nil, false, err
 		}
 	}
-	if rewritten, ok := replaceSingleTopLevelRawJSONField(body, "model", rawModel); ok {
+	var rewritten []byte
+	var ok bool
+	if bodyValidated {
+		rewritten, ok = replaceSingleTopLevelRawJSONFieldValidated(body, "model", rawModel)
+	} else {
+		rewritten, ok = replaceSingleTopLevelRawJSONField(body, "model", rawModel)
+	}
+	if ok {
 		return rewritten, true, nil
 	}
 	return rewriteResponsesRequestModel(body, upstreamModel)
@@ -2660,7 +2675,7 @@ func (h *ProxyHandler) newProviderJSONRequestWithTemplateHeaders(ctx context.Con
 	// authentication. Publish it now so failures in either step retain the actual
 	// provider attribution even if the dynamic model catalog changes afterward.
 	publishProviderRoute(ctx, route)
-	if method == http.MethodPost && len(extraHeaders) == 0 && extraQuery == "" {
+	if method == http.MethodPost && extraQuery == "" && (len(extraHeaders) == 0 || path == providerEndpointMessages) {
 		if template := provider.postRequestTemplates[path]; template != nil {
 			// Inference sends go directly through the RoundTripper, which preserves
 			// the request body object on resp.Request. Store route attribution there
@@ -2668,10 +2683,22 @@ func (h *ProxyHandler) newProviderJSONRequestWithTemplateHeaders(ctx context.Con
 			// requests retain the context fallback because redirect bookkeeping may
 			// wrap or replace their bodies.
 			if reuseSealedHeaders && len(body) > 0 {
-				return requestFromProviderTemplate(ctx, template, body, reuseSealedHeaders, route, provider.postRequestAutoGzip), nil
+				req := requestFromProviderTemplate(ctx, template, body, reuseSealedHeaders, route, provider.postRequestAutoGzip)
+				if len(extraHeaders) > 0 {
+					req.Header = shallowCloneHeader(template.Header)
+					mergeHeaderValues(req.Header, extraHeaders)
+				}
+				return req, nil
 			}
 			ctx = context.WithValue(ctx, providerRouteContextKey{}, route)
-			return requestFromProviderTemplate(ctx, template, body, reuseSealedHeaders, route, provider.postRequestAutoGzip), nil
+			req := requestFromProviderTemplate(ctx, template, body, reuseSealedHeaders, route, provider.postRequestAutoGzip)
+			if len(extraHeaders) > 0 {
+				if reuseSealedHeaders {
+					req.Header = shallowCloneHeader(req.Header)
+				}
+				mergeHeaderValues(req.Header, extraHeaders)
+			}
+			return req, nil
 		}
 	}
 	ctx = context.WithValue(ctx, providerRouteContextKey{}, route)

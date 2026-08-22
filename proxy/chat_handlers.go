@@ -474,7 +474,7 @@ func (h *ProxyHandler) executeChatCompletionsRouteRequestForModel(ctx context.Co
 
 func (h *ProxyHandler) executeAnthropicMessagesRouteRequest(ctx context.Context, body []byte, headers http.Header, streaming bool, model string) (*http.Response, error) {
 	send := func(attemptCtx context.Context) (*http.Response, error) {
-		return h.postJSONEndpointWithHeadersForModel(attemptCtx, providerEndpointMessages, body, headers, model)
+		return h.postJSONEndpointWithHeadersForModelValidated(attemptCtx, providerEndpointMessages, body, headers, model)
 	}
 	return h.executeExplicitRouteSurfaceRequest(ctx, providerEndpointMessages, streaming, explicitRouteStreamAnthropic, send)
 }
@@ -1906,13 +1906,43 @@ func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 		"Anthropic-Beta",
 		"Anthropic-Dangerous-Direct-Browser-Access",
 	} {
-		for _, value := range r.Header.Values(name) {
-			if trimmed := strings.TrimSpace(value); trimmed != "" {
-				if headers == nil {
-					headers = make(http.Header, 2)
+		values := r.Header.Values(name)
+		if len(values) == 0 {
+			continue
+		}
+		trimmedValues := values
+		borrowed := true
+		kept := 0
+		for index, value := range values {
+			trimmed := strings.TrimSpace(value)
+			if trimmed == "" {
+				if borrowed {
+					trimmedValues = make([]string, 0, len(values))
+					trimmedValues = append(trimmedValues, values[:index]...)
+					borrowed = false
 				}
-				headers.Add(name, trimmed)
+				continue
 			}
+			if trimmed != value && borrowed {
+				trimmedValues = make([]string, 0, len(values))
+				trimmedValues = append(trimmedValues, values[:index]...)
+				borrowed = false
+			}
+			if !borrowed {
+				trimmedValues = append(trimmedValues, trimmed)
+			}
+			kept++
+		}
+		if kept == 0 {
+			continue
+		}
+		if headers == nil {
+			headers = make(http.Header, 3)
+		}
+		if borrowed {
+			headers[name] = values[:len(values):len(values)]
+		} else {
+			headers[name] = trimmedValues[:len(trimmedValues):len(trimmedValues)]
 		}
 	}
 	return headers
@@ -1920,6 +1950,10 @@ func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 
 func (h *ProxyHandler) shouldForwardAnthropicMessagesDirect(model string) bool {
 	provider, owner, known := h.resolveProviderModelForRequest(model, providerEndpointMessages)
+	return shouldForwardAnthropicMessagesDirectResolved(provider, owner, known)
+}
+
+func shouldForwardAnthropicMessagesDirectResolved(provider *providerRuntime, owner providerModel, known bool) bool {
 	if provider == nil {
 		return false
 	}
@@ -1940,9 +1974,8 @@ func (h *ProxyHandler) shouldForwardAnthropicCountTokensDirect(model string) boo
 	return provider != nil && provider.kind == providerTypeAnthropicCompatible
 }
 
-func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *http.Request, body []byte, req *models.AnthropicRequest) {
+func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *http.Request, body []byte, req *models.AnthropicRequest, publicModel, upstreamModel string) {
 	streaming := req != nil && req.Stream
-	publicModel, upstreamModel := h.directAnthropicResponseModels(req)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), streaming)
 	defer upstreamCancel()
@@ -2067,9 +2100,13 @@ func (h *ProxyHandler) directAnthropicResponseModels(req *models.AnthropicReques
 	if req == nil {
 		return "", ""
 	}
-	publicModel := strings.TrimSpace(req.Model)
-	upstreamModel := publicModel
 	_, owner, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
+	return directAnthropicResponseModelsResolved(req.Model, owner, known)
+}
+
+func directAnthropicResponseModelsResolved(model string, owner providerModel, known bool) (string, string) {
+	publicModel := strings.TrimSpace(model)
+	upstreamModel := publicModel
 	if !known {
 		return publicModel, upstreamModel
 	}
@@ -2220,7 +2257,10 @@ func translateOpenAIToAnthropicForRequest(resp *models.OpenAIResponse, req *mode
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
 // request to OpenAI format, forwarding to Copilot, and translating the response back.
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
-	body, err := readBody(r)
+	body, pooledBody, err := readBodyBorrowed(r)
+	if pooledBody != nil {
+		defer releaseSmallRequestBodyBuffer(pooledBody)
+	}
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
 			return
@@ -2231,7 +2271,14 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 	defer func() { _ = r.Body.Close() }()
 
-	admissionModel := extractOpenAIChatCompletionsRequestModel(body)
+	var req models.AnthropicRequest
+	decodeErr := json.Unmarshal(body, &req)
+	admissionModel := req.Model
+	if decodeErr != nil {
+		// Preserve early explicit-route admission and error precedence for typed
+		// decode failures without making successful requests scan the body twice.
+		admissionModel = extractOpenAIChatCompletionsRequestModel(body)
+	}
 	h.observePolicyRequestSummary(r.Context(), "anthropic", admissionModel, false)
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), admissionModel, providerEndpointMessages)
 	if err != nil {
@@ -2244,9 +2291,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
 	}
 
-	var req models.AnthropicRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		message, _ := jsonDecodeErrorDetails(err, "invalid JSON in request body")
+	if decodeErr != nil {
+		message, _ := jsonDecodeErrorDetails(decodeErr, "invalid JSON in request body")
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
 		return
 	}
@@ -2262,23 +2308,27 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if err := validateAnthropicOutputConfigEffort(body); err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
-		return
+	if req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) == "" {
+		if err := validateAnthropicOutputConfigEffort(body); err != nil {
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
 	}
 	if err := validateAnthropicMessageTokenLimits(&req, r.Header); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
-	h.log.Debug("anthropic request",
-		logger.F("model", req.Model),
-		logger.F("stream", req.Stream),
-		logger.F("messages", len(req.Messages)),
-		logger.F("tools", len(req.Tools)),
-	)
+	if h.log != nil && h.log.Enabled(logger.LevelDebug) {
+		h.log.Debug("anthropic request",
+			logger.F("model", req.Model),
+			logger.F("stream", req.Stream),
+			logger.F("messages", len(req.Messages)),
+			logger.F("tools", len(req.Tools)),
+		)
+	}
 
-	provider, _, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
+	provider, owner, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
 	if strings.TrimSpace(req.Model) != "" && !known && providerUsesDynamicModels(provider) {
 		if err := h.refreshUnknownChatRouteProvider(r.Context(), provider); err != nil {
 			if h.handleShutdownError(w, r, r.Context(), err) {
@@ -2288,9 +2338,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
 			return
 		}
+		provider, owner, known = h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
 	}
 
-	directAnthropic := h.shouldForwardAnthropicMessagesDirect(req.Model)
+	directAnthropic := shouldForwardAnthropicMessagesDirectResolved(provider, owner, known)
 	providerEndpoint := providerEndpointChatCompletions
 	providerModel := req.Model
 	if directAnthropic {
@@ -2301,7 +2352,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic", req.Model, providerModel, req.Stream, providerEndpoint)
 
 	if directAnthropic {
-		h.forwardAnthropicMessagesDirect(w, r, body, &req)
+		directPublicModel, directUpstreamModel := directAnthropicResponseModelsResolved(req.Model, owner, known)
+		h.forwardAnthropicMessagesDirect(w, r, body, &req, directPublicModel, directUpstreamModel)
 		return
 	}
 

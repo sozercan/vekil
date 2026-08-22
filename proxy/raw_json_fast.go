@@ -950,6 +950,13 @@ func replaceSingleTopLevelRawJSONField(body []byte, field string, replacement js
 	if !json.Valid(body) || !json.Valid(replacement) {
 		return body, false
 	}
+	return replaceSingleTopLevelRawJSONFieldValidated(body, field, replacement)
+}
+
+func replaceSingleTopLevelRawJSONFieldValidated(body []byte, field string, replacement json.RawMessage) ([]byte, bool) {
+	if !json.Valid(replacement) {
+		return body, false
+	}
 	object, ok := newRawJSONObjectScanner(body)
 	if !ok {
 		return body, false
@@ -979,9 +986,13 @@ func replaceSingleTopLevelRawJSONField(body []byte, field string, replacement js
 	if matchEnd < matchStart || matchEnd > len(body) {
 		return body, false
 	}
-	// Let append perform its checked capacity growth rather than computing a
-	// potentially overflowing allocation size from attacker-controlled lengths.
-	out := make([]byte, 0, len(body))
+	newLen := len(body) - (matchEnd - matchStart)
+	maxInt := int(^uint(0) >> 1)
+	if len(replacement) > maxInt-newLen {
+		return body, false
+	}
+	newLen += len(replacement)
+	out := make([]byte, 0, newLen)
 	out = append(out, body[:matchStart]...)
 	out = append(out, replacement...)
 	out = append(out, body[matchEnd:]...)

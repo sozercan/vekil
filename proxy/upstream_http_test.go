@@ -113,6 +113,172 @@ func TestReadDirectAnthropicJSONBodyRejectsOversizedExplicitResponse(t *testing.
 	}
 }
 
+func TestReadDirectAnthropicJSONBodyKnownLength(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+		maxBodySize   int64
+		want          string
+		wantErr       error
+		wantLimitErr  bool
+	}{
+		{name: "exact", body: "payload", contentLength: 7, want: "payload"},
+		{name: "longer than advertised", body: "longer payload", contentLength: 4, want: "longer payload"},
+		{name: "truncated", body: "short", contentLength: 10, wantErr: io.ErrUnexpectedEOF},
+		{name: "declared length exceeds explicit route limit", body: "12345", contentLength: 5, maxBodySize: 4, wantLimitErr: true},
+		{name: "explicit route limit", body: "12345", contentLength: 4, maxBodySize: 4, wantLimitErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, pooled, err := readDirectAnthropicJSONBodyKnownLength(strings.NewReader(tt.body), tt.contentLength, tt.maxBodySize)
+			defer releaseUsageSniffBuffer(pooled)
+			switch {
+			case tt.wantLimitErr:
+				if err == nil || !strings.Contains(err.Error(), "exceeds model-normalization limit") {
+					t.Fatalf("readDirectAnthropicJSONBodyKnownLength() error = %v, want limit error", err)
+				}
+			case tt.wantErr != nil:
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("readDirectAnthropicJSONBodyKnownLength() error = %v, want %v", err, tt.wantErr)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("readDirectAnthropicJSONBodyKnownLength() error = %v", err)
+				}
+				if string(got) != tt.want {
+					t.Fatalf("readDirectAnthropicJSONBodyKnownLength() = %q, want %q", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestRewriteAnthropicResponseModelJSONFast(t *testing.T) {
+	body := []byte(`{"id":"msg","model":"claude-upstream","content":[],"usage":{"input_tokens":1,"output_tokens":2}}`)
+	rewritten, changed, ok := rewriteAnthropicResponseModelJSONFast(body, json.RawMessage(`"claude-public"`))
+	if !ok || !changed {
+		t.Fatalf("rewriteAnthropicResponseModelJSONFast() = changed %v, ok %v; want true, true", changed, ok)
+	}
+	want := `{"id":"msg","model":"claude-public","content":[],"usage":{"input_tokens":1,"output_tokens":2}}`
+	if got := string(rewritten); got != want {
+		t.Fatalf("rewriteAnthropicResponseModelJSONFast() = %s, want %s", got, want)
+	}
+}
+
+func TestRewriteAnthropicResponseModelJSONInPlace(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		publicModel string
+	}{
+		{name: "shrink", publicModel: "public"},
+		{name: "grow", publicModel: "claude-public-model-longer-than-upstream"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			original := []byte(`{"id":"msg","model":"upstream","content":[]}`)
+			body := make([]byte, len(original), 256)
+			copy(body, original)
+			rewritten, changed, err := rewriteAnthropicResponseModelJSONInPlace(body, tt.publicModel, "upstream")
+			if err != nil {
+				t.Fatalf("rewriteAnthropicResponseModelJSONInPlace() error = %v", err)
+			}
+			if !changed {
+				t.Fatal("rewriteAnthropicResponseModelJSONInPlace() changed = false, want true")
+			}
+			var payload struct {
+				Model string `json:"model"`
+			}
+			if err := json.Unmarshal(rewritten, &payload); err != nil {
+				t.Fatalf("json.Unmarshal(rewritten) error = %v", err)
+			}
+			if payload.Model != tt.publicModel {
+				t.Fatalf("rewritten model = %q, want %q", payload.Model, tt.publicModel)
+			}
+		})
+	}
+}
+
+func TestRewriteAnthropicResponseModelJSONInPlaceFallsBackWithoutCapacity(t *testing.T) {
+	body := []byte(`{"model":"x"}`)
+	rewritten, changed, err := rewriteAnthropicResponseModelJSONInPlace(body, strings.Repeat("long", 32), "x")
+	if err != nil {
+		t.Fatalf("rewriteAnthropicResponseModelJSONInPlace() error = %v", err)
+	}
+	if rewritten != nil || changed {
+		t.Fatalf("rewriteAnthropicResponseModelJSONInPlace() = %q, %v; want nil, false fallback", rewritten, changed)
+	}
+}
+
+func TestWriteDirectAnthropicJSONResponseInPlaceRewriteRetainsUsage(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	body := `{"id":"msg","type":"message","model":"claude-upstream-model","content":[],"usage":{"input_tokens":7,"output_tokens":3}}`
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/json"}, "Content-Length": []string{strconv.Itoa(len(body))}},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+	w := httptest.NewRecorder()
+	if err := writeDirectAnthropicJSONResponse(ctx, context.Background(), w, resp, "public", "claude-upstream-model"); err != nil {
+		t.Fatalf("writeDirectAnthropicJSONResponse() error = %v", err)
+	}
+	if summary.promptTokens == nil || *summary.promptTokens != 7 ||
+		summary.completionTokens == nil || *summary.completionTokens != 3 ||
+		summary.totalTokens == nil || *summary.totalTokens != 10 {
+		t.Fatalf("usage = prompt:%v completion:%v total:%v, want 7/3/10", summary.promptTokens, summary.completionTokens, summary.totalTokens)
+	}
+	var payload struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(response) error = %v", err)
+	}
+	if payload.Model != "public" {
+		t.Fatalf("response model = %q, want public", payload.Model)
+	}
+}
+
+func TestRewriteAnthropicResponseModelJSONFastFallsBackForAmbiguousShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "duplicate model", body: `{"model":"first","model":"second"}`},
+		{name: "escaped model key", body: `{"mo\u0064el":"claude-upstream"}`},
+		{name: "escaped model value", body: `{"model":"claude-\u0075pstream"}`},
+		{name: "nested message", body: `{"model":"claude-upstream","message":{"model":"claude-upstream"}}`},
+		{name: "malformed", body: `{"model":"claude-upstream"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, ok := rewriteAnthropicResponseModelJSONFast([]byte(tt.body), json.RawMessage(`"claude-public"`))
+			if ok {
+				t.Fatal("rewriteAnthropicResponseModelJSONFast() ok = true, want fallback")
+			}
+		})
+	}
+}
+
+func TestRewriteAnthropicResponseModelJSONFallbackRetainsNestedSemantics(t *testing.T) {
+	body := []byte(`{"model":"claude-upstream","message":{"model":"claude-upstream","content":[]}}`)
+	rewritten, changed := rewriteAnthropicResponseModelJSON(body, "claude-public", "claude-upstream")
+	if !changed {
+		t.Fatal("rewriteAnthropicResponseModelJSON() changed = false, want true")
+	}
+	var payload struct {
+		Model   string `json:"model"`
+		Message struct {
+			Model string `json:"model"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(rewritten, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(rewritten) error = %v", err)
+	}
+	if payload.Model != "claude-public" || payload.Message.Model != "claude-public" {
+		t.Fatalf("rewritten models = %q, %q; want claude-public", payload.Model, payload.Message.Model)
+	}
+}
+
 func TestReadUsageSniffPrefixUsesKnownLengthWithoutTruncatingExtraBytes(t *testing.T) {
 	tests := []struct {
 		name          string
