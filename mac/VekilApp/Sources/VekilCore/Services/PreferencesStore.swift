@@ -6,6 +6,7 @@ public protocol VekilPreferencesStore: AnyObject {
   var mainWindowFrame: VekilWindowFrame? { get set }
   var openAtLogin: Bool { get set }
   var startProxyWhenAppLaunches: Bool { get set }
+  var completedOnboardingVersion: Int? { get set }
 }
 
 @MainActor
@@ -15,12 +16,14 @@ public final class UserDefaultsVekilPreferencesStore: VekilPreferencesStore {
     public var mainWindowFrame: String
     public var openAtLogin: String
     public var startProxyWhenAppLaunches: String
+    public var completedOnboardingVersion: String
 
     public init(prefix: String = "com.vekil.menubar.native") {
       selectedDestination = "\(prefix).selected-destination"
       mainWindowFrame = "\(prefix).main-window-frame"
       openAtLogin = "\(prefix).open-at-login"
       startProxyWhenAppLaunches = "\(prefix).start-proxy-when-app-launches"
+      completedOnboardingVersion = "\(prefix).completed-onboarding-version"
     }
   }
 
@@ -38,7 +41,7 @@ public final class UserDefaultsVekilPreferencesStore: VekilPreferencesStore {
     get {
       guard
         let rawValue = defaults.string(forKey: keys.selectedDestination),
-        let destination = VekilDestination(rawValue: rawValue)
+        let destination = VekilDestination(persistedRawValue: rawValue)
       else {
         return .overview
       }
@@ -82,6 +85,24 @@ public final class UserDefaultsVekilPreferencesStore: VekilPreferencesStore {
     get { defaults.bool(forKey: keys.startProxyWhenAppLaunches) }
     set { defaults.set(newValue, forKey: keys.startProxyWhenAppLaunches) }
   }
+
+  /// Absence is preserved so callers can distinguish an unset preference from
+  /// an explicitly completed onboarding schema version.
+  public var completedOnboardingVersion: Int? {
+    get {
+      guard defaults.object(forKey: keys.completedOnboardingVersion) != nil else {
+        return nil
+      }
+      return defaults.integer(forKey: keys.completedOnboardingVersion)
+    }
+    set {
+      guard let newValue else {
+        defaults.removeObject(forKey: keys.completedOnboardingVersion)
+        return
+      }
+      defaults.set(newValue, forKey: keys.completedOnboardingVersion)
+    }
+  }
 }
 
 @MainActor
@@ -90,16 +111,19 @@ public final class InMemoryVekilPreferencesStore: VekilPreferencesStore {
   public var mainWindowFrame: VekilWindowFrame?
   public var openAtLogin: Bool
   public var startProxyWhenAppLaunches: Bool
+  public var completedOnboardingVersion: Int?
 
   public init(
     selectedDestination: VekilDestination = .overview,
     mainWindowFrame: VekilWindowFrame? = nil,
     openAtLogin: Bool = false,
-    startProxyWhenAppLaunches: Bool = false
+    startProxyWhenAppLaunches: Bool = false,
+    completedOnboardingVersion: Int? = nil
   ) {
     self.selectedDestination = selectedDestination
     self.mainWindowFrame = mainWindowFrame
     self.openAtLogin = openAtLogin
     self.startProxyWhenAppLaunches = startProxyWhenAppLaunches
+    self.completedOnboardingVersion = completedOnboardingVersion
   }
 }

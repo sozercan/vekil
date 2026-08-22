@@ -158,6 +158,14 @@ Policy v1 has a separate deployment restriction: one trusted user/tenant per Vek
 
 Startup behavior depends on active providers. For the full auth matrix, see [Provider Authentication](provider-routing.md#provider-authentication). For provider console links and key setup patterns, see [Provider API Keys](provider-api-keys.md).
 
+### Native macOS source build
+
+The implemented native candidate opens a setup assistant on a true first run. Its provider gallery covers GitHub Copilot, OpenAI Codex, Azure OpenAI, OpenAI-compatible, Anthropic-compatible, and multi-provider imports. Copilot has a direct zero-config sign-in path; the other choices select an existing JSON/YAML provider configuration, which can contain several providers and remains user-owned. The runtime validates the selected file, discovers the combined model catalog, rejects global public-model-ID collisions, verifies the local endpoint, and then offers temporary client commands. Managed provider-key entry stays unavailable until the native release's cross-version Keychain gate is satisfied.
+
+The app distinguishes a fresh installation from an upgrade by inspecting recovered authentication, configuration, service, window/navigation, and startup-preference state. Existing users are not forced through setup merely because the native onboarding preference is absent. **Skip Setup** suppresses the current assistant version, and **Settings > Run Setup Assistant…** opens it again on demand without first changing the active proxy.
+
+This flow describes the native source build, not the currently published Go tray bundle. See [macOS App and Linux Tray](menubar.md#implementation-and-release-status) for the release boundary and [Client Usage Examples](clients.md#native-macos-client-setup) for the native copyable-command surface.
+
 ### GitHub Copilot
 
 Zero-config startup and explicit `type: "copilot"` providers need GitHub Copilot auth. The proxy checks, in order:

@@ -1,11 +1,26 @@
 import Foundation
 
-public enum VekilDestination: String, CaseIterable, Codable, Equatable, Sendable {
+public enum VekilDestination: String, CaseIterable, Equatable, Sendable {
   case overview
-  case traffic
-  case requests
-  case providers
+  case activity
+  case connection
+  case clients
   case settings
+  case about
+
+  /// Maps destinations persisted by the pre-arrangement native shell onto the
+  /// smaller durable navigation model.
+  public init?(persistedRawValue: String) {
+    switch persistedRawValue {
+    case "overview": self = .overview
+    case "activity", "traffic", "requests": self = .activity
+    case "connection", "providers", "models": self = .connection
+    case "clients", "client-setup": self = .clients
+    case "settings": self = .settings
+    case "about": self = .about
+    default: return nil
+    }
+  }
 }
 
 /// Framework-neutral window geometry suitable for UserDefaults persistence.

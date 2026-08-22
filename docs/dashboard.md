@@ -12,11 +12,17 @@ For a default local run that is <http://localhost:1337/dashboard>. In the tray a
 
 ## Native macOS Analytics Status
 
-The browser dashboard and endpoints in this document are the analytics surface in the currently published app. The native source also implements tolerant `/stats.json` models, a generation-scoped `StatsStore`, request/attempt projection, fixtures, tests, and Overview/Traffic/Requests views. Those views are not published behavior until the native app is assembled and passes its release gates; **Open Dashboard** remains the supported release path meanwhile.
+The browser dashboard and endpoints in this document are the analytics surface in the currently published app. The native source also implements tolerant `/stats.json` models, a generation-scoped `StatsStore`, request/attempt projection, fixtures, tests, and these SwiftUI surfaces:
+
+- **Overview** shows current-run request, token, error, and P95-latency tiles plus a Swift Charts request/error trend alongside service and endpoint status.
+- **Activity** groups a summary and request log behind one local segmented control. Its summary switches Swift Charts between request/error counts and input/output tokens, adds latency/retry/failover totals, and breaks down providers, models, clients, and routes. Its request log provides filters, search, a native table, trace-completeness warnings, and ordered route-attempt details.
+- The transient menu-bar popover stays operational rather than becoming a miniature dashboard: it shows lifecycle status, any actionable warning, the local endpoint, and one compact current-run request/error/token summary.
+
+These views are not published behavior until the native app is assembled and passes its release gates; **Open Dashboard** remains the supported release path meanwhile.
 
 The native implementation reuses `GET /stats.json`; it does not create a second metrics API or persistent history. It associates snapshots with the helper runtime generation, moves stopped/restarted/uptime-regressed data to an explicitly previous-run state, marks data stale only while a running service cannot refresh, and joins requests to attempts only within one snapshot/generation. **Errors** means `status >= 400`; **Failovers** means `target_switches > 0`; **Partial** identifies missing, evicted, redacted, WebSocket-limited, or fewer-than-`upstream_sends` attempts.
 
-The native store is visibility-driven and single-flight, with five-second refresh for relevant views and cancellation when views/window hide. The browser dashboard retains its existing one-second polling behavior. Native charts require textual summaries and table alternatives; stale/error states cannot rely only on color.
+Native analytics are current-run-only and in memory, matching the proxy snapshot: restarting the proxy begins a new generation rather than presenting the previous run as live data. The native store is visibility-driven and single-flight, with five-second refresh for relevant views and cancellation when views/window hide; users can also refresh Traffic explicitly. The browser dashboard retains its existing one-second polling behavior. Native charts have textual summaries and table alternatives, and stale/error states do not rely only on color.
 
 ## What it shows
 

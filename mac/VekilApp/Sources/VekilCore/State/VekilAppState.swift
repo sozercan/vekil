@@ -8,6 +8,8 @@ import Foundation
 /// infer helper, service, operation, authentication, or configuration lifecycle.
 @MainActor
 public final class VekilAppState: ObservableObject {
+  public static let currentOnboardingVersion = 1
+
   @Published public private(set) var initializationState: VekilInitializationState = .notStarted
   @Published public private(set) var runtimeState: AppRuntimeStateSnapshot = .placeholder
   @Published public private(set) var lastError: AppRuntimeStructuredError?
@@ -21,6 +23,7 @@ public final class VekilAppState: ObservableObject {
   @Published public private(set) var openAtLogin: Bool
   @Published public private(set) var startProxyWhenAppLaunches: Bool
   @Published public private(set) var loginItemStatus: LoginItemStatus = .unavailable
+  @Published public private(set) var isShowingOnboarding = false
 
   @Published public private(set) var isSubmittingCommand = false
   @Published public private(set) var isUpdatingOpenAtLogin = false
@@ -70,6 +73,7 @@ public final class VekilAppState: ObservableObject {
   private let browserService: any BrowserService
   private let clipboardService: any ClipboardService
   private let externalConfigurationPathSelector: any ExternalConfigurationPathSelecting
+  private let hadPersistedNativeSetupEvidence: Bool
 
   private var initializationTask: Task<Bool, Never>?
   private var eventTask: Task<Void, Never>?
@@ -102,6 +106,11 @@ public final class VekilAppState: ObservableObject {
     self.clipboardService = resolvedClipboardService
     self.externalConfigurationPathSelector = resolvedPathSelector
     self.applicationVersion = applicationVersion
+    hadPersistedNativeSetupEvidence =
+      resolvedPreferences.mainWindowFrame != nil
+      || resolvedPreferences.selectedDestination != .overview
+      || resolvedPreferences.openAtLogin
+      || resolvedPreferences.startProxyWhenAppLaunches
 
     selectedDestination = resolvedPreferences.selectedDestination
     mainWindowFrame = resolvedPreferences.mainWindowFrame
@@ -320,6 +329,25 @@ public final class VekilAppState: ObservableObject {
     preferences.mainWindowFrame = usableFrame
   }
 
+  /// Presents the setup assistant on demand without changing completion state.
+  public func showOnboarding() {
+    isShowingOnboarding = true
+  }
+
+  /// Completing or explicitly skipping onboarding is durable and never
+  /// changes proxy running intent, navigation, or launch preferences.
+  public func completeOnboarding() {
+    preferences.completedOnboardingVersion = max(
+      preferences.completedOnboardingVersion ?? 0,
+      Self.currentOnboardingVersion
+    )
+    isShowingOnboarding = false
+  }
+
+  public func deferOnboarding() {
+    completeOnboarding()
+  }
+
   /// This preference only affects the one launch-time evaluation. Changing it
   /// after initialization never starts or stops the current runtime.
   public func setStartProxyWhenAppLaunches(_ enabled: Bool) {
@@ -390,6 +418,24 @@ public final class VekilAppState: ObservableObject {
   }
 
   @discardableResult
+  public func copyText(_ text: String) async -> Bool {
+    guard !text.isEmpty, text.utf8.count <= 32 * 1024 else {
+      lastError = AppRuntimeStructuredError(
+        code: "clipboard_value_invalid",
+        userMessage: "The setup value could not be copied."
+      )
+      return false
+    }
+    do {
+      try await clipboardService.copy(text)
+      return true
+    } catch {
+      record(error, code: "clipboard_failed", message: "Could not copy the setup value.")
+      return false
+    }
+  }
+
+  @discardableResult
   public func openDashboard() async -> Bool {
     guard runtimeState.service == .running, let dashboardURL else {
       lastError = AppRuntimeStructuredError(
@@ -455,6 +501,7 @@ public final class VekilAppState: ObservableObject {
       applyLoginItemStatus(status, requestedValue: preferences.openAtLogin)
 
       initializationState = .initialized
+      resolveInitialOnboardingPresentation()
       await evaluateAutoStartExactlyOnce()
       return true
     } catch {
@@ -462,8 +509,42 @@ public final class VekilAppState: ObservableObject {
       record(
         error, code: "runtime_initialization_failed",
         message: "Could not initialize the Vekil runtime.")
+      if needsOnboardingForStoredVersion {
+        isShowingOnboarding = true
+      }
       return false
     }
+  }
+
+  /// A missing preference is only a signal to inspect recovered runtime and
+  /// native state. It is not, on its own, proof that this is a fresh install.
+  private func resolveInitialOnboardingPresentation() {
+    if let completedVersion = preferences.completedOnboardingVersion {
+      isShowingOnboarding = completedVersion < Self.currentOnboardingVersion
+      return
+    }
+
+    let recoveredExistingSetup =
+      runtimeState.authentication.state == .signedIn
+      || runtimeState.configuration.mode == .external
+      || runtimeState.configuration.mode == .managed
+      || runtimeState.configuration.selectedExternalPath != nil
+      || runtimeState.service == .running
+      || hadPersistedNativeSetupEvidence
+
+    if recoveredExistingSetup {
+      preferences.completedOnboardingVersion = Self.currentOnboardingVersion
+      isShowingOnboarding = false
+    } else {
+      isShowingOnboarding = true
+    }
+  }
+
+  private var needsOnboardingForStoredVersion: Bool {
+    guard let completedVersion = preferences.completedOnboardingVersion else {
+      return true
+    }
+    return completedVersion < Self.currentOnboardingVersion
   }
 
   private func startEventObservationIfNeeded() async {

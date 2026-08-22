@@ -5,6 +5,114 @@ import XCTest
 
 @MainActor
 final class VekilAppStateTests: XCTestCase {
+  func testFreshInstallShowsOnboardingAfterRuntimeInitializationAndCompletionPersists() async {
+    var fresh = AppRuntimeStateSnapshot.connectedStopped
+    fresh.authentication = AppRuntimeAuthentication(state: .signedOut, source: .none)
+    let runtime = RuntimeClientSpy(state: fresh)
+    let preferences = InMemoryVekilPreferencesStore()
+    let state = makeState(runtime: runtime, preferences: preferences)
+
+    XCTAssertFalse(state.isShowingOnboarding)
+    await assertTrueAsync(await state.initialize())
+    XCTAssertTrue(state.isShowingOnboarding)
+    XCTAssertNil(preferences.completedOnboardingVersion)
+
+    state.completeOnboarding()
+    XCTAssertFalse(state.isShowingOnboarding)
+    XCTAssertEqual(
+      preferences.completedOnboardingVersion,
+      VekilAppState.currentOnboardingVersion
+    )
+  }
+
+  func testRecoveredExistingSetupDoesNotForceOnboarding() async {
+    var recovered = AppRuntimeStateSnapshot.connectedStopped
+    recovered.authentication = AppRuntimeAuthentication(state: .signedIn, source: .vekil)
+    let runtime = RuntimeClientSpy(state: recovered)
+    let preferences = InMemoryVekilPreferencesStore()
+    let state = makeState(runtime: runtime, preferences: preferences)
+
+    await assertTrueAsync(await state.initialize())
+
+    XCTAssertFalse(state.isShowingOnboarding)
+    XCTAssertEqual(
+      preferences.completedOnboardingVersion,
+      VekilAppState.currentOnboardingVersion
+    )
+  }
+
+  func testStoredOnboardingCompletionSuppressesAutomaticPresentationButAllowsManualSetup() async {
+    let runtime = RuntimeClientSpy()
+    let preferences = InMemoryVekilPreferencesStore(completedOnboardingVersion: 1)
+    let state = makeState(runtime: runtime, preferences: preferences)
+
+    await assertTrueAsync(await state.initialize())
+    XCTAssertFalse(state.isShowingOnboarding)
+
+    state.selectDestination(.settings)
+    state.showOnboarding()
+    XCTAssertTrue(state.isShowingOnboarding)
+    state.deferOnboarding()
+    XCTAssertFalse(state.isShowingOnboarding)
+    XCTAssertEqual(state.selectedDestination, .settings)
+    XCTAssertEqual(preferences.completedOnboardingVersion, 1)
+  }
+
+  func testStoredOnboardingVersionsRespectCurrentSchema() async {
+    var fresh = AppRuntimeStateSnapshot.connectedStopped
+    fresh.authentication = AppRuntimeAuthentication(state: .signedOut, source: .none)
+    let cases = [
+      (VekilAppState.currentOnboardingVersion - 1, true),
+      (VekilAppState.currentOnboardingVersion, false),
+      (VekilAppState.currentOnboardingVersion + 1, false),
+    ]
+
+    for (completedVersion, shouldShow) in cases {
+      let runtime = RuntimeClientSpy(state: fresh)
+      let preferences = InMemoryVekilPreferencesStore(
+        completedOnboardingVersion: completedVersion)
+      let state = makeState(runtime: runtime, preferences: preferences)
+
+      await assertTrueAsync(await state.initialize())
+      XCTAssertEqual(
+        state.isShowingOnboarding,
+        shouldShow,
+        "Unexpected presentation for stored onboarding version \(completedVersion)"
+      )
+    }
+  }
+
+  func testCompletingManualSetupDoesNotDowngradeFutureVersion() async {
+    let futureVersion = VekilAppState.currentOnboardingVersion + 1
+    let runtime = RuntimeClientSpy()
+    let preferences = InMemoryVekilPreferencesStore(
+      completedOnboardingVersion: futureVersion)
+    let state = makeState(runtime: runtime, preferences: preferences)
+
+    await assertTrueAsync(await state.initialize())
+    state.showOnboarding()
+    state.completeOnboarding()
+
+    XCTAssertEqual(preferences.completedOnboardingVersion, futureVersion)
+  }
+
+  func testPreInitializationNavigationDoesNotBecomeMigrationEvidence() async {
+    var fresh = AppRuntimeStateSnapshot.connectedStopped
+    fresh.authentication = AppRuntimeAuthentication(state: .signedOut, source: .none)
+    let runtime = RuntimeClientSpy(state: fresh)
+    await runtime.setInitializationDelay(nanoseconds: 20_000_000)
+    let preferences = InMemoryVekilPreferencesStore()
+    let state = makeState(runtime: runtime, preferences: preferences)
+
+    let initialization = Task { await state.initialize() }
+    await Task.yield()
+    state.selectDestination(.settings)
+
+    await assertTrueAsync(await initialization.value)
+    XCTAssertTrue(state.isShowingOnboarding)
+    XCTAssertNil(preferences.completedOnboardingVersion)
+  }
+
   func testAutoStartIsEvaluatedExactlyOnceAndIsNoninteractive() async {
     let runtime = RuntimeClientSpy()
     await runtime.setInitializationDelay(nanoseconds: 10_000_000)
@@ -59,9 +167,11 @@ final class VekilAppStateTests: XCTestCase {
 
     await assertFalseAsync(await state.initialize())
     XCTAssertEqual(state.initializationState, .failed)
+    XCTAssertTrue(state.isShowingOnboarding)
     await runtime.setThrownError(nil)
     await assertTrueAsync(await state.initialize())
     await assertTrueAsync(await state.initialize())
+    XCTAssertFalse(state.isShowingOnboarding)
 
     let calls = await runtime.recordedCalls()
     XCTAssertEqual(calls.filter { if case .start = $0 { true } else { false } }.count, 1)
@@ -330,16 +440,23 @@ final class VekilAppStateTests: XCTestCase {
     )
     await assertTrueAsync(await state.initialize())
 
-    state.selectDestination(.requests)
+    state.selectDestination(.activity)
     let frame = VekilWindowFrame(x: 10, y: 10, width: 800, height: 600)
     state.saveMainWindowFrame(frame)
-    XCTAssertEqual(preferences.selectedDestination, .requests)
+    XCTAssertEqual(preferences.selectedDestination, .activity)
     XCTAssertEqual(preferences.mainWindowFrame, frame)
 
     await assertTrueAsync(await state.copyBaseURL())
+    await assertTrueAsync(await state.copyText("OPENAI_BASE_URL=http://127.0.0.1:1337/v1"))
     await assertTrueAsync(await state.openDashboard())
     await assertTrueAsync(await state.checkForUpdates())
-    XCTAssertEqual(clipboard.copiedStrings, ["http://127.0.0.1:1337"])
+    XCTAssertEqual(
+      clipboard.copiedStrings,
+      [
+        "http://127.0.0.1:1337",
+        "OPENAI_BASE_URL=http://127.0.0.1:1337/v1",
+      ]
+    )
     XCTAssertEqual(browser.openedURLs, [URL(string: "http://127.0.0.1:1337/dashboard")!])
     XCTAssertEqual(updater.checkCount, 1)
   }

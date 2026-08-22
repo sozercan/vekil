@@ -81,101 +81,14 @@ public final class ApplicationInstanceGate: @unchecked Sendable {
     }
 }
 
-enum CompactStatusMenuAction: Equatable {
-    case primary
-    case openVekil
-    case settings
-    case copyBaseURL
-    case quit
-}
-
-struct CompactStatusMenuItemDescriptor: Equatable {
-    let title: String?
-    let tag: Int?
-    let action: CompactStatusMenuAction?
-    let isEnabled: Bool
-    let isHidden: Bool
-
-    var isSeparator: Bool {
-        title == nil
-    }
-
-    static let separator = Self(
-        title: nil,
-        tag: nil,
-        action: nil,
-        isEnabled: false,
-        isHidden: false
-    )
-}
-
-func makeCompactStatusMenuDescriptors(
-    summaryTitle: String,
-    warningTitle: String? = nil,
-    primaryTitle: String = "Start Proxy",
-    primaryEnabled: Bool = true,
-    hasBaseURL: Bool
-) -> [CompactStatusMenuItemDescriptor] {
-    [
-        .init(
-            title: summaryTitle,
-            tag: 2,
-            action: nil,
-            isEnabled: false,
-            isHidden: false
-        ),
-        .init(
-            title: warningTitle ?? "",
-            tag: 8,
-            action: nil,
-            isEnabled: false,
-            isHidden: warningTitle == nil
-        ),
-        .separator,
-        .init(
-            title: primaryTitle,
-            tag: 3,
-            action: .primary,
-            isEnabled: primaryEnabled,
-            isHidden: false
-        ),
-        .init(
-            title: "Open Vekil…",
-            tag: 5,
-            action: .openVekil,
-            isEnabled: true,
-            isHidden: false
-        ),
-        .init(
-            title: "Settings…",
-            tag: 12,
-            action: .settings,
-            isEnabled: true,
-            isHidden: false
-        ),
-        .init(
-            title: "Copy Base URL",
-            tag: 4,
-            action: .copyBaseURL,
-            isEnabled: hasBaseURL,
-            isHidden: !hasBaseURL
-        ),
-        .separator,
-        .init(
-            title: "Quit Vekil",
-            tag: nil,
-            action: .quit,
-            isEnabled: true,
-            isHidden: false
-        ),
-    ]
-}
-
 @MainActor
-public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate, NSWindowDelegate {
+public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate, NSWindowDelegate,
+    NSPopoverDelegate
+{
     private let appState: VekilAppState, analytics: AnalyticsViewModel, gate: ApplicationInstanceGate
     private let shutdownRuntime: @Sendable () async -> Void
-    private var window: NSWindow?, statusItem: NSStatusItem?, cancellables = Set<AnyCancellable>()
+    private var window: NSWindow?, statusItem: NSStatusItem?, statusPopover: NSPopover?
+    private var cancellables = Set<AnyCancellable>()
     private var windowDidCloseObserver: NSObjectProtocol?
     private var windowDidBecomeKeyObserver: NSObjectProtocol?
     private var terminating = false
@@ -205,10 +118,15 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
                 self.analytics.applyRuntime(self.appState.runtimeState)
             }
         } }.store(in: &cancellables)
+        appState.$isShowingOnboarding.removeDuplicates().sink { [weak self] isShowing in
+            guard isShowing else { return }
+            DispatchQueue.main.async { self?.showWindow() }
+        }.store(in: &cancellables)
         Task {
             let initialized = await appState.initialize()
             if !initialized {
                 fputs("Vekil runtime initialization failed.\n", stderr)
+                showWindow()
             }
             analytics.applyRuntime(appState.runtimeState)
         }
@@ -235,8 +153,15 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
     }
 
     public func windowWillClose(_: Notification) {
-        analytics.setVisible(.menu, true)
         scheduleActivationPolicyUpdate()
+    }
+
+    public func popoverWillShow(_: Notification) {
+        analytics.setVisible(.menu, true)
+    }
+
+    public func popoverDidClose(_: Notification) {
+        analytics.setVisible(.menu, false)
     }
 
     private func scheduleActivationPolicyUpdate() {
@@ -268,80 +193,44 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
         window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }
 
-    private var statusMenuSummaryTitle: String {
-        "\(appState.presentation.title) · \(appState.runtimeState.configuration.displayName)"
-    }
-
-    private var statusMenuWarningTitle: String? {
-        appState.lastError?.userMessage ?? appState.environmentTokenSignOutNotice
-    }
-
-    private func statusMenuSelector(for action: CompactStatusMenuAction) -> Selector {
-        switch action {
-        case .primary: #selector(primary)
-        case .openVekil: #selector(openWindow)
-        case .settings: #selector(openSettings)
-        case .copyBaseURL: #selector(copyURL)
-        case .quit: #selector(quit)
-        }
-    }
-
     private func installStatusMenu() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem = item
 
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        let descriptors = makeCompactStatusMenuDescriptors(
-            summaryTitle: statusMenuSummaryTitle,
-            warningTitle: statusMenuWarningTitle,
-            primaryTitle: appState.primaryAction.title,
-            primaryEnabled: appState.primaryAction.isEnabled,
-            hasBaseURL: appState.baseURL != nil
-        )
-        for descriptor in descriptors {
-            if descriptor.isSeparator {
-                menu.addItem(.separator())
-                continue
-            }
-
-            let action = descriptor.action.map { statusMenuSelector(for: $0) }
-            let keyEquivalent = descriptor.action == .settings ? "," : ""
-            let menuItem = NSMenuItem(
-                title: descriptor.title ?? "", action: action, keyEquivalent: keyEquivalent
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        popover.delegate = self
+        popover.contentSize = NSSize(width: 340, height: 330)
+        popover.contentViewController = NSHostingController(
+            rootView: VekilMenuBarPopoverView(
+                app: appState,
+                analytics: analytics,
+                openMainWindow: { [weak self] in
+                    self?.statusPopover?.performClose(nil)
+                    self?.showWindow()
+                },
+                openSettings: { [weak self] in
+                    self?.statusPopover?.performClose(nil)
+                    self?.openSettings()
+                },
+                quit: { [weak self] in
+                    self?.statusPopover?.performClose(nil)
+                    self?.quit()
+                }
             )
-            if descriptor.action == .settings {
-                menuItem.keyEquivalentModifierMask = [.command]
-            }
-            menuItem.target = descriptor.action == nil ? nil : self
-            menuItem.tag = descriptor.tag ?? 0
-            menuItem.isEnabled = descriptor.isEnabled
-            menuItem.isHidden = descriptor.isHidden
-            menu.addItem(menuItem)
-        }
+        )
+        statusPopover = popover
 
-        item.menu = menu
-        analytics.setVisible(.menu, true)
+        if let button = item.button {
+            button.target = self
+            button.action = #selector(toggleStatusPopover(_:))
+            button.sendAction(on: [.leftMouseUp])
+        }
         refreshMenu()
     }
 
     private func refreshMenu() {
-        guard let menu = statusItem?.menu else { return }
-        menu.item(withTag: 2)?.title = statusMenuSummaryTitle
-
-        let primary = menu.item(withTag: 3)
-        primary?.title = appState.primaryAction.title
-        primary?.isEnabled = appState.primaryAction.isEnabled
-
-        let hasBaseURL = appState.baseURL != nil
-        let copyBaseURL = menu.item(withTag: 4)
-        copyBaseURL?.isEnabled = hasBaseURL
-        copyBaseURL?.isHidden = !hasBaseURL
-
-        let persistentWarning = statusMenuWarningTitle
-        menu.item(withTag: 8)?.title = persistentWarning ?? ""
-        menu.item(withTag: 8)?.isHidden = persistentWarning == nil
-
         let symbol = appState.presentation.kind == .ready ? "bolt.horizontal.circle.fill" : "bolt.horizontal.circle"
         statusItem?.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: appState.presentation.title)
         statusItem?.button?.toolTip = "Vekil — \(appState.presentation.title)"
@@ -350,24 +239,21 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
         statusItem?.button?.setAccessibilityHelp("Open Vekil proxy controls and status")
     }
 
-    @objc private func primary() {
-        Task { await appState.performPrimaryAction() }
+    @objc private func toggleStatusPopover(_ sender: NSStatusBarButton) {
+        guard let statusPopover else { return }
+        if statusPopover.isShown {
+            statusPopover.performClose(sender)
+        } else {
+            statusPopover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+        }
     }
 
-    @objc private func copyURL() {
-        Task { await appState.copyBaseURL() }
-    }
-
-    @objc private func openWindow() {
-        showWindow()
-    }
-
-    @objc private func openSettings() {
+    private func openSettings() {
         appState.selectDestination(.settings)
         showWindow()
     }
 
-    @objc private func quit() {
+    private func quit() {
         NSApp.terminate(nil)
     }
 }
