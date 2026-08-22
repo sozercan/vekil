@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -628,6 +629,8 @@ func stopServeServer(srv serveLifecycleServer, log *logger.Logger) error {
 }
 
 func runServe() {
+	configureServeGC()
+
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -676,6 +679,18 @@ func runServe() {
 	if err := serveUntilContextDone(ctx, srv, authenticator, serveUsesCopilot(srv, providersCfg.UsesCopilot()), log); err != nil {
 		log.Fatal("serve error", logger.Err(err))
 	}
+}
+
+const defaultServeGCPercent = 200
+
+func configureServeGC() {
+	if shouldApplyServeGCDefault(os.Getenv("GOGC")) {
+		debug.SetGCPercent(defaultServeGCPercent)
+	}
+}
+
+func shouldApplyServeGCDefault(value string) bool {
+	return strings.TrimSpace(value) == ""
 }
 
 func getPolicyRoutingModeEnv() string {

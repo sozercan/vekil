@@ -38,6 +38,7 @@ type chatExecutionOptions struct {
 	ResponsesMinimumOutputTokens int
 	ResponsesDropSamplingParams  bool
 	ResponsesUsageOnly           bool
+	MutableRequestBody           bool
 }
 
 type chatExecutionResult struct {
@@ -92,6 +93,13 @@ func rawJSONFieldsExactOrFold(object map[string]json.RawMessage, name string) []
 }
 
 func chatRequestContainsResponsesReplayID(body []byte) bool {
+	// Replay IDs are proxy-owned and always carry this literal prefix. Avoid
+	// decoding the full message tree on ordinary Chat requests, which make up the
+	// overwhelmingly common native-Chat path.
+	if !bytes.Contains(body, []byte(responsesChatReplayCallIDPrefix)) {
+		return false
+	}
+
 	var request map[string]json.RawMessage
 	if json.Unmarshal(body, &request) != nil {
 		return false
@@ -146,13 +154,12 @@ func chatRequestContainsResponsesReplayID(body []byte) bool {
 }
 
 func (h *ProxyHandler) executeResolvedNativeChat(ctx context.Context, route resolvedChatRoute, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
-	resp, err := h.postResolvedProviderRequest(ctx, route.provider, route.owner, providerEndpointChatCompletions, chatBody, nil)
+	resp, err := h.postResolvedProviderRequestForModelWithOwnership(ctx, route.provider, route.owner, providerEndpointChatCompletions, chatBody, nil, route.publicModel, options.MutableRequestBody)
 	if err != nil {
 		return chatExecutionResult{}, err
 	}
 	return chatExecutionResult{
 		Response: resp,
-		Headers:  convertedChatSafeHeaders(resp.Header),
 		Backend:  chatBackendNativeChat,
 		route:    route,
 	}, nil
@@ -389,6 +396,16 @@ func convertedChatSafeHeaders(src http.Header) http.Header {
 		return nil
 	}
 	return dst
+}
+
+func chatExecutionUpstreamHeaders(result chatExecutionResult) http.Header {
+	if len(result.Headers) > 0 {
+		return result.Headers
+	}
+	if result.Response != nil {
+		return result.Response.Header
+	}
+	return nil
 }
 
 func (h *ProxyHandler) routeChatExecutionResult(

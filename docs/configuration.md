@@ -33,6 +33,11 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 
 Native CLI and tray-app runs default to `127.0.0.1`. Container deployments that publish the proxy port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path.
 
+Serve mode defaults Go's garbage-collection target to `GOGC=200` to favor
+throughput while retaining a bounded memory footprint. Set a non-empty `GOGC`
+environment variable, including `GOGC=off`, to override that default with the
+standard Go runtime behavior requested by the operator.
+
 Policy `observe` and `enforce` are a v1 single-tenant feature. Loopback is the default supported topology. A non-loopback bind requires the explicit remote-single-tenant acknowledgement above, but that acknowledgement does not protect the proxy; put remote deployments behind a trusted external authentication and network boundary.
 
 ## Copilot Header Overrides

@@ -139,6 +139,7 @@ type providerRuntime struct {
 	authType                   providerAuthType
 	authHeader                 string
 	authPrefix                 string
+	authValue                  string
 	extraHeaders               http.Header
 	paths                      providerEndpointPaths
 	modelDiscovery             providerModelDiscovery
@@ -150,6 +151,8 @@ type providerRuntime struct {
 	staticModels               map[string]providerModel
 	staticConfigs              map[string]ProviderModelConfig
 	staticOrder                []string
+	postRequestTemplates       map[string]*http.Request
+	postRequestAutoGzip        bool
 	codexAuth                  *openAICodexAuth
 	headerProfiles             CopilotHeaderProfilesConfig
 }
@@ -164,6 +167,7 @@ type providerEndpointPaths struct {
 type providerModel struct {
 	publicID               string
 	upstreamModel          string
+	upstreamModelJSON      json.RawMessage
 	providerID             string
 	supportedEndpoints     []string
 	parallelToolCalls      *bool
@@ -1324,6 +1328,7 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		runtime.authHeader = authHeader
 		runtime.authPrefix = authPrefix
 		runtime.apiKey = apiKey
+		runtime.authValue = genericProviderAuthValue(authPrefix, apiKey)
 		runtime.extraHeaders = extraHeaders
 		runtime.modelDiscovery = modelDiscovery
 
@@ -1335,6 +1340,9 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		}
 	}
 
+	if err := sealProviderRequestTemplates(runtime); err != nil {
+		return nil, err
+	}
 	return runtime, nil
 }
 
@@ -1726,6 +1734,7 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 	return providerModel{
 		publicID:               publicID,
 		upstreamModel:          upstreamModel,
+		upstreamModelJSON:      encodeProviderModelJSON(upstreamModel),
 		providerID:             providerID,
 		supportedEndpoints:     endpoints,
 		parallelToolCalls:      cloneBoolPtr(cfg.ParallelToolCalls),
@@ -2153,6 +2162,10 @@ func rewriteRequestModelForProvider(body []byte, upstreamModel string) ([]byte, 
 }
 
 func rewriteRequestModelForProviderFromModel(body []byte, currentModel string, upstreamModel string) ([]byte, bool, error) {
+	return rewriteRequestModelForProviderFromModelJSON(body, currentModel, upstreamModel, nil)
+}
+
+func rewriteRequestModelForProviderFromModelJSON(body []byte, currentModel string, upstreamModel string, rawModel json.RawMessage) ([]byte, bool, error) {
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
 		return body, false, nil
@@ -2162,10 +2175,33 @@ func rewriteRequestModelForProviderFromModel(body []byte, currentModel string, u
 	if currentModel == "" || currentModel == upstreamModel {
 		return body, false, nil
 	}
+	if len(rawModel) == 0 {
+		var err error
+		rawModel, err = json.Marshal(upstreamModel)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	if rewritten, ok := replaceSingleTopLevelRawJSONField(body, "model", rawModel); ok {
+		return rewritten, true, nil
+	}
 	return rewriteResponsesRequestModel(body, upstreamModel)
 }
 
+func encodeProviderModelJSON(model string) json.RawMessage {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+	raw, _ := json.Marshal(model)
+	return raw
+}
+
 func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string, extraQuery string, owners ...providerModel) (string, error) {
+	return buildProviderRequestURL(provider, path, extraQuery, owners...)
+}
+
+func buildProviderRequestURL(provider *providerRuntime, path string, extraQuery string, owners ...providerModel) (string, error) {
 	if provider == nil {
 		return "", fmt.Errorf("provider is required")
 	}
@@ -2203,6 +2239,126 @@ func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string
 		return appendRawQuery(fullURL, extraQuery), nil
 	}
 	return appendRawQuery(fullURL, appendQuery("api-version="+url.QueryEscape(provider.apiVersion), extraQuery)), nil
+}
+
+func sealProviderRequestTemplates(provider *providerRuntime) error {
+	if provider == nil || (provider.kind != providerTypeOpenAICompatible && provider.kind != providerTypeAnthropicCompatible) {
+		return nil
+	}
+	headers, err := sealedGenericProviderJSONHeaders(provider)
+	if err != nil {
+		return err
+	}
+	autoGzip := headers.Get("Accept-Encoding") == ""
+	if autoGzip {
+		headers["Accept-Encoding"] = []string{"gzip"}
+	}
+	templates := make(map[string]*http.Request, 4)
+	for _, endpoint := range []string{
+		providerEndpointChatCompletions,
+		providerEndpointResponses,
+		providerEndpointMessages,
+		providerEndpointMessagesCount,
+	} {
+		fullURL, err := buildProviderRequestURL(provider, endpoint, "")
+		if err != nil {
+			return err
+		}
+		template, err := http.NewRequest(http.MethodPost, fullURL, nil)
+		if err != nil {
+			return fmt.Errorf("provider %q build request template for %s: %w", provider.id, endpoint, err)
+		}
+		template.Header = headers
+		templates[endpoint] = template
+	}
+	provider.postRequestTemplates = templates
+	provider.postRequestAutoGzip = autoGzip
+	return nil
+}
+
+func sealedGenericProviderJSONHeaders(provider *providerRuntime) (http.Header, error) {
+	headers := make(http.Header, len(provider.extraHeaders)+3)
+	for key, values := range provider.extraHeaders {
+		cloned := append([]string(nil), values...)
+		headers[key] = cloned[:len(cloned):len(cloned)]
+	}
+	switch provider.authType {
+	case providerAuthTypeNone, "":
+	case providerAuthTypeBearer, providerAuthTypeAPIKeyHeader:
+		if strings.TrimSpace(provider.apiKey) == "" {
+			return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no API key configured", provider.id)}
+		}
+		header := strings.TrimSpace(provider.authHeader)
+		if header == "" {
+			return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no auth header configured", provider.id)}
+		}
+		headers.Set(header, provider.authValue)
+	default:
+		return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported auth type %q", provider.authType)}
+	}
+	headers.Set("Content-Type", "application/json")
+	return headers, nil
+}
+
+func shallowCloneHeader(src http.Header) http.Header {
+	dst := make(http.Header, len(src))
+	for key, values := range src {
+		dst[key] = values
+	}
+	return dst
+}
+
+type providerRequestBody struct {
+	bytes.Reader
+	route              providerRouteInfo
+	autoDecompressGzip bool
+}
+
+func newProviderRequestBody(body []byte, route providerRouteInfo, autoDecompressGzip bool) *providerRequestBody {
+	reader := &providerRequestBody{route: route, autoDecompressGzip: autoDecompressGzip}
+	reader.Reset(body)
+	return reader
+}
+
+func (*providerRequestBody) Close() error {
+	return nil
+}
+
+func requestFromProviderTemplate(ctx context.Context, template *http.Request, body []byte, reuseSealedHeaders bool, route providerRouteInfo, autoDecompressGzip bool) *http.Request {
+	req := template.WithContext(ctx)
+	if !reuseSealedHeaders {
+		req.Header = shallowCloneHeader(template.Header)
+	}
+	if len(body) == 0 {
+		if autoDecompressGzip {
+			if reuseSealedHeaders {
+				req.Header = shallowCloneHeader(template.Header)
+			}
+			req.Header.Del("Accept-Encoding")
+		}
+		return req
+	}
+	reader := newProviderRequestBody(body, route, autoDecompressGzip)
+	req.Body = reader
+	req.ContentLength = int64(len(body))
+	if reuseSealedHeaders {
+		// Inference retries rebuild the whole request through their factory. Keep
+		// GetBody nil so net/http cannot create an unbudgeted transparent replay.
+		return req
+	}
+	snapshot := reader.Reader
+	req.GetBody = func() (io.ReadCloser, error) {
+		return &providerRequestBody{Reader: snapshot, route: route, autoDecompressGzip: autoDecompressGzip}, nil
+	}
+	return req
+}
+
+func providerRequestAutoDecompressGzip(req *http.Request) bool {
+	if req == nil || req.Body == nil {
+		return false
+	}
+	body, ok := req.Body.(*providerRequestBody)
+	return ok && body != nil && body.autoDecompressGzip
 }
 
 func azureClassicOpenAIBaseURL(baseURL string, baseKind azureBaseURLKind) string {
@@ -2401,15 +2557,23 @@ func applyGenericProviderAuth(req *http.Request, provider *providerRuntime) erro
 		if header == "" {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no auth header configured", provider.id)}
 		}
-		value := provider.apiKey
-		if prefix := strings.TrimSpace(provider.authPrefix); prefix != "" {
-			value = prefix + " " + value
+		value := provider.authValue
+		if value == "" {
+			value = genericProviderAuthValue(provider.authPrefix, provider.apiKey)
 		}
 		req.Header.Set(header, value)
 		return nil
 	default:
 		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported auth type %q", provider.authType)}
 	}
+}
+
+func genericProviderAuthValue(prefix, apiKey string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return apiKey
+	}
+	return prefix + " " + apiKey
 }
 
 type providerRouteContextKey struct{}
@@ -2457,27 +2621,62 @@ func providerRouteFromResponse(resp *http.Response) (providerRouteInfo, bool) {
 	if resp == nil || resp.Request == nil {
 		return providerRouteInfo{}, false
 	}
-	route, ok := resp.Request.Context().Value(providerRouteContextKey{}).(providerRouteInfo)
+	return providerRouteFromRequest(resp.Request)
+}
+
+func providerRouteFromRequest(req *http.Request) (providerRouteInfo, bool) {
+	if req == nil {
+		return providerRouteInfo{}, false
+	}
+	if body, ok := req.Body.(*providerRequestBody); ok && body != nil && body.route.id != "" {
+		return body.route, true
+	}
+	route, ok := req.Context().Value(providerRouteContextKey{}).(providerRouteInfo)
 	return route, ok && route.id != ""
 }
 
 func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
+	return h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, false, owners...)
+}
+
+// newProviderJSONInferenceRequest may reuse the immutable header map sealed on
+// a configured generic provider's request template. RoundTripper implementations
+// must not mutate requests, and inference retries call the factory again, so the
+// common path does not need a per-attempt header-map clone.
+func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
+	return h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
+}
+
+func (h *ProxyHandler) newProviderJSONRequestWithTemplateHeaders(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, reuseSealedHeaders bool, owners ...providerModel) (*http.Request, error) {
 	route := providerRouteInfo{id: provider.id, kind: string(provider.kind)}
 	// Route selection has already happened before URL construction or provider
 	// authentication. Publish it now so failures in either step retain the actual
 	// provider attribution even if the dynamic model catalog changes afterward.
 	publishProviderRoute(ctx, route)
+	if method == http.MethodPost && len(extraHeaders) == 0 && extraQuery == "" {
+		if template := provider.postRequestTemplates[path]; template != nil {
+			// Inference sends go directly through the RoundTripper, which preserves
+			// the request body object on resp.Request. Store route attribution there
+			// and avoid a separate context layer on this common path. General Client
+			// requests retain the context fallback because redirect bookkeeping may
+			// wrap or replace their bodies.
+			if reuseSealedHeaders && len(body) > 0 {
+				return requestFromProviderTemplate(ctx, template, body, reuseSealedHeaders, route, provider.postRequestAutoGzip), nil
+			}
+			ctx = context.WithValue(ctx, providerRouteContextKey{}, route)
+			return requestFromProviderTemplate(ctx, template, body, reuseSealedHeaders, route, provider.postRequestAutoGzip), nil
+		}
+	}
+	ctx = context.WithValue(ctx, providerRouteContextKey{}, route)
+
 	fullURL, err := h.providerRequestURL(provider, path, extraQuery, owners...)
 	if err != nil {
 		return nil, err
 	}
-
 	var bodyReader io.Reader
 	if len(body) > 0 {
 		bodyReader = bytes.NewReader(body)
 	}
-
-	ctx = context.WithValue(ctx, providerRouteContextKey{}, route)
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
 		return nil, err

@@ -610,6 +610,9 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	if provider.apiKey != "generic-key" {
 		t.Fatalf("apiKey = %q, want generic-key", provider.apiKey)
 	}
+	if provider.authValue != "Token generic-key" {
+		t.Fatalf("authValue = %q, want Token generic-key", provider.authValue)
+	}
 	if got := provider.extraHeaders.Get("X-Provider"); got != "local" {
 		t.Fatalf("extra header X-Provider = %q, want local", got)
 	}
@@ -619,6 +622,12 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	if provider.modelDiscovery != providerModelDiscoveryOllama {
 		t.Fatalf("modelDiscovery = %q, want ollama", provider.modelDiscovery)
 	}
+	if !provider.postRequestAutoGzip {
+		t.Fatal("postRequestAutoGzip = false, want automatic gzip for sealed provider requests")
+	}
+	if got := provider.postRequestTemplates[providerEndpointChatCompletions].Header.Get("Accept-Encoding"); got != "gzip" {
+		t.Fatalf("sealed request Accept-Encoding = %q, want gzip", got)
+	}
 
 	model := provider.staticModels["local-chat"]
 	if model.publicID != "local-chat" || model.upstreamModel != "llama3.2:latest" {
@@ -626,6 +635,116 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	}
 	if !reflect.DeepEqual(model.supportedEndpoints, []string{"/chat/completions"}) {
 		t.Fatalf("default openai-compatible endpoints = %v, want [/chat/completions]", model.supportedEndpoints)
+	}
+
+	body := []byte(`{"model":"local-chat"}`)
+	first, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+	if err != nil {
+		t.Fatalf("newProviderJSONRequest() error = %v", err)
+	}
+	if got := first.URL.String(); got != "http://localhost:1234/v1/chat/completions" {
+		t.Fatalf("request URL = %q, want configured Chat URL", got)
+	}
+	if got := first.Header.Get("X-Api-Key"); got != "Token generic-key" {
+		t.Fatalf("request X-Api-Key = %q, want Token generic-key", got)
+	}
+	if got := first.Header.Get("X-Provider"); got != "local" {
+		t.Fatalf("request X-Provider = %q, want local", got)
+	}
+	if first.GetBody == nil {
+		t.Fatal("request GetBody = nil, want replayable configured-provider body")
+	}
+	replay, err := first.GetBody()
+	if err != nil {
+		t.Fatalf("request GetBody() error = %v", err)
+	}
+	replayed, err := io.ReadAll(replay)
+	_ = replay.Close()
+	if err != nil || !reflect.DeepEqual(replayed, body) {
+		t.Fatalf("replayed body = %q, %v; want %q", replayed, err, body)
+	}
+
+	first.Header.Set("X-Api-Key", "mutated")
+	second, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+	if err != nil {
+		t.Fatalf("second newProviderJSONRequest() error = %v", err)
+	}
+	if got := second.Header.Get("X-Api-Key"); got != "Token generic-key" {
+		t.Fatalf("second request X-Api-Key = %q after first mutation, want Token generic-key", got)
+	}
+
+	inference, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+	if err != nil {
+		t.Fatalf("newProviderJSONInferenceRequest() error = %v", err)
+	}
+	if got := inference.Header.Get("Accept-Encoding"); got != "gzip" {
+		t.Fatalf("inference Accept-Encoding = %q, want gzip", got)
+	}
+	if !providerRequestAutoDecompressGzip(inference) {
+		t.Fatal("inference request did not retain automatic gzip response marker")
+	}
+	if inference.GetBody != nil {
+		t.Fatal("inference request GetBody is non-nil; transport replay must remain disabled")
+	}
+	inferenceBody, err := io.ReadAll(inference.Body)
+	_ = inference.Body.Close()
+	if err != nil || !reflect.DeepEqual(inferenceBody, body) {
+		t.Fatalf("inference body = %q, %v; want %q", inferenceBody, err, body)
+	}
+
+	bodyless, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, nil, nil, "")
+	if err != nil {
+		t.Fatalf("bodyless newProviderJSONInferenceRequest() error = %v", err)
+	}
+	if got := bodyless.Header.Get("Accept-Encoding"); got != "" {
+		t.Fatalf("bodyless inference Accept-Encoding = %q, want transport-managed encoding", got)
+	}
+	if bodyless.Body != nil || bodyless.ContentLength != 0 || providerRequestAutoDecompressGzip(bodyless) {
+		t.Fatalf("bodyless inference = Body %T, ContentLength %d, auto-gzip %t; want nil, 0, false", bodyless.Body, bodyless.ContentLength, providerRequestAutoDecompressGzip(bodyless))
+	}
+	if got := provider.postRequestTemplates[providerEndpointChatCompletions].Header.Get("Accept-Encoding"); got != "gzip" {
+		t.Fatalf("bodyless request mutated sealed template Accept-Encoding to %q", got)
+	}
+}
+
+func TestBuildProvidersGenericRequestPreservesOperatorAcceptEncoding(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:             "operator-encoding",
+			Type:           "openai-compatible",
+			Default:        true,
+			BaseURL:        "http://localhost:1234",
+			AuthType:       "none",
+			ExtraHeaders:   map[string]string{"Accept-Encoding": "identity"},
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID: "local-chat",
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	provider := providers["operator-encoding"]
+	if provider == nil {
+		t.Fatal("expected operator-encoding provider")
+	}
+	if provider.postRequestAutoGzip {
+		t.Fatal("postRequestAutoGzip = true with operator-supplied Accept-Encoding")
+	}
+
+	for _, body := range [][]byte{[]byte(`{"model":"local-chat"}`), nil} {
+		req, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+		if err != nil {
+			t.Fatalf("newProviderJSONInferenceRequest(body=%q) error = %v", body, err)
+		}
+		if got := req.Header.Get("Accept-Encoding"); got != "identity" {
+			t.Fatalf("Accept-Encoding = %q, want operator value identity", got)
+		}
+		if providerRequestAutoDecompressGzip(req) {
+			t.Fatal("operator-supplied encoding enabled proxy gzip decompression")
+		}
 	}
 }
 

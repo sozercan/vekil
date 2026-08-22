@@ -28,11 +28,79 @@ func TestNewProxyHandlerInitializesLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProxyHandler() error = %v", err)
 	}
-	if handler.lifecycleCtx == nil || handler.lifecycleCancel == nil {
+	if handler.lifecycleCtx == nil || handler.retryTrackedLifecycleCtx == nil || handler.lifecycleCancel == nil {
 		t.Fatal("NewProxyHandler() did not initialize the lifecycle context")
 	}
 	if err := handler.lifecycleCtx.Err(); err != nil {
 		t.Fatalf("new lifecycle context error = %v, want active context", err)
+	}
+	if !isRetryStatsTracked(handler.retryTrackedLifecycleCtx) {
+		t.Fatal("tracked lifecycle context is missing its retry-stats marker")
+	}
+}
+
+func TestRequestBodyLifecycleBindingPreservesFirstCause(t *testing.T) {
+	t.Run("client cancellation before shutdown", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+		req.Body = &fixedErrorReadCloser{err: context.Canceled}
+		binding := handler.BindRequestBodyToLifecycle(req, nil)
+		defer binding.Release()
+
+		cancel()
+		handler.BeginShutdown()
+		_, err := req.Body.Read(make([]byte, 1))
+		if !errors.Is(err, context.Canceled) || errors.Is(err, errProxyLifecycleShutdown) {
+			t.Fatalf("Read() error = %v, want client context cancellation", err)
+		}
+	})
+
+	t.Run("shutdown before client cancellation", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+		req.Body = &fixedErrorReadCloser{err: context.Canceled}
+		binding := handler.BindRequestBodyToLifecycle(req, nil)
+		defer binding.Release()
+
+		handler.BeginShutdown()
+		cancel()
+		_, err := req.Body.Read(make([]byte, 1))
+		if !errors.Is(err, errProxyLifecycleShutdown) {
+			t.Fatalf("Read() error = %v, want lifecycle shutdown cause", err)
+		}
+	})
+
+	t.Run("completed binding before shutdown", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Body = &fixedErrorReadCloser{err: context.Canceled}
+		binding := handler.BindRequestBodyToLifecycle(req, nil)
+		binding.Release()
+
+		handler.BeginShutdown()
+		_, err := req.Body.Read(make([]byte, 1))
+		if !errors.Is(err, context.Canceled) || errors.Is(err, errProxyLifecycleShutdown) {
+			t.Fatalf("Read() error = %v, want completed binding to retain original error", err)
+		}
+	})
+}
+
+func TestRequestBodyLifecycleBindingReleaseAndRecycleRestoresOriginalBody(t *testing.T) {
+	handler := &ProxyHandler{}
+	original := io.NopCloser(strings.NewReader("request body"))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = original
+	binding := handler.BindRequestBodyToLifecycle(req, nil)
+	if req.Body == original {
+		t.Fatal("BindRequestBodyToLifecycle() did not install a wrapper")
+	}
+
+	binding.ReleaseAndRecycle(req)
+	if req.Body != original {
+		t.Fatal("ReleaseAndRecycle() did not restore the original request body")
 	}
 }
 

@@ -17,7 +17,7 @@ func toolExecutionScopeFromHeaders(headers http.Header) string {
 	if headers == nil {
 		return ""
 	}
-	if sessionID := strings.TrimSpace(headers.Get("session_id")); sessionID != "" {
+	if sessionID := strings.TrimSpace(headers.Get("Session_id")); sessionID != "" {
 		return "session:" + sessionID
 	}
 	parentThread := strings.TrimSpace(headers.Get("X-Codex-Parent-Thread-Id"))

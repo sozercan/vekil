@@ -258,12 +258,15 @@ type ProxyHandler struct {
 	draining                         atomic.Bool
 	lifecycleOnce                    sync.Once
 	lifecycleCtx                     context.Context
+	retryTrackedLifecycleCtx         context.Context
 	lifecycleCancel                  context.CancelCauseFunc
 	shutdownSequenceOnce             sync.Once
 	shutdownSequence                 atomic.Uint64
 	lifecycleWorkersMu               sync.Mutex
 	lifecycleWorkers                 sync.WaitGroup
 	lifecycleWorkersActive           int
+	lifecycleRequestBodiesMu         sync.Mutex
+	lifecycleRequestBodies           map[*lifecycleRequestBody]struct{}
 	startupAuthenticationPending     atomic.Bool
 	dynamicProviderValidationPending atomic.Bool
 	azureIdentityTokenSourceFactory  azureIdentityTokenSourceFactory
@@ -314,6 +317,7 @@ func (h *ProxyHandler) initializeLifecycle() {
 	}
 	h.lifecycleOnce.Do(func() {
 		h.lifecycleCtx, h.lifecycleCancel = context.WithCancelCause(context.Background())
+		h.retryTrackedLifecycleCtx = context.WithValue(h.lifecycleCtx, retryStatsTrackedContextKey{}, true)
 	})
 }
 
@@ -323,6 +327,14 @@ func (h *ProxyHandler) lifecycleContext() context.Context {
 	}
 	h.initializeLifecycle()
 	return h.lifecycleCtx
+}
+
+func (h *ProxyHandler) lifecycleContextForRetryStats(tracked bool) context.Context {
+	if !tracked || h == nil {
+		return h.lifecycleContext()
+	}
+	h.initializeLifecycle()
+	return h.retryTrackedLifecycleCtx
 }
 
 func (h *ProxyHandler) responsesChatReplayStore() *responsesChatReplayStore {
@@ -366,6 +378,7 @@ func (h *ProxyHandler) BeginShutdown() {
 		})
 	})
 	h.draining.Store(true)
+	h.cancelLifecycleRequestBodies()
 	h.initializeLifecycle()
 	h.lifecycleCancel(errProxyLifecycleShutdown)
 	if h.client != nil {
@@ -383,53 +396,100 @@ func (h *ProxyHandler) upstreamShutdownStarted() bool {
 	return h.ShuttingDown()
 }
 
+var lifecycleRequestBodyPool = sync.Pool{New: func() any {
+	return new(lifecycleRequestBody)
+}}
+
 // BindRequestBodyToLifecycle makes a request body read interruptible by proxy
-// shutdown without changing the inbound request context. The separate cause
-// context preserves whether client cancellation or lifecycle shutdown happened
+// shutdown without changing the inbound request context. A small atomic cause
+// state preserves whether client cancellation or lifecycle shutdown happened
 // first, so a client disconnect racing shutdown is not rewritten as a local 503.
-func (h *ProxyHandler) BindRequestBodyToLifecycle(r *http.Request, forceClose func()) func() {
+func (h *ProxyHandler) BindRequestBodyToLifecycle(r *http.Request, forceClose io.Closer) RequestBodyLifecycleBinding {
 	if h == nil || r == nil || r.Body == nil || r.Body == http.NoBody {
-		return func() {}
+		return RequestBodyLifecycleBinding{}
 	}
 
-	causeCtx, cancelCause := context.WithCancelCause(r.Context())
-	body := &lifecycleRequestBody{ReadCloser: r.Body, causeCtx: causeCtx}
+	body := lifecycleRequestBodyPool.Get().(*lifecycleRequestBody)
+	*body = lifecycleRequestBody{
+		ReadCloser: r.Body,
+		requestCtx: r.Context(),
+		owner:      h,
+		forceClose: forceClose,
+	}
 	r.Body = body
-
-	cancelForShutdown := func() {
-		cancelCause(errProxyLifecycleShutdown)
-		if !body.complete.Load() && forceClose != nil {
-			forceClose()
-			return
-		}
-		_ = body.Close()
+	if !h.registerLifecycleRequestBody(body) {
+		body.cancelForShutdown()
 	}
-	stopLifecycle := context.AfterFunc(h.lifecycleContext(), cancelForShutdown)
-	if h.ShuttingDown() {
-		cancelForShutdown()
-	}
+	return RequestBodyLifecycleBinding{body: body}
+}
 
-	return func() {
-		stopLifecycle()
-		cancelCause(context.Canceled)
+// RequestBodyLifecycleBinding releases a request body from shutdown tracking.
+// The value handle avoids allocating a closure on every admitted HTTP request.
+type RequestBodyLifecycleBinding struct {
+	body *lifecycleRequestBody
+}
+
+// Release stops lifecycle tracking without closing the underlying request body.
+func (b RequestBodyLifecycleBinding) Release() {
+	if b.body != nil {
+		b.body.release()
 	}
 }
 
+// ReleaseAndRecycle finishes server-owned request-body tracking after the
+// handler has returned. It restores the original body on the request before
+// pooling the wrapper so net/http can retain its ordinary body-close behavior.
+// A wrapper captured by the shutdown cancellation snapshot is deliberately not
+// pooled because that snapshot may still call cancelForShutdown asynchronously.
+func (b RequestBodyLifecycleBinding) ReleaseAndRecycle(r *http.Request) {
+	body := b.body
+	if body == nil {
+		return
+	}
+	if r != nil && r.Body == body {
+		r.Body = body.ReadCloser
+	}
+	body.release()
+	if body.shutdownScheduled.Load() || !body.recycled.CompareAndSwap(false, true) {
+		return
+	}
+	*body = lifecycleRequestBody{}
+	lifecycleRequestBodyPool.Put(body)
+}
+
+type lifecycleRequestBodyCause uint32
+
+const (
+	lifecycleRequestBodyCauseOpen lifecycleRequestBodyCause = iota
+	lifecycleRequestBodyCauseOther
+	lifecycleRequestBodyCauseShutdown
+)
+
 type lifecycleRequestBody struct {
 	io.ReadCloser
-	causeCtx context.Context
-	closeMu  sync.Mutex
-	closed   bool
-	closeErr error
-	complete atomic.Bool
+	requestCtx        context.Context
+	owner             *ProxyHandler
+	forceClose        io.Closer
+	closeMu           sync.Mutex
+	closed            bool
+	closeErr          error
+	complete          atomic.Bool
+	released          atomic.Bool
+	recycled          atomic.Bool
+	shutdownScheduled atomic.Bool
+	cause             atomic.Uint32
 }
 
 func (b *lifecycleRequestBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if errors.Is(err, io.EOF) {
 		b.complete.Store(true)
+		b.release()
 	}
-	if err != nil && b.causeCtx != nil && errors.Is(context.Cause(b.causeCtx), errProxyLifecycleShutdown) {
+	if err != nil {
+		b.recordClientCancellation()
+	}
+	if err != nil && lifecycleRequestBodyCause(b.cause.Load()) == lifecycleRequestBodyCauseShutdown {
 		return n, errProxyLifecycleShutdown
 	}
 	return n, err
@@ -440,12 +500,93 @@ func (b *lifecycleRequestBody) Close() error {
 		return nil
 	}
 	b.closeMu.Lock()
-	defer b.closeMu.Unlock()
 	if !b.closed {
 		b.closed = true
 		b.closeErr = b.ReadCloser.Close()
 	}
-	return b.closeErr
+	err := b.closeErr
+	b.closeMu.Unlock()
+	b.release()
+	return err
+}
+
+func (b *lifecycleRequestBody) release() {
+	if b == nil || !b.released.CompareAndSwap(false, true) {
+		return
+	}
+	b.cause.CompareAndSwap(uint32(lifecycleRequestBodyCauseOpen), uint32(lifecycleRequestBodyCauseOther))
+	if b.owner != nil {
+		b.owner.unregisterLifecycleRequestBody(b)
+	}
+}
+
+func (b *lifecycleRequestBody) recordClientCancellation() {
+	if b == nil || b.requestCtx == nil || b.requestCtx.Err() == nil {
+		return
+	}
+	b.cause.CompareAndSwap(uint32(lifecycleRequestBodyCauseOpen), uint32(lifecycleRequestBodyCauseOther))
+}
+
+func (b *lifecycleRequestBody) cancelForShutdown() {
+	if b == nil {
+		return
+	}
+	b.shutdownScheduled.Store(true)
+	if b.released.Load() {
+		return
+	}
+	b.recordClientCancellation()
+	b.cause.CompareAndSwap(uint32(lifecycleRequestBodyCauseOpen), uint32(lifecycleRequestBodyCauseShutdown))
+	if b.released.Load() {
+		return
+	}
+	if !b.complete.Load() && b.forceClose != nil {
+		_ = b.forceClose.Close()
+		return
+	}
+	_ = b.Close()
+}
+
+func (h *ProxyHandler) registerLifecycleRequestBody(body *lifecycleRequestBody) bool {
+	if h == nil || body == nil {
+		return false
+	}
+	h.lifecycleRequestBodiesMu.Lock()
+	defer h.lifecycleRequestBodiesMu.Unlock()
+	if h.ShuttingDown() {
+		return false
+	}
+	if h.lifecycleRequestBodies == nil {
+		h.lifecycleRequestBodies = make(map[*lifecycleRequestBody]struct{})
+	}
+	h.lifecycleRequestBodies[body] = struct{}{}
+	return true
+}
+
+func (h *ProxyHandler) unregisterLifecycleRequestBody(body *lifecycleRequestBody) {
+	if h == nil || body == nil {
+		return
+	}
+	h.lifecycleRequestBodiesMu.Lock()
+	delete(h.lifecycleRequestBodies, body)
+	h.lifecycleRequestBodiesMu.Unlock()
+}
+
+func (h *ProxyHandler) cancelLifecycleRequestBodies() {
+	if h == nil {
+		return
+	}
+	h.lifecycleRequestBodiesMu.Lock()
+	bodies := make([]*lifecycleRequestBody, 0, len(h.lifecycleRequestBodies))
+	for body := range h.lifecycleRequestBodies {
+		body.shutdownScheduled.Store(true)
+		bodies = append(bodies, body)
+	}
+	h.lifecycleRequestBodies = nil
+	h.lifecycleRequestBodiesMu.Unlock()
+	for _, body := range bodies {
+		body.cancelForShutdown()
+	}
 }
 
 func (h *ProxyHandler) beginLifecycleWorker() bool {
@@ -1088,8 +1229,12 @@ func sanitizeProxySummaryText(text string) string {
 }
 
 func copyPassthroughHeaders(dst, src http.Header) {
-	connectionTokens := make(map[string]struct{})
-	for _, value := range src.Values("Connection") {
+	var connectionTokens map[string]struct{}
+	connectionValues := src.Values("Connection")
+	if len(connectionValues) > 0 {
+		connectionTokens = make(map[string]struct{})
+	}
+	for _, value := range connectionValues {
 		for _, token := range strings.Split(value, ",") {
 			token = http.CanonicalHeaderKey(strings.TrimSpace(token))
 			if token != "" {
@@ -1106,10 +1251,14 @@ func copyPassthroughHeaders(dst, src http.Header) {
 		if _, skip := connectionTokens[canonicalKey]; skip {
 			continue
 		}
-		dst.Del(key)
-		for _, value := range values {
-			dst.Add(key, value)
+		if len(values) == 0 {
+			delete(dst, canonicalKey)
+			continue
 		}
+		// Upstream response headers are immutable after receipt. Borrow their
+		// value slices with capped capacity so a later Header.Add allocates instead
+		// of modifying the upstream slice in place.
+		dst[canonicalKey] = values[:len(values):len(values)]
 	}
 }
 
@@ -2024,6 +2173,83 @@ func writeOpenAIErrorWithDetails(w http.ResponseWriter, status int, message, err
 // the limit, it returns an error so callers can return HTTP 413.
 func readBody(r *http.Request) ([]byte, error) {
 	return readBodyWithLimit(r, maxRequestBodySize)
+}
+
+const (
+	tinyRequestBodyBufferSize  = 512
+	smallRequestBodyBufferSize = 4 << 10
+)
+
+var tinyRequestBodyBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, tinyRequestBodyBufferSize)
+	return &buffer
+}}
+
+var smallRequestBodyBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, smallRequestBodyBufferSize)
+	return &buffer
+}}
+
+// readBodyBorrowed reads an ordinary small request into a pooled buffer. The
+// caller must release a non-nil pooled buffer only after it has finished using
+// body. Unknown-length, compressed, and larger requests retain the general
+// bounded reader below.
+func readBodyBorrowed(r *http.Request) ([]byte, *[]byte, error) {
+	if r == nil || r.Body == nil || r.Header.Get("Content-Encoding") != "" ||
+		r.ContentLength < 0 || r.ContentLength >= smallRequestBodyBufferSize ||
+		r.ContentLength > maxRequestBodySize {
+		body, err := readBody(r)
+		return body, nil, err
+	}
+
+	var pooled *[]byte
+	if r.ContentLength < tinyRequestBodyBufferSize {
+		pooled = tinyRequestBodyBufferPool.Get().(*[]byte)
+	} else {
+		pooled = smallRequestBodyBufferPool.Get().(*[]byte)
+	}
+	buffer := (*pooled)[:int(r.ContentLength)+1]
+	n, err := io.ReadFull(r.Body, buffer)
+	switch err {
+	case nil:
+		// The body exceeded its advertised length. Continue through the normal
+		// request cap so a mismatched Content-Length cannot truncate it.
+		remaining := maxRequestBodySize + 1 - int64(len(buffer))
+		rest, readErr := io.ReadAll(io.LimitReader(r.Body, remaining))
+		body := append(buffer, rest...)
+		if readErr != nil {
+			return nil, pooled, &requestBodyError{statusCode: http.StatusBadRequest, err: readErr}
+		}
+		if int64(len(body)) > maxRequestBodySize {
+			return nil, pooled, &requestBodyError{
+				statusCode: http.StatusRequestEntityTooLarge,
+				err:        fmt.Errorf("request body too large (max %d bytes)", maxRequestBodySize),
+			}
+		}
+		return body, pooled, nil
+	case io.EOF, io.ErrUnexpectedEOF:
+		return buffer[:n], pooled, nil
+	default:
+		return nil, pooled, &requestBodyError{statusCode: http.StatusBadRequest, err: err}
+	}
+}
+
+func releaseSmallRequestBodyBuffer(buffer *[]byte) {
+	if buffer == nil {
+		return
+	}
+	switch cap(*buffer) {
+	case tinyRequestBodyBufferSize:
+		full := (*buffer)[:tinyRequestBodyBufferSize]
+		clear(full)
+		*buffer = full
+		tinyRequestBodyBufferPool.Put(buffer)
+	case smallRequestBodyBufferSize:
+		full := (*buffer)[:smallRequestBodyBufferSize]
+		clear(full)
+		*buffer = full
+		smallRequestBodyBufferPool.Put(buffer)
+	}
 }
 
 // readBodyWithLimit reads and transparently decompresses the request body up to

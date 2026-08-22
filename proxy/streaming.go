@@ -36,10 +36,14 @@ func (r *lifecycleAwareReadCloser) Read(p []byte) (int, error) {
 	// context.Canceled. Consult the request context only for that exact class of
 	// read failure; EOF, resets, and deadlines remain provider failures even if
 	// shutdown races immediately afterward.
-	if err != nil && errors.Is(err, context.Canceled) && r.ctx != nil && errors.Is(context.Cause(r.ctx), errProxyLifecycleShutdown) {
+	if lifecycleCancellationAtReadFailure(r.ctx, err) {
 		r.cancellationAtFailure.Store(true)
 	}
 	return n, err
+}
+
+func lifecycleCancellationAtReadFailure(ctx context.Context, err error) bool {
+	return err != nil && errors.Is(err, context.Canceled) && ctx != nil && errors.Is(context.Cause(ctx), errProxyLifecycleShutdown)
 }
 
 func (r *lifecycleAwareReadCloser) canceledAtFailure() bool {

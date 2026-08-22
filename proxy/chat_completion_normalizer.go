@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -284,6 +285,342 @@ func normalizeOpenAIChatCompletionResponse(body []byte, requestedModel string, n
 		return nil, false, err
 	}
 	return out, true, nil
+}
+
+// inspectCanonicalOpenAIChatCompletionResponse recognizes the common case where
+// an upstream already returned a complete Chat Completions response. It uses an
+// exact-key token walk so it preserves the map-based normalizer's casing and
+// duplicate-key semantics while avoiding nested map allocations. Any ambiguous
+// or provider-specific shape falls back to the full normalizer.
+func inspectCanonicalOpenAIChatCompletionResponse(body []byte, requestedModel string) (models.OpenAIUsage, bool) {
+	if usage, ok := inspectCanonicalOpenAIChatCompletionResponseFast(body, requestedModel); ok {
+		return usage, true
+	}
+	usage, ok := inspectCanonicalOpenAIChatCompletionResponseWithDecoder(body, requestedModel)
+	if !ok || usage == nil {
+		return models.OpenAIUsage{}, false
+	}
+	return *usage, true
+}
+
+func inspectCanonicalOpenAIChatCompletionResponseWithDecoder(body []byte, requestedModel string) (*models.OpenAIUsage, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+
+	root, err := decoder.Token()
+	if err != nil {
+		return nil, false
+	}
+	if delim, ok := root.(json.Delim); !ok || delim != '{' {
+		return nil, false
+	}
+
+	idOK := false
+	objectOK := false
+	createdOK := false
+	modelOK := strings.TrimSpace(requestedModel) == ""
+	choicesOK := false
+	usageOK := false
+	var usage *models.OpenAIUsage
+
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, false
+		}
+
+		switch key {
+		case "error":
+			// Successful 2xx error envelopes deliberately bypass normalization.
+			// They are uncommon and retain the existing map-based path.
+			return nil, false
+		case "id":
+			idOK = decodeCanonicalNonEmptyString(decoder)
+			if !idOK {
+				return nil, false
+			}
+		case "object":
+			objectOK = decodeCanonicalNonEmptyString(decoder)
+			if !objectOK {
+				return nil, false
+			}
+		case "created":
+			createdOK = decodeCanonicalNonNullScalar(decoder)
+			if !createdOK {
+				return nil, false
+			}
+		case "model":
+			modelOK = decodeCanonicalNonEmptyString(decoder)
+			if !modelOK {
+				return nil, false
+			}
+		case "choices":
+			choicesOK = inspectCanonicalOpenAIChatChoices(decoder)
+			if !choicesOK {
+				return nil, false
+			}
+		case "usage":
+			usage, usageOK = inspectCanonicalOpenAIUsage(decoder)
+			if !usageOK {
+				return nil, false
+			}
+		default:
+			if err := skipJSONValue(decoder); err != nil {
+				return nil, false
+			}
+		}
+	}
+
+	end, err := decoder.Token()
+	if err != nil {
+		return nil, false
+	}
+	if delim, ok := end.(json.Delim); !ok || delim != '}' {
+		return nil, false
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, false
+	}
+	if !idOK || !objectOK || !createdOK || !modelOK || !choicesOK || !usageOK {
+		return nil, false
+	}
+	return usage, true
+}
+
+func decodeCanonicalNonEmptyString(decoder *json.Decoder) bool {
+	token, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	value, ok := token.(string)
+	return ok && strings.TrimSpace(value) != ""
+}
+
+func decodeCanonicalNonNullScalar(decoder *json.Decoder) bool {
+	token, err := decoder.Token()
+	if err != nil || token == nil {
+		return false
+	}
+	_, delimited := token.(json.Delim)
+	return !delimited
+}
+
+func inspectCanonicalOpenAIUsage(decoder *json.Decoder) (*models.OpenAIUsage, bool) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, false
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return nil, false
+	}
+
+	usage := &models.OpenAIUsage{}
+	promptOK := false
+	completionOK := false
+	totalOK := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, false
+		}
+
+		switch key {
+		case "prompt_tokens":
+			usage.PromptTokens, promptOK = decodeCanonicalInt(decoder)
+			if !promptOK {
+				return nil, false
+			}
+		case "completion_tokens":
+			usage.CompletionTokens, completionOK = decodeCanonicalInt(decoder)
+			if !completionOK {
+				return nil, false
+			}
+		case "total_tokens":
+			usage.TotalTokens, totalOK = decodeCanonicalInt(decoder)
+			if !totalOK {
+				return nil, false
+			}
+		case "prompt_tokens_details":
+			var details *models.OpenAIPromptTokensDetails
+			if err := decoder.Decode(&details); err != nil {
+				return nil, false
+			}
+			usage.PromptTokensDetails = details
+		case "completion_tokens_details":
+			var details *models.OpenAICompletionTokensDetails
+			if err := decoder.Decode(&details); err != nil {
+				return nil, false
+			}
+			usage.CompletionTokensDetails = details
+		default:
+			if err := skipJSONValue(decoder); err != nil {
+				return nil, false
+			}
+		}
+	}
+
+	end, err := decoder.Token()
+	if err != nil {
+		return nil, false
+	}
+	if delim, ok := end.(json.Delim); !ok || delim != '}' {
+		return nil, false
+	}
+	return usage, promptOK && completionOK && totalOK
+}
+
+func decodeCanonicalInt(decoder *json.Decoder) (int, bool) {
+	token, err := decoder.Token()
+	if err != nil {
+		return 0, false
+	}
+	number, ok := token.(json.Number)
+	if !ok {
+		return 0, false
+	}
+	value, err := number.Int64()
+	if err != nil || int64(int(value)) != value {
+		return 0, false
+	}
+	return int(value), true
+}
+
+func inspectCanonicalOpenAIChatChoices(decoder *json.Decoder) bool {
+	token, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '[' {
+		return false
+	}
+
+	for decoder.More() {
+		choiceToken, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		if delim, ok := choiceToken.(json.Delim); !ok || delim != '{' {
+			return false
+		}
+
+		indexOK := false
+		finishReasonOK := false
+		messageOK := false
+		providerToolShape := false
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return false
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return false
+			}
+
+			switch key {
+			case "index":
+				indexOK = decodeCanonicalNonNullScalar(decoder)
+				if !indexOK {
+					return false
+				}
+			case "finish_reason":
+				finishReasonOK = decodeCanonicalNonEmptyString(decoder)
+				if !finishReasonOK {
+					return false
+				}
+			case "message":
+				messageOK = inspectCanonicalOpenAIChatMessage(decoder)
+				if !messageOK {
+					return false
+				}
+			case "tool_calls", "function_call":
+				providerToolShape = true
+				if err := skipJSONValue(decoder); err != nil {
+					return false
+				}
+			default:
+				if err := skipJSONValue(decoder); err != nil {
+					return false
+				}
+			}
+		}
+
+		end, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		if delim, ok := end.(json.Delim); !ok || delim != '}' {
+			return false
+		}
+		if !indexOK || !finishReasonOK || !messageOK || providerToolShape {
+			return false
+		}
+	}
+
+	end, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	if delim, ok := end.(json.Delim); !ok || delim != ']' {
+		return false
+	}
+	return true
+}
+
+func inspectCanonicalOpenAIChatMessage(decoder *json.Decoder) bool {
+	token, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return false
+	}
+
+	roleOK := false
+	contentOK := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return false
+		}
+		switch key {
+		case "role":
+			roleOK = decodeCanonicalNonEmptyString(decoder)
+			if !roleOK {
+				return false
+			}
+		case "content":
+			contentOK = decodeCanonicalNonNullScalar(decoder)
+			if !contentOK {
+				return false
+			}
+		default:
+			if err := skipJSONValue(decoder); err != nil {
+				return false
+			}
+		}
+	}
+
+	end, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	if delim, ok := end.(json.Delim); !ok || delim != '}' {
+		return false
+	}
+	return roleOK && contentOK
 }
 
 func normalizeOpenAIChatCompletionStruct(resp *models.OpenAIResponse, requestedModel string) {

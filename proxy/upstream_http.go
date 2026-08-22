@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sozercan/vekil/logger"
@@ -17,7 +18,26 @@ import (
 )
 
 func (h *ProxyHandler) newLifecycleUpstreamContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	causeCtx, cancelCause := context.WithCancelCause(h.lifecycleContext())
+	return h.newLifecycleUpstreamContextFrom(h.lifecycleContext(), timeout)
+}
+
+func (h *ProxyHandler) newLifecycleUpstreamContextFrom(lifecycle context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if lifecycle == nil {
+		lifecycle = context.Background()
+	}
+	if !h.ShuttingDown() {
+		ctx, cancel := context.WithTimeout(lifecycle, timeout)
+		// BeginShutdown publishes draining before canceling the lifecycle root.
+		// Keep the ordinary path to one child context, but recheck after creating
+		// it so a context installed in that ordering window still returns with the
+		// proxy-shutdown cause below.
+		if !h.ShuttingDown() || lifecycle.Err() != nil {
+			return ctx, cancel
+		}
+		cancel()
+	}
+
+	causeCtx, cancelCause := context.WithCancelCause(lifecycle)
 	ctx, cancelTimeout := context.WithTimeout(causeCtx, timeout)
 	// BeginShutdown publishes draining before canceling the lifecycle root so
 	// admission closes first. Close that tiny ordering window for children
@@ -54,11 +74,8 @@ func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, 
 	if streaming {
 		timeout = h.effectiveStreamingUpstreamTimeout()
 	}
-	ctx, cancel := h.newLifecycleUpstreamContext(timeout)
-	if isRetryStatsTracked(inbound) {
-		ctx = markRetryStatsTracked(ctx)
-	}
-	return ctx, cancel
+	lifecycle := h.lifecycleContextForRetryStats(isRetryStatsTracked(inbound))
+	return h.newLifecycleUpstreamContextFrom(lifecycle, timeout)
 }
 
 func upstreamStatusCode(err error, fallback int) int {
@@ -74,6 +91,9 @@ func upstreamStatusCode(err error, fallback int) int {
 }
 
 func extractRequestModel(body []byte) string {
+	if model, _, ok := extractTopLevelJSONStringFast(body, "model", false); ok {
+		return model
+	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	tok, err := dec.Token()
 	if err != nil {
@@ -202,6 +222,17 @@ func prepareResolvedProviderRequestBody(
 	provider *providerRuntime,
 	owner providerModel,
 ) ([]byte, error) {
+	return prepareResolvedProviderRequestBodyWithOwnership(body, requestModel, endpoint, provider, owner, false)
+}
+
+func prepareResolvedProviderRequestBodyWithOwnership(
+	body []byte,
+	requestModel string,
+	endpoint string,
+	provider *providerRuntime,
+	owner providerModel,
+	mutable bool,
+) ([]byte, error) {
 	if provider == nil {
 		return nil, fmt.Errorf("provider is required")
 	}
@@ -209,12 +240,39 @@ func prepareResolvedProviderRequestBody(
 	rewrittenBody := body
 	if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
 		var err error
-		rewrittenBody, _, err = rewriteRequestModelForProviderFromModel(body, requestModel, owner.upstreamModel)
+		if mutable {
+			rewrittenBody, _, err = rewriteRequestModelForProviderFromModelJSONInPlace(body, requestModel, owner.upstreamModel, owner.upstreamModelJSON)
+		} else {
+			rewrittenBody, _, err = rewriteRequestModelForProviderFromModelJSON(body, requestModel, owner.upstreamModel, owner.upstreamModelJSON)
+		}
 		if err != nil {
 			return nil, err
 		}
 	}
 	return applyProviderModelRequestPolicy(rewrittenBody, endpoint, owner), nil
+}
+
+func rewriteRequestModelForProviderFromModelJSONInPlace(body []byte, currentModel string, upstreamModel string, rawModel json.RawMessage) ([]byte, bool, error) {
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	if upstreamModel == "" {
+		return body, false, nil
+	}
+
+	currentModel = strings.TrimSpace(currentModel)
+	if currentModel == "" || currentModel == upstreamModel {
+		return body, false, nil
+	}
+	if len(rawModel) == 0 {
+		var err error
+		rawModel, err = json.Marshal(upstreamModel)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	if rewritten, ok := replaceSingleTopLevelRawJSONFieldInPlace(body, "model", rawModel); ok {
+		return rewritten, true, nil
+	}
+	return rewriteRequestModelForProviderFromModelJSON(body, currentModel, upstreamModel, rawModel)
 }
 
 func applyProviderModelRequestPolicy(body []byte, endpoint string, owner providerModel) []byte {
@@ -276,6 +334,31 @@ func (h *ProxyHandler) postResolvedProviderRequest(
 	body []byte,
 	extraHeaders http.Header,
 ) (*http.Response, error) {
+	return h.postResolvedProviderRequestForModel(ctx, provider, owner, endpoint, body, extraHeaders, extractRequestModel(body))
+}
+
+func (h *ProxyHandler) postResolvedProviderRequestForModel(
+	ctx context.Context,
+	provider *providerRuntime,
+	owner providerModel,
+	endpoint string,
+	body []byte,
+	extraHeaders http.Header,
+	requestModel string,
+) (*http.Response, error) {
+	return h.postResolvedProviderRequestForModelWithOwnership(ctx, provider, owner, endpoint, body, extraHeaders, requestModel, false)
+}
+
+func (h *ProxyHandler) postResolvedProviderRequestForModelWithOwnership(
+	ctx context.Context,
+	provider *providerRuntime,
+	owner providerModel,
+	endpoint string,
+	body []byte,
+	extraHeaders http.Header,
+	requestModel string,
+	mutable bool,
+) (*http.Response, error) {
 	if provider == nil {
 		return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
 	}
@@ -283,13 +366,13 @@ func (h *ProxyHandler) postResolvedProviderRequest(
 		ctx = context.Background()
 	}
 
-	preparedBody, err := prepareResolvedProviderRequestBody(body, extractRequestModel(body), endpoint, provider, owner)
+	preparedBody, err := prepareResolvedProviderRequestBodyWithOwnership(body, requestModel, endpoint, provider, owner, mutable)
 	if err != nil {
 		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
-		return h.newProviderJSONRequest(ctx, provider, http.MethodPost, endpoint, preparedBody, extraHeaders, "", owner)
+	return h.doInferenceWithRetry(func() (*http.Request, error) {
+		return h.newProviderJSONInferenceRequest(ctx, provider, http.MethodPost, endpoint, preparedBody, extraHeaders, "", owner)
 	})
 }
 
@@ -450,8 +533,8 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 		return nil, err
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "", owner)
+	return h.doInferenceWithRetry(func() (*http.Request, error) {
+		req, err := h.newProviderJSONInferenceRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "", owner)
 		if err != nil {
 			return nil, err
 		}
@@ -506,8 +589,8 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, bod
 		}
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointMessagesCount, rewrittenBody, extraHeaders, "", owner)
+	return h.doInferenceWithRetry(func() (*http.Request, error) {
+		req, err := h.newProviderJSONInferenceRequest(ctx, provider, http.MethodPost, providerEndpointMessagesCount, rewrittenBody, extraHeaders, "", owner)
 		if err != nil {
 			return nil, err
 		}
@@ -586,6 +669,10 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) error {
 // responses fail open to passthrough behavior.
 func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string) error {
 	return writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
+		if usage, canonical := inspectCanonicalOpenAIChatCompletionResponse(body, requestedModel); canonical {
+			observeOpenAIUsage(ctx, &usage)
+			return body, false
+		}
 		out, changed, err := normalizeOpenAIChatCompletionResponse(body, requestedModel, time.Now())
 		if err != nil {
 			observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
@@ -611,6 +698,21 @@ func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context,
 // buffered whole. Oversized bodies stream through with usage stats skipped.
 const usageSniffMaxBuffer = 4 << 20 // 4 MiB
 
+const (
+	usageSniffTinyBufferSize  = 512
+	usageSniffSmallBufferSize = 4 << 10
+)
+
+var usageSniffTinyBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, usageSniffTinyBufferSize)
+	return &buffer
+}}
+
+var usageSniffSmallBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, usageSniffSmallBufferSize)
+	return &buffer
+}}
+
 // writePassthroughSniffingUsage writes a non-streaming upstream response to the
 // client while buffering at most usageSniffMaxBuffer bytes so the supplied
 // transform can sniff usage and optionally rewrite the complete body. A 2xx body
@@ -622,6 +724,11 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 	if resp == nil || resp.Body == nil {
 		return &responseBodyWriteError{err: fmt.Errorf("upstream response body is unavailable"), upstream: true}
 	}
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices &&
+		resp.ContentLength >= 0 && resp.ContentLength < usageSniffSmallBufferSize {
+		return writeSmallKnownLengthPassthroughSniffingUsage(w, resp, transform)
+	}
+
 	body := newLifecycleAwareReadCloser(resp.Body, responseRequestContext(resp))
 	defer func() { _ = body.Close() }()
 
@@ -640,7 +747,12 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 	}
 
 	// Read one byte past the cap so we can tell a full body from an oversized one.
-	prefix, err := io.ReadAll(io.LimitReader(body, usageSniffMaxBuffer+1))
+	// Known small Content-Length responses use one exact allocation instead of
+	// constructing a limiter and growing io.ReadAll's default buffer.
+	prefix, pooledBuffer, err := readUsageSniffPrefix(body, resp.ContentLength)
+	if pooledBuffer != nil {
+		defer releaseUsageSniffBuffer(pooledBuffer)
+	}
 	if body.canceledAtFailure() {
 		return newResponseBodyWriteError(resp, context.Canceled, false, true, body.canceledAtFailure())
 	}
@@ -683,6 +795,139 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 		return newResponseBodyWriteError(resp, err, true, tracked.writeErr == nil, body.canceledAtFailure())
 	}
 	return nil
+}
+
+func writeSmallKnownLengthPassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, transform func([]byte) ([]byte, bool)) error {
+	ctx := responseRequestContext(resp)
+	defer func() { _ = resp.Body.Close() }()
+
+	pooledBuffer := borrowUsageSniffBuffer(resp.ContentLength)
+	defer releaseUsageSniffBuffer(pooledBuffer)
+	prefix := (*pooledBuffer)[:int(resp.ContentLength)+1]
+	n, canceledAtFailure, err := readFullObservingLifecycle(resp.Body, ctx, prefix)
+	if canceledAtFailure {
+		return newResponseBodyWriteError(resp, context.Canceled, false, true, true)
+	}
+	switch err {
+	case nil:
+		// The body exceeded its advertised length. Continue to the normal cap so
+		// a malformed Content-Length cannot truncate the downstream response.
+		body := newLifecycleAwareReadCloser(resp.Body, ctx)
+		rest, readErr := io.ReadAll(io.LimitReader(body, int64(usageSniffMaxBuffer+1-len(prefix))))
+		prefix = append(prefix, rest...)
+		if body.canceledAtFailure() {
+			return newResponseBodyWriteError(resp, context.Canceled, false, true, true)
+		}
+		if readErr != nil {
+			return newResponseBodyWriteError(resp, readErr, false, true, false)
+		}
+		if len(prefix) > usageSniffMaxBuffer {
+			copyPassthroughHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			if _, writeErr := w.Write(prefix); writeErr != nil {
+				return newResponseBodyWriteError(resp, writeErr, true, false, false)
+			}
+			tracked := &bodyCopyWriter{w: w}
+			_, copyErr := io.Copy(tracked, body)
+			if body.canceledAtFailure() {
+				return newResponseBodyWriteError(resp, context.Canceled, true, true, true)
+			}
+			if copyErr != nil {
+				return newResponseBodyWriteError(resp, copyErr, true, tracked.writeErr == nil, false)
+			}
+			return nil
+		}
+	case io.EOF, io.ErrUnexpectedEOF:
+		prefix = prefix[:n]
+	default:
+		return newResponseBodyWriteError(resp, err, false, true, false)
+	}
+
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	out := prefix
+	changed := false
+	if transform != nil {
+		out, changed = transform(prefix)
+	}
+	if changed {
+		w.Header().Del("Content-Length")
+		w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+	}
+	w.WriteHeader(resp.StatusCode)
+	if _, writeErr := w.Write(out); writeErr != nil {
+		return newResponseBodyWriteError(resp, writeErr, true, false, false)
+	}
+	return nil
+}
+
+func readFullObservingLifecycle(body io.Reader, ctx context.Context, buffer []byte) (n int, canceledAtFailure bool, err error) {
+	for n < len(buffer) && err == nil {
+		var read int
+		read, err = body.Read(buffer[n:])
+		n += read
+		if lifecycleCancellationAtReadFailure(ctx, err) {
+			canceledAtFailure = true
+		}
+	}
+	if n >= len(buffer) {
+		err = nil
+	} else if n > 0 && errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	return n, canceledAtFailure, err
+}
+
+func readUsageSniffPrefix(body io.Reader, contentLength int64) ([]byte, *[]byte, error) {
+	const limit = usageSniffMaxBuffer + 1
+	if contentLength < 0 || contentLength > usageSniffMaxBuffer {
+		prefix, err := io.ReadAll(io.LimitReader(body, limit))
+		return prefix, nil, err
+	}
+
+	var pooledBuffer *[]byte
+	var prefix []byte
+	if contentLength < usageSniffSmallBufferSize {
+		pooledBuffer = borrowUsageSniffBuffer(contentLength)
+		prefix = (*pooledBuffer)[:int(contentLength)+1]
+	} else {
+		prefix = make([]byte, int(contentLength)+1)
+	}
+	n, err := io.ReadFull(body, prefix)
+	switch err {
+	case nil:
+		// The body exceeded its advertised length. Continue to the normal cap so
+		// a malformed Content-Length cannot truncate the downstream response.
+		if len(prefix) >= limit {
+			return prefix, pooledBuffer, nil
+		}
+		rest, readErr := io.ReadAll(io.LimitReader(body, int64(limit-len(prefix))))
+		return append(prefix, rest...), pooledBuffer, readErr
+	case io.EOF, io.ErrUnexpectedEOF:
+		return prefix[:n], pooledBuffer, nil
+	default:
+		return nil, pooledBuffer, err
+	}
+}
+
+func borrowUsageSniffBuffer(contentLength int64) *[]byte {
+	if contentLength < usageSniffTinyBufferSize {
+		return usageSniffTinyBufferPool.Get().(*[]byte)
+	}
+	return usageSniffSmallBufferPool.Get().(*[]byte)
+}
+
+func releaseUsageSniffBuffer(buffer *[]byte) {
+	if buffer == nil {
+		return
+	}
+	switch cap(*buffer) {
+	case usageSniffTinyBufferSize:
+		*buffer = (*buffer)[:usageSniffTinyBufferSize]
+		usageSniffTinyBufferPool.Put(buffer)
+	case usageSniffSmallBufferSize:
+		*buffer = (*buffer)[:usageSniffSmallBufferSize]
+		usageSniffSmallBufferPool.Put(buffer)
+	}
 }
 
 // sniffOpenAIUsage extracts the usage block from a non-streaming OpenAI chat

@@ -76,6 +76,21 @@ func TestExtractRequestModel(t *testing.T) {
 			body: `["gpt-4.1"]`,
 			want: "",
 		},
+		{
+			name: "escaped model string",
+			body: `{"model":"gpt-4\u002e1","input":"hello"}`,
+			want: "gpt-4.1",
+		},
+		{
+			name: "first duplicate model is preserved",
+			body: `{"model":"first","model":"second"}`,
+			want: "first",
+		},
+		{
+			name: "escaped model key falls back to decoder",
+			body: `{"mo\u0064el":"gpt-4.1"}`,
+			want: "gpt-4.1",
+		},
 	}
 
 	for _, tt := range tests {
@@ -94,6 +109,48 @@ func TestReadDirectAnthropicJSONBodyRejectsOversizedExplicitResponse(t *testing.
 	}
 	if data != nil {
 		t.Fatalf("readDirectAnthropicJSONBody() data = %q, want nil on oversized response", data)
+	}
+}
+
+func TestReadUsageSniffPrefixUsesKnownLengthWithoutTruncatingMismatch(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+	}{
+		{name: "exact", body: "payload", contentLength: int64(len("payload"))},
+		{name: "shorter than advertised", body: "short", contentLength: 20},
+		{name: "longer than advertised", body: "longer payload", contentLength: 4},
+		{name: "unknown", body: "unknown", contentLength: -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, pooledBuffer, err := readUsageSniffPrefix(strings.NewReader(tt.body), tt.contentLength)
+			defer releaseUsageSniffBuffer(pooledBuffer)
+			if err != nil {
+				t.Fatalf("readUsageSniffPrefix() error = %v", err)
+			}
+			if string(got) != tt.body {
+				t.Fatalf("readUsageSniffPrefix() = %q, want %q", got, tt.body)
+			}
+		})
+	}
+}
+
+func TestProviderRouteFromRequestUsesInferenceBodyWithContextFallback(t *testing.T) {
+	bodyRoute := providerRouteInfo{id: "body-provider", kind: string(providerTypeOpenAICompatible)}
+	contextRoute := providerRouteInfo{id: "context-provider", kind: string(providerTypeAzureOpenAI)}
+	ctx := context.WithValue(context.Background(), providerRouteContextKey{}, contextRoute)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	req.Body = newProviderRequestBody([]byte(`{}`), bodyRoute, false)
+	if got, ok := providerRouteFromRequest(req); !ok || got != bodyRoute {
+		t.Fatalf("providerRouteFromRequest() = %+v, %t; want body route %+v", got, ok, bodyRoute)
+	}
+
+	req.Body = http.NoBody
+	if got, ok := providerRouteFromRequest(req); !ok || got != contextRoute {
+		t.Fatalf("providerRouteFromRequest() fallback = %+v, %t; want context route %+v", got, ok, contextRoute)
 	}
 }
 
@@ -1126,9 +1183,92 @@ func TestPostChatCompletions_UsesAzureClassicDeploymentURLAndKeepsPublicBodyMode
 // bytes, for exercising the passthrough/usage-sniff helpers directly.
 func fakeBodyResponse(body string) *http.Response {
 	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(body)),
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+}
+
+func TestWriteSmallKnownLengthPassthroughSniffingUsagePreservesLengthMismatches(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		body          string
+		contentLength int64
+	}{
+		{name: "exact", body: `{"ok":true}`, contentLength: int64(len(`{"ok":true}`))},
+		{name: "shorter than advertised", body: `{"ok":true}`, contentLength: 100},
+		{name: "longer than advertised", body: `{"ok":true,"extra":true}`, contentLength: 4},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := fakeBodyResponse(tt.body)
+			resp.ContentLength = tt.contentLength
+			w := httptest.NewRecorder()
+			if err := writePassthroughSniffingUsage(w, resp, nil); err != nil {
+				t.Fatalf("writePassthroughSniffingUsage() error = %v", err)
+			}
+			if got := w.Body.String(); got != tt.body {
+				t.Fatalf("body = %q, want %q", got, tt.body)
+			}
+		})
+	}
+}
+
+func TestBorrowUsageSniffBufferSelectsSizeTier(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		contentLength int64
+		wantCapacity  int
+	}{
+		{name: "tiny", contentLength: usageSniffTinyBufferSize - 1, wantCapacity: usageSniffTinyBufferSize},
+		{name: "small", contentLength: usageSniffTinyBufferSize, wantCapacity: usageSniffSmallBufferSize},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			buffer := borrowUsageSniffBuffer(tt.contentLength)
+			defer releaseUsageSniffBuffer(buffer)
+			if got := cap(*buffer); got != tt.wantCapacity {
+				t.Fatalf("buffer capacity = %d, want %d", got, tt.wantCapacity)
+			}
+		})
+	}
+}
+
+type bytesAndErrorReadCloser struct {
+	body []byte
+	err  error
+	done bool
+}
+
+func (r *bytesAndErrorReadCloser) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, r.err
+	}
+	r.done = true
+	return copy(p, r.body), r.err
+}
+
+func (*bytesAndErrorReadCloser) Close() error { return nil }
+
+func TestWriteSmallKnownLengthPassthroughSniffingUsageCapturesCancellationWithBytes(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(errProxyLifecycleShutdown)
+	body := []byte(`{"ok":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          &bytesAndErrorReadCloser{body: body, err: context.Canceled},
+		ContentLength: int64(len(body) - 1),
+		Request:       req,
+	}
+
+	err := writePassthroughSniffingUsage(httptest.NewRecorder(), resp, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("writePassthroughSniffingUsage() error = %v, want context.Canceled", err)
+	}
+	var writeErr *responseBodyWriteError
+	if !errors.As(err, &writeErr) || !writeErr.cancellationAtFailure || !writeErr.upstream || writeErr.committed {
+		t.Fatalf("responseBodyWriteError = %#v, want precommit upstream lifecycle cancellation", writeErr)
 	}
 }
 

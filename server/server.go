@@ -111,6 +111,26 @@ type responseRecorder struct {
 	bytes  int64
 }
 
+var responseRecorderPool = sync.Pool{
+	New: func() any { return new(responseRecorder) },
+}
+
+func acquireResponseRecorder(w http.ResponseWriter) *responseRecorder {
+	recorder := responseRecorderPool.Get().(*responseRecorder)
+	recorder.ResponseWriter = w
+	return recorder
+}
+
+func releaseResponseRecorder(recorder *responseRecorder) {
+	if recorder == nil {
+		return
+	}
+	recorder.ResponseWriter = nil
+	recorder.status = 0
+	recorder.bytes = 0
+	responseRecorderPool.Put(recorder)
+}
+
 func (r *responseRecorder) WriteHeader(status int) {
 	if r.status != 0 {
 		return
@@ -216,8 +236,12 @@ func withProviderValidationGate(next http.Handler, handler startupReadinessGate)
 func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		recorder := &responseRecorder{ResponseWriter: w}
-		ctx, summary := proxy.WithRequestSummary(r.Context())
+		recorder := acquireResponseRecorder(w)
+		defer releaseResponseRecorder(recorder)
+		ctx, summary, ownsSummary := proxy.AcquireRequestSummary(r.Context())
+		if ownsSummary {
+			defer proxy.ReleaseRequestSummary(summary)
+		}
 
 		admitted := handler == nil || !handler.ShuttingDown() || r.URL.Path == "/healthz"
 		tracked := admitted && handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
@@ -236,14 +260,14 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		}
 
 		r = r.WithContext(ctx)
-		var releaseRequestBody func()
+		var requestBodyBinding proxy.RequestBodyLifecycleBinding
 		if admitted && handler != nil {
-			var forceClose func()
+			var forceClose io.Closer
 			if conn, ok := r.Context().Value(serverConnContextKey{}).(net.Conn); ok && conn != nil {
-				forceClose = func() { _ = conn.Close() }
+				forceClose = conn
 			}
-			releaseRequestBody = handler.BindRequestBodyToLifecycle(r, forceClose)
-			defer releaseRequestBody()
+			requestBodyBinding = handler.BindRequestBodyToLifecycle(r, forceClose)
+			defer requestBodyBinding.ReleaseAndRecycle(r)
 		}
 		if admitted {
 			next.ServeHTTP(recorder, r)
@@ -266,7 +290,7 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		if tracked && !summary.StatsSuppressed() {
 			handler.RecordRequest(summary, statsStatus, r.Header.Get("User-Agent"), elapsed)
 		}
-		if log != nil {
+		if log != nil && log.Enabled(logger.LevelInfo) {
 			fields := []logger.Field{
 				logger.F("method", r.Method),
 				logger.F("path", r.URL.Path),

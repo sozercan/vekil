@@ -85,6 +85,25 @@ func TestGetEnvDuration(t *testing.T) {
 	}
 }
 
+func TestShouldApplyServeGCDefault(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "unset or empty", want: true},
+		{name: "whitespace", value: "  ", want: true},
+		{name: "explicit percent", value: "100", want: false},
+		{name: "disabled", value: "off", want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldApplyServeGCDefault(tt.value); got != tt.want {
+				t.Fatalf("shouldApplyServeGCDefault(%q) = %t, want %t", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetEnvBool(t *testing.T) {
 	const envKey = "TEST_BOOL_VAR"
 
@@ -341,6 +360,11 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 }
 
 func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	client := &http.Client{Transport: transport}
+	t.Cleanup(transport.CloseIdleConnections)
+
 	upstreamStarted := make(chan struct{})
 	upstreamCanceled := make(chan struct{})
 	releaseUpstream := make(chan struct{})
@@ -392,7 +416,7 @@ func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
 	for {
 		if addr := srv.Addr(); addr != "127.0.0.1:0" {
 			baseURL = "http://" + addr
-			resp, requestErr := http.Get(baseURL + "/healthz")
+			resp, requestErr := client.Get(baseURL + "/healthz")
 			if requestErr == nil {
 				_ = resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
@@ -418,7 +442,7 @@ func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
 	}
 	requestDone := make(chan requestResult, 1)
 	go func() {
-		resp, requestErr := http.Post(
+		resp, requestErr := client.Post(
 			baseURL+"/v1/chat/completions",
 			"application/json",
 			strings.NewReader(`{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}`),

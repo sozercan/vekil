@@ -40,6 +40,127 @@ func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
 	return h
 }
 
+func TestCopyPassthroughHeadersBorrowsImmutableValues(t *testing.T) {
+	src := http.Header{
+		"Connection":   []string{"X-Hop"},
+		"Content-Type": []string{"application/json"},
+		"X-Hop":        []string{"secret"},
+		"X-Multi":      []string{"one", "two"},
+	}
+	dst := http.Header{
+		"X-Local": []string{"keep"},
+		"X-Multi": []string{"stale"},
+	}
+
+	copyPassthroughHeaders(dst, src)
+	if got := dst.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if got := dst.Get("X-Hop"); got != "" {
+		t.Fatalf("hop-by-hop nominated header leaked: %q", got)
+	}
+	if got := dst.Get("X-Local"); got != "keep" {
+		t.Fatalf("proxy-owned header = %q, want keep", got)
+	}
+	dst.Add("X-Multi", "three")
+	if got := src.Values("X-Multi"); !reflect.DeepEqual(got, []string{"one", "two"}) {
+		t.Fatalf("adding a downstream value mutated upstream headers: %v", got)
+	}
+	dst.Set("Content-Type", "text/plain")
+	if got := src.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("setting a downstream value mutated upstream headers: %q", got)
+	}
+}
+
+func TestReadBodyBorrowedUsesSmallKnownLengthBuffer(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","messages":[]}`))
+	body, pooled, err := readBodyBorrowed(req)
+	if err != nil {
+		t.Fatalf("readBodyBorrowed() error = %v", err)
+	}
+	if pooled == nil {
+		t.Fatal("readBodyBorrowed() did not borrow a small known-length buffer")
+	}
+	defer releaseSmallRequestBodyBuffer(pooled)
+	if got, want := cap(*pooled), tinyRequestBodyBufferSize; got != want {
+		t.Fatalf("pooled buffer capacity = %d, want tiny tier %d", got, want)
+	}
+	if got, want := string(body), `{"model":"test","messages":[]}`; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
+func TestReadBodyBorrowedUsesFourKiBTier(t *testing.T) {
+	bodyText := strings.Repeat("x", tinyRequestBodyBufferSize)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(bodyText))
+	body, pooled, err := readBodyBorrowed(req)
+	if err != nil {
+		t.Fatalf("readBodyBorrowed() error = %v", err)
+	}
+	if pooled == nil {
+		t.Fatal("readBodyBorrowed() did not borrow a small known-length buffer")
+	}
+	defer releaseSmallRequestBodyBuffer(pooled)
+	if got, want := cap(*pooled), smallRequestBodyBufferSize; got != want {
+		t.Fatalf("pooled buffer capacity = %d, want small tier %d", got, want)
+	}
+	if got := string(body); got != bodyText {
+		t.Fatalf("body length = %d, want %d", len(got), len(bodyText))
+	}
+}
+
+func TestReadBodyBorrowedFallsBackForUnknownLengthAndCompression(t *testing.T) {
+	t.Run("unknown-length", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+		req.ContentLength = -1
+		body, pooled, err := readBodyBorrowed(req)
+		if err != nil {
+			t.Fatalf("readBodyBorrowed() error = %v", err)
+		}
+		if pooled != nil {
+			t.Fatal("unknown-length body unexpectedly used the small buffer pool")
+		}
+		if got, want := string(body), `{"model":"test"}`; got != want {
+			t.Fatalf("body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("compressed", func(t *testing.T) {
+		var compressed bytes.Buffer
+		writer := gzip.NewWriter(&compressed)
+		_, _ = writer.Write([]byte(`{"model":"test"}`))
+		_ = writer.Close()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", &compressed)
+		req.Header.Set("Content-Encoding", "gzip")
+		body, pooled, err := readBodyBorrowed(req)
+		if err != nil {
+			t.Fatalf("readBodyBorrowed() error = %v", err)
+		}
+		if pooled != nil {
+			t.Fatal("compressed body unexpectedly used the small buffer pool")
+		}
+		if got, want := string(body), `{"model":"test"}`; got != want {
+			t.Fatalf("body = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestReadBodyBorrowedDoesNotTrustShortContentLength(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = io.NopCloser(strings.NewReader("abcdef"))
+	req.ContentLength = 3
+	body, pooled, err := readBodyBorrowed(req)
+	if pooled != nil {
+		defer releaseSmallRequestBodyBuffer(pooled)
+	}
+	if err != nil {
+		t.Fatalf("readBodyBorrowed() error = %v", err)
+	}
+	if got, want := string(body), "abcdef"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

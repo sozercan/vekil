@@ -277,7 +277,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	result, oaiBody, mode = h.retryChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, oaiBody, mode)
 	observeChatExecutionRoute(r.Context(), result)
-	observeUpstreamHeaders(r.Context(), result.Headers)
+	observeUpstreamHeaders(r.Context(), chatExecutionUpstreamHeaders(result))
 	if result.Backend == chatBackendResponses && len(result.Headers) > 0 {
 		mergeHeaderValues(w.Header(), result.Headers)
 	}
