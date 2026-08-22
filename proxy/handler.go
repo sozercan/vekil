@@ -2228,6 +2228,9 @@ func readBodyBorrowed(r *http.Request) ([]byte, *[]byte, error) {
 		}
 		return body, pooled, nil
 	case io.EOF, io.ErrUnexpectedEOF:
+		if int64(n) != r.ContentLength {
+			return nil, pooled, &requestBodyError{statusCode: http.StatusBadRequest, err: io.ErrUnexpectedEOF}
+		}
 		return buffer[:n], pooled, nil
 	default:
 		return nil, pooled, &requestBodyError{statusCode: http.StatusBadRequest, err: err}

@@ -112,14 +112,13 @@ func TestReadDirectAnthropicJSONBodyRejectsOversizedExplicitResponse(t *testing.
 	}
 }
 
-func TestReadUsageSniffPrefixUsesKnownLengthWithoutTruncatingMismatch(t *testing.T) {
+func TestReadUsageSniffPrefixUsesKnownLengthWithoutTruncatingExtraBytes(t *testing.T) {
 	tests := []struct {
 		name          string
 		body          string
 		contentLength int64
 	}{
 		{name: "exact", body: "payload", contentLength: int64(len("payload"))},
-		{name: "shorter than advertised", body: "short", contentLength: 20},
 		{name: "longer than advertised", body: "longer payload", contentLength: 4},
 		{name: "unknown", body: "unknown", contentLength: -1},
 	}
@@ -132,6 +131,21 @@ func TestReadUsageSniffPrefixUsesKnownLengthWithoutTruncatingMismatch(t *testing
 			}
 			if string(got) != tt.body {
 				t.Fatalf("readUsageSniffPrefix() = %q, want %q", got, tt.body)
+			}
+		})
+	}
+}
+
+func TestReadUsageSniffPrefixRejectsTruncatedKnownLength(t *testing.T) {
+	for _, contentLength := range []int64{20, usageSniffSmallBufferSize} {
+		t.Run(fmt.Sprintf("content-length-%d", contentLength), func(t *testing.T) {
+			got, pooledBuffer, err := readUsageSniffPrefix(strings.NewReader("short"), contentLength)
+			defer releaseUsageSniffBuffer(pooledBuffer)
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("readUsageSniffPrefix() error = %v, want io.ErrUnexpectedEOF", err)
+			}
+			if got != nil {
+				t.Fatalf("readUsageSniffPrefix() = %q, want nil", got)
 			}
 		})
 	}
@@ -1190,21 +1204,32 @@ func fakeBodyResponse(body string) *http.Response {
 	}
 }
 
-func TestWriteSmallKnownLengthPassthroughSniffingUsagePreservesLengthMismatches(t *testing.T) {
+func TestWriteSmallKnownLengthPassthroughSniffingUsageHandlesLengthMismatches(t *testing.T) {
 	for _, tt := range []struct {
 		name          string
 		body          string
 		contentLength int64
+		wantErr       bool
 	}{
 		{name: "exact", body: `{"ok":true}`, contentLength: int64(len(`{"ok":true}`))},
-		{name: "shorter than advertised", body: `{"ok":true}`, contentLength: 100},
+		{name: "shorter than advertised", body: `{"ok":true}`, contentLength: 100, wantErr: true},
 		{name: "longer than advertised", body: `{"ok":true,"extra":true}`, contentLength: 4},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			resp := fakeBodyResponse(tt.body)
 			resp.ContentLength = tt.contentLength
 			w := httptest.NewRecorder()
-			if err := writePassthroughSniffingUsage(w, resp, nil); err != nil {
+			err := writePassthroughSniffingUsage(w, resp, nil)
+			if tt.wantErr {
+				if !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("writePassthroughSniffingUsage() error = %v, want io.ErrUnexpectedEOF", err)
+				}
+				if w.Body.Len() != 0 {
+					t.Fatalf("body = %q, want no committed partial response", w.Body.String())
+				}
+				return
+			}
+			if err != nil {
 				t.Fatalf("writePassthroughSniffingUsage() error = %v", err)
 			}
 			if got := w.Body.String(); got != tt.body {

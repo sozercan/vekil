@@ -167,6 +167,22 @@ func TestReadBodyBorrowedDoesNotTrustShortContentLength(t *testing.T) {
 	}
 }
 
+func TestReadBodyBorrowedRejectsTruncatedDeclaredLength(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-4"}`))
+	req.ContentLength = 100
+	body, pooled, err := readBodyBorrowed(req)
+	if pooled != nil {
+		defer releaseSmallRequestBodyBuffer(pooled)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("readBodyBorrowed() error = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if body != nil {
+		t.Fatalf("readBodyBorrowed() body = %q, want nil", body)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

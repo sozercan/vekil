@@ -979,14 +979,11 @@ func replaceSingleTopLevelRawJSONField(body []byte, field string, replacement js
 	if matchEnd < matchStart || matchEnd > len(body) {
 		return body, false
 	}
-	retainedLength := len(body) - (matchEnd - matchStart)
-	maxInt := int(^uint(0) >> 1)
-	if len(replacement) > maxInt-retainedLength {
-		return body, false
-	}
-	out := make([]byte, retainedLength+len(replacement))
-	copy(out, body[:matchStart])
-	n := matchStart + copy(out[matchStart:], replacement)
-	copy(out[n:], body[matchEnd:])
+	// Let append perform its checked capacity growth rather than computing a
+	// potentially overflowing allocation size from attacker-controlled lengths.
+	out := make([]byte, 0, len(body))
+	out = append(out, body[:matchStart]...)
+	out = append(out, replacement...)
+	out = append(out, body[matchEnd:]...)
 	return out, true
 }

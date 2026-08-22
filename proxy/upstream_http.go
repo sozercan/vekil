@@ -787,6 +787,9 @@ func writeSmallKnownLengthPassthroughSniffingUsage(w http.ResponseWriter, resp *
 			return nil
 		}
 	case io.EOF, io.ErrUnexpectedEOF:
+		if int64(n) != resp.ContentLength {
+			return newResponseBodyWriteError(resp, io.ErrUnexpectedEOF, false, true, false)
+		}
 		prefix = prefix[:n]
 	default:
 		return newResponseBodyWriteError(resp, err, false, true, false)
@@ -852,6 +855,9 @@ func readUsageSniffPrefix(body io.Reader, contentLength int64) ([]byte, *[]byte,
 		rest, readErr := io.ReadAll(io.LimitReader(body, int64(limit-len(prefix))))
 		return append(prefix, rest...), pooledBuffer, readErr
 	case io.EOF, io.ErrUnexpectedEOF:
+		if int64(n) != contentLength {
+			return nil, pooledBuffer, io.ErrUnexpectedEOF
+		}
 		return prefix[:n], pooledBuffer, nil
 	default:
 		return nil, pooledBuffer, err

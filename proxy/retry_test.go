@@ -99,6 +99,43 @@ func TestInferenceRetryRejectsRedirectsWhileOrdinaryRetryFollows(t *testing.T) {
 	}
 }
 
+func TestInferenceRetryExceptionalClientStillRejectsRedirects(t *testing.T) {
+	var redirectedCalls atomic.Int32
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectedCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer redirected.Close()
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirected.URL, http.StatusTemporaryRedirect)
+	}))
+	defer primary.Close()
+
+	client := primary.Client()
+	client.Timeout = time.Second
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return nil
+	}
+	h := &ProxyHandler{
+		client:         client,
+		maxRetries:     1,
+		retryBaseDelay: time.Millisecond,
+	}
+	resp, err := h.doInferenceWithRetry(func() (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, primary.URL, nil)
+	})
+	if err != nil {
+		t.Fatalf("doInferenceWithRetry() error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("inference status = %d, want %d", resp.StatusCode, http.StatusTemporaryRedirect)
+	}
+	if got := redirectedCalls.Load(); got != 0 {
+		t.Fatalf("inference redirect target calls = %d, want 0", got)
+	}
+}
+
 func TestInferenceRetryAutoDecompressesSealedProviderGzipResponse(t *testing.T) {
 	payload := []byte(`{"id":"chatcmpl-test","choices":[]}`)
 	compressed := gzipTestPayload(t, payload)

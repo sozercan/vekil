@@ -335,7 +335,15 @@ func (h *ProxyHandler) sendRetryRequest(req *http.Request, inference bool) (*htt
 		client = http.DefaultClient
 	}
 	autoDecompressGzip := providerRequestAutoDecompressGzip(req)
-	if !inference || client.Timeout != 0 || client.Jar != nil || client.CheckRedirect != nil || req.URL == nil || req.URL.User != nil {
+	exceptionalInferenceClient := client.Timeout != 0 || client.Jar != nil || client.CheckRedirect != nil || req.URL == nil || req.URL.User != nil
+	if !inference || exceptionalInferenceClient {
+		if inference {
+			clone := *client
+			clone.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			}
+			client = &clone
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return resp, err
