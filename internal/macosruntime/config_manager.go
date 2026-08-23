@@ -78,7 +78,16 @@ type ConfigManager struct {
 	uuid            func() string
 	state           PersistentState
 	stagedSelection *PersistentState
+	externalCache   map[externalSnapshotKey][]byte
+	cacheOrder      []externalSnapshotKey
 }
+
+type externalSnapshotKey struct {
+	path     string
+	revision string
+}
+
+const maxExternalConfigSnapshots = 8
 
 // NewConfigManager loads state and resolves any incomplete apply journal before
 // accepting commands.
@@ -167,6 +176,8 @@ func (m *ConfigManager) LoadConfiguration(ctx context.Context) (appcontrol.Confi
 	}
 	m.mu.Lock()
 	state := clonePersistentState(m.state)
+	selectionStaged := m.stagedSelection != nil
+	cachedExternalBody, hasCachedExternalBody := m.externalSnapshotLocked(state.SelectedPath, state.SelectedConfigRevision)
 	m.mu.Unlock()
 
 	switch state.ConfigMode {
@@ -194,15 +205,46 @@ func (m *ConfigManager) LoadConfiguration(ctx context.Context) (appcontrol.Confi
 		if path == "" {
 			return appcontrol.Configuration{}, errors.New("external configuration path is missing")
 		}
-		body, _, err := readSecureFile(path, MaxConfigBytes)
-		if err != nil {
-			return appcontrol.Configuration{}, err
+		body := cachedExternalBody
+		usedCachedBody := selectionStaged && hasCachedExternalBody
+		if !usedCachedBody {
+			var err error
+			body, _, err = readSecureFile(path, MaxConfigBytes)
+			if err != nil {
+				if !hasCachedExternalBody {
+					return appcontrol.Configuration{}, err
+				}
+				body = cachedExternalBody
+				usedCachedBody = true
+			}
 		}
 		cfg, err := proxy.LoadProvidersConfigBytes(path, body)
+		if err != nil {
+			if usedCachedBody {
+				liveBody, _, readErr := readSecureFile(path, MaxConfigBytes)
+				if readErr == nil {
+					cfg, err = proxy.LoadProvidersConfigBytes(path, liveBody)
+					if err == nil {
+						body = liveBody
+						usedCachedBody = false
+					}
+				}
+			}
+			if err != nil && hasCachedExternalBody && (!usedCachedBody || !bytes.Equal(body, cachedExternalBody)) {
+				cfg, err = proxy.LoadProvidersConfigBytes(path, cachedExternalBody)
+				if err == nil {
+					body = cachedExternalBody
+					usedCachedBody = true
+				}
+			}
+		}
 		if err != nil {
 			return appcontrol.Configuration{}, err
 		}
 		revision, _ := configRevision(body)
+		m.mu.Lock()
+		m.rememberExternalSnapshotLocked(path, revision, body)
+		m.mu.Unlock()
 		return appcontrol.Configuration{Revision: revision, Value: cfg}, nil
 	default:
 		return appcontrol.Configuration{}, fmt.Errorf("unsupported config mode %q", state.ConfigMode)
@@ -268,6 +310,7 @@ func (m *ConfigManager) StageExternal(ctx context.Context, path string) error {
 	m.state.ConfigMode = ConfigModeExternal
 	m.state.SelectedPath = path
 	m.state.SelectedConfigRevision = revision
+	m.rememberExternalSnapshotLocked(path, revision, body)
 	return nil
 }
 
@@ -413,6 +456,37 @@ func (m *ConfigManager) RestoreSelection(previous PersistentState) error {
 	m.state.SelectedPath = previous.SelectedPath
 	m.state.SelectedConfigRevision = previous.SelectedConfigRevision
 	return m.saveStateLocked()
+}
+
+func (m *ConfigManager) externalSnapshotLocked(path, revision string) ([]byte, bool) {
+	key := externalSnapshotKey{path: strings.TrimSpace(path), revision: strings.TrimSpace(revision)}
+	if key.path == "" || key.revision == "" || len(m.externalCache) == 0 {
+		return nil, false
+	}
+	body, ok := m.externalCache[key]
+	if !ok {
+		return nil, false
+	}
+	return bytes.Clone(body), true
+}
+
+func (m *ConfigManager) rememberExternalSnapshotLocked(path, revision string, body []byte) {
+	key := externalSnapshotKey{path: strings.TrimSpace(path), revision: strings.TrimSpace(revision)}
+	if key.path == "" || key.revision == "" || len(body) == 0 {
+		return
+	}
+	if m.externalCache == nil {
+		m.externalCache = make(map[externalSnapshotKey][]byte, maxExternalConfigSnapshots)
+	}
+	if _, exists := m.externalCache[key]; !exists {
+		m.cacheOrder = append(m.cacheOrder, key)
+	}
+	m.externalCache[key] = bytes.Clone(body)
+	for len(m.cacheOrder) > maxExternalConfigSnapshots {
+		evict := m.cacheOrder[0]
+		m.cacheOrder = m.cacheOrder[1:]
+		delete(m.externalCache, evict)
+	}
 }
 
 // UseManaged selects an already-owned, non-drifted managed file.
