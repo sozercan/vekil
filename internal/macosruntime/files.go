@@ -11,22 +11,25 @@ import (
 )
 
 func writeAtomicFile(path string, body []byte) (returnErr error) {
-	dir := filepath.Dir(path)
-	if err := ensurePrivateDirectory(dir); err != nil {
+	dirPath := filepath.Dir(path)
+	directory, err := openPrivateDirectory(dirPath)
+	if err != nil {
 		return err
 	}
+	defer func() { _ = directory.close() }()
+	name := filepath.Base(path)
 	var random [8]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return fmt.Errorf("generate temporary filename: %w", err)
 	}
-	tmp := filepath.Join(dir, "."+filepath.Base(path)+"."+hex.EncodeToString(random[:])+".tmp")
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	tmpName := "." + name + "." + hex.EncodeToString(random[:]) + ".tmp"
+	file, err := directory.createExclusive(tmpName)
 	if err != nil {
 		return fmt.Errorf("create temporary file for %q: %w", path, err)
 	}
 	defer func() {
 		_ = file.Close()
-		_ = os.Remove(tmp)
+		_ = directory.remove(tmpName)
 	}()
 	if err := file.Chmod(0o600); err != nil {
 		return fmt.Errorf("protect temporary file for %q: %w", path, err)
@@ -40,11 +43,11 @@ func writeAtomicFile(path string, body []byte) (returnErr error) {
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close temporary file for %q: %w", path, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := directory.rename(tmpName, name); err != nil {
 		return fmt.Errorf("install %q: %w", path, err)
 	}
-	if err := syncDirectory(dir); err != nil {
-		return err
+	if err := directory.sync(); err != nil {
+		return fmt.Errorf("sync directory %q: %w", dirPath, err)
 	}
 	return nil
 }
@@ -62,10 +65,14 @@ func writeExclusiveFileWithBody(path string, writeBody func(*os.File) error) (re
 	if writeBody == nil {
 		return errors.New("owned file writer is required")
 	}
-	if err := ensurePrivateDirectory(filepath.Dir(path)); err != nil {
+	dirPath := filepath.Dir(path)
+	directory, err := openPrivateDirectory(dirPath)
+	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	defer func() { _ = directory.close() }()
+	name := filepath.Base(path)
+	file, err := directory.createExclusive(name)
 	if err != nil {
 		return fmt.Errorf("create owned file %q: %w", path, err)
 	}
@@ -74,7 +81,7 @@ func writeExclusiveFileWithBody(path string, writeBody func(*os.File) error) (re
 		if returnErr == nil {
 			return
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := directory.remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 			returnErr = errors.Join(returnErr, fmt.Errorf("remove incomplete owned file %q: %w", path, err))
 		}
 	}()
@@ -90,17 +97,36 @@ func writeExclusiveFileWithBody(path string, writeBody func(*os.File) error) (re
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close owned file %q: %w", path, err)
 	}
-	return syncDirectory(filepath.Dir(path))
+	if err := directory.sync(); err != nil {
+		return fmt.Errorf("sync directory %q: %w", dirPath, err)
+	}
+	return nil
 }
 
 func syncDirectory(path string) error {
-	dir, err := os.Open(path)
+	directory, err := openPrivateDirectory(path)
 	if err != nil {
 		return fmt.Errorf("open directory %q for sync: %w", path, err)
 	}
-	defer func() { _ = dir.Close() }()
-	if err := dir.Sync(); err != nil && !errors.Is(err, os.ErrInvalid) {
+	defer func() { _ = directory.close() }()
+	if err := directory.sync(); err != nil {
 		return fmt.Errorf("sync directory %q: %w", path, err)
+	}
+	return nil
+}
+
+func removePrivateFile(path string) error {
+	dirPath := filepath.Dir(path)
+	directory, err := openPrivateDirectory(dirPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = directory.close() }()
+	if err := directory.remove(filepath.Base(path)); err != nil {
+		return err
+	}
+	if err := directory.sync(); err != nil {
+		return fmt.Errorf("sync directory %q: %w", dirPath, err)
 	}
 	return nil
 }

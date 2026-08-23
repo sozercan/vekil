@@ -473,7 +473,7 @@ func (m *ConfigManager) EnsureManagedConfiguration() (ConfigDescription, error) 
 	m.state.CommittedSHA256 = digest
 	m.state.Providers = []ProviderIdentity{{UUID: m.uuid(), ProviderID: "copilot"}}
 	if err := m.saveStateLocked(); err != nil {
-		_ = os.Remove(m.paths.Managed)
+		_ = removePrivateFile(m.paths.Managed)
 		return ConfigDescription{}, err
 	}
 	return m.describeLocked(initialManagedCopilotYAML, nil), nil

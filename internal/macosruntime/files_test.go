@@ -56,3 +56,62 @@ func TestEnsurePrivateDirectoryRejectsSymlinkWithoutChangingTarget(t *testing.T)
 		t.Fatalf("symlink target permissions = %#o, want 0755", got)
 	}
 }
+
+func TestPrivateDirectoryOperationsStayBoundAfterPathReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks requires privileges on some Windows hosts")
+	}
+
+	parent := t.TempDir()
+	path := filepath.Join(parent, "vekil")
+	directory, err := openPrivateDirectory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = directory.close() }()
+
+	original := filepath.Join(parent, "original")
+	redirect := filepath.Join(parent, "redirect")
+	if err := os.Mkdir(redirect, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(redirect, path); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := directory.createExclusive("pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("owned")); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := directory.rename("pending", "installed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := directory.sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := os.ReadFile(filepath.Join(original, "installed")); err != nil || string(got) != "owned" {
+		t.Fatalf("descriptor-relative write = %q, %v", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(redirect, "installed")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("write followed replacement symlink: %v", err)
+	}
+	if err := directory.remove("installed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(original, "installed")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("descriptor-relative cleanup failed: %v", err)
+	}
+}

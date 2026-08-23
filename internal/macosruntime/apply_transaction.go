@@ -76,8 +76,8 @@ func (m *ConfigManager) PrepareManagedApply(operationID string, candidate Manage
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect managed apply journal: %w", err)
 	}
-	_ = os.Remove(m.paths.Staged)
-	_ = os.Remove(m.paths.Backup)
+	_ = removePrivateFile(m.paths.Staged)
+	_ = removePrivateFile(m.paths.Backup)
 	if err := writeAtomicFile(m.paths.Staged, candidate.Bytes); err != nil {
 		return nil, err
 	}
@@ -96,7 +96,7 @@ func (m *ConfigManager) PrepareManagedApply(operationID string, candidate Manage
 		NewProviders:        cloneProviderIdentities(candidate.Providers),
 	}
 	if err := writeApplyJournal(m.paths.Journal, journal); err != nil {
-		_ = os.Remove(m.paths.Staged)
+		_ = removePrivateFile(m.paths.Staged)
 		return nil, err
 	}
 	return &ManagedApplyTransaction{manager: m, journal: journal, candidate: candidate}, nil
@@ -144,7 +144,7 @@ func (t *ManagedApplyTransaction) Install() error {
 		return err
 	}
 	if err := writeAtomicFile(m.paths.Managed, stagedBody); err != nil {
-		_ = os.Remove(m.paths.Backup)
+		_ = removePrivateFile(m.paths.Backup)
 		return err
 	}
 
@@ -488,12 +488,12 @@ func readApplyJournal(path string) (ApplyJournal, error) {
 func removeApplyArtifacts(paths Paths, includeJournal bool) error {
 	var errs []error
 	for _, path := range []string{paths.Staged, paths.Backup} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removePrivateFile(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, fmt.Errorf("remove %q: %w", path, err))
 		}
 	}
 	if includeJournal {
-		if err := os.Remove(paths.Journal); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removePrivateFile(paths.Journal); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, fmt.Errorf("remove %q: %w", paths.Journal, err))
 		}
 	}
