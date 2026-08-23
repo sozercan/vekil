@@ -36,6 +36,12 @@ type Controller struct {
 	updates chan State
 }
 
+// StartOptions captures app-owned startup policy for one start admission.
+type StartOptions struct {
+	ExpectedConfigRevision         string
+	AllowInteractiveAuthentication bool
+}
+
 // New creates an idle, stopped controller.
 func New(opts Options) (*Controller, error) {
 	if opts.ConfigurationSource == nil {
@@ -94,6 +100,15 @@ func (c *Controller) Updates() <-chan State { return c.updates }
 
 // Start admits one asynchronous startup operation.
 func (c *Controller) Start(parent context.Context, expectedConfigRevision string) (Operation, error) {
+	return c.StartWithOptions(parent, StartOptions{
+		ExpectedConfigRevision:         expectedConfigRevision,
+		AllowInteractiveAuthentication: true,
+	})
+}
+
+// StartWithOptions admits one asynchronous startup operation with explicit
+// app-owned startup policy.
+func (c *Controller) StartWithOptions(parent context.Context, opts StartOptions) (Operation, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -118,7 +133,7 @@ func (c *Controller) Start(parent context.Context, expectedConfigRevision string
 	c.setOperationPhaseLocked(op, PhaseLoadingConfiguration)
 	c.mu.Unlock()
 
-	go c.runStart(op, expectedConfigRevision)
+	go c.runStart(op, opts)
 	return Operation{ID: op.id, Kind: op.kind, completion: op.completion}, nil
 }
 
@@ -227,14 +242,18 @@ func (c *Controller) newOperationLocked(parent context.Context, kind OperationKi
 	return op
 }
 
-func (c *Controller) runStart(op *activeOperation, expectedRevision string) {
+type nonInteractiveAuthenticator interface {
+	GetTokenNonInteractive(context.Context) (string, error)
+}
+
+func (c *Controller) runStart(op *activeOperation, opts StartOptions) {
 	cfg, err := c.source.LoadConfiguration(op.ctx)
 	if err != nil {
 		c.finishStartFailure(op, PhaseLoadingConfiguration, nil, 0, err)
 		return
 	}
-	if expectedRevision != "" && expectedRevision != cfg.Revision {
-		c.finishStartFailure(op, PhaseLoadingConfiguration, nil, 0, fmt.Errorf("%w: expected %q, loaded %q", ErrConfigRevisionMismatch, expectedRevision, cfg.Revision))
+	if opts.ExpectedConfigRevision != "" && opts.ExpectedConfigRevision != cfg.Revision {
+		c.finishStartFailure(op, PhaseLoadingConfiguration, nil, 0, fmt.Errorf("%w: expected %q, loaded %q", ErrConfigRevisionMismatch, opts.ExpectedConfigRevision, cfg.Revision))
 		return
 	}
 	if err := op.ctx.Err(); err != nil {
@@ -287,7 +306,18 @@ func (c *Controller) runStart(op *activeOperation, expectedRevision string) {
 			c.finishStartFailure(op, PhaseStartupAuthentication, runtime, generation, errors.New("copilot authentication is unavailable"))
 			return
 		}
-		if _, err := c.auth.GetToken(op.ctx); err != nil {
+		var err error
+		if opts.AllowInteractiveAuthentication {
+			_, err = c.auth.GetToken(op.ctx)
+		} else {
+			nonInteractive, ok := c.auth.(nonInteractiveAuthenticator)
+			if !ok {
+				err = errors.New("noninteractive copilot authentication is unavailable")
+			} else {
+				_, err = nonInteractive.GetTokenNonInteractive(op.ctx)
+			}
+		}
+		if err != nil {
 			c.setAuth(op, AuthFailed)
 			c.finishStartFailure(op, PhaseStartupAuthentication, runtime, generation, err)
 			return

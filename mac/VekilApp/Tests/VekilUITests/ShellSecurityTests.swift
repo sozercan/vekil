@@ -201,6 +201,25 @@ final class ShellSecurityTests: XCTestCase {
         )
     }
 
+    func testRuntimeAppClientForwardsStartRequestPolicy() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = packageRoot.appendingPathComponent("Sources/Vekil/RuntimeAppClient.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let compact = source.components(separatedBy: .whitespacesAndNewlines).joined()
+
+        XCTAssertTrue(
+            compact.contains(#""allows_interactive_authentication":request.allowsInteractiveAuthentication"#),
+            "Start must forward the caller's interactive-authentication policy to the helper"
+        )
+        XCTAssertTrue(
+            compact.contains(#""reason":request.reason.rawValue"#),
+            "Start must forward the caller's start reason to the helper"
+        )
+    }
+
     @MainActor func testSingletonCreatesMissingApplicationSupportParents() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let base = root.appendingPathComponent("Library/Application Support")

@@ -1020,7 +1020,9 @@ public actor RuntimeController {
         }
 
         let payload = JSONValue.object([
-            "expected_config_revision": .string(state.payload.expectedStartConfigRevision ?? "")
+            "expected_config_revision": .string(state.payload.expectedStartConfigRevision ?? ""),
+            "allows_interactive_authentication": .bool(false),
+            "reason": .string(AppRuntimeStartReason.automaticLaunch.rawValue),
         ])
         let response = try await sendInternal(
             command: .start,

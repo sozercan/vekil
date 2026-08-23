@@ -54,9 +54,11 @@ func (f *testFactory) NewRuntime(ctx context.Context, _ Configuration) (Runtime,
 }
 
 type testAuthenticator struct {
-	started chan struct{}
-	block   bool
-	err     error
+	started               chan struct{}
+	nonInteractiveStarted chan struct{}
+	block                 bool
+	err                   error
+	nonInteractiveErr     error
 }
 
 func (a *testAuthenticator) GetToken(ctx context.Context) (string, error) {
@@ -72,6 +74,21 @@ func (a *testAuthenticator) GetToken(ctx context.Context) (string, error) {
 		return "", ctx.Err()
 	}
 	return "token", a.err
+}
+
+func (a *testAuthenticator) GetTokenNonInteractive(ctx context.Context) (string, error) {
+	if a.nonInteractiveStarted != nil {
+		select {
+		case <-a.nonInteractiveStarted:
+		default:
+			close(a.nonInteractiveStarted)
+		}
+	}
+	if a.block {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	return "token", a.nonInteractiveErr
 }
 
 type testReadiness struct {
@@ -244,6 +261,7 @@ func TestControllerStartupAuthenticationGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	result, _ := op.Wait(t.Context())
 	if result.Status != OperationSucceeded {
 		t.Fatalf("result = %+v", result)
@@ -256,6 +274,34 @@ func TestControllerStartupAuthenticationGate(t *testing.T) {
 	}
 	if got := controller.Snapshot().Auth; got != AuthSignedIn {
 		t.Fatalf("Auth = %q, want signed_in", got)
+	}
+}
+
+func TestControllerStartWithOptionsUsesNonInteractiveAuthentication(t *testing.T) {
+	runtime := newTestRuntime()
+	runtime.usesCopilot = true
+	interactiveStarted := make(chan struct{})
+	nonInteractiveStarted := make(chan struct{})
+	authn := &testAuthenticator{started: interactiveStarted, nonInteractiveStarted: nonInteractiveStarted}
+	controller := newControllerForTest(t, runtime, authn, ReadinessCheckFunc(func(context.Context, string) error { return nil }))
+
+	op, err := controller.StartWithOptions(t.Context(), StartOptions{AllowInteractiveAuthentication: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, _ := op.Wait(t.Context())
+	if result.Status != OperationSucceeded {
+		t.Fatalf("result = %+v", result)
+	}
+	select {
+	case <-nonInteractiveStarted:
+	default:
+		t.Fatal("noninteractive authentication was not used")
+	}
+	select {
+	case <-interactiveStarted:
+		t.Fatal("interactive authentication was used")
+	default:
 	}
 }
 

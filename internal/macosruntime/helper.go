@@ -307,13 +307,31 @@ func (h *helper) dispatch(ctx context.Context, request requestEnvelope) (respons
 		return success(description), nil, false
 	case "start":
 		var payload struct {
-			ExpectedConfigRevision string `json:"expected_config_revision"`
+			ExpectedConfigRevision         string `json:"expected_config_revision"`
+			AllowInteractiveAuthentication *bool  `json:"allows_interactive_authentication"`
+			Reason                         string `json:"reason"`
 		}
 		if err := decodePayload(request.Payload, &payload); err != nil {
 			return failure(invalidPayloadError()), nil, false
 		}
+		allowInteractiveAuthentication := true
+		if payload.AllowInteractiveAuthentication != nil {
+			allowInteractiveAuthentication = *payload.AllowInteractiveAuthentication
+		}
+		switch payload.Reason {
+		case "", "userInitiated":
+		case "automaticLaunch":
+			if allowInteractiveAuthentication {
+				return failure(invalidPayloadError()), nil, false
+			}
+		default:
+			return failure(invalidPayloadError()), nil, false
+		}
 		op, err := h.operations.beginController(ctx, "start", h.opts.Controller, func() (appcontrol.Operation, error) {
-			return h.opts.Controller.Start(ctx, strings.TrimSpace(payload.ExpectedConfigRevision))
+			return h.opts.Controller.StartWithOptions(ctx, appcontrol.StartOptions{
+				ExpectedConfigRevision:         strings.TrimSpace(payload.ExpectedConfigRevision),
+				AllowInteractiveAuthentication: allowInteractiveAuthentication,
+			})
 		})
 		if err != nil {
 			return failure(mapProtocolError(err)), nil, false

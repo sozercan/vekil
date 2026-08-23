@@ -169,6 +169,19 @@ func TestRequestCacheEvictsOldestCompletedIDsAtCapacity(t *testing.T) {
 	}
 }
 
+func TestStartPayloadRejectsAutomaticInteractiveAuthentication(t *testing.T) {
+	h := &helper{epoch: "hep_test"}
+	response, _, _ := h.dispatch(t.Context(), requestEnvelope{
+		Version: ProtocolMax,
+		ID:      "req_start",
+		Command: "start",
+		Payload: json.RawMessage(`{"expected_config_revision":"","reason":"automaticLaunch","allows_interactive_authentication":true}`),
+	})
+	if response.OK || response.Error == nil || response.Error.Code != "invalid_payload" {
+		t.Fatalf("response = %+v, want invalid_payload", response)
+	}
+}
+
 func TestProtocolWriterConcurrentFramesRemainCompleteAndStateNeverRegresses(t *testing.T) {
 	var output bytes.Buffer
 	writer := newProtocolWriter(&output)
