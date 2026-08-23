@@ -69,6 +69,7 @@ require_plist_value CFBundleShortVersionString "${marketing_version}"
 require_plist_value CFBundleVersion "${bundle_version}"
 require_plist_value LSMinimumSystemVersion "${minimum_system_version}"
 require_plist_value LSUIElement true
+require_plist_value SUEnableAutomaticChecks false
 require_plist_value SUFeedURL "${sparkle_feed}"
 require_plist_value SUPublicEDKey "${sparkle_public_key}"
 require_plist_value SURequireSignedFeed true

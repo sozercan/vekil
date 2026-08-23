@@ -139,6 +139,7 @@ assert native["CFBundleShortVersionString"] == "0.15.0"
 assert native["CFBundleVersion"] == "15001"
 assert native["LSMinimumSystemVersion"] == "13.0"
 assert native["LSUIElement"] is True
+assert native["SUEnableAutomaticChecks"] is False
 assert native["SURequireSignedFeed"] is True
 assert native["SUVerifyUpdateBeforeExtraction"] is True
 assert native["VekilBundleBuildID"] == "vekil-15001-testfixture"
@@ -146,6 +147,7 @@ assert "SUEnableInstallerLauncherService" not in native
 assert legacy["CFBundleExecutable"] == "vekil-menubar"
 assert legacy["LSMinimumSystemVersion"] == "10.13"
 assert legacy["SUEnableInstallerLauncherService"] is True
+assert "SUEnableAutomaticChecks" not in legacy
 PY
 
 artifact="${TMP_ROOT}/vekil-macos-universal.zip"

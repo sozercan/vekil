@@ -9,6 +9,7 @@
 <key>CFBundleVersion</key><string>$(VEKIL_BUILD_NUMBER)</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
+<key>SUEnableAutomaticChecks</key><false/>
 <key>SUFeedURL</key><string>https://github.com/sozercan/vekil/releases/latest/download/appcast.xml</string>
 <key>SUPublicEDKey</key><string>$(SPARKLE_PUBLIC_ED_KEY)</string>
 <key>SURequireSignedFeed</key><true/>

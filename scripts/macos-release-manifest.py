@@ -296,6 +296,10 @@ def write_plist(args: argparse.Namespace) -> None:
     if legacy:
         # Retain the old Go shell's updater behavior during the two-release rollback window.
         plist["SUEnableInstallerLauncherService"] = True
+    else:
+        # Update checks are user-initiated only, so Sparkle never shows its automatic-check
+        # permission prompt at launch and cold/login/update launches stay menu-only.
+        plist["SUEnableAutomaticChecks"] = False
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
