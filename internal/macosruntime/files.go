@@ -103,18 +103,6 @@ func writeExclusiveFileWithBody(path string, writeBody func(*os.File) error) (re
 	return nil
 }
 
-func syncDirectory(path string) error {
-	directory, err := openPrivateDirectory(path)
-	if err != nil {
-		return fmt.Errorf("open directory %q for sync: %w", path, err)
-	}
-	defer func() { _ = directory.close() }()
-	if err := directory.sync(); err != nil {
-		return fmt.Errorf("sync directory %q: %w", path, err)
-	}
-	return nil
-}
-
 func removePrivateFile(path string) error {
 	dirPath := filepath.Dir(path)
 	directory, err := openPrivateDirectory(dirPath)

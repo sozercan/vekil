@@ -486,19 +486,24 @@ func readApplyJournal(path string) (ApplyJournal, error) {
 }
 
 func removeApplyArtifacts(paths Paths, includeJournal bool) error {
-	var errs []error
-	for _, path := range []string{paths.Staged, paths.Backup} {
-		if err := removePrivateFile(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			errs = append(errs, fmt.Errorf("remove %q: %w", path, err))
-		}
+	return removeApplyArtifactsWith(paths, includeJournal, removePrivateFile)
+}
+
+func removeApplyArtifactsWith(paths Paths, includeJournal bool, remove func(string) error) error {
+	if remove == nil {
+		return errors.New("apply artifact remover is required")
 	}
 	if includeJournal {
-		if err := removePrivateFile(paths.Journal); err != nil && !errors.Is(err, os.ErrNotExist) {
-			errs = append(errs, fmt.Errorf("remove %q: %w", paths.Journal, err))
+		if err := remove(paths.Journal); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove %q: %w", paths.Journal, err)
 		}
 	}
-	if len(errs) == 0 {
-		return syncDirectory(paths.Directory)
+
+	var errs []error
+	for _, path := range []string{paths.Staged, paths.Backup} {
+		if err := remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove %q: %w", path, err))
+		}
 	}
 	return errors.Join(errs...)
 }

@@ -3,6 +3,7 @@ package macosruntime
 import (
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -118,5 +119,36 @@ func TestManagedApplyInstallFailureWhileRunningRetainsRuntimeRollback(t *testing
 	}
 	if _, statErr := os.Stat(manager.paths.Journal); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("journal remains after runtime rollback finished: %v", statErr)
+	}
+}
+
+func TestRemoveApplyArtifactsMakesJournalRemovalTheDurableBoundary(t *testing.T) {
+	paths := PathsInDirectory("/test/state")
+	var removed []string
+	if err := removeApplyArtifactsWith(paths, true, func(path string) error {
+		removed = append(removed, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{paths.Journal, paths.Staged, paths.Backup}
+	if !reflect.DeepEqual(removed, want) {
+		t.Fatalf("removal order = %v, want %v", removed, want)
+	}
+
+	injected := errors.New("journal fsync failed")
+	removed = nil
+	err := removeApplyArtifactsWith(paths, true, func(path string) error {
+		removed = append(removed, path)
+		if path == paths.Journal {
+			return injected
+		}
+		return nil
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("removeApplyArtifactsWith() error = %v, want %v", err, injected)
+	}
+	if !reflect.DeepEqual(removed, []string{paths.Journal}) {
+		t.Fatalf("removals after journal failure = %v, want journal only", removed)
 	}
 }

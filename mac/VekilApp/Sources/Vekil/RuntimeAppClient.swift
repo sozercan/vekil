@@ -15,24 +15,23 @@ struct ValidatingProcessFactory: RuntimeProcessFactory {
 
 actor RuntimeAppClient: AppRuntimeClient {
     let controller: RuntimeController
-    private var continuation: AsyncStream<AppRuntimeClientEvent>.Continuation?
-    private var observation: Task<Void, Never>?
 
     init(controller: RuntimeController) { self.controller = controller }
     func events() async -> AsyncStream<AppRuntimeClientEvent> {
-        if let continuation { return AsyncStream { $0.onTermination = { _ in }; _ = continuation } }
-        var created: AsyncStream<AppRuntimeClientEvent>.Continuation!
-        let stream = AsyncStream<AppRuntimeClientEvent> { created = $0 }
-        continuation = created
-        observation = Task { [weak self] in
-            guard let self else { return }
-            let notifications = await controller.scopedNotificationStream()
-            for await scoped in notifications {
-                guard let identity = scoped.launchIdentity else { continue }
-                if let event = Self.map(scoped.notification, identity: identity) { created.yield(event) }
+        AsyncStream<AppRuntimeClientEvent> { continuation in
+            let observation = Task { [controller] in
+                let notifications = await controller.scopedNotificationStream()
+                for await scoped in notifications {
+                    guard !Task.isCancelled else { break }
+                    guard let identity = scoped.launchIdentity else { continue }
+                    if let event = Self.map(scoped.notification, identity: identity) {
+                        continuation.yield(event)
+                    }
+                }
+                continuation.finish()
             }
+            continuation.onTermination = { @Sendable _ in observation.cancel() }
         }
-        return stream
     }
 
     func initialize() async throws -> AppRuntimeInitialization {
