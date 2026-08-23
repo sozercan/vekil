@@ -27,7 +27,6 @@ framework_rel="$(${MANIFEST_TOOL} get --file "${CONFIG}" --key sparkle.framework
 appcast_tool_rel="$(${MANIFEST_TOOL} get --file "${CONFIG}" --key sparkle.generate_appcast_path)"
 archive_path="${DOWNLOAD_ROOT}/${archive_name}"
 unpack_dir="${CACHE_ROOT}/${version}"
-marker="${unpack_dir}/.verified-sha256"
 
 verify_archive() {
   [[ -f "${archive_path}" ]] || return 1
@@ -37,11 +36,10 @@ verify_archive() {
 }
 
 verify_unpacked() {
-  [[ -f "${marker}" ]] || return 1
-  [[ "$(cat "${marker}")" == "${archive_sha256}" ]] || return 1
-  [[ -d "${unpack_dir}/${framework_rel}" ]] || return 1
-  [[ -x "${unpack_dir}/${appcast_tool_rel}" ]] || return 1
-  python3 - "${unpack_dir}/${framework_rel}" "${version}" <<'PY'
+  local root="$1"
+  [[ -d "${root}/${framework_rel}" ]] || return 1
+  [[ -x "${root}/${appcast_tool_rel}" ]] || return 1
+  python3 - "${root}/${framework_rel}" "${version}" <<'PY'
 import plistlib
 import sys
 from pathlib import Path
@@ -87,11 +85,10 @@ fi
 
 verify_archive || die "cached Sparkle archive failed SHA-256 verification"
 
-if ! verify_unpacked; then
-  temp_unpack="$(mktemp -d "${CACHE_ROOT}/.${version}.XXXXXX")"
-  trap 'rm -f "${temp_archive:-}"; rm -rf "${temp_unpack:-}"' EXIT
-  log "Validating Sparkle archive paths before extraction"
-  python3 - "${archive_path}" <<'PY'
+temp_unpack="$(mktemp -d "${CACHE_ROOT}/.${version}.XXXXXX")"
+trap 'rm -f "${temp_archive:-}"; rm -rf "${temp_unpack:-}"' EXIT
+log "Validating Sparkle archive paths before extraction"
+python3 - "${archive_path}" <<'PY'
 import os
 import sys
 import tarfile
@@ -112,13 +109,12 @@ with tarfile.open(archive, mode="r:xz") as handle:
             if ".." in resolved.parts:
                 raise SystemExit(f"unsafe escaping link: {name} -> {member.linkname}")
 PY
-  tar -xf "${archive_path}" -C "${temp_unpack}"
-  printf '%s\n' "${archive_sha256}" >"${temp_unpack}/.verified-sha256"
-  rm -rf "${unpack_dir}"
-  mv "${temp_unpack}" "${unpack_dir}"
-  temp_unpack=""
-fi
+tar -xf "${archive_path}" -C "${temp_unpack}"
+verify_unpacked "${temp_unpack}" || die "fresh Sparkle ${version} extraction failed verification"
+rm -rf "${unpack_dir}"
+mv "${temp_unpack}" "${unpack_dir}"
+temp_unpack=""
 
-verify_unpacked || die "Sparkle ${version} extraction failed verification"
+verify_unpacked "${unpack_dir}" || die "Sparkle ${version} extraction failed verification"
 log "Verified Sparkle ${version} (${archive_sha256})"
 printf '%s\n' "${unpack_dir}"

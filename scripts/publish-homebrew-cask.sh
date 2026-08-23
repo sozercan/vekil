@@ -70,12 +70,6 @@ cask "vekil" do
   app "Vekil.app"
 
   zap trash: [
-    "~/Library/Application Support/vekil/menubar.json",
-    "~/Library/Application Support/vekil/managed-apply.json",
-    "~/Library/Application Support/vekil/.providers.yaml.staged",
-    "~/Library/Application Support/vekil/.providers.yaml.previous",
-    "~/Library/Application Support/vekil/Singleton-*",
-    "~/Library/Application Support/vekil/dashboard-config",
     "~/Library/Caches/com.vekil.menubar",
     "~/Library/LaunchAgents/com.vekil.menubar.plist",
     "~/Library/Preferences/com.vekil.menubar.plist",

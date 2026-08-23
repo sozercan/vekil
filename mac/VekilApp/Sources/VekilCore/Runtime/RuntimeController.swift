@@ -841,10 +841,13 @@ public actor RuntimeController {
         session.handshakeTimeoutTask?.cancel()
         self.hello = hello
         helperEpoch = hello.helperEpoch
-        lastNotificationIdentity = RuntimeLaunchIdentity(
+        let replacementIdentity = RuntimeLaunchIdentity(
             launchToken: session.id,
             helperEpoch: hello.helperEpoch
         )
+        if !session.isAutomaticRestart || lastNotificationIdentity == nil {
+            lastNotificationIdentity = replacementIdentity
+        }
         negotiatedProtocolVersion = event.version
         lastStateRevision = nil
         currentRuntimeGeneration = nil
@@ -1114,6 +1117,12 @@ public actor RuntimeController {
         }
 
         currentState = event
+        if let launchToken, event.helperEpoch == helperEpoch {
+            lastNotificationIdentity = RuntimeLaunchIdentity(
+                launchToken: launchToken,
+                helperEpoch: event.helperEpoch
+            )
+        }
         if let generation = event.payload.runtimeGeneration {
             currentRuntimeGeneration = generation
         }
@@ -1506,7 +1515,7 @@ public actor RuntimeController {
         let activeIdentity = launchToken.flatMap { token in
             helperEpoch.map { RuntimeLaunchIdentity(launchToken: token, helperEpoch: $0) }
         }
-        if let identity = activeIdentity ?? lastNotificationIdentity {
+        if let identity = lastNotificationIdentity ?? activeIdentity {
             let scoped = RuntimeScopedNotification(
                 launchToken: identity.launchToken,
                 helperEpoch: identity.helperEpoch,

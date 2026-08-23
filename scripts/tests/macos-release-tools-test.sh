@@ -15,7 +15,7 @@ fail() {
   exit 1
 }
 
-for command in base64 openssl tail; do
+for command in base64 openssl shasum tail tar; do
   command -v "${command}" >/dev/null 2>&1 || fail "missing required command: ${command}"
 done
 
@@ -201,14 +201,59 @@ expect_failure env \
   MACOS_FORWARD_REVERT_TESTED_SHA256="${sha256}" \
   "${REPO_ROOT}/scripts/verify-macos-release-gates.sh" "${artifact}" "${sha_file}"
 
+sparkle_fixture="${TMP_ROOT}/sparkle-fixture"
+sparkle_source="${sparkle_fixture}/source"
+sparkle_downloads="${sparkle_fixture}/downloads"
+sparkle_cache="${sparkle_fixture}/cache"
+sparkle_config="${sparkle_fixture}/app-config.json"
+mkdir -p \
+  "${sparkle_source}/Sparkle.framework/Versions/B/Resources" \
+  "${sparkle_source}/bin" \
+  "${sparkle_downloads}"
+python3 - "${sparkle_source}/Sparkle.framework/Versions/B/Resources/Info.plist" <<'PY_SPARKLE_FIXTURE'
+import plistlib
+import sys
+from pathlib import Path
+
+with Path(sys.argv[1]).open("wb") as handle:
+    plistlib.dump({"CFBundleShortVersionString": "2.9.4"}, handle)
+PY_SPARKLE_FIXTURE
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "fixture-original"\n' >"${sparkle_source}/bin/generate_appcast"
+chmod +x "${sparkle_source}/bin/generate_appcast"
+tar -cJf "${sparkle_downloads}/Sparkle-2.9.4.tar.xz" -C "${sparkle_source}" .
+sparkle_fixture_sha="$(shasum -a 256 "${sparkle_downloads}/Sparkle-2.9.4.tar.xz" | awk '{print $1}')"
+python3 - "${CONFIG}" "${sparkle_config}" "${sparkle_fixture_sha}" <<'PY_SPARKLE_CONFIG'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text())
+value["sparkle"]["archive_sha256"] = sys.argv[3]
+Path(sys.argv[2]).write_text(json.dumps(value))
+PY_SPARKLE_CONFIG
+sparkle_root="$(
+  MACOS_APP_CONFIG="${sparkle_config}" \
+  SPARKLE_CACHE_DIR="${sparkle_cache}" \
+  SPARKLE_DOWNLOAD_DIR="${sparkle_downloads}" \
+    "${REPO_ROOT}/scripts/fetch-sparkle.sh"
+)"
+printf '#!/usr/bin/env bash\nexit 99\n' >"${sparkle_root}/bin/generate_appcast"
+sparkle_root_after_corruption="$(
+  MACOS_APP_CONFIG="${sparkle_config}" \
+  SPARKLE_CACHE_DIR="${sparkle_cache}" \
+  SPARKLE_DOWNLOAD_DIR="${sparkle_downloads}" \
+    "${REPO_ROOT}/scripts/fetch-sparkle.sh"
+)"
+[[ "${sparkle_root_after_corruption}" == "${sparkle_root}" ]] || fail "Sparkle cache path changed between verified fetches"
+grep -Fq 'fixture-original' "${sparkle_root}/bin/generate_appcast" || fail "Sparkle fetch trusted modified cached contents"
+
 "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.15.0 "${sha256}" "${TMP_ROOT}/tap"
 cask="${TMP_ROOT}/tap/Casks/vekil.rb"
 grep -Fq 'vekil-macos-universal.zip' "${cask}" || fail "Homebrew cask does not use universal artifact"
 grep -Fq 'depends_on macos: ">= :ventura"' "${cask}" || fail "Homebrew cask does not require macOS 13"
 if grep -Eq 'depends_on arch|xattr' "${cask}"; then fail "Homebrew cask retains architecture restriction or quarantine bypass"; fi
 if grep -Fq '.config/vekil' "${cask}"; then fail "Homebrew cask must not delete external configuration roots"; fi
-if grep -Fq 'Application Support/vekil",' "${cask}"; then fail "Homebrew cask must not recursively delete Application Support"; fi
-if grep -Fq 'Application Support/vekil/providers.yaml' "${cask}"; then fail "Homebrew cask must preserve the path when it may be user-owned External Configuration"; fi
+if grep -Fq 'Application Support/vekil' "${cask}"; then fail "Homebrew cask must preserve managed state and every selectable External Configuration path"; fi
 "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.16.0 "${sha256}" "${TMP_ROOT}/tap"
 expect_failure "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.15.0 "${sha256}" "${TMP_ROOT}/tap"
 

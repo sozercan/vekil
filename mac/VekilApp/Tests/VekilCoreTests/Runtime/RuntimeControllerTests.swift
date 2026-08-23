@@ -806,6 +806,82 @@ final class RuntimeControllerTests: XCTestCase {
         await controller.shutdown()
     }
 
+    func testPostHandshakeRestartStateFailureRetainsPreviousScopedIdentity() async throws {
+        let first = FakeRuntimeProcess()
+        configureSuccessfulHandshake(process: first, epoch: "hep_original")
+        let second = FakeRuntimeProcess()
+        second.onRun { [weak second] in
+            second?.emitStandardOutput(try! encodedHello(epoch: "hep_replacement"))
+        }
+        second.onWrite { [weak second] data in
+            guard let second, let request = try? requestFromLine(data), request.command == .getState else { return }
+            let error = RuntimeStructuredError(
+                code: "state_unavailable",
+                userMessage: "The replacement state is unavailable.",
+                retryable: false
+            )
+            second.emitStandardOutput(
+                try! RuntimeFrameCodec().encodeLine(
+                    RuntimeResponseEnvelope(
+                        version: 1,
+                        id: request.id,
+                        helperEpoch: "hep_replacement",
+                        ok: false,
+                        error: error
+                    )
+                )
+            )
+        }
+        var configuration = makeConfiguration()
+        configuration.restartPolicy = RuntimeRestartPolicy(
+            maximumAutomaticRestarts: 1,
+            window: 60,
+            delays: [0]
+        )
+        let controller = RuntimeController(
+            configuration: configuration,
+            processFactory: FakeRuntimeProcessFactory([first, second]),
+            clock: ManualRuntimeClock(),
+            idGenerator: SequenceRuntimeIDGenerator(["req_original", "req_replacement"])
+        )
+        _ = try await controller.connect()
+        let originalSnapshot = await controller.snapshot()
+        let originalIdentity = try XCTUnwrap(originalSnapshot.launchIdentity)
+        let stream = await controller.scopedNotificationStream()
+
+        first.emitExit(status: 1)
+        try await eventually {
+            await controller.connectionState == .failed(.launchPreparationFailed)
+        }
+
+        let failure = try await withThrowingTaskGroup(
+            of: RuntimeScopedNotification.self
+        ) { group in
+            group.addTask {
+                for await scoped in stream {
+                    try Task.checkCancellation()
+                    if case .connectionStateChanged(.failed(_)) = scoped.notification {
+                        return scoped
+                    }
+                }
+                throw RuntimeTestError.timedOut
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+                throw RuntimeTestError.timedOut
+            }
+            guard let result = try await group.next() else {
+                throw RuntimeTestError.timedOut
+            }
+            group.cancelAll()
+            return result
+        }
+        XCTAssertEqual(failure.launchIdentity, originalIdentity)
+        second.emitExit(status: 1)
+        try await eventually { await controller.snapshot().launchIdentity == nil }
+        await controller.shutdown()
+    }
+
     func testPostHandshakeRestartPreparationFailurePublishesReplacementStateBeforeFailure() async throws {
         let first = FakeRuntimeProcess()
         configureSuccessfulHandshake(process: first, epoch: "hep_original")
