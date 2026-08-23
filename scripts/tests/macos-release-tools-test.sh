@@ -157,6 +157,12 @@ openssl pkeyutl -sign \
   -in "${artifact}" \
   -out "${TMP_ROOT}/artifact-signature"
 signature="$(base64 <"${TMP_ROOT}/artifact-signature" | tr -d '\r\n')"
+openssl pkeyutl -sign \
+  -inkey "${TMP_ROOT}/test-key.pem" \
+  -rawin \
+  -in "${legacy_artifact}" \
+  -out "${TMP_ROOT}/legacy-artifact-signature"
+legacy_signature="$(base64 <"${TMP_ROOT}/legacy-artifact-signature" | tr -d '\r\n')"
 appcast="${TMP_ROOT}/appcast.xml"
 unsigned_appcast="${TMP_ROOT}/unsigned-appcast.xml"
 cat >"${unsigned_appcast}" <<EOF_APPCAST
@@ -176,7 +182,7 @@ cat >"${unsigned_appcast}" <<EOF_APPCAST
       <sparkle:shortVersionString>0.14.1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>10.13</sparkle:minimumSystemVersion>
       <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-      <enclosure url="${legacy_artifact_url}" length="${legacy_artifact_size}" type="application/octet-stream" sparkle:edSignature="${signature}"/>
+      <enclosure url="${legacy_artifact_url}" length="${legacy_artifact_size}" type="application/octet-stream" sparkle:edSignature="${legacy_signature}"/>
     </item>
   </channel>
 </rss>
@@ -216,6 +222,48 @@ PY_BAD_LEGACY_URL
 sign_appcast "${bad_legacy_url_unsigned}" "${bad_legacy_url_appcast}"
 expect_failure "${APPCAST_TOOL}" \
   --appcast "${bad_legacy_url_appcast}" \
+  --manifest "${manifest}" \
+  --artifact "${artifact}" \
+  --legacy-artifact "${legacy_artifact}" \
+  --expected-url-prefix https://example.invalid/releases/v0.15.0 \
+  --require-legacy-compatible-entry
+
+bad_legacy_signature_unsigned="${TMP_ROOT}/bad-legacy-signature-unsigned-appcast.xml"
+bad_legacy_signature_appcast="${TMP_ROOT}/bad-legacy-signature-appcast.xml"
+python3 - \
+  "${unsigned_appcast}" \
+  "${bad_legacy_signature_unsigned}" \
+  "${legacy_artifact_url}" \
+  "${legacy_signature}" \
+  "${signature}" <<'PY_BAD_LEGACY_SIGNATURE'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+legacy_url = sys.argv[3]
+legacy_signature = sys.argv[4]
+wrong_signature = sys.argv[5]
+lines = source.splitlines(keepends=True)
+matches = 0
+for index, line in enumerate(lines):
+    if f'url="{legacy_url}"' not in line:
+        continue
+    expected = f'sparkle:edSignature="{legacy_signature}"'
+    if expected not in line:
+        raise SystemExit("legacy enclosure signature fixture not found")
+    lines[index] = line.replace(
+        expected,
+        f'sparkle:edSignature="{wrong_signature}"',
+        1,
+    )
+    matches += 1
+if matches != 1:
+    raise SystemExit(f"expected one legacy enclosure fixture, found {matches}")
+Path(sys.argv[2]).write_text("".join(lines))
+PY_BAD_LEGACY_SIGNATURE
+sign_appcast "${bad_legacy_signature_unsigned}" "${bad_legacy_signature_appcast}"
+expect_failure "${APPCAST_TOOL}" \
+  --appcast "${bad_legacy_signature_appcast}" \
   --manifest "${manifest}" \
   --artifact "${artifact}" \
   --legacy-artifact "${legacy_artifact}" \

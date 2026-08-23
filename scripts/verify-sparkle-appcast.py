@@ -314,6 +314,11 @@ def main() -> int:
         parsed_legacy_url = urllib.parse.urlparse(legacy_url)
         if parsed_legacy_url.scheme != "https" or not Path(parsed_legacy_url.path).name:
             raise VerificationError("legacy enclosure URL must identify an HTTPS artifact")
+        legacy_signature = decode_base64(
+            (legacy_enclosure.get(f"{{{SPARKLE}}}edSignature") or "").strip(),
+            "legacy enclosure Ed25519 signature",
+            64,
+        )
         if not args.legacy_artifact:
             raise VerificationError(
                 "--legacy-artifact is required with --require-legacy-compatible-entry"
@@ -332,6 +337,12 @@ def main() -> int:
             raise VerificationError(
                 f"legacy enclosure length {expected_length} does not match artifact {actual_length}"
             )
+        verify_ed25519_signature(
+            legacy_artifact,
+            legacy_signature,
+            public_key,
+            "legacy enclosure Ed25519 signature",
+        )
 
     print(
         f"verified appcast candidate {marketing_version} ({bundle_version}), "

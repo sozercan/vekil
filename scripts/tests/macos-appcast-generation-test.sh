@@ -43,6 +43,12 @@ printf 'legacy-zip-fixture' >"${legacy_artifact}"
 legacy_artifact_size="$(wc -c <"${legacy_artifact}" | tr -d ' ')"
 legacy_artifact_sha256="$(shasum -a 256 "${legacy_artifact}" | awk '{print $1}')"
 legacy_artifact_url="https://example.invalid/v0.14.1/vekil-macos-arm64.zip"
+openssl pkeyutl -sign \
+  -inkey "${TMP_ROOT}/test-key.pem" \
+  -rawin \
+  -in "${legacy_artifact}" \
+  -out "${TMP_ROOT}/legacy-artifact-signature"
+legacy_signature="$(base64 <"${TMP_ROOT}/legacy-artifact-signature" | tr -d '\r\n')"
 python3 - \
   "${manifest}" \
   "${public_key}" \
@@ -83,7 +89,7 @@ cat >"${TMP_ROOT}/base-appcast.xml" <<EOF_APPCAST
       <sparkle:shortVersionString>0.14.1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>10.13</sparkle:minimumSystemVersion>
       <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-      <enclosure url="${legacy_artifact_url}" length="${legacy_artifact_size}" type="application/octet-stream" sparkle:edSignature="${signature}"/>
+      <enclosure url="${legacy_artifact_url}" length="${legacy_artifact_size}" type="application/octet-stream" sparkle:edSignature="${legacy_signature}"/>
     </item>
   </channel>
 </rss><!-- sparkle-signatures:
