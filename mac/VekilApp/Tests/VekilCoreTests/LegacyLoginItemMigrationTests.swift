@@ -4,23 +4,18 @@ import XCTest
 @testable import VekilCore
 
 final class LegacyLoginItemMigrationTests: XCTestCase {
-    func testRecognizesLoadedAndDisabledOwnedLegacyItems() async throws {
+    func testRecognizesOwnedLegacyItemAsEnabledWhenLaunchdHasNotLoadedIt() async throws {
         let home = try makeHome(plist: ownedPlist())
         defer { try? FileManager.default.removeItem(at: home) }
 
-        let loaded = LegacyLaunchAgentMigrator(
-            homeDirectory: home,
-            runner: LegacyLaunchctlRunner { arguments in arguments.first == "print" ? 0 : 0 }
-        )
-        let loadedIntent = await loaded.inspect()
-        XCTAssertEqual(loadedIntent, .enabled)
-
-        let disabled = LegacyLaunchAgentMigrator(
+        let migrator = LegacyLaunchAgentMigrator(
             homeDirectory: home,
             runner: LegacyLaunchctlRunner { _ in 113 }
         )
-        let disabledIntent = await disabled.inspect()
-        XCTAssertEqual(disabledIntent, .disabled)
+
+        let intent = await migrator.inspect()
+
+        XCTAssertEqual(intent, .enabled)
     }
 
     func testRejectsForeignMalformedAndSymlinkedItems() async throws {

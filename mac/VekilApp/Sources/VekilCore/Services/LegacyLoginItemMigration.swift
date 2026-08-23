@@ -55,9 +55,10 @@ public actor LegacyLaunchAgentMigrator: LegacyLoginItemMigrating {
         guard let plist = readOwnedPlist(), Self.isVekilPlist(plist) else {
             return FileManager.default.fileExists(atPath: plistURL.path) ? .invalid : .absent
         }
-        let domain = "gui/\(uid)/\(Self.label)"
-        let status = try? await runner.run(["print", domain])
-        return status == 0 ? .enabled : .disabled
+        // The legacy shell persisted enabled intent by keeping this owned
+        // plist on disk. Whether launchd has loaded it in the current session
+        // does not change that saved preference.
+        return .enabled
     }
 
     public func removeOwnedLegacyItem() async throws {
