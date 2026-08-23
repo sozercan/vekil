@@ -37,8 +37,17 @@ public struct RuntimeHelperCodeIdentity: Equatable, Sendable {
     }
 }
 
+public enum RuntimeHelperSignaturePolicy: Equatable, Sendable {
+    case requireProductionTeam
+    case allowAdHocForTesting
+}
+
 public struct SecurityHelperCodeSignatureValidator: HelperCodeSignatureValidating {
-    public init() {}
+    private let policy: RuntimeHelperSignaturePolicy
+
+    public init(policy: RuntimeHelperSignaturePolicy = .requireProductionTeam) {
+        self.policy = policy
+    }
 
     public func validate(
         at helperURL: URL,
@@ -46,12 +55,39 @@ public struct SecurityHelperCodeSignatureValidator: HelperCodeSignatureValidatin
     ) throws -> RuntimeHelperCodeIdentity {
         let helper = try staticCode(at: helperURL)
         let application = try staticCode(at: applicationURL)
-        let flags = SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures)
-        guard SecStaticCodeCheckValidity(helper, flags, nil) == errSecSuccess,
-              SecStaticCodeCheckValidity(application, flags, nil) == errSecSuccess else {
+        let runningApplication = try currentApplicationCode()
+        let staticFlags = SecCSFlags(
+            rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures
+        )
+        let runningFlags = SecCSFlags(rawValue: kSecCSStrictValidate)
+        guard SecStaticCodeCheckValidity(helper, staticFlags, nil) == errSecSuccess,
+              SecStaticCodeCheckValidity(application, staticFlags, nil) == errSecSuccess,
+              SecCodeCheckValidity(runningApplication, runningFlags, nil) == errSecSuccess else {
             throw RuntimeHelperValidationError.invalidSignature
         }
-        guard try teamIdentifier(for: helper) == teamIdentifier(for: application) else {
+
+        let runningStaticCode = try staticCode(for: runningApplication)
+        guard try codeURL(for: runningStaticCode).resolvingSymlinksInPath().standardizedFileURL
+            == applicationURL.resolvingSymlinksInPath().standardizedFileURL else {
+            throw RuntimeHelperValidationError.signatureIdentityMismatch
+        }
+        let runningRequirement = try designatedRequirement(for: runningStaticCode)
+        guard SecStaticCodeCheckValidity(
+            application,
+            runningFlags,
+            runningRequirement
+        ) == errSecSuccess else {
+            throw RuntimeHelperValidationError.signatureIdentityMismatch
+        }
+
+        let runningTeam = try teamIdentifier(for: runningStaticCode)
+        guard try teamIdentifier(for: application) == runningTeam else {
+            throw RuntimeHelperValidationError.signatureIdentityMismatch
+        }
+        if policy == .requireProductionTeam, runningTeam == nil {
+            throw RuntimeHelperValidationError.missingTeamIdentifier
+        }
+        guard try teamIdentifier(for: helper) == runningTeam else {
             throw RuntimeHelperValidationError.signatureIdentityMismatch
         }
         return RuntimeHelperCodeIdentity(codeDirectoryHash: try codeDirectoryHash(for: helper))
@@ -89,6 +125,40 @@ public struct SecurityHelperCodeSignatureValidator: HelperCodeSignatureValidatin
         return code
     }
 
+    private func currentApplicationCode() throws -> SecCode {
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else {
+            throw RuntimeHelperValidationError.invalidSignature
+        }
+        return code
+    }
+
+    private func staticCode(for code: SecCode) throws -> SecStaticCode {
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+              let staticCode else {
+            throw RuntimeHelperValidationError.invalidSignature
+        }
+        return staticCode
+    }
+
+    private func codeURL(for code: SecStaticCode) throws -> URL {
+        var url: CFURL?
+        guard SecCodeCopyPath(code, [], &url) == errSecSuccess, let url else {
+            throw RuntimeHelperValidationError.invalidSignature
+        }
+        return url as URL
+    }
+
+    private func designatedRequirement(for code: SecStaticCode) throws -> SecRequirement {
+        var requirement: SecRequirement?
+        guard SecCodeCopyDesignatedRequirement(code, [], &requirement) == errSecSuccess,
+              let requirement else {
+            throw RuntimeHelperValidationError.invalidSignature
+        }
+        return requirement
+    }
+
     private func teamIdentifier(for code: SecStaticCode) throws -> String? {
         var information: CFDictionary?
         guard SecCodeCopySigningInformation(
@@ -96,7 +166,11 @@ public struct SecurityHelperCodeSignatureValidator: HelperCodeSignatureValidatin
         ) == errSecSuccess, let values = information as? [String: Any] else {
             throw RuntimeHelperValidationError.invalidSignature
         }
-        return values[kSecCodeInfoTeamIdentifier as String] as? String
+        guard let identifier = values[kSecCodeInfoTeamIdentifier as String] as? String else {
+            return nil
+        }
+        let trimmed = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func codeDirectoryHash(for code: SecStaticCode) throws -> Data {
@@ -115,7 +189,7 @@ public struct SecurityHelperCodeSignatureValidator: HelperCodeSignatureValidatin
 
 public enum RuntimeHelperValidationError: Error, Equatable, LocalizedError {
     case outsideBundle, missing, symlink, notRegular, notExecutable, ownerMismatch
-    case invalidSignature, signatureIdentityMismatch, codeIdentityMismatch
+    case invalidSignature, missingTeamIdentifier, signatureIdentityMismatch, codeIdentityMismatch
     case changedDuringValidation, missingProcessIdentifier
     public var errorDescription: String? {
         switch self {
@@ -126,6 +200,7 @@ public enum RuntimeHelperValidationError: Error, Equatable, LocalizedError {
         case .notExecutable: "The runtime helper is not executable."
         case .ownerMismatch: "The runtime helper owner does not match Vekil.app."
         case .invalidSignature: "The runtime helper code signature is invalid."
+        case .missingTeamIdentifier: "The production app signature has no Team Identifier."
         case .signatureIdentityMismatch: "The runtime helper signature does not match Vekil.app."
         case .codeIdentityMismatch: "The running helper does not match the validated runtime helper."
         case .changedDuringValidation: "The runtime helper changed while Vekil was validating it."
@@ -173,8 +248,7 @@ public struct RuntimeHelperValidator: Sendable {
         guard fstat(fd, &after) == 0, after.st_mode & S_IFMT == S_IFREG, after.st_ino == before.st_ino, after.st_dev == before.st_dev else {
             throw RuntimeHelperValidationError.notRegular
         }
-        let application = bundle.appendingPathComponent("Contents/MacOS/Vekil")
-        let codeIdentity = try signature.validate(at: helper, matchingApplicationAt: application)
+        let codeIdentity = try signature.validate(at: helper, matchingApplicationAt: bundle)
         var final = stat()
         guard lstat(helper.path, &final) == 0,
               final.st_mode & S_IFMT == S_IFREG,

@@ -48,7 +48,11 @@ MainActor.assumeIsolated {
         configuration: configuration,
         processFactory: ValidatingProcessFactory(
             bundleURL: bundle.bundleURL,
-            validator: RuntimeHelperValidator()
+            validator: RuntimeHelperValidator(
+                signature: SecurityHelperCodeSignatureValidator(
+                    policy: testRoot == nil ? .requireProductionTeam : .allowAdHocForTesting
+                )
+            )
         ),
         launchPreparation: { context in
             let requests = try await secretProjectionPreparer.requests(for: context)

@@ -13,6 +13,7 @@ final class ShellSecurityTests: XCTestCase {
 
     final class SignatureSpy: HelperCodeSignatureValidating, @unchecked Sendable {
         var calls: [URL] = []
+        var applicationCalls: [URL] = []
         var runningCalls: [(Int32, RuntimeHelperCodeIdentity)] = []
         var runningError: Error?
         var runningValidation: ((Int32, RuntimeHelperCodeIdentity) throws -> Void)?
@@ -23,6 +24,7 @@ final class ShellSecurityTests: XCTestCase {
             matchingApplicationAt applicationURL: URL
         ) throws -> RuntimeHelperCodeIdentity {
             calls.append(helperURL)
+            applicationCalls.append(applicationURL)
             return identity
         }
 
@@ -76,6 +78,7 @@ final class ShellSecurityTests: XCTestCase {
             helper.path
         )
         XCTAssertEqual(spy.calls.map(\.path), [helper.path])
+        XCTAssertEqual(spy.applicationCalls.map(\.path), [bundle.path])
         XCTAssertEqual(VekilBundleLayout.helperRelativePath, "Contents/Helpers/vekil-runtime")
     }
 

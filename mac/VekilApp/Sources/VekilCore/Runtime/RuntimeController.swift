@@ -343,6 +343,7 @@ public actor RuntimeController {
     private var suppression: RestartSuppression = .none
     private var currentRuntimeGeneration: UInt64?
     private var restoreProxyAfterReconnect = false
+    private var preserveStoppedIntent = false
 
     public init(
         configuration: RuntimeControllerConfiguration,
@@ -573,8 +574,8 @@ public actor RuntimeController {
     }
 
     public func restartHelper() async throws -> RuntimeHelloPayload {
-        let shouldRestoreProxy = restoreProxyAfterReconnect
-            || currentState?.payload.service == .running
+        let shouldRestoreProxy = !preserveStoppedIntent
+            && (restoreProxyAfterReconnect || currentState?.payload.service == .running)
         await shutdown(reason: .manualRestart)
         restoreProxyAfterReconnect = shouldRestoreProxy
         suppression = .none
@@ -1112,6 +1113,13 @@ public actor RuntimeController {
               let operationID = admission.operationID,
               !operationID.isEmpty else { return }
 
+        if command == .stop {
+            preserveStoppedIntent = true
+            restoreProxyAfterReconnect = false
+        } else if command == .start {
+            preserveStoppedIntent = false
+        }
+
         let tracked = RuntimeTrackedOperation(
             id: operationID,
             requestID: response.id,
@@ -1180,6 +1188,8 @@ public actor RuntimeController {
         currentState = event
         if event.payload.service == .running {
             restoreProxyAfterReconnect = false
+        } else if event.payload.service == .stopped {
+            preserveStoppedIntent = false
         }
         if let launchToken, event.helperEpoch == helperEpoch {
             lastNotificationIdentity = RuntimeLaunchIdentity(
@@ -1251,6 +1261,12 @@ public actor RuntimeController {
         tracked.error = payload.error
         operations[payload.operationID] = tracked
 
+        if tracked.kind == RuntimeOperationKind(RuntimeCommand.stop.rawValue),
+           tracked.isTerminal,
+           tracked.status != .succeeded {
+            preserveStoppedIntent = false
+        }
+
         if tracked.isTerminal {
             if activeOperationID == payload.operationID { activeOperationID = nil }
             resumeOperationWaiters(for: tracked)
@@ -1293,7 +1309,9 @@ public actor RuntimeController {
         }
 
         guard let session, session.id == sessionID else { return }
-        if suppression == .none, currentState?.payload.service == .running {
+        if suppression == .none,
+           currentState?.payload.service == .running,
+           !preserveStoppedIntent {
             restoreProxyAfterReconnect = true
         }
         session.handshakeTimeoutTask?.cancel()

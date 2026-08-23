@@ -956,6 +956,85 @@ final class RuntimeControllerTests: XCTestCase {
         XCTAssertEqual(replacementCommands, [.getState, .start])
     }
 
+    func testAutomaticRestartPreservesAdmittedStopIntentBeforeStateUpdate() async throws {
+        let first = FakeRuntimeProcess()
+        first.onRun { [weak first] in
+            first?.emitStandardOutput(try! encodedHello(epoch: "hep_original"))
+        }
+        first.onWrite { [weak first] data in
+            guard let first, let request = try? requestFromLine(data) else { return }
+            if request.command == .getState {
+                let state = RuntimeStatePayload(
+                    runtimeGeneration: 7,
+                    configRevision: "cfg_running",
+                    service: .running,
+                    readiness: .ready,
+                    auth: .signedIn
+                )
+                first.emitStandardOutput(
+                    try! encodedResponse(
+                        for: request,
+                        epoch: "hep_original",
+                        result: .object([
+                            "state_revision": .integer(1),
+                            "state": try! JSONValue.encode(state),
+                        ])
+                    )
+                )
+            } else if request.command == .stop {
+                first.emitStandardOutput(
+                    try! encodedResponse(
+                        for: request,
+                        epoch: "hep_original",
+                        result: .object([
+                            "accepted": .bool(true),
+                            "operation_id": .string("op_stop"),
+                        ])
+                    )
+                )
+            }
+        }
+
+        let replacement = FakeRuntimeProcess()
+        configureSuccessfulHandshake(process: replacement, epoch: "hep_replacement")
+
+        let controller = RuntimeController(
+            configuration: makeConfiguration(
+                restartPolicy: RuntimeRestartPolicy(
+                    maximumAutomaticRestarts: 1,
+                    window: 60,
+                    delays: [0]
+                )
+            ),
+            processFactory: FakeRuntimeProcessFactory([first, replacement]),
+            clock: ManualRuntimeClock(),
+            idGenerator: SequenceRuntimeIDGenerator([
+                "req_original_state", "req_stop", "req_replacement_state",
+                "req_unwanted_restore",
+            ])
+        )
+        _ = try await controller.connect()
+
+        let stop = try await controller.submitOperation(command: .stop)
+        XCTAssertEqual(stop.id, "op_stop")
+        try await eventually { await controller.snapshot().activeOperationID == "op_stop" }
+
+        first.emitExit(status: 1)
+
+        try await eventually {
+            let snapshot = await controller.snapshot()
+            return snapshot.connectionState == .connected
+                && snapshot.currentState?.helperEpoch == "hep_replacement"
+        }
+        XCTAssertEqual(
+            try replacement.writtenData.map(requestFromLine).map(\.command),
+            [.getState]
+        )
+        let snapshot = await controller.snapshot()
+        XCTAssertEqual(snapshot.operations["op_stop"]?.status, .failed)
+        XCTAssertEqual(snapshot.operations["op_stop"]?.error?.code, "helper_exited")
+    }
+
     func testAutomaticRestartRestoreFailureKeepsReplacementConnected() async throws {
         let first = FakeRuntimeProcess()
         first.onRun { [weak first] in
