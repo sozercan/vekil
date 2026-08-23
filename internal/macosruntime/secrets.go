@@ -11,8 +11,10 @@ import (
 )
 
 const (
-	maxSecretProjectionEntries = 256
-	maxSecretProjectionBytes   = 1 << 20
+	maxSecretProjectionEntries     = 256
+	maxSecretProjectionBytes       = 1 << 20
+	maxSecretProjectionGenerations = 8
+	maxSecretProjectionStoreBytes  = 4 << 20
 )
 
 // SecretValue is accepted only on the write-only set_secret_projection path.
@@ -40,11 +42,16 @@ type projectionKey struct {
 type SecretProjectionStore struct {
 	mu          sync.RWMutex
 	projections map[projectionKey]map[string]string
+	sizes       map[projectionKey]int
+	totalBytes  int
 }
 
 // NewSecretProjectionStore creates an empty store.
 func NewSecretProjectionStore() *SecretProjectionStore {
-	return &SecretProjectionStore{projections: make(map[projectionKey]map[string]string)}
+	return &SecretProjectionStore{
+		projections: make(map[projectionKey]map[string]string),
+		sizes:       make(map[projectionKey]int),
+	}
 }
 
 // Set atomically installs one complete immutable generation. Re-sending an
@@ -94,6 +101,9 @@ func (s *SecretProjectionStore) Set(projection SecretProjection) error {
 	if s.projections == nil {
 		s.projections = make(map[projectionKey]map[string]string)
 	}
+	if s.sizes == nil {
+		s.sizes = make(map[projectionKey]int)
+	}
 	key := projectionKey{revision: revision, generation: projection.SecretGeneration}
 	if existing, ok := s.projections[key]; ok {
 		if maps.Equal(existing, values) {
@@ -101,7 +111,15 @@ func (s *SecretProjectionStore) Set(projection SecretProjection) error {
 		}
 		return errors.New("secret projection conflicts with existing immutable generation")
 	}
+	if len(s.projections) >= maxSecretProjectionGenerations {
+		return fmt.Errorf("secret projection store contains more than %d generations", maxSecretProjectionGenerations)
+	}
+	if s.totalBytes+totalBytes > maxSecretProjectionStoreBytes {
+		return fmt.Errorf("secret projection store exceeds %d bytes", maxSecretProjectionStoreBytes)
+	}
 	s.projections[key] = values
+	s.sizes[key] = totalBytes
+	s.totalBytes += totalBytes
 	return nil
 }
 
@@ -127,8 +145,35 @@ func (s *SecretProjectionStore) Delete(configRevision string, generation uint64)
 		return
 	}
 	s.mu.Lock()
-	delete(s.projections, projectionKey{revision: strings.TrimSpace(configRevision), generation: generation})
+	s.deleteLocked(projectionKey{revision: strings.TrimSpace(configRevision), generation: generation})
 	s.mu.Unlock()
+}
+
+// DeleteGeneration removes every revision for a rejected or validation-only
+// generation. Generations are app-assigned and globally monotonic.
+func (s *SecretProjectionStore) DeleteGeneration(generation uint64) {
+	if s == nil || generation == 0 {
+		return
+	}
+	s.mu.Lock()
+	for key := range s.projections {
+		if key.generation == generation {
+			s.deleteLocked(key)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *SecretProjectionStore) deleteLocked(key projectionKey) {
+	if _, ok := s.projections[key]; !ok {
+		return
+	}
+	delete(s.projections, key)
+	s.totalBytes -= s.sizes[key]
+	if s.totalBytes < 0 {
+		s.totalBytes = 0
+	}
+	delete(s.sizes, key)
 }
 
 // Has reports metadata only.

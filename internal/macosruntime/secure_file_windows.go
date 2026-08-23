@@ -37,3 +37,7 @@ func readSecureFile(path string, maxBytes int64) ([]byte, fileIdentity, error) {
 	}
 	return body, fileIdentity{Size: info.Size()}, nil
 }
+
+func readOwnedFile(path string, maxBytes int64) ([]byte, fileIdentity, error) {
+	return readSecureFile(path, maxBytes)
+}

@@ -439,16 +439,41 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           cd "${RUNNER_TEMP}/macos-release"
           sha256sum --check vekil-macos-universal.zip.sha256
           test "$(sha256sum vekil-macos-universal.zip | awk '{print $1}')" = \
             "${{ needs.macos-candidate.outputs.app_sha256 }}"
-          gh release upload "${RELEASE_TAG}" \
-            vekil-macos-universal.zip \
-            vekil-macos-universal.zip.sha256 \
-            vekil-macos-release.json \
-            appcast.xml \
-            --repo "${GITHUB_REPOSITORY}"
+
+          assets=(
+            vekil-macos-universal.zip
+            vekil-macos-universal.zip.sha256
+            vekil-macos-release.json
+            appcast.xml
+          )
+          existing_assets="$(
+            gh release view "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+          mkdir github-existing
+          for asset in "${assets[@]}"; do
+            if grep -Fxq -- "${asset}" <<<"${existing_assets}"; then
+              gh release download "${RELEASE_TAG}" \
+                --pattern "${asset}" \
+                --dir github-existing \
+                --repo "${GITHUB_REPOSITORY}"
+              cmp --silent "${asset}" "github-existing/${asset}" || {
+                printf 'existing release asset differs from candidate: %s\n' "${asset}" >&2
+                exit 1
+              }
+              continue
+            fi
+            gh release upload "${RELEASE_TAG}" "${asset}" \
+              --repo "${GITHUB_REPOSITORY}"
+          done
+
           mkdir github-roundtrip
           gh release download "${RELEASE_TAG}" \
             --pattern vekil-macos-universal.zip \

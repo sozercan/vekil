@@ -26,6 +26,7 @@ public protocol AppRuntimeClient: Sendable {
   /// and waits for the appropriate protocol transitions; app state does not
   /// infer a restart from HTTP or optimistically mutate service lifecycle.
   func restart(_ request: AppRuntimeStartRequest) async throws -> AppRuntimeOperationAcceptance
+  func restartHelper() async throws
 
   func startDeviceAuthentication() async throws -> AppRuntimeOperationAcceptance
   func authenticateWithGitHubCLI() async throws -> AppRuntimeOperationAcceptance

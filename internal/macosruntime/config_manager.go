@@ -166,7 +166,7 @@ func (m *ConfigManager) LoadConfiguration(ctx context.Context) (appcontrol.Confi
 		if state.ManagedOwnershipID == "" {
 			return appcontrol.Configuration{}, errors.New("managed configuration ownership is missing")
 		}
-		body, _, err := readSecureFile(m.paths.Managed, MaxConfigBytes)
+		body, _, err := readOwnedFile(m.paths.Managed, MaxConfigBytes)
 		if err != nil {
 			return appcontrol.Configuration{}, err
 		}
@@ -324,7 +324,7 @@ func (m *ConfigManager) StagePreferredAppConfiguration() error {
 
 	var revision string
 	if managedOwned {
-		body, _, err := readSecureFile(m.paths.Managed, MaxConfigBytes)
+		body, _, err := readOwnedFile(m.paths.Managed, MaxConfigBytes)
 		if err != nil {
 			return err
 		}
@@ -412,7 +412,7 @@ func (m *ConfigManager) UseManaged() error {
 	if m.state.ManagedOwnershipID == "" {
 		return errors.New("managed configuration has not been created")
 	}
-	body, _, err := readSecureFile(m.paths.Managed, MaxConfigBytes)
+	body, _, err := readOwnedFile(m.paths.Managed, MaxConfigBytes)
 	if err != nil {
 		return err
 	}
@@ -436,7 +436,7 @@ func (m *ConfigManager) EnsureManagedConfiguration() (ConfigDescription, error) 
 	}
 
 	if m.state.ManagedOwnershipID != "" {
-		body, _, err := readSecureFile(m.paths.Managed, MaxConfigBytes)
+		body, _, err := readOwnedFile(m.paths.Managed, MaxConfigBytes)
 		if err != nil {
 			return ConfigDescription{}, err
 		}
@@ -516,7 +516,7 @@ func (m *ConfigManager) Describe() (ConfigDescription, error) {
 	case ConfigModeLegacy:
 		return m.describeLocked(nil, nil), nil
 	case ConfigModeManaged:
-		body, _, readErr = readSecureFile(m.paths.Managed, MaxConfigBytes)
+		body, _, readErr = readOwnedFile(m.paths.Managed, MaxConfigBytes)
 	case ConfigModeExternal:
 		body, _, readErr = readSecureFile(m.state.SelectedPath, MaxConfigBytes)
 	default:
@@ -532,7 +532,7 @@ func (m *ConfigManager) describeLocked(body []byte, readErr error) ConfigDescrip
 		ActiveRevision:          m.state.ActiveRuntimeRevision,
 		ManagedOwnershipPresent: m.state.ManagedOwnershipID != "",
 		SecretGeneration:        m.state.SecretGeneration,
-		SecretProjections:       managedSecretProjectionRequirements(m.state),
+		SecretProjections:       m.secretProjectionRequirementsLocked(),
 	}
 	if m.state.ConfigMode == ConfigModeLegacy {
 		description.Available = true
@@ -570,12 +570,79 @@ func (m *ConfigManager) describeLocked(body []byte, readErr error) ConfigDescrip
 }
 
 func managedSecretProjectionRequirements(state PersistentState) []SecretProjectionRequirement {
-	if state.ManagedOwnershipID == "" || state.CommittedConfigRevision == "" || state.SecretGeneration == 0 {
+	if state.ManagedOwnershipID == "" {
 		return nil
+	}
+	requirement, ok := managedSecretProjectionRequirement(
+		state.CommittedConfigRevision,
+		state.SecretGeneration,
+		state.Providers,
+	)
+	if !ok {
+		return nil
+	}
+	return []SecretProjectionRequirement{requirement}
+}
+
+func (m *ConfigManager) secretProjectionRequirementsLocked() []SecretProjectionRequirement {
+	requirements := managedSecretProjectionRequirements(m.state)
+	if m.state.RecoveryState != string(ApplyPhaseRollbackFailed) {
+		return requirements
+	}
+
+	journal, err := readApplyJournal(m.paths.Journal)
+	if err != nil {
+		return requirements
+	}
+	for _, candidate := range []struct {
+		revision   string
+		generation uint64
+		providers  []ProviderIdentity
+	}{
+		{journal.OldRevision, journal.OldSecretGeneration, journal.OldProviders},
+		{journal.NewRevision, journal.NewSecretGeneration, journal.NewProviders},
+	} {
+		requirement, ok := managedSecretProjectionRequirement(
+			candidate.revision,
+			candidate.generation,
+			candidate.providers,
+		)
+		if !ok {
+			continue
+		}
+		duplicate := false
+		for _, existing := range requirements {
+			if existing.ConfigRevision == requirement.ConfigRevision &&
+				existing.SecretGeneration == requirement.SecretGeneration {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			requirements = append(requirements, requirement)
+		}
+	}
+	sort.Slice(requirements, func(i, j int) bool {
+		if requirements[i].ConfigRevision != requirements[j].ConfigRevision {
+			return requirements[i].ConfigRevision < requirements[j].ConfigRevision
+		}
+		return requirements[i].SecretGeneration < requirements[j].SecretGeneration
+	})
+	return requirements
+}
+
+func managedSecretProjectionRequirement(
+	revision string,
+	generation uint64,
+	providers []ProviderIdentity,
+) (SecretProjectionRequirement, bool) {
+	revision = strings.TrimSpace(revision)
+	if revision == "" || generation == 0 {
+		return SecretProjectionRequirement{}, false
 	}
 
 	secrets := make([]ManagedSecretRequirement, 0)
-	for _, provider := range state.Providers {
+	for _, provider := range providers {
 		providerID := strings.TrimSpace(provider.ProviderID)
 		providerUUID := strings.TrimSpace(provider.UUID)
 		for _, role := range normalizeSecretRoles(provider.SecretRoles) {
@@ -583,7 +650,7 @@ func managedSecretProjectionRequirements(state PersistentState) []SecretProjecti
 				ProviderID:   providerID,
 				ProviderUUID: providerUUID,
 				Role:         role,
-				Reference:    ManagedSecretReference(providerUUID, role, state.SecretGeneration),
+				Reference:    ManagedSecretReference(providerUUID, role, generation),
 			})
 		}
 	}
@@ -597,11 +664,11 @@ func managedSecretProjectionRequirements(state PersistentState) []SecretProjecti
 		return secrets[i].Role < secrets[j].Role
 	})
 
-	return []SecretProjectionRequirement{{
-		ConfigRevision:   state.CommittedConfigRevision,
-		SecretGeneration: state.SecretGeneration,
+	return SecretProjectionRequirement{
+		ConfigRevision:   revision,
+		SecretGeneration: generation,
 		Secrets:          secrets,
-	}}
+	}, true
 }
 
 func (m *ConfigManager) saveStateLocked() error {
@@ -629,7 +696,7 @@ func (m *ConfigManager) saveStateLocked() error {
 }
 
 func loadPersistentState(path string) (PersistentState, bool, error) {
-	body, _, err := readSecureFile(path, MaxStateBytes)
+	body, _, err := readOwnedFile(path, MaxStateBytes)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
 			return PersistentState{Version: StateVersion, ConfigMode: ConfigModeLegacy, SelectedConfigRevision: LegacyConfigRevision}, false, nil

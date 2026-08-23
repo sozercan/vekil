@@ -312,6 +312,9 @@ final class VekilAppStateTests: XCTestCase {
     XCTAssertEqual(state.runtimeState.readiness, .unknown)
     XCTAssertNil(state.runtimeState.operation)
     XCTAssertEqual(state.lastError?.code, "helper_failed")
+
+    await assertTrueAsync(await state.performPrimaryAction())
+    await assertTrueAsync((await runtime.recordedCalls()).contains(.restartHelper))
   }
 
   func testConnectionEventsDoNotConsumeTheNextAuthoritativeStateRevision() async {

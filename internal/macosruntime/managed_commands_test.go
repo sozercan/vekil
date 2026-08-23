@@ -120,6 +120,96 @@ func TestApplyManagedDraftWhileStoppedStaysStopped(t *testing.T) {
 	}
 }
 
+func TestValidateManagedDraftDeletesValidationOnlyProjection(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, _, h, initialRevision := newApplyHarness(t, factory)
+	payload := managedDraftPayload{
+		ExpectedConfigRevision: initialRevision,
+		SecretGeneration:       1,
+		Draft:                  managedApplyDraft(manager.State().Providers[0].UUID, true),
+	}
+	candidate, err := manager.BuildManagedCandidate(payload.Draft, payload.SecretGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.opts.Secrets.Set(SecretProjection{
+		ConfigRevision:   candidate.Revision,
+		SecretGeneration: candidate.SecretGeneration,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.validateManagedDraft(t.Context(), payload); err != nil {
+		t.Fatal(err)
+	}
+	if h.opts.Secrets.Has(candidate.Revision, candidate.SecretGeneration) {
+		t.Fatal("validation-only secret projection was retained")
+	}
+}
+
+func TestValidateManagedDraftRetainsRequiredProjection(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, _, h, initialRevision := newApplyHarness(t, factory)
+	manager.mu.Lock()
+	manager.state.SecretGeneration = 1
+	manager.mu.Unlock()
+	payload := managedDraftPayload{
+		ExpectedConfigRevision: initialRevision,
+		SecretGeneration:       1,
+		Draft:                  managedApplyDraft(manager.State().Providers[0].UUID, false),
+	}
+	candidate, err := manager.BuildManagedCandidate(payload.Draft, payload.SecretGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Revision != initialRevision {
+		t.Fatalf("candidate revision = %q, want %q", candidate.Revision, initialRevision)
+	}
+	if err := h.opts.Secrets.Set(SecretProjection{
+		ConfigRevision:   candidate.Revision,
+		SecretGeneration: candidate.SecretGeneration,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.validateManagedDraft(t.Context(), payload); err != nil {
+		t.Fatal(err)
+	}
+	if !h.opts.Secrets.Has(candidate.Revision, candidate.SecretGeneration) {
+		t.Fatal("required secret projection was deleted")
+	}
+}
+
+func TestApplyManagedDraftDeletesProjectionRejectedBeforeTransaction(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, _, h, initialRevision := newApplyHarness(t, factory)
+	payload := managedDraftPayload{
+		ExpectedConfigRevision: initialRevision,
+		SecretGeneration:       1,
+		Draft:                  managedApplyDraft(manager.State().Providers[0].UUID, true),
+	}
+	candidate, err := manager.BuildManagedCandidate(payload.Draft, payload.SecretGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.opts.Secrets.Set(SecretProjection{
+		ConfigRevision:   candidate.Revision,
+		SecretGeneration: candidate.SecretGeneration,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.opts.CandidateValidator = candidateValidatorFunc(func(context.Context, ManagedCandidate) error {
+		return errors.New("candidate rejected")
+	})
+
+	if err := h.applyManagedDraft(t.Context(), "op_rejected", payload); err == nil {
+		t.Fatal("apply unexpectedly succeeded")
+	}
+	if h.opts.Secrets.Has(candidate.Revision, candidate.SecretGeneration) {
+		t.Fatal("rejected candidate secret projection was retained")
+	}
+}
+
 func TestApplyManagedDraftWhileRunningReturnsToRunning(t *testing.T) {
 	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
 	manager, controller, h, initialRevision := newApplyHarness(t, factory)
@@ -235,6 +325,36 @@ func TestApplyManagedDraftStoppedCommitFailureRestoresPreviousFile(t *testing.T)
 	}
 	if revision, _ := configRevision(body); revision != initialRevision {
 		t.Fatalf("managed file revision = %q, want %q", revision, initialRevision)
+	}
+}
+
+func TestApplyManagedDraftStoppedCancellationAfterInstallRollsBack(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, controller, h, initialRevision := newApplyHarness(t, factory)
+	ctx, cancel := context.WithCancel(t.Context())
+	h.beforeManagedCommit = cancel
+	payload := managedDraftPayload{ExpectedConfigRevision: initialRevision, SecretGeneration: 1, Draft: managedApplyDraft(manager.State().Providers[0].UUID, true)}
+	candidate, err := manager.BuildManagedCandidate(payload.Draft, payload.SecretGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.opts.Secrets.Set(SecretProjection{ConfigRevision: candidate.Revision, SecretGeneration: candidate.SecretGeneration}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = h.applyManagedDraft(ctx, "op_cancel_stopped", payload)
+	var applyErr *ManagedApplyError
+	if !errors.As(err, &applyErr) || !errors.Is(applyErr.Primary, context.Canceled) || applyErr.Rollback != nil {
+		t.Fatalf("apply error = %+v, want canceled primary with successful rollback", err)
+	}
+	if got := controller.Snapshot().Service; got != appcontrol.ServiceStopped {
+		t.Fatalf("service = %q", got)
+	}
+	if got := manager.State().CommittedConfigRevision; got != initialRevision {
+		t.Fatalf("committed revision = %q, want %q", got, initialRevision)
+	}
+	if h.opts.Secrets.Has(candidate.Revision, candidate.SecretGeneration) {
+		t.Fatal("canceled candidate secret projection was retained")
 	}
 }
 

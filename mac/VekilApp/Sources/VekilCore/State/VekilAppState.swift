@@ -173,6 +173,8 @@ public final class VekilAppState: ObservableObject {
       return await cancelStarting(operationID: action.operationID)
     case .stopProxy:
       return await stopProxy()
+    case .restartHelper:
+      return await restartHelper()
     case .none:
       return false
     }
@@ -224,6 +226,23 @@ public final class VekilAppState: ObservableObject {
       failureMessage: "Could not restart the proxy."
     ) {
       try await runtimeClient.restart(.userInitiated)
+    }
+  }
+
+  @discardableResult
+  public func restartHelper() async -> Bool {
+    guard !isSubmittingCommand else {
+      return false
+    }
+
+    isSubmittingCommand = true
+    defer { isSubmittingCommand = false }
+    do {
+      try await runtimeClient.restartHelper()
+      return true
+    } catch {
+      record(error, code: "helper_restart_failed", message: "Could not restart the runtime.")
+      return false
     }
   }
 

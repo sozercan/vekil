@@ -211,6 +211,32 @@ func TestCanceledStoppedConfigSelectionRestoresPriorSelection(t *testing.T) {
 	}
 }
 
+func TestCanceledRunningConfigSelectionAfterCandidateReadyRestoresPriorRuntime(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	path, _ := writeExternalConfigForSwitchTest(t, "selected-model")
+	ctx, cancel := context.WithCancel(t.Context())
+	h.beforeSelectionCommit = cancel
+
+	err := h.switchSelectedConfiguration(ctx, func(opCtx context.Context) error {
+		_, selectErr := manager.SelectExternal(opCtx, path)
+		return selectErr
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, context.Canceled) || switchErr.Rollback != nil {
+		t.Fatalf("switch error = %+v, want canceled primary with successful restore", err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != LegacyConfigRevision || state.RuntimeGeneration != 3 {
+		t.Fatalf("restored runtime = %+v", state)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeLegacy || selection.SelectedPath != "" || selection.SelectedConfigRevision != LegacyConfigRevision {
+		t.Fatalf("selection after cancellation = %+v", selection)
+	}
+}
+
 func TestConfigSelectionWaitsForNonCancelableStopBeforeRestoringSelection(t *testing.T) {
 	stopStarted := make(chan struct{})
 	releaseStop := make(chan struct{})

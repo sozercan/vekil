@@ -112,13 +112,14 @@ final class VekilPresentationTests: XCTestCase {
       for: state, initialization: .initialized)
     XCTAssertEqual(presentation.kind, .helperUnavailable)
     XCTAssertTrue(presentation.isWarning)
-    XCTAssertFalse(
+    XCTAssertEqual(
       VekilPresentationProjector.primaryAction(
         for: state,
         initialization: .initialized,
         isSubmittingCommand: false,
         cancellationRequestedOperationID: nil
-      ).isEnabled
+      ),
+      VekilPrimaryAction(kind: .restartHelper, title: "Restart Runtime", isEnabled: true)
     )
   }
 

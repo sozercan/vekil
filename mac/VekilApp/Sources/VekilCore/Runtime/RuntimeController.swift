@@ -342,6 +342,7 @@ public actor RuntimeController {
     private var scheduledRestartID: UUID?
     private var suppression: RestartSuppression = .none
     private var currentRuntimeGeneration: UInt64?
+    private var restoreProxyAfterReconnect = false
 
     public init(
         configuration: RuntimeControllerConfiguration,
@@ -568,7 +569,10 @@ public actor RuntimeController {
     }
 
     public func restartHelper() async throws -> RuntimeHelloPayload {
+        let shouldRestoreProxy = restoreProxyAfterReconnect
+            || currentState?.payload.service == .running
         await shutdown(reason: .manualRestart)
+        restoreProxyAfterReconnect = shouldRestoreProxy
         suppression = .none
         return try await connect()
     }
@@ -916,6 +920,7 @@ public actor RuntimeController {
                 throw error
             }
             try applyReconciliationStateIfNeeded(preparationState)
+            try await restoreProxyIfNeeded(preparationState)
             setConnectionState(.connected)
             resumeConnectionWaiters()
         } catch let error as RuntimeControllerError {
@@ -935,6 +940,40 @@ public actor RuntimeController {
             throw RuntimeControllerError.protocolViolation
         }
         applyState(state)
+    }
+
+    private func restoreProxyIfNeeded(_ state: RuntimeStateEvent) async throws {
+        guard restoreProxyAfterReconnect else { return }
+        if state.payload.service == .running {
+            restoreProxyAfterReconnect = false
+            return
+        }
+        guard state.payload.service == .stopped else {
+            throw RuntimeControllerError.protocolViolation
+        }
+
+        let payload = JSONValue.object([
+            "expected_config_revision": .string(state.payload.expectedStartConfigRevision ?? "")
+        ])
+        let response = try await sendInternal(
+            command: .start,
+            payload: payload,
+            timeout: configuration.requestTimeout,
+            allowDuringReconciliation: true
+        )
+        guard let result = response.result,
+              let admission = try? result.decode(RuntimeAdmissionResult.self),
+              admission.accepted,
+              let operationID = admission.operationID,
+              !operationID.isEmpty else {
+            throw RuntimeControllerError.invalidOperationAdmission
+        }
+        let operation = try await waitForOperation(id: operationID)
+        guard operation.status == .succeeded else {
+            if let error = operation.error { throw error }
+            throw RuntimeControllerError.protocolViolation
+        }
+        restoreProxyAfterReconnect = false
     }
 
     // MARK: Requests and responses
@@ -1229,6 +1268,9 @@ public actor RuntimeController {
         }
 
         guard let session, session.id == sessionID else { return }
+        if suppression == .none, currentState?.payload.service == .running {
+            restoreProxyAfterReconnect = true
+        }
         session.handshakeTimeoutTask?.cancel()
         session.failureTerminationTask?.cancel()
         session.writeTail?.cancel()

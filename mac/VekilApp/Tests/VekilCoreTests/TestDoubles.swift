@@ -12,6 +12,7 @@ actor RuntimeClientSpy: AppRuntimeClient {
     case cancel(String)
     case stop
     case restart(AppRuntimeStartRequest)
+    case restartHelper
     case deviceAuth
     case githubCLIAuth
     case signOut
@@ -80,6 +81,11 @@ actor RuntimeClientSpy: AppRuntimeClient {
     calls.append(.restart(request))
     try throwIfConfigured()
     return acceptance(kind: .restart)
+  }
+
+  func restartHelper() async throws {
+    calls.append(.restartHelper)
+    try throwIfConfigured()
   }
 
   func startDeviceAuthentication() async throws -> AppRuntimeOperationAcceptance {

@@ -107,6 +107,23 @@ public enum VekilOnboardingStage: String, CaseIterable, Identifiable, Sendable {
   public var id: String { rawValue }
 }
 
+func onboardingConfigurationIsReady(
+  provider: VekilOnboardingProvider,
+  configuration: AppRuntimeConfigurationState
+) -> Bool {
+  guard configuration.drift == .none else { return false }
+  if let activeRevision = configuration.activeRevision,
+    activeRevision != configuration.selectedRevision
+  {
+    return false
+  }
+  if provider == .githubCopilot {
+    return configuration.mode != .external
+  }
+  return configuration.mode == .external
+    && configuration.selectedExternalPath != nil
+}
+
 /// First-run setup for the native configuration paths that can ship safely.
 /// External provider files remain user-owned and are validated by the runtime.
 public struct VekilOnboardingView: View {
@@ -1112,13 +1129,10 @@ public struct VekilOnboardingView: View {
   }
 
   private var configurationIsReady: Bool {
-    if provider == .githubCopilot {
-      return app.runtimeState.configuration.mode != .external
-    }
-    return externalConfigurationIsSelected
-      && app.runtimeState.configuration.drift != .missing
-      && app.runtimeState.configuration.drift != .unsafe
-      && app.runtimeState.configuration.drift != .invalid
+    onboardingConfigurationIsReady(
+      provider: provider,
+      configuration: app.runtimeState.configuration
+    )
   }
 
   private var configurationOperationIsBusy: Bool {

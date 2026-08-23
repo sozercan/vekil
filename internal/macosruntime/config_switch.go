@@ -54,10 +54,7 @@ func (h *helper) switchSelectedConfiguration(ctx context.Context, selectConfigur
 		return err
 	}
 	if !wasRunning {
-		if err := ctx.Err(); err != nil {
-			return &ConfigSwitchError{Primary: err, Rollback: h.opts.Configuration.RestoreSelection(previous)}
-		}
-		if err := h.opts.Configuration.CommitSelection(); err != nil {
+		if err := h.commitSelection(ctx); err != nil {
 			return &ConfigSwitchError{Primary: err, Rollback: h.opts.Configuration.RestoreSelection(previous)}
 		}
 		return nil
@@ -106,7 +103,7 @@ func (h *helper) switchSelectedConfiguration(ctx context.Context, selectConfigur
 		}
 	}
 	if err == nil {
-		err = h.opts.Configuration.CommitSelection()
+		err = h.commitSelection(ctx)
 	}
 	if err == nil {
 		return nil
@@ -143,6 +140,16 @@ func (h *helper) switchSelectedConfiguration(ctx context.Context, selectConfigur
 		}
 	}
 	return &ConfigSwitchError{Primary: primary, Rollback: rollbackErr}
+}
+
+func (h *helper) commitSelection(ctx context.Context) error {
+	if h.beforeSelectionCommit != nil {
+		h.beforeSelectionCommit()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return h.opts.Configuration.CommitSelection()
 }
 
 func (h *helper) signOut(ctx context.Context) error {

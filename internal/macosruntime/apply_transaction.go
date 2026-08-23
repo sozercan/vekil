@@ -63,7 +63,7 @@ func (m *ConfigManager) PrepareManagedApply(operationID string, candidate Manage
 	if candidate.SecretGeneration <= m.state.SecretGeneration {
 		return nil, fmt.Errorf("secret generation must advance beyond %d", m.state.SecretGeneration)
 	}
-	oldBody, _, err := readSecureFile(m.paths.Managed, MaxConfigBytes)
+	oldBody, _, err := readOwnedFile(m.paths.Managed, MaxConfigBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +124,7 @@ func (t *ManagedApplyTransaction) Install() error {
 	if journal.OperationID != t.journal.OperationID || journal.Phase != ApplyPhasePrepared {
 		return errors.New("managed apply journal no longer matches prepared transaction")
 	}
-	oldBody, _, err := readSecureFile(m.paths.Managed, MaxConfigBytes)
+	oldBody, _, err := readOwnedFile(m.paths.Managed, MaxConfigBytes)
 	if err != nil {
 		return err
 	}
@@ -132,7 +132,7 @@ func (t *ManagedApplyTransaction) Install() error {
 	if oldRevision != journal.OldRevision || oldDigest != journal.OldSHA256 {
 		return errors.New("managed configuration changed after validation")
 	}
-	stagedBody, _, err := readSecureFile(m.paths.Staged, MaxConfigBytes)
+	stagedBody, _, err := readOwnedFile(m.paths.Staged, MaxConfigBytes)
 	if err != nil {
 		return err
 	}
@@ -244,7 +244,7 @@ func (t *ManagedApplyTransaction) restoreForRuntimeRollbackLocked(primaryFailure
 	if err != nil {
 		return err
 	}
-	backup, _, err := readSecureFile(m.paths.Backup, MaxConfigBytes)
+	backup, _, err := readOwnedFile(m.paths.Backup, MaxConfigBytes)
 	if err == nil {
 		revision, digest := configRevision(backup)
 		if revision != journal.OldRevision || digest != journal.OldSHA256 {
@@ -254,7 +254,7 @@ func (t *ManagedApplyTransaction) restoreForRuntimeRollbackLocked(primaryFailure
 			return err
 		}
 	} else if journal.Phase == ApplyPhasePrepared {
-		current, _, currentErr := readSecureFile(m.paths.Managed, MaxConfigBytes)
+		current, _, currentErr := readOwnedFile(m.paths.Managed, MaxConfigBytes)
 		if currentErr != nil {
 			return currentErr
 		}
@@ -348,7 +348,7 @@ func (t *ManagedApplyTransaction) rollbackLocked(primaryFailureCode, rollbackFai
 		return err
 	}
 	journal.PrimaryFailureCode = sanitizeFailureCode(primaryFailureCode)
-	if backupBody, _, backupErr := readSecureFile(m.paths.Backup, MaxConfigBytes); backupErr == nil {
+	if backupBody, _, backupErr := readOwnedFile(m.paths.Backup, MaxConfigBytes); backupErr == nil {
 		revision, digest := configRevision(backupBody)
 		if revision != journal.OldRevision || digest != journal.OldSHA256 {
 			err = errors.New("rollback backup revision mismatch")
@@ -357,7 +357,7 @@ func (t *ManagedApplyTransaction) rollbackLocked(primaryFailureCode, rollbackFai
 		}
 	} else if journal.Phase == ApplyPhasePrepared {
 		// Installation did not create a backup; the original file is still active.
-		current, _, currentErr := readSecureFile(m.paths.Managed, MaxConfigBytes)
+		current, _, currentErr := readOwnedFile(m.paths.Managed, MaxConfigBytes)
 		if currentErr != nil {
 			err = currentErr
 		} else {
@@ -407,7 +407,7 @@ func (m *ConfigManager) recoverApplyJournalLocked() error {
 	case ApplyPhaseCommitted:
 		return removeApplyArtifacts(m.paths, true)
 	case ApplyPhasePrepared, ApplyPhaseInstalled, ApplyPhaseRollbackFailed:
-		backup, _, backupErr := readSecureFile(m.paths.Backup, MaxConfigBytes)
+		backup, _, backupErr := readOwnedFile(m.paths.Backup, MaxConfigBytes)
 		if backupErr == nil {
 			revision, digest := configRevision(backup)
 			if revision != journal.OldRevision || digest != journal.OldSHA256 {
@@ -416,7 +416,7 @@ func (m *ConfigManager) recoverApplyJournalLocked() error {
 				backupErr = writeAtomicFile(m.paths.Managed, backup)
 			}
 		} else if journal.Phase == ApplyPhasePrepared {
-			current, _, currentErr := readSecureFile(m.paths.Managed, MaxConfigBytes)
+			current, _, currentErr := readOwnedFile(m.paths.Managed, MaxConfigBytes)
 			if currentErr == nil {
 				revision, digest := configRevision(current)
 				if revision == journal.OldRevision && digest == journal.OldSHA256 {
@@ -462,7 +462,7 @@ func writeApplyJournal(path string, journal ApplyJournal) error {
 }
 
 func readApplyJournal(path string) (ApplyJournal, error) {
-	body, _, err := readSecureFile(path, MaxStateBytes)
+	body, _, err := readOwnedFile(path, MaxStateBytes)
 	if err != nil {
 		return ApplyJournal{}, err
 	}

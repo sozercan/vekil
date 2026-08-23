@@ -39,6 +39,7 @@ public enum VekilPrimaryActionKind: String, Codable, Equatable, Sendable {
   case startProxy
   case cancelStarting
   case stopProxy
+  case restartHelper
   case none
 }
 
@@ -161,7 +162,19 @@ public enum VekilPresentationProjector {
     isSubmittingCommand: Bool,
     cancellationRequestedOperationID: String?
   ) -> VekilPrimaryAction {
-    guard initialization == .initialized, state.helper == .connected else {
+    guard initialization == .initialized else {
+      return VekilPrimaryAction(kind: .startProxy, title: "Start Proxy", isEnabled: false)
+    }
+
+    if state.helper == .failed || state.helper == .stopped {
+      return VekilPrimaryAction(
+        kind: .restartHelper,
+        title: "Restart Runtime",
+        isEnabled: !isSubmittingCommand
+      )
+    }
+
+    guard state.helper == .connected else {
       return VekilPrimaryAction(kind: .startProxy, title: "Start Proxy", isEnabled: false)
     }
 

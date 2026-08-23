@@ -71,6 +71,7 @@ actor RuntimeAppClient: AppRuntimeClient {
         }
         return try await start(request)
     }
+    func restartHelper() async throws { _ = try await controller.restartHelper() }
     func startDeviceAuthentication() async throws -> AppRuntimeOperationAcceptance { try await submit(.authDeviceStart) }
     func authenticateWithGitHubCLI() async throws -> AppRuntimeOperationAcceptance { try await submit(.authGitHubCLI) }
     func signOut() async throws -> AppRuntimeOperationAcceptance { try await submit(.authSignOut) }

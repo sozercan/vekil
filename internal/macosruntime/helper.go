@@ -99,13 +99,15 @@ type runtimeStatePayload struct {
 }
 
 type helper struct {
-	opts          HelperOptions
-	epoch         string
-	writer        *protocolWriter
-	cache         requestCache
-	operations    operationCoordinator
-	projector     stateProjector
-	managedCommit func(*ManagedApplyTransaction) error
+	opts                  HelperOptions
+	epoch                 string
+	writer                *protocolWriter
+	cache                 requestCache
+	operations            operationCoordinator
+	projector             stateProjector
+	managedCommit         func(*ManagedApplyTransaction) error
+	beforeManagedCommit   func()
+	beforeSelectionCommit func()
 }
 
 type frameResult struct {
@@ -427,11 +429,7 @@ func (h *helper) dispatch(ctx context.Context, request requestEnvelope) (respons
 		return success(map[string]any{"accepted": true, "operation_id": op.id}), func() {
 			_ = h.publishState()
 			go h.runConfigOperation(op, func(opCtx context.Context) error {
-				candidate, err := h.opts.Configuration.BuildManagedCandidate(payload.Draft, payload.SecretGeneration)
-				if err != nil {
-					return err
-				}
-				return h.opts.CandidateValidator.ValidateManagedCandidate(opCtx, candidate)
+				return h.validateManagedDraft(opCtx, payload)
 			})
 		}, false
 	case "apply_managed_draft":

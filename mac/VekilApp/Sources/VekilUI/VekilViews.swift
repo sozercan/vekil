@@ -111,6 +111,8 @@ public struct VekilRootView: View {
       return "xmark"
     case .stopProxy:
       return "stop.fill"
+    case .restartHelper:
+      return "arrow.clockwise"
     case .none:
       return "circle"
     }

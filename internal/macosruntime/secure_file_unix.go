@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/unix"
 )
@@ -20,11 +21,41 @@ type fileIdentity struct {
 func readSecureFile(path string, maxBytes int64) ([]byte, fileIdentity, error) {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		if errors.Is(err, unix.ELOOP) {
-			return nil, fileIdentity{}, fmt.Errorf("open %q: symlinks are not allowed", path)
-		}
-		return nil, fileIdentity{}, fmt.Errorf("open %q: %w", path, err)
+		return nil, fileIdentity{}, secureOpenError(path, err)
 	}
+	return readSecureFileDescriptor(fd, path, maxBytes)
+}
+
+// readOwnedFile resolves only the verified private directory by path, then
+// opens the helper-owned basename relative to that descriptor. Replacing the
+// directory path after validation cannot redirect the file read.
+func readOwnedFile(path string, maxBytes int64) ([]byte, fileIdentity, error) {
+	directory, err := openPrivateDirectory(filepath.Dir(path))
+	if err != nil {
+		return nil, fileIdentity{}, err
+	}
+	defer func() { _ = directory.close() }()
+
+	fd, err := unix.Openat(
+		directory.fd,
+		filepath.Base(path),
+		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return nil, fileIdentity{}, secureOpenError(path, err)
+	}
+	return readSecureFileDescriptor(fd, path, maxBytes)
+}
+
+func secureOpenError(path string, err error) error {
+	if errors.Is(err, unix.ELOOP) {
+		return fmt.Errorf("open %q: symlinks are not allowed", path)
+	}
+	return fmt.Errorf("open %q: %w", path, err)
+}
+
+func readSecureFileDescriptor(fd int, path string, maxBytes int64) ([]byte, fileIdentity, error) {
 	file := os.NewFile(uintptr(fd), path)
 	if file == nil {
 		_ = unix.Close(fd)

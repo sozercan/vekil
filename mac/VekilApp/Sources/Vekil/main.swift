@@ -41,6 +41,9 @@ MainActor.assumeIsolated {
     let secretProjectionPreparer = RuntimeSecretProjectionPreparer(
         manager: secretGenerationManager
     )
+    let secretGenerationCleaner = RuntimeSecretGenerationCleaner(
+        manager: secretGenerationManager
+    )
     let controller = RuntimeController(
         configuration: configuration,
         processFactory: ValidatingProcessFactory(
@@ -48,9 +51,26 @@ MainActor.assumeIsolated {
             validator: RuntimeHelperValidator()
         ),
         launchPreparation: { context in
-            try await secretProjectionPreparer.requests(for: context)
+            let requests = try await secretProjectionPreparer.requests(for: context)
+            do {
+                try await secretGenerationCleaner.reconcile(context.state)
+            } catch {
+                fputs("Vekil could not remove obsolete Keychain credentials.\n", stderr)
+            }
+            return requests
         }
     )
+    let secretCleanupTask = Task {
+        let notifications = await controller.notificationStream()
+        for await notification in notifications {
+            guard case let .state(event) = notification else { continue }
+            do {
+                try await secretGenerationCleaner.reconcile(event.payload)
+            } catch {
+                fputs("Vekil could not remove obsolete Keychain credentials.\n", stderr)
+            }
+        }
+    }
     let runtimeClient = RuntimeAppClient(controller: controller)
     let updater = SparkleUpdateDriver()
     let preferences: any VekilPreferencesStore = testRoot == nil
@@ -80,10 +100,12 @@ MainActor.assumeIsolated {
     let application = NSApplication.shared
     application.delegate = coordinator
     application.run()
+    secretCleanupTask.cancel()
     withExtendedLifetime(
         (
             gate, coordinator, updater, runtimeClient, controller, analytics,
-            keychainStore, secretGenerationManager, secretProjectionPreparer
+            keychainStore, secretGenerationManager, secretProjectionPreparer,
+            secretGenerationCleaner, secretCleanupTask
         )
     ) {}
 }

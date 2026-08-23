@@ -46,25 +46,42 @@ func (e *ManagedApplyError) Unwrap() []error {
 	return errs
 }
 
+func (h *helper) validateManagedDraft(ctx context.Context, payload managedDraftPayload) error {
+	candidate, err := h.opts.Configuration.BuildManagedCandidate(payload.Draft, payload.SecretGeneration)
+	if err != nil {
+		h.deleteUnrequiredSecretGeneration(payload.SecretGeneration)
+		return err
+	}
+	defer h.deleteUnrequiredSecretProjection(candidate.Revision, candidate.SecretGeneration)
+	return h.opts.CandidateValidator.ValidateManagedCandidate(ctx, candidate)
+}
+
 func (h *helper) applyManagedDraft(ctx context.Context, operationID string, payload managedDraftPayload) error {
 	candidate, err := h.opts.Configuration.BuildManagedCandidate(payload.Draft, payload.SecretGeneration)
 	if err != nil {
+		h.deleteUnrequiredSecretGeneration(payload.SecretGeneration)
 		return err
 	}
 	if err := h.opts.CandidateValidator.ValidateManagedCandidate(ctx, candidate); err != nil {
+		h.deleteUnrequiredSecretProjection(candidate.Revision, candidate.SecretGeneration)
 		return err
 	}
 	if err := ctx.Err(); err != nil {
+		h.deleteUnrequiredSecretProjection(candidate.Revision, candidate.SecretGeneration)
 		return err
 	}
 
 	wasRunning := h.opts.Controller.Snapshot().Service == appcontrol.ServiceRunning
 	tx, err := h.opts.Configuration.PrepareManagedApply(operationID, candidate, payload.ExpectedConfigRevision, wasRunning)
 	if err != nil {
+		h.deleteUnrequiredSecretProjection(candidate.Revision, candidate.SecretGeneration)
 		return err
 	}
 	rollbackStopped := func(primary error) error {
 		rollbackErr := tx.Rollback(failureCode(primary))
+		if rollbackErr == nil {
+			h.opts.Secrets.Delete(candidate.Revision, candidate.SecretGeneration)
+		}
 		return &ManagedApplyError{Primary: primary, Rollback: rollbackErr}
 	}
 
@@ -72,7 +89,7 @@ func (h *helper) applyManagedDraft(ctx context.Context, operationID string, payl
 		if err := tx.Install(); err != nil {
 			return rollbackStopped(err)
 		}
-		if err := h.commitManagedApply(tx); err != nil {
+		if err := h.commitManagedApply(ctx, tx); err != nil {
 			return rollbackStopped(err)
 		}
 		h.opts.Secrets.Delete(tx.journal.OldRevision, tx.journal.OldSecretGeneration)
@@ -109,14 +126,46 @@ func (h *helper) applyManagedDraft(ctx context.Context, operationID string, payl
 		return h.restoreManagedRunningIntent(ctx, tx, candidate, err, false)
 	}
 
-	if err := h.commitManagedApply(tx); err != nil {
+	if err := h.commitManagedApply(ctx, tx); err != nil {
 		return h.restoreManagedRunningIntent(ctx, tx, candidate, err, true)
 	}
 	h.opts.Secrets.Delete(tx.journal.OldRevision, tx.journal.OldSecretGeneration)
 	return nil
 }
 
-func (h *helper) commitManagedApply(tx *ManagedApplyTransaction) error {
+func (h *helper) deleteUnrequiredSecretGeneration(generation uint64) {
+	description, err := h.opts.Configuration.Describe()
+	if err != nil {
+		return
+	}
+	for _, required := range description.SecretProjections {
+		if required.SecretGeneration == generation {
+			return
+		}
+	}
+	h.opts.Secrets.DeleteGeneration(generation)
+}
+
+func (h *helper) deleteUnrequiredSecretProjection(revision string, generation uint64) {
+	description, err := h.opts.Configuration.Describe()
+	if err != nil {
+		return
+	}
+	for _, required := range description.SecretProjections {
+		if required.ConfigRevision == revision && required.SecretGeneration == generation {
+			return
+		}
+	}
+	h.opts.Secrets.Delete(revision, generation)
+}
+
+func (h *helper) commitManagedApply(ctx context.Context, tx *ManagedApplyTransaction) error {
+	if h.beforeManagedCommit != nil {
+		h.beforeManagedCommit()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if h.managedCommit != nil {
 		return h.managedCommit(tx)
 	}
