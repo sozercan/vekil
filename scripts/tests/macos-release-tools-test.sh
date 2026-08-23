@@ -208,7 +208,7 @@ grep -Fq 'depends_on macos: ">= :ventura"' "${cask}" || fail "Homebrew cask does
 if grep -Eq 'depends_on arch|xattr' "${cask}"; then fail "Homebrew cask retains architecture restriction or quarantine bypass"; fi
 if grep -Fq '.config/vekil' "${cask}"; then fail "Homebrew cask must not delete external configuration roots"; fi
 if grep -Fq 'Application Support/vekil",' "${cask}"; then fail "Homebrew cask must not recursively delete Application Support"; fi
-grep -Fq 'Application Support/vekil/providers.yaml' "${cask}" || fail "Homebrew cask does not remove the owned managed configuration"
+if grep -Fq 'Application Support/vekil/providers.yaml' "${cask}"; then fail "Homebrew cask must preserve the path when it may be user-owned External Configuration"; fi
 "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.16.0 "${sha256}" "${TMP_ROOT}/tap"
 expect_failure "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.15.0 "${sha256}" "${TMP_ROOT}/tap"
 

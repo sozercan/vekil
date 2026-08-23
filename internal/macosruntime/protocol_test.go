@@ -24,9 +24,34 @@ func TestFrameReaderEnforcesIncrementalLimitAndUTF8(t *testing.T) {
 			t.Fatalf("ReadFrame() len=%d err=%v", len(frame), err)
 		}
 	})
+	t.Run("exact limit with CRLF", func(t *testing.T) {
+		body := bytes.Repeat([]byte{'a'}, MaxFrameBytes)
+		wire := append(append(body, '\r'), '\n')
+		frame, err := newFrameReader(bytes.NewReader(wire)).ReadFrame()
+		if err != nil || len(frame) != MaxFrameBytes {
+			t.Fatalf("ReadFrame() len=%d err=%v", len(frame), err)
+		}
+	})
+	t.Run("exact limit with split CRLF", func(t *testing.T) {
+		body := bytes.Repeat([]byte{'a'}, MaxFrameBytes)
+		wire := append(append(body, '\r'), '\n')
+		reader := &frameReader{reader: bufio.NewReaderSize(bytes.NewReader(wire), MaxFrameBytes+1)}
+		frame, err := reader.ReadFrame()
+		if err != nil || !bytes.Equal(frame, body) {
+			t.Fatalf("ReadFrame() len=%d err=%v", len(frame), err)
+		}
+	})
 	t.Run("one byte over", func(t *testing.T) {
 		body := bytes.Repeat([]byte{'a'}, MaxFrameBytes+1)
 		_, err := newFrameReader(bytes.NewReader(append(body, '\n'))).ReadFrame()
+		if !errors.Is(err, ErrFrameTooLarge) {
+			t.Fatalf("ReadFrame() error = %v, want frame too large", err)
+		}
+	})
+	t.Run("one byte over with CRLF", func(t *testing.T) {
+		body := bytes.Repeat([]byte{'a'}, MaxFrameBytes+1)
+		wire := append(append(body, '\r'), '\n')
+		_, err := newFrameReader(bytes.NewReader(wire)).ReadFrame()
 		if !errors.Is(err, ErrFrameTooLarge) {
 			t.Fatalf("ReadFrame() error = %v, want frame too large", err)
 		}

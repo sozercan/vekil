@@ -71,7 +71,6 @@ cask "vekil" do
 
   zap trash: [
     "~/Library/Application Support/vekil/menubar.json",
-    "~/Library/Application Support/vekil/providers.yaml",
     "~/Library/Application Support/vekil/managed-apply.json",
     "~/Library/Application Support/vekil/.providers.yaml.staged",
     "~/Library/Application Support/vekil/.providers.yaml.previous",

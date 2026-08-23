@@ -17,6 +17,7 @@ func newFrameReader(reader io.Reader) *frameReader {
 
 func (r *frameReader) ReadFrame() ([]byte, error) {
 	var frame []byte
+	pendingCR := false
 	for {
 		fragment, err := r.reader.ReadSlice('\n')
 		if len(fragment) > 0 {
@@ -24,14 +25,26 @@ func (r *frameReader) ReadFrame() ([]byte, error) {
 			if newline {
 				fragment = fragment[:len(fragment)-1]
 			}
+			if pendingCR {
+				if !newline || len(fragment) > 0 {
+					if len(frame) == MaxFrameBytes {
+						return nil, ErrFrameTooLarge
+					}
+					frame = append(frame, '\r')
+				}
+				pendingCR = false
+			}
+			if newline && len(fragment) > 0 && fragment[len(fragment)-1] == '\r' {
+				fragment = fragment[:len(fragment)-1]
+			} else if !newline && len(fragment) > 0 && fragment[len(fragment)-1] == '\r' {
+				fragment = fragment[:len(fragment)-1]
+				pendingCR = true
+			}
 			if len(frame)+len(fragment) > MaxFrameBytes {
 				return nil, ErrFrameTooLarge
 			}
 			frame = append(frame, fragment...)
 			if newline {
-				if len(frame) > 0 && frame[len(frame)-1] == '\r' {
-					frame = frame[:len(frame)-1]
-				}
 				if len(frame) == 0 {
 					return nil, errors.New("empty protocol frame")
 				}
@@ -45,6 +58,12 @@ func (r *frameReader) ReadFrame() ([]byte, error) {
 		case errors.Is(err, bufio.ErrBufferFull):
 			continue
 		case errors.Is(err, io.EOF):
+			if pendingCR {
+				if len(frame) == MaxFrameBytes {
+					return nil, ErrFrameTooLarge
+				}
+				frame = append(frame, '\r')
+			}
 			if len(frame) == 0 {
 				return nil, io.EOF
 			}
