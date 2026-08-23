@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -135,28 +136,50 @@ func saveMenubarConfig(cfg menubarConfig) error {
 		return fmt.Errorf("encode menubar config: %w", err)
 	}
 	body = append(body, '\n')
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o600)
+	return writeMenubarConfigAtomic(path, body)
+}
+
+func writeMenubarConfigAtomic(path string, body []byte) (returnErr error) {
+	dir := filepath.Dir(path)
+	file, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
-		return fmt.Errorf("write menubar config %q: %w", path, err)
+		return fmt.Errorf("create temporary menubar config for %q: %w", path, err)
 	}
-	// Existing installations may have created this file with broader permissions.
-	// Secure the open inode before replacing contents that can include a signed URL.
+	tmp := file.Name()
+	defer func() {
+		_ = file.Close()
+		_ = os.Remove(tmp)
+	}()
 	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("secure menubar config %q: %w", path, err)
+		return fmt.Errorf("secure temporary menubar config for %q: %w", path, err)
 	}
-	if err := file.Truncate(0); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("truncate menubar config %q: %w", path, err)
+	for len(body) > 0 {
+		n, err := file.Write(body)
+		if err != nil {
+			return fmt.Errorf("write temporary menubar config for %q: %w", path, err)
+		}
+		if n == 0 {
+			return fmt.Errorf("write temporary menubar config for %q: %w", path, io.ErrShortWrite)
+		}
+		body = body[n:]
 	}
-	if _, err := file.Write(body); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("write menubar config %q: %w", path, err)
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync temporary menubar config for %q: %w", path, err)
 	}
 	if err := file.Close(); err != nil {
-		return fmt.Errorf("close menubar config %q: %w", path, err)
+		return fmt.Errorf("close temporary menubar config for %q: %w", path, err)
 	}
-
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("install menubar config %q: %w", path, err)
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open menubar config directory %q: %w", dir, err)
+	}
+	defer func() { _ = directory.Close() }()
+	if err := directory.Sync(); err != nil && !errors.Is(err, os.ErrInvalid) {
+		return fmt.Errorf("sync menubar config directory %q: %w", dir, err)
+	}
 	return nil
 }
 

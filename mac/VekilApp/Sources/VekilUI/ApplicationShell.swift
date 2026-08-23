@@ -89,8 +89,6 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
     private let shutdownRuntime: @Sendable () async -> Void
     private var window: NSWindow?, statusItem: NSStatusItem?, statusPopover: NSPopover?
     private var cancellables = Set<AnyCancellable>()
-    private var windowDidCloseObserver: NSObjectProtocol?
-    private var windowDidBecomeKeyObserver: NSObjectProtocol?
     private var terminating = false
 
     public init(
@@ -107,12 +105,6 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
 
     public func applicationDidFinishLaunching(_: Notification) {
         installStatusMenu(); gate.observe { [weak self] in self?.showWindow() }
-        windowDidBecomeKeyObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
-        ) { _ in DispatchQueue.main.async { NSApp.setActivationPolicy(.regular) } }
-        windowDidCloseObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification, object: nil, queue: .main
-        ) { [weak self] _ in Task { @MainActor in self?.scheduleActivationPolicyUpdate() } }
         appState.objectWillChange.receive(on: RunLoop.main).sink { [weak self] _ in DispatchQueue.main.async {
             self?.refreshMenu(); if let self {
                 self.analytics.applyRuntime(self.appState.runtimeState)
@@ -173,6 +165,7 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
 
     public func popoverDidClose(_: Notification) {
         analytics.setVisible(.menu, false)
+        scheduleActivationPolicyUpdate()
     }
 
     private func scheduleActivationPolicyUpdate() {
@@ -183,15 +176,6 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
             if !hasVisibleWindow {
                 NSApp.setActivationPolicy(.accessory)
             }
-        }
-    }
-
-    deinit {
-        if let windowDidCloseObserver {
-            NotificationCenter.default.removeObserver(windowDidCloseObserver)
-        }
-        if let windowDidBecomeKeyObserver {
-            NotificationCenter.default.removeObserver(windowDidBecomeKeyObserver)
         }
     }
 

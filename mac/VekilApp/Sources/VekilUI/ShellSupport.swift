@@ -124,6 +124,7 @@ public final class AnalyticsViewModel: ObservableObject {
     @Published public private(set) var requests: [StatsProjectedRequest] = []
     public let store: StatsStore
     private var tick: Task<Void, Never>?
+    private var visibleSurfaces: Set<StatsVisibility> = []
 
     public init(store: StatsStore) { self.store = store }
     public func applyRuntime(_ runtime: AppRuntimeStateSnapshot) {
@@ -140,18 +141,29 @@ public final class AnalyticsViewModel: ObservableObject {
         }
     }
     public func setVisible(_ surface: StatsVisibility, _ visible: Bool) {
+        if visible {
+            visibleSurfaces.insert(surface)
+        } else {
+            visibleSurfaces.remove(surface)
+        }
         Task { await store.setVisibility(surface, isVisible: visible); await reload() }
-        if visible, tick == nil {
+        if !visibleSurfaces.isEmpty, tick == nil {
             tick = Task { [weak self] in
                 while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    do {
+                        try await Task.sleep(nanoseconds: 1_000_000_000)
+                    } catch {
+                        return
+                    }
                     await self?.reload()
                 }
             }
-        } else if !visible {
+        } else if visibleSurfaces.isEmpty {
             tick?.cancel(); tick = nil
         }
     }
+
+    deinit { tick?.cancel() }
     public func reload() async {
         state = await store.state()
         requests = await store.requests()

@@ -1,12 +1,30 @@
 package macosruntime
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestWriteExclusiveFileRemovesPartialFileOnFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "owned")
+	injected := errors.New("injected write failure")
+	err := writeExclusiveFileWithBody(path, func(file *os.File) error {
+		if _, writeErr := file.Write([]byte("partial")); writeErr != nil {
+			return writeErr
+		}
+		return injected
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("writeExclusiveFileWithBody() error = %v, want injected failure", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial owned file remains: %v", err)
+	}
+}
 
 func TestEnsurePrivateDirectoryRejectsSymlinkWithoutChangingTarget(t *testing.T) {
 	if runtime.GOOS == "windows" {

@@ -139,6 +139,13 @@ func (m *ConfigManager) State() PersistentState {
 	return clonePersistentState(m.state)
 }
 
+func (m *ConfigManager) recoveryRequiredLocked() error {
+	if m.state.RecoveryState == "" {
+		return nil
+	}
+	return fmt.Errorf("managed recovery is required: %s", m.state.RecoveryState)
+}
+
 // LoadConfiguration implements appcontrol.ConfigurationSource using one safe,
 // immutable byte snapshot.
 func (m *ConfigManager) LoadConfiguration(ctx context.Context) (appcontrol.Configuration, error) {
@@ -237,6 +244,9 @@ func (m *ConfigManager) StageExternal(ctx context.Context, path string) error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.recoveryRequiredLocked(); err != nil {
+		return err
+	}
 	if m.stagedSelection != nil {
 		return errors.New("a configuration selection is already staged")
 	}
@@ -262,6 +272,10 @@ func (m *ConfigManager) SelectExternal(ctx context.Context, path string) (Config
 
 func (m *ConfigManager) StageReloadExternal(ctx context.Context) error {
 	m.mu.Lock()
+	if err := m.recoveryRequiredLocked(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
 	if m.state.ConfigMode != ConfigModeExternal || strings.TrimSpace(m.state.SelectedPath) == "" {
 		m.mu.Unlock()
 		return errors.New("external configuration is not selected")
@@ -286,6 +300,9 @@ func (m *ConfigManager) ReloadExternal(ctx context.Context) (ConfigDescription, 
 func (m *ConfigManager) UseLegacy() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.recoveryRequiredLocked(); err != nil {
+		return err
+	}
 	m.state.ConfigMode = ConfigModeLegacy
 	m.state.SelectedPath = ""
 	m.state.SelectedConfigRevision = LegacyConfigRevision
@@ -294,6 +311,10 @@ func (m *ConfigManager) UseLegacy() error {
 
 func (m *ConfigManager) StagePreferredAppConfiguration() error {
 	m.mu.Lock()
+	if err := m.recoveryRequiredLocked(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
 	if m.stagedSelection != nil {
 		m.mu.Unlock()
 		return errors.New("a configuration selection is already staged")
@@ -321,6 +342,9 @@ func (m *ConfigManager) StagePreferredAppConfiguration() error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.recoveryRequiredLocked(); err != nil {
+		return err
+	}
 	if m.stagedSelection != nil {
 		return errors.New("a configuration selection is already staged")
 	}
@@ -340,6 +364,9 @@ func (m *ConfigManager) StagePreferredAppConfiguration() error {
 func (m *ConfigManager) CommitSelection() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.recoveryRequiredLocked(); err != nil {
+		return err
+	}
 	if m.stagedSelection == nil {
 		return m.saveStateLocked()
 	}
@@ -379,6 +406,9 @@ func (m *ConfigManager) RestoreSelection(previous PersistentState) error {
 func (m *ConfigManager) UseManaged() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.recoveryRequiredLocked(); err != nil {
+		return err
+	}
 	if m.state.ManagedOwnershipID == "" {
 		return errors.New("managed configuration has not been created")
 	}
@@ -401,6 +431,9 @@ func (m *ConfigManager) UseManaged() error {
 func (m *ConfigManager) EnsureManagedConfiguration() (ConfigDescription, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.recoveryRequiredLocked(); err != nil {
+		return ConfigDescription{}, err
+	}
 
 	if m.state.ManagedOwnershipID != "" {
 		body, _, err := readSecureFile(m.paths.Managed, MaxConfigBytes)

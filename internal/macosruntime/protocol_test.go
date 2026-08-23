@@ -51,6 +51,26 @@ func TestDecodeRequestEnvelopeRejectsDuplicateTopLevelFields(t *testing.T) {
 	}
 }
 
+func TestDecodeRequestEnvelopeRejectsDuplicatePayloadFieldsAtAnyDepth(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "direct", payload: `{"operation_id":"expected","operation_id":"other"}`},
+		{name: "nested array", payload: `{"items":[{"operation_id":"expected","operation_id":"other"}]}`},
+		{name: "escaped equivalent", payload: `{"operation_id":"expected","operation\u005fid":"other"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			frame := []byte(`{"v":1,"id":"req_1","command":"cancel_operation","payload":` + test.payload + `}`)
+			_, err := decodeRequestEnvelope(frame)
+			if !errors.Is(err, ErrDuplicateField) {
+				t.Fatalf("decodeRequestEnvelope() error = %v, want duplicate field", err)
+			}
+		})
+	}
+}
+
 func TestRequestCacheIdempotencyAndIDReuseConflict(t *testing.T) {
 	first, err := decodeRequestEnvelope([]byte(`{"v":1,"id":"req_1","command":"start","payload":{"a":1,"b":2}}`))
 	if err != nil {

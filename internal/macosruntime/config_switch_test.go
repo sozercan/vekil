@@ -125,6 +125,38 @@ func TestInvalidExternalSelectionDoesNotStopRunningRuntime(t *testing.T) {
 	}
 }
 
+func TestCanceledConfigSelectionPreservesRestoreFailure(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	path, _ := writeExternalConfigForSwitchTest(t, "selected-model")
+	ctx, cancel := context.WithCancel(t.Context())
+
+	err := h.switchSelectedConfiguration(ctx, func(opCtx context.Context) error {
+		if err := manager.StageExternal(opCtx, path); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(manager.paths.Directory); err != nil {
+			return err
+		}
+		if err := os.WriteFile(manager.paths.Directory, []byte("blocks state restore"), 0o600); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) {
+		t.Fatalf("switch error = %v, want ConfigSwitchError", err)
+	}
+	if !errors.Is(switchErr.Primary, context.Canceled) || switchErr.Rollback == nil {
+		t.Fatalf("switch error = %+v, want canceled primary and restore failure", switchErr)
+	}
+	if !hasRollbackFailure(err) {
+		t.Fatalf("hasRollbackFailure(%v) = false", err)
+	}
+}
+
 func TestConfigSelectionWaitsForNonCancelableStopBeforeRestoringSelection(t *testing.T) {
 	stopStarted := make(chan struct{})
 	releaseStop := make(chan struct{})

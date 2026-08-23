@@ -2,7 +2,6 @@ package macosruntime
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/sozercan/vekil/internal/appcontrol"
@@ -61,7 +60,7 @@ func (h *helper) switchSelectedConfiguration(ctx context.Context, selectConfigur
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
-		return errors.Join(err, h.opts.Configuration.RestoreSelection(previous))
+		return &ConfigSwitchError{Primary: err, Rollback: h.opts.Configuration.RestoreSelection(previous)}
 	}
 
 	stop, err := h.opts.Controller.Stop(ctx)

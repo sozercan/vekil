@@ -31,7 +31,7 @@ func writeAtomicFile(path string, body []byte) (returnErr error) {
 	if err := file.Chmod(0o600); err != nil {
 		return fmt.Errorf("protect temporary file for %q: %w", path, err)
 	}
-	if _, err := file.Write(body); err != nil {
+	if err := writeAll(file, body); err != nil {
 		return fmt.Errorf("write temporary file for %q: %w", path, err)
 	}
 	if err := file.Sync(); err != nil {
@@ -49,7 +49,19 @@ func writeAtomicFile(path string, body []byte) (returnErr error) {
 	return nil
 }
 
-func writeExclusiveFile(path string, body []byte) (returnErr error) {
+func writeExclusiveFile(path string, body []byte) error {
+	return writeExclusiveFileWithBody(path, func(file *os.File) error {
+		if err := writeAll(file, body); err != nil {
+			return fmt.Errorf("write owned file %q: %w", path, err)
+		}
+		return nil
+	})
+}
+
+func writeExclusiveFileWithBody(path string, writeBody func(*os.File) error) (returnErr error) {
+	if writeBody == nil {
+		return errors.New("owned file writer is required")
+	}
 	if err := ensurePrivateDirectory(filepath.Dir(path)); err != nil {
 		return err
 	}
@@ -57,12 +69,20 @@ func writeExclusiveFile(path string, body []byte) (returnErr error) {
 	if err != nil {
 		return fmt.Errorf("create owned file %q: %w", path, err)
 	}
-	defer func() { _ = file.Close() }()
+	defer func() {
+		_ = file.Close()
+		if returnErr == nil {
+			return
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove incomplete owned file %q: %w", path, err))
+		}
+	}()
 	if err := file.Chmod(0o600); err != nil {
 		return fmt.Errorf("protect owned file %q: %w", path, err)
 	}
-	if _, err := file.Write(body); err != nil {
-		return fmt.Errorf("write owned file %q: %w", path, err)
+	if err := writeBody(file); err != nil {
+		return err
 	}
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("sync owned file %q: %w", path, err)

@@ -422,3 +422,73 @@ func TestStagedExternalSelectionIsNotPersistedBeforeCommit(t *testing.T) {
 		t.Fatalf("committed selection missing: %+v", persisted)
 	}
 }
+
+func TestConfigurationSelectionRejectsPendingRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := []byte("schema_version: 2\nproviders:\n  - id: local\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: local-model\n        endpoints: [/chat/completions]\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		run  func(*ConfigManager) error
+	}{
+		{name: "stage external", run: func(manager *ConfigManager) error { return manager.StageExternal(t.Context(), path) }},
+		{name: "reload external", run: func(manager *ConfigManager) error { return manager.StageReloadExternal(t.Context()) }},
+		{name: "stage preferred", run: func(manager *ConfigManager) error { return manager.StagePreferredAppConfiguration() }},
+		{name: "use legacy", run: func(manager *ConfigManager) error { return manager.UseLegacy() }},
+		{name: "use managed", run: func(manager *ConfigManager) error { return manager.UseManaged() }},
+		{name: "ensure managed", run: func(manager *ConfigManager) error { _, err := manager.EnsureManagedConfiguration(); return err }},
+		{name: "commit", run: func(manager *ConfigManager) error { return manager.CommitSelection() }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := newManagerForTest(t)
+			manager.mu.Lock()
+			manager.state.RecoveryState = string(ApplyPhaseRollbackFailed)
+			manager.mu.Unlock()
+
+			err := test.run(manager)
+			if err == nil || !strings.Contains(err.Error(), "managed recovery is required") {
+				t.Fatalf("selection error = %v, want recovery rejection", err)
+			}
+			if manager.stagedSelection != nil {
+				t.Fatal("selection was staged during recovery")
+			}
+			state := manager.State()
+			if state.ConfigMode != ConfigModeLegacy || state.SelectedPath != "" || state.RecoveryState != string(ApplyPhaseRollbackFailed) {
+				t.Fatalf("state changed during recovery: %+v", state)
+			}
+		})
+	}
+}
+
+func TestCommitSelectionRejectsRecoveryThatStartsAfterStaging(t *testing.T) {
+	manager := newManagerForTest(t)
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := []byte("schema_version: 2\nproviders:\n  - id: local\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: local-model\n        endpoints: [/chat/completions]\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.StageExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	manager.state.RecoveryState = string(ApplyPhaseRollbackFailed)
+	manager.mu.Unlock()
+
+	if err := manager.CommitSelection(); err == nil || !strings.Contains(err.Error(), "managed recovery is required") {
+		t.Fatalf("CommitSelection() error = %v, want recovery rejection", err)
+	}
+	if manager.stagedSelection == nil {
+		t.Fatal("rejected commit discarded the staged selection")
+	}
+	persisted, _, err := loadPersistentState(manager.paths.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ConfigMode != ConfigModeLegacy || persisted.SelectedPath != "" {
+		t.Fatalf("rejected selection reached disk: %+v", persisted)
+	}
+}

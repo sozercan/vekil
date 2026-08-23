@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -74,6 +75,10 @@ func TestSaveMenubarConfigSecuresExistingFile(t *testing.T) {
 	if err := os.Chmod(configPath, 0o644); err != nil {
 		t.Fatalf("Chmod() error = %v", err)
 	}
+	before, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("Stat(before) error = %v", err)
+	}
 
 	wantPath := "https://config.example/providers.yaml?token=secret"
 	if err := saveMenubarConfig(menubarConfig{ProvidersConfigPath: wantPath}); err != nil {
@@ -86,6 +91,9 @@ func TestSaveMenubarConfigSecuresExistingFile(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("saved config permissions = %#o, want 0600", got)
+	}
+	if runtime.GOOS != "windows" && os.SameFile(before, info) {
+		t.Fatal("saveMenubarConfig() rewrote the existing inode instead of replacing it atomically")
 	}
 	cfg, err := loadMenubarConfig()
 	if err != nil {
