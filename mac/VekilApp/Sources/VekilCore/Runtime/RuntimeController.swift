@@ -1351,6 +1351,10 @@ public actor RuntimeController {
         guard let session, session.id == sessionID else { return }
         if suppressRestart { suppression = .failure(error) }
         guard session.failureTerminationTask == nil else { return }
+        let helperCompletedHandshake = connectionState == .connected || connectionState == .reconciling
+        let cooperativeTerminationGracePeriod = helperCompletedHandshake
+            ? configuration.shutdownGracePeriod
+            : configuration.forceTerminationGracePeriod
         session.acceptingFrames = false
         session.handshakeTimeoutTask?.cancel()
         session.writeTail?.cancel()
@@ -1360,18 +1364,25 @@ public actor RuntimeController {
         session.process.closeStandardInput()
         session.process.terminate()
         session.failureTerminationTask = Task { [weak self] in
-            await self?.escalateFailedSessionTermination(sessionID: sessionID, error: error)
+            await self?.escalateFailedSessionTermination(
+                sessionID: sessionID,
+                error: error,
+                cooperativeGracePeriod: cooperativeTerminationGracePeriod
+            )
         }
     }
 
     private func escalateFailedSessionTermination(
         sessionID: UUID,
-        error: RuntimeControllerError
+        error: RuntimeControllerError,
+        cooperativeGracePeriod: TimeInterval
     ) async {
         guard session?.id == sessionID else { return }
-        let gracePeriod = configuration.forceTerminationGracePeriod
 
-        if await waitForTermination(sessionID: sessionID, timeout: gracePeriod) != nil {
+        if await waitForTermination(
+            sessionID: sessionID,
+            timeout: cooperativeGracePeriod
+        ) != nil {
             return
         }
         guard !Task.isCancelled,
@@ -1379,7 +1390,10 @@ public actor RuntimeController {
               activeSession.id == sessionID else { return }
 
         activeSession.process.forceTerminate()
-        if await waitForTermination(sessionID: sessionID, timeout: gracePeriod) != nil {
+        if await waitForTermination(
+            sessionID: sessionID,
+            timeout: configuration.forceTerminationGracePeriod
+        ) != nil {
             return
         }
         guard !Task.isCancelled,

@@ -86,6 +86,48 @@ func TestConfigManagerMigratesUnavailableLegacyExternalWithoutLegacyRevision(t *
 	}
 }
 
+func TestNewConfigManagerClearsStaleRuntimeActivation(t *testing.T) {
+	manager := newManagerForTest(t, "owner", "copilot-uuid")
+	description, err := manager.EnsureManagedConfiguration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RuntimeActivated(
+		t.Context(),
+		appcontrol.Configuration{Revision: description.SelectedRevision},
+		7,
+		"127.0.0.1:1337",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewConfigManager(ConfigManagerOptions{
+		Paths: manager.paths,
+		UUID:  func() string { return "unused" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := restarted.State()
+	if state.ActiveRuntimeRevision != "" || state.ActiveRuntimeGeneration != 0 {
+		t.Fatalf("stale activation survived restart: %+v", state)
+	}
+	restartedDescription, err := restarted.Describe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restartedDescription.ActiveRevision != "" || restartedDescription.Drifted {
+		t.Fatalf("restart description retained stale activation: %+v", restartedDescription)
+	}
+	persisted, _, err := loadPersistentState(manager.paths.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ActiveRuntimeRevision != "" || persisted.ActiveRuntimeGeneration != 0 {
+		t.Fatalf("stale activation remained on disk: %+v", persisted)
+	}
+}
+
 func TestEnsureManagedConfigurationUsesExclusiveOwnedPrivateFile(t *testing.T) {
 	manager := newManagerForTest(t, "owner-id", "provider-uuid")
 	description, err := manager.EnsureManagedConfiguration()

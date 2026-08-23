@@ -1227,6 +1227,38 @@ final class RuntimeControllerTests: XCTestCase {
         clock.advance(by: 120)
     }
 
+    func testConnectedFailureUsesCooperativeShutdownGraceBeforeForceTermination() async throws {
+        let process = FakeRuntimeProcess()
+        configureSuccessfulHandshake(process: process)
+        let clock = ManualRuntimeClock()
+        var configuration = makeConfiguration()
+        configuration.shutdownGracePeriod = 11
+        configuration.forceTerminationGracePeriod = 2
+        configuration.restartPolicy = RuntimeRestartPolicy(maximumAutomaticRestarts: 0)
+        let controller = RuntimeController(
+            configuration: configuration,
+            processFactory: FakeRuntimeProcessFactory([process]),
+            clock: clock,
+            idGenerator: SequenceRuntimeIDGenerator(["req_state"])
+        )
+        _ = try await controller.connect()
+
+        process.emitStandardOutput(Data("{}\n".utf8))
+        try await eventually { process.terminateCount == 1 }
+        try await eventually {
+            clock.recordedSleeps.filter { $0 == 11 }.count == 1
+        }
+        XCTAssertEqual(process.forceTerminateCount, 0)
+
+        clock.advance(by: 11)
+        try await eventually { process.forceTerminateCount == 1 }
+        process.emitExit(status: 2)
+        try await eventually {
+            await controller.connectionState
+                == .failed(.restartLimitExceeded(maximum: 0, window: 60))
+        }
+    }
+
     private func stateEvent(
         epoch: String,
         revision: UInt64,

@@ -121,7 +121,10 @@ func NewConfigManager(opts ConfigManagerOptions) (*ConfigManager, error) {
 	if err := manager.recoverApplyJournalLocked(); err != nil {
 		return nil, err
 	}
-	if migrated {
+	activationReset := manager.state.ActiveRuntimeRevision != "" || manager.state.ActiveRuntimeGeneration != 0
+	manager.state.ActiveRuntimeRevision = ""
+	manager.state.ActiveRuntimeGeneration = 0
+	if migrated || activationReset {
 		if err := manager.saveStateLocked(); err != nil {
 			return nil, err
 		}

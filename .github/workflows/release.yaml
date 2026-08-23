@@ -26,6 +26,7 @@ jobs:
     timeout-minutes: 45
     outputs:
       release_sha: ${{ steps.release.outputs.sha }}
+      stable: ${{ steps.release.outputs.stable }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,6 +43,11 @@ jobs:
             echo "release tag must be semantic version text prefixed by v" >&2
             exit 1
           }
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            echo "stable=false" >>"${GITHUB_OUTPUT}"
+          else
+            echo "stable=true" >>"${GITHUB_OUTPUT}"
+          fi
           git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
           git fetch origin main
           release_sha="$(git rev-list -n 1 "${RELEASE_TAG}^{commit}")"
@@ -496,9 +502,10 @@ jobs:
         run: gh release edit "${RELEASE_TAG}" --draft=false --repo "${GITHUB_REPOSITORY}"
 
   promote-container-latest:
+    if: ${{ needs.validate.outputs.stable == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: finalize-release
+    needs: [validate, finalize-release]
     permissions:
       contents: read
       packages: write
@@ -522,6 +529,7 @@ jobs:
             "ghcr.io/${GITHUB_REPOSITORY}:${RELEASE_TAG}-rtk"
 
   homebrew-cask:
+    if: ${{ needs.validate.outputs.stable == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [validate, macos-candidate, finalize-release]
