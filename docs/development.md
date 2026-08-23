@@ -275,7 +275,7 @@ The same release workflow also:
 - verifies the retained legacy appcast entry against its pinned version, minimum macOS, artifact URL, artifact SHA-256, and enclosure signature;
 - requires exact-digest N-1 update, Homebrew installation, and forward-revert attestations before publication;
 - keeps the GitHub release as a draft until the exact macOS assets and immutable versioned container manifests are published;
-- publishes the GitHub release before updating the public Homebrew cask, verifies the release asset anonymously, and only then advances the GHCR `latest` and `latest-rtk` manifests.
+- builds GHCR images by digest, refuses to replace a versioned tag with a different digest, publishes the GitHub release before updating the public Homebrew cask, and only then advances `latest` and `latest-rtk`.
 
 To publish the Homebrew cask, configure `HOMEBREW_REPO_TOKEN` with push access to `sozercan/homebrew-repo`. Sparkle's public key is pinned in `build-support/macos/app-config.json`; configure only `SPARKLE_PRIVATE_ED_KEY` for appcast signing. Production app signing/notarization additionally requires the Developer ID certificate, signing identity/team variables, and Apple notary API credentials listed in the release workflow.
 

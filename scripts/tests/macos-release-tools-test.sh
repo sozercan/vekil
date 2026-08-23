@@ -407,6 +407,79 @@ grep -Fq "sha256 \"${sha256}\"" "${cask}" || fail "same-version digest rejection
 "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.16.0 "${sha256}" "${TMP_ROOT}/tap"
 expect_failure "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.15.0 "${sha256}" "${TMP_ROOT}/tap"
 
+container_bin="${TMP_ROOT}/container-bin"
+container_state="${TMP_ROOT}/container-state"
+container_log="${TMP_ROOT}/container-log"
+mkdir -p "${container_bin}"
+cat >"${container_bin}/docker" <<'EOF_FAKE_DOCKER'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_DOCKER_LOG:?}"
+[[ "${1:-}" == buildx && "${2:-}" == imagetools ]] || exit 64
+case "${3:-}" in
+  inspect)
+    if [[ -n "${FAKE_DOCKER_INSPECT_ERROR:-}" ]]; then
+      printf '%s\n' "${FAKE_DOCKER_INSPECT_ERROR}" >&2
+      exit 1
+    fi
+    if [[ ! -f "${FAKE_DOCKER_STATE:?}" ]]; then
+      echo "ERROR: manifest unknown" >&2
+      exit 1
+    fi
+    printf '{"digest":"%s"}\n' "$(<"${FAKE_DOCKER_STATE}")"
+    ;;
+  create)
+    source_reference="${*: -1}"
+    printf '%s' "${source_reference##*@}" >"${FAKE_DOCKER_STATE:?}"
+    ;;
+  *) exit 64 ;;
+esac
+EOF_FAKE_DOCKER
+chmod 0755 "${container_bin}/docker"
+
+container_image="ghcr.io/sozercan/vekil"
+container_tag="v0.15.0"
+container_digest="sha256:$(printf '%064d' 0)"
+different_container_digest="sha256:$(printf '%064d' 1)"
+container_publish_env=(
+  "PATH=${container_bin}:${PATH}"
+  "FAKE_DOCKER_LOG=${container_log}"
+  "FAKE_DOCKER_STATE=${container_state}"
+)
+
+rm -f "${container_state}"
+: >"${container_log}"
+env "${container_publish_env[@]}" "${REPO_ROOT}/scripts/publish-immutable-container-tag.sh" \
+  "${container_image}" "${container_tag}" "${container_digest}"
+[[ "$(<"${container_state}")" == "${container_digest}" ]] || fail "container tag did not resolve to candidate digest"
+grep -Fq "buildx imagetools create --tag ${container_image}:${container_tag} ${container_image}@${container_digest}" "${container_log}" || \
+  fail "missing digest-only container tag publication"
+
+: >"${container_log}"
+env "${container_publish_env[@]}" "${REPO_ROOT}/scripts/publish-immutable-container-tag.sh" \
+  "${container_image}" "${container_tag}" "${container_digest}"
+if grep -Fq 'buildx imagetools create' "${container_log}"; then fail "matching container tag was republished"; fi
+
+printf '%s' "${different_container_digest}" >"${container_state}"
+: >"${container_log}"
+expect_failure env "${container_publish_env[@]}" "${REPO_ROOT}/scripts/publish-immutable-container-tag.sh" \
+  "${container_image}" "${container_tag}" "${container_digest}"
+if grep -Fq 'buildx imagetools create' "${container_log}"; then fail "mismatched container tag was overwritten"; fi
+[[ "$(<"${container_state}")" == "${different_container_digest}" ]] || fail "mismatched container digest changed"
+
+rm -f "${container_state}"
+: >"${container_log}"
+expect_failure env "${container_publish_env[@]}" FAKE_DOCKER_INSPECT_ERROR='unauthorized: authentication required' \
+  "${REPO_ROOT}/scripts/publish-immutable-container-tag.sh" \
+  "${container_image}" "${container_tag}" "${container_digest}"
+if grep -Fq 'buildx imagetools create' "${container_log}"; then fail "container tag was published after an inspection error"; fi
+
+release_workflow="${REPO_ROOT}/.github/workflows/release.yaml"
+[[ "$(grep -cF 'push-by-digest=true,name-canonical=true,push=true' "${release_workflow}")" -eq 2 ]] || \
+  fail "release workflow must build both container variants by digest"
+grep -Fq 'scripts/publish-immutable-container-tag.sh' "${release_workflow}" || \
+  fail "release workflow does not publish immutable versioned container tags"
+
 status_output="${TMP_ROOT}/github-output"
 set +e
 GITHUB_OUTPUT="${status_output}" "${REPO_ROOT}/scripts/macos-native-source-status.sh" --github-output >/dev/null 2>&1
@@ -434,6 +507,7 @@ bash -n \
   "${REPO_ROOT}/scripts/notarize-macos-app.sh" \
   "${REPO_ROOT}/scripts/package-macos-app.sh" \
   "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" \
+  "${REPO_ROOT}/scripts/publish-immutable-container-tag.sh" \
   "${REPO_ROOT}/scripts/sign-macos-app.sh" \
   "${REPO_ROOT}/scripts/validate-release-tag.sh" \
   "${REPO_ROOT}/scripts/verify-macos-app.sh" \

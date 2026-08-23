@@ -400,22 +400,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push base image by digest
+        id: base_image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ghcr.io/${{ github.repository }}:${{ inputs.tag }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
 
-      - name: Build and push RTK variant
+      - name: Build and push RTK image by digest
+        id: rtk_image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile.rtk
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ghcr.io/${{ github.repository }}:${{ inputs.tag }}-rtk
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Publish immutable versioned container tags
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+          BASE_DIGEST: ${{ steps.base_image.outputs.digest }}
+          RTK_DIGEST: ${{ steps.rtk_image.outputs.digest }}
+        run: |
+          scripts/publish-immutable-container-tag.sh \
+            "${IMAGE_NAME}" "${RELEASE_TAG}" "${BASE_DIGEST}"
+          scripts/publish-immutable-container-tag.sh \
+            "${IMAGE_NAME}" "${RELEASE_TAG}-rtk" "${RTK_DIGEST}"
 
   upload-macos-assets:
     runs-on: ubuntu-latest
