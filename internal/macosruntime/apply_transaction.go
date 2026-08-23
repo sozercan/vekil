@@ -511,9 +511,6 @@ func (m *ConfigManager) recoverInitialManagedCreationLocked(journal ApplyJournal
 	}
 
 	previous := clonePersistentState(m.state)
-	m.state.ConfigMode = ConfigModeManaged
-	m.state.SelectedPath = m.paths.Managed
-	m.state.SelectedConfigRevision = expected.NewRevision
 	m.state.ManagedOwnershipID = m.uuid()
 	m.state.CommittedConfigRevision = expected.NewRevision
 	m.state.CommittedSHA256 = expected.NewSHA256

@@ -431,8 +431,12 @@ func TestEnsureManagedConfigurationUsesExclusiveOwnedPrivateFile(t *testing.T) {
 	}
 }
 
-func TestNewConfigManagerRecoversCommittedInitialManagedCreation(t *testing.T) {
+func TestNewConfigManagerRecoversInitialManagedOwnershipWithoutChangingSelection(t *testing.T) {
 	manager := newManagerForTest(t)
+	externalPath, externalRevision := writeExternalConfigForSwitchTest(t, "external-model")
+	if _, err := manager.SelectExternal(t.Context(), externalPath); err != nil {
+		t.Fatal(err)
+	}
 	journal := initialManagedCreationJournal()
 	if err := writeApplyJournal(manager.paths.Journal, journal); err != nil {
 		t.Fatal(err)
@@ -456,13 +460,82 @@ func TestNewConfigManagerRecoversCommittedInitialManagedCreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := recovered.State()
-	if state.ConfigMode != ConfigModeManaged || state.ManagedOwnershipID != "recovered-owner" ||
+	if state.ConfigMode != ConfigModeExternal || state.SelectedPath != externalPath ||
+		state.SelectedConfigRevision != externalRevision || state.ManagedOwnershipID != "recovered-owner" ||
 		state.CommittedConfigRevision != journal.NewRevision || state.CommittedSHA256 != journal.NewSHA256 ||
 		len(state.Providers) != 1 || state.Providers[0].UUID != "recovered-provider" {
 		t.Fatalf("recovered initial managed state = %+v", state)
 	}
 	if _, err := os.Stat(manager.paths.Journal); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("initial creation journal remains after recovery: %v", err)
+	}
+}
+
+func TestEnsureManagedConfigurationStagesSelectionUntilCommit(t *testing.T) {
+	for _, managedOwned := range []bool{false, true} {
+		name := "new managed file"
+		if managedOwned {
+			name = "existing managed file"
+		}
+		t.Run(name, func(t *testing.T) {
+			manager := newManagerForTest(t, "owner", "provider")
+			if managedOwned {
+				if _, err := manager.EnsureManagedConfiguration(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			externalPath, externalRevision := writeExternalConfigForSwitchTest(t, "external-model")
+			if _, err := manager.SelectExternal(t.Context(), externalPath); err != nil {
+				t.Fatal(err)
+			}
+
+			previous := manager.State()
+			manager.beginSelectionSwitch(previous)
+			defer manager.endSelectionSwitch()
+			description, err := manager.EnsureManagedConfiguration()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if description.Mode != ConfigModeManaged {
+				t.Fatalf("staged description mode = %q, want %q", description.Mode, ConfigModeManaged)
+			}
+			if state := manager.State(); state.ConfigMode != ConfigModeManaged || state.SelectedPath != manager.paths.Managed {
+				t.Fatalf("in-memory staged selection = %+v", state)
+			}
+
+			persisted, _, err := loadPersistentState(manager.paths.State)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.ConfigMode != ConfigModeExternal || persisted.SelectedPath != externalPath ||
+				persisted.SelectedConfigRevision != externalRevision || persisted.ManagedOwnershipID == "" {
+				t.Fatalf("selection persisted before commit: %+v", persisted)
+			}
+			restarted, err := NewConfigManager(ConfigManagerOptions{
+				Paths: manager.paths,
+				UUID:  func() string { return "unexpected-replacement" },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state := restarted.State(); state.ConfigMode != ConfigModeExternal ||
+				state.SelectedPath != externalPath || state.SelectedConfigRevision != externalRevision ||
+				state.ManagedOwnershipID != persisted.ManagedOwnershipID {
+				t.Fatalf("restart adopted staged managed selection: %+v", state)
+			}
+
+			if err := manager.CommitSelection(); err != nil {
+				t.Fatal(err)
+			}
+			persisted, _, err = loadPersistentState(manager.paths.State)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.ConfigMode != ConfigModeManaged || persisted.SelectedPath != manager.paths.Managed ||
+				persisted.SelectedConfigRevision != description.SelectedRevision {
+				t.Fatalf("committed managed selection = %+v", persisted)
+			}
+		})
 	}
 }
 

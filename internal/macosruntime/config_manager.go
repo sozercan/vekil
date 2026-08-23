@@ -494,9 +494,7 @@ func (m *ConfigManager) RestoreSelection(previous PersistentState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stagedSelection = nil
-	m.state.ConfigMode = previous.ConfigMode
-	m.state.SelectedPath = previous.SelectedPath
-	m.state.SelectedConfigRevision = previous.SelectedConfigRevision
+	m.restoreSelectionFieldsLocked(previous)
 	m.preparedExternalSnapshot = nil
 	if previous.ConfigMode == ConfigModeExternal && m.rollbackExternalSnapshot.matches(
 		previous.SelectedPath, previous.SelectedConfigRevision,
@@ -523,10 +521,32 @@ func (m *ConfigManager) beginSelectionSwitch(previous PersistentState) {
 func (m *ConfigManager) endSelectionSwitch() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.stagedSelection != nil {
+		m.restoreSelectionFieldsLocked(*m.stagedSelection)
+		m.stagedSelection = nil
+	}
 	m.selectionSwitchActive = false
 	m.preparedExternalSnapshot = nil
 	m.rollbackExternalSnapshot = nil
 	m.pruneLastExternalSnapshotLocked()
+}
+
+func (m *ConfigManager) stageSelectionForSwitchLocked() error {
+	if !m.selectionSwitchActive {
+		return nil
+	}
+	if m.stagedSelection != nil {
+		return errors.New("a configuration selection is already staged")
+	}
+	previous := clonePersistentState(m.state)
+	m.stagedSelection = &previous
+	return nil
+}
+
+func (m *ConfigManager) restoreSelectionFieldsLocked(previous PersistentState) {
+	m.state.ConfigMode = previous.ConfigMode
+	m.state.SelectedPath = previous.SelectedPath
+	m.state.SelectedConfigRevision = previous.SelectedConfigRevision
 }
 
 func (m *ConfigManager) pruneLastExternalSnapshotLocked() {
@@ -592,6 +612,9 @@ func (m *ConfigManager) EnsureManagedConfiguration() (ConfigDescription, error) 
 		if revision != m.state.CommittedConfigRevision || digest != m.state.CommittedSHA256 {
 			return ConfigDescription{}, errors.New("managed configuration is drifted")
 		}
+		if err := m.stageSelectionForSwitchLocked(); err != nil {
+			return ConfigDescription{}, err
+		}
 		m.state.ConfigMode = ConfigModeManaged
 		m.state.SelectedPath = m.paths.Managed
 		m.state.SelectedConfigRevision = revision
@@ -619,6 +642,9 @@ func (m *ConfigManager) EnsureManagedConfiguration() (ConfigDescription, error) 
 		return ConfigDescription{}, err
 	}
 	if err := writeExclusiveFile(m.paths.Managed, initialManagedCopilotYAML); err != nil {
+		return ConfigDescription{}, errors.Join(err, removeUncommittedInitialManagedCreation(m.paths))
+	}
+	if err := m.stageSelectionForSwitchLocked(); err != nil {
 		return ConfigDescription{}, errors.Join(err, removeUncommittedInitialManagedCreation(m.paths))
 	}
 	revision, digest := journal.NewRevision, journal.NewSHA256
