@@ -39,7 +39,17 @@ public struct RuntimeHelperCodeIdentity: Equatable, Sendable {
 
 public enum RuntimeHelperSignaturePolicy: Equatable, Sendable {
     case requireProductionTeam
-    case allowAdHocForTesting
+    case allowAdHocForDevelopment
+}
+
+public enum VekilBuildConfiguration {
+    public static let helperSignaturePolicy: RuntimeHelperSignaturePolicy = {
+#if VEKIL_DEVELOPMENT_BUILD
+        .allowAdHocForDevelopment
+#else
+        .requireProductionTeam
+#endif
+    }()
 }
 
 public struct SecurityHelperCodeSignatureValidator: HelperCodeSignatureValidating {

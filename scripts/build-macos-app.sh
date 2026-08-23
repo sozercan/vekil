@@ -77,6 +77,10 @@ mkdir -p \
 
 swift_binaries=()
 swift_bin_dirs=()
+swift_build_flags=(-Xswiftc -DVEKIL_DEVELOPMENT_BUILD)
+if [[ "${RELEASE_MODE}" == 1 ]]; then
+  swift_build_flags=(-Xswiftc -DVEKIL_PRODUCTION_RELEASE)
+fi
 for arch in arm64 x86_64; do
   triple="${arch}-apple-macosx${minimum_system_version}"
   scratch="${BUILD_ROOT}/swift/${arch}"
@@ -88,6 +92,7 @@ for arch in arm64 x86_64; do
       --configuration release \
       --triple "${triple}" \
       --only-use-versions-from-resolved-file \
+      "${swift_build_flags[@]}" \
       --product "${swift_product}" \
       -Xlinker -rpath \
       -Xlinker '@executable_path/../Frameworks'
@@ -97,6 +102,7 @@ for arch in arm64 x86_64; do
       --configuration release \
       --triple "${triple}" \
       --only-use-versions-from-resolved-file \
+      "${swift_build_flags[@]}" \
       --show-bin-path)"
   binary="${bin_dir}/${swift_product}"
   [[ -x "${binary}" ]] || die "Swift executable not found: ${binary}"

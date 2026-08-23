@@ -5,6 +5,15 @@ import VekilCore
 @testable import VekilUI
 
 final class ShellSecurityTests: XCTestCase {
+    func testBuildConfigurationSelectsExpectedHelperSignaturePolicy() {
+#if VEKIL_DEVELOPMENT_BUILD
+        let expected = RuntimeHelperSignaturePolicy.allowAdHocForDevelopment
+#else
+        let expected = RuntimeHelperSignaturePolicy.requireProductionTeam
+#endif
+        XCTAssertEqual(VekilBuildConfiguration.helperSignaturePolicy, expected)
+    }
+
     func testShellArgumentQuotesModelIDs() {
         XCTAssertEqual(ShellArgument.quote("model name; rm -rf /"), "'model name; rm -rf /'")
         XCTAssertEqual(ShellArgument.quote("model'$(command)'"), "'model'\"'\"'$(command)'\"'\"''")

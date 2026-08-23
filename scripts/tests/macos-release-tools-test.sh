@@ -480,6 +480,15 @@ release_workflow="${REPO_ROOT}/.github/workflows/release.yaml"
 grep -Fq 'scripts/publish-immutable-container-tag.sh' "${release_workflow}" || \
   fail "release workflow does not publish immutable versioned container tags"
 
+native_build_script="${REPO_ROOT}/scripts/build-macos-app.sh"
+grep -Fq 'swift_build_flags=(-Xswiftc -DVEKIL_DEVELOPMENT_BUILD)' "${native_build_script}" || \
+  fail "local macOS builds do not set the trusted Swift development marker"
+grep -Fq 'swift_build_flags=(-Xswiftc -DVEKIL_PRODUCTION_RELEASE)' "${native_build_script}" || \
+  fail "production macOS builds do not set the trusted Swift release marker"
+grep -Fq 'policy: VekilBuildConfiguration.helperSignaturePolicy' \
+  "${REPO_ROOT}/mac/VekilApp/Sources/Vekil/main.swift" || \
+  fail "native entry point does not use the compile-time helper signature policy"
+
 status_output="${TMP_ROOT}/github-output"
 set +e
 GITHUB_OUTPUT="${status_output}" "${REPO_ROOT}/scripts/macos-native-source-status.sh" --github-output >/dev/null 2>&1

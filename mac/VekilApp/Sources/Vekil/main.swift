@@ -50,7 +50,7 @@ MainActor.assumeIsolated {
             bundleURL: bundle.bundleURL,
             validator: RuntimeHelperValidator(
                 signature: SecurityHelperCodeSignatureValidator(
-                    policy: testRoot == nil ? .requireProductionTeam : .allowAdHocForTesting
+                    policy: VekilBuildConfiguration.helperSignaturePolicy
                 )
             )
         ),
