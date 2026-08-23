@@ -67,12 +67,12 @@ cat >"${TMP_ROOT}/base-appcast.xml" <<EOF_APPCAST
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
     <item>
-      <title>0.14.0</title>
-      <sparkle:version>0.14.0</sparkle:version>
-      <sparkle:shortVersionString>0.14.0</sparkle:shortVersionString>
+      <title>0.14.1</title>
+      <sparkle:version>0.14.1</sparkle:version>
+      <sparkle:shortVersionString>0.14.1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>10.13</sparkle:minimumSystemVersion>
       <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-      <enclosure url="https://example.invalid/v0.14.0/vekil-macos-arm64.zip" length="1" type="application/octet-stream" sparkle:edSignature="${signature}"/>
+      <enclosure url="https://example.invalid/v0.14.1/vekil-macos-arm64.zip" length="1" type="application/octet-stream" sparkle:edSignature="${signature}"/>
     </item>
   </channel>
 </rss><!-- sparkle-signatures:

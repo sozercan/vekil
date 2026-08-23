@@ -1041,6 +1041,102 @@ final class RuntimeControllerTests: XCTestCase {
         XCTAssertEqual(replacement.forceTerminateCount, 0)
     }
 
+    func testAutomaticRestartRestoreHelperExitDoesNotReportConnected() async throws {
+        let first = FakeRuntimeProcess()
+        first.onRun { [weak first] in
+            first?.emitStandardOutput(try! encodedHello(epoch: "hep_original"))
+        }
+        first.onWrite { [weak first] data in
+            guard let first, let request = try? requestFromLine(data), request.command == .getState else {
+                return
+            }
+            let state = RuntimeStatePayload(
+                runtimeGeneration: 7,
+                configRevision: "cfg_running",
+                service: .running,
+                readiness: .ready,
+                auth: .signedIn
+            )
+            first.emitStandardOutput(
+                try! encodedResponse(
+                    for: request,
+                    epoch: "hep_original",
+                    result: .object([
+                        "state_revision": .integer(1),
+                        "state": try! JSONValue.encode(state),
+                    ])
+                )
+            )
+        }
+
+        let replacement = FakeRuntimeProcess()
+        replacement.onRun { [weak replacement] in
+            replacement?.emitStandardOutput(try! encodedHello(epoch: "hep_replacement"))
+        }
+        replacement.onWrite { [weak replacement] data in
+            guard let replacement, let request = try? requestFromLine(data) else { return }
+            if request.command == .getState {
+                let state = RuntimeStatePayload(
+                    runtimeGeneration: 0,
+                    configRevision: "cfg_running",
+                    service: .stopped,
+                    readiness: .unknown,
+                    auth: .signedIn
+                )
+                replacement.emitStandardOutput(
+                    try! encodedResponse(
+                        for: request,
+                        epoch: "hep_replacement",
+                        result: .object([
+                            "state_revision": .integer(1),
+                            "state": try! JSONValue.encode(state),
+                        ])
+                    )
+                )
+            } else if request.command == .start {
+                replacement.emitStandardOutput(
+                    try! encodedResponse(
+                        for: request,
+                        epoch: "hep_replacement",
+                        result: .object([
+                            "accepted": .bool(true),
+                            "operation_id": .string("op_restore"),
+                        ])
+                    )
+                )
+            }
+        }
+
+        let controller = RuntimeController(
+            configuration: makeConfiguration(
+                restartPolicy: RuntimeRestartPolicy(
+                    maximumAutomaticRestarts: 1,
+                    window: 60,
+                    delays: [0]
+                )
+            ),
+            processFactory: FakeRuntimeProcessFactory([first, replacement]),
+            clock: ManualRuntimeClock(),
+            idGenerator: SequenceRuntimeIDGenerator([
+                "req_original_state", "req_replacement_state", "req_restore_start",
+            ])
+        )
+        _ = try await controller.connect()
+
+        first.emitExit(status: 1)
+        try await eventually { await controller.snapshot().activeOperationID == "op_restore" }
+        replacement.emitExit(status: 1)
+
+        try await eventually {
+            await controller.connectionState
+                == .failed(.restartLimitExceeded(maximum: 1, window: 60))
+        }
+        let snapshot = await controller.snapshot()
+        XCTAssertNil(snapshot.launchIdentity)
+        XCTAssertNil(snapshot.currentState)
+        XCTAssertEqual(snapshot.operations["op_restore"]?.error?.code, "helper_exited")
+    }
+
     func testPreHandshakeRestartFailureRetainsPreviousScopedIdentity() async throws {
         let first = FakeRuntimeProcess()
         configureSuccessfulHandshake(process: first, epoch: "hep_original")

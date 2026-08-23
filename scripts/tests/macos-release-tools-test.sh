@@ -137,12 +137,12 @@ cat >"${unsigned_appcast}" <<EOF_APPCAST
       <enclosure url="https://example.invalid/releases/v0.15.0/vekil-macos-universal.zip" length="${artifact_size}" type="application/octet-stream" sparkle:edSignature="${signature}"/>
     </item>
     <item>
-      <title>0.14.0</title>
-      <sparkle:version>0.14.0</sparkle:version>
-      <sparkle:shortVersionString>0.14.0</sparkle:shortVersionString>
+      <title>0.14.1</title>
+      <sparkle:version>0.14.1</sparkle:version>
+      <sparkle:shortVersionString>0.14.1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>10.13</sparkle:minimumSystemVersion>
       <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-      <enclosure url="https://example.invalid/releases/v0.14.0/vekil-macos-arm64.zip" length="1" type="application/octet-stream" sparkle:edSignature="${signature}"/>
+      <enclosure url="https://example.invalid/releases/v0.14.1/vekil-macos-arm64.zip" length="1" type="application/octet-stream" sparkle:edSignature="${signature}"/>
     </item>
   </channel>
 </rss>

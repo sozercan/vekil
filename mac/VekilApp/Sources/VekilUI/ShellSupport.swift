@@ -300,6 +300,7 @@ public final class AnalyticsViewModel: ObservableObject {
     public let store: StatsStore
     private var tick: Task<Void, Never>?
     private var runtimeUpdateTail: Task<Void, Never>?
+    private var visibilityUpdateTail: Task<Void, Never>?
     private var visibleSurfaces: Set<StatsVisibility> = []
 
     public init(store: StatsStore) { self.store = store }
@@ -322,13 +323,22 @@ public final class AnalyticsViewModel: ObservableObject {
     func waitForRuntimeUpdates() async {
         await runtimeUpdateTail?.value
     }
+    func waitForVisibilityUpdates() async {
+        await visibilityUpdateTail?.value
+    }
     public func setVisible(_ surface: StatsVisibility, _ visible: Bool) {
         if visible {
             visibleSurfaces.insert(surface)
         } else {
             visibleSurfaces.remove(surface)
         }
-        Task { await store.setVisibility(surface, isVisible: visible); await reload() }
+        let predecessor = visibilityUpdateTail
+        visibilityUpdateTail = Task { [weak self, store] in
+            await predecessor?.value
+            guard !Task.isCancelled else { return }
+            await store.setVisibility(surface, isVisible: visible)
+            await self?.reload()
+        }
         if !visibleSurfaces.isEmpty, tick == nil {
             tick = Task { [weak self] in
                 while !Task.isCancelled {
@@ -347,6 +357,7 @@ public final class AnalyticsViewModel: ObservableObject {
 
     deinit {
         runtimeUpdateTail?.cancel()
+        visibilityUpdateTail?.cancel()
         tick?.cancel()
     }
     public func reload() async {

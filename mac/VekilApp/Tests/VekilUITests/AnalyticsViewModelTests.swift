@@ -56,4 +56,23 @@ final class AnalyticsViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.state.runtimeIdentity, expectedIdentity)
         XCTAssertEqual(viewModel.state.serviceState, .running)
     }
+
+    @MainActor
+    func testVisibilityUpdatesFinishInSubmissionOrder() async {
+        let store = StatsStore(
+            dataSource: AnalyticsViewModelDataSource(),
+            configuration: StatsStoreConfiguration(automaticPolling: false)
+        )
+        let viewModel = AnalyticsViewModel(store: store)
+
+        viewModel.setVisible(.overview, true)
+        viewModel.setVisible(.overview, false)
+        viewModel.setVisible(.providers, true)
+
+        await viewModel.waitForVisibilityUpdates()
+
+        let state = await store.state()
+        XCTAssertEqual(state.visibleSurfaces, [.providers])
+        XCTAssertEqual(viewModel.state.visibleSurfaces, [.providers])
+    }
 }

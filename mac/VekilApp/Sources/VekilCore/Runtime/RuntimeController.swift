@@ -929,10 +929,12 @@ public actor RuntimeController {
                 // The replacement helper is healthy. A rejected or failed
                 // proxy start is represented by its operation and state
                 // events, so keep the helper connected for manual recovery.
+                guard session?.id == sessionID else { return }
                 setConnectionState(.connected)
                 resumeConnectionWaiters()
                 return
             }
+            guard session?.id == sessionID else { return }
             setConnectionState(.connected)
             resumeConnectionWaiters()
         } catch let error as RuntimeControllerError {

@@ -680,10 +680,12 @@ func (m *ConfigManager) Describe() (ConfigDescription, error) {
 	case ConfigModeManaged:
 		body, _, readErr = readOwnedFile(m.paths.Managed, MaxConfigBytes)
 	case ConfigModeExternal:
-		if m.lastExternalSnapshot.matches(m.state.SelectedPath, m.state.SelectedConfigRevision) {
-			body = append([]byte(nil), m.lastExternalSnapshot.body...)
-		} else if proxy.IsRemoteProvidersConfigSource(m.state.SelectedPath) {
-			readErr = errRemoteConfigurationNotLoaded
+		if proxy.IsRemoteProvidersConfigSource(m.state.SelectedPath) {
+			if m.lastExternalSnapshot.matches(m.state.SelectedPath, m.state.SelectedConfigRevision) {
+				body = append([]byte(nil), m.lastExternalSnapshot.body...)
+			} else {
+				readErr = errRemoteConfigurationNotLoaded
+			}
 		} else {
 			_, body, readErr = loadExternalConfigurationSnapshot(context.Background(), m.state.SelectedPath)
 		}

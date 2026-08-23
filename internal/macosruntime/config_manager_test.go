@@ -349,6 +349,40 @@ func TestExternalEditRequiresReloadBeforeActivation(t *testing.T) {
 	}
 }
 
+func TestDescribeRereadsLocalExternalConfigurationAfterRuntimeLoad(t *testing.T) {
+	manager := newManagerForTest(t)
+	path, originalRevision := writeExternalConfigForSwitchTest(t, "original-model")
+	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := manager.LoadConfiguration(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RuntimeActivated(t.Context(), configuration, 1, "127.0.0.1:1337"); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := bytes.Replace(body, []byte("original-model"), []byte("updated-model"), 1)
+	if err := os.WriteFile(path, updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	updatedRevision, _ := configRevision(updated)
+
+	description, err := manager.Describe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !description.Available || !description.Drifted ||
+		description.ActiveRevision != originalRevision ||
+		description.SelectedRevision != updatedRevision {
+		t.Fatalf("drift description = %+v", description)
+	}
+}
+
 func TestEnsureManagedConfigurationUsesExclusiveOwnedPrivateFile(t *testing.T) {
 	manager := newManagerForTest(t, "owner-id", "provider-uuid")
 	description, err := manager.EnsureManagedConfiguration()

@@ -37,7 +37,7 @@ public struct RuntimeSecretProjectionPreparer: Sendable {
   public func requests(
     for requirements: [RuntimeSecretProjectionRequirement]
   ) async throws -> [RuntimePreparedRequest] {
-    var seen = Set<ProjectionIdentity>()
+    var seenGenerations = Set<UInt64>()
     var requests: [RuntimePreparedRequest] = []
 
     for requirement in requirements.sorted(by: requirementOrder) {
@@ -45,9 +45,7 @@ public struct RuntimeSecretProjectionPreparer: Sendable {
       guard !revision.isEmpty, requirement.secretGeneration > 0 else {
         throw RuntimeSecretProjectionPreparationError.invalidRequirement
       }
-      guard seen.insert(
-        ProjectionIdentity(revision: revision, generation: requirement.secretGeneration)
-      ).inserted else {
+      guard seenGenerations.insert(requirement.secretGeneration).inserted else {
         throw RuntimeSecretProjectionPreparationError.duplicateRequirement
       }
 
@@ -147,11 +145,6 @@ public struct RuntimeSecretProjectionPreparer: Sendable {
       return left.configRevision < right.configRevision
     }
     return left.secretGeneration < right.secretGeneration
-  }
-
-  private struct ProjectionIdentity: Hashable {
-    let revision: String
-    let generation: UInt64
   }
 
   private struct NormalizedEntry {

@@ -27,10 +27,10 @@
   },
   "legacy_shell": {
     "minimum_system_version": "10.13",
-    "last_compatible_marketing_version": "0.14.0",
-    "last_compatible_bundle_version": "0.14.0",
-    "last_compatible_artifact_url": "https://github.com/sozercan/vekil/releases/download/v0.14.0/vekil-macos-arm64.zip",
-    "last_compatible_artifact_sha256": "fd43c4353fb4a6763b7b56a1751ec5277dfb3f4e630364fde1dc6d32102ff60b",
-    "last_compatible_appcast_url": "https://github.com/sozercan/vekil/releases/download/v0.14.0/appcast.xml"
+    "last_compatible_marketing_version": "0.14.1",
+    "last_compatible_bundle_version": "0.14.1",
+    "last_compatible_artifact_url": "https://github.com/sozercan/vekil/releases/download/v0.14.1/vekil-macos-arm64.zip",
+    "last_compatible_artifact_sha256": "79fedc6b9037ebbd3e302f0c1f5e3faae7ad6463c6fd316c05ccfd81e732103f",
+    "last_compatible_appcast_url": "https://github.com/sozercan/vekil/releases/download/v0.14.1/appcast.xml"
   }
 }

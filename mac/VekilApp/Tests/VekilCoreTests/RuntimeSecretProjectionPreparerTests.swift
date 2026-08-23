@@ -77,6 +77,34 @@ final class RuntimeSecretProjectionPreparerTests: XCTestCase {
     let requests = try await preparer.requests(for: [])
     XCTAssertEqual(requests, [])
   }
+
+  func testRejectsGenerationReusedAcrossRevisions() async throws {
+    let preparer = RuntimeSecretProjectionPreparer(
+      manager: KeychainSecretGenerationManager(store: InMemoryKeychainSecretStore())
+    )
+    let requirements = [
+      RuntimeSecretProjectionRequirement(
+        configRevision: "cfg_current",
+        secretGeneration: 7,
+        secrets: []
+      ),
+      RuntimeSecretProjectionRequirement(
+        configRevision: "cfg_rollback",
+        secretGeneration: 7,
+        secrets: []
+      ),
+    ]
+
+    do {
+      _ = try await preparer.requests(for: requirements)
+      XCTFail("Expected duplicate generation rejection")
+    } catch {
+      XCTAssertEqual(
+        error as? RuntimeSecretProjectionPreparationError,
+        .duplicateRequirement
+      )
+    }
+  }
 }
 
 private actor FailingProjectionManager: SecretGenerationManaging {

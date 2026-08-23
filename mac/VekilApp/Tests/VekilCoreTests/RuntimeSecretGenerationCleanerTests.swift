@@ -54,6 +54,21 @@ final class RuntimeSecretGenerationCleanerTests: XCTestCase {
     let cleanupCalls = await manager.cleanupCalls()
     XCTAssertEqual(cleanupCalls, [])
   }
+
+  func testMissingConfigurationDefersCleanup() async throws {
+    let manager = CleanupRecordingSecretManager()
+    let cleaner = RuntimeSecretGenerationCleaner(manager: manager)
+    let partial = RuntimeStatePayload(
+      service: .stopped,
+      readiness: .unknown,
+      auth: .notRequired
+    )
+
+    try await cleaner.reconcile(partial)
+
+    let cleanupCalls = await manager.cleanupCalls()
+    XCTAssertEqual(cleanupCalls, [])
+  }
 }
 
 private actor CleanupRecordingSecretManager: SecretGenerationManaging {
