@@ -1633,7 +1633,7 @@ func inspectOpenAIChatRequestFastWithScanner(body []byte, object *rawJSONObjectS
 	}, true
 }
 
-func decodeOpenAIChatRequestModelRaw(raw []byte) string {
+func decodeRequestModelRaw(raw []byte) string {
 	raw = bytes.TrimSpace(raw)
 	contentStart, contentEnd, end, escaped, ok := scanRawJSONString(raw, 0)
 	if !ok || end != len(raw) {
@@ -1649,14 +1649,14 @@ func decodeOpenAIChatRequestModelRaw(raw []byte) string {
 	return strings.TrimSpace(model)
 }
 
-func (h *ProxyHandler) decodeInternedOpenAIChatRequestModelRaw(raw []byte) string {
+func (h *ProxyHandler) decodeInternedRequestModelRaw(raw []byte) string {
 	raw = bytes.TrimSpace(raw)
 	contentStart, contentEnd, end, escaped, ok := scanRawJSONString(raw, 0)
 	if !ok || end != len(raw) {
 		return ""
 	}
 	if escaped {
-		return decodeOpenAIChatRequestModelRaw(raw)
+		return decodeRequestModelRaw(raw)
 	}
 	content := bytes.TrimSpace(raw[contentStart:contentEnd])
 	if len(content) == 0 {
@@ -3174,7 +3174,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		}
 	}
 	if requestInspectionOK {
-		requestedModel = h.decodeInternedOpenAIChatRequestModelRaw(requestInspection.modelRaw)
+		requestedModel = h.decodeInternedRequestModelRaw(requestInspection.modelRaw)
 	} else if requestJSONValid {
 		requestedModel = extractOpenAIChatCompletionsRequestModelValidated(bodyBytes)
 	} else {

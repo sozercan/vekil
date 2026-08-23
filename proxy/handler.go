@@ -2250,10 +2250,17 @@ var smallRequestBodyBufferPool = sync.Pool{New: func() any {
 // body. Unknown-length, compressed, and larger requests retain the general
 // bounded reader below.
 func readBodyBorrowed(r *http.Request) ([]byte, *[]byte, error) {
+	return readBodyBorrowedWithLimit(r, maxRequestBodySize)
+}
+
+// readBodyBorrowedWithLimit applies the small known-length fast path while
+// preserving the caller's endpoint-specific body limit for every fallback and
+// mismatched Content-Length case.
+func readBodyBorrowedWithLimit(r *http.Request, limit int64) ([]byte, *[]byte, error) {
 	if r == nil || r.Body == nil || r.Header.Get("Content-Encoding") != "" ||
 		r.ContentLength < 0 || r.ContentLength >= smallRequestBodyBufferSize ||
-		r.ContentLength > maxRequestBodySize {
-		body, err := readBody(r)
+		r.ContentLength > limit {
+		body, err := readBodyWithLimit(r, limit)
 		return body, nil, err
 	}
 
@@ -2269,16 +2276,16 @@ func readBodyBorrowed(r *http.Request) ([]byte, *[]byte, error) {
 	case nil:
 		// The body exceeded its advertised length. Continue through the normal
 		// request cap so a mismatched Content-Length cannot truncate it.
-		remaining := maxRequestBodySize + 1 - int64(len(buffer))
+		remaining := limit + 1 - int64(len(buffer))
 		rest, readErr := io.ReadAll(io.LimitReader(r.Body, remaining))
 		body := append(buffer, rest...)
 		if readErr != nil {
 			return nil, pooled, &requestBodyError{statusCode: http.StatusBadRequest, err: readErr}
 		}
-		if int64(len(body)) > maxRequestBodySize {
+		if int64(len(body)) > limit {
 			return nil, pooled, &requestBodyError{
 				statusCode: http.StatusRequestEntityTooLarge,
-				err:        fmt.Errorf("request body too large (max %d bytes)", maxRequestBodySize),
+				err:        fmt.Errorf("request body too large (max %d bytes)", limit),
 			}
 		}
 		return body, pooled, nil

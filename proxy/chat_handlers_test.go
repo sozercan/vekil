@@ -48,7 +48,7 @@ func TestDecodeInternedOpenAIChatRequestModelRawReturnsStableStrings(t *testing.
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			raw := []byte(tt.raw)
-			got := handler.decodeInternedOpenAIChatRequestModelRaw(raw)
+			got := handler.decodeInternedRequestModelRaw(raw)
 			for i := range raw {
 				raw[i] = 'x'
 			}

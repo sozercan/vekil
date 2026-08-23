@@ -543,7 +543,11 @@ func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte
 }
 
 func (h *ProxyHandler) postResponsesWithHeadersForModel(ctx context.Context, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
-	resp, err := h.postJSONEndpointWithHeadersForModel(ctx, providerEndpointResponses, body, extraHeaders, model)
+	return h.postResponsesWithHeadersForModelValidation(ctx, body, extraHeaders, model, false)
+}
+
+func (h *ProxyHandler) postResponsesWithHeadersForModelValidation(ctx context.Context, body []byte, extraHeaders http.Header, model string, bodyValidated bool) (*http.Response, error) {
+	resp, err := h.postJSONEndpointWithHeadersForModelValidation(ctx, providerEndpointResponses, body, extraHeaders, model, bodyValidated)
 	if err != nil {
 		return nil, err
 	}

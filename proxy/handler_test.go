@@ -1533,6 +1533,39 @@ func TestHandleResponses(t *testing.T) {
 	}
 }
 
+func TestHandleResponsesDetachesBorrowedBodyBeforeUpstream(t *testing.T) {
+	const responseBody = `{"id":"resp-native","object":"response","status":"completed","model":"gpt-4","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
+	capturedBody := make(chan io.ReadCloser, 1)
+	h := newRoundTripTestProxyHandler(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		capturedBody <- req.Body
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			Body:          io.NopCloser(strings.NewReader(responseBody)),
+			ContentLength: int64(len(responseBody)),
+			Request:       req,
+		}, nil
+	}))
+
+	reqBody := `{"model":"gpt-4","input":"` + strings.Repeat("x", 1024) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+	h.HandleResponses(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	upstreamBody := <-capturedBody
+	defer func() { _ = upstreamBody.Close() }()
+	gotBody, err := io.ReadAll(upstreamBody)
+	if err != nil {
+		t.Fatalf("read asynchronously retained upstream body: %v", err)
+	}
+	if string(gotBody) != reqBody {
+		t.Fatalf("upstream body was recycled before asynchronous close: got %q, want %q", gotBody, reqBody)
+	}
+}
+
 // TestHandleResponsesRecordsUsage verifies the non-streaming POST /v1/responses
 // path observes token usage into the per-request RequestSummary (so the traffic
 // dashboard records Codex /responses traffic instead of zeros).

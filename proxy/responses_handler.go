@@ -22,10 +22,8 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
-	var headers http.Header
-
-	for _, name := range []string{
+var responsesExtraHeaderNames = func() map[string]struct{} {
+	names := []string{
 		"X-OpenAI-Subagent",
 		"X-OpenAI-Memgen-Request",
 		"OpenAI-Beta",
@@ -44,13 +42,29 @@ func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
 		"X-ResponsesAPI-Include-Timing-Metrics",
 		"Traceparent",
 		"Tracestate",
-	} {
-		for _, value := range r.Header.Values(name) {
+	}
+	allowed := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		allowed[http.CanonicalHeaderKey(name)] = struct{}{}
+	}
+	return allowed
+}()
+
+func responsesExtraHeadersFromRequest(r *http.Request) http.Header {
+	if r == nil || len(r.Header) == 0 {
+		return nil
+	}
+	var headers http.Header
+	for name, values := range r.Header {
+		if _, ok := responsesExtraHeaderNames[name]; !ok {
+			continue
+		}
+		for _, value := range values {
 			if trimmed := strings.TrimSpace(value); trimmed != "" {
 				if headers == nil {
 					headers = make(http.Header, 2)
 				}
-				headers.Add(name, trimmed)
+				headers[name] = append(headers[name], trimmed)
 			}
 		}
 	}
@@ -86,10 +100,87 @@ type responsesRequestMetadata struct {
 	Stream             bool
 }
 
+type responsesRequestInspection struct {
+	modelRaw              []byte
+	previousResponseIDRaw []byte
+	stream                bool
+}
+
+// inspectResponsesRequestFast validates an ordinary Responses request while
+// collecting the few fields needed before dispatch. Escaped or case-folded
+// field names fall back to encoding/json so its matching semantics stay intact.
+func inspectResponsesRequestFast(body []byte) (responsesRequestInspection, bool) {
+	object, ok := newStrictRawJSONObjectScanner(body)
+	if !ok {
+		return responsesRequestInspection{}, false
+	}
+	var inspection responsesRequestInspection
+	var streamRaw []byte
+	for {
+		key, start, end, done, scanOK := object.next()
+		if !scanOK {
+			return responsesRequestInspection{}, false
+		}
+		if done {
+			break
+		}
+		value := body[start:end]
+		switch {
+		case rawJSONKeyEqual(key, "model"):
+			inspection.modelRaw = value
+		case rawJSONKeyEqual(key, "previous_response_id"):
+			inspection.previousResponseIDRaw = value
+		case rawJSONKeyEqual(key, "stream"):
+			streamRaw = value
+		default:
+			if rawJSONKeyEqualFold(key, "model") || rawJSONKeyEqualFold(key, "previous_response_id") || rawJSONKeyEqualFold(key, "stream") {
+				return responsesRequestInspection{}, false
+			}
+		}
+	}
+	inspection.stream = bytes.Equal(bytes.TrimSpace(streamRaw), []byte("true"))
+	return inspection, true
+}
+
+func decodeResponsesRequestMetadataString(raw []byte) string {
+	raw = bytes.TrimSpace(raw)
+	contentStart, contentEnd, end, escaped, ok := scanRawJSONString(raw, 0)
+	if !ok || end != len(raw) {
+		return ""
+	}
+	if !escaped {
+		return strings.TrimSpace(string(raw[contentStart:contentEnd]))
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func responsesRequestMetadataFromInspection(inspection responsesRequestInspection) responsesRequestMetadata {
+	return responsesRequestMetadata{
+		Model:              decodeResponsesRequestMetadataString(inspection.modelRaw),
+		PreviousResponseID: decodeResponsesRequestMetadataString(inspection.previousResponseIDRaw),
+		Stream:             inspection.stream,
+	}
+}
+
+func (h *ProxyHandler) internedResponsesRequestMetadataFromInspection(inspection responsesRequestInspection) responsesRequestMetadata {
+	return responsesRequestMetadata{
+		Model:              h.decodeInternedRequestModelRaw(inspection.modelRaw),
+		PreviousResponseID: decodeResponsesRequestMetadataString(inspection.previousResponseIDRaw),
+		Stream:             inspection.stream,
+	}
+}
+
 // parseResponsesRequestMetadata extracts the fields needed by routing, streaming,
 // and tool scoping in one decode so long replay bodies are not rescanned for each
 // field independently.
 func parseResponsesRequestMetadata(bodyBytes []byte) responsesRequestMetadata {
+	if inspection, ok := inspectResponsesRequestFast(bodyBytes); ok {
+		return responsesRequestMetadataFromInspection(inspection)
+	}
 	var raw struct {
 		Model              json.RawMessage `json:"model"`
 		PreviousResponseID json.RawMessage `json:"previous_response_id,omitempty"`
@@ -111,7 +202,10 @@ func parseResponsesRequestMetadata(bodyBytes []byte) responsesRequestMetadata {
 }
 
 func (h *ProxyHandler) prepareResponsesRequest(ctx context.Context, r *http.Request, bodyBytes []byte) preparedResponsesRequest {
-	metadata := parseResponsesRequestMetadata(bodyBytes)
+	return h.prepareResponsesRequestWithMetadata(ctx, r, bodyBytes, parseResponsesRequestMetadata(bodyBytes))
+}
+
+func (h *ProxyHandler) prepareResponsesRequestWithMetadata(ctx context.Context, r *http.Request, bodyBytes []byte, metadata responsesRequestMetadata) preparedResponsesRequest {
 	extraHeaders := responsesExtraHeadersFromRequest(r)
 	if rewrittenBody, resetLineage := resetSyntheticCompactionResponseLineage(bodyBytes); resetLineage {
 		bodyBytes = rewrittenBody
@@ -141,7 +235,11 @@ func (h *ProxyHandler) prepareResponsesRequest(ctx context.Context, r *http.Requ
 }
 
 func (h *ProxyHandler) postPreparedResponsesRequest(ctx context.Context, observeCtx context.Context, req preparedResponsesRequest) (*http.Response, error) {
-	resp, err := h.postResponsesWithHeadersForModel(ctx, req.body, req.upstreamHeaders, req.model)
+	return h.postPreparedResponsesRequestWithValidation(ctx, observeCtx, req, false)
+}
+
+func (h *ProxyHandler) postPreparedResponsesRequestWithValidation(ctx context.Context, observeCtx context.Context, req preparedResponsesRequest, bodyValidated bool) (*http.Response, error) {
+	resp, err := h.postResponsesWithHeadersForModelValidation(ctx, req.body, req.upstreamHeaders, req.model, bodyValidated)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +262,10 @@ func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWrite
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, err := readBodyWithLimit(r, maxLargeRequestBodySize)
+	bodyBytes, pooledBody, err := readBodyBorrowedWithLimit(r, maxLargeRequestBodySize)
+	if pooledBody != nil {
+		defer releaseSmallRequestBodyBuffer(pooledBody)
+	}
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
 			return
@@ -174,8 +275,17 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	requestedModel := extractResponsesRequestModel(bodyBytes)
-	h.observePolicyRequestSummary(r.Context(), "responses", requestedModel, parseResponsesRequestMetadata(bodyBytes).Stream)
+	requestInspection, requestInspectionOK := inspectResponsesRequestFast(bodyBytes)
+	requestJSONValid := requestInspectionOK
+	var metadata responsesRequestMetadata
+	if requestInspectionOK {
+		metadata = h.internedResponsesRequestMetadataFromInspection(requestInspection)
+	} else {
+		requestJSONValid = json.Valid(bodyBytes)
+		metadata = parseResponsesRequestMetadata(bodyBytes)
+	}
+	requestedModel := metadata.Model
+	h.observePolicyRequestSummary(r.Context(), "responses", requestedModel, metadata.Stream)
 	if publicID, ok := h.policyPublicModelID(requestedModel); ok {
 		h.handlePolicyResponses(w, r, bodyBytes, publicID)
 		return
@@ -194,7 +304,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prepared := h.prepareResponsesRequest(r.Context(), r, bodyBytes)
+	prepared := h.prepareResponsesRequestWithMetadata(r.Context(), r, bodyBytes, metadata)
 	h.observeRequestSummary(r.Context(), "responses", prepared.model, prepared.streaming, providerEndpointResponses)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), prepared.streaming)
@@ -238,7 +348,11 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.postPreparedResponsesRequest(upstreamCtx, r.Context(), prepared)
+	// RoundTripper may finish reading or closing a request body asynchronously
+	// after RoundTrip returns. Detach a borrowed inbound buffer before upstream
+	// code can retain it past this handler's pool release.
+	prepared.body = detachBorrowedRequestBody(prepared.body, pooledBody)
+	resp, err := h.postPreparedResponsesRequestWithValidation(upstreamCtx, r.Context(), prepared, requestJSONValid)
 	if err != nil {
 		h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses", err)
 		return
