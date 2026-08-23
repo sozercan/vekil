@@ -3,9 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/sozercan/vekil/internal/macosruntime"
 )
 
 func TestParseOptionsSupportsInjectedHostAndPortZero(t *testing.T) {
@@ -60,5 +64,44 @@ func TestRunEmitsLdflagsHelloFirstAndKeepsStdoutProtocolOnly(t *testing.T) {
 	}
 	if err := scanner.Err(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRunWaitsForPreviousHelperStateOwner(t *testing.T) {
+	stateDir := t.TempDir()
+	lock, err := macosruntime.AcquireHelperStateLock(
+		context.Background(),
+		macosruntime.PathsInDirectory(stateDir),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lock.Close() })
+
+	done := make(chan int, 1)
+	go func() {
+		done <- run(
+			[]string{"--host", "127.0.0.1", "--port", "0", "--state-dir", stateDir, "--log-level", "error"},
+			strings.NewReader("{\"v\":1,\"id\":\"req_shutdown\",\"command\":\"shutdown\",\"payload\":{}}\n"),
+			&bytes.Buffer{},
+			&bytes.Buffer{},
+		)
+	}()
+
+	select {
+	case code := <-done:
+		t.Fatalf("replacement helper returned before state ownership was released: %d", code)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("replacement helper exit code = %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement helper did not start after state ownership was released")
 	}
 }

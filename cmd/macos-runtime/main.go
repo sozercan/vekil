@@ -50,6 +50,23 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	log := logger.NewWithWriter(logger.ParseLevel(opts.logLevel), stderr)
+	paths := macosruntime.Paths{}
+	if opts.stateDir != "" {
+		paths = macosruntime.PathsInDirectory(opts.stateDir)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	stateLock, err := macosruntime.AcquireHelperStateLock(ctx, paths)
+	if err != nil {
+		log.Error("helper initialization failed", logger.F("code", "state_lock_failed"))
+		return 1
+	}
+	defer func() {
+		if err := stateLock.Close(); err != nil {
+			log.Error("helper state lock release failed", logger.F("code", "state_lock_release_failed"))
+		}
+	}()
+
 	authenticator, err := auth.NewAuthenticator(opts.tokenDir)
 	if err != nil {
 		log.Error("helper initialization failed", logger.F("code", "auth_init_failed"))
@@ -57,10 +74,6 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	authenticator.DisableAutoDeviceFlow = true
 
-	paths := macosruntime.Paths{}
-	if opts.stateDir != "" {
-		paths = macosruntime.PathsInDirectory(opts.stateDir)
-	}
 	configuration, err := macosruntime.NewConfigManager(macosruntime.ConfigManagerOptions{Paths: paths})
 	if err != nil {
 		log.Error("helper initialization failed", logger.F("code", "config_state_failed"))
@@ -90,8 +103,6 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	if err := macosruntime.RunHelper(ctx, macosruntime.HelperOptions{
 		Stdin:              stdin,
 		Stdout:             stdout,

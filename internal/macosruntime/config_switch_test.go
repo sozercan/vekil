@@ -320,6 +320,7 @@ func (r *copilotSwitchRuntime) UsesCopilot() bool { return r.usesCopilot }
 type signOutAuthenticator struct {
 	status       auth.AuthStatus
 	tokenErr     error
+	signOutErr   error
 	signOutCalls int
 }
 
@@ -339,7 +340,7 @@ func (a *signOutAuthenticator) SignInWithGitHubCLI(context.Context) error {
 func (a *signOutAuthenticator) SignOut() error {
 	a.signOutCalls++
 	a.status = auth.AuthStatus{}
-	return nil
+	return a.signOutErr
 }
 
 func TestSignOutStopsOnlyCopilotRuntime(t *testing.T) {
@@ -378,6 +379,46 @@ func TestSignOutStopsOnlyCopilotRuntime(t *testing.T) {
 				t.Fatalf("SignOut calls = %d", authenticator.signOutCalls)
 			}
 		})
+	}
+}
+
+func TestSignOutClearsCredentialsAfterTerminalStopFailure(t *testing.T) {
+	stopErr := errors.New("runtime cleanup failed")
+	signOutErr := errors.New("credential cleanup failed")
+	authenticator := &signOutAuthenticator{
+		status:     auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceVekil},
+		signOutErr: signOutErr,
+	}
+	manager := newManagerForTest(t)
+	controller, err := appcontrol.New(appcontrol.Options{
+		ConfigurationSource: manager,
+		RuntimeFactory: runtimeFactoryFunc(func(context.Context, appcontrol.Configuration) (appcontrol.Runtime, error) {
+			runtime := newApplyRuntime(nil)
+			runtime.stop = func(context.Context) error { return stopErr }
+			return &copilotSwitchRuntime{applyRuntime: runtime, usesCopilot: true}, nil
+		}),
+		Authenticator:    authenticator,
+		ReadinessChecker: appcontrol.ReadinessCheckFunc(func(context.Context, string) error { return nil }),
+		StopTimeout:      time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	h := &helper{opts: HelperOptions{
+		Controller: controller, Configuration: manager,
+		Authenticator: authenticator, ShutdownTimeout: time.Second,
+	}}
+
+	err = h.signOut(t.Context())
+	if !errors.Is(err, stopErr) || !errors.Is(err, signOutErr) {
+		t.Fatalf("signOut() error = %v, want joined stop and credential failures", err)
+	}
+	if authenticator.signOutCalls != 1 || authenticator.Status().SignedIn {
+		t.Fatalf("credentials were not cleared after terminal stop failure: %+v", authenticator)
+	}
+	if _, stopAgainErr := controller.Stop(t.Context()); !errors.Is(stopAgainErr, appcontrol.ErrNotRunning) {
+		t.Fatalf("runtime remained owned after terminal stop failure: %v", stopAgainErr)
 	}
 }
 

@@ -2,6 +2,7 @@ package macosruntime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/sozercan/vekil/internal/appcontrol"
@@ -153,6 +154,7 @@ func (h *helper) commitSelection(ctx context.Context) error {
 }
 
 func (h *helper) signOut(ctx context.Context) error {
+	var stopErr error
 	if h.opts.Controller.Snapshot().Service == appcontrol.ServiceRunning && h.opts.Controller.UsesCopilot() {
 		stop, err := h.opts.Controller.Stop(ctx)
 		if err != nil {
@@ -163,8 +165,11 @@ func (h *helper) signOut(ctx context.Context) error {
 			return err
 		}
 		if result.Status != appcontrol.OperationSucceeded {
-			return result.Err
+			stopErr = result.Err
+			if stopErr == nil {
+				stopErr = fmt.Errorf("stop operation ended with status %s", result.Status)
+			}
 		}
 	}
-	return h.opts.Authenticator.SignOut()
+	return errors.Join(stopErr, h.opts.Authenticator.SignOut())
 }

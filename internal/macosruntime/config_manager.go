@@ -37,6 +37,7 @@ type Paths struct {
 	Journal   string
 	Staged    string
 	Backup    string
+	Lock      string
 }
 
 // PathsInDirectory returns the canonical filenames under directory.
@@ -48,6 +49,7 @@ func PathsInDirectory(directory string) Paths {
 		Journal:   filepath.Join(directory, "managed-apply.json"),
 		Staged:    filepath.Join(directory, ".providers.yaml.staged"),
 		Backup:    filepath.Join(directory, ".providers.yaml.previous"),
+		Lock:      filepath.Join(directory, ".runtime.lock"),
 	}
 }
 
@@ -81,30 +83,9 @@ type ConfigManager struct {
 // NewConfigManager loads state and resolves any incomplete apply journal before
 // accepting commands.
 func NewConfigManager(opts ConfigManagerOptions) (*ConfigManager, error) {
-	paths := opts.Paths
-	if strings.TrimSpace(paths.Directory) == "" {
-		var err error
-		paths, err = DefaultPaths()
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		defaults := PathsInDirectory(paths.Directory)
-		if paths.Managed == "" {
-			paths.Managed = defaults.Managed
-		}
-		if paths.State == "" {
-			paths.State = defaults.State
-		}
-		if paths.Journal == "" {
-			paths.Journal = defaults.Journal
-		}
-		if paths.Staged == "" {
-			paths.Staged = defaults.Staged
-		}
-		if paths.Backup == "" {
-			paths.Backup = defaults.Backup
-		}
+	paths, err := resolvePaths(opts.Paths)
+	if err != nil {
+		return nil, err
 	}
 	if opts.UUID == nil {
 		opts.UUID = uuid.NewString
@@ -130,6 +111,32 @@ func NewConfigManager(opts ConfigManagerOptions) (*ConfigManager, error) {
 		}
 	}
 	return manager, nil
+}
+
+func resolvePaths(paths Paths) (Paths, error) {
+	if strings.TrimSpace(paths.Directory) == "" {
+		return DefaultPaths()
+	}
+	defaults := PathsInDirectory(paths.Directory)
+	if paths.Managed == "" {
+		paths.Managed = defaults.Managed
+	}
+	if paths.State == "" {
+		paths.State = defaults.State
+	}
+	if paths.Journal == "" {
+		paths.Journal = defaults.Journal
+	}
+	if paths.Staged == "" {
+		paths.Staged = defaults.Staged
+	}
+	if paths.Backup == "" {
+		paths.Backup = defaults.Backup
+	}
+	if paths.Lock == "" {
+		paths.Lock = defaults.Lock
+	}
+	return paths, nil
 }
 
 // Paths returns the configured persistence paths.
@@ -206,6 +213,9 @@ func (m *ConfigManager) LoadConfiguration(ctx context.Context) (appcontrol.Confi
 func (m *ConfigManager) RuntimeActivated(_ context.Context, cfg appcontrol.Configuration, generation uint64, _ string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.state.ConfigMode == ConfigModeExternal {
+		m.state.SelectedConfigRevision = cfg.Revision
+	}
 	m.state.ActiveRuntimeRevision = cfg.Revision
 	m.state.ActiveRuntimeGeneration = generation
 	return m.saveStateLocked()

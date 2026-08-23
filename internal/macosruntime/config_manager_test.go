@@ -1,6 +1,7 @@
 package macosruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -125,6 +126,45 @@ func TestNewConfigManagerClearsStaleRuntimeActivation(t *testing.T) {
 	}
 	if persisted.ActiveRuntimeRevision != "" || persisted.ActiveRuntimeGeneration != 0 {
 		t.Fatalf("stale activation remained on disk: %+v", persisted)
+	}
+}
+
+func TestRuntimeActivationPersistsAcceptedExternalRevision(t *testing.T) {
+	manager := newManagerForTest(t)
+	path, originalRevision := writeExternalConfigForSwitchTest(t, "original-model")
+	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := bytes.Replace(body, []byte("original-model"), []byte("updated-model"), 1)
+	if err := os.WriteFile(path, updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	configuration, err := manager.LoadConfiguration(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.Revision == originalRevision {
+		t.Fatal("external edit did not produce a new revision")
+	}
+	if err := manager.RuntimeActivated(t.Context(), configuration, 1, "127.0.0.1:1337"); err != nil {
+		t.Fatal(err)
+	}
+
+	state := manager.State()
+	if state.SelectedConfigRevision != configuration.Revision || state.ActiveRuntimeRevision != configuration.Revision {
+		t.Fatalf("activated external revision was not persisted: %+v", state)
+	}
+	persisted, _, err := loadPersistentState(manager.paths.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.SelectedConfigRevision != configuration.Revision {
+		t.Fatalf("persisted selected revision = %q, want %q", persisted.SelectedConfigRevision, configuration.Revision)
 	}
 }
 

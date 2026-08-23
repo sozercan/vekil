@@ -317,6 +317,37 @@ final class VekilAppStateTests: XCTestCase {
     await assertTrueAsync((await runtime.recordedCalls()).contains(.restartHelper))
   }
 
+  func testHealthyReplacementClearsTransientHelperFailure() async {
+    var running = AppRuntimeStateSnapshot.connectedStopped
+    running.service = .running
+    running.readiness = .ready
+    let runtime = RuntimeClientSpy(state: running)
+    let state = makeState(runtime: runtime)
+    await assertTrueAsync(await state.initialize())
+
+    await runtime.emit(.connection(AppRuntimeConnectionEvent(
+      launchToken: running.launchToken,
+      helperEpoch: running.helperEpoch,
+      helper: .failed,
+      error: AppRuntimeStructuredError(
+        code: "helper_failed",
+        userMessage: "The runtime helper stopped.",
+        recoveryAction: "restart_helper"
+      )
+    )))
+    await assertTrueAsync(await eventually { state.lastError?.code == "helper_failed" })
+
+    var replacement = running
+    replacement.launchToken = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+    replacement.helperEpoch = "hep_replacement"
+    replacement.stateRevision = 1
+    await runtime.emit(.state(replacement))
+
+    await assertTrueAsync(await eventually {
+      state.runtimeState.launchToken == replacement.launchToken && state.lastError == nil
+    })
+  }
+
   func testConnectionEventsDoNotConsumeTheNextAuthoritativeStateRevision() async {
     let runtime = RuntimeClientSpy()
     var initial = AppRuntimeStateSnapshot.connectedStopped
