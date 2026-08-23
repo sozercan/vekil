@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInspectOpenAIChatRequestFastStrictJSON(t *testing.T) {
@@ -214,6 +215,11 @@ func TestInspectCanonicalOpenAIChatCompletionResponseFast(t *testing.T) {
 			body:           `{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{"cached_tokens":1}}}`,
 		},
 		{
+			name:           "case-folded usage details fall back",
+			requestedModel: "public-model",
+			body:           `{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"Prompt_Tokens_Details":{"cached_tokens":1},"Completion_Tokens_Details":{"reasoning_tokens":2}}}`,
+		},
+		{
 			name:           "escaped key falls back",
 			requestedModel: "public-model",
 			body:           `{"\u0069d":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
@@ -274,6 +280,25 @@ func TestInspectCanonicalOpenAIChatCompletionResponseFast(t *testing.T) {
 				t.Fatalf("usage = %+v, want prompt=%d completion=%d total=%d", usage, tt.wantPrompt, tt.wantCompletion, tt.wantTotal)
 			}
 		})
+	}
+}
+
+func TestCaseFoldedOpenAIUsageDetailsUseTypedFallback(t *testing.T) {
+	body := []byte(`{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"Prompt_Tokens_Details":{"cached_tokens":3},"Completion_Tokens_Details":{"reasoning_tokens":2}}}`)
+	if _, canonical := inspectCanonicalOpenAIChatCompletionResponse(body, "public-model"); canonical {
+		t.Fatal("case-folded usage details unexpectedly used the canonical fast path")
+	}
+
+	normalized, _, err := normalizeOpenAIChatCompletionResponse(body, "public-model", time.Unix(1, 0))
+	if err != nil {
+		t.Fatalf("normalizeOpenAIChatCompletionResponse() error = %v", err)
+	}
+	usage := sniffOpenAIUsage(normalized)
+	if usage == nil || usage.PromptTokensDetails == nil || usage.CompletionTokensDetails == nil {
+		t.Fatalf("typed usage fallback = %+v, want both detail blocks", usage)
+	}
+	if usage.PromptTokensDetails.CachedTokens != 3 || usage.CompletionTokensDetails.ReasoningTokens != 2 {
+		t.Fatalf("typed usage details = %+v/%+v, want cached=3 reasoning=2", usage.PromptTokensDetails, usage.CompletionTokensDetails)
 	}
 }
 

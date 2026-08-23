@@ -767,6 +767,63 @@ func TestBuildProvidersGenericRequestPreservesOperatorAcceptEncoding(t *testing.
 	}
 }
 
+func TestProviderMessagesTemplateKeepsConfiguredHeaderPrecedence(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:         "native",
+		Type:       "anthropic-compatible",
+		Default:    true,
+		BaseURL:    "http://localhost:1234",
+		APIKey:     "configured-credential",
+		AuthType:   "api-key-header",
+		AuthHeader: "Anthropic-Version",
+		ExtraHeaders: map[string]string{
+			"Anthropic-Beta": "configured-beta",
+		},
+		ModelDiscovery: "static",
+		Models: []ProviderModelConfig{{
+			PublicID:   "claude-public",
+			Deployment: "claude-upstream",
+			Endpoints:  []string{providerEndpointMessages},
+		}},
+	}}})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	provider := providers["native"]
+	if provider == nil {
+		t.Fatal("expected native provider")
+	}
+
+	req, err := handler.newProviderJSONInferenceRequest(
+		context.Background(),
+		provider,
+		http.MethodPost,
+		providerEndpointMessages,
+		[]byte(`{"model":"claude-upstream"}`),
+		http.Header{
+			"Anthropic-Version":                         []string{"client-version"},
+			"Anthropic-Beta":                            []string{"client-beta"},
+			"Anthropic-Dangerous-Direct-Browser-Access": []string{"true"},
+		},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("newProviderJSONInferenceRequest() error = %v", err)
+	}
+	defer func() { _ = req.Body.Close() }()
+
+	if got := req.Header.Get("Anthropic-Version"); got != "configured-credential" {
+		t.Fatalf("Anthropic-Version = %q, want configured credential", got)
+	}
+	if got := req.Header.Get("Anthropic-Beta"); got != "configured-beta" {
+		t.Fatalf("Anthropic-Beta = %q, want configured provider value", got)
+	}
+	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "true" {
+		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want forwarded value", got)
+	}
+}
+
 func TestBuildProvidersGenericAnthropicCompatibleConfig(t *testing.T) {
 	t.Parallel()
 

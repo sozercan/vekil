@@ -478,6 +478,9 @@ func inspectCanonicalOpenAIUsage(decoder *json.Decoder) (*models.OpenAIUsage, bo
 			}
 			usage.CompletionTokensDetails = details
 		default:
+			if strings.EqualFold(key, "prompt_tokens_details") || strings.EqualFold(key, "completion_tokens_details") {
+				return nil, false
+			}
 			if err := skipJSONValue(decoder); err != nil {
 				return nil, false
 			}

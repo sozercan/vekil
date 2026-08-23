@@ -354,7 +354,7 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 }
 
 func servesTrustedBrowserContent(r *http.Request) bool {
-	if r == nil || r.URL == nil || r.Method != http.MethodGet {
+	if r == nil || r.URL == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
 		return false
 	}
 	switch r.URL.Path {

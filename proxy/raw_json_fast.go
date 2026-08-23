@@ -817,7 +817,7 @@ func inspectCanonicalOpenAIUsageSingleWalk(data []byte, pos int, walk rawJSONSin
 		case rawJSONKeyEqual(key, "total_tokens"):
 			usage.TotalTokens, totalOK = rawJSONInt(data[valueStart:valueEnd])
 			valueOK = totalOK
-		case rawJSONKeyEqual(key, "prompt_tokens_details"), rawJSONKeyEqual(key, "completion_tokens_details"):
+		case rawJSONKeyEqualFold(key, "prompt_tokens_details"), rawJSONKeyEqualFold(key, "completion_tokens_details"):
 			return models.OpenAIUsage{}, 0, false
 		}
 		if !valueOK || !object.advance(valueEnd) {

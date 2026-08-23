@@ -2323,6 +2323,17 @@ func shallowCloneHeader(src http.Header) http.Header {
 	return dst
 }
 
+func mergeHeaderValuesWithoutOverride(dst, src http.Header) {
+	for key, values := range src {
+		if _, exists := dst[http.CanonicalHeaderKey(key)]; exists {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
 type providerRequestBody struct {
 	bytes.Reader
 	route              providerRouteInfo
@@ -2686,7 +2697,7 @@ func (h *ProxyHandler) newProviderJSONRequestWithTemplateHeaders(ctx context.Con
 				req := requestFromProviderTemplate(ctx, template, body, reuseSealedHeaders, route, provider.postRequestAutoGzip)
 				if len(extraHeaders) > 0 {
 					req.Header = shallowCloneHeader(template.Header)
-					mergeHeaderValues(req.Header, extraHeaders)
+					mergeHeaderValuesWithoutOverride(req.Header, extraHeaders)
 				}
 				return req, nil
 			}
@@ -2696,7 +2707,7 @@ func (h *ProxyHandler) newProviderJSONRequestWithTemplateHeaders(ctx context.Con
 				if reuseSealedHeaders {
 					req.Header = shallowCloneHeader(req.Header)
 				}
-				mergeHeaderValues(req.Header, extraHeaders)
+				mergeHeaderValuesWithoutOverride(req.Header, extraHeaders)
 			}
 			return req, nil
 		}
