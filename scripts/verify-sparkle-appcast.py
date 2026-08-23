@@ -6,13 +6,16 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import subprocess
 import sys
+import tempfile
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
 SPARKLE = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+ED25519_SUBJECT_PUBLIC_KEY_INFO_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 
 class VerificationError(ValueError):
@@ -44,15 +47,53 @@ def text(item: ET.Element, name: str) -> str:
     return (value or "").strip()
 
 
-def verify_signature_text(value: str, label: str) -> None:
+def decode_base64(value: str, label: str, expected_bytes: int) -> bytes:
     if not value:
         raise VerificationError(f"{label} is missing")
     try:
         decoded = base64.b64decode(value, validate=True)
     except ValueError as exc:
         raise VerificationError(f"{label} is not valid base64") from exc
-    if len(decoded) != 64:
-        raise VerificationError(f"{label} must decode to a 64-byte Ed25519 signature")
+    if len(decoded) != expected_bytes:
+        raise VerificationError(f"{label} must decode to {expected_bytes} bytes")
+    return decoded
+
+
+def verify_artifact_signature(artifact: Path, signature: bytes, public_key: bytes) -> None:
+    with tempfile.TemporaryDirectory(prefix="vekil-sparkle-verify-") as temporary:
+        temporary_path = Path(temporary)
+        public_key_path = temporary_path / "public-key.der"
+        signature_path = temporary_path / "signature"
+        public_key_path.write_bytes(ED25519_SUBJECT_PUBLIC_KEY_INFO_PREFIX + public_key)
+        signature_path.write_bytes(signature)
+        try:
+            result = subprocess.run(
+                [
+                    "openssl",
+                    "pkeyutl",
+                    "-verify",
+                    "-pubin",
+                    "-inkey",
+                    str(public_key_path),
+                    "-keyform",
+                    "DER",
+                    "-rawin",
+                    "-in",
+                    str(artifact),
+                    "-sigfile",
+                    str(signature_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError as exc:
+            raise VerificationError(f"cannot run OpenSSL signature verification: {exc}") from exc
+    if result.returncode != 0:
+        raise VerificationError(
+            "candidate enclosure Ed25519 signature does not verify against "
+            "manifest sparkle.public_ed_key"
+        )
 
 
 def main() -> int:
@@ -68,8 +109,9 @@ def main() -> int:
     manifest = load_json(Path(args.manifest))
     application = manifest.get("application") or {}
     legacy = manifest.get("legacy_shell") or {}
-    if not isinstance(application, dict) or not isinstance(legacy, dict):
-        raise VerificationError("manifest application and legacy_shell must be objects")
+    sparkle = manifest.get("sparkle") or {}
+    if not isinstance(application, dict) or not isinstance(legacy, dict) or not isinstance(sparkle, dict):
+        raise VerificationError("manifest application, legacy_shell, and sparkle must be objects")
 
     bundle_version = str(manifest.get("bundle_version") or "")
     marketing_version = str(manifest.get("marketing_version") or "")
@@ -92,7 +134,7 @@ def main() -> int:
         if line.strip().startswith("edSignature:"):
             appcast_signature = line.split(":", 1)[1].strip()
             break
-    verify_signature_text(appcast_signature, "appcast Ed25519 signature")
+    decode_base64(appcast_signature, "appcast Ed25519 signature", 64)
 
     items = root.findall("./channel/item")
     candidates = [item for item in items if text(item, "version") == bundle_version]
@@ -125,9 +167,10 @@ def main() -> int:
         raise VerificationError(f"candidate enclosure URL does not name {artifact_name}")
     if args.expected_url_prefix and not url.startswith(args.expected_url_prefix.rstrip("/") + "/"):
         raise VerificationError("candidate enclosure URL does not use the expected release prefix")
-    verify_signature_text(
+    candidate_signature = decode_base64(
         (enclosure.get(f"{{{SPARKLE}}}edSignature") or "").strip(),
         "candidate enclosure Ed25519 signature",
+        64,
     )
 
     if args.artifact:
@@ -143,6 +186,12 @@ def main() -> int:
             raise VerificationError(
                 f"candidate enclosure length {expected_length} does not match artifact {actual_length}"
             )
+        public_key = decode_base64(
+            str(sparkle.get("public_ed_key") or ""),
+            "manifest sparkle.public_ed_key",
+            32,
+        )
+        verify_artifact_signature(artifact, candidate_signature, public_key)
 
     fixture_expectations = {
         "10.13": False,

@@ -15,6 +15,10 @@ fail() {
   exit 1
 }
 
+for command in base64 openssl tail; do
+  command -v "${command}" >/dev/null 2>&1 || fail "missing required command: ${command}"
+done
+
 expect_failure() {
   if "$@" >"${TMP_ROOT}/unexpected.stdout" 2>"${TMP_ROOT}/unexpected.stderr"; then
     cat "${TMP_ROOT}/unexpected.stdout" "${TMP_ROOT}/unexpected.stderr" >&2 || true
@@ -63,6 +67,21 @@ manifest="${TMP_ROOT}/vekil-macos-release.json"
 [[ "$("${MANIFEST_TOOL}" compare-bundle-versions 15001 14000)" == 1 ]] || fail "bundle version comparison failed"
 [[ "$("${MANIFEST_TOOL}" compare-system-versions 13.0 13.0.0)" == 0 ]] || fail "system version comparison failed"
 
+openssl genpkey -algorithm Ed25519 -out "${TMP_ROOT}/test-key.pem" >/dev/null 2>&1
+openssl pkey -in "${TMP_ROOT}/test-key.pem" -pubout -outform DER -out "${TMP_ROOT}/test-public.der"
+public_key="$(tail -c 32 "${TMP_ROOT}/test-public.der" | base64 | tr -d '\r\n')"
+python3 - "${manifest}" "${public_key}" <<'PY_SPARKLE_KEY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+value = json.loads(path.read_text())
+value["sparkle"]["public_ed_key"] = sys.argv[2]
+path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+PY_SPARKLE_KEY
+"${MANIFEST_TOOL}" validate --manifest "${manifest}"
+
 native_plist="${TMP_ROOT}/Info.plist"
 legacy_plist="${TMP_ROOT}/Legacy-Info.plist"
 "${MANIFEST_TOOL}" plist --manifest "${manifest}" --output "${native_plist}"
@@ -93,11 +112,12 @@ PY
 artifact="${TMP_ROOT}/vekil-macos-universal.zip"
 printf 'zip-fixture' >"${artifact}"
 artifact_size="$(wc -c <"${artifact}" | tr -d ' ')"
-signature="$(python3 - <<'PY'
-import base64
-print(base64.b64encode(bytes(range(64))).decode())
-PY
-)"
+openssl pkeyutl -sign \
+  -inkey "${TMP_ROOT}/test-key.pem" \
+  -rawin \
+  -in "${artifact}" \
+  -out "${TMP_ROOT}/artifact-signature"
+signature="$(base64 <"${TMP_ROOT}/artifact-signature" | tr -d '\r\n')"
 appcast="${TMP_ROOT}/appcast.xml"
 cat >"${appcast}" <<EOF_APPCAST
 <?xml version="1.0"?>
@@ -130,6 +150,26 @@ EOF_APPCAST
   --artifact "${artifact}" \
   --expected-url-prefix https://example.invalid/releases/v0.15.0 \
   --require-legacy-compatible-entry >/dev/null
+
+wrong_manifest="${TMP_ROOT}/wrong-key-manifest.json"
+cp "${manifest}" "${wrong_manifest}"
+openssl genpkey -algorithm Ed25519 -out "${TMP_ROOT}/wrong-key.pem" >/dev/null 2>&1
+openssl pkey -in "${TMP_ROOT}/wrong-key.pem" -pubout -outform DER -out "${TMP_ROOT}/wrong-public.der"
+wrong_public_key="$(tail -c 32 "${TMP_ROOT}/wrong-public.der" | base64 | tr -d '\r\n')"
+python3 - "${wrong_manifest}" "${wrong_public_key}" <<'PY_WRONG_SPARKLE_KEY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+value = json.loads(path.read_text())
+value["sparkle"]["public_ed_key"] = sys.argv[2]
+path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+PY_WRONG_SPARKLE_KEY
+expect_failure "${APPCAST_TOOL}" \
+  --appcast "${appcast}" \
+  --manifest "${wrong_manifest}" \
+  --artifact "${artifact}"
 
 bad_appcast="${TMP_ROOT}/bad-appcast.xml"
 python3 - "${appcast}" "${bad_appcast}" <<'PY_BAD_APPCAST'

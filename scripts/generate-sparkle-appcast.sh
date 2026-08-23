@@ -16,7 +16,7 @@ CONFIG="${MACOS_APP_CONFIG:-${REPO_ROOT}/build-support/macos/app-config.json}"
 MANIFEST_TOOL="${SCRIPT_DIR}/macos-release-manifest.py"
 
 [[ "$(uname -s)" == Darwin ]] || die "Sparkle appcast generation requires Darwin"
-for command in curl ditto shasum python3; do require_cmd "${command}"; done
+for command in curl ditto openssl shasum python3; do require_cmd "${command}"; done
 [[ -f "${ZIP_PATH}" ]] || die "release ZIP not found: ${ZIP_PATH}"
 [[ -f "${RESOLVED_MANIFEST}" ]] || die "release manifest not found: ${RESOLVED_MANIFEST}"
 [[ -n "${SPARKLE_PRIVATE_ED_KEY:-}" ]] || die "SPARKLE_PRIVATE_ED_KEY is required to sign the appcast"
