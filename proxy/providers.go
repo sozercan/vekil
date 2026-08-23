@@ -2668,7 +2668,8 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 // newProviderJSONInferenceRequest may reuse the immutable header map sealed on
 // a configured generic provider's request template. RoundTripper implementations
 // must not mutate requests, and inference retries call the factory again, so the
-// common path does not need a per-attempt header-map clone.
+// common path does not need a per-attempt header-map clone. Client.Do adds jar
+// cookies to the request header, so clients with a cookie jar retain isolation.
 func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
 	req, err := h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
 	if err == nil && req != nil {
@@ -2676,6 +2677,13 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 		// transparent transport replay that NewRequest enables for byte readers,
 		// including fallback paths that cannot use a sealed request template.
 		req.GetBody = nil
+		client := h.client
+		if client == nil {
+			client = http.DefaultClient
+		}
+		if client != nil && client.Jar != nil {
+			req.Header = shallowCloneHeader(req.Header)
+		}
 	}
 	return req, err
 }

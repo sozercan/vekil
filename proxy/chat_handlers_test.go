@@ -426,6 +426,26 @@ func TestParseOpenAIChatCompletionsModePreservesCaseInsensitiveJSONFields(t *tes
 	}
 }
 
+func TestParseOpenAIChatCompletionsModePreservesUnicodeCaseFoldedJSONFields(t *testing.T) {
+	input := []byte(`{"ſtream":true,"ſtream_options":{"include_uſage":true},"toolſ":[{"type":"function"}]}`)
+	if _, ok := parseOpenAIChatCompletionsModeFast(input); ok {
+		t.Fatal("fast parser accepted Unicode case-folded fields")
+	}
+	mode := parseOpenAIChatCompletionsMode(input)
+	if !mode.clientRequestedStream {
+		t.Fatal("clientRequestedStream = false, want true")
+	}
+	if !mode.clientRequestedStreamUsage {
+		t.Fatal("clientRequestedStreamUsage = false, want true")
+	}
+	if !mode.requestHasTools {
+		t.Fatal("requestHasTools = false, want true")
+	}
+	if mode.forceUpstreamStream {
+		t.Fatal("forceUpstreamStream = true, want false for client streaming")
+	}
+}
+
 func TestParseOpenAIChatCompletionsModePreservesDuplicateTypeErrorSemantics(t *testing.T) {
 	tests := []string{
 		`{"stream":1,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,

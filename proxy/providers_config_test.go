@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -723,6 +724,85 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	}
 	if got := provider.postRequestTemplates[providerEndpointChatCompletions].Header.Get("Accept-Encoding"); got != "gzip" {
 		t.Fatalf("bodyless request mutated sealed template Accept-Encoding to %q", got)
+	}
+}
+
+func TestProviderInferenceRequestsIsolateSealedHeadersFromCookieJars(t *testing.T) {
+	tests := []struct {
+		name string
+		send func(*ProxyHandler, *http.Request) (*http.Response, error)
+	}{
+		{
+			name: "retry send",
+			send: func(handler *ProxyHandler, req *http.Request) (*http.Response, error) {
+				return handler.sendRetryRequest(req, true)
+			},
+		},
+		{
+			name: "single send",
+			send: func(handler *ProxyHandler, req *http.Request) (*http.Response, error) {
+				return handler.singleInferenceSend(req, nil)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer server.Close()
+
+			jar, err := cookiejar.New(nil)
+			if err != nil {
+				t.Fatalf("cookiejar.New() error = %v", err)
+			}
+			client := server.Client()
+			client.Jar = jar
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com", client: client}
+			providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+				ID:             "local",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        server.URL,
+				AuthType:       "none",
+				ModelDiscovery: "static",
+				Models:         []ProviderModelConfig{{PublicID: "local-chat"}},
+			}}})
+			if err != nil {
+				t.Fatalf("buildProviders() error = %v", err)
+			}
+			provider := providers["local"]
+			body := []byte(`{"model":"local-chat","messages":[]}`)
+			first, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+			if err != nil {
+				t.Fatalf("newProviderJSONInferenceRequest() error = %v", err)
+			}
+			jar.SetCookies(first.URL, []*http.Cookie{{Name: "session", Value: "one"}})
+
+			resp, err := tt.send(handler, first)
+			if err != nil {
+				t.Fatalf("send() error = %v", err)
+			}
+			_ = resp.Body.Close()
+			if got := first.Header.Get("Cookie"); got != "session=one" {
+				t.Fatalf("first request Cookie = %q, want session=one", got)
+			}
+
+			jar.SetCookies(first.URL, []*http.Cookie{{Name: "session", MaxAge: -1}})
+			second, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+			if err != nil {
+				t.Fatalf("second newProviderJSONInferenceRequest() error = %v", err)
+			}
+			defer func() { _ = second.Body.Close() }()
+			if got := second.Header.Get("Cookie"); got != "" {
+				t.Fatalf("second request inherited Cookie %q from sealed headers", got)
+			}
+			if got := provider.postRequestTemplates[providerEndpointChatCompletions].Header.Get("Cookie"); got != "" {
+				t.Fatalf("sealed template retained Cookie %q", got)
+			}
+		})
 	}
 }
 

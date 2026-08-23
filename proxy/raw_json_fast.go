@@ -577,23 +577,30 @@ func rawJSONKeyEqual(key []byte, want string) bool {
 }
 
 func rawJSONKeyEqualFold(key []byte, want string) bool {
-	if len(key) != len(want) {
-		return false
+	if len(key) == len(want) {
+		ascii := true
+		for i := range key {
+			left := key[i]
+			right := want[i]
+			if left >= 0x80 || right >= 0x80 {
+				ascii = false
+				break
+			}
+			if left >= 'A' && left <= 'Z' {
+				left += 'a' - 'A'
+			}
+			if right >= 'A' && right <= 'Z' {
+				right += 'a' - 'A'
+			}
+			if left != right {
+				return false
+			}
+		}
+		if ascii {
+			return true
+		}
 	}
-	for i := range key {
-		left := key[i]
-		right := want[i]
-		if left >= 'A' && left <= 'Z' {
-			left += 'a' - 'A'
-		}
-		if right >= 'A' && right <= 'Z' {
-			right += 'a' - 'A'
-		}
-		if left != right {
-			return false
-		}
-	}
-	return true
+	return bytes.EqualFold(key, []byte(want))
 }
 
 func rawJSONNonEmptyString(raw []byte) bool {
