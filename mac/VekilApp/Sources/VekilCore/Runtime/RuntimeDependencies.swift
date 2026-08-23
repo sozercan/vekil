@@ -11,9 +11,19 @@ public struct SystemRuntimeClock: RuntimeClock {
     public func now() -> Date { Date() }
 
     public func sleep(for interval: TimeInterval) async throws {
-        guard interval > 0 else { return }
-        let clamped = min(interval, Double(UInt64.max) / 1_000_000_000)
-        try await Task.sleep(nanoseconds: UInt64(clamped * 1_000_000_000))
+        let nanoseconds = Self.nanoseconds(for: interval)
+        guard nanoseconds > 0 else { return }
+        try await Task.sleep(nanoseconds: nanoseconds)
+    }
+
+    static func nanoseconds(for interval: TimeInterval) -> UInt64 {
+        guard interval > 0 else { return 0 }
+        let nanosecondsPerSecond: UInt64 = 1_000_000_000
+        let maximumWholeSeconds = UInt64.max / nanosecondsPerSecond
+        guard interval.isFinite, interval < TimeInterval(maximumWholeSeconds) else {
+            return UInt64.max
+        }
+        return UInt64(interval * TimeInterval(nanosecondsPerSecond))
     }
 }
 

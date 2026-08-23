@@ -797,7 +797,6 @@ private extension StatsStore {
     }
 
     private static func nanoseconds(for interval: TimeInterval) -> UInt64 {
-        let clamped = max(0.001, min(interval, TimeInterval(UInt64.max) / 1_000_000_000))
-        return UInt64(clamped * 1_000_000_000)
+        SystemRuntimeClock.nanoseconds(for: max(0.001, interval))
     }
 }

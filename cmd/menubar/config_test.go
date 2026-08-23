@@ -471,3 +471,74 @@ func TestSaveMenubarConfigReplacingUnreadablePreservesBackup(t *testing.T) {
 		t.Fatalf("backup = %q, want %q", backup, unreadable)
 	}
 }
+
+func TestSaveMenubarConfigReplacingUnreadablePreservesStateOnInitialReadFailure(t *testing.T) {
+	configDir := stubUserConfigDir(t)
+	configPath := filepath.Join(configDir, "vekil", menubarConfigFilename)
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte("{\"version\":1,\"config_mode\":\"managed\",\"managed_ownership_id\":\"owner-123\"}\n")
+	if err := os.WriteFile(configPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousRead := readMenubarConfigFile
+	readMenubarConfigFile = func(string) ([]byte, error) {
+		return nil, os.ErrPermission
+	}
+	t.Cleanup(func() { readMenubarConfigFile = previousRead })
+
+	err := saveMenubarConfigReplacingUnreadable(menubarConfig{
+		ProvidersConfigPath:    "/tmp/recovered.yaml",
+		selectedConfigRevision: "cfg_recovered",
+	})
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("saveMenubarConfigReplacingUnreadable() error = %v, want permission error", err)
+	}
+	body, readErr := os.ReadFile(configPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(body, original) {
+		t.Fatalf("config after failed recovery = %q, want %q", body, original)
+	}
+}
+
+func TestSaveMenubarConfigReplacingUnreadablePreservesStateOnBackupReadFailure(t *testing.T) {
+	configDir := stubUserConfigDir(t)
+	configPath := filepath.Join(configDir, "vekil", menubarConfigFilename)
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte("{\n")
+	if err := os.WriteFile(configPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousRead := readMenubarConfigFile
+	readCount := 0
+	readMenubarConfigFile = func(string) ([]byte, error) {
+		readCount++
+		if readCount == 1 {
+			return append([]byte(nil), original...), nil
+		}
+		return nil, os.ErrPermission
+	}
+	t.Cleanup(func() { readMenubarConfigFile = previousRead })
+
+	err := saveMenubarConfigReplacingUnreadable(menubarConfig{
+		ProvidersConfigPath:    "/tmp/recovered.yaml",
+		selectedConfigRevision: "cfg_recovered",
+	})
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("saveMenubarConfigReplacingUnreadable() error = %v, want permission error", err)
+	}
+	body, readErr := os.ReadFile(configPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(body, original) {
+		t.Fatalf("config after failed backup = %q, want %q", body, original)
+	}
+}

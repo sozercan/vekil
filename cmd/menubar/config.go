@@ -20,6 +20,8 @@ const (
 
 var (
 	userConfigDir          = os.UserConfigDir
+	readMenubarConfigFile  = os.ReadFile
+	errMenubarConfigDecode = errors.New("menubar config decode failed")
 	errMenubarConfigLoad   = errors.New("menubar config load failed")
 	errProvidersConfigLoad = errors.New("providers config load failed")
 )
@@ -44,7 +46,7 @@ func loadMenubarConfig() (menubarConfig, error) {
 		return menubarConfig{}, err
 	}
 
-	body, err := os.ReadFile(path)
+	body, err := readMenubarConfigFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return menubarConfig{}, nil
@@ -54,7 +56,7 @@ func loadMenubarConfig() (menubarConfig, error) {
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return menubarConfig{}, fmt.Errorf("decode menubar config %q: %w", path, err)
+		return menubarConfig{}, fmt.Errorf("%w: decode menubar config %q: %w", errMenubarConfigDecode, path, err)
 	}
 	var probe struct {
 		Version             int    `json:"version"`
@@ -64,7 +66,7 @@ func loadMenubarConfig() (menubarConfig, error) {
 		ProvidersConfigPath string `json:"providers_config_path"`
 	}
 	if err := json.Unmarshal(body, &probe); err != nil {
-		return menubarConfig{}, fmt.Errorf("decode menubar config %q: %w", path, err)
+		return menubarConfig{}, fmt.Errorf("%w: decode menubar config %q: %w", errMenubarConfigDecode, path, err)
 	}
 	cfg := menubarConfig{ProvidersConfigPath: strings.TrimSpace(probe.ProvidersConfigPath)}
 	if probe.Version > 0 {
@@ -100,7 +102,7 @@ func saveMenubarConfigWithRecovery(cfg menubarConfig, replaceUnreadable bool) er
 	if cfg.versionedState == nil {
 		existing, err := loadMenubarConfig()
 		if err != nil {
-			if !replaceUnreadable {
+			if !replaceUnreadable || !errors.Is(err, errMenubarConfigDecode) {
 				return fmt.Errorf("preserve existing menubar config: %w", err)
 			}
 			if err := ensureMenubarConfigDirectory(path); err != nil {
@@ -179,9 +181,9 @@ func ensureMenubarConfigDirectory(path string) error {
 }
 
 func backupUnreadableMenubarConfig(path string) error {
-	body, err := os.ReadFile(path)
+	body, err := readMenubarConfigFile(path)
 	if err != nil {
-		return nil
+		return fmt.Errorf("read unreadable menubar config %q for backup: %w", path, err)
 	}
 	digest := sha256.Sum256(body)
 	backupPath := fmt.Sprintf("%s.unreadable-%x.bak", path, digest[:8])
