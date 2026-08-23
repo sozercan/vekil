@@ -649,6 +649,10 @@ func loadPersistentState(path string) (PersistentState, bool, error) {
 		if selected != "" {
 			state.ConfigMode = ConfigModeExternal
 			state.SelectedPath = selected
+			state.SelectedConfigRevision = ""
+			if body, _, readErr := readSecureFile(selected, MaxConfigBytes); readErr == nil {
+				state.SelectedConfigRevision, _ = configRevision(body)
+			}
 		}
 		return state, true, nil
 	}

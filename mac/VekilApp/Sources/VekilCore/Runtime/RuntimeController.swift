@@ -41,7 +41,7 @@ public struct RuntimeControllerConfiguration: Sendable, Equatable {
         diagnosticsByteLimit: Int = 64 * 1_024,
         handshakeTimeout: TimeInterval = 5,
         requestTimeout: TimeInterval = 15,
-        shutdownGracePeriod: TimeInterval = 10,
+        shutdownGracePeriod: TimeInterval = 13,
         forceTerminationGracePeriod: TimeInterval = 2,
         restartPolicy: RuntimeRestartPolicy = RuntimeRestartPolicy()
     ) {

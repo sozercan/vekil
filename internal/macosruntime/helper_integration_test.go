@@ -207,6 +207,12 @@ func TestHelperHelloStartPortZeroHealthAndStdinEOF(t *testing.T) {
 	}
 }
 
+func TestDefaultHelperShutdownTimeoutOutlivesControllerCleanup(t *testing.T) {
+	if defaultHelperShutdownTimeout <= appcontrol.DefaultStopTimeout {
+		t.Fatalf("helper shutdown timeout = %s, controller cleanup timeout = %s", defaultHelperShutdownTimeout, appcontrol.DefaultStopTimeout)
+	}
+}
+
 func TestHelperMalformedDuplicateEnvelopeTerminatesWithoutResponse(t *testing.T) {
 	manager := newManagerForTest(t)
 	runtime := newTestRuntimeForHelper()

@@ -440,6 +440,26 @@ final class VekilAppStateTests: XCTestCase {
     XCTAssertEqual(login.requestedValues, [false])
   }
 
+  func testApplicationActivationRefreshesLoginItemStatus() async {
+    let runtime = RuntimeClientSpy()
+    let preferences = InMemoryVekilPreferencesStore(openAtLogin: true)
+    let login = LoginItemServiceSpy(status: .requiresApproval)
+    let state = makeState(runtime: runtime, preferences: preferences, login: login)
+    await assertTrueAsync(await state.initialize())
+
+    XCTAssertTrue(state.openAtLogin)
+    XCTAssertEqual(state.loginItemStatus, .requiresApproval)
+    XCTAssertEqual(login.currentStatusCount, 1)
+
+    login.status = .disabled
+    await state.applicationDidBecomeActive()
+
+    XCTAssertFalse(state.openAtLogin)
+    XCTAssertFalse(preferences.openAtLogin)
+    XCTAssertEqual(state.loginItemStatus, .disabled)
+    XCTAssertEqual(login.currentStatusCount, 2)
+  }
+
   func testNavigationWindowUpdaterBrowserAndClipboardUseInjectedServices() async {
     var running = AppRuntimeStateSnapshot.connectedStopped
     running.service = .running

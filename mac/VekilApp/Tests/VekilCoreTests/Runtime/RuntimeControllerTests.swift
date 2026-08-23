@@ -710,7 +710,7 @@ final class RuntimeControllerTests: XCTestCase {
             0.5
         )
 
-        XCTAssertGreaterThan(configuration.shutdownGracePeriod - commandBudget, 7)
+        XCTAssertGreaterThan(configuration.shutdownGracePeriod - commandBudget, 11)
         XCTAssertGreaterThan(configuration.forceTerminationGracePeriod, 1)
     }
 

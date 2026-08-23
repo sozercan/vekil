@@ -41,6 +41,10 @@ func TestConfigManagerMigratesLegacyMenubarState(t *testing.T) {
 	dir := t.TempDir()
 	paths := PathsInDirectory(dir)
 	external := filepath.Join(dir, "external.yaml")
+	externalBody := []byte("schema_version: 2\nproviders:\n  - id: local\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: local-model\n        endpoints: [/chat/completions]\n")
+	if err := os.WriteFile(external, externalBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	legacy := []byte(`{"providers_config_path":"` + external + `"}`)
 	if err := os.WriteFile(paths.State, legacy, 0o600); err != nil {
 		t.Fatal(err)
@@ -50,7 +54,8 @@ func TestConfigManagerMigratesLegacyMenubarState(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := manager.State()
-	if state.Version != StateVersion || state.ConfigMode != ConfigModeExternal || state.SelectedPath != external {
+	wantRevision, _ := configRevision(externalBody)
+	if state.Version != StateVersion || state.ConfigMode != ConfigModeExternal || state.SelectedPath != external || state.SelectedConfigRevision != wantRevision {
 		t.Fatalf("migrated state = %+v", state)
 	}
 	body, err := os.ReadFile(paths.State)
@@ -59,6 +64,25 @@ func TestConfigManagerMigratesLegacyMenubarState(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `"version": 1`) || !strings.Contains(string(body), `"providers_config_path"`) {
 		t.Fatalf("rewritten state = %s", body)
+	}
+}
+
+func TestConfigManagerMigratesUnavailableLegacyExternalWithoutLegacyRevision(t *testing.T) {
+	dir := t.TempDir()
+	paths := PathsInDirectory(dir)
+	external := filepath.Join(dir, "missing.yaml")
+	legacy := []byte(`{"providers_config_path":"` + external + `"}`)
+	if err := os.WriteFile(paths.State, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := NewConfigManager(ConfigManagerOptions{Paths: paths, UUID: func() string { return "uuid" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := manager.State()
+	if state.ConfigMode != ConfigModeExternal || state.SelectedPath != external || state.SelectedConfigRevision != "" {
+		t.Fatalf("migrated state = %+v", state)
 	}
 }
 

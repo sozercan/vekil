@@ -178,6 +178,10 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
         showWindow(); return true
     }
 
+    public func applicationDidBecomeActive(_: Notification) {
+        Task { await appState.applicationDidBecomeActive() }
+    }
+
     public func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool {
         false
     }

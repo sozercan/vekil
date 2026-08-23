@@ -385,6 +385,13 @@ public final class VekilAppState: ObservableObject {
     }
   }
 
+  public func applicationDidBecomeActive() async {
+    guard initializationState == .initialized else {
+      return
+    }
+    await refreshLoginItemStatus()
+  }
+
   @discardableResult
   public func checkForUpdates() async -> Bool {
     guard updaterService.isAvailable else {
@@ -497,8 +504,7 @@ public final class VekilAppState: ObservableObject {
       bundleBuildID = initialization.bundleBuildID
       apply(initialization.state)
 
-      let status = await loginItemService.currentStatus()
-      applyLoginItemStatus(status, requestedValue: preferences.openAtLogin)
+      await refreshLoginItemStatus()
 
       initializationState = .initialized
       resolveInitialOnboardingPresentation()
@@ -770,6 +776,11 @@ public final class VekilAppState: ObservableObject {
       openAtLogin = requestedValue
       preferences.openAtLogin = requestedValue
     }
+  }
+
+  private func refreshLoginItemStatus() async {
+    let status = await loginItemService.currentStatus()
+    applyLoginItemStatus(status, requestedValue: preferences.openAtLogin)
   }
 
   private func record(_ error: Error, code: String, message: String) {

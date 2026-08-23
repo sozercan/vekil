@@ -10,7 +10,8 @@ import (
 	"time"
 )
 
-const defaultStopTimeout = 10 * time.Second
+// DefaultStopTimeout bounds runtime cleanup when callers do not provide one.
+const DefaultStopTimeout = 10 * time.Second
 
 // Controller serializes proxy mutations while keeping reads and named
 // cancellation responsive.
@@ -47,7 +48,7 @@ func New(opts Options) (*Controller, error) {
 		opts.OperationID = randomOperationID
 	}
 	if opts.StopTimeout <= 0 {
-		opts.StopTimeout = defaultStopTimeout
+		opts.StopTimeout = DefaultStopTimeout
 	}
 	ctx, cancel := context.WithCancelCause(context.Background())
 	c := &Controller{

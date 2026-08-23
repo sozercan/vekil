@@ -181,6 +181,7 @@ extension AppRuntimeStateSnapshot {
 @MainActor
 final class LoginItemServiceSpy: LoginItemService {
   var status: LoginItemStatus
+  var currentStatusCount = 0
   var requestedValues: [Bool] = []
   var openSettingsCount = 0
   var error: Error?
@@ -190,7 +191,8 @@ final class LoginItemServiceSpy: LoginItemService {
   }
 
   func currentStatus() async -> LoginItemStatus {
-    status
+    currentStatusCount += 1
+    return status
   }
 
   func setEnabled(_ enabled: Bool) async throws -> LoginItemStatus {

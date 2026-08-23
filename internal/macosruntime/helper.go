@@ -12,7 +12,7 @@ import (
 	"github.com/sozercan/vekil/internal/appcontrol"
 )
 
-const defaultHelperShutdownTimeout = 7 * time.Second
+const defaultHelperShutdownTimeout = appcontrol.DefaultStopTimeout + time.Second
 
 // HelperAuthenticator is the authentication surface exposed by the helper.
 type HelperAuthenticator interface {
