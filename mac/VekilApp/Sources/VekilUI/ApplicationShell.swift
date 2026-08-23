@@ -36,17 +36,35 @@ public final class ApplicationInstanceGate: @unchecked Sendable {
             uid: uid
         )
         let lockName = "\(identifier)-\(uid).lock"
+        let coordinationName = "\(identifier)-\(uid).coordination.lock"
         let activationName = "activate-\(uid).request"
-        let fd = openat(dirFD, lockName, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
-        guard fd >= 0 else { Darwin.close(dirFD); throw ApplicationInstanceGateError.lockOpen(errno) }
-        var st = stat()
-        guard fstat(fd, &st) == 0,
-              st.st_mode & S_IFMT == S_IFREG,
-              st.st_uid == uid,
-              st.st_nlink == 1,
-              fchmod(fd, 0o600) == 0 else {
-            Darwin.close(fd); Darwin.close(dirFD)
+        let coordinationFD: Int32
+        do {
+            coordinationFD = try openOwnedLockFile(
+                named: coordinationName,
+                directoryFD: dirFD,
+                uid: uid
+            )
+        } catch {
+            Darwin.close(dirFD)
+            throw error
+        }
+        guard flock(coordinationFD, LOCK_EX) == 0 else {
+            Darwin.close(coordinationFD)
+            Darwin.close(dirFD)
             throw ApplicationInstanceGateError.unsafeLock
+        }
+        defer {
+            flock(coordinationFD, LOCK_UN)
+            Darwin.close(coordinationFD)
+        }
+
+        let fd: Int32
+        do {
+            fd = try openOwnedLockFile(named: lockName, directoryFD: dirFD, uid: uid)
+        } catch {
+            Darwin.close(dirFD)
+            throw error
         }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
             let request = openat(
@@ -71,7 +89,32 @@ public final class ApplicationInstanceGate: @unchecked Sendable {
             DistributedNotificationCenter.default().postNotificationName(activationNotification, object: identifier, userInfo: ["uid": uid], deliverImmediately: true)
             Darwin.close(fd); Darwin.close(dirFD); return nil
         }
+        _ = unlinkat(dirFD, activationName, 0)
         return ApplicationInstanceGate(lockFD: fd, directoryFD: dirFD, uid: uid, identifier: identifier, activationName: activationName)
+    }
+
+    private static func openOwnedLockFile(
+        named name: String,
+        directoryFD: Int32,
+        uid: uid_t
+    ) throws -> Int32 {
+        let fd = openat(
+            directoryFD,
+            name,
+            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            0o600
+        )
+        guard fd >= 0 else { throw ApplicationInstanceGateError.lockOpen(errno) }
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == uid,
+              info.st_nlink == 1,
+              fchmod(fd, 0o600) == 0 else {
+            Darwin.close(fd)
+            throw ApplicationInstanceGateError.unsafeLock
+        }
+        return fd
     }
 
     private static func openOwnedBaseDirectory(at url: URL, uid: uid_t) throws -> Int32 {

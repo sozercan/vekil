@@ -217,6 +217,38 @@ final class ShellSecurityTests: XCTestCase {
         wait(for: [activated], timeout: 1)
     }
 
+    @MainActor func testNewPrimaryDiscardsActivationFromPreviousGeneration() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        var first: ApplicationInstanceGate? = try XCTUnwrap(
+            ApplicationInstanceGate.acquire(
+                identifier: "com.vekil.test.stale-activation",
+                baseDirectory: base
+            )
+        )
+        XCTAssertNil(
+            try ApplicationInstanceGate.acquire(
+                identifier: "com.vekil.test.stale-activation",
+                baseDirectory: base
+            )
+        )
+        XCTAssertNotNil(first)
+        first = nil
+
+        let replacement = try XCTUnwrap(
+            ApplicationInstanceGate.acquire(
+                identifier: "com.vekil.test.stale-activation",
+                baseDirectory: base
+            )
+        )
+        let activated = expectation(description: "stale activation")
+        activated.isInverted = true
+        replacement.observe { activated.fulfill() }
+        wait(for: [activated], timeout: 0.2)
+    }
+
     @MainActor func testSingletonRejectsSymlinkedApplicationDirectory() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let base = root.appendingPathComponent("ApplicationSupport")

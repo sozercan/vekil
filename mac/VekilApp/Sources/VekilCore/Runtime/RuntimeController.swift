@@ -508,6 +508,10 @@ public actor RuntimeController {
             throw RuntimeControllerError.operationAlreadyActive(activeOperationID)
         }
 
+        if command == .stop {
+            restoreProxyAfterReconnect = false
+        }
+
         let response = try await send(command: command, payload: payload, timeout: timeout)
         guard let result = response.result,
               let admission = try? result.decode(RuntimeAdmissionResult.self),
@@ -938,7 +942,11 @@ public actor RuntimeController {
             setConnectionState(.connected)
             resumeConnectionWaiters()
         } catch let error as RuntimeControllerError {
-            failSession(sessionID: sessionID, error: error, suppressRestart: true)
+            failSession(
+                sessionID: sessionID,
+                error: error,
+                suppressRestart: shouldSuppressAutomaticRestart(after: error)
+            )
         } catch {
             failSession(sessionID: sessionID, error: .launchPreparationFailed, suppressRestart: true)
         }
@@ -1170,6 +1178,9 @@ public actor RuntimeController {
         }
 
         currentState = event
+        if event.payload.service == .running {
+            restoreProxyAfterReconnect = false
+        }
         if let launchToken, event.helperEpoch == helperEpoch {
             lastNotificationIdentity = RuntimeLaunchIdentity(
                 launchToken: launchToken,
