@@ -65,7 +65,7 @@ public struct RuntimeSecretProjectionPreparer: Sendable {
         guard let data = projection.secrets[entry.identity],
           !data.isEmpty,
           let value = String(data: data, encoding: .utf8),
-          !value.isEmpty
+          !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
           throw RuntimeSecretProjectionPreparationError.invalidSecretEncoding
         }

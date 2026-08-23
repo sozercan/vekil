@@ -72,6 +72,38 @@ final class RuntimeSecretProjectionPreparerTests: XCTestCase {
     }
   }
 
+  func testRejectsWhitespaceOnlySecretValue() async throws {
+    let providerUUID = UUID(uuidString: "cccccccc-cccc-cccc-cccc-cccccccccccc")!
+    let identity = ProviderSecretIdentity(providerID: providerUUID, role: .apiKey)
+    let reference = ProviderSecretReference(identity: identity, generation: 3)
+    let store = InMemoryKeychainSecretStore(secrets: [reference: Data(" \t\n ".utf8)])
+    let preparer = RuntimeSecretProjectionPreparer(
+      manager: KeychainSecretGenerationManager(store: store)
+    )
+    let requirement = RuntimeSecretProjectionRequirement(
+      configRevision: "cfg_test",
+      secretGeneration: 3,
+      secrets: [
+        RuntimeManagedSecretRequirement(
+          providerID: "upstream",
+          providerUUID: providerUUID.uuidString,
+          role: "api_key",
+          reference: "VEKIL_MANAGED_UPSTREAM_API_KEY_3"
+        )
+      ]
+    )
+
+    do {
+      _ = try await preparer.requests(for: [requirement])
+      XCTFail("Expected whitespace-only secret rejection")
+    } catch {
+      XCTAssertEqual(
+        error as? RuntimeSecretProjectionPreparationError,
+        .invalidSecretEncoding
+      )
+    }
+  }
+
   func testEmptyRequirementsDoNotAccessKeychain() async throws {
     let preparer = RuntimeSecretProjectionPreparer(manager: FailingProjectionManager())
     let requests = try await preparer.requests(for: [])
