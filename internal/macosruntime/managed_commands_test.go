@@ -268,6 +268,76 @@ func TestApplyManagedDraftFailedStartRestoresPreviousRuntime(t *testing.T) {
 	}
 }
 
+func TestApplyManagedDraftRunningPersistsCandidateOnlyAfterReadiness(t *testing.T) {
+	validationStarted := make(chan struct{})
+	releaseValidation := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseValidation)
+		}
+	}()
+
+	var candidateRevision string
+	factory := &revisionRuntimeFactory{newRuntime: func(revision string, _ int) *applyRuntime {
+		runtime := newApplyRuntime(nil)
+		if revision == candidateRevision {
+			runtime.validateModels = func(ctx context.Context) error {
+				close(validationStarted)
+				select {
+				case <-releaseValidation:
+					return errors.New("candidate validation failed")
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+		return runtime
+	}}
+	manager, controller, h, initialRevision := newApplyHarness(t, factory)
+	start, _ := controller.Start(t.Context(), initialRevision)
+	_, _ = start.Wait(t.Context())
+	payload := managedDraftPayload{ExpectedConfigRevision: initialRevision, SecretGeneration: 1, Draft: managedApplyDraft(manager.State().Providers[0].UUID, true)}
+	candidate, err := manager.BuildManagedCandidate(payload.Draft, payload.SecretGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateRevision = candidate.Revision
+
+	done := make(chan error, 1)
+	go func() {
+		done <- h.applyManagedDraft(t.Context(), "op_readiness_boundary", payload)
+	}()
+
+	select {
+	case <-validationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("candidate validation did not start")
+	}
+	persisted, _, err := loadPersistentState(manager.paths.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.CommittedConfigRevision != initialRevision || persisted.SelectedConfigRevision != initialRevision {
+		t.Fatalf("candidate persisted before readiness: %+v", persisted)
+	}
+
+	close(releaseValidation)
+	released = true
+	select {
+	case err := <-done:
+		var applyErr *ManagedApplyError
+		if !errors.As(err, &applyErr) || applyErr.Primary == nil || applyErr.Rollback != nil {
+			t.Fatalf("apply error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("managed apply did not finish after validation failure")
+	}
+	if got := manager.State().CommittedConfigRevision; got != initialRevision {
+		t.Fatalf("restored configuration = %q, want %q", got, initialRevision)
+	}
+}
+
 func TestApplyManagedDraftFailedStopRestoresPreviousRuntime(t *testing.T) {
 	stopFailure := errors.New("stop failed after listener close")
 	factory := &revisionRuntimeFactory{newRuntime: func(_ string, call int) *applyRuntime {

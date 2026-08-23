@@ -96,10 +96,10 @@ func TestManagedApplyInstallPreservesPrimaryAndRollbackErrors(t *testing.T) {
 	}
 }
 
-func TestManagedApplyInstallFailureWhileRunningRetainsRuntimeRollback(t *testing.T) {
+func TestManagedApplyInstallJournalFailureWhileRunningRetainsRuntimeRollback(t *testing.T) {
 	manager, tx, oldRevision, _ := prepareApplyTransactionForTest(t, "op_running_state_failure", true)
-	primary := errors.New("state save failed")
-	tx.saveInstalledState = func() error { return primary }
+	primary := errors.New("installed journal failed")
+	tx.writeInstalledJournal = func(string, ApplyJournal) error { return primary }
 
 	err := tx.Install()
 	if !errors.Is(err, primary) || err.Error() != primary.Error() {

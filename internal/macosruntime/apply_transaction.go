@@ -153,12 +153,14 @@ func (t *ManagedApplyTransaction) Install() error {
 	m.state.SelectedConfigRevision = journal.NewRevision
 	m.state.SecretGeneration = journal.NewSecretGeneration
 	m.state.Providers = cloneProviderIdentities(journal.NewProviders)
-	saveInstalledState := m.saveStateLocked
-	if t.saveInstalledState != nil {
-		saveInstalledState = t.saveInstalledState
-	}
-	if err := saveInstalledState(); err != nil {
-		return t.rollbackInstallFailureLocked(err, "state_install_failed")
+	if !journal.WasRunning {
+		saveInstalledState := m.saveStateLocked
+		if t.saveInstalledState != nil {
+			saveInstalledState = t.saveInstalledState
+		}
+		if err := saveInstalledState(); err != nil {
+			return t.rollbackInstallFailureLocked(err, "state_install_failed")
+		}
 	}
 	journal.Phase = ApplyPhaseInstalled
 	writeInstalledJournal := writeApplyJournal
