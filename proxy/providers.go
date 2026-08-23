@@ -1434,10 +1434,6 @@ func normalizeProviderPath(configured, fallback, field string) (string, error) {
 	return path, nil
 }
 
-func configuredGenericProviderAuth(cfg ProviderConfig) (providerAuthType, string, string, string, error) {
-	return configuredGenericProviderAuthWithResolver(cfg, nil)
-}
-
 func configuredGenericProviderAuthWithResolver(cfg ProviderConfig, resolver ProviderSecretResolver) (providerAuthType, string, string, string, error) {
 	apiKey := strings.TrimSpace(cfg.APIKey)
 	apiKeyEnv := strings.TrimSpace(cfg.APIKeyEnv)

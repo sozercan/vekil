@@ -616,10 +616,6 @@ func validateProviderConfigDescriptors(configured []ProviderConfig, allowRouteOn
 	return providers, ordered, defaultOptional, nil
 }
 
-func validateProviderRuntimeEnvironment(cfg ProviderConfig, providerIndex int) error {
-	return validateProviderRuntimeEnvironmentWithResolver(cfg, providerIndex, nil)
-}
-
 func validateProviderRuntimeEnvironmentWithResolver(cfg ProviderConfig, providerIndex int, resolver ProviderSecretResolver) error {
 	if strings.TrimSpace(cfg.APIKey) != "" {
 		return nil
