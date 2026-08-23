@@ -4,6 +4,7 @@
 package proxy
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -2289,6 +2290,13 @@ func readBodyBorrowed(r *http.Request) ([]byte, *[]byte, error) {
 	default:
 		return nil, pooled, &requestBodyError{statusCode: http.StatusBadRequest, err: err}
 	}
+}
+
+func detachBorrowedRequestBody(body []byte, buffer *[]byte) []byte {
+	if buffer != nil && len(body) > 0 && len(*buffer) > 0 && &body[0] == &(*buffer)[0] {
+		return bytes.Clone(body)
+	}
+	return body
 }
 
 func releaseSmallRequestBodyBuffer(buffer *[]byte) {

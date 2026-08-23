@@ -977,6 +977,7 @@ func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.R
 	if err != nil {
 		return newResponseBodyWriteError(resp, err, false, true, bodyReader.canceledAtFailure())
 	}
+	contentLengthMismatch := resp.ContentLength >= 0 && int64(len(body)) != resp.ContentLength
 
 	var rewritten []byte
 	var changed bool
@@ -1011,7 +1012,7 @@ func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.R
 	}
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
-	if changed {
+	if changed || contentLengthMismatch {
 		w.Header().Del("Content-Length")
 	}
 	if explicitRoute {
@@ -1204,7 +1205,15 @@ func rewriteAnthropicResponseModelJSONFast(body []byte, rawPublicModel json.RawM
 		return body, false, true
 	}
 
-	out := make([]byte, 0, len(body)-modelEnd+modelStart+len(rawPublicModel))
+	if modelStart < 0 || modelEnd < modelStart || modelEnd > len(body) {
+		return body, false, false
+	}
+	baseLen := len(body) - (modelEnd - modelStart)
+	maxInt := int(^uint(0) >> 1)
+	if len(rawPublicModel) > maxInt-baseLen {
+		return body, false, false
+	}
+	out := make([]byte, 0, baseLen+len(rawPublicModel))
 	out = append(out, body[:modelStart]...)
 	out = append(out, rawPublicModel...)
 	out = append(out, body[modelEnd:]...)

@@ -2308,11 +2308,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) == "" {
-		if err := validateAnthropicOutputConfigEffort(body); err != nil {
-			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
-			return
-		}
+	if err := validateAnthropicOutputConfigEffort(body); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
 	}
 	if err := validateAnthropicMessageTokenLimits(&req, r.Header); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -2352,6 +2350,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic", req.Model, providerModel, req.Stream, providerEndpoint)
 
 	if directAnthropic {
+		body = detachBorrowedRequestBody(body, pooledBody)
 		directPublicModel, directUpstreamModel := directAnthropicResponseModelsResolved(req.Model, owner, known)
 		h.forwardAnthropicMessagesDirect(w, r, body, &req, directPublicModel, directUpstreamModel)
 		return
@@ -3300,9 +3299,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	// RoundTripper may finish closing or reading a request body asynchronously
 	// after RoundTrip returns. Detach a borrowed inbound buffer before handing it
 	// to upstream code so the handler can safely return that buffer to its pool.
-	if pooledBody != nil && len(bodyBytes) > 0 && len(*pooledBody) > 0 && &bodyBytes[0] == &(*pooledBody)[0] {
-		bodyBytes = bytes.Clone(bodyBytes)
-	}
+	bodyBytes = detachBorrowedRequestBody(bodyBytes, pooledBody)
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, chatExecutionOptions{}, requestedModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {

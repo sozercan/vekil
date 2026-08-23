@@ -153,6 +153,80 @@ func TestHandleAnthropicMessages_CopilotNativeMessages(t *testing.T) {
 	})
 }
 
+func TestHandleAnthropicMessagesRejectsDuplicateEffortEndingInNull(t *testing.T) {
+	handler := newTestProxyHandler(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("backend should not be called for invalid output_config.effort")
+	})
+	req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(`{
+		"model":"claude-sonnet-4",
+		"messages":[{"role":"user","content":"hello"}],
+		"max_tokens":64,
+		"output_config":{"effort":"high","effort":null}
+	}`))
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "output_config.effort must be a non-empty string") {
+		t.Fatalf("body = %q, want effort validation error", w.Body.String())
+	}
+}
+
+func TestHandleAnthropicMessagesDetachesBorrowedDirectBody(t *testing.T) {
+	const requestBody = `{"model":"claude-public","messages":[{"role":"user","content":"hello"}],"max_tokens":64}`
+	const responseBody = `{"id":"msg","type":"message","role":"assistant","model":"claude-public","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+
+	retainedBody := make(chan io.ReadCloser, 1)
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "native",
+			Type:     string(providerTypeAnthropicCompatible),
+			Default:  true,
+			BaseURL:  "http://upstream.test",
+			AuthType: string(providerAuthTypeNone),
+			Models: []ProviderModelConfig{{
+				PublicID:  "claude-public",
+				Endpoints: []string{providerEndpointMessages},
+			}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.client = &http.Client{Transport: handlerTestRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		retainedBody <- req.Body
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			Body:          io.NopCloser(strings.NewReader(responseBody)),
+			ContentLength: int64(len(responseBody)),
+			Request:       req,
+		}, nil
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(requestBody))
+	w := httptest.NewRecorder()
+	handler.HandleAnthropicMessages(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	upstreamBody := <-retainedBody
+	got, err := io.ReadAll(upstreamBody)
+	_ = upstreamBody.Close()
+	if err != nil {
+		t.Fatalf("read retained upstream body: %v", err)
+	}
+	if string(got) != requestBody {
+		t.Fatalf("retained upstream body = %q, want %q", got, requestBody)
+	}
+}
+
 func TestPolicyChatSafeHeadersQuotaAllowlist(t *testing.T) {
 	pastHTTPDate := time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)
 	tests := []struct {

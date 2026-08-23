@@ -1451,6 +1451,45 @@ func TestWritePassthroughSniffingUsageClearsStaleContentLengthOnRealServer(t *te
 	}
 }
 
+func TestWriteDirectAnthropicJSONResponseClearsStaleContentLengthOnRealServer(t *testing.T) {
+	const body = `{"id":"msg","type":"message","model":"claude-public","content":[],"usage":{"input_tokens":1,"output_tokens":1}}`
+	const advertisedLength = 4
+
+	writeErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type":   []string{"application/json"},
+				"Content-Length": []string{strconv.Itoa(advertisedLength)},
+			},
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: advertisedLength,
+		}
+		writeErr <- writeDirectAnthropicJSONResponse(context.Background(), context.Background(), w, resp, "claude-public", "claude-public")
+	}))
+	defer server.Close()
+
+	resp, err := server.Client().Get(server.URL)
+	if err != nil {
+		t.Fatalf("GET downstream response: %v", err)
+	}
+	got, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err := <-writeErr; err != nil {
+		t.Fatalf("writeDirectAnthropicJSONResponse() error = %v", err)
+	}
+	if readErr != nil {
+		t.Fatalf("read downstream response: %v", readErr)
+	}
+	if string(got) != body {
+		t.Fatalf("body = %q, want %q", got, body)
+	}
+	if resp.ContentLength == advertisedLength {
+		t.Fatalf("downstream ContentLength = %d, stale advertised length was retained", resp.ContentLength)
+	}
+}
+
 func TestBorrowUsageSniffBufferSelectsSizeTier(t *testing.T) {
 	for _, tt := range []struct {
 		name          string

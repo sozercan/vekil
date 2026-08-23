@@ -71,6 +71,7 @@ func TestValidateAnthropicOutputConfigEffort(t *testing.T) {
 		{name: "null", body: `{"output_config":{"effort":null}}`},
 		{name: "empty", body: `{"output_config":{"effort":""}}`},
 		{name: "whitespace", body: `{"output_config":{"effort":" \t\n "}}`},
+		{name: "duplicate ending in null", body: `{"output_config":{"effort":"high","effort":null}}`},
 	} {
 		t.Run("rejects "+tc.name, func(t *testing.T) {
 			err := validateAnthropicOutputConfigEffort([]byte(tc.body))
