@@ -26,8 +26,8 @@ type ManagedApplyTransaction struct {
 	restored  bool
 	finished  bool
 
-	// Install persistence seams keep failure-path tests deterministic without
-	// weakening the production filesystem implementation.
+	// State and installed-journal persistence seams keep failure-path tests
+	// deterministic without weakening the production filesystem implementation.
 	saveInstalledState    func() error
 	writeInstalledJournal func(string, ApplyJournal) error
 }
@@ -194,6 +194,15 @@ func (t *ManagedApplyTransaction) Commit() error {
 	}
 	if journal.OperationID != t.journal.OperationID || journal.Phase != ApplyPhaseInstalled {
 		return errors.New("managed apply journal no longer matches installed transaction")
+	}
+	if journal.WasRunning {
+		saveInstalledState := m.saveStateLocked
+		if t.saveInstalledState != nil {
+			saveInstalledState = t.saveInstalledState
+		}
+		if err := saveInstalledState(); err != nil {
+			return err
+		}
 	}
 	journal.Phase = ApplyPhaseCommitted
 	if err := writeApplyJournal(m.paths.Journal, journal); err != nil {

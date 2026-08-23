@@ -286,7 +286,7 @@ func TestApplyManagedDraftRunningPersistsCandidateOnlyAfterReadiness(t *testing.
 				close(validationStarted)
 				select {
 				case <-releaseValidation:
-					return errors.New("candidate validation failed")
+					return nil
 				case <-ctx.Done():
 					return ctx.Err()
 				}
@@ -326,15 +326,21 @@ func TestApplyManagedDraftRunningPersistsCandidateOnlyAfterReadiness(t *testing.
 	released = true
 	select {
 	case err := <-done:
-		var applyErr *ManagedApplyError
-		if !errors.As(err, &applyErr) || applyErr.Primary == nil || applyErr.Rollback != nil {
+		if err != nil {
 			t.Fatalf("apply error = %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("managed apply did not finish after validation failure")
+		t.Fatal("managed apply did not finish after validation succeeded")
 	}
-	if got := manager.State().CommittedConfigRevision; got != initialRevision {
-		t.Fatalf("restored configuration = %q, want %q", got, initialRevision)
+	persisted, _, err = loadPersistentState(manager.paths.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.CommittedConfigRevision != candidateRevision || persisted.SelectedConfigRevision != candidateRevision {
+		t.Fatalf("candidate was not persisted after readiness: %+v", persisted)
+	}
+	if got := manager.State().CommittedConfigRevision; got != candidateRevision {
+		t.Fatalf("committed configuration = %q, want %q", got, candidateRevision)
 	}
 }
 
