@@ -102,6 +102,45 @@ final class SecretGenerationManagerTests: XCTestCase {
     XCTAssertEqual(references, Set([generation1, generation3]))
   }
 
+  func testCleanupCannotDeleteGenerationStagedAfterItsSnapshot() async throws {
+    let provider = UUID(uuidString: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")!
+    let retained = ProviderSecretReference(providerID: provider, role: .apiKey, generation: 1)
+    let candidateReference = ProviderSecretReference(
+      providerID: provider,
+      role: .apiKey,
+      generation: 2
+    )
+    let store = InterleavingKeychainSecretStore(secrets: [
+      retained: Data("old".utf8),
+      candidateReference: Data("stale".utf8),
+    ])
+    let manager = KeychainSecretGenerationManager(store: store)
+
+    let cleanup = Task {
+      try await manager.cleanup(retainingGenerations: Set([1]))
+    }
+    await store.waitForFirstReferenceSnapshot()
+
+    let staged = try await manager.stage(
+      CompleteSecretGeneration(
+        generation: 2,
+        secrets: [
+          ProviderSecretIdentity(providerID: provider, role: .apiKey): Data("candidate".utf8)
+        ]
+      )
+    )
+    await store.releaseFirstReferenceSnapshot()
+    try await cleanup.value
+
+    var snapshot = await store.snapshot()
+    XCTAssertEqual(snapshot[candidateReference], Data("candidate".utf8))
+
+    await manager.releaseLease(for: staged)
+    try await manager.cleanup(retainingGenerations: Set([1]))
+    snapshot = await store.snapshot()
+    XCTAssertEqual(snapshot, [retained: Data("old".utf8)])
+  }
+
   func testProjectionRejectsExtraOrMissingAccounts() async throws {
     let identity = ProviderSecretIdentity(providerID: UUID(), role: .apiKey)
     let expected = ProviderSecretReference(identity: identity, generation: 5)
@@ -149,6 +188,52 @@ private actor FailingKeychainSecretStore: KeychainSecretStore {
 
   func allReferences() async throws -> Set<ProviderSecretReference> {
     Set(secrets.keys)
+  }
+}
+
+private actor InterleavingKeychainSecretStore: KeychainSecretStore {
+  private var secrets: [ProviderSecretReference: Data]
+  private var firstReferenceSnapshot: Set<ProviderSecretReference>?
+  private var firstSnapshotContinuation: CheckedContinuation<Set<ProviderSecretReference>, Never>?
+
+  init(secrets: [ProviderSecretReference: Data]) {
+    self.secrets = secrets
+  }
+
+  func secret(for reference: ProviderSecretReference) async throws -> Data? {
+    secrets[reference]
+  }
+
+  func setSecret(_ secret: Data, for reference: ProviderSecretReference) async throws {
+    secrets[reference] = secret
+  }
+
+  func removeSecret(for reference: ProviderSecretReference) async throws {
+    secrets.removeValue(forKey: reference)
+  }
+
+  func allReferences() async throws -> Set<ProviderSecretReference> {
+    guard firstReferenceSnapshot == nil else { return Set(secrets.keys) }
+    firstReferenceSnapshot = Set(secrets.keys)
+    return await withCheckedContinuation { continuation in
+      firstSnapshotContinuation = continuation
+    }
+  }
+
+  func waitForFirstReferenceSnapshot() async {
+    while firstSnapshotContinuation == nil {
+      await Task.yield()
+    }
+  }
+
+  func releaseFirstReferenceSnapshot() {
+    guard let firstReferenceSnapshot, let continuation = firstSnapshotContinuation else { return }
+    firstSnapshotContinuation = nil
+    continuation.resume(returning: firstReferenceSnapshot)
+  }
+
+  func snapshot() -> [ProviderSecretReference: Data] {
+    secrets
   }
 }
 

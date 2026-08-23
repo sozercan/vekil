@@ -67,6 +67,8 @@ private actor CleanupRecordingSecretManager: SecretGenerationManaging {
     throw CleanupRecordingError.unexpectedCall
   }
 
+  func releaseLease(for staged: StagedSecretGeneration) async {}
+
   func removeGeneration(_ generation: UInt64) async throws {
     throw CleanupRecordingError.unexpectedCall
   }

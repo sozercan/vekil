@@ -54,6 +54,7 @@ public struct SecretProjection: Equatable, Sendable, CustomStringConvertible,
 public protocol SecretGenerationManaging: Sendable {
   func stage(_ candidate: CompleteSecretGeneration) async throws -> StagedSecretGeneration
   func projection(for staged: StagedSecretGeneration) async throws -> SecretProjection
+  func releaseLease(for staged: StagedSecretGeneration) async
   func removeGeneration(_ generation: UInt64) async throws
   func cleanup(retainingGenerations: Set<UInt64>) async throws
 }
@@ -85,17 +86,21 @@ public enum SecretGenerationStoreError: Error, Equatable, LocalizedError, Sendab
   }
 }
 
-/// Serializes complete-generation Keychain transactions. Old generations are
-/// retained until `cleanup(retainingGenerations:)` is explicitly called after a
-/// managed-config commit or successful rollback.
+/// Serializes complete-generation Keychain transactions. Staging acquires a
+/// generation lease so cleanup cannot remove a candidate before the paired
+/// helper operation reaches a terminal state. The caller releases that lease
+/// immediately before reconciling the terminal state, or removes the generation
+/// explicitly when the helper never accepted the candidate.
 public actor KeychainSecretGenerationManager: SecretGenerationManaging {
   private let store: any KeychainSecretStore
+  private var leaseCounts: [UInt64: Int] = [:]
 
   public init(store: any KeychainSecretStore) {
     self.store = store
   }
 
   public func stage(_ candidate: CompleteSecretGeneration) async throws -> StagedSecretGeneration {
+    acquireLease(for: candidate.generation)
     let desired: [ProviderSecretReference: Data] = Dictionary(
       uniqueKeysWithValues: candidate.secrets.map { identity, secret in
         (ProviderSecretReference(identity: identity, generation: candidate.generation), secret)
@@ -106,6 +111,7 @@ public actor KeychainSecretGenerationManager: SecretGenerationManaging {
     do {
       try await removeReferences(inGeneration: candidate.generation)
     } catch {
+      releaseLease(forGeneration: candidate.generation)
       throw SecretGenerationStoreError.preparationFailed
     }
 
@@ -124,8 +130,10 @@ public actor KeychainSecretGenerationManager: SecretGenerationManaging {
       do {
         try await removeReferences(inGeneration: candidate.generation)
       } catch {
+        releaseLease(forGeneration: candidate.generation)
         throw SecretGenerationStoreError.stagingFailedAndCleanupFailed
       }
+      releaseLease(forGeneration: candidate.generation)
       if error is SecretGenerationStoreError {
         throw SecretGenerationStoreError.verificationFailed
       }
@@ -155,7 +163,12 @@ public actor KeychainSecretGenerationManager: SecretGenerationManaging {
     return SecretProjection(generation: staged.generation, secrets: secrets)
   }
 
+  public func releaseLease(for staged: StagedSecretGeneration) async {
+    releaseLease(forGeneration: staged.generation)
+  }
+
   public func removeGeneration(_ generation: UInt64) async throws {
+    leaseCounts.removeValue(forKey: generation)
     do {
       try await removeReferences(inGeneration: generation)
     } catch {
@@ -165,6 +178,7 @@ public actor KeychainSecretGenerationManager: SecretGenerationManaging {
 
   public func cleanup(retainingGenerations: Set<UInt64>) async throws {
     let references: Set<ProviderSecretReference>
+    let leasesAtStart = Set(leaseCounts.keys)
     do {
       references = try await store.allReferences()
     } catch {
@@ -174,9 +188,14 @@ public actor KeychainSecretGenerationManager: SecretGenerationManaging {
     var failed = false
     for reference
       in references
-      .filter({ !retainingGenerations.contains($0.generation) })
       .sorted(by: { $0.accountName < $1.accountName })
     {
+      if retainingGenerations.contains(reference.generation)
+        || leasesAtStart.contains(reference.generation)
+        || leaseCounts[reference.generation] != nil
+      {
+        continue
+      }
       do {
         try await store.removeSecret(for: reference)
       } catch {
@@ -186,6 +205,19 @@ public actor KeychainSecretGenerationManager: SecretGenerationManaging {
 
     if failed {
       throw SecretGenerationStoreError.cleanupFailed
+    }
+  }
+
+  private func acquireLease(for generation: UInt64) {
+    leaseCounts[generation, default: 0] += 1
+  }
+
+  private func releaseLease(forGeneration generation: UInt64) {
+    guard let count = leaseCounts[generation] else { return }
+    if count <= 1 {
+      leaseCounts.removeValue(forKey: generation)
+    } else {
+      leaseCounts[generation] = count - 1
     }
   }
 
