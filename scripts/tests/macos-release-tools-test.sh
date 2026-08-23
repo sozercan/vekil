@@ -26,6 +26,11 @@ expect_failure() {
   fi
 }
 
+"${REPO_ROOT}/scripts/validate-release-tag.sh" v1.2.3
+expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" v1.2.3-rc.1
+expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" 1.2.3
+expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" v1.2
+
 "${MANIFEST_TOOL}" validate-config --config "${CONFIG}"
 expect_failure "${MANIFEST_TOOL}" resolve \
   --config "${CONFIG}" \
@@ -318,6 +323,7 @@ bash -n \
   "${REPO_ROOT}/scripts/package-macos-app.sh" \
   "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" \
   "${REPO_ROOT}/scripts/sign-macos-app.sh" \
+  "${REPO_ROOT}/scripts/validate-release-tag.sh" \
   "${REPO_ROOT}/scripts/verify-macos-app.sh" \
   "${REPO_ROOT}/scripts/verify-macos-release-artifact.sh" \
   "${REPO_ROOT}/scripts/verify-macos-release-gates.sh" \

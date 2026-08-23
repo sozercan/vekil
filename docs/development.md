@@ -264,7 +264,7 @@ The macOS workflow in [`.github/workflows/macos-app.yaml`](../.github/workflows/
 
 ## Release
 
-Production releases are started manually from protected `main` through [`.github/workflows/release.yaml`](../.github/workflows/release.yaml), with an existing semantic-version tag such as `v1.2.3` as input. The workflow fails before credentialed jobs unless that tag resolves to a commit reachable from `origin/main`, then uses [`.goreleaser.yaml`](../.goreleaser.yaml) to publish CLI binaries and checksums for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
+Production releases are started manually from protected `main` through [`.github/workflows/release.yaml`](../.github/workflows/release.yaml), with an existing stable semantic-version tag such as `v1.2.3` as input. Prerelease tags are rejected until the project has a persistent prerelease Sparkle feed. The workflow fails before credentialed jobs unless the stable tag resolves to a commit reachable from `origin/main`, then uses [`.goreleaser.yaml`](../.goreleaser.yaml) to publish CLI binaries and checksums for `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`.
 
 RTK version bumps for the optional Docker variant are automated by [`.github/workflows/update-rtk.yaml`](../.github/workflows/update-rtk.yaml). The scheduled workflow runs [`scripts/update-rtk-version.sh`](../scripts/update-rtk-version.sh), updates the pinned `RTK_VERSION` Docker build arg in `Dockerfile.rtk` when `rtk-ai/rtk` publishes a new latest release, validates the rebuilt variant with `make docker-build-rtk` and `make docker-rtk-e2e`, and opens a signed PR.
 
