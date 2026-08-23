@@ -637,6 +637,7 @@ public final class VekilAppState: ObservableObject {
   @discardableResult
   private func apply(_ incoming: AppRuntimeStateSnapshot) -> Bool {
     let currentToken = runtimeState.launchToken
+    let previousStateError = runtimeState.lastError
     let hasCurrentIdentity = currentToken != RuntimeLaunchIdentity.zero.launchToken
     let isHealthyReplacement = hasCurrentIdentity
       && incoming.launchToken != currentToken
@@ -671,6 +672,8 @@ public final class VekilAppState: ObservableObject {
     runtimeState = incoming
     if let error = incoming.lastError {
       lastError = error
+    } else if let previousStateError, lastError == previousStateError {
+      lastError = nil
     } else if isHealthyReplacement, lastError?.code == "helper_failed" {
       lastError = nil
     }

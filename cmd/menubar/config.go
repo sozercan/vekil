@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +13,10 @@ import (
 	"github.com/sozercan/vekil/proxy"
 )
 
-const menubarConfigFilename = "menubar.json"
+const (
+	menubarConfigFilename       = "menubar.json"
+	legacyCopilotConfigRevision = "cfg_legacy_copilot"
+)
 
 var (
 	userConfigDir          = os.UserConfigDir
@@ -21,8 +25,9 @@ var (
 )
 
 type menubarConfig struct {
-	ProvidersConfigPath string `json:"providers_config_path,omitempty"`
-	versionedState      map[string]json.RawMessage
+	ProvidersConfigPath    string `json:"providers_config_path,omitempty"`
+	selectedConfigRevision string
+	versionedState         map[string]json.RawMessage
 }
 
 func menubarConfigPath() (string, error) {
@@ -55,6 +60,7 @@ func loadMenubarConfig() (menubarConfig, error) {
 		Version             int    `json:"version"`
 		ConfigMode          string `json:"config_mode"`
 		SelectedPath        string `json:"selected_path"`
+		SelectedRevision    string `json:"selected_config_revision"`
 		ProvidersConfigPath string `json:"providers_config_path"`
 	}
 	if err := json.Unmarshal(body, &probe); err != nil {
@@ -65,6 +71,7 @@ func loadMenubarConfig() (menubarConfig, error) {
 		cfg.versionedState = raw
 		if strings.TrimSpace(probe.ConfigMode) == "external" {
 			cfg.ProvidersConfigPath = strings.TrimSpace(probe.SelectedPath)
+			cfg.selectedConfigRevision = strings.TrimSpace(probe.SelectedRevision)
 			if cfg.ProvidersConfigPath == "" {
 				cfg.ProvidersConfigPath = strings.TrimSpace(probe.ProvidersConfigPath)
 			}
@@ -76,6 +83,14 @@ func loadMenubarConfig() (menubarConfig, error) {
 }
 
 func saveMenubarConfig(cfg menubarConfig) error {
+	return saveMenubarConfigWithRecovery(cfg, false)
+}
+
+func saveMenubarConfigReplacingUnreadable(cfg menubarConfig) error {
+	return saveMenubarConfigWithRecovery(cfg, true)
+}
+
+func saveMenubarConfigWithRecovery(cfg menubarConfig, replaceUnreadable bool) error {
 	path, err := menubarConfigPath()
 	if err != nil {
 		return err
@@ -85,9 +100,21 @@ func saveMenubarConfig(cfg menubarConfig) error {
 	if cfg.versionedState == nil {
 		existing, err := loadMenubarConfig()
 		if err != nil {
-			return fmt.Errorf("preserve existing menubar config: %w", err)
+			if !replaceUnreadable {
+				return fmt.Errorf("preserve existing menubar config: %w", err)
+			}
+			if err := ensureMenubarConfigDirectory(path); err != nil {
+				return err
+			}
+			if err := backupUnreadableMenubarConfig(path); err != nil {
+				return err
+			}
+		} else {
+			cfg.versionedState = existing.versionedState
+			if cfg.selectedConfigRevision == "" && cfg.ProvidersConfigPath == existing.ProvidersConfigPath {
+				cfg.selectedConfigRevision = existing.selectedConfigRevision
+			}
 		}
-		cfg.versionedState = existing.versionedState
 	}
 	if cfg.versionedState == nil && cfg.ProvidersConfigPath == "" {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -96,11 +123,8 @@ func saveMenubarConfig(cfg menubarConfig) error {
 		return nil
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create menubar config dir: %w", err)
-	}
-	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("protect menubar config dir: %w", err)
+	if err := ensureMenubarConfigDirectory(path); err != nil {
+		return err
 	}
 
 	var body []byte
@@ -121,12 +145,16 @@ func saveMenubarConfig(cfg menubarConfig) error {
 			_ = set("config_mode", "legacy")
 			delete(raw, "selected_path")
 			delete(raw, "providers_config_path")
-			_ = set("selected_config_revision", "cfg_legacy_copilot")
+			_ = set("selected_config_revision", legacyCopilotConfigRevision)
 		} else {
 			_ = set("config_mode", "external")
 			_ = set("selected_path", cfg.ProvidersConfigPath)
 			_ = set("providers_config_path", cfg.ProvidersConfigPath)
-			delete(raw, "selected_config_revision")
+			if cfg.selectedConfigRevision == "" {
+				delete(raw, "selected_config_revision")
+			} else {
+				_ = set("selected_config_revision", cfg.selectedConfigRevision)
+			}
 		}
 		body, err = json.MarshalIndent(raw, "", "  ")
 	} else {
@@ -137,6 +165,30 @@ func saveMenubarConfig(cfg menubarConfig) error {
 	}
 	body = append(body, '\n')
 	return writeMenubarConfigAtomic(path, body)
+}
+
+func ensureMenubarConfigDirectory(path string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create menubar config dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("protect menubar config dir: %w", err)
+	}
+	return nil
+}
+
+func backupUnreadableMenubarConfig(path string) error {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	digest := sha256.Sum256(body)
+	backupPath := fmt.Sprintf("%s.unreadable-%x.bak", path, digest[:8])
+	if err := writeMenubarConfigAtomic(backupPath, append([]byte(nil), body...)); err != nil {
+		return fmt.Errorf("backup unreadable menubar config %q: %w", path, err)
+	}
+	return nil
 }
 
 func writeMenubarConfigAtomic(path string, body []byte) (returnErr error) {

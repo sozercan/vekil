@@ -348,6 +348,58 @@ final class VekilAppStateTests: XCTestCase {
     })
   }
 
+  func testCleanRefreshClearsRecoveredConfigurationError() async {
+    var unavailable = AppRuntimeStateSnapshot.connectedStopped
+    unavailable.configuration = AppRuntimeConfigurationState(
+      mode: .external,
+      displayName: "providers.yaml",
+      selectedExternalPath: "/tmp/providers.yaml",
+      drift: .missing,
+      requiresGitHubAuthentication: false
+    )
+    unavailable.lastError = AppRuntimeStructuredError(
+      code: "missing_config",
+      userMessage: "The selected configuration is unavailable."
+    )
+    let runtime = RuntimeClientSpy(state: unavailable)
+    let state = makeState(runtime: runtime)
+    await assertTrueAsync(await state.initialize())
+    XCTAssertEqual(state.lastError?.code, "missing_config")
+
+    var recovered = unavailable
+    recovered.stateRevision = 2
+    recovered.configuration.drift = .none
+    recovered.lastError = nil
+    await runtime.setInitialization(recovered)
+
+    await assertTrueAsync(await state.refreshRuntimeState())
+    XCTAssertNil(state.lastError)
+  }
+
+  func testCleanRefreshRetainsNewerCommandFailure() async {
+    var unavailable = AppRuntimeStateSnapshot.connectedStopped
+    unavailable.configuration.drift = .invalid
+    unavailable.lastError = AppRuntimeStructuredError(
+      code: "invalid_config",
+      userMessage: "The selected configuration is unavailable."
+    )
+    let runtime = RuntimeClientSpy(state: unavailable)
+    let state = makeState(runtime: runtime)
+    await assertTrueAsync(await state.initialize())
+
+    await assertFalseAsync(await state.copyText(""))
+    XCTAssertEqual(state.lastError?.code, "clipboard_value_invalid")
+
+    var recovered = unavailable
+    recovered.stateRevision = 2
+    recovered.configuration.drift = .none
+    recovered.lastError = nil
+    await runtime.setInitialization(recovered)
+
+    await assertTrueAsync(await state.refreshRuntimeState())
+    XCTAssertEqual(state.lastError?.code, "clipboard_value_invalid")
+  }
+
   func testConnectionEventsDoNotConsumeTheNextAuthoritativeStateRevision() async {
     let runtime = RuntimeClientSpy()
     var initial = AppRuntimeStateSnapshot.connectedStopped

@@ -256,6 +256,22 @@ func TestCanceledConfigSelectionPreservesRestoreFailure(t *testing.T) {
 	}
 }
 
+func TestMapProtocolErrorPrioritizesRollbackFailureOverCancellation(t *testing.T) {
+	rollbackErr := errors.New("restore failed")
+	tests := map[string]error{
+		"managed apply": &ManagedApplyError{Primary: context.Canceled, Rollback: rollbackErr},
+		"config switch": &ConfigSwitchError{Primary: context.Canceled, Rollback: rollbackErr},
+	}
+	for name, err := range tests {
+		t.Run(name, func(t *testing.T) {
+			mapped := mapProtocolError(err)
+			if mapped == nil || mapped.Code != "rollback_failed" || mapped.Retryable || mapped.RecoveryAction != "open_recovery" {
+				t.Fatalf("mapProtocolError(%v) = %+v", err, mapped)
+			}
+		})
+	}
+}
+
 func TestCanceledStoppedConfigSelectionRestoresPriorSelection(t *testing.T) {
 	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
 	manager, _, h := newConfigSwitchHarness(t, factory)

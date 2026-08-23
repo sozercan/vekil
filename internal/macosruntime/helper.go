@@ -599,6 +599,9 @@ func mapProtocolError(err error) *ProtocolError {
 	if err == nil {
 		return nil
 	}
+	if hasRollbackFailure(err) {
+		return protocolError("rollback_failed", "The previous configuration could not be fully restored.", false, "open_recovery")
+	}
 	switch {
 	case errors.Is(err, appcontrol.ErrOperationInProgress):
 		return protocolError("operation_in_progress", "Another operation is still finishing.", true, "wait")
@@ -617,9 +620,6 @@ func mapProtocolError(err error) *ProtocolError {
 	}
 	var applyErr *ManagedApplyError
 	if errors.As(err, &applyErr) {
-		if applyErr.Rollback != nil {
-			return protocolError("rollback_failed", "The managed configuration could not be applied or fully restored.", false, "open_recovery")
-		}
 		return protocolError("managed_apply_failed", "The managed configuration was not applied. The previous configuration was restored.", true, "open_providers")
 	}
 	var stage *appcontrol.StageError

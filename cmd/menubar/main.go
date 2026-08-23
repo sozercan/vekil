@@ -605,11 +605,16 @@ func clearProvidersConfig() {
 func applyProvidersConfigPath(path string) error {
 	nextCfg := menubarCfg
 	nextCfg.ProvidersConfigPath = path
-	loadedProvidersCfg, err := proxy.LoadProvidersConfigFile(path)
+	loadedProvidersCfg, snapshot, err := proxy.LoadProvidersConfigSnapshot(context.Background(), path)
 	if err != nil {
 		return err
 	}
-	if err := saveMenubarConfig(nextCfg); err != nil {
+	if strings.TrimSpace(path) == "" {
+		nextCfg.selectedConfigRevision = legacyCopilotConfigRevision
+	} else {
+		nextCfg.selectedConfigRevision = proxy.ProvidersConfigRevision(snapshot)
+	}
+	if err := saveMenubarConfigReplacingUnreadable(nextCfg); err != nil {
 		return err
 	}
 	nextCfg, err = loadMenubarConfig()

@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +19,13 @@ const (
 	maxRemoteProvidersConfigBodySize = 4 << 20
 	remoteProvidersConfigTimeout     = 15 * time.Second
 )
+
+// ProvidersConfigRevision returns the stable revision used to bind one exact
+// provider-configuration byte snapshot across proxy frontends.
+func ProvidersConfigRevision(body []byte) string {
+	digest := sha256.Sum256(body)
+	return "cfg_" + base64.RawURLEncoding.EncodeToString(digest[:16])
+}
 
 func readProvidersConfigSource(ctx context.Context, source string) ([]byte, error) {
 	if ctx == nil {

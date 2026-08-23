@@ -397,7 +397,10 @@ func TestVersionedNativeStateIsPreservedByForwardRevertEdits(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(initial), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveMenubarConfig(menubarConfig{ProvidersConfigPath: "/tmp/external.yaml"}); err != nil {
+	if err := saveMenubarConfig(menubarConfig{
+		ProvidersConfigPath:    "/tmp/external.yaml",
+		selectedConfigRevision: "cfg_external",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(configPath)
@@ -408,7 +411,7 @@ func TestVersionedNativeStateIsPreservedByForwardRevertEdits(t *testing.T) {
 	if err := json.Unmarshal(body, &state); err != nil {
 		t.Fatal(err)
 	}
-	if state["managed_ownership_id"] != "owner-123" || state["secret_generation"] != float64(7) || state["config_mode"] != "external" || state["selected_path"] != "/tmp/external.yaml" {
+	if state["managed_ownership_id"] != "owner-123" || state["secret_generation"] != float64(7) || state["config_mode"] != "external" || state["selected_path"] != "/tmp/external.yaml" || state["selected_config_revision"] != "cfg_external" {
 		t.Fatalf("versioned state was not preserved: %s", body)
 	}
 
@@ -424,5 +427,47 @@ func TestVersionedNativeStateIsPreservedByForwardRevertEdits(t *testing.T) {
 	}
 	if state["managed_ownership_id"] != "owner-123" || state["config_mode"] != "legacy" {
 		t.Fatalf("clear destroyed native ownership state: %s", body)
+	}
+}
+
+func TestSaveMenubarConfigReplacingUnreadablePreservesBackup(t *testing.T) {
+	configDir := stubUserConfigDir(t)
+	configPath := filepath.Join(configDir, "vekil", menubarConfigFilename)
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unreadable := []byte("{\n")
+	if err := os.WriteFile(configPath, unreadable, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := saveMenubarConfigReplacingUnreadable(menubarConfig{
+		ProvidersConfigPath:    "/tmp/recovered.yaml",
+		selectedConfigRevision: "cfg_recovered",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadMenubarConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProvidersConfigPath != "/tmp/recovered.yaml" {
+		t.Fatalf("recovered path = %q", cfg.ProvidersConfigPath)
+	}
+
+	backups, err := filepath.Glob(configPath + ".unreadable-*.bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("unreadable backups = %v, want one", backups)
+	}
+	backup, err := os.ReadFile(backups[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(backup, unreadable) {
+		t.Fatalf("backup = %q, want %q", backup, unreadable)
 	}
 }

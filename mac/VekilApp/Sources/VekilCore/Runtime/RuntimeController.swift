@@ -1455,6 +1455,7 @@ public actor RuntimeController {
         session.writeTail?.cancel()
         self.session = nil
         failPendingRequests(with: requestError)
+        failActiveOperationsForHelperExit()
         moveCurrentStateToPreviousRun()
         clearSessionIdentity()
         if !preserveFailureState { setConnectionState(.stopped) }

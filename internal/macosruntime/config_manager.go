@@ -929,7 +929,7 @@ func clonePersistentState(state PersistentState) PersistentState {
 
 func configRevision(body []byte) (string, string) {
 	digest := sha256.Sum256(body)
-	return "cfg_" + base64.RawURLEncoding.EncodeToString(digest[:16]), hex.EncodeToString(digest[:])
+	return proxy.ProvidersConfigRevision(body), hex.EncodeToString(digest[:])
 }
 
 func reconcileManagedProviders(existing []ProviderIdentity, drafts []ManagedProviderDraft, generation uint64, newUUID func() string) ([]proxy.ProviderConfig, []ProviderIdentity, error) {

@@ -1400,6 +1400,73 @@ final class RuntimeControllerTests: XCTestCase {
         }
     }
 
+    func testUnresponsiveFailedSessionRetiresActiveOperationAfterForceTerminationTimeout() async throws {
+        let process = FakeRuntimeProcess()
+        process.onRun { [weak process] in
+            process?.emitStandardOutput(try! encodedHello())
+        }
+        process.onWrite { [weak process] data in
+            guard let process, let request = try? requestFromLine(data) else { return }
+            if request.command == .getState {
+                let state = RuntimeStatePayload(
+                    service: .stopped,
+                    readiness: .unknown,
+                    auth: .signedIn
+                )
+                process.emitStandardOutput(
+                    try! encodedResponse(
+                        for: request,
+                        result: .object([
+                            "state_revision": .integer(1),
+                            "state": try! JSONValue.encode(state),
+                        ])
+                    )
+                )
+            } else if request.command == .start {
+                process.emitStandardOutput(
+                    try! encodedResponse(
+                        for: request,
+                        result: .object([
+                            "accepted": .bool(true),
+                            "operation_id": .string("op_start"),
+                        ])
+                    )
+                )
+            }
+        }
+
+        let clock = ManualRuntimeClock()
+        var configuration = makeConfiguration(
+            restartPolicy: RuntimeRestartPolicy(maximumAutomaticRestarts: 0)
+        )
+        configuration.shutdownGracePeriod = 11
+        configuration.forceTerminationGracePeriod = 2
+        let controller = RuntimeController(
+            configuration: configuration,
+            processFactory: FakeRuntimeProcessFactory([process]),
+            clock: clock,
+            idGenerator: SequenceRuntimeIDGenerator(["req_state", "req_start"])
+        )
+        _ = try await controller.connect()
+        let handle = try await controller.submitOperation(command: .start)
+        let terminal = Task { try await controller.waitForOperation(id: handle.id) }
+
+        process.emitStandardOutput(Data("{}\n".utf8))
+        try await eventually { process.terminateCount == 1 }
+        try await eventually { clock.recordedSleeps.contains(11) }
+        clock.advance(by: 11)
+        try await eventually { process.forceTerminateCount == 1 }
+        try await eventually { clock.recordedSleeps.contains(2) }
+        clock.advance(by: 2)
+
+        let failed = try await terminal.value
+        XCTAssertEqual(failed.status, .failed)
+        XCTAssertEqual(failed.error?.code, "helper_exited")
+        let snapshot = await controller.snapshot()
+        XCTAssertNil(snapshot.activeOperationID)
+        XCTAssertEqual(snapshot.operations[handle.id]?.status, .failed)
+    }
+
     private func stateEvent(
         epoch: String,
         revision: UInt64,
