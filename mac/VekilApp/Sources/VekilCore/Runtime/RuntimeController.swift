@@ -509,13 +509,26 @@ public actor RuntimeController {
             throw RuntimeControllerError.operationAlreadyActive(activeOperationID)
         }
 
-        if command == .stop {
+        let isStop = command == .stop
+        if isStop {
+            preserveStoppedIntent = true
             restoreProxyAfterReconnect = false
         }
 
-        let response = try await send(command: command, payload: payload, timeout: timeout)
-        guard let result = response.result,
-              let admission = try? result.decode(RuntimeAdmissionResult.self),
+        let response: RuntimeResponseEnvelope
+        do {
+            response = try await send(command: command, payload: payload, timeout: timeout)
+        } catch {
+            if isStop, stopAdmissionDefinitelyFailed(error) {
+                preserveStoppedIntent = false
+            }
+            throw error
+        }
+        let admission = response.result.flatMap { try? $0.decode(RuntimeAdmissionResult.self) }
+        if isStop, admission?.accepted == false {
+            preserveStoppedIntent = false
+        }
+        guard let admission,
               admission.accepted,
               let operationID = admission.operationID,
               !operationID.isEmpty else {
@@ -542,6 +555,20 @@ public actor RuntimeController {
             kind: tracked.kind,
             launchIdentity: RuntimeLaunchIdentity(launchToken: tracked.launchToken, helperEpoch: tracked.helperEpoch)
         )
+    }
+
+    private func stopAdmissionDefinitelyFailed(_ error: Error) -> Bool {
+        if error is CancellationError || error is RuntimeStructuredError {
+            return true
+        }
+        guard let error = error as? RuntimeControllerError else { return false }
+        switch error {
+        case .invalidConfiguration, .notConnected, .controllerStopping,
+             .requestEncodingFailed, .duplicateRequestID:
+            return true
+        default:
+            return false
+        }
     }
 
     public func waitForOperation(id: String) async throws -> RuntimeTrackedOperation {

@@ -1035,6 +1035,209 @@ final class RuntimeControllerTests: XCTestCase {
         XCTAssertEqual(snapshot.operations["op_stop"]?.error?.code, "helper_exited")
     }
 
+    func testAutomaticRestartPreservesStopIntentWhenAdmissionResponseIsLost() async throws {
+        let first = FakeRuntimeProcess()
+        first.onRun { [weak first] in
+            first?.emitStandardOutput(try! encodedHello(epoch: "hep_original"))
+        }
+        first.onWrite { [weak first] data in
+            guard let first, let request = try? requestFromLine(data),
+                  request.command == .getState else { return }
+            let state = RuntimeStatePayload(
+                runtimeGeneration: 7,
+                configRevision: "cfg_running",
+                service: .running,
+                readiness: .ready,
+                auth: .signedIn
+            )
+            first.emitStandardOutput(
+                try! encodedResponse(
+                    for: request,
+                    epoch: "hep_original",
+                    result: .object([
+                        "state_revision": .integer(1),
+                        "state": try! JSONValue.encode(state),
+                    ])
+                )
+            )
+        }
+
+        let replacement = FakeRuntimeProcess()
+        configureSuccessfulHandshake(process: replacement, epoch: "hep_replacement")
+
+        let controller = RuntimeController(
+            configuration: makeConfiguration(
+                restartPolicy: RuntimeRestartPolicy(
+                    maximumAutomaticRestarts: 1,
+                    window: 60,
+                    delays: [0]
+                )
+            ),
+            processFactory: FakeRuntimeProcessFactory([first, replacement]),
+            clock: ManualRuntimeClock(),
+            idGenerator: SequenceRuntimeIDGenerator([
+                "req_original_state", "req_stop", "req_replacement_state",
+                "req_unwanted_restore",
+            ])
+        )
+        _ = try await controller.connect()
+
+        let stop = Task { try await controller.submitOperation(command: .stop) }
+        try await eventually {
+            first.writtenData.contains { data in
+                (try? requestFromLine(data).command) == .stop
+            }
+        }
+        first.emitExit(status: 1)
+
+        do {
+            _ = try await stop.value
+            XCTFail("Expected the lost stop response to fail with the helper exit")
+        } catch {
+            guard let controllerError = error as? RuntimeControllerError else {
+                return XCTFail("stop error = \(error), want helperExited")
+            }
+            guard case .helperExited = controllerError else {
+                return XCTFail("stop error = \(error), want helperExited")
+            }
+        }
+        try await eventually {
+            let snapshot = await controller.snapshot()
+            return snapshot.connectionState == .connected
+                && snapshot.currentState?.helperEpoch == "hep_replacement"
+        }
+        XCTAssertEqual(
+            try replacement.writtenData.map(requestFromLine).map(\.command),
+            [.getState]
+        )
+    }
+
+    func testDefinitiveStopRejectionAllowsAutomaticRestore() async throws {
+        let first = FakeRuntimeProcess()
+        first.onRun { [weak first] in
+            first?.emitStandardOutput(try! encodedHello(epoch: "hep_original"))
+        }
+        first.onWrite { [weak first] data in
+            guard let first, let request = try? requestFromLine(data) else { return }
+            if request.command == .getState {
+                let state = RuntimeStatePayload(
+                    runtimeGeneration: 7,
+                    configRevision: "cfg_running",
+                    service: .running,
+                    readiness: .ready,
+                    auth: .signedIn
+                )
+                first.emitStandardOutput(
+                    try! encodedResponse(
+                        for: request,
+                        epoch: "hep_original",
+                        result: .object([
+                            "state_revision": .integer(1),
+                            "state": try! JSONValue.encode(state),
+                        ])
+                    )
+                )
+            } else if request.command == .stop {
+                let rejection = RuntimeStructuredError(
+                    code: "operation_in_progress",
+                    userMessage: "Another operation is still finishing.",
+                    retryable: true,
+                    recoveryAction: "wait"
+                )
+                first.emitStandardOutput(
+                    try! RuntimeFrameCodec().encodeLine(
+                        RuntimeResponseEnvelope(
+                            version: 1,
+                            id: request.id,
+                            helperEpoch: "hep_original",
+                            ok: false,
+                            error: rejection
+                        )
+                    )
+                )
+            }
+        }
+
+        let replacement = FakeRuntimeProcess()
+        replacement.onRun { [weak replacement] in
+            replacement?.emitStandardOutput(try! encodedHello(epoch: "hep_replacement"))
+        }
+        replacement.onWrite { [weak replacement] data in
+            guard let replacement, let request = try? requestFromLine(data) else { return }
+            if request.command == .getState {
+                let state = RuntimeStatePayload(
+                    runtimeGeneration: 0,
+                    configRevision: "cfg_running",
+                    service: .stopped,
+                    readiness: .unknown,
+                    auth: .signedIn
+                )
+                replacement.emitStandardOutput(
+                    try! encodedResponse(
+                        for: request,
+                        epoch: "hep_replacement",
+                        result: .object([
+                            "state_revision": .integer(1),
+                            "state": try! JSONValue.encode(state),
+                        ])
+                    )
+                )
+            } else if request.command == .start {
+                let rejection = RuntimeStructuredError(
+                    code: "authentication_failed",
+                    userMessage: "Provider authentication failed during startup.",
+                    retryable: true,
+                    recoveryAction: "retry_start"
+                )
+                replacement.emitStandardOutput(
+                    try! RuntimeFrameCodec().encodeLine(
+                        RuntimeResponseEnvelope(
+                            version: 1,
+                            id: request.id,
+                            helperEpoch: "hep_replacement",
+                            ok: false,
+                            error: rejection
+                        )
+                    )
+                )
+            }
+        }
+
+        let controller = RuntimeController(
+            configuration: makeConfiguration(
+                restartPolicy: RuntimeRestartPolicy(
+                    maximumAutomaticRestarts: 1,
+                    window: 60,
+                    delays: [0]
+                )
+            ),
+            processFactory: FakeRuntimeProcessFactory([first, replacement]),
+            clock: ManualRuntimeClock(),
+            idGenerator: SequenceRuntimeIDGenerator([
+                "req_original_state", "req_stop", "req_replacement_state", "req_restore_start",
+            ])
+        )
+        _ = try await controller.connect()
+
+        do {
+            _ = try await controller.submitOperation(command: .stop)
+            XCTFail("Expected a definitive stop rejection")
+        } catch {
+            XCTAssertEqual((error as? RuntimeStructuredError)?.code, "operation_in_progress")
+        }
+
+        first.emitExit(status: 1)
+        try await eventually {
+            let snapshot = await controller.snapshot()
+            return snapshot.connectionState == .connected
+                && snapshot.currentState?.helperEpoch == "hep_replacement"
+        }
+        XCTAssertEqual(
+            try replacement.writtenData.map(requestFromLine).map(\.command),
+            [.getState, .start]
+        )
+    }
+
     func testAutomaticRestartRestoreFailureKeepsReplacementConnected() async throws {
         let first = FakeRuntimeProcess()
         first.onRun { [weak first] in
