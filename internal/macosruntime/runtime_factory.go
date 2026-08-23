@@ -85,7 +85,10 @@ func (f *RuntimeFactory) NewRuntime(ctx context.Context, configuration appcontro
 		// explicit cancellable startup phase after listener/auth initialization.
 		proxy.WithDeferredDynamicProviderModelValidation(true),
 	)
-	if f.secrets != nil && configuration.SecretGeneration > 0 {
+	if configuration.SecretGeneration > 0 {
+		if f.secrets == nil {
+			return nil, errors.New("secret projection store is required for managed secret generation")
+		}
 		proxyOptions = append(proxyOptions, proxy.WithProviderSecretResolver(
 			f.secrets.Resolver(configuration.Revision, configuration.SecretGeneration),
 		))
