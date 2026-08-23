@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import subprocess
 import sys
@@ -59,6 +60,19 @@ def decode_base64(value: str, label: str, expected_bytes: int) -> bytes:
     if len(decoded) != expected_bytes:
         raise VerificationError(f"{label} must decode to {expected_bytes} bytes")
     return decoded
+
+
+def sha256_file(path: Path, label: str) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+    except OSError as exc:
+        raise VerificationError(f"cannot read {label} {path}: {exc}") from exc
+    return digest.hexdigest(), size
 
 
 def extract_signed_appcast(raw_appcast: bytes) -> tuple[bytes, bytes]:
@@ -146,6 +160,7 @@ def main() -> int:
     parser.add_argument("--appcast", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--artifact")
+    parser.add_argument("--legacy-artifact")
     parser.add_argument("--expected-url-prefix")
     parser.add_argument("--require-legacy-compatible-entry", action="store_true")
     args = parser.parse_args()
@@ -264,16 +279,59 @@ def main() -> int:
 
     if args.require_legacy_compatible_entry:
         legacy_version = str(legacy.get("last_compatible_bundle_version") or "")
+        legacy_marketing = str(legacy.get("last_compatible_marketing_version") or "")
         legacy_minimum = str(legacy.get("minimum_system_version") or "")
-        matches = [item for item in items if text(item, "version") == legacy_version]
-        if not matches:
+        legacy_url = str(legacy.get("last_compatible_artifact_url") or "")
+        legacy_sha256 = str(legacy.get("last_compatible_artifact_sha256") or "")
+        if not all((legacy_version, legacy_marketing, legacy_minimum, legacy_url, legacy_sha256)):
+            raise VerificationError("manifest is missing legacy compatible release identity fields")
+
+        version_matches = [item for item in items if text(item, "version") == legacy_version]
+        if not version_matches:
             raise VerificationError(
                 f"appcast no longer preserves legacy compatible release {legacy_version}"
             )
-        if all(version_tuple(text(item, "minimumSystemVersion")) > version_tuple("12.999") for item in matches):
+        exact_matches: list[tuple[ET.Element, ET.Element]] = []
+        for item in version_matches:
+            enclosure = item.find("enclosure")
+            if enclosure is None:
+                continue
+            if (
+                text(item, "shortVersionString") == legacy_marketing
+                and text(item, "minimumSystemVersion") == legacy_minimum
+                and (enclosure.get("url") or "").strip() == legacy_url
+            ):
+                exact_matches.append((item, enclosure))
+        if len(exact_matches) != 1:
+            raise VerificationError(
+                "expected one legacy entry matching the manifest marketing version, "
+                f"minimum system version, and enclosure URL; found {len(exact_matches)}"
+            )
+
+        legacy_item, legacy_enclosure = exact_matches[0]
+        if version_tuple(text(legacy_item, "minimumSystemVersion")) > version_tuple("12.999"):
             raise VerificationError("legacy release entry is not eligible for pre-macOS-13 users")
-        if all(text(item, "minimumSystemVersion") != legacy_minimum for item in matches):
-            raise VerificationError("legacy release minimumSystemVersion changed unexpectedly")
+        parsed_legacy_url = urllib.parse.urlparse(legacy_url)
+        if parsed_legacy_url.scheme != "https" or not Path(parsed_legacy_url.path).name:
+            raise VerificationError("legacy enclosure URL must identify an HTTPS artifact")
+        if not args.legacy_artifact:
+            raise VerificationError(
+                "--legacy-artifact is required with --require-legacy-compatible-entry"
+            )
+        legacy_artifact = Path(args.legacy_artifact)
+        actual_sha256, actual_length = sha256_file(legacy_artifact, "legacy artifact")
+        if actual_sha256 != legacy_sha256:
+            raise VerificationError(
+                f"legacy artifact SHA-256 {actual_sha256} does not match manifest {legacy_sha256}"
+            )
+        try:
+            expected_length = int(legacy_enclosure.get("length") or "")
+        except ValueError as exc:
+            raise VerificationError("legacy enclosure length is invalid") from exc
+        if expected_length != actual_length:
+            raise VerificationError(
+                f"legacy enclosure length {expected_length} does not match artifact {actual_length}"
+            )
 
     print(
         f"verified appcast candidate {marketing_version} ({bundle_version}), "

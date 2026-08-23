@@ -272,6 +272,7 @@ The same release workflow also:
 
 - builds, signs, notarizes, staples, tests, and packages one `vekil-macos-universal.zip`;
 - preserves its SHA-256 through signed appcast generation, GitHub upload/download verification, and the Homebrew cask;
+- verifies the retained legacy appcast entry against its pinned version, minimum macOS, artifact URL, and artifact SHA-256;
 - requires exact-digest N-1 update, Homebrew installation, and forward-revert attestations before publication;
 - keeps the GitHub release as a draft until the exact macOS assets and immutable versioned container manifests are published;
 - publishes the GitHub release before updating the public Homebrew cask, verifies the release asset anonymously, and only then advances the GHCR `latest` and `latest-rtk` manifests.

@@ -38,7 +38,16 @@ openssl pkey -in "${TMP_ROOT}/test-key.pem" -outform DER -out "${TMP_ROOT}/test-
 openssl pkey -in "${TMP_ROOT}/test-key.pem" -pubout -outform DER -out "${TMP_ROOT}/test-public.der"
 private_seed="$(tail -c 32 "${TMP_ROOT}/test-private.der" | base64 | tr -d '\r\n')"
 public_key="$(tail -c 32 "${TMP_ROOT}/test-public.der" | base64 | tr -d '\r\n')"
-python3 - "${manifest}" "${public_key}" <<'PY'
+legacy_artifact="${TMP_ROOT}/vekil-macos-arm64.zip"
+printf 'legacy-zip-fixture' >"${legacy_artifact}"
+legacy_artifact_size="$(wc -c <"${legacy_artifact}" | tr -d ' ')"
+legacy_artifact_sha256="$(shasum -a 256 "${legacy_artifact}" | awk '{print $1}')"
+legacy_artifact_url="https://example.invalid/v0.14.1/vekil-macos-arm64.zip"
+python3 - \
+  "${manifest}" \
+  "${public_key}" \
+  "${legacy_artifact_url}" \
+  "${legacy_artifact_sha256}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -46,6 +55,8 @@ from pathlib import Path
 path = Path(sys.argv[1])
 value = json.loads(path.read_text())
 value["sparkle"]["public_ed_key"] = sys.argv[2]
+value["legacy_shell"]["last_compatible_artifact_url"] = sys.argv[3]
+value["legacy_shell"]["last_compatible_artifact_sha256"] = sys.argv[4]
 path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 PY
 
@@ -72,7 +83,7 @@ cat >"${TMP_ROOT}/base-appcast.xml" <<EOF_APPCAST
       <sparkle:shortVersionString>0.14.1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>10.13</sparkle:minimumSystemVersion>
       <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-      <enclosure url="https://example.invalid/v0.14.1/vekil-macos-arm64.zip" length="1" type="application/octet-stream" sparkle:edSignature="${signature}"/>
+      <enclosure url="${legacy_artifact_url}" length="${legacy_artifact_size}" type="application/octet-stream" sparkle:edSignature="${signature}"/>
     </item>
   </channel>
 </rss><!-- sparkle-signatures:
@@ -83,6 +94,7 @@ EOF_APPCAST
 
 SPARKLE_PRIVATE_ED_KEY="${private_seed}" \
 SPARKLE_BASE_APPCAST_FILE="${TMP_ROOT}/base-appcast.xml" \
+SPARKLE_LEGACY_ARTIFACT_FILE="${legacy_artifact}" \
 SPARKLE_REQUIRE_BASE_APPCAST=1 \
 SPARKLE_DOWNLOAD_URL_PREFIX=https://example.invalid/v0.15.0-test.1 \
 SPARKLE_RELEASE_NOTES_URL=https://example.invalid/v0.15.0-test.1 \
@@ -101,6 +113,7 @@ after_sha256="$(shasum -a 256 "${release_dir}/vekil-macos-universal.zip" | awk '
   --appcast "${release_dir}/appcast.xml" \
   --manifest "${manifest}" \
   --artifact "${release_dir}/vekil-macos-universal.zip" \
+  --legacy-artifact "${legacy_artifact}" \
   --expected-url-prefix https://example.invalid/v0.15.0-test.1 \
   --require-legacy-compatible-entry >/dev/null
 

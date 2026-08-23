@@ -26,6 +26,25 @@ expect_failure() {
   fi
 }
 
+sign_appcast() {
+  local unsigned_appcast="$1"
+  local signed_appcast="$2"
+  local signature_file="${TMP_ROOT}/appcast-signature"
+  openssl pkeyutl -sign \
+    -inkey "${TMP_ROOT}/test-key.pem" \
+    -rawin \
+    -in "${unsigned_appcast}" \
+    -out "${signature_file}"
+  local appcast_signature
+  appcast_signature="$(base64 <"${signature_file}" | tr -d '\r\n')"
+  local appcast_length
+  appcast_length="$(wc -c <"${unsigned_appcast}" | tr -d ' ')"
+  cp "${unsigned_appcast}" "${signed_appcast}"
+  printf '<!-- sparkle-signatures:\nedSignature: %s\nlength: %s\n-->\n' \
+    "${appcast_signature}" \
+    "${appcast_length}" >>"${signed_appcast}"
+}
+
 "${REPO_ROOT}/scripts/validate-release-tag.sh" v1.2.3
 expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" v1.2.3-rc.1
 expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" 1.2.3
@@ -75,7 +94,16 @@ manifest="${TMP_ROOT}/vekil-macos-release.json"
 openssl genpkey -algorithm Ed25519 -out "${TMP_ROOT}/test-key.pem" >/dev/null 2>&1
 openssl pkey -in "${TMP_ROOT}/test-key.pem" -pubout -outform DER -out "${TMP_ROOT}/test-public.der"
 public_key="$(tail -c 32 "${TMP_ROOT}/test-public.der" | base64 | tr -d '\r\n')"
-python3 - "${manifest}" "${public_key}" <<'PY_SPARKLE_KEY'
+legacy_artifact="${TMP_ROOT}/vekil-macos-arm64.zip"
+printf 'legacy-zip-fixture' >"${legacy_artifact}"
+legacy_artifact_size="$(wc -c <"${legacy_artifact}" | tr -d ' ')"
+legacy_artifact_sha256="$(shasum -a 256 "${legacy_artifact}" | awk '{print $1}')"
+legacy_artifact_url="https://example.invalid/releases/v0.14.1/vekil-macos-arm64.zip"
+python3 - \
+  "${manifest}" \
+  "${public_key}" \
+  "${legacy_artifact_url}" \
+  "${legacy_artifact_sha256}" <<'PY_SPARKLE_KEY'
 import json
 import sys
 from pathlib import Path
@@ -83,6 +111,8 @@ from pathlib import Path
 path = Path(sys.argv[1])
 value = json.loads(path.read_text())
 value["sparkle"]["public_ed_key"] = sys.argv[2]
+value["legacy_shell"]["last_compatible_artifact_url"] = sys.argv[3]
+value["legacy_shell"]["last_compatible_artifact_sha256"] = sys.argv[4]
 path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 PY_SPARKLE_KEY
 "${MANIFEST_TOOL}" validate --manifest "${manifest}"
@@ -142,28 +172,51 @@ cat >"${unsigned_appcast}" <<EOF_APPCAST
       <sparkle:shortVersionString>0.14.1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>10.13</sparkle:minimumSystemVersion>
       <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-      <enclosure url="https://example.invalid/releases/v0.14.1/vekil-macos-arm64.zip" length="1" type="application/octet-stream" sparkle:edSignature="${signature}"/>
+      <enclosure url="${legacy_artifact_url}" length="${legacy_artifact_size}" type="application/octet-stream" sparkle:edSignature="${signature}"/>
     </item>
   </channel>
 </rss>
 EOF_APPCAST
-openssl pkeyutl -sign \
-  -inkey "${TMP_ROOT}/test-key.pem" \
-  -rawin \
-  -in "${unsigned_appcast}" \
-  -out "${TMP_ROOT}/appcast-signature"
-appcast_signature="$(base64 <"${TMP_ROOT}/appcast-signature" | tr -d '\r\n')"
-appcast_length="$(wc -c <"${unsigned_appcast}" | tr -d ' ')"
-cp "${unsigned_appcast}" "${appcast}"
-printf '<!-- sparkle-signatures:\nedSignature: %s\nlength: %s\n-->\n' \
-  "${appcast_signature}" \
-  "${appcast_length}" >>"${appcast}"
+sign_appcast "${unsigned_appcast}" "${appcast}"
 "${APPCAST_TOOL}" \
   --appcast "${appcast}" \
   --manifest "${manifest}" \
   --artifact "${artifact}" \
+  --legacy-artifact "${legacy_artifact}" \
   --expected-url-prefix https://example.invalid/releases/v0.15.0 \
   --require-legacy-compatible-entry >/dev/null
+
+wrong_legacy_artifact="${TMP_ROOT}/wrong-vekil-macos-arm64.zip"
+printf 'wrong-legacy-zip-fixture' >"${wrong_legacy_artifact}"
+expect_failure "${APPCAST_TOOL}" \
+  --appcast "${appcast}" \
+  --manifest "${manifest}" \
+  --artifact "${artifact}" \
+  --legacy-artifact "${wrong_legacy_artifact}" \
+  --expected-url-prefix https://example.invalid/releases/v0.15.0 \
+  --require-legacy-compatible-entry
+
+bad_legacy_url_unsigned="${TMP_ROOT}/bad-legacy-url-unsigned-appcast.xml"
+bad_legacy_url_appcast="${TMP_ROOT}/bad-legacy-url-appcast.xml"
+python3 - "${unsigned_appcast}" "${bad_legacy_url_unsigned}" "${legacy_artifact_url}" <<'PY_BAD_LEGACY_URL'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+expected = sys.argv[3]
+replacement = "https://example.invalid/releases/v0.14.0/vekil-macos-arm64.zip"
+if expected not in source:
+    raise SystemExit("legacy enclosure URL fixture not found")
+Path(sys.argv[2]).write_text(source.replace(expected, replacement, 1))
+PY_BAD_LEGACY_URL
+sign_appcast "${bad_legacy_url_unsigned}" "${bad_legacy_url_appcast}"
+expect_failure "${APPCAST_TOOL}" \
+  --appcast "${bad_legacy_url_appcast}" \
+  --manifest "${manifest}" \
+  --artifact "${artifact}" \
+  --legacy-artifact "${legacy_artifact}" \
+  --expected-url-prefix https://example.invalid/releases/v0.15.0 \
+  --require-legacy-compatible-entry
 
 bad_feed_signature_appcast="${TMP_ROOT}/bad-feed-signature-appcast.xml"
 python3 - "${appcast}" "${bad_feed_signature_appcast}" <<'PY_BAD_FEED_SIGNATURE'
