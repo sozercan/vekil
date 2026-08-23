@@ -370,6 +370,9 @@ func inspectCanonicalOpenAIChatCompletionResponseWithDecoder(body []byte, reques
 				return nil, false
 			}
 		default:
+			if strings.EqualFold(key, "usage") {
+				return nil, false
+			}
 			if err := skipJSONValue(decoder); err != nil {
 				return nil, false
 			}
@@ -478,7 +481,11 @@ func inspectCanonicalOpenAIUsage(decoder *json.Decoder) (*models.OpenAIUsage, bo
 			}
 			usage.CompletionTokensDetails = details
 		default:
-			if strings.EqualFold(key, "prompt_tokens_details") || strings.EqualFold(key, "completion_tokens_details") {
+			if strings.EqualFold(key, "prompt_tokens") ||
+				strings.EqualFold(key, "completion_tokens") ||
+				strings.EqualFold(key, "total_tokens") ||
+				strings.EqualFold(key, "prompt_tokens_details") ||
+				strings.EqualFold(key, "completion_tokens_details") {
 				return nil, false
 			}
 			if err := skipJSONValue(decoder); err != nil {

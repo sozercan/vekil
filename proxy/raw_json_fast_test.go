@@ -220,6 +220,16 @@ func TestInspectCanonicalOpenAIChatCompletionResponseFast(t *testing.T) {
 			body:           `{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"Prompt_Tokens_Details":{"cached_tokens":1},"Completion_Tokens_Details":{"reasoning_tokens":2}}}`,
 		},
 		{
+			name:           "case-folded top-level usage alias falls back",
+			requestedModel: "public-model",
+			body:           `{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"Usage":{"prompt_tokens":4,"completion_tokens":5,"total_tokens":9}}`,
+		},
+		{
+			name:           "case-folded token aliases fall back",
+			requestedModel: "public-model",
+			body:           `{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":1,"Prompt_Tokens":4,"completion_tokens":2,"Completion_Tokens":5,"total_tokens":3,"Total_Tokens":9}}`,
+		},
+		{
 			name:           "escaped key falls back",
 			requestedModel: "public-model",
 			body:           `{"\u0069d":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
@@ -299,6 +309,43 @@ func TestCaseFoldedOpenAIUsageDetailsUseTypedFallback(t *testing.T) {
 	}
 	if usage.PromptTokensDetails.CachedTokens != 3 || usage.CompletionTokensDetails.ReasoningTokens != 2 {
 		t.Fatalf("typed usage details = %+v/%+v, want cached=3 reasoning=2", usage.PromptTokensDetails, usage.CompletionTokensDetails)
+	}
+}
+
+func TestCaseFoldedOpenAIUsageAliasesUseTypedFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "top-level usage alias",
+			body: `{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"Usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}`,
+		},
+		{
+			name: "nested token aliases",
+			body: `{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":1,"Prompt_Tokens":11,"completion_tokens":2,"Completion_Tokens":7,"total_tokens":3,"Total_Tokens":18}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(tt.body)
+			if _, canonical := inspectCanonicalOpenAIChatCompletionResponse(body, "public-model"); canonical {
+				t.Fatal("case-folded usage alias unexpectedly used the canonical fast path")
+			}
+
+			normalized, changed, err := normalizeOpenAIChatCompletionResponse(body, "public-model", time.Unix(1, 0))
+			if err != nil {
+				t.Fatalf("normalizeOpenAIChatCompletionResponse() error = %v", err)
+			}
+			if changed || !bytes.Equal(normalized, body) {
+				t.Fatal("canonical response changed before typed usage fallback")
+			}
+			usage := sniffOpenAIUsage(normalized)
+			if usage == nil || usage.PromptTokens != 11 || usage.CompletionTokens != 7 || usage.TotalTokens != 18 {
+				t.Fatalf("typed usage fallback = %+v, want 11/7/18", usage)
+			}
+		})
 	}
 }
 

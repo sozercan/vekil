@@ -770,6 +770,8 @@ func inspectCanonicalOpenAIChatCompletionObjectSingleWalk(data []byte, pos int, 
 			}
 			usage, valueEnd, usageOK = inspectCanonicalOpenAIUsageSingleWalk(data, valueStart, usageWalk)
 			ok = usageOK
+		case rawJSONKeyEqualFold(key, "usage"):
+			return models.OpenAIUsage{}, 0, false
 		default:
 			valueEnd, ok = walk.valueEnd(data, valueStart)
 		}
@@ -817,7 +819,11 @@ func inspectCanonicalOpenAIUsageSingleWalk(data []byte, pos int, walk rawJSONSin
 		case rawJSONKeyEqual(key, "total_tokens"):
 			usage.TotalTokens, totalOK = rawJSONInt(data[valueStart:valueEnd])
 			valueOK = totalOK
-		case rawJSONKeyEqualFold(key, "prompt_tokens_details"), rawJSONKeyEqualFold(key, "completion_tokens_details"):
+		case rawJSONKeyEqualFold(key, "prompt_tokens"),
+			rawJSONKeyEqualFold(key, "completion_tokens"),
+			rawJSONKeyEqualFold(key, "total_tokens"),
+			rawJSONKeyEqualFold(key, "prompt_tokens_details"),
+			rawJSONKeyEqualFold(key, "completion_tokens_details"):
 			return models.OpenAIUsage{}, 0, false
 		}
 		if !valueOK || !object.advance(valueEnd) {
