@@ -136,7 +136,7 @@ func onReady() {
 					startProxy()
 				}
 			case <-mDashboard.ClickedCh:
-				openDashboard()
+				go openDashboard()
 			case <-mProvidersChoose.ClickedCh:
 				selectProvidersConfig()
 			case <-mProvidersClear.ClickedCh:
@@ -431,7 +431,10 @@ func stopMenubarProxyServer(current menubarProxyServer, timeout time.Duration) e
 
 // openDashboard opens the live traffic dashboard in the default browser. It is a
 // convenience shortcut; the dashboard is served by the proxy itself and is also
-// reachable directly at the dashboard URL.
+// reachable directly at the dashboard URL. On Linux this waits on the portal's
+// bounded, asynchronous OpenURI response (see portalOpenURITimeout), so it is
+// expected to be called on its own goroutine rather than the tray's single
+// menu-dispatch loop, the same as GitHub sign-in.
 func openDashboard() {
 	if !proxyLifecycle.isRunning() {
 		showErrorDialog("Vekil Not Running", "Start Vekil before opening the dashboard.")
@@ -440,8 +443,9 @@ func openDashboard() {
 	openURL(dashboardURL())
 }
 
-// signInWithGitHub drives the interactive GitHub device-code flow via native macOS
-// dialogs. It is expected to be called in its own goroutine.
+// signInWithGitHub drives the interactive GitHub device-code flow via the
+// platform's native confirmation prompt. It is expected to be called in its
+// own goroutine.
 func signInWithGitHub() {
 	// Guard against double sign-in.
 	signInMu.Lock()
@@ -473,14 +477,20 @@ func signInWithGitHub() {
 
 	copyToClipboard(dcResp.UserCode)
 
-	button := showOsascriptDialog(
-		"Sign in to GitHub Copilot",
-		fmt.Sprintf("Your code has been copied to the clipboard.\n\nEnter this code on GitHub:\n\n%s", dcResp.UserCode),
-		"Open GitHub",
-		"Cancel",
-	)
+	// The menu title shows the device code only while confirmation is
+	// awaited: refreshSessionUI (called on every exit path below, including
+	// a decline) immediately overwrites it. Only the clipboard copy survives
+	// a decline or refresh; retrying sign-in requests a fresh code.
+	mAuthMenu.SetTitle(fmt.Sprintf("GitHub Auth: Confirm code %s to continue", dcResp.UserCode))
 
-	if button == "Cancel" {
+	approved := confirmAction(ctx, confirmationPrompt{
+		Title:        "Sign in to GitHub Copilot",
+		Message:      fmt.Sprintf("Your code has been copied to the clipboard.\n\nEnter this code on GitHub:\n\n%s", dcResp.UserCode),
+		ApproveLabel: "Open GitHub",
+		DeclineLabel: "Cancel",
+	})
+
+	if !approved {
 		cancel()
 		refreshSessionUI()
 		setAuthActionsEnabled(true)
@@ -580,8 +590,8 @@ func selectProvidersConfig() {
 	}
 
 	if err := applyProvidersConfigPath(path); err != nil {
-		log.Error("failed to apply providers config", logger.Err(err), logger.F("path", path))
-		showErrorDialog("Providers Config", fmt.Sprintf("Could not use %s.\n\n%v", filepath.Base(path), err))
+		log.Error("failed to apply providers config", logger.Err(err), logger.F("path", proxy.ProvidersConfigSourceDisplay(path)))
+		showErrorDialog("Providers Config", fmt.Sprintf("Could not use %s.\n\n%v", providersConfigDisplayName(path), err))
 	}
 }
 
@@ -593,12 +603,17 @@ func clearProvidersConfig() {
 }
 
 func applyProvidersConfigPath(path string) error {
-	nextCfg := menubarConfig{ProvidersConfigPath: path}
+	nextCfg := menubarCfg
+	nextCfg.ProvidersConfigPath = path
 	loadedProvidersCfg, err := proxy.LoadProvidersConfigFile(path)
 	if err != nil {
 		return err
 	}
 	if err := saveMenubarConfig(nextCfg); err != nil {
+		return err
+	}
+	nextCfg, err = loadMenubarConfig()
+	if err != nil {
 		return err
 	}
 
@@ -755,14 +770,18 @@ func providersMenuTitle() string {
 	case isMenubarConfigLoadError(providersConfigErr):
 		return "Providers: Config unavailable"
 	case providersConfigErr != nil && menubarCfg.ProvidersConfigPath != "":
-		return fmt.Sprintf("Providers: Invalid (%s)", filepath.Base(menubarCfg.ProvidersConfigPath))
+		return fmt.Sprintf("Providers: Invalid (%s)", providersConfigDisplayName(menubarCfg.ProvidersConfigPath))
 	case providersConfigErr != nil:
 		return "Providers: Invalid"
 	case menubarCfg.ProvidersConfigPath == "":
 		return "Providers: Copilot default"
 	default:
-		return fmt.Sprintf("Providers: %s", filepath.Base(menubarCfg.ProvidersConfigPath))
+		return fmt.Sprintf("Providers: %s", providersConfigDisplayName(menubarCfg.ProvidersConfigPath))
 	}
+}
+
+func providersConfigDisplayName(source string) string {
+	return filepath.Base(proxy.ProvidersConfigSourceDisplay(source))
 }
 
 func logProvidersConfigLoadError(err error) {
@@ -770,7 +789,7 @@ func logProvidersConfigLoadError(err error) {
 		log.Error("failed to load menubar config", logger.Err(err))
 		return
 	}
-	log.Error("failed to load providers config", logger.Err(err), logger.F("path", menubarCfg.ProvidersConfigPath))
+	log.Error("failed to load providers config", logger.Err(err), logger.F("path", proxy.ProvidersConfigSourceDisplay(menubarCfg.ProvidersConfigPath)))
 }
 
 func providersConfigUnavailableDialog(err error) (string, string) {

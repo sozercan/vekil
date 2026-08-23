@@ -253,7 +253,7 @@ func (c *Controller) runStart(op *activeOperation, expectedRevision string) {
 	c.mu.Lock()
 	if c.active != op {
 		c.mu.Unlock()
-		c.cleanupRuntime(runtime, 0)
+		_ = c.cleanupRuntime(runtime, 0)
 		return
 	}
 	c.state.RuntimeGeneration++
@@ -285,7 +285,7 @@ func (c *Controller) runStart(op *activeOperation, expectedRevision string) {
 		c.setOperationPhase(op, PhaseStartupAuthentication)
 		c.setAuth(op, AuthSigningIn)
 		if c.auth == nil {
-			c.finishStartFailure(op, PhaseStartupAuthentication, runtime, generation, errors.New("Copilot authentication is unavailable"))
+			c.finishStartFailure(op, PhaseStartupAuthentication, runtime, generation, errors.New("copilot authentication is unavailable"))
 			return
 		}
 		if _, err := c.auth.GetToken(op.ctx); err != nil {
@@ -335,7 +335,7 @@ func (c *Controller) runStart(op *activeOperation, expectedRevision string) {
 	c.mu.Lock()
 	if c.active != op || c.runtime != runtime || c.state.RuntimeGeneration != generation {
 		c.mu.Unlock()
-		c.cleanupRuntime(runtime, generation)
+		_ = c.cleanupRuntime(runtime, generation)
 		return
 	}
 	if cause := context.Cause(op.ctx); cause != nil {

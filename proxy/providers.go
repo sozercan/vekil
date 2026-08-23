@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -267,15 +266,18 @@ func (e *providerRequestError) Unwrap() error {
 	return e.err
 }
 
+// LoadProvidersConfigFile loads a provider configuration from a local path or
+// an HTTP(S) URL. Remote sources are fetched once per call with a bounded body
+// and timeout; Vekil does not poll them for changes.
 func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return ProvidersConfig{}, nil
 	}
 
-	body, err := os.ReadFile(path)
+	body, err := readProvidersConfigSource(path)
 	if err != nil {
-		return ProvidersConfig{}, fmt.Errorf("read providers config %q: %w", path, err)
+		return ProvidersConfig{}, err
 	}
 	return LoadProvidersConfigBytes(path, body)
 }
@@ -294,7 +296,7 @@ func LoadProvidersConfigBytes(name string, body []byte) (ProvidersConfig, error)
 	}
 	validated, err := validateAndNormalizeProvidersConfig(cfg)
 	if err != nil {
-		return cfg, fmt.Errorf("validate providers config %q: %w", name, err)
+		return cfg, fmt.Errorf("validate providers config %q: %w", ProvidersConfigSourceDisplay(name), err)
 	}
 	return validated.config, nil
 }
@@ -446,36 +448,37 @@ func configuredProviderAllowsModel(cfg ProviderConfig, model string) bool {
 }
 
 func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) error {
+	displayPath := ProvidersConfigSourceDisplay(path)
 	if len(bytes.TrimSpace(body)) == 0 {
-		return fmt.Errorf("providers config %q is empty", path)
+		return fmt.Errorf("providers config %q is empty", displayPath)
 	}
 
-	switch strings.ToLower(filepath.Ext(path)) {
+	switch providersConfigSourceExtension(path) {
 	case ".yaml", ".yml":
 		allowMergeKeys := !providersConfigSchemaUsesStrictDecoding(sniffProvidersConfigSchemaVersionYAML(body))
 		if err := rejectDuplicateYAMLMappingKeys(body, allowMergeKeys); err != nil {
-			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
+			return fmt.Errorf("decode providers config %q as YAML: %w", displayPath, err)
 		}
 		if !allowMergeKeys {
 			if err := validateYAMLConfigFieldPaths(body); err != nil {
-				return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
+				return fmt.Errorf("decode providers config %q as YAML: %w", displayPath, err)
 			}
 		}
 		decoder := yaml.NewDecoder(bytes.NewReader(body))
 		decoder.KnownFields(true)
 		if err := decoder.Decode(cfg); err != nil {
-			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
+			return fmt.Errorf("decode providers config %q as YAML: %w", displayPath, err)
 		}
 		var extra interface{}
 		if err := decoder.Decode(&extra); err != io.EOF {
 			if err != nil {
-				return fmt.Errorf("decode providers config %q as YAML: trailing document: %w", path, err)
+				return fmt.Errorf("decode providers config %q as YAML: trailing document: %w", displayPath, err)
 			}
-			return fmt.Errorf("decode providers config %q as YAML: more than one YAML document", path)
+			return fmt.Errorf("decode providers config %q as YAML: more than one YAML document", displayPath)
 		}
 		present, err := yamlTopLevelConfigFields(body)
 		if err != nil {
-			return fmt.Errorf("decode providers config %q as YAML: %w", path, err)
+			return fmt.Errorf("decode providers config %q as YAML: %w", displayPath, err)
 		}
 		cfg.schemaVersionSet = present["schema_version"]
 		cfg.modelRoutesSet = present["model_routes"]
@@ -483,26 +486,26 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		markYAMLProvidersConfigFieldPresence(body, cfg)
 	default:
 		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
-			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
+			return fmt.Errorf("decode providers config %q as JSON: %w", displayPath, err)
 		}
 		if err := validateJSONConfigFieldPaths(body); err != nil {
-			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
+			return fmt.Errorf("decode providers config %q as JSON: %w", displayPath, err)
 		}
 		decoder := json.NewDecoder(bytes.NewReader(body))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(cfg); err != nil {
-			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
+			return fmt.Errorf("decode providers config %q as JSON: %w", displayPath, err)
 		}
 		var extra interface{}
 		if err := decoder.Decode(&extra); err != io.EOF {
 			if err != nil {
-				return fmt.Errorf("decode providers config %q as JSON: trailing value: %w", path, err)
+				return fmt.Errorf("decode providers config %q as JSON: trailing value: %w", displayPath, err)
 			}
-			return fmt.Errorf("decode providers config %q as JSON: more than one JSON value", path)
+			return fmt.Errorf("decode providers config %q as JSON: more than one JSON value", displayPath)
 		}
 		present, err := jsonTopLevelConfigFields(body)
 		if err != nil {
-			return fmt.Errorf("decode providers config %q as JSON: %w", path, err)
+			return fmt.Errorf("decode providers config %q as JSON: %w", displayPath, err)
 		}
 		cfg.schemaVersionSet = present["schema_version"]
 		cfg.modelRoutesSet = present["model_routes"]
@@ -2387,7 +2390,13 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 
 	switch provider.kind {
 	case providerTypeCopilot:
-		token, err := h.auth.GetToken(req.Context())
+		var token string
+		var err error
+		if endpoint == providerEndpointResponses {
+			token, err = h.auth.GetResponsesToken(req.Context())
+		} else {
+			token, err = h.auth.GetToken(req.Context())
+		}
 		if err != nil {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 		}

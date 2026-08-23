@@ -6,15 +6,19 @@ Use this file when editing provider credentials, model ownership, JSON/YAML prov
 
 ### GitHub Copilot
 
-For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly; it overrides cached Vekil login state and is exchanged for a short-lived Copilot token at startup.
+For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly, and it overrides cached Vekil login state. Supported GitHub credentials are `gho_` OAuth user tokens, `ghu_` GitHub App user tokens, and `github_pat_` fine-grained PATs with the Copilot Requests permission. Vekil uses them directly where the Copilot upstream accepts them. The current exception is `/responses` with a `ghu_` credential: Copilot rejects that app-user bearer directly, so Vekil exchanges it through `/copilot_internal/v2/token` and caches the short-lived result in memory only. Vekil does not call the private Copilot user endpoint. Revoked, expired, unlicensed, or under-permissioned credentials surface as upstream authentication or permission failures.
+
+Unless explicitly overridden, direct `ghu_` credentials use the `copilot-language-server` integration ID for catalog and native Chat requests. Their exchanged Responses token uses `vscode-chat`; other direct credential types also use `vscode-chat`.
 
 Vekil intentionally ignores generic GitHub token variables such as `GH_TOKEN` and `GITHUB_TOKEN`. If you want Vekil to use an authenticated GitHub CLI account, opt in explicitly with `vekil login --github-cli` or `vekil login --gh`; Vekil then runs `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only, without copying it into Vekil's `access-token` or `api-key.json` caches.
 
-Plain `vekil login` refreshes an existing Vekil-managed login when possible, otherwise starts GitHub's device-code flow. Use `vekil login --force` to force a new device-code flow even if an existing login can still refresh. A device-code sign-in disables GitHub CLI auto sign-in because the active account is then managed by Vekil rather than by `gh`.
+Plain `vekil login` reloads an existing Vekil-managed credential when possible, otherwise starts GitHub's device-code flow. The resulting supported GitHub credential is stored in `access-token` and used directly; Vekil no longer creates a short-lived `api-key.json` entry for that normal path. Use `vekil login --force` to force a new device-code flow even if an existing credential is present. A device-code sign-in disables GitHub CLI auto sign-in because the active account is then managed by Vekil rather than by `gh`.
+
+For migration compatibility, Vekil still reads an unexpired legacy `api-key.json` cache. An unrecognized older GitHub credential can also use the legacy token exchange; only a successful legacy exchange writes that cache. This fallback is not used for the supported credential types above.
 
 After `vekil logout` or menubar Sign Out, Vekil clears its cached credentials, disables GitHub CLI auto sign-in, and suppresses automatic GitHub CLI reuse until you explicitly opt back in with `vekil login --github-cli` or `vekil login --gh`. `COPILOT_GITHUB_TOKEN` remains an explicit override and still works while signed out.
 
-Concurrent Copilot-token refresh callers share one refresh attempt, but each caller still honors its own context deadline. The same rule applies to callers waiting for an interactive device flow.
+Concurrent Copilot credential refresh callers share one refresh attempt, but each caller still honors its own context deadline. The same rule applies to callers waiting for an interactive device flow.
 
 ### OpenAI Codex
 
@@ -60,7 +64,9 @@ Managed keys are resolved through the implemented provider-scoped secret resolve
 
 ## Provider Routing
 
-Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, OpenAI Codex, or generic OpenAI-compatible and Anthropic-compatible upstreams. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
+Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, OpenAI Codex, or generic OpenAI-compatible and Anthropic-compatible upstreams. The JSON (`.json`) or YAML (`.yaml`/`.yml`) config source may be a local path or an HTTP(S) URL.
+
+Remote sources are fetched once per server startup, validation command, or managed launcher invocation with a 15-second total timeout and a 4 MiB response-body limit. Vekil does not poll for changes or follow redirects. The URL path extension selects YAML; query parameters do not affect format detection, and other extensions use JSON decoding. Prefer HTTPS and use environment-backed credentials instead of putting secrets in a remotely hosted config. Any fetch, non-2xx response, decode, or validation failure stops startup. User-visible diagnostics omit URL userinfo, query parameters, and fragments so credentials and signed query values are not printed.
 
 Provider config decoding is strict. Unknown fields and duplicate JSON/YAML mapping keys are rejected so typos or ambiguous values do not silently change routing. A JSON file must contain exactly one value, and a YAML file must contain exactly one document. Schema-version-2 YAML also rejects merge keys (`<<`); expand anchors into explicit fields before migrating a version-1 file.
 
@@ -177,13 +183,13 @@ Route-level `drop_sampling_params` and `drop_stop_sequences` likewise apply unif
 
 The binary validates a compiled provider/native-endpoint/surface/mode feature matrix. A provider kind, native endpoint, public translation surface, or routing mode that the running binary does not implement is rejected during validation rather than accepted with degraded behavior. Native route endpoints remain `/responses`, `/chat/completions`, and `/v1/messages`. OpenAI Chat plus translated Anthropic and Gemini requests enter canonical Chat execution, which prefers a route's `/chat/completions` endpoint and otherwise uses `/responses`; direct `anthropic-compatible` Messages uses `/v1/messages`. See [Supported route surfaces](#supported-route-surfaces) below.
 
-Validate a file without serving or modifying it:
+Validate a local or remote config source without serving or modifying it:
 
 ```bash
 vekil config validate --providers-config /path/to/providers.yaml
 ```
 
-The command performs strict JSON/YAML decoding, provider/target reference checks, collision and limit checks, adapter compatibility checks, route-budget validation, and catalog compilation. It does not start the HTTP server or contact model/inference endpoints. Local auth configuration must still be usable: for example, a referenced `api_key_env` must be populated, and local credential construction may fail validation before any network request.
+The command performs strict JSON/YAML decoding, provider/target reference checks, collision and limit checks, adapter compatibility checks, route-budget validation, and catalog compilation. It does not start the HTTP server or contact model/inference endpoints; when given a URL, it only fetches the config source itself. Local auth configuration must still be usable: for example, a referenced `api_key_env` must be populated, and local credential construction may fail validation before any provider request.
 
 For schema-v2 policies, explicitly request classifier protocol preflight with:
 
@@ -452,34 +458,17 @@ providers:
 
 #### OpenCode Zen Free Tier
 
-OpenCode Zen is an OpenAI-compatible gateway at `https://opencode.ai/zen/v1`. Its free models can be reached anonymously with the literal sentinel key `public` (the same value the opencode client sends when no real key is configured). No signup, OAuth, or token refresh is involved, so this maps directly onto an `openai-compatible` provider with `auth_type: bearer` and `api_key: public`. A ready-to-run config is in [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml):
-
-```yaml
-providers:
-  - id: opencode-zen
-    type: openai-compatible
-    base_url: https://opencode.ai/zen/v1
-    auth_type: bearer
-    api_key: public                  # shared anonymous sentinel, not a secret
-    model_discovery: static
-    models:
-      - public_id: deepseek-v4-flash-free
-        endpoints:
-          - /chat/completions
-      - public_id: big-pickle
-        endpoints:
-          - /chat/completions
-```
+OpenCode Zen is an OpenAI-compatible gateway at `https://opencode.ai/zen/v1`. Its free models can be reached anonymously with the literal sentinel key `public` (the same value the opencode client sends when no real key is configured). No signup, OAuth, or token refresh is involved, so this maps directly onto an `openai-compatible` provider with `auth_type: bearer` and `api_key: public`. Use the ready-to-run [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml); its marked model block is generated from OpenCode's current endpoint and pricing tables rather than duplicated here.
 
 Operational notes for the free tier:
 
 - Use `model_discovery: static`, not `openai`. Dynamic discovery lists the full Zen catalog, including paid models that reject the `public` key with `401`, and there is no cost-based filter (only `include_models`/`exclude_models`). Static discovery also skips the upstream readiness probe.
 - Do not set `default: true`. Under static discovery, unlisted models return `400`, so making this the catch-all only risks routing unknown models to a revocable trial gateway.
-- The free set rotates and individual promotions end without notice. When a promo ends, that model returns an error body (observed as `401`) such as `Free promotion has ended for <model>`. Re-check the live set before relying on it: `curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'`.
+- The free set rotates and individual promotions end without notice. Removed models have returned `401` messages such as `Free promotion has ended for <model>` and `Model <model> is not supported`. Re-check the live set before relying on it: `curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'`.
 - `public` is a shared anonymous credential, rate-limited server-side per IP. It suits personal, low-volume use, not fan-out or automation.
-- Free models are not zero-retention ("collected data may be used to improve the model"). `north-mini-code-free` (Cohere) and `nemotron-3-ultra-free` (NVIDIA) add "trial use only / do not submit confidential data" terms. Do not route proprietary or sensitive prompts through them.
-- `/responses` support is per model. It is verified working for `deepseek-v4-flash-free`, `north-mini-code-free`, and `nemotron-3-ultra-free`; `big-pickle` returns `401` ("not supported for format openai"). Add `/responses` to a model's `endpoints` only after confirming it, and keep the others `/chat/completions`-only.
-- Client compatibility: Claude Code (`/v1/messages`) and Gemini CLI translate to `/chat/completions` and work against the free tier. The GitHub Copilot CLI works in offline BYOK mode with `COPILOT_PROVIDER_WIRE_API=completions`. The OpenAI Codex CLI does not work against Zen free models: it is `/responses`-only and always sends a built-in `web_search` tool with no `name`, which the free upstreams reject during responses→chat translation.
+- Data handling varies by promotion. Ox Alpha's provider is documented as zero-retention with no training use, while other free models may retain prompts or use them for improvement. Check the current Zen terms before routing proprietary or sensitive prompts.
+- `/responses` support is per model. The generated example copies each free model's documented native endpoint and does not infer `/responses` from model family or client compatibility.
+- Client compatibility: Claude Code (`/v1/messages`) and Gemini CLI translate to `/chat/completions` and work against the free tier. The GitHub Copilot CLI works in offline BYOK mode with `COPILOT_PROVIDER_WIRE_API=completions`. OpenAI Codex CLI requires a model advertising native `/responses`; with the generated example, `muse-spark-1.2-contributor-free` is routed directly to Zen's `/responses` endpoint. Codex cannot use the Chat-only free entries through its Responses wire API, and the automated Zen CLI smoke remains intentionally Chat-oriented.
 
 For the full (paid) Zen catalog or higher limits, sign in at [opencode.ai/auth](https://opencode.ai/auth) and swap `api_key: public` for `api_key_env: OPENCODE_API_KEY` (still a static key, still no refresh). Swapping the key alone is not enough to route paid models: under `model_discovery: static` only the listed `models:` entries are routable, so add each paid model's `public_id` (and `endpoints`) you want to use, or switch to `model_discovery: openai` with `include_models` to opt into specific discovered paid IDs. Validate the free tier end to end with [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) (a quick `curl`/`jq` check), or with the CLI-driven [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow described in [Development](development.md#live-opencode-zen-cli-smoke-workflow).
 

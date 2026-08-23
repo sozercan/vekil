@@ -1,0 +1,47 @@
+name: Live Copilot Direct Bearer Smoke
+
+# Credentialed live coverage for direct GitHub credential authentication. The
+# test verifies that Vekil returns the fine-grained PAT without calling the
+# legacy GitHub auth endpoints, then proves the credential reaches Copilot's
+# /models and /responses endpoints successfully. It deliberately runs only
+# from the trusted default branch so the repository PAT is never exposed to
+# pull-request-controlled code.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 9 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-copilot-direct-bearer-smoke-main
+  cancel-in-progress: true
+
+jobs:
+  direct-bearer-auth:
+    name: direct-bearer-auth
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_FINE_GRAINED_PAT }}
+    steps:
+      - name: Require direct-bearer smoke credential
+        run: |
+          if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
+            echo "COPILOT_FINE_GRAINED_PAT repository secret is required for the direct-bearer smoke." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify live fine-grained PAT direct bearer inference
+        env:
+          LIVE_COPILOT_DIRECT_BEARER_TEST: "1"
+        run: go test ./auth -run '^TestLiveEnvAccessTokenDirectBearer$' -count=1 -v -timeout=2m

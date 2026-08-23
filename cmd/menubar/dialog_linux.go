@@ -1,9 +1,10 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -13,139 +14,187 @@ import (
 const dbusNotifyDest = "org.freedesktop.Notifications"
 const dbusNotifyPath = "/org/freedesktop/Notifications"
 const dbusNotifyIface = "org.freedesktop.Notifications"
+const providersConfigSelectionGuidance = "install and run a desktop portal backend, run vekil --providers-config SOURCE, or edit the saved menubar config file directly"
 
 var (
 	errNotificationDismissed = errors.New("notification dismissed")
-	execLookPath             = exec.LookPath
-	execCommand              = exec.Command
 	notifyWithActions        = dbusNotifyWithActions
 	notify                   = dbusNotify
+	runXDGOpen               = func(rawURL string) { _ = exec.Command("xdg-open", rawURL).Start() }
 )
 
-type dialogAttemptResult int
+// confirmAction prompts the user through an xdg-desktop-portal notification
+// with approve/decline actions, falling back to a legacy
+// org.freedesktop.Notifications action prompt only when the portal
+// notification was provably never shown. false is the safe default: once a
+// prompt may have been shown by either mechanism, any decline, dismissal,
+// timeout, ctx cancellation, or ambiguous delivery failure returns false
+// without ever trying the other mechanism, so at most one prompt is ever
+// shown. One overall timeout budget covers both the portal attempt and any
+// legacy fallback.
+func confirmAction(ctx context.Context, prompt confirmationPrompt) bool {
+	ctx, cancel := context.WithTimeout(ctx, portalConfirmationTimeout)
+	defer cancel()
 
-const (
-	dialogUnavailable dialogAttemptResult = iota
-	dialogAccepted
-	dialogCanceled
-)
-
-// showOsascriptDialog displays a dialog using zenity, kdialog, or a DBus
-// notification with action buttons, and returns the button the user clicked.
-// If no dialog mechanism is available, defaultButton is returned so that the
-// calling flow proceeds automatically.
-func showOsascriptDialog(title, message, defaultButton, secondButton string) string {
-	// Try zenity first (GNOME/GTK).
-	if zenity, err := execLookPath("zenity"); err == nil {
-		switch runQuestionDialog(zenity,
-			"--question",
-			"--title="+title,
-			"--text="+message,
-			"--ok-label="+defaultButton,
-			"--cancel-label="+secondButton,
-		) {
-		case dialogAccepted:
-			return defaultButton
-		case dialogCanceled:
-			return "Cancel"
+	if conn, err := sharedPortalNotificationConn.get(); err == nil {
+		switch portalConfirm(ctx, conn, prompt) {
+		case portalConfirmApproved:
+			return true
+		case portalConfirmDeclined:
+			return false
+		case portalConfirmNotShown:
+			// The portal notification was never displayed; fall through to
+			// the bounded legacy fallback below.
 		}
 	}
 
-	// Fall back to kdialog (KDE).
-	if kdialog, err := execLookPath("kdialog"); err == nil {
-		switch runQuestionDialog(kdialog,
-			"--title", title,
-			"--yesno", message,
-			"--yes-label", defaultButton,
-			"--no-label", secondButton,
-		) {
-		case dialogAccepted:
-			return defaultButton
-		case dialogCanceled:
-			return "Cancel"
-		}
+	if ctx.Err() != nil {
+		// The shared budget above already covers the legacy attempt too:
+		// never post a second prompt once it is exhausted, or once the
+		// caller (e.g. a cancelled sign-in) has already moved on.
+		return false
 	}
 
-	// Fall back to DBus notification with action buttons.
-	action, err := notifyWithActions(title, message, []string{
-		"default", defaultButton,
-		"cancel", secondButton,
+	action, err := notifyWithActions(ctx, prompt.Title, prompt.Message, []string{
+		portalActionApprove, prompt.ApproveLabel,
+		portalActionDecline, prompt.DeclineLabel,
 	})
-	if err == nil {
-		if action == "cancel" {
-			return "Cancel"
-		}
-		return defaultButton
+	if err != nil {
+		return false
 	}
-	if errors.Is(err, errNotificationDismissed) {
-		return "Cancel"
-	}
-
-	// No dialog mechanism available — proceed automatically.
-	return defaultButton
+	return action == portalActionApprove
 }
 
-// showErrorDialog displays a simple error dialog using zenity, kdialog, or a
-// DBus notification.
+// portalConfirmOutcome is the three-state result of showing a portal
+// confirmation notification and waiting for the user's answer.
+type portalConfirmOutcome int
+
+const (
+	// portalConfirmNotShown means the notification was never actually
+	// displayed (an ActionInvoked subscribe failure, or an AddNotification
+	// failure portalErrorProvesNotShown recognizes as having occurred before
+	// display). The caller may safely retry through the legacy fallback path.
+	portalConfirmNotShown portalConfirmOutcome = iota
+	// portalConfirmApproved means the user clicked the explicit approve
+	// button.
+	portalConfirmApproved
+	// portalConfirmDeclined covers every other outcome once the notification
+	// may already have been displayed: an explicit decline, any other
+	// action, a timeout, a cancellation, or an ambiguous delivery failure.
+	// At most one prompt is ever shown, so this is always final.
+	portalConfirmDeclined
+)
+
+// portalConfirm shows a portal notification with approve/decline buttons and
+// no default-action (so activating the notification body cannot approve) and
+// waits for the user's answer. See portalConfirmOutcome for what each result
+// means to the caller.
+func portalConfirm(ctx context.Context, conn portalConn, prompt confirmationPrompt) portalConfirmOutcome {
+	id := newPortalToken("confirm")
+	notification := portalConfirmationNotification(prompt)
+
+	action, err := waitForPortalAction(ctx, conn, id, func() error {
+		callCtx, callCancel := context.WithTimeout(ctx, portalMethodCallTimeout)
+		defer callCancel()
+		_, callErr := conn.Call(callCtx, portalBusName, portalObjectPath, portalNotification+".AddNotification", id, notification)
+		return callErr
+	})
+
+	removeCtx, removeCancel := context.WithTimeout(context.Background(), portalCleanupTimeout)
+	portalRemoveNotification(removeCtx, conn, id)
+	removeCancel()
+
+	if err != nil {
+		if errors.Is(err, errPortalNotificationNotShown) {
+			return portalConfirmNotShown
+		}
+		return portalConfirmDeclined
+	}
+	if action == portalActionApprove {
+		return portalConfirmApproved
+	}
+	return portalConfirmDeclined
+}
+
+// showErrorDialog displays an urgent-priority portal notification, falling
+// back to a plain legacy notification. Linux errors are notifications rather
+// than modal windows because the portal exposes no generic message-dialog
+// interface.
 func showErrorDialog(title, message string) {
-	if zenity, err := execLookPath("zenity"); err == nil && runDialog(zenity,
-		"--error",
-		"--title="+title,
-		"--text="+message,
-	) {
+	if err := portalShow(title, message, portalPriorityUrgent); err == nil {
 		return
 	}
-
-	if kdialog, err := execLookPath("kdialog"); err == nil && runDialog(kdialog,
-		"--title", title,
-		"--error", message,
-	) {
-		return
-	}
-
-	// Fall back to a plain DBus notification (no actions needed).
 	_ = notify(title, message)
 }
 
+// showNotification displays a normal-priority portal notification, falling
+// back to a plain legacy notification.
+func showNotification(title, message string) {
+	if err := portalShow(title, message, portalPriorityNormal); err == nil {
+		return
+	}
+	_ = notify(title, message)
+}
+
+// portalShow calls Notification.AddNotification on the shared
+// Notification-interface connection. On failure it simply returns the
+// error: it never evicts or closes the shared connection, and callers fall
+// back to a plain legacy notification for this one call only. Unlike
+// confirmAction's at-most-once semantics, a duplicate plain toast (e.g. if
+// the portal actually displayed one before an ambiguous error) is an
+// acceptable, low-consequence outcome.
+func portalShow(title, message, priority string) error {
+	conn, err := sharedPortalNotificationConn.get()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), portalMethodCallTimeout)
+	defer cancel()
+	return portalAddNotification(ctx, conn, newPortalToken("notify"), title, message, priority)
+}
+
+// chooseProvidersConfigPath opens the xdg-desktop-portal file chooser. There
+// is no subprocess dialog fallback: no remaining in-process mechanism
+// provides an equivalent picker without reintroducing the dependency being
+// removed. Pass --providers-config or edit the saved menubar config directly
+// when no portal backend is available.
 func chooseProvidersConfigPath() (string, error) {
-	if zenity, err := execLookPath("zenity"); err == nil {
-		output, runErr := execCommand(zenity,
-			"--file-selection",
-			"--title=Choose Providers Config",
-			"--file-filter=Provider config files | *.json *.yaml *.yml",
-			"--file-filter=All files | *",
-		).CombinedOutput()
-		if runErr == nil {
-			path := strings.TrimSpace(string(output))
-			if path == "" {
-				return "", errDialogCanceled
-			}
-			return path, nil
-		}
-		if isDialogCancel(runErr, output) {
-			return "", errDialogCanceled
-		}
+	conn, err := newPortalConn()
+	if err != nil {
+		return "", fmt.Errorf("connect to xdg-desktop-portal: %w; %s", err, providersConfigSelectionGuidance)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), portalFileChooserTimeout)
+	defer cancel()
+
+	token := newPortalToken("file")
+	predicted := predictRequestPath(conn.UniqueName(), token)
+
+	resp, err := portalOpenFile(ctx, conn, token, predicted, "Choose Providers Config")
+	if err != nil {
+		return "", fmt.Errorf("xdg-desktop-portal file chooser failed: %w; %s", err, providersConfigSelectionGuidance)
 	}
 
-	if kdialog, err := execLookPath("kdialog"); err == nil {
-		output, runErr := execCommand(kdialog,
-			"--getopenfilename",
-			"",
-			"*.json *.yaml *.yml|Provider config files",
-		).CombinedOutput()
-		if runErr == nil {
-			path := strings.TrimSpace(string(output))
-			if path == "" {
-				return "", errDialogCanceled
-			}
-			return path, nil
-		}
-		if isDialogCancel(runErr, output) {
-			return "", errDialogCanceled
-		}
+	switch resp.Code {
+	case 0:
+		// success
+	case 1:
+		return "", errDialogCanceled
+	default:
+		return "", fmt.Errorf("xdg-desktop-portal file chooser failed (response code %d); %s", resp.Code, providersConfigSelectionGuidance)
 	}
 
-	return "", errors.New("file selection is unavailable; install zenity or kdialog")
+	uris, err := decodePortalStringArray(resp.Results, "uris")
+	if err != nil {
+		return "", fmt.Errorf("xdg-desktop-portal file chooser returned a successful response without usable file selection results: %w", err)
+	}
+	if len(uris) == 0 {
+		return "", fmt.Errorf("xdg-desktop-portal file chooser returned a successful response with no selected files")
+	}
+
+	return decodePortalFileURI(uris[0])
 }
 
 // copyToClipboard copies the given text to the clipboard, trying Wayland and
@@ -177,44 +226,48 @@ func copyToClipboard(text string) {
 	}
 }
 
-// openURL opens a URL in the default browser using xdg-open.
-func openURL(url string) {
-	_ = exec.Command("xdg-open", url).Start()
-}
-
-// showNotification displays a desktop notification. It tries DBus directly
-// first, falling back to notify-send.
-func showNotification(title, message string) {
-	if err := notify(title, message); err == nil {
+// openURL opens an HTTP(S) URL via the xdg-desktop-portal OpenURI method,
+// awaiting its Request response before deciding whether to fall back.
+// Response code 0 (success) and code 1 (a deliberate user cancellation, e.g.
+// dismissing an application chooser) are both final; xdg-open only runs when
+// the portal cannot be reached, the method call itself fails, the response
+// wait fails or times out, or the response reports any other code.
+func openURL(rawURL string) {
+	if !isSupportedOpenURIScheme(rawURL) {
+		runXDGOpen(rawURL)
 		return
 	}
-	_ = execCommand("notify-send", title, message).Run()
-}
 
-func runQuestionDialog(command string, args ...string) dialogAttemptResult {
-	output, err := execCommand(command, args...).CombinedOutput()
-	if err == nil {
-		return dialogAccepted
+	conn, err := newPortalConn()
+	if err != nil {
+		runXDGOpen(rawURL)
+		return
 	}
-	if isDialogCancel(err, output) {
-		return dialogCanceled
-	}
-	return dialogUnavailable
-}
+	defer func() { _ = conn.Close() }()
 
-func runDialog(command string, args ...string) bool {
-	return execCommand(command, args...).Run() == nil
-}
+	ctx, cancel := context.WithTimeout(context.Background(), portalOpenURITimeout)
+	defer cancel()
 
-func isDialogCancel(err error, output []byte) bool {
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		return false
+	token := newPortalToken("open")
+	predicted := predictRequestPath(conn.UniqueName(), token)
+	activationToken := os.Getenv("XDG_ACTIVATION_TOKEN")
+
+	resp, err := portalOpenURICall(ctx, conn, token, predicted, activationToken, rawURL)
+	if err != nil {
+		runXDGOpen(rawURL)
+		return
 	}
-	if exitErr.ExitCode() != 1 {
-		return false
+
+	switch resp.Code {
+	case 0:
+		// success
+	case 1:
+		// user canceled (e.g. dismissed an application chooser); a
+		// deliberate cancel is final, not a signal to try a second
+		// mechanism.
+	default:
+		runXDGOpen(rawURL)
 	}
-	return len(bytes.TrimSpace(output)) == 0
 }
 
 // dbusNotify sends a simple notification (no action buttons) via DBus.
@@ -241,12 +294,14 @@ func dbusNotify(summary, body string) error {
 	return call.Err
 }
 
-// dbusNotifyWithActions sends a notification with action buttons via DBus and
-// blocks until the user clicks an action or dismisses the notification.
-// The actions slice contains alternating key/label pairs: ["key1", "Label 1", "key2", "Label 2"].
-// Returns the action key the user clicked, or an error if the notification was
-// dismissed or if DBus is unavailable.
-func dbusNotifyWithActions(summary, body string, actions []string) (string, error) {
+// dbusNotifyWithActions sends a notification with action buttons via the
+// legacy org.freedesktop.Notifications interface and blocks until the user
+// clicks an action, dismisses the notification, or ctx is done. The actions
+// slice contains alternating key/label pairs: ["key1", "Label 1", "key2",
+// "Label 2"]; only signals reporting one of those keys are honored. Returns
+// the action key the user clicked, or an error if the notification was
+// dismissed, ctx ended, or DBus is unavailable.
+func dbusNotifyWithActions(ctx context.Context, summary, body string, actions []string) (string, error) {
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		return "", err
@@ -255,9 +310,34 @@ func dbusNotifyWithActions(summary, body string, actions []string) (string, erro
 		_ = conn.Close()
 	}()
 
-	obj := conn.Object(dbusNotifyDest, dbusNotifyPath)
+	validActions := make(map[string]bool, len(actions)/2)
+	for i := 0; i+1 < len(actions); i += 2 {
+		validActions[actions[i]] = true
+	}
 
-	call := obj.Call(dbusNotifyIface+".Notify", 0,
+	sigCh := make(chan *dbus.Signal, 10)
+	conn.Signal(sigCh)
+	defer conn.RemoveSignal(sigCh)
+
+	if err := conn.AddMatchSignalContext(ctx,
+		dbus.WithMatchSender(dbusNotifyDest),
+		dbus.WithMatchObjectPath(dbusNotifyPath),
+		dbus.WithMatchInterface(dbusNotifyIface),
+	); err != nil {
+		return "", err
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), portalCleanupTimeout)
+		defer cancel()
+		_ = conn.RemoveMatchSignalContext(cleanupCtx,
+			dbus.WithMatchSender(dbusNotifyDest),
+			dbus.WithMatchObjectPath(dbusNotifyPath),
+			dbus.WithMatchInterface(dbusNotifyIface),
+		)
+	}()
+
+	obj := conn.Object(dbusNotifyDest, dbusNotifyPath)
+	call := obj.CallWithContext(ctx, dbusNotifyIface+".Notify", 0,
 		"Vekil",   // app_name
 		uint32(0), // replaces_id
 		"",        // app_icon
@@ -278,36 +358,75 @@ func dbusNotifyWithActions(summary, body string, actions []string) (string, erro
 		return "", err
 	}
 
-	// Subscribe to notification signals.
-	if err := conn.AddMatchSignal(
-		dbus.WithMatchObjectPath(dbusNotifyPath),
-		dbus.WithMatchInterface(dbusNotifyIface),
-	); err != nil {
-		return "", err
-	}
+	return waitForLegacyNotificationAction(ctx, sigCh, nid, validActions, func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), portalCleanupTimeout)
+		_ = obj.CallWithContext(closeCtx, dbusNotifyIface+".CloseNotification", 0, nid).Err
+		cancel()
+	})
+}
 
-	sigCh := make(chan *dbus.Signal, 10)
-	conn.Signal(sigCh)
-	defer conn.RemoveSignal(sigCh)
-
-	for sig := range sigCh {
-		switch sig.Name {
-		case dbusNotifyIface + ".ActionInvoked":
-			if len(sig.Body) >= 2 {
-				if id, ok := sig.Body[0].(uint32); ok && id == nid {
-					if action, ok := sig.Body[1].(string); ok {
-						return action, nil
-					}
-				}
+// waitForLegacyNotificationAction waits for an action or dismissal belonging
+// to notificationID. When ctx ends, an already-buffered matching result wins;
+// otherwise closeNotification is invoked before returning the context error.
+func waitForLegacyNotificationAction(ctx context.Context, sigCh <-chan *dbus.Signal, notificationID uint32, validActions map[string]bool, closeNotification func()) (string, error) {
+	for {
+		select {
+		case sig, ok := <-sigCh:
+			if !ok {
+				return "", fmt.Errorf("signal channel closed")
 			}
-		case dbusNotifyIface + ".NotificationClosed":
-			if len(sig.Body) >= 1 {
-				if id, ok := sig.Body[0].(uint32); ok && id == nid {
-					return "", errNotificationDismissed
+			if action, err, matched := decodeLegacyNotificationResult(sig, notificationID, validActions); matched {
+				return action, err
+			}
+		case <-ctx.Done():
+			// A user action can already be buffered when the shared timeout
+			// expires. Preserve that explicit answer instead of randomly
+			// choosing cancellation and closing the notification first.
+			if action, err, matched := drainQueuedLegacyNotificationResult(sigCh, notificationID, validActions); matched {
+				return action, err
+			}
+			closeNotification()
+			return "", ctx.Err()
+		}
+	}
+}
+
+// drainQueuedLegacyNotificationResult non-blockingly drains signals already
+// buffered on sigCh, looking for a matching action or dismissal.
+func drainQueuedLegacyNotificationResult(sigCh <-chan *dbus.Signal, notificationID uint32, validActions map[string]bool) (string, error, bool) {
+	for {
+		select {
+		case sig, ok := <-sigCh:
+			if !ok {
+				return "", nil, false
+			}
+			if action, err, matched := decodeLegacyNotificationResult(sig, notificationID, validActions); matched {
+				return action, err, true
+			}
+		default:
+			return "", nil, false
+		}
+	}
+}
+
+// decodeLegacyNotificationResult decodes a matching ActionInvoked or
+// NotificationClosed signal for notificationID.
+func decodeLegacyNotificationResult(sig *dbus.Signal, notificationID uint32, validActions map[string]bool) (string, error, bool) {
+	switch sig.Name {
+	case dbusNotifyIface + ".ActionInvoked":
+		if len(sig.Body) >= 2 {
+			if id, ok := sig.Body[0].(uint32); ok && id == notificationID {
+				if action, ok := sig.Body[1].(string); ok && validActions[action] {
+					return action, nil, true
 				}
 			}
 		}
+	case dbusNotifyIface + ".NotificationClosed":
+		if len(sig.Body) >= 1 {
+			if id, ok := sig.Body[0].(uint32); ok && id == notificationID {
+				return "", errNotificationDismissed, true
+			}
+		}
 	}
-
-	return "", fmt.Errorf("signal channel closed")
+	return "", nil, false
 }

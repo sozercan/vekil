@@ -6,29 +6,32 @@
 #
 # Caveats (see docs/provider-routing.md "OpenCode Zen Free Tier"):
 #   - "public" is a SHARED ANONYMOUS key, rate-limited server-side per IP.
-#   - The free set ROTATES and individual promotions END without notice. When a
-#     promo ends, that model returns an error body (HTTP 401) such as
-#     "Free promotion has ended for <model>". Re-check the live set before relying
-#     on it:  curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'
-#   - Free models are NOT zero-retention ("collected data may be used to improve
-#     the model"); north-mini-code-free (Cohere) and nemotron-3-ultra-free (NVIDIA)
-#     add "trial use only / do not submit confidential data" terms. Do not route
-#     proprietary or sensitive prompts through them.
+#   - The free set ROTATES and individual promotions END without notice. Removed
+#     models return HTTP 401 messages such as "Free promotion has ended for
+#     <model>" or "Model <model> is not supported", or HTTP 400 with "Model is
+#     unavailable". Re-check the live set:
+#     curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'
+#   - Data handling varies by promotion. Ox Alpha's provider is documented as
+#     zero-retention with no training use, while other free models may retain
+#     prompts or use them for improvement. Check the current Zen terms before
+#     routing proprietary or sensitive prompts.
 #
 # Use model_discovery: static (not openai): dynamic /models also lists PAID Zen
 # models that reject the "public" key with HTTP 401, and there is no cost filter.
-# Static discovery also skips the upstream readiness probe.
+# Static discovery also skips the upstream readiness probe. The marked model
+# block is generated from Zen's published endpoint and pricing tables by
+# scripts/update-opencode-zen-free-config.sh; do not edit it by hand. Live CI
+# still intersects it with current Free price labels before exercising models.
 #
 # Do NOT set default: true here. Under static discovery, unlisted models return
 # HTTP 400, so making this the default catch-all only risks routing unknown
 # models to a revocable trial gateway.
 #
-# Endpoint allowlists are per model. /responses is verified working upstream for
-# deepseek-v4-flash-free, north-mini-code-free, and nemotron-3-ultra-free; the
-# others are advertised as /chat/completions only (big-pickle returns HTTP 401
-# "not supported for format openai" on /responses). Note: the GitHub Copilot CLI
-# and Codex CLI use /responses with built-in tools that Zen free upstreams may
-# reject; use COPILOT_PROVIDER_WIRE_API=completions for the Copilot CLI.
+# Endpoint allowlists are per model and copied exactly from Zen's published
+# table. Do not add an endpoint merely because Vekil can translate to it.
+# Note: the GitHub Copilot CLI defaults to /responses, while Codex CLI requires
+# a model advertising /responses. The shared Zen CLI smoke sets
+# COPILOT_PROVIDER_WIRE_API=completions and tests only Chat-capable entries.
 #
 # For the full (paid) Zen catalog or higher limits, sign in at
 # https://opencode.ai/auth and swap `api_key: public` for
@@ -41,26 +44,31 @@
 providers:
   - id: opencode-zen
     type: openai-compatible
-    base_url: https://opencode.ai/zen/v1   # proxy appends "/chat/completions"
+    base_url: https://opencode.ai/zen/v1   # proxy appends each model's endpoint
     auth_type: bearer
     api_key: public                         # shared anonymous sentinel, not a secret
     model_discovery: static
+    # BEGIN GENERATED: OpenCode Zen free models
     models:
-      - public_id: big-pickle
+      - public_id: "big-pickle"
         endpoints:
           - /chat/completions
-      - public_id: deepseek-v4-flash-free
+      - public_id: "hy3-free"
         endpoints:
           - /chat/completions
+      - public_id: "mimo-v2.5-free"
+        endpoints:
+          - /chat/completions
+      - public_id: "muse-spark-1.2-contributor-free"
+        endpoints:
           - /responses
-      - public_id: mimo-v2.5-free
+      - public_id: "nemotron-3-ultra-free"
         endpoints:
           - /chat/completions
-      - public_id: nemotron-3-ultra-free    # NVIDIA API Trial Terms; no confidential data
+      - public_id: "nemotron-3.5-lightning-free"
         endpoints:
           - /chat/completions
-          - /responses
-      - public_id: north-mini-code-free      # Cohere Terms; no confidential data
+      - public_id: "x-preview-f-free"
         endpoints:
           - /chat/completions
-          - /responses
+    # END GENERATED: OpenCode Zen free models

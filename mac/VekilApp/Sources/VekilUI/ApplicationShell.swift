@@ -143,7 +143,9 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if terminating {
             return .terminateNow
-        }; terminating = true
+        }
+        persistMainWindowFrame()
+        terminating = true
         Task {
             await analytics.store.shutdown()
             await shutdownRuntime()
@@ -152,7 +154,16 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
         return .terminateLater
     }
 
-    public func windowWillClose(_: Notification) {
+    public func windowDidMove(_ notification: Notification) {
+        persistMainWindowFrame(from: notification)
+    }
+
+    public func windowDidResize(_ notification: Notification) {
+        persistMainWindowFrame(from: notification)
+    }
+
+    public func windowWillClose(_ notification: Notification) {
+        persistMainWindowFrame(from: notification)
         scheduleActivationPolicyUpdate()
     }
 
@@ -187,10 +198,68 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
     private func showWindow() {
         NSApp.setActivationPolicy(.regular)
         if window == nil {
-            let win = NSWindow(contentViewController: NSHostingController(rootView: VekilRootView(app: appState, analytics: analytics)))
-            win.title = "Vekil"; win.styleMask = [.titled, .closable, .miniaturizable, .resizable]; win.setContentSize(.init(width: 980, height: 680)); win.minSize = .init(width: 860, height: 580); win.setFrameAutosaveName("VekilMainWindow"); win.delegate = self; win.isReleasedWhenClosed = false; window = win
+            let win = NSWindow(
+                contentViewController: NSHostingController(
+                    rootView: VekilRootView(app: appState, analytics: analytics)
+                )
+            )
+            win.title = "Vekil"
+            win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            win.setContentSize(.init(width: 980, height: 680))
+            win.minSize = .init(width: 860, height: 580)
+            restoreMainWindowFrame(on: win)
+            win.delegate = self
+            win.isReleasedWhenClosed = false
+            window = win
         }
-        window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func restoreMainWindowFrame(on window: NSWindow) {
+        guard let saved = appState.mainWindowFrame else { return }
+        var frame = NSRect(
+            x: saved.x,
+            y: saved.y,
+            width: saved.width,
+            height: saved.height
+        )
+        guard let screen = screen(for: saved.screenIdentifier, intersecting: frame) else { return }
+        frame.size.width = min(max(frame.width, window.minSize.width), screen.visibleFrame.width)
+        frame.size.height = min(max(frame.height, window.minSize.height), screen.visibleFrame.height)
+        window.setFrame(window.constrainFrameRect(frame, to: screen), display: false)
+    }
+
+    private func persistMainWindowFrame(from notification: Notification? = nil) {
+        guard let window else { return }
+        if let source = notification?.object as? NSWindow, source !== window { return }
+        let frame = window.frame
+        appState.saveMainWindowFrame(
+            VekilWindowFrame(
+                x: frame.origin.x,
+                y: frame.origin.y,
+                width: frame.width,
+                height: frame.height,
+                screenIdentifier: screenIdentifier(window.screen)
+            )
+        )
+    }
+
+    private func screen(for identifier: String?, intersecting frame: NSRect) -> NSScreen? {
+        if let identifier,
+            let match = NSScreen.screens.first(where: { screenIdentifier($0) == identifier })
+        {
+            return match
+        }
+        return NSScreen.screens.first(where: { $0.visibleFrame.intersects(frame) }) ?? NSScreen.main
+    }
+
+    private func screenIdentifier(_ screen: NSScreen?) -> String? {
+        guard
+            let value = screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+                as? NSNumber
+        else { return nil }
+        return value.stringValue
     }
 
     private func installStatusMenu() {

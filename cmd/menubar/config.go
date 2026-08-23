@@ -81,6 +81,13 @@ func saveMenubarConfig(cfg menubarConfig) error {
 	}
 
 	cfg.ProvidersConfigPath = strings.TrimSpace(cfg.ProvidersConfigPath)
+	if cfg.versionedState == nil {
+		existing, err := loadMenubarConfig()
+		if err != nil {
+			return fmt.Errorf("preserve existing menubar config: %w", err)
+		}
+		cfg.versionedState = existing.versionedState
+	}
 	if cfg.versionedState == nil && cfg.ProvidersConfigPath == "" {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove menubar config %q: %w", path, err)
@@ -128,10 +135,29 @@ func saveMenubarConfig(cfg menubarConfig) error {
 		return fmt.Errorf("encode menubar config: %w", err)
 	}
 	body = append(body, '\n')
-	if err := os.WriteFile(path, body, 0o600); err != nil {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
 		return fmt.Errorf("write menubar config %q: %w", path, err)
 	}
-	return os.Chmod(path, 0o600)
+	// Existing installations may have created this file with broader permissions.
+	// Secure the open inode before replacing contents that can include a signed URL.
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("secure menubar config %q: %w", path, err)
+	}
+	if err := file.Truncate(0); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("truncate menubar config %q: %w", path, err)
+	}
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write menubar config %q: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close menubar config %q: %w", path, err)
+	}
+
+	return nil
 }
 
 func loadProvidersConfigForMenubar() (menubarConfig, proxy.ProvidersConfig, error) {

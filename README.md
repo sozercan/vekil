@@ -31,16 +31,40 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 
 ## Quick Start
 
-Grab a binary from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest), or run the container from GHCR:
+Try Vekil with OpenCode Zen's free models without creating an account or a
+local config file:
+
+```bash
+docker run --rm -p 127.0.0.1:1337:1337 \
+  ghcr.io/sozercan/vekil:latest \
+  --providers-config \
+  https://raw.githubusercontent.com/sozercan/vekil/main/examples/opencode-zen-free.yaml
+```
+
+In another terminal, inspect the available public model IDs:
+
+```bash
+curl -s http://127.0.0.1:1337/v1/models
+```
+
+The config URL is fetched once at startup. Pin the URL to a Vekil commit instead
+of `main` for reproducible deployments. Zen's free tier is shared and
+rate-limited, its models rotate, and data handling varies by promotion; do not
+send sensitive prompts. See [OpenCode Zen Free Tier](docs/provider-routing.md#opencode-zen-free-tier).
+
+For zero-config GitHub Copilot mode, persist Vekil's authentication state:
 
 ```bash
 mkdir -p ~/.config/vekil
-docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot -p 1337:1337 \
+docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot \
+  -p 127.0.0.1:1337:1337 \
   -v ~/.config/vekil:/home/nonroot/.config/vekil \
   ghcr.io/sozercan/vekil:latest
 ```
 
-On Apple Silicon Macs, install the macOS tray app via Homebrew:
+Native binaries are available from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest).
+
+On Apple Silicon Macs, install the published tray app via Homebrew:
 
 ```bash
 brew install --cask sozercan/repo/vekil
@@ -48,7 +72,9 @@ brew install --cask sozercan/repo/vekil
 
 > The currently published app is the Go tray shell, is Apple Silicon-only, and is not Developer ID signed. Clear quarantine with `xattr -cr /Applications/Vekil.app`. Manual `vekil-macos-arm64.zip` downloads are also on [Releases](https://github.com/sozercan/vekil/releases/latest). AppKit/SwiftUI and Go-helper source is implemented in this tree, but the native replacement is not a production-signed/notarized release yet; see [macOS App and Linux Tray](docs/menubar.md).
 
-For explicit provider routing, start the proxy with `--providers-config /path/to/providers.{json,yaml}`.
+For explicit provider routing, pass a local file or HTTP(S) URL with
+`--providers-config`, such as `/path/to/providers.yaml` or
+`https://config.example.com/providers.yaml`.
 
 Schema-v2 policy routing follows each profile's YAML `mode` by default; an explicit process mode can still lower it for rollout or emergency rollback. Policy profiles use a text/function-tool canonical Chat contract with translated Anthropic and bounded stateless Responses ingress for managed agents, and support one trusted user/tenant per deployment; see [Semantic Policy Routing](docs/policy-routing.md) before enabling `observe` or `enforce`.
 
@@ -68,8 +94,8 @@ vekil launch copilot --model gpt-5.4-mini
 Pass `--model` to Claude Code or Codex CLI when you want Vekil to validate,
 scope, and pin the session to one public model.
 
-Use `--providers-config` with the same JSON/YAML routing file accepted by the
-server. Arguments after `--` are forwarded to the agent:
+Use `--providers-config` with the same local or HTTP(S) JSON/YAML routing source
+accepted by the server. Arguments after `--` are forwarded to the agent:
 
 ```bash
 vekil launch codex \
@@ -132,8 +158,10 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
 
 ```bash
 env OPENAI_API_KEY=dummy \
-  OPENAI_BASE_URL=http://localhost:1337/v1 \
-  codex exec --skip-git-repo-check -m gpt-5.5 "Reply with exactly PROXY_OK"
+  codex exec --skip-git-repo-check -m gpt-5.5 \
+  -c 'model_provider="openai"' \
+  -c 'openai_base_url="http://localhost:1337/v1"' \
+  "Reply with exactly PROXY_OK"
 ```
 
 ### GitHub Copilot CLI

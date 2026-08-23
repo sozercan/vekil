@@ -562,7 +562,7 @@ func (m *ConfigManager) saveStateLocked() error {
 func loadPersistentState(path string) (PersistentState, bool, error) {
 	body, _, err := readSecureFile(path, MaxStateBytes)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
+		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
 			return PersistentState{Version: StateVersion, ConfigMode: ConfigModeLegacy, SelectedConfigRevision: LegacyConfigRevision}, false, nil
 		}
 		return PersistentState{}, false, err

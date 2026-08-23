@@ -63,6 +63,7 @@ SMOKE_PROCESS_TERM_GRACE_SECONDS="${SMOKE_PROCESS_TERM_GRACE_SECONDS:-8}"
 SMOKE_PORT_RELEASE_TIMEOUT_SECONDS="${SMOKE_PORT_RELEASE_TIMEOUT_SECONDS:-8}"
 SMOKE_AUTO_PORT_MAX_ATTEMPTS="${SMOKE_AUTO_PORT_MAX_ATTEMPTS:-3}"
 SMOKE_DIAGNOSTIC_MAX_BYTES="${SMOKE_DIAGNOSTIC_MAX_BYTES:-32768}"
+COPILOT_QUOTA_UNAVAILABLE_EXIT=75
 
 TMP_PARENT="${LIVE_POLICY_ROUTING_TMP_PARENT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
 SMOKE_DIR="${LIVE_POLICY_ROUTING_SMOKE_DIR:-$(mktemp -d "${TMP_PARENT%/}/live-policy-routing-copilot-smoke.XXXXXX")}"
@@ -199,6 +200,27 @@ text = text[:limit]
 print("--- copilot-bridge.log (redacted) ---", file=sys.stderr)
 print(text, file=sys.stderr)
 PY
+}
+
+copilot_billing_is_unavailable() {
+  [[ -f "${BRIDGE_LOG}" ]] || return 1
+  jq -R -s -e '
+    [
+      split("\n")[]
+      | fromjson?
+      | select(
+          .msg == "request completed"
+          and .provider_kind == "copilot"
+          and .status == 402
+        )
+    ]
+    | length > 0
+  ' "${BRIDGE_LOG}" >/dev/null 2>&1
+}
+
+report_copilot_quota_unavailable() {
+  log "Copilot returned HTTP 402; live policy-routing coverage is temporarily unavailable."
+  exit "${COPILOT_QUOTA_UNAVAILABLE_EXIT}"
 }
 
 cleanup() {
@@ -367,13 +389,13 @@ select_copilot_models() {
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL:-}" \
     "" \
     high \
-	    gpt-5.4 gemini-3.1-pro-preview gemini-3.5-flash claude-sonnet-4.6 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
+	    gemini-3.1-pro-preview gemini-3.5-flash claude-sonnet-4.6 gpt-5.4 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
   selected_secondary="$(pick_copilot_model \
     powerful-secondary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL:-}" \
     "${selected_primary}" \
     high \
-	    gemini-3.1-pro-preview gemini-3.5-flash gpt-5.4 claude-sonnet-4.6 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
+    gemini-3.5-flash claude-sonnet-4.6 gemini-3.1-pro-preview gpt-5.4 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1 gpt-5-mini)"
 
   jq -n \
     --arg lightweight "${selected_lightweight}" \
@@ -458,8 +480,14 @@ main() {
   start_copilot_bridge
   fetch_copilot_models
   select_copilot_models
-  run_policy_harness
-  run_sol_effort_harness
+  if ! run_policy_harness; then
+    copilot_billing_is_unavailable && report_copilot_quota_unavailable
+    die "Copilot-backed semantic policy-routing smoke failed"
+  fi
+  if ! run_sol_effort_harness; then
+    copilot_billing_is_unavailable && report_copilot_quota_unavailable
+    die "Copilot-backed Sol effort smoke failed"
+  fi
 
   log "Copilot-backed semantic policy-routing and Sol low/max effort smokes passed."
   if [[ "${LIVE_POLICY_ROUTING_KEEP_ARTIFACTS:-0}" == "1" ]]; then

@@ -2,7 +2,6 @@ package macosruntime
 
 import (
 	"context"
-	"errors"
 	"sync"
 
 	"github.com/sozercan/vekil/internal/appcontrol"
@@ -157,5 +156,3 @@ func (c *operationCoordinator) wait(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
-
-var errOperationCompletionLost = errors.New("operation completion lost")

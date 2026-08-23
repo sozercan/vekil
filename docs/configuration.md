@@ -38,7 +38,7 @@ This source implementation does not add provider-schema fields or public endpoin
 | `--port` | `PORT` | `1337` | Listen port |
 | `--host` | `HOST` | `127.0.0.1` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
-| `--providers-config` | `PROVIDERS_CONFIG` | unset | Path to JSON or YAML provider configuration for explicit provider routing |
+| `--providers-config` | `PROVIDERS_CONFIG` | unset | Local path or HTTP(S) URL to JSON or YAML provider configuration for explicit provider routing |
 | `--policy-routing` | `POLICY_ROUTING_MODE` | `config` | Policy-routing ceiling: `config` follows each profile's YAML `mode`; `off`, `observe`, or `enforce` explicitly cap every profile. A profile cannot run above an explicit ceiling. |
 | `--policy-routing-allow-remote-single-tenant` | `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT` | `false` | Acknowledge running policy `observe`/`enforce` on a non-loopback bind for one trusted tenant. This adds no authentication or tenant isolation. |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
@@ -57,13 +57,15 @@ These overrides only affect Copilot-backed upstream requests. For provider-level
 | `--copilot-editor-version` | `COPILOT_EDITOR_VERSION` | `vscode/1.95.0` | Upstream `editor-version` header |
 | `--copilot-plugin-version` | `COPILOT_PLUGIN_VERSION` | `copilot-chat/0.26.7` | Upstream `editor-plugin-version` header |
 | `--copilot-user-agent` | `COPILOT_USER_AGENT` | `GitHubCopilotChat/0.26.7` | Upstream `user-agent` header |
-| `--copilot-integration-id` | `COPILOT_INTEGRATION_ID` | `vscode-chat` | Upstream `copilot-integration-id` header |
+| `--copilot-integration-id` | `COPILOT_INTEGRATION_ID` | credential-aware | Upstream `copilot-integration-id` header; direct `ghu_` catalog/Chat requests default to `copilot-language-server`, while its Responses fallback and other credentials default to `vscode-chat` |
 | `--copilot-github-api-version` | `COPILOT_GITHUB_API_VERSION` | `2025-05-01` | Upstream `x-github-api-version` header |
 | `--copilot-openai-intent` | `COPILOT_OPENAI_INTENT` | unset (`conversation-panel` for chat/responses) | Upstream `openai-intent` header |
 
 ## Provider Configs
 
-Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership of public model IDs across providers. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
+Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership of public model IDs across providers. The source may be a local path or an HTTP(S) URL. Configs can be JSON (`.json`) or YAML (`.yaml`/`.yml`); for a URL, the URL path extension selects YAML and the query string is ignored when detecting the format. Other extensions use JSON decoding, matching local-file behavior.
+
+Remote configs are fetched once when the server, validator, or managed launcher loads them. Each fetch has a 15-second total timeout and a 4 MiB response-body limit; Vekil does not poll the URL or reload changes. Redirects are not followed. Prefer HTTPS because an HTTP response can be modified in transit, and keep credentials in `api_key_env` rather than embedding them in remotely hosted configuration. Startup and validation fail closed when the source cannot be fetched or returns a non-2xx status. User-visible diagnostics omit URL userinfo, query parameters, and fragments so credentials and signed query values are not printed.
 
 - See [Provider Routing](provider-routing.md) for auth notes, generic-compatible provider fields, provider examples, routing rules, endpoint allowlists, and model metadata.
 - See [Semantic Policy Routing](policy-routing.md) for the schema-v2 `exposure`, `policy_profiles`, provider trust metadata, and classifier data-policy contract. A complete example is checked in at [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml).
@@ -85,7 +87,7 @@ For a schema-v2 policy config, add `--live` to perform one fixed non-user classi
 vekil config validate --live --providers-config /path/to/providers.yaml
 ```
 
-Live validation verifies authentication/reachability, the forced `emit_policy_signals` function contract, strict arguments, configured non-storage behavior, and the one-send limit. It proves protocol acceptance, not the provider's external retention behavior. Ordinary `config validate` remains offline.
+When the config source is a URL, ordinary validation fetches that source but remains offline with respect to provider discovery and inference endpoints. Live validation verifies authentication/reachability, the forced `emit_policy_signals` function contract, strict arguments, configured non-storage behavior, and the one-send limit. It proves protocol acceptance, not the provider's external retention behavior.
 
 At server startup, effective `enforce` profiles must pass live preflight before startup/readiness completes. An effective `observe` profile that fails preflight is kept off with a readiness/configuration diagnostic. Effective `off` profiles send no preflight or classifier request.
 

@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -775,6 +777,341 @@ func TestLoadProvidersConfigFileRejectsEmptyBody(t *testing.T) {
 				t.Fatalf("LoadProvidersConfigFile() error = %v, want empty config error", err)
 			}
 		})
+	}
+}
+
+func TestLoadProvidersConfigFileURL(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "JSON",
+			path: "/providers.json?revision=1",
+			body: `{"providers":[{"id":"remote","type":"openai-compatible","base_url":"http://localhost:1234","auth_type":"none","models":[{"public_id":"remote-model"}]}]}`,
+		},
+		{
+			name: "YAML with query",
+			path: "/providers.yaml?revision=1",
+			body: "providers:\n  - id: remote\n    type: openai-compatible\n    base_url: http://localhost:1234\n    auth_type: none\n    models:\n      - public_id: remote-model\n",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+
+			cfg, err := LoadProvidersConfigFile(server.URL + tc.path)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+			if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "remote" {
+				t.Fatalf("providers = %+v, want one remote provider", cfg.Providers)
+			}
+		})
+	}
+}
+
+func TestParseProvidersConfigURLTreatsFilesystemPathsAsLocal(t *testing.T) {
+	t.Parallel()
+
+	for _, source := range []string{
+		"/tmp/http://providers.yaml",
+		"relative/http://providers.yaml",
+		"C://providers.yaml",
+	} {
+		source := source
+		t.Run(source, func(t *testing.T) {
+			t.Parallel()
+
+			parsed, remote, err := parseProvidersConfigURL(source)
+			if err != nil {
+				t.Fatalf("parseProvidersConfigURL(%q) error = %v", source, err)
+			}
+			if remote || parsed != nil {
+				t.Fatalf("parseProvidersConfigURL(%q) = (%v, %v), want local source", source, parsed, remote)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileLocalPathContainingURLDelimiter(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not permit a colon in this path component")
+	}
+
+	configDir := filepath.Join(t.TempDir(), "http:")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	configPath := filepath.Join(configDir, "providers.yaml")
+	if err := os.WriteFile(configPath, []byte("providers:\n  - id: copilot\n    type: copilot\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	source := configDir + "//providers.yaml"
+	if !strings.Contains(source, "://") {
+		t.Fatalf("test source %q does not contain URL delimiter", source)
+	}
+	cfg, err := LoadProvidersConfigFile(source)
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile(%q) error = %v", source, err)
+	}
+	if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "copilot" {
+		t.Fatalf("providers = %+v, want local Copilot provider", cfg.Providers)
+	}
+}
+
+func TestLoadProvidersConfigFileURLDoesNotRestrictContentNegotiation(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept"); got != "*/*" {
+			http.Error(w, "unsupported Accept header", http.StatusNotAcceptable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-yaml")
+		_, _ = io.WriteString(w, "providers:\n  - id: copilot\n    type: copilot\n")
+	}))
+	defer server.Close()
+
+	cfg, err := LoadProvidersConfigFile(server.URL + "/providers.yaml")
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+	}
+	if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "copilot" {
+		t.Fatalf("providers = %+v, want negotiated YAML config", cfg.Providers)
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsRedirect(t *testing.T) {
+	t.Parallel()
+
+	targetCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/providers.yaml":
+			http.Redirect(w, r, "/redirected.yaml", http.StatusFound)
+		case "/redirected.yaml":
+			targetCalls++
+			_, _ = io.WriteString(w, "providers: []\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 302 Found") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want redirect status failure", err)
+	}
+	if targetCalls != 0 {
+		t.Fatalf("redirect target calls = %d, want 0", targetCalls)
+	}
+}
+
+func TestLoadProvidersConfigFileURLRedactsSensitiveSourceParts(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status.yaml":
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		case "/decode.yaml":
+			_, _ = io.WriteString(w, "providers: [\n")
+		case "/validate.json":
+			_, _ = io.WriteString(w, `{"schema_version":2,"providers":[{"id":"remote","type":"unsupported"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	testCases := []struct {
+		path string
+		want string
+	}{
+		{path: "/status.yaml", want: "unexpected HTTP status 503 Service Unavailable"},
+		{path: "/decode.yaml", want: "decode providers config"},
+		{path: "/validate.json", want: "validate providers config"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.path, func(t *testing.T) {
+			source := strings.Replace(server.URL, "http://", "http://source-user:source-password@", 1) + tc.path + "?signature=signed-secret#fragment-secret"
+			_, err := LoadProvidersConfigFile(source)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want %q", err, tc.want)
+			}
+			for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("LoadProvidersConfigFile() error exposes %q: %v", secret, err)
+				}
+			}
+			if wantSource := server.URL + tc.path; !strings.Contains(err.Error(), wantSource) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want sanitized source %q", err, wantSource)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileURLRedactsRequestError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	server.Close()
+	source := strings.Replace(server.URL, "http://", "http://source-user:source-password@", 1) + "/providers.yaml?signature=signed-secret#fragment-secret"
+
+	_, err := LoadProvidersConfigFile(source)
+	if err == nil || !strings.Contains(err.Error(), "fetch providers config") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want fetch failure", err)
+	}
+	for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("LoadProvidersConfigFile() error exposes %q: %v", secret, err)
+		}
+	}
+	if wantSource := server.URL + "/providers.yaml"; !strings.Contains(err.Error(), wantSource) {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want sanitized source %q", err, wantSource)
+	}
+}
+
+func TestProvidersConfigSourceDisplay(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{name: "local path", source: "/tmp/provider config.yaml", want: "/tmp/provider config.yaml"},
+		{
+			name:   "remote secrets",
+			source: "HTTPS://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret",
+			want:   "https://example.com/providers.yaml",
+		},
+		{name: "local path containing URL delimiter", source: "/tmp/http://providers.yaml", want: "/tmp/http://providers.yaml"},
+		{name: "Windows drive path", source: "C://providers.yaml", want: "C://providers.yaml"},
+		{name: "hostless HTTPS URL", source: "https:/config.example/providers.yaml?signature=signed-secret", want: "https://<invalid>"},
+		{name: "malformed remote", source: "https://source-user:source-password@example.com/%zz?signature=signed-secret", want: "https://<invalid>"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ProvidersConfigSourceDisplay(tc.source); got != tc.want {
+				t.Fatalf("ProvidersConfigSourceDisplay(%q) = %q, want %q", tc.source, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileMalformedURLRedactsSensitiveSourceParts(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{
+			name:   "invalid escape",
+			source: "https://source-user:source-password@example.com/%zz?signature=signed-secret#fragment-secret",
+			want:   `parse providers config URL "https://<invalid>"`,
+		},
+		{
+			name:   "hostless HTTPS",
+			source: "https:/config.example/providers.yaml?signature=signed-secret#fragment-secret",
+			want:   `providers config URL "https://<invalid>" has no host`,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadProvidersConfigFile(tc.source)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want %q", err, tc.want)
+			}
+			for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("LoadProvidersConfigFile() error exposes %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsHTTPFailure(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 503 Service Unavailable") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want HTTP status failure", err)
+	}
+}
+
+func TestLoadProvidersConfigFileURLCanonicalizesHTTPStatus(t *testing.T) {
+	t.Parallel()
+
+	const reflectedSecret = "signed-query-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("ResponseWriter does not support hijacking")
+			return
+		}
+		connection, response, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("Hijack() error = %v", err)
+			return
+		}
+		defer func() { _ = connection.Close() }()
+		_, _ = io.WriteString(response, "HTTP/1.1 503 "+reflectedSecret+"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		if err := response.Flush(); err != nil {
+			t.Errorf("Flush() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml?signature=" + reflectedSecret)
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 503 Service Unavailable") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want canonical HTTP status failure", err)
+	}
+	if strings.Contains(err.Error(), reflectedSecret) {
+		t.Fatalf("LoadProvidersConfigFile() error exposes reflected query secret: %v", err)
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsOversizedBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat(" ", maxRemoteProvidersConfigBodySize+1))
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), "response exceeds 4194304 bytes") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want response-size failure", err)
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsUnsupportedScheme(t *testing.T) {
+	t.Parallel()
+
+	_, err := LoadProvidersConfigFile("ftp://example.com/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), `unsupported scheme "ftp"`) {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want unsupported-scheme failure", err)
 	}
 }
 

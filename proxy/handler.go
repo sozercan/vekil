@@ -60,6 +60,7 @@ const (
 	defaultCopilotEditorPluginVersion = "copilot-chat/0.26.7"
 	defaultCopilotUserAgent           = "GitHubCopilotChat/0.26.7"
 	defaultCopilotIntegrationID       = "vscode-chat"
+	directGitHubAppIntegrationID      = "copilot-language-server"
 	defaultCopilotGitHubAPIVersion    = "2025-05-01"
 	defaultCopilotOpenAIIntent        = "conversation-panel"
 	defaultResponsesWSCompactMaxItems = 8
@@ -1018,7 +1019,7 @@ func setCopilotHeaders(req *http.Request, token string) {
 }
 
 func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHeaderConfig) {
-	cfg = cfg.withDefaults()
+	cfg = cfg.withCredentialDefaults(token)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("editor-version", cfg.EditorVersion)
 	req.Header.Set("editor-plugin-version", cfg.EditorPluginVersion)
@@ -1028,6 +1029,13 @@ func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHea
 	req.Header.Set("x-request-id", uuid.New().String())
 	req.Header.Set("openai-intent", cfg.OpenAIIntent)
 	req.Header.Set("Content-Type", "application/json")
+}
+
+func (c CopilotHeaderConfig) withCredentialDefaults(token string) CopilotHeaderConfig {
+	if c.IntegrationID == "" && strings.HasPrefix(strings.TrimSpace(token), "ghu_") {
+		c.IntegrationID = directGitHubAppIntegrationID
+	}
+	return c.withDefaults()
 }
 
 func clearCopilotHeaders(headers http.Header) {
@@ -1056,7 +1064,7 @@ func copilotEndpointUsesDefaultOpenAIIntent(endpoint string) bool {
 
 func setCopilotHeadersForEndpoint(req *http.Request, token string, cfg CopilotHeaderConfig, endpoint string) {
 	explicitOpenAIIntent := cfg.OpenAIIntent != ""
-	cfg = cfg.withDefaults()
+	cfg = cfg.withCredentialDefaults(token)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("editor-version", cfg.EditorVersion)
 	req.Header.Set("editor-plugin-version", cfg.EditorPluginVersion)

@@ -119,11 +119,19 @@ GOARCH=arm64 make build-tray-linux
 
 Linux preserves the Go-shell start/stop, status, auth, provider-config, and XDG autostart features. Keychain, SwiftUI, and Sparkle behavior is macOS-only.
 
-Dialogs, notifications, and sign-in use DBus directly when possible. Optional helpers improve desktop integration:
+Dialogs, notifications, and sign-in use `xdg-desktop-portal` D-Bus interfaces (`FileChooser.OpenFile`, `OpenURI.OpenURI`, `Notification.AddNotification`) rather than subprocess dialog tools. A portal backend (`xdg-desktop-portal-gtk`, `xdg-desktop-portal-kde`, or similar, matched to your X11 or Wayland desktop) is only strictly required for `Choose Providers Config…`, which has no other picker to fall back to. Sign-in confirmation and error/plain notifications prefer the portal but fall back to the legacy `org.freedesktop.Notifications` interface when it is unavailable.
 
-| Feature | Packages |
-|---------|----------|
-| Dialogs | `zenity` or `kdialog` for richer dialogs |
-| Clipboard | `wl-clipboard`, `xclip`, or `xsel` |
-| Open URLs | `xdg-open` |
-| Notifications | DBus notification daemon; `notify-send` fallback |
+Portal notifications are non-modal and may be grouped or suppressed by the desktop; there is no portal-provided generic modal dialog. Sign-in confirmation uses a notification with approve/decline action buttons and deliberately no default action, so only an explicit click on the approve button ever approves; clicking the notification body, dismissing it, letting it time out, or any other outcome declines. One two-minute budget covers the portal attempt and any legacy fallback together, so sign-in confirmation never shows more than one prompt. Error alerts and plain notifications are informational, non-interactive notifications with no buttons.
+
+Once a confirmation notification may have been displayed by either mechanism, a failure is never treated as reason to retry: the legacy fallback runs only when the portal attempt is provably certain to have never been shown (for example, the portal service is unreachable); any other failure, including an ambiguous delivery error where the notification may already be on screen, declines outright rather than risking a duplicate prompt.
+
+Fallback behavior when no portal is available:
+
+| Feature | Behavior without a portal |
+|---------|----------------------------|
+| Sign-in confirmation | Falls back to a legacy `org.freedesktop.Notifications` action prompt with approve/decline buttons on a plain notification daemon. If no notification mechanism responds at all, sign-in confirmation defaults to decline rather than proceeding unattended. |
+| Error alerts, notifications | Falls back to a plain legacy `org.freedesktop.Notifications` notification (no action buttons, no wait) on a plain notification daemon. |
+| Choose Providers Config… | No fallback; the menu action reports an actionable error naming `xdg-desktop-portal`. Pass `--providers-config` or edit the saved menubar config file directly instead. |
+| Open URLs (Open Dashboard, sign-in link) | Falls back to `xdg-open` when the portal method call cannot be made, the response wait fails or times out, or the portal reports an outcome other than success or a deliberate user cancellation. Both Open Dashboard and sign-in run this bounded portal wait on their own goroutine rather than the tray's single menu-dispatch loop, so other menu clicks stay responsive while it is pending. |
+
+Clipboard support is unchanged and does not use the portal (the portal's clipboard interface requires an active RemoteDesktop/InputCapture session, not a standalone API): `wl-clipboard`, `xclip`, or `xsel`.

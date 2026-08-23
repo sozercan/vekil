@@ -8,8 +8,8 @@ import (
 	"github.com/sozercan/vekil/auth"
 )
 
-// ValidateProvidersConfigFileLive performs ordinary offline validation and then
-// executes the same classifier capability preflight used by server startup.
+// ValidateProvidersConfigFileLive performs ordinary structural validation and
+// then executes the same classifier capability preflight used by server startup.
 // Profiles configured off remain offline; observe/enforce profiles are probed.
 func ValidateProvidersConfigFileLive(ctx context.Context, path string) error {
 	cfg, err := LoadProvidersConfigFile(path)

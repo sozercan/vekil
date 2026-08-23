@@ -283,6 +283,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "path": self.path,
             "model": body.get("model"),
             "effort": effort,
+            "store": body.get("store"),
             "stream": body.get("stream"),
         }
         try:
@@ -374,7 +375,7 @@ config = {
         "auth_type": "none",
         "model_discovery": "static",
         "trust_domain": "github-copilot-loopback",
-        "classifier_no_store_supported": False,
+        "classifier_no_store_supported": True,
     }],
     "model_routes": [
         route("semantic-sol-low", "low"),
@@ -516,6 +517,8 @@ if not classifiers:
     raise SystemExit("no classifier request was captured")
 if any(event.get("effort") is not None for event in classifiers):
     raise SystemExit(f"classifier request received terminal effort: {classifiers}")
+if any(event.get("store") is not False for event in classifiers):
+    raise SystemExit(f"classifier request did not retain store=false: {classifiers}")
 if any(event.get("path") != "/v1/responses" for event in events):
     raise SystemExit(f"non-Responses upstream path captured: {events}")
 for label, expected in (("simple", "low"), ("complex", "max")):

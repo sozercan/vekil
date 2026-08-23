@@ -449,6 +449,82 @@ func TestHandleResponsesWebSocket_BridgesStreamingResponse(t *testing.T) {
 	}
 }
 
+func TestHandleResponsesWebSocket_NormalizesBlankAdditionalToolsNamespaceDescription(t *testing.T) {
+	var upstreamRequests atomic.Int32
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests.Add(1)
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body struct {
+			Input []struct {
+				Type  string `json:"type"`
+				Tools []struct {
+					Type        string `json:"type"`
+					Name        string `json:"name"`
+					Description string `json:"description"`
+				} `json:"tools"`
+			} `json:"input"`
+		}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		if len(body.Input) != 2 || body.Input[0].Type != "additional_tools" {
+			t.Fatalf("upstream input = %+v, want additional_tools and user message", body.Input)
+		}
+		if len(body.Input[0].Tools) != 1 {
+			t.Fatalf("upstream additional tools = %+v, want one namespace", body.Input[0].Tools)
+		}
+		namespace := body.Input[0].Tools[0]
+		if namespace.Type != "namespace" || namespace.Name != "functions" || namespace.Description != "Tools in the functions namespace." {
+			t.Fatalf("upstream namespace = %+v, want normalized functions description", namespace)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-normalized\"}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-normalized\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n")
+	})
+
+	server := startResponsesWebSocketProxyServer(t, handler)
+	conn := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = conn.Close() }()
+
+	request := newResponsesWebSocketCreateRequest([]interface{}{
+		map[string]interface{}{
+			"type": "additional_tools",
+			"role": "developer",
+			"tools": []interface{}{
+				map[string]interface{}{
+					"type":        "namespace",
+					"name":        "functions",
+					"description": "",
+					"tools":       []interface{}{},
+				},
+			},
+		},
+		map[string]interface{}{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "input_text", "text": "hello"},
+			},
+		},
+	})
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("failed to write websocket request: %v", err)
+	}
+	if created := mustReadWebSocketJSON(t, conn); created["type"] != "response.created" {
+		t.Fatalf("expected response.created, got %v", created["type"])
+	}
+	if completed := mustReadWebSocketJSON(t, conn); completed["type"] != "response.completed" {
+		t.Fatalf("expected response.completed, got %v", completed["type"])
+	}
+	if got := upstreamRequests.Load(); got != 1 {
+		t.Fatalf("upstream requests = %d, want 1", got)
+	}
+}
+
 func TestHandleResponsesWebSocket_ForwardsCustomTurnMetadataFields(t *testing.T) {
 	turnMetadata := `{"turn_id":"turn-123","fiber_run_id":"fiber-123","origin":"app-server"}`
 	var gotTurnMetadata string
@@ -2127,6 +2203,93 @@ func TestResponsesWebSocketAutoCompactsShortBytePressureHistory(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketCompactHistoryPreservesAdditionalToolsOutsideSummary(t *testing.T) {
+	raw := func(v interface{}) json.RawMessage {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("failed to marshal raw message: %v", err)
+		}
+		return b
+	}
+	msg := func(role, text string) json.RawMessage {
+		contentType := "input_text"
+		if role == "assistant" {
+			contentType = "output_text"
+		}
+		return raw(map[string]interface{}{
+			"type":    "message",
+			"role":    role,
+			"content": []map[string]string{{"type": contentType, "text": text}},
+		})
+	}
+
+	additionalTools := raw(map[string]interface{}{
+		"type": "additional_tools",
+		"role": "developer",
+		"tools": []interface{}{
+			map[string]interface{}{"type": "custom", "name": "exec"},
+		},
+	})
+	var compactInput []map[string]interface{}
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream request body: %v", err)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			t.Fatalf("failed to decode upstream request body: %v", err)
+		}
+		compactInput = upstreamInputItems(t, body)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"comp-additional-tools","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"catalog-free checkpoint"}]}]}`)
+	})
+	handler.responsesWS = ResponsesWebSocketConfig{
+		AutoCompactMaxItems: 2,
+		AutoCompactMaxBytes: 1 << 20,
+		AutoCompactKeepTail: 1,
+	}
+
+	session := &responsesWebSocketSession{
+		ctx: context.Background(),
+		historyItems: []json.RawMessage{
+			additionalTools,
+			msg("user", "old question"),
+			msg("assistant", "latest answer"),
+		},
+	}
+	request := &responsesWebSocketCreateRequest{Model: "gpt-5.4"}
+
+	_, compacted, err := session.compactHistory(handler, context.Background(), request, false, nil)
+	if err != nil {
+		t.Fatalf("compactHistory failed: %v", err)
+	}
+	if !compacted {
+		t.Fatal("expected websocket history to compact")
+	}
+	if len(compactInput) != 1 {
+		t.Fatalf("expected internal compaction to omit additional_tools and summarize one history item, got %#v", compactInput)
+	}
+	if got := inputTextFromMessage(t, compactInput[0]); got != "old question" {
+		t.Fatalf("expected compacted prefix to contain the old question, got %q", got)
+	}
+	if len(session.historyItems) != 3 {
+		t.Fatalf("expected additional_tools, checkpoint, and tail after compaction, got %d items", len(session.historyItems))
+	}
+	if !bytes.Equal(session.historyItems[0], additionalTools) {
+		t.Fatalf("expected additional_tools to be restored exactly once, got %s", session.historyItems[0])
+	}
+	compactedItems := decodeRawMessagesForTest(t, session.historyItems)
+	if got := requireMessageTextWithRole(t, compactedItems[1], "developer"); !strings.Contains(got, "catalog-free checkpoint") {
+		t.Fatalf("expected checkpoint summary after restored catalog, got %q", got)
+	}
+	if got := inputTextFromMessage(t, compactedItems[2]); got != "latest answer" {
+		t.Fatalf("expected latest answer tail to be retained, got %q", got)
+	}
+}
+
 func TestResponsesWebSocketCompactHistoryStripsInternalChatMetadataBeforeUpstream(t *testing.T) {
 	raw := func(v interface{}) json.RawMessage {
 		t.Helper()
@@ -2499,7 +2662,15 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 	conn := mustDialResponsesWebSocket(t, server, nil)
 	defer func() { _ = conn.Close() }()
 
+	additionalTools := map[string]interface{}{
+		"type": "additional_tools",
+		"role": "developer",
+		"tools": []interface{}{
+			map[string]interface{}{"type": "custom", "name": "exec"},
+		},
+	}
 	first := newResponsesWebSocketCreateRequest([]interface{}{
+		additionalTools,
 		map[string]interface{}{
 			"type": "message",
 			"role": "user",
@@ -2552,10 +2723,13 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 	}
 
 	initialReplayInput := upstreamInputItems(t, requests[1])
-	if len(initialReplayInput) != 5 {
+	if len(initialReplayInput) != 6 {
 		t.Fatalf("expected oversized replay to include full history plus latest input, got %d items", len(initialReplayInput))
 	}
-	if got := inputTextFromMessage(t, initialReplayInput[0]); got != "first turn" {
+	if initialReplayInput[0]["type"] != "additional_tools" {
+		t.Fatalf("expected oversized replay to preserve additional_tools first, got %#v", initialReplayInput[0])
+	}
+	if got := inputTextFromMessage(t, initialReplayInput[1]); got != "first turn" {
 		t.Fatalf("expected oversized replay to start with original user turn, got %q", got)
 	}
 
@@ -2568,13 +2742,16 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 	}
 
 	retriedInput := upstreamInputItems(t, requests[3])
-	if len(retriedInput) != 4 {
+	if len(retriedInput) != 5 {
 		t.Fatalf("expected retried request to use compacted history plus latest input, got %d items", len(retriedInput))
 	}
-	if got := requireMessageTextWithRole(t, retriedInput[0], "developer"); !strings.Contains(got, "checkpoint summary after 413") {
+	if retriedInput[0]["type"] != "additional_tools" {
+		t.Fatalf("expected retried request to restore additional_tools first, got %#v", retriedInput[0])
+	}
+	if got := requireMessageTextWithRole(t, retriedInput[1], "developer"); !strings.Contains(got, "checkpoint summary after 413") {
 		t.Fatalf("expected retried request to start with compacted checkpoint, got %q", got)
 	}
-	if got := inputTextFromMessage(t, retriedInput[3]); got != "second turn" {
+	if got := inputTextFromMessage(t, retriedInput[4]); got != "second turn" {
 		t.Fatalf("expected retried request to keep latest user turn, got %q", got)
 	}
 

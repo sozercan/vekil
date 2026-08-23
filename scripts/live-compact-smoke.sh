@@ -28,6 +28,7 @@ SMOKE_CURL_MAX_TIME_SECONDS="${SMOKE_CURL_MAX_TIME_SECONDS:-180}"
 SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS="${SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS:-5}"
 SMOKE_PROCESS_TERM_GRACE_SECONDS="${SMOKE_PROCESS_TERM_GRACE_SECONDS:-5}"
 SMOKE_PORT_RELEASE_TIMEOUT_SECONDS="${SMOKE_PORT_RELEASE_TIMEOUT_SECONDS:-5}"
+COPILOT_QUOTA_UNAVAILABLE_EXIT=75
 
 python_command() {
   if command -v python3 >/dev/null 2>&1; then
@@ -359,6 +360,11 @@ post_json() {
     || die "${endpoint} request failed before an HTTP response"
 
   if [[ "${status}" != "200" ]]; then
+    if [[ "${endpoint}" == "/v1/responses/compact" && "${status}" == "402" ]] \
+      && jq -e '.error.code == "quota_exceeded"' "${response_file}" >/dev/null 2>&1; then
+      log "Copilot monthly quota is exhausted; live coverage is temporarily unavailable."
+      exit "${COPILOT_QUOTA_UNAVAILABLE_EXIT}"
+    fi
     if [[ -s "${response_file}" ]]; then
       log "${endpoint} response body:"
       cat "${response_file}" >&2

@@ -215,21 +215,23 @@ final class RuntimeControllerTests: XCTestCase {
         try await eventually { process.writtenData.count == 3 }
 
         let requests = try process.writtenData.dropFirst().map(requestFromLine)
-        let requestA = try XCTUnwrap(requests.first { $0.id == "req_a" })
-        let requestB = try XCTUnwrap(requests.first { $0.id == "req_b" })
+        let firstRequest = try XCTUnwrap(requests.first { $0.command == .describeConfig })
+        let secondRequest = try XCTUnwrap(
+            requests.first { $0.command == RuntimeCommand("second_read") }
+        )
 
-        process.emitStandardOutput(try encodedResponse(for: requestA, epoch: "old_epoch"))
+        process.emitStandardOutput(try encodedResponse(for: firstRequest, epoch: "old_epoch"))
         process.emitStandardOutput(
-            try encodedResponse(for: requestB, result: .object(["value": .string("b")]))
+            try encodedResponse(for: secondRequest, result: .object(["value": .string("b")]))
         )
         process.emitStandardOutput(
-            try encodedResponse(for: requestA, result: .object(["value": .string("a")]))
+            try encodedResponse(for: firstRequest, result: .object(["value": .string("a")]))
         )
 
         let firstResponse = try await first.value
         let secondResponse = try await second.value
-        XCTAssertEqual(firstResponse.id, "req_a")
-        XCTAssertEqual(secondResponse.id, "req_b")
+        XCTAssertEqual(firstResponse.id, firstRequest.id)
+        XCTAssertEqual(secondResponse.id, secondRequest.id)
     }
 
     func testEpochRevisionAndRuntimeGenerationFilteringPreventRegression() async throws {

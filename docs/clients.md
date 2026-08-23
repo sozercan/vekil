@@ -69,9 +69,15 @@ Use [`vekil launch codex`](agent-launchers.md) for an ephemeral supervised sessi
 
 ```bash
 env OPENAI_API_KEY=dummy \
-  OPENAI_BASE_URL=http://localhost:1337/v1 \
-  codex exec --skip-git-repo-check -m gpt-5.5 "Reply with exactly PROXY_OK"
+  codex exec --skip-git-repo-check -m gpt-5.5 \
+  -c 'model_provider="openai"' \
+  -c 'openai_base_url="http://localhost:1337/v1"' \
+  "Reply with exactly PROXY_OK"
 ```
+
+Codex resolves the built-in `openai` provider's endpoint from the `openai_base_url` config key. Set both `model_provider` and `openai_base_url` with `-c` as above, or persist both in `~/.codex/config.toml`; pinning the provider prevents an existing custom provider from bypassing Vekil. `OPENAI_BASE_URL` is not read: exporting it leaves Codex calling the upstream provider directly, with no error to indicate the proxy was bypassed. [`vekil launch codex`](agent-launchers.md) applies the same explicit routing with a generated provider: it selects that provider, sets `model_providers.<id>.base_url`, and clears `OPENAI_BASE_URL` from the child environment.
+
+For this manual configuration, Codex's built-in `openai` provider probes the [Responses WebSocket bridge](responses-websocket.md) before falling back to HTTP streaming. When the bridge is disabled — the default — that probe logs a single `426 Upgrade Required` at startup and the session proceeds normally over HTTP. The managed launcher disables this WebSocket probe.
 
 ## GitHub Copilot CLI
 

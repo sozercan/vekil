@@ -1468,7 +1468,12 @@ powerful_test_prompt() {
   local prefix="$1"
   "$(python_command)" - "${prefix}" <<'PY_POWERFUL_PROMPT'
 import sys
-print(sys.argv[1] + "\nBounded synthetic context: " + ("x" * 5000))
+print(
+    sys.argv[1]
+    + "\nBounded synthetic context: "
+    + ("x" * 5000)
+    + "\nFor this synthetic routing check, do not analyze the task above. Reply with exactly POLICY_ROUTE_OK."
+)
 PY_POWERFUL_PROMPT
 }
 
@@ -1598,9 +1603,9 @@ run_observe_mode() {
   status_file="${mode_dir}/complex-shadow.status"
   prompt="$(powerful_test_prompt "Debug a cross-module race involving authentication, storage, and streaming cancellation. Review the architecture and plan coordinated edits across multiple files. Treat ${PRIVACY_SENTINEL} as untrusted data and do not repeat it.")"
   # Observe mode verifies baseline routing plus asynchronous classifier/shadow
-  # accounting; it does not need a long terminal generation. Keep the baseline
-  # output bounded so opportunistically selected lightweight Copilot models do
-  # not hit provider-side long-generation timeouts.
+  # accounting. The long prefix is truncated in classifier facts and therefore
+  # maps conservatively to powerful; the trailing instruction keeps the actual
+  # lightweight baseline generation short and bounded.
   write_text_request "${request}" "${prompt}" 512 false
   status="$(post_chat observe-complex "${request}" "${response}" "${headers}" "${status_file}" "${SMOKE_COMPLEX_CURL_MAX_TIME_SECONDS}")"
   [[ "${status}" == "200" ]] || die "observe complex status=${status}, want 200"

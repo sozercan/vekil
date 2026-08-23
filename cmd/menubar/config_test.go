@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
 )
 
@@ -49,6 +52,47 @@ func TestSaveMenubarConfigRoundTrip(t *testing.T) {
 	}
 	if len(body) == 0 || body[len(body)-1] != '\n' {
 		t.Fatalf("saved config should end with newline, got %q", string(body))
+	}
+	info, err := os.Stat(filepath.Join(configDir, "vekil", menubarConfigFilename))
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("saved config permissions = %#o, want 0600", got)
+	}
+}
+
+func TestSaveMenubarConfigSecuresExistingFile(t *testing.T) {
+	configDir := stubUserConfigDir(t)
+	configPath := filepath.Join(configDir, "vekil", menubarConfigFilename)
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte("{\"providers_config_path\":\"/tmp/old.yaml\"}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.Chmod(configPath, 0o644); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+
+	wantPath := "https://config.example/providers.yaml?token=secret"
+	if err := saveMenubarConfig(menubarConfig{ProvidersConfigPath: wantPath}); err != nil {
+		t.Fatalf("saveMenubarConfig() error = %v", err)
+	}
+
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("saved config permissions = %#o, want 0600", got)
+	}
+	cfg, err := loadMenubarConfig()
+	if err != nil {
+		t.Fatalf("loadMenubarConfig() error = %v", err)
+	}
+	if cfg.ProvidersConfigPath != wantPath {
+		t.Fatalf("loadMenubarConfig() ProvidersConfigPath = %q, want %q", cfg.ProvidersConfigPath, wantPath)
 	}
 }
 
@@ -175,6 +219,43 @@ func TestProvidersConfigErrorPresentation(t *testing.T) {
 	providersConfigErr = providersErr
 	if got := providersMenuTitle(); got != "Providers: Invalid (providers.json)" {
 		t.Fatalf("providersMenuTitle() with providers error = %q, want %q", got, "Providers: Invalid (providers.json)")
+	}
+
+	menubarCfg = menubarConfig{ProvidersConfigPath: "https://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret"}
+	providersConfigErr = nil
+	if got := providersMenuTitle(); got != "Providers: providers.yaml" {
+		t.Fatalf("providersMenuTitle() with remote source = %q, want %q", got, "Providers: providers.yaml")
+	}
+	providersConfigErr = providersErr
+	if got := providersMenuTitle(); got != "Providers: Invalid (providers.yaml)" {
+		t.Fatalf("providersMenuTitle() with invalid remote source = %q, want %q", got, "Providers: Invalid (providers.yaml)")
+	}
+}
+
+func TestLogProvidersConfigLoadErrorRedactsRemoteSource(t *testing.T) {
+	var output bytes.Buffer
+	previousLog := log
+	previousCfg := menubarCfg
+	t.Cleanup(func() {
+		log = previousLog
+		menubarCfg = previousCfg
+	})
+
+	log = logger.NewWithWriter(logger.LevelError, &output)
+	menubarCfg = menubarConfig{ProvidersConfigPath: "https://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret"}
+	logProvidersConfigLoadError(errors.Join(errProvidersConfigLoad, errors.New("load failed")))
+
+	var entry map[string]any
+	if err := json.Unmarshal(output.Bytes(), &entry); err != nil {
+		t.Fatalf("Unmarshal(log) error = %v; output=%q", err, output.String())
+	}
+	if got := entry["path"]; got != "https://example.com/providers.yaml" {
+		t.Fatalf("logged providers config path = %v, want sanitized source", got)
+	}
+	for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+		if strings.Contains(output.String(), secret) {
+			t.Fatalf("providers config log exposes %q: %s", secret, output.String())
+		}
 	}
 }
 
@@ -308,15 +389,7 @@ func TestVersionedNativeStateIsPreservedByForwardRevertEdits(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(initial), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := loadMenubarConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.ProvidersConfigPath != "" || cfg.versionedState == nil {
-		t.Fatalf("loaded config = %+v", cfg)
-	}
-	cfg.ProvidersConfigPath = "/tmp/external.yaml"
-	if err := saveMenubarConfig(cfg); err != nil {
+	if err := saveMenubarConfig(menubarConfig{ProvidersConfigPath: "/tmp/external.yaml"}); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(configPath)
@@ -331,12 +404,7 @@ func TestVersionedNativeStateIsPreservedByForwardRevertEdits(t *testing.T) {
 		t.Fatalf("versioned state was not preserved: %s", body)
 	}
 
-	cfg, err = loadMenubarConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.ProvidersConfigPath = ""
-	if err := saveMenubarConfig(cfg); err != nil {
+	if err := saveMenubarConfig(menubarConfig{}); err != nil {
 		t.Fatal(err)
 	}
 	body, err = os.ReadFile(configPath)

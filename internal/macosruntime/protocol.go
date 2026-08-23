@@ -181,11 +181,13 @@ func requestFingerprint(request requestEnvelope) ([32]byte, error) {
 	if err != nil {
 		return [32]byte{}, err
 	}
-	body := make([]byte, 0, len(request.Command)+1+len(canonical))
-	body = append(body, request.Command...)
-	body = append(body, 0)
-	body = append(body, canonical...)
-	return sha256.Sum256(body), nil
+	hash := sha256.New()
+	_, _ = io.WriteString(hash, request.Command)
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write(canonical)
+	var fingerprint [sha256.Size]byte
+	hash.Sum(fingerprint[:0])
+	return fingerprint, nil
 }
 
 type cachedRequest struct {

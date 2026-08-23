@@ -255,13 +255,29 @@ func TestCompactionContract_InternalCompactionNormalizesCallerControls(t *testin
 			name:   "compact endpoint",
 			path:   "/v1/responses/compact",
 			invoke: (*ProxyHandler).HandleCompact,
-			input:  []interface{}{messageItemForContract("user", "compact controls")},
+			input: []interface{}{
+				map[string]interface{}{
+					"type": "additional_tools",
+					"role": "developer",
+					"tools": []interface{}{
+						map[string]interface{}{"type": "custom", "name": "exec"},
+					},
+				},
+				messageItemForContract("user", "compact controls"),
+			},
 		},
 		{
 			name:   "remote compaction trigger",
 			path:   "/v1/responses",
 			invoke: (*ProxyHandler).HandleResponses,
 			input: []interface{}{
+				map[string]interface{}{
+					"type": "additional_tools",
+					"role": "developer",
+					"tools": []interface{}{
+						map[string]interface{}{"type": "custom", "name": "exec"},
+					},
+				},
 				messageItemForContract("user", "compact controls"),
 				map[string]interface{}{"type": "compaction_trigger"},
 			},
@@ -338,6 +354,21 @@ func TestCompactionContract_InternalCompactionNormalizesCallerControls(t *testin
 				}
 			}
 
+			upstreamInput := rawJSONArrayForContract(t, upstream["input"])
+			foundUserHistory := false
+			for _, item := range upstreamInput {
+				itemType := contractItemType(t, item)
+				if itemType == "additional_tools" {
+					t.Fatalf("internal compaction request must remove embedded additional_tools: %s", upstream["input"])
+				}
+				if itemType == "message" && contractItemRole(t, item) == "user" && contractMessageText(t, item, "user") == "compact controls" {
+					foundUserHistory = true
+				}
+			}
+			if !foundUserHistory {
+				t.Fatalf("internal compaction request must preserve ordinary user history: %s", upstream["input"])
+			}
+
 			if got := rawJSONToIntForContract(t, upstream["max_output_tokens"]); got != internalCompactionMaxOutputTokens {
 				t.Fatalf("internal max_output_tokens = %d, want proxy cap %d", got, internalCompactionMaxOutputTokens)
 			}
@@ -366,6 +397,146 @@ func TestCompactionContract_InternalCompactionNormalizesCallerControls(t *testin
 				t.Fatalf("expected routing metadata to survive, got %q", got)
 			}
 		})
+	}
+}
+
+func TestCompactionContract_OrdinaryResponsesPreservesAdditionalTools(t *testing.T) {
+	additionalTools := map[string]interface{}{
+		"type": "additional_tools",
+		"role": "developer",
+		"tools": []interface{}{
+			map[string]interface{}{
+				"type":        "custom",
+				"name":        "exec",
+				"description": "Execute shell commands",
+				"format":      map[string]interface{}{"type": "text"},
+			},
+		},
+	}
+	wantAdditionalTools := mustMarshalContractJSON(t, additionalTools)
+
+	var upstreamInput []json.RawMessage
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body := decodeJSONBodyForContract(t, r.Body)
+		upstreamInput = rawJSONArrayForContract(t, body["input"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp-ordinary","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ordinary response"}]}]}`)
+	})
+
+	reqBody := mustMarshalContractJSON(t, map[string]interface{}{
+		"model": "gpt-5.4",
+		"input": []interface{}{
+			additionalTools,
+			messageItemForContract("user", "ordinary request"),
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if len(upstreamInput) != 2 {
+		t.Fatalf("expected additional tools and ordinary user history upstream, got %d items: %s", len(upstreamInput), upstreamInput)
+	}
+	if !bytes.Equal(upstreamInput[0], wantAdditionalTools) {
+		t.Fatalf("ordinary responses request changed additional_tools item:\n got: %s\nwant: %s", upstreamInput[0], wantAdditionalTools)
+	}
+	if got := contractMessageText(t, upstreamInput[1], "user"); got != "ordinary request" {
+		t.Fatalf("expected ordinary user history upstream, got %q", got)
+	}
+}
+
+func TestCompactionContract_OrdinaryResponsesNormalizesBlankAdditionalToolsNamespaceDescription(t *testing.T) {
+	additionalTools := map[string]interface{}{
+		"type": "additional_tools",
+		"role": "developer",
+		"tools": []interface{}{
+			map[string]interface{}{
+				"type":        "namespace",
+				"name":        "functions",
+				"description": "",
+				"tools": []interface{}{
+					map[string]interface{}{
+						"type":        "function",
+						"name":        "exec",
+						"description": "Execute shell commands",
+						"parameters":  map[string]interface{}{"type": "object"},
+					},
+				},
+			},
+			map[string]interface{}{
+				"type":        "namespace",
+				"name":        "editor",
+				"description": "Editing tools",
+				"tools":       []interface{}{},
+			},
+			map[string]interface{}{
+				"type":        "custom",
+				"name":        "shell",
+				"description": "",
+				"format":      map[string]interface{}{"type": "text"},
+			},
+		},
+	}
+
+	var upstreamInput []json.RawMessage
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body := decodeJSONBodyForContract(t, r.Body)
+		upstreamInput = rawJSONArrayForContract(t, body["input"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp-ordinary","object":"response","status":"completed","output":[]}`)
+	})
+
+	reqBody := mustMarshalContractJSON(t, map[string]interface{}{
+		"model": "gpt-5.6-sol",
+		"input": []interface{}{
+			additionalTools,
+			messageItemForContract("user", "ordinary request"),
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleResponses(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	if len(upstreamInput) != 2 {
+		t.Fatalf("expected additional tools and ordinary user history upstream, got %d items: %s", len(upstreamInput), upstreamInput)
+	}
+	catalog := rawJSONObjectForContract(t, upstreamInput[0])
+	tools := rawJSONArrayForContract(t, catalog["tools"])
+	if len(tools) != 3 {
+		t.Fatalf("expected three catalog tools, got %d: %s", len(tools), catalog["tools"])
+	}
+	functionsNamespace := rawJSONObjectForContract(t, tools[0])
+	if got := rawJSONToStringForContract(t, functionsNamespace["description"]); got != "Tools in the functions namespace." {
+		t.Fatalf("functions namespace description = %q, want normalized fallback", got)
+	}
+	functionTools := rawJSONArrayForContract(t, functionsNamespace["tools"])
+	if got := rawJSONToStringForContract(t, rawJSONObjectForContract(t, functionTools[0])["name"]); got != "exec" {
+		t.Fatalf("nested function name = %q, want exec", got)
+	}
+	editorNamespace := rawJSONObjectForContract(t, tools[1])
+	if got := rawJSONToStringForContract(t, editorNamespace["description"]); got != "Editing tools" {
+		t.Fatalf("editor namespace description = %q, want unchanged", got)
+	}
+	customTool := rawJSONObjectForContract(t, tools[2])
+	if got := rawJSONToStringForContract(t, customTool["description"]); got != "" {
+		t.Fatalf("custom tool description = %q, want unchanged empty string", got)
+	}
+	if got := contractMessageText(t, upstreamInput[1], "user"); got != "ordinary request" {
+		t.Fatalf("expected ordinary user history upstream, got %q", got)
 	}
 }
 

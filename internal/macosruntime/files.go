@@ -10,16 +10,6 @@ import (
 	"path/filepath"
 )
 
-func ensurePrivateDirectory(path string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return fmt.Errorf("create private directory %q: %w", path, err)
-	}
-	if err := os.Chmod(path, 0o700); err != nil {
-		return fmt.Errorf("protect private directory %q: %w", path, err)
-	}
-	return nil
-}
-
 func writeAtomicFile(path string, body []byte) (returnErr error) {
 	dir := filepath.Dir(path)
 	if err := ensurePrivateDirectory(dir); err != nil {
@@ -81,14 +71,6 @@ func writeExclusiveFile(path string, body []byte) (returnErr error) {
 		return fmt.Errorf("close owned file %q: %w", path, err)
 	}
 	return syncDirectory(filepath.Dir(path))
-}
-
-func copyFileExclusive(source, destination string) error {
-	body, _, err := readSecureFile(source, MaxConfigBytes)
-	if err != nil {
-		return err
-	}
-	return writeExclusiveFile(destination, body)
 }
 
 func syncDirectory(path string) error {

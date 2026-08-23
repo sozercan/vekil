@@ -333,7 +333,7 @@ func TestHelperParentLossStopsSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	stdinReader, stdinWriter := io.Pipe()
-	defer stdinWriter.Close()
+	defer func() { _ = stdinWriter.Close() }()
 	var output strings.Builder
 	done := make(chan error, 1)
 	go func() {
