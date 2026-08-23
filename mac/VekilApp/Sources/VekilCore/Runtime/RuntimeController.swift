@@ -510,23 +510,35 @@ public actor RuntimeController {
         }
 
         let isStop = command == .stop
+        let isStart = command == .start
         if isStop {
             preserveStoppedIntent = true
             restoreProxyAfterReconnect = false
+        } else if isStart {
+            preserveStoppedIntent = false
+            restoreProxyAfterReconnect = true
         }
 
         let response: RuntimeResponseEnvelope
         do {
             response = try await send(command: command, payload: payload, timeout: timeout)
         } catch {
-            if isStop, stopAdmissionDefinitelyFailed(error) {
-                preserveStoppedIntent = false
+            if operationAdmissionDefinitelyFailed(error) {
+                if isStop {
+                    preserveStoppedIntent = false
+                } else if isStart {
+                    clearPendingStartIntent()
+                }
             }
             throw error
         }
         let admission = response.result.flatMap { try? $0.decode(RuntimeAdmissionResult.self) }
-        if isStop, admission?.accepted == false {
-            preserveStoppedIntent = false
+        if admission?.accepted == false {
+            if isStop {
+                preserveStoppedIntent = false
+            } else if isStart {
+                clearPendingStartIntent()
+            }
         }
         guard let admission,
               admission.accepted,
@@ -557,7 +569,7 @@ public actor RuntimeController {
         )
     }
 
-    private func stopAdmissionDefinitelyFailed(_ error: Error) -> Bool {
+    private func operationAdmissionDefinitelyFailed(_ error: Error) -> Bool {
         if error is CancellationError || error is RuntimeStructuredError {
             return true
         }
@@ -569,6 +581,11 @@ public actor RuntimeController {
         default:
             return false
         }
+    }
+
+    private func clearPendingStartIntent() {
+        restoreProxyAfterReconnect = currentState?.payload.service == .running
+            && !preserveStoppedIntent
     }
 
     public func waitForOperation(id: String) async throws -> RuntimeTrackedOperation {
@@ -1145,6 +1162,7 @@ public actor RuntimeController {
             restoreProxyAfterReconnect = false
         } else if command == .start {
             preserveStoppedIntent = false
+            restoreProxyAfterReconnect = true
         }
 
         let tracked = RuntimeTrackedOperation(
@@ -1293,6 +1311,11 @@ public actor RuntimeController {
            tracked.status != .succeeded {
             preserveStoppedIntent = false
         }
+        if tracked.kind == RuntimeOperationKind(RuntimeCommand.start.rawValue),
+           tracked.isTerminal,
+           tracked.status != .succeeded {
+            clearPendingStartIntent()
+        }
 
         if tracked.isTerminal {
             if activeOperationID == payload.operationID { activeOperationID = nil }
@@ -1336,11 +1359,7 @@ public actor RuntimeController {
         }
 
         guard let session, session.id == sessionID else { return }
-        if suppression == .none,
-           currentState?.payload.service == .running,
-           !preserveStoppedIntent {
-            restoreProxyAfterReconnect = true
-        }
+        captureRunningIntentForUnexpectedSessionLoss()
         session.handshakeTimeoutTask?.cancel()
         session.failureTerminationTask?.cancel()
         session.writeTail?.cancel()
@@ -1475,6 +1494,7 @@ public actor RuntimeController {
         // session after both bounded waits so a suppressed failure can be
         // retried manually and a retryable failure can follow restart policy.
         activeSession.failureTerminationTask = nil
+        captureRunningIntentForUnexpectedSessionLoss()
         invalidateSession(
             sessionID: sessionID,
             requestError: error,
@@ -1489,6 +1509,14 @@ public actor RuntimeController {
         case let .failure(failure):
             setConnectionState(.failed(failure))
             failConnectionWaiters(with: failure)
+        }
+    }
+
+    private func captureRunningIntentForUnexpectedSessionLoss() {
+        if suppression == .none,
+           currentState?.payload.service == .running,
+           !preserveStoppedIntent {
+            restoreProxyAfterReconnect = true
         }
     }
 
