@@ -119,7 +119,8 @@ openssl pkeyutl -sign \
   -out "${TMP_ROOT}/artifact-signature"
 signature="$(base64 <"${TMP_ROOT}/artifact-signature" | tr -d '\r\n')"
 appcast="${TMP_ROOT}/appcast.xml"
-cat >"${appcast}" <<EOF_APPCAST
+unsigned_appcast="${TMP_ROOT}/unsigned-appcast.xml"
+cat >"${unsigned_appcast}" <<EOF_APPCAST
 <?xml version="1.0"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
@@ -139,17 +140,49 @@ cat >"${appcast}" <<EOF_APPCAST
       <enclosure url="https://example.invalid/releases/v0.14.0/vekil-macos-arm64.zip" length="1" type="application/octet-stream" sparkle:edSignature="${signature}"/>
     </item>
   </channel>
-</rss><!-- sparkle-signatures:
-edSignature: ${signature}
-length: 1
--->
+</rss>
 EOF_APPCAST
+openssl pkeyutl -sign \
+  -inkey "${TMP_ROOT}/test-key.pem" \
+  -rawin \
+  -in "${unsigned_appcast}" \
+  -out "${TMP_ROOT}/appcast-signature"
+appcast_signature="$(base64 <"${TMP_ROOT}/appcast-signature" | tr -d '\r\n')"
+appcast_length="$(wc -c <"${unsigned_appcast}" | tr -d ' ')"
+cp "${unsigned_appcast}" "${appcast}"
+printf '<!-- sparkle-signatures:\nedSignature: %s\nlength: %s\n-->\n' \
+  "${appcast_signature}" \
+  "${appcast_length}" >>"${appcast}"
 "${APPCAST_TOOL}" \
   --appcast "${appcast}" \
   --manifest "${manifest}" \
   --artifact "${artifact}" \
   --expected-url-prefix https://example.invalid/releases/v0.15.0 \
   --require-legacy-compatible-entry >/dev/null
+
+bad_feed_signature_appcast="${TMP_ROOT}/bad-feed-signature-appcast.xml"
+python3 - "${appcast}" "${bad_feed_signature_appcast}" <<'PY_BAD_FEED_SIGNATURE'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_bytes()
+prefix = b"<!-- sparkle-signatures:\n"
+block_offset = source.rfind(prefix)
+if block_offset < 0:
+    raise SystemExit("appcast signature block fixture not found")
+signature_marker = b"edSignature: "
+signature_offset = source.find(signature_marker, block_offset)
+if signature_offset < 0:
+    raise SystemExit("appcast signature fixture not found")
+signature_offset += len(signature_marker)
+replacement = b"A" if source[signature_offset : signature_offset + 1] != b"A" else b"B"
+corrupted = source[:signature_offset] + replacement + source[signature_offset + 1 :]
+Path(sys.argv[2]).write_bytes(corrupted)
+PY_BAD_FEED_SIGNATURE
+expect_failure "${APPCAST_TOOL}" \
+  --appcast "${bad_feed_signature_appcast}" \
+  --manifest "${manifest}" \
+  --artifact "${artifact}"
 
 wrong_manifest="${TMP_ROOT}/wrong-key-manifest.json"
 cp "${manifest}" "${wrong_manifest}"

@@ -268,6 +268,46 @@ func TestApplyManagedDraftFailedStartRestoresPreviousRuntime(t *testing.T) {
 	}
 }
 
+func TestApplyManagedDraftFailedStopRestoresPreviousRuntime(t *testing.T) {
+	stopFailure := errors.New("stop failed after listener close")
+	factory := &revisionRuntimeFactory{newRuntime: func(_ string, call int) *applyRuntime {
+		runtime := newApplyRuntime(nil)
+		if call == 1 {
+			runtime.stop = func(context.Context) error { return stopFailure }
+		}
+		return runtime
+	}}
+	manager, controller, h, initialRevision := newApplyHarness(t, factory)
+	start, err := controller.Start(t.Context(), initialRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, waitErr := start.Wait(t.Context()); waitErr != nil || result.Status != appcontrol.OperationSucceeded {
+		t.Fatalf("initial start result=%+v err=%v", result, waitErr)
+	}
+
+	payload := managedDraftPayload{
+		ExpectedConfigRevision: initialRevision,
+		SecretGeneration:       1,
+		Draft:                  managedApplyDraft(manager.State().Providers[0].UUID, true),
+	}
+	err = h.applyManagedDraft(t.Context(), "op_stop_restore", payload)
+	var applyErr *ManagedApplyError
+	if !errors.As(err, &applyErr) || !errors.Is(applyErr.Primary, stopFailure) || applyErr.Rollback != nil {
+		t.Fatalf("apply error = %v, want stop failure with successful restore", err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != initialRevision || state.RuntimeGeneration != 2 {
+		t.Fatalf("restored runtime = %+v", state)
+	}
+	if got := manager.State().CommittedConfigRevision; got != initialRevision {
+		t.Fatalf("restored configuration = %q, want %q", got, initialRevision)
+	}
+	if _, statErr := os.Stat(manager.paths.Journal); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("journal remains: %v", statErr)
+	}
+}
+
 func TestApplyManagedDraftRollbackStartFailurePersistsRecovery(t *testing.T) {
 	var candidateRevision string
 	factory := &revisionRuntimeFactory{newRuntime: func(revision string, call int) *applyRuntime {

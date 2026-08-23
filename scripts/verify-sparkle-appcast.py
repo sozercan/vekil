@@ -16,6 +16,8 @@ from typing import Any
 
 SPARKLE = "http://www.andymatuschak.org/xml-namespaces/sparkle"
 ED25519_SUBJECT_PUBLIC_KEY_INFO_PREFIX = bytes.fromhex("302a300506032b6570032100")
+SIGNED_FEED_PREFIX = b"<!-- sparkle-signatures:\n"
+SIGNED_FEED_SUFFIX = b"-->"
 
 
 class VerificationError(ValueError):
@@ -59,7 +61,53 @@ def decode_base64(value: str, label: str, expected_bytes: int) -> bytes:
     return decoded
 
 
-def verify_artifact_signature(artifact: Path, signature: bytes, public_key: bytes) -> None:
+def extract_signed_appcast(raw_appcast: bytes) -> tuple[bytes, bytes]:
+    prefix_offset = raw_appcast.rfind(SIGNED_FEED_PREFIX)
+    if prefix_offset < 0:
+        raise VerificationError("appcast-level Sparkle signature block is missing")
+
+    block_offset = prefix_offset + len(SIGNED_FEED_PREFIX)
+    suffix_offset = raw_appcast.find(SIGNED_FEED_SUFFIX, block_offset)
+    if suffix_offset < 0:
+        raise VerificationError("appcast-level Sparkle signature block is incomplete")
+    try:
+        signature_block = raw_appcast[block_offset:suffix_offset].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise VerificationError("appcast-level Sparkle signature block is not UTF-8") from exc
+
+    signature_value = ""
+    content_length_value = ""
+    for line in signature_block.splitlines():
+        if line.startswith("edSignature:"):
+            signature_value = line.removeprefix("edSignature:").strip()
+        elif line.startswith("length:"):
+            content_length_value = line.removeprefix("length:").strip()
+
+    signature = decode_base64(signature_value, "appcast Ed25519 signature", 64)
+    if not content_length_value:
+        raise VerificationError("appcast signed content length is missing")
+    try:
+        content_length = int(content_length_value)
+    except ValueError as exc:
+        raise VerificationError("appcast signed content length is invalid") from exc
+    if content_length < 0:
+        raise VerificationError("appcast signed content length is invalid")
+
+    signed_content = raw_appcast[:prefix_offset]
+    if content_length != len(signed_content):
+        raise VerificationError(
+            f"appcast signed content length {content_length} does not match "
+            f"the extracted {len(signed_content)} bytes"
+        )
+    return signed_content, signature
+
+
+def verify_ed25519_signature(
+    payload: Path,
+    signature: bytes,
+    public_key: bytes,
+    label: str,
+) -> None:
     with tempfile.TemporaryDirectory(prefix="vekil-sparkle-verify-") as temporary:
         temporary_path = Path(temporary)
         public_key_path = temporary_path / "public-key.der"
@@ -79,7 +127,7 @@ def verify_artifact_signature(artifact: Path, signature: bytes, public_key: byte
                     "DER",
                     "-rawin",
                     "-in",
-                    str(artifact),
+                    str(payload),
                     "-sigfile",
                     str(signature_path),
                 ],
@@ -90,10 +138,7 @@ def verify_artifact_signature(artifact: Path, signature: bytes, public_key: byte
         except OSError as exc:
             raise VerificationError(f"cannot run OpenSSL signature verification: {exc}") from exc
     if result.returncode != 0:
-        raise VerificationError(
-            "candidate enclosure Ed25519 signature does not verify against "
-            "manifest sparkle.public_ed_key"
-        )
+        raise VerificationError(f"{label} does not verify against manifest sparkle.public_ed_key")
 
 
 def main() -> int:
@@ -121,20 +166,30 @@ def main() -> int:
         raise VerificationError("manifest is missing release identity fields")
 
     try:
-        raw_xml = appcast_path.read_text(encoding="utf-8")
-        root = ET.fromstring(raw_xml)
-    except (OSError, UnicodeDecodeError, ET.ParseError) as exc:
-        raise VerificationError(f"cannot parse appcast {appcast_path}: {exc}") from exc
+        raw_appcast = appcast_path.read_bytes()
+    except OSError as exc:
+        raise VerificationError(f"cannot read appcast {appcast_path}: {exc}") from exc
 
-    if "sparkle-signatures:" not in raw_xml:
-        raise VerificationError("appcast-level Sparkle signature block is missing")
-    signature_tail = raw_xml.rsplit("sparkle-signatures:", 1)[-1]
-    appcast_signature = ""
-    for line in signature_tail.splitlines():
-        if line.strip().startswith("edSignature:"):
-            appcast_signature = line.split(":", 1)[1].strip()
-            break
-    decode_base64(appcast_signature, "appcast Ed25519 signature", 64)
+    signed_content, appcast_signature = extract_signed_appcast(raw_appcast)
+    public_key = decode_base64(
+        str(sparkle.get("public_ed_key") or ""),
+        "manifest sparkle.public_ed_key",
+        32,
+    )
+    with tempfile.TemporaryDirectory(prefix="vekil-sparkle-appcast-") as temporary:
+        signed_content_path = Path(temporary) / "appcast-content.xml"
+        signed_content_path.write_bytes(signed_content)
+        verify_ed25519_signature(
+            signed_content_path,
+            appcast_signature,
+            public_key,
+            "appcast Ed25519 signature",
+        )
+
+    try:
+        root = ET.fromstring(signed_content)
+    except ET.ParseError as exc:
+        raise VerificationError(f"cannot parse appcast {appcast_path}: {exc}") from exc
 
     items = root.findall("./channel/item")
     candidates = [item for item in items if text(item, "version") == bundle_version]
@@ -186,12 +241,12 @@ def main() -> int:
             raise VerificationError(
                 f"candidate enclosure length {expected_length} does not match artifact {actual_length}"
             )
-        public_key = decode_base64(
-            str(sparkle.get("public_ed_key") or ""),
-            "manifest sparkle.public_ed_key",
-            32,
+        verify_ed25519_signature(
+            artifact,
+            candidate_signature,
+            public_key,
+            "candidate enclosure Ed25519 signature",
         )
-        verify_artifact_signature(artifact, candidate_signature, public_key)
 
     fixture_expectations = {
         "10.13": False,
