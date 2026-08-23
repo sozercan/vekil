@@ -1,0 +1,687 @@
+package macosruntime
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/internal/appcontrol"
+)
+
+func writeExternalConfigForSwitchTest(t *testing.T, model string) (string, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	body := externalConfigBodyForSwitchTest(model)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	revision, _ := configRevision(body)
+	return path, revision
+}
+
+func externalConfigBodyForSwitchTest(model string) []byte {
+	return []byte("schema_version: 2\nproviders:\n  - id: local\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: " + model + "\n        endpoints: [/chat/completions]\n")
+}
+
+func replaceExternalConfigForSwitchTest(t *testing.T, path string, body []byte) {
+	t.Helper()
+	replacement := path + ".replacement"
+	if err := os.WriteFile(replacement, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newConfigSwitchHarness(t *testing.T, factory appcontrol.RuntimeFactory) (*ConfigManager, *appcontrol.Controller, *helper) {
+	t.Helper()
+	manager := newManagerForTest(t)
+	controller, err := appcontrol.New(appcontrol.Options{
+		ConfigurationSource: manager, ConfigurationObserver: manager, RuntimeFactory: factory,
+		ReadinessChecker: appcontrol.ReadinessCheckFunc(func(context.Context, string) error { return nil }),
+		StopTimeout:      time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manager, controller, &helper{opts: HelperOptions{
+		Controller: controller, Configuration: manager, ShutdownTimeout: time.Second,
+	}}
+}
+
+func startConfigSwitchHarness(t *testing.T, controller *appcontrol.Controller, revision string) {
+	t.Helper()
+	operation, err := controller.Start(t.Context(), revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := operation.Wait(t.Context())
+	if err != nil || result.Status != appcontrol.OperationSucceeded {
+		t.Fatalf("start result=%+v err=%v", result, err)
+	}
+}
+
+func TestConfigSelectionWhileRunningRestartsWithSelectedRevision(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	path, revision := writeExternalConfigForSwitchTest(t, "selected-model")
+
+	if err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
+		return manager.StageExternal(ctx, path)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.RuntimeGeneration != 2 || state.ConfigRevision != revision {
+		t.Fatalf("runtime state = %+v", state)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeExternal || selection.SelectedPath != path || selection.SelectedConfigRevision != revision {
+		t.Fatalf("selection = %+v", selection)
+	}
+}
+
+func TestConfigSelectionFailureRestoresPriorSelectionAndRuntime(t *testing.T) {
+	path, failedRevision := writeExternalConfigForSwitchTest(t, "failing-model")
+	factory := &revisionRuntimeFactory{newRuntime: func(revision string, _ int) *applyRuntime {
+		if revision == failedRevision {
+			return newApplyRuntime(errors.New("candidate start failed"))
+		}
+		return newApplyRuntime(nil)
+	}}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+
+	err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
+		return manager.StageExternal(ctx, path)
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) || switchErr.Rollback != nil {
+		t.Fatalf("switch error = %v", err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != LegacyConfigRevision {
+		t.Fatalf("restored runtime = %+v", state)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeLegacy || selection.SelectedPath != "" || selection.SelectedConfigRevision != LegacyConfigRevision {
+		t.Fatalf("restored selection = %+v", selection)
+	}
+}
+
+func TestExternalReloadUsesValidatedCandidateAndRollbackSnapshots(t *testing.T) {
+	path, previousRevision := writeExternalConfigForSwitchTest(t, "previous-model")
+	candidateBody := externalConfigBodyForSwitchTest("candidate-model")
+	candidateRevision, _ := configRevision(candidateBody)
+	candidateErr := errors.New("candidate start failed")
+	factory := &revisionRuntimeFactory{newRuntime: func(revision string, _ int) *applyRuntime {
+		if revision == candidateRevision {
+			return newApplyRuntime(candidateErr)
+		}
+		return newApplyRuntime(nil)
+	}}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	startConfigSwitchHarness(t, controller, previousRevision)
+	replaceExternalConfigForSwitchTest(t, path, candidateBody)
+
+	err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
+		if stageErr := manager.StageReloadExternal(ctx); stageErr != nil {
+			return stageErr
+		}
+		replaceExternalConfigForSwitchTest(t, path, []byte("not: [valid"))
+		return nil
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, candidateErr) || switchErr.Rollback != nil {
+		t.Fatalf("switch error = %+v, want candidate failure with successful snapshot rollback", err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != previousRevision {
+		t.Fatalf("restored runtime = %+v", state)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeExternal || selection.SelectedPath != path || selection.SelectedConfigRevision != previousRevision {
+		t.Fatalf("restored selection = %+v", selection)
+	}
+
+	stop, stopErr := controller.Stop(t.Context())
+	if stopErr != nil {
+		t.Fatal(stopErr)
+	}
+	stopResult, stopWaitErr := stop.Wait(t.Context())
+	if stopWaitErr != nil || stopResult.Status != appcontrol.OperationSucceeded {
+		t.Fatalf("stop result=%+v err=%v", stopResult, stopWaitErr)
+	}
+	restart, restartErr := controller.Start(t.Context(), previousRevision)
+	if restartErr != nil {
+		t.Fatal(restartErr)
+	}
+	restartResult, restartWaitErr := restart.Wait(t.Context())
+	if restartWaitErr != nil || restartResult.Status != appcontrol.OperationFailed || restartResult.Err == nil {
+		t.Fatalf("restart result=%+v err=%v, want invalid current file after transaction snapshot expires", restartResult, restartWaitErr)
+	}
+}
+
+func TestConfigSelectionStopFailureRestoresPriorSelectionAndRuntime(t *testing.T) {
+	stopErr := errors.New("candidate switch stop failed")
+	factory := &revisionRuntimeFactory{newRuntime: func(revision string, call int) *applyRuntime {
+		runtime := newApplyRuntime(nil)
+		if revision == LegacyConfigRevision && call == 1 {
+			runtime.stop = func(context.Context) error { return stopErr }
+		}
+		return runtime
+	}}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	path, _ := writeExternalConfigForSwitchTest(t, "selected-model")
+
+	err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
+		return manager.StageExternal(ctx, path)
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, stopErr) || switchErr.Rollback != nil {
+		t.Fatalf("switch error = %+v, want stop failure with successful restore", err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.RuntimeGeneration != 2 || state.ConfigRevision != LegacyConfigRevision {
+		t.Fatalf("restored runtime = %+v", state)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeLegacy || selection.SelectedPath != "" || selection.SelectedConfigRevision != LegacyConfigRevision {
+		t.Fatalf("restored selection = %+v", selection)
+	}
+}
+
+func TestInvalidExternalSelectionDoesNotStopRunningRuntime(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+
+	err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
+		_, err := manager.SelectExternal(ctx, filepath.Join(t.TempDir(), "missing.yaml"))
+		return err
+	})
+	if err == nil {
+		t.Fatal("selection succeeded for a missing file")
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.RuntimeGeneration != 1 || state.ConfigRevision != LegacyConfigRevision {
+		t.Fatalf("runtime changed after validation failure: %+v", state)
+	}
+	if selection := manager.State(); selection.ConfigMode != ConfigModeLegacy || selection.SelectedPath != "" {
+		t.Fatalf("selection changed after validation failure: %+v", selection)
+	}
+}
+
+func TestCanceledConfigSelectionPreservesRestoreFailure(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	path, _ := writeExternalConfigForSwitchTest(t, "selected-model")
+	ctx, cancel := context.WithCancel(t.Context())
+
+	err := h.switchSelectedConfiguration(ctx, func(opCtx context.Context) error {
+		if err := manager.StageExternal(opCtx, path); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(manager.paths.Directory); err != nil {
+			return err
+		}
+		if err := os.WriteFile(manager.paths.Directory, []byte("blocks state restore"), 0o600); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) {
+		t.Fatalf("switch error = %v, want ConfigSwitchError", err)
+	}
+	if !errors.Is(switchErr.Primary, context.Canceled) || switchErr.Rollback == nil {
+		t.Fatalf("switch error = %+v, want canceled primary and restore failure", switchErr)
+	}
+	if !hasRollbackFailure(err) {
+		t.Fatalf("hasRollbackFailure(%v) = false", err)
+	}
+}
+
+func TestMapProtocolErrorPrioritizesRollbackFailureOverCancellation(t *testing.T) {
+	rollbackErr := errors.New("restore failed")
+	tests := map[string]error{
+		"managed apply": &ManagedApplyError{Primary: context.Canceled, Rollback: rollbackErr},
+		"config switch": &ConfigSwitchError{Primary: context.Canceled, Rollback: rollbackErr},
+	}
+	for name, err := range tests {
+		t.Run(name, func(t *testing.T) {
+			mapped := mapProtocolError(err)
+			if mapped == nil || mapped.Code != "rollback_failed" || mapped.Retryable || mapped.RecoveryAction != "open_recovery" {
+				t.Fatalf("mapProtocolError(%v) = %+v", err, mapped)
+			}
+		})
+	}
+}
+
+func TestCanceledStoppedConfigSelectionRestoresPriorSelection(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, _, h := newConfigSwitchHarness(t, factory)
+	path, _ := writeExternalConfigForSwitchTest(t, "selected-model")
+	ctx, cancel := context.WithCancel(t.Context())
+
+	err := h.switchSelectedConfiguration(ctx, func(opCtx context.Context) error {
+		if err := manager.StageExternal(opCtx, path); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, context.Canceled) || switchErr.Rollback != nil {
+		t.Fatalf("switch error = %+v, want canceled primary with successful restore", err)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeLegacy || selection.SelectedPath != "" || selection.SelectedConfigRevision != LegacyConfigRevision {
+		t.Fatalf("selection after cancellation = %+v", selection)
+	}
+}
+
+func TestCanceledRunningConfigSelectionAfterCandidateReadyRestoresPriorRuntime(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	path, _ := writeExternalConfigForSwitchTest(t, "selected-model")
+	ctx, cancel := context.WithCancel(t.Context())
+	h.beforeSelectionCommit = cancel
+
+	err := h.switchSelectedConfiguration(ctx, func(opCtx context.Context) error {
+		return manager.StageExternal(opCtx, path)
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, context.Canceled) || switchErr.Rollback != nil {
+		t.Fatalf("switch error = %+v, want canceled primary with successful restore", err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != LegacyConfigRevision || state.RuntimeGeneration != 3 {
+		t.Fatalf("restored runtime = %+v", state)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeLegacy || selection.SelectedPath != "" || selection.SelectedConfigRevision != LegacyConfigRevision {
+		t.Fatalf("selection after cancellation = %+v", selection)
+	}
+}
+
+func TestConfigSelectionWaitsForNonCancelableStopBeforeRestoringSelection(t *testing.T) {
+	stopStarted := make(chan struct{})
+	releaseStop := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseStop)
+		}
+	}()
+
+	factory := &revisionRuntimeFactory{newRuntime: func(revision string, call int) *applyRuntime {
+		runtime := newApplyRuntime(nil)
+		if revision == LegacyConfigRevision && call == 1 {
+			runtime.stop = func(ctx context.Context) error {
+				close(stopStarted)
+				select {
+				case <-releaseStop:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+		return runtime
+	}}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	h.opts.ShutdownTimeout = 250 * time.Millisecond
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	path, revision := writeExternalConfigForSwitchTest(t, "slow-stop-model")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
+			return manager.StageExternal(ctx, path)
+		})
+	}()
+
+	select {
+	case <-stopStarted:
+	case <-time.After(time.Second):
+		t.Fatal("stop operation did not start")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("configuration switch returned while stop cleanup was active: %v", err)
+	case <-time.After(h.opts.ShutdownTimeout + 50*time.Millisecond):
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeExternal || selection.SelectedPath != path || selection.SelectedConfigRevision != revision {
+		t.Fatalf("selection was restored while stop cleanup was active: %+v", selection)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceStopping || state.Operation == nil || state.Operation.Kind != appcontrol.OperationStop {
+		t.Fatalf("controller stop was not still active: %+v", state)
+	}
+
+	close(releaseStop)
+	released = true
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("configuration switch did not finish after stop completed")
+	}
+	state = controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != revision || state.Operation != nil {
+		t.Fatalf("selected runtime = %+v", state)
+	}
+}
+
+func TestReloadExternalConfigUsesValidatedSnapshotAcrossRestart(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	path, oldRevision := writeExternalConfigForSwitchTest(t, "old-model")
+	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	startConfigSwitchHarness(t, controller, oldRevision)
+
+	candidateBody := externalConfigBodyForSwitchTest("new-model")
+	newRevision, _ := configRevision(candidateBody)
+	replaceExternalConfigForSwitchTest(t, path, candidateBody)
+	if err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
+		if err := manager.StageReloadExternal(ctx); err != nil {
+			return err
+		}
+		replaceExternalConfigForSwitchTest(t, path, []byte("not valid: ["))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != newRevision {
+		t.Fatalf("runtime state = %+v", state)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeExternal || selection.SelectedPath != path || selection.SelectedConfigRevision != newRevision {
+		t.Fatalf("selection = %+v", selection)
+	}
+}
+
+type copilotSwitchRuntime struct {
+	*applyRuntime
+	usesCopilot bool
+}
+
+func (r *copilotSwitchRuntime) UsesCopilot() bool { return r.usesCopilot }
+
+type signOutAuthenticator struct {
+	status       auth.AuthStatus
+	tokenErr     error
+	signOutErr   error
+	signOutCalls int
+}
+
+func (a *signOutAuthenticator) GetToken(context.Context) (string, error) {
+	return "token", a.tokenErr
+}
+func (a *signOutAuthenticator) Status() auth.AuthStatus { return a.status }
+func (a *signOutAuthenticator) RequestDeviceCode(context.Context) (*auth.DeviceCodeResponse, error) {
+	return nil, errors.New("unused")
+}
+func (a *signOutAuthenticator) PollForAuthorization(context.Context, *auth.DeviceCodeResponse) error {
+	return errors.New("unused")
+}
+func (a *signOutAuthenticator) SignInWithGitHubCLI(context.Context) error {
+	return errors.New("unused")
+}
+func (a *signOutAuthenticator) SignOut() error {
+	a.signOutCalls++
+	a.status = auth.AuthStatus{}
+	return a.signOutErr
+}
+
+func TestSignOutStopsOnlyCopilotRuntime(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		usesCopilot bool
+		wantService appcontrol.ServiceState
+	}{
+		{name: "Copilot", usesCopilot: true, wantService: appcontrol.ServiceStopped},
+		{name: "provider only", usesCopilot: false, wantService: appcontrol.ServiceRunning},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authenticator := &signOutAuthenticator{status: auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceVekil}}
+			manager := newManagerForTest(t)
+			controller, err := appcontrol.New(appcontrol.Options{
+				ConfigurationSource: manager,
+				RuntimeFactory: runtimeFactoryFunc(func(context.Context, appcontrol.Configuration) (appcontrol.Runtime, error) {
+					return &copilotSwitchRuntime{applyRuntime: newApplyRuntime(nil), usesCopilot: test.usesCopilot}, nil
+				}),
+				Authenticator:    authenticator,
+				ReadinessChecker: appcontrol.ReadinessCheckFunc(func(context.Context, string) error { return nil }),
+				StopTimeout:      time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+			h := &helper{opts: HelperOptions{Controller: controller, Configuration: manager, Authenticator: authenticator, ShutdownTimeout: time.Second}}
+			if err := h.signOut(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if got := controller.Snapshot().Service; got != test.wantService {
+				t.Fatalf("service = %q, want %q", got, test.wantService)
+			}
+			if authenticator.signOutCalls != 1 {
+				t.Fatalf("SignOut calls = %d", authenticator.signOutCalls)
+			}
+		})
+	}
+}
+
+func TestSignOutClearsCredentialsAfterTerminalStopFailure(t *testing.T) {
+	stopErr := errors.New("runtime cleanup failed")
+	signOutErr := errors.New("credential cleanup failed")
+	authenticator := &signOutAuthenticator{
+		status:     auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceVekil},
+		signOutErr: signOutErr,
+	}
+	manager := newManagerForTest(t)
+	controller, err := appcontrol.New(appcontrol.Options{
+		ConfigurationSource: manager,
+		RuntimeFactory: runtimeFactoryFunc(func(context.Context, appcontrol.Configuration) (appcontrol.Runtime, error) {
+			runtime := newApplyRuntime(nil)
+			runtime.stop = func(context.Context) error { return stopErr }
+			return &copilotSwitchRuntime{applyRuntime: runtime, usesCopilot: true}, nil
+		}),
+		Authenticator:    authenticator,
+		ReadinessChecker: appcontrol.ReadinessCheckFunc(func(context.Context, string) error { return nil }),
+		StopTimeout:      time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	h := &helper{opts: HelperOptions{
+		Controller: controller, Configuration: manager,
+		Authenticator: authenticator, ShutdownTimeout: time.Second,
+	}}
+
+	err = h.signOut(t.Context())
+	if !errors.Is(err, stopErr) || !errors.Is(err, signOutErr) {
+		t.Fatalf("signOut() error = %v, want joined stop and credential failures", err)
+	}
+	if authenticator.signOutCalls != 1 || authenticator.Status().SignedIn {
+		t.Fatalf("credentials were not cleared after terminal stop failure: %+v", authenticator)
+	}
+	if _, stopAgainErr := controller.Stop(t.Context()); !errors.Is(stopAgainErr, appcontrol.ErrNotRunning) {
+		t.Fatalf("runtime remained owned after terminal stop failure: %v", stopAgainErr)
+	}
+}
+
+func TestSignOutClearsCredentialsWhenStopFindsListenerAlreadyGone(t *testing.T) {
+	authenticator := &signOutAuthenticator{status: auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceVekil}}
+	manager := newManagerForTest(t)
+	var runtime *applyRuntime
+	controller, err := appcontrol.New(appcontrol.Options{
+		ConfigurationSource: manager,
+		RuntimeFactory: runtimeFactoryFunc(func(context.Context, appcontrol.Configuration) (appcontrol.Runtime, error) {
+			runtime = newApplyRuntime(nil)
+			return &copilotSwitchRuntime{applyRuntime: runtime, usesCopilot: true}, nil
+		}),
+		Authenticator:    authenticator,
+		ReadinessChecker: appcontrol.ReadinessCheckFunc(func(context.Context, string) error { return nil }),
+		StopTimeout:      time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	h := &helper{opts: HelperOptions{
+		Controller: controller, Configuration: manager,
+		Authenticator: authenticator, ShutdownTimeout: time.Second,
+	}}
+	h.beforeControllerStop = func() {
+		terminateRuntimeAndWaitForCleanup(t, controller, runtime)
+	}
+
+	if err := h.signOut(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if authenticator.signOutCalls != 1 || authenticator.Status().SignedIn {
+		t.Fatalf("credentials were not cleared after listener exit: %+v", authenticator)
+	}
+	if _, stopErr := controller.Stop(t.Context()); !errors.Is(stopErr, appcontrol.ErrNotRunning) {
+		t.Fatalf("runtime remained owned after listener exit: %v", stopErr)
+	}
+}
+
+type deviceAuthStub struct{ signOutAuthenticator }
+
+func (a *deviceAuthStub) RequestDeviceCode(context.Context) (*auth.DeviceCodeResponse, error) {
+	return &auth.DeviceCodeResponse{VerificationURI: "https://github.com/login/device", UserCode: "ABCD-EFGH", ExpiresIn: 900}, nil
+}
+func (a *deviceAuthStub) PollForAuthorization(context.Context, *auth.DeviceCodeResponse) error {
+	return nil
+}
+
+func TestDeviceCodeEventCarriesMonotonicStateRevision(t *testing.T) {
+	manager := newManagerForTest(t)
+	controller, err := appcontrol.New(appcontrol.Options{
+		ConfigurationSource: manager,
+		RuntimeFactory: runtimeFactoryFunc(func(context.Context, appcontrol.Configuration) (appcontrol.Runtime, error) {
+			return newTestRuntimeForHelper(), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	writer := newProtocolWriter(&output)
+	h := &helper{
+		epoch:  "hep_device",
+		writer: writer,
+		opts: HelperOptions{
+			Controller: controller, Configuration: manager,
+			Authenticator: &deviceAuthStub{}, ShutdownTimeout: time.Second,
+		},
+	}
+	operation := &coordinatedOperation{id: "op_device", kind: "auth_device_start", ctx: t.Context(), done: make(chan struct{})}
+	h.runDeviceAuth(operation)
+	closeCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := writer.Close(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	var deviceRevision, followingStateRevision uint64
+	for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+		var envelope struct {
+			Event         string            `json:"event"`
+			StateRevision uint64            `json:"state_revision"`
+			Payload       deviceCodePayload `json:"payload"`
+		}
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Event == "device_code" {
+			found = true
+			deviceRevision = envelope.StateRevision
+			if envelope.StateRevision == 0 || envelope.Payload.OperationID != operation.id {
+				t.Fatalf("device code event = %+v", envelope)
+			}
+		}
+		if envelope.Event == "state" && deviceRevision != 0 && envelope.StateRevision > deviceRevision && followingStateRevision == 0 {
+			followingStateRevision = envelope.StateRevision
+		}
+	}
+	if !found {
+		t.Fatal("device_code event not emitted")
+	}
+	if followingStateRevision <= deviceRevision {
+		t.Fatalf("paired state revision = %d, device revision = %d", followingStateRevision, deviceRevision)
+	}
+}
+
+func TestProtocolAuthSourceUsesStableWireTokens(t *testing.T) {
+	cases := map[auth.AuthSource]string{
+		auth.AuthSourceNone:      "none",
+		auth.AuthSourceEnv:       "environment",
+		auth.AuthSourceVekil:     "vekil",
+		auth.AuthSourceGitHubCLI: "github_cli",
+	}
+	for source, want := range cases {
+		if got := protocolAuthSource(source); got != want {
+			t.Fatalf("protocolAuthSource(%q) = %q, want %q", source, got, want)
+		}
+	}
+}
+
+func TestStateProjectionPreservesAuthenticationFailureWithStoredCredential(t *testing.T) {
+	authenticator := &signOutAuthenticator{
+		status:   auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceVekil},
+		tokenErr: errors.New("invalid credential"),
+	}
+	manager := newManagerForTest(t)
+	controller, err := appcontrol.New(appcontrol.Options{
+		ConfigurationSource: manager,
+		RuntimeFactory: runtimeFactoryFunc(func(context.Context, appcontrol.Configuration) (appcontrol.Runtime, error) {
+			return &copilotSwitchRuntime{applyRuntime: newApplyRuntime(nil), usesCopilot: true}, nil
+		}),
+		Authenticator: authenticator,
+		StopTimeout:   time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := controller.Start(t.Context(), LegacyConfigRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := operation.Wait(t.Context())
+	if err != nil || result.Status != appcontrol.OperationFailed {
+		t.Fatalf("start result=%+v err=%v", result, err)
+	}
+	h := &helper{opts: HelperOptions{Controller: controller, Configuration: manager, Authenticator: authenticator}}
+	payload := h.buildStatePayload()
+	if payload.Auth != appcontrol.AuthFailed || payload.AuthSource != "vekil" {
+		t.Fatalf("auth projection = state %q source %q", payload.Auth, payload.AuthSource)
+	}
+}

@@ -1,0 +1,224 @@
+{
+  "uptime_seconds": 45,
+  "inflight": 0,
+  "totals": {
+    "requests": 1,
+    "errors": 0,
+    "prompt_tokens": 11,
+    "completion_tokens": 4,
+    "total_tokens": 15,
+    "cached_tokens": 0,
+    "reasoning_tokens": 0,
+    "latency_p50_ms": 125,
+    "latency_p95_ms": 125,
+    "latency_p99_ms": 125
+  },
+  "status": {
+    "2xx": 1
+  },
+  "status_codes": [],
+  "errors": [],
+  "series": [],
+  "by_model": [],
+  "by_provider": [],
+  "by_agent": [],
+  "by_route": [
+    {
+      "route": "route-gpt",
+      "requests": 1,
+      "tokens": 15,
+      "errors": 0,
+      "avg_ms": 125,
+      "target_switches": 1,
+      "requests_with_failover": 1,
+      "successful_failovers": 1,
+      "route_exhaustions": 0
+    }
+  ],
+  "by_target": [
+    {
+      "route": "route-gpt",
+      "target": "primary",
+      "provider": "azure-west",
+      "kind": "azure-openai",
+      "attempts": 1,
+      "physical_usage": {
+        "prompt_tokens": 4,
+        "completion_tokens": 1,
+        "total_tokens": 5,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "wasted_usage": {
+        "prompt_tokens": 4,
+        "completion_tokens": 1,
+        "total_tokens": 5,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      }
+    },
+    {
+      "route": "route-gpt",
+      "target": "secondary",
+      "provider": "azure-east",
+      "kind": "azure-openai",
+      "attempts": 1,
+      "physical_usage": {
+        "prompt_tokens": 11,
+        "completion_tokens": 4,
+        "total_tokens": 15,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "wasted_usage": {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      }
+    }
+  ],
+  "physical_usage": {
+    "prompt_tokens": 15,
+    "completion_tokens": 5,
+    "total_tokens": 20,
+    "cached_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "wasted_usage": {
+    "prompt_tokens": 4,
+    "completion_tokens": 1,
+    "total_tokens": 5,
+    "cached_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "upstream_attempts": 2,
+  "target_switches": 1,
+  "requests_with_failover": 1,
+  "successful_failovers": 1,
+  "route_exhaustions": 0,
+  "state_binding_hits": 0,
+  "state_binding_misses": 0,
+  "state_binding_evictions": 0,
+  "retries": 0,
+  "retries_by_code": [],
+  "recent": [
+    {
+      "t": 1718900200,
+      "endpoint": "openai_responses",
+      "model": "gpt-5.4",
+      "operation_id": "op-failover",
+      "route_id": "route-gpt",
+      "final_target": "secondary",
+      "provider": "azure-east",
+      "agent": "Codex CLI",
+      "status": 200,
+      "dur_ms": 125,
+      "total_tokens": 15,
+      "upstream_sends": 2,
+      "target_switches": 1,
+      "upstream_request_id": "req-secondary"
+    }
+  ],
+  "recent_attempts": [
+    {
+      "t": 1718900201,
+      "operation_id": "op-failover",
+      "route_id": "route-gpt",
+      "target_id": "secondary",
+      "provider_id": "azure-east",
+      "provider_kind": "azure-openai",
+      "sequence": 2,
+      "attempt_kind": "failover",
+      "status": "200",
+      "status_code": 200,
+      "outcome": "succeeded",
+      "delivery": "delivered_or_ambiguous",
+      "semantic_progress": "terminal_success",
+      "downstream_commitment": "committed",
+      "retry_decision": "accepted",
+      "ttft_ms": 35,
+      "upstream_request_id": "req-secondary",
+      "cleanup_complete": true,
+      "reported_usage": {
+        "prompt_tokens": 11,
+        "completion_tokens": 4,
+        "total_tokens": 15,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      }
+    },
+    {
+      "t": 1718900200,
+      "operation_id": "op-failover",
+      "route_id": "route-gpt",
+      "target_id": "primary",
+      "provider_id": "azure-west",
+      "provider_kind": "azure-openai",
+      "sequence": 1,
+      "attempt_kind": "normal",
+      "status": "429",
+      "status_code": 429,
+      "outcome": "rejected",
+      "delivery": "explicitly_rejected",
+      "semantic_progress": "terminal_failure",
+      "downstream_commitment": "none",
+      "retry_decision": "switch_target",
+      "retry_after_seconds": 2,
+      "upstream_request_id": "req-primary",
+      "cleanup_complete": true,
+      "reported_usage": {
+        "prompt_tokens": 4,
+        "completion_tokens": 1,
+        "total_tokens": 5,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      }
+    }
+  ],
+  "insights_enabled": false,
+  "policy_routing": {
+    "totals": {
+      "eligible": 0,
+      "sampled": 0,
+      "admitted": 0,
+      "drop_reasons": [],
+      "classifier": {
+        "completion": 0,
+        "unavailable": 0,
+        "uncertain": 0,
+        "abstain": 0
+      },
+      "actual_tiers": {
+        "lightweight": 0,
+        "powerful": 0,
+        "unknown": 0
+      },
+      "shadow_tiers": {
+        "lightweight": 0,
+        "powerful": 0,
+        "unknown": 0
+      },
+      "classifier_latency": {
+        "count": 0,
+        "recent_samples": 0,
+        "avg_ms": 0,
+        "min_ms": 0,
+        "max_ms": 0,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0
+      },
+      "classifier_usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "physical_classifier_sends": 0
+    },
+    "profiles": []
+  }
+}

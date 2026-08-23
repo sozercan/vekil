@@ -20,7 +20,9 @@ brew install --cask sozercan/repo/vekil
 xattr -cr /Applications/Vekil.app  # only if macOS quarantine blocks launch
 ```
 
-For tray app details, see [macOS/Linux Tray App](menubar.md).
+The currently published cask/ZIP contains the Go tray shell, is `arm64`-only, and is ad-hoc signed rather than Developer ID signed. This source tree now contains and assembles the macOS 13 AppKit/SwiftUI shell, universal bundled helper, External Configuration and managed-config control plane, login migration, Keychain support, analytics, and build-once release tooling. The native candidate is not a production release until Developer ID signing/notarization, real N-1 update continuity, exact-artifact architecture/Homebrew checks, and forward-revert gates in [Development](development.md#native-macos-shell-and-release-gates) pass. Older installations must remain on a compatible release rather than receiving an incompatible update.
+
+For current release behavior and the native source/release boundary, see [macOS App and Linux Tray](menubar.md).
 
 Build from source:
 
@@ -155,6 +157,14 @@ Policy v1 has a separate deployment restriction: one trusted user/tenant per Vek
 ## First Run And Authentication
 
 Startup behavior depends on active providers. For the full auth matrix, see [Provider Authentication](provider-routing.md#provider-authentication). For provider console links and key setup patterns, see [Provider API Keys](provider-api-keys.md).
+
+### Native macOS source build
+
+The implemented native candidate opens a setup assistant on a true first run. Its provider gallery covers GitHub Copilot, OpenAI Codex, Azure OpenAI, OpenAI-compatible, Anthropic-compatible, and multi-provider imports. Copilot has a direct zero-config sign-in path; the other choices select an existing JSON/YAML provider configuration, which can contain several providers and remains user-owned. The runtime validates the selected file, discovers the combined model catalog, rejects global public-model-ID collisions, verifies the local endpoint, and then offers temporary client commands. Managed provider-key entry stays unavailable until the native release's cross-version Keychain gate is satisfied.
+
+The app distinguishes a fresh installation from an upgrade by inspecting recovered authentication, configuration, service, window/navigation, and startup-preference state. Existing users are not forced through setup merely because the native onboarding preference is absent. **Skip Setup** suppresses the current assistant version, and **Settings > Run Setup Assistant…** opens it again on demand without first changing the active proxy.
+
+This flow describes the native source build, not the currently published Go tray bundle. See [macOS App and Linux Tray](menubar.md#implementation-and-release-status) for the release boundary and [Client Usage Examples](clients.md#native-macos-client-setup) for the native copyable-command surface.
 
 ### GitHub Copilot
 

@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -18,7 +20,20 @@ const (
 	remoteProvidersConfigTimeout     = 15 * time.Second
 )
 
-func readProvidersConfigSource(source string) ([]byte, error) {
+// ProvidersConfigRevision returns the stable revision used to bind one exact
+// provider-configuration byte snapshot across proxy frontends.
+func ProvidersConfigRevision(body []byte) string {
+	digest := sha256.Sum256(body)
+	return "cfg_" + base64.RawURLEncoding.EncodeToString(digest[:16])
+}
+
+func readProvidersConfigSource(ctx context.Context, source string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	configURL, remote, err := parseProvidersConfigURL(source)
 	if err != nil {
 		return nil, err
@@ -32,7 +47,7 @@ func readProvidersConfigSource(source string) ([]byte, error) {
 	}
 	displaySource := ProvidersConfigSourceDisplay(source)
 
-	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, configURL.String(), nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, configURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("fetch providers config %q: %w", displaySource, providersConfigRequestError(err))
 	}
@@ -66,6 +81,13 @@ func readProvidersConfigSource(source string) ([]byte, error) {
 		return nil, fmt.Errorf("fetch providers config %q: response exceeds %d bytes", displaySource, maxRemoteProvidersConfigBodySize)
 	}
 	return body, nil
+}
+
+// IsRemoteProvidersConfigSource reports whether source uses URL syntax. The
+// loader still validates the scheme and host before making a request.
+func IsRemoteProvidersConfigSource(source string) bool {
+	_, remote := providersConfigSourceScheme(strings.TrimSpace(source))
+	return remote
 }
 
 func parseProvidersConfigURL(source string) (*url.URL, bool, error) {

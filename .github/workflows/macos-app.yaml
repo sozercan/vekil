@@ -17,7 +17,7 @@ concurrency:
 jobs:
   smoke:
     runs-on: macos-26
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -25,5 +25,51 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build and smoke test macOS menubar app
-        run: scripts/macos-app-smoke.sh
+      - name: Validate release tooling
+        run: make test-macos-release-tools
+
+      - name: Generate and validate a signed test appcast
+        run: make test-macos-appcast-generation
+
+      - name: Verify synthetic universal bundle and nested signatures
+        run: make test-macos-bundle-verification
+
+      - name: Require native source contract
+        run: make require-native-macos-sources
+
+      - name: Keep legacy Go shell buildable
+        run: make test-legacy-app
+
+      - name: Test Swift package
+        run: swift test --package-path mac/VekilApp --only-use-versions-from-resolved-file
+
+      - name: Build and verify universal native app
+        env:
+          VERSION: 0.0.0-ci.${{ github.run_number }}
+          MACOS_BUNDLE_VERSION: 900000${{ github.run_number }}
+          MACOS_BUNDLE_BUILD_ID: ci-${{ github.sha }}-${{ github.run_id }}
+        run: make test-app
+
+      - name: Package the already-built app
+        env:
+          MACOS_RESOLVED_MANIFEST: ${{ github.workspace }}/.build/macos/vekil-macos-release.json
+          MACOS_RELEASE_DIR: ${{ runner.temp }}/macos-candidate
+        run: scripts/package-macos-app.sh
+
+      - name: Verify exact CI ZIP
+        run: |
+          scripts/verify-macos-release-artifact.sh \
+            "${RUNNER_TEMP}/macos-candidate/vekil-macos-universal.zip" \
+            "${RUNNER_TEMP}/macos-candidate/vekil-macos-release.json" \
+            "${RUNNER_TEMP}/macos-candidate/vekil-macos-universal.zip.sha256"
+
+      - name: Smoke exact CI ZIP on both slices
+        env:
+          MACOS_SMOKE_ARCHES: arm64 x86_64
+        run: |
+          extract_root="${RUNNER_TEMP}/exact-macos-candidate"
+          mkdir -p "${extract_root}"
+          ditto -x -k "${RUNNER_TEMP}/macos-candidate/vekil-macos-universal.zip" "${extract_root}"
+          APP_PATH="${extract_root}/Vekil.app" \
+          MACOS_RESOLVED_MANIFEST="${RUNNER_TEMP}/macos-candidate/vekil-macos-release.json" \
+            scripts/macos-app-smoke.sh

@@ -293,8 +293,22 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 	})
 }
 
-// New creates a Server with routes and timeouts configured.
+// New creates a Server with routes and timeouts configured. It preserves the
+// historical non-cancelable construction behavior. App-owned lifecycles should
+// use NewContext.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
+	return NewContext(context.Background(), authenticator, log, host, port, opts...)
+}
+
+// NewContext creates a Server while honoring ctx during proxy-handler and
+// provider initialization.
+func NewContext(ctx context.Context, authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	cfg := options{}
 	for _, opt := range opts {
 		if opt != nil {
@@ -302,7 +316,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		}
 	}
 
-	handler, err := proxy.NewProxyHandler(authenticator, log, cfg.proxyOptions...)
+	handler, err := proxy.NewProxyHandlerContext(ctx, authenticator, log, cfg.proxyOptions...)
 	if err != nil {
 		return nil, err
 	}

@@ -691,12 +691,13 @@ EOF
 
 # Preference order for free models; intersected with the live /v1/models catalog.
 ZEN_MODEL_PREFS=(
-  x-preview-f-free
-  big-pickle
   mimo-v2.5-free
   hy3-free
+  nemotron-3-ultra-free
   nemotron-3.5-lightning-free
   muse-spark-1.2-contributor-free
+  x-preview-f-free
+  big-pickle
 )
 
 ATTEMPT_STATUS=""

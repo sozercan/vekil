@@ -31,6 +31,16 @@ Replay state is byte-bounded, process-local, and expires one hour after the tool
 
 Claude Code and Gemini `countTokens` calls also use the selected model's native backend. Anthropic counting requires reported upstream usage; Gemini counting retains its existing cache and can use a local estimate for transient failures or missing usage.
 
+## Native macOS Client Setup
+
+The native-source main window includes **Clients** for Claude Code, Codex CLI, and GitHub Copilot CLI. Once the app-owned proxy is running, the page reads the live public `/v1/models` catalog, omits models marked unavailable to pickers, shows the selected model's native endpoints, and generates a copyable **Connect to this running proxy** command. That command sets temporary client-specific environment variables for the active endpoint and selected model, matching the manual examples below.
+
+If the catalog is not available yet, the command shows `<model-id>` rather than guessing. Endpoint compatibility remains model-specific: in particular, the generated Copilot manual form uses the Responses wire API, so select a direct Responses-capable model as described below.
+
+The app copies the command to the clipboard only. It does not launch a client from the durable setup page, persist the temporary environment overlay, or rewrite client configuration and dotfiles. The first-run assistant offers a smaller copyable setup surface for Claude Code, Codex, GitHub Copilot CLI, and a generic OpenAI-compatible client.
+
+This UI is implemented in the native macOS source candidate and is not part of the currently published Go tray app; see [macOS App and Linux Tray](menubar.md#implementation-and-release-status).
+
 ## Claude Code
 
 Use [`vekil launch claude`](agent-launchers.md) to start an ephemeral proxy and Claude Code together, or configure an already-running proxy manually:

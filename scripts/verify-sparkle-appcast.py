@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Verify Vekil's signed Sparkle appcast and macOS 13 eligibility metadata."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any
+
+SPARKLE = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+ED25519_SUBJECT_PUBLIC_KEY_INFO_PREFIX = bytes.fromhex("302a300506032b6570032100")
+SIGNED_FEED_PREFIX = b"<!-- sparkle-signatures:\n"
+SIGNED_FEED_SUFFIX = b"-->"
+
+
+class VerificationError(ValueError):
+    pass
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise VerificationError(f"cannot read manifest {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise VerificationError("manifest root must be an object")
+    return value
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    try:
+        parts = tuple(int(part) for part in value.split("."))
+    except ValueError as exc:
+        raise VerificationError(f"invalid dotted version: {value!r}") from exc
+    if not parts or any(part < 0 for part in parts):
+        raise VerificationError(f"invalid dotted version: {value!r}")
+    return parts + (0,) * (4 - len(parts))
+
+
+def text(item: ET.Element, name: str) -> str:
+    value = item.findtext(f"{{{SPARKLE}}}{name}")
+    return (value or "").strip()
+
+
+def decode_base64(value: str, label: str, expected_bytes: int) -> bytes:
+    if not value:
+        raise VerificationError(f"{label} is missing")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except ValueError as exc:
+        raise VerificationError(f"{label} is not valid base64") from exc
+    if len(decoded) != expected_bytes:
+        raise VerificationError(f"{label} must decode to {expected_bytes} bytes")
+    return decoded
+
+
+def sha256_file(path: Path, label: str) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+    except OSError as exc:
+        raise VerificationError(f"cannot read {label} {path}: {exc}") from exc
+    return digest.hexdigest(), size
+
+
+def extract_signed_appcast(raw_appcast: bytes) -> tuple[bytes, bytes]:
+    prefix_offset = raw_appcast.rfind(SIGNED_FEED_PREFIX)
+    if prefix_offset < 0:
+        raise VerificationError("appcast-level Sparkle signature block is missing")
+
+    block_offset = prefix_offset + len(SIGNED_FEED_PREFIX)
+    suffix_offset = raw_appcast.find(SIGNED_FEED_SUFFIX, block_offset)
+    if suffix_offset < 0:
+        raise VerificationError("appcast-level Sparkle signature block is incomplete")
+    try:
+        signature_block = raw_appcast[block_offset:suffix_offset].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise VerificationError("appcast-level Sparkle signature block is not UTF-8") from exc
+
+    signature_value = ""
+    content_length_value = ""
+    for line in signature_block.splitlines():
+        if line.startswith("edSignature:"):
+            signature_value = line.removeprefix("edSignature:").strip()
+        elif line.startswith("length:"):
+            content_length_value = line.removeprefix("length:").strip()
+
+    signature = decode_base64(signature_value, "appcast Ed25519 signature", 64)
+    if not content_length_value:
+        raise VerificationError("appcast signed content length is missing")
+    try:
+        content_length = int(content_length_value)
+    except ValueError as exc:
+        raise VerificationError("appcast signed content length is invalid") from exc
+    if content_length < 0:
+        raise VerificationError("appcast signed content length is invalid")
+
+    signed_content = raw_appcast[:prefix_offset]
+    if content_length != len(signed_content):
+        raise VerificationError(
+            f"appcast signed content length {content_length} does not match "
+            f"the extracted {len(signed_content)} bytes"
+        )
+    return signed_content, signature
+
+
+def verify_ed25519_signature(
+    payload: Path,
+    signature: bytes,
+    public_key: bytes,
+    label: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="vekil-sparkle-verify-") as temporary:
+        temporary_path = Path(temporary)
+        public_key_path = temporary_path / "public-key.der"
+        signature_path = temporary_path / "signature"
+        public_key_path.write_bytes(ED25519_SUBJECT_PUBLIC_KEY_INFO_PREFIX + public_key)
+        signature_path.write_bytes(signature)
+        try:
+            result = subprocess.run(
+                [
+                    "openssl",
+                    "pkeyutl",
+                    "-verify",
+                    "-pubin",
+                    "-inkey",
+                    str(public_key_path),
+                    "-keyform",
+                    "DER",
+                    "-rawin",
+                    "-in",
+                    str(payload),
+                    "-sigfile",
+                    str(signature_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError as exc:
+            raise VerificationError(f"cannot run OpenSSL signature verification: {exc}") from exc
+    if result.returncode != 0:
+        raise VerificationError(f"{label} does not verify against manifest sparkle.public_ed_key")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--appcast", required=True)
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--artifact")
+    parser.add_argument("--legacy-artifact")
+    parser.add_argument("--expected-url-prefix")
+    parser.add_argument("--require-legacy-compatible-entry", action="store_true")
+    args = parser.parse_args()
+
+    appcast_path = Path(args.appcast)
+    manifest = load_json(Path(args.manifest))
+    application = manifest.get("application") or {}
+    legacy = manifest.get("legacy_shell") or {}
+    sparkle = manifest.get("sparkle") or {}
+    if not isinstance(application, dict) or not isinstance(legacy, dict) or not isinstance(sparkle, dict):
+        raise VerificationError("manifest application, legacy_shell, and sparkle must be objects")
+
+    bundle_version = str(manifest.get("bundle_version") or "")
+    marketing_version = str(manifest.get("marketing_version") or "")
+    minimum_version = str(application.get("minimum_system_version") or "")
+    artifact_name = str(application.get("artifact_name") or "")
+    if not all((bundle_version, marketing_version, minimum_version, artifact_name)):
+        raise VerificationError("manifest is missing release identity fields")
+
+    try:
+        raw_appcast = appcast_path.read_bytes()
+    except OSError as exc:
+        raise VerificationError(f"cannot read appcast {appcast_path}: {exc}") from exc
+
+    signed_content, appcast_signature = extract_signed_appcast(raw_appcast)
+    public_key = decode_base64(
+        str(sparkle.get("public_ed_key") or ""),
+        "manifest sparkle.public_ed_key",
+        32,
+    )
+    with tempfile.TemporaryDirectory(prefix="vekil-sparkle-appcast-") as temporary:
+        signed_content_path = Path(temporary) / "appcast-content.xml"
+        signed_content_path.write_bytes(signed_content)
+        verify_ed25519_signature(
+            signed_content_path,
+            appcast_signature,
+            public_key,
+            "appcast Ed25519 signature",
+        )
+
+    try:
+        root = ET.fromstring(signed_content)
+    except ET.ParseError as exc:
+        raise VerificationError(f"cannot parse appcast {appcast_path}: {exc}") from exc
+
+    items = root.findall("./channel/item")
+    candidates = [item for item in items if text(item, "version") == bundle_version]
+    if len(candidates) != 1:
+        raise VerificationError(
+            f"expected one candidate with sparkle:version {bundle_version}, found {len(candidates)}"
+        )
+    candidate = candidates[0]
+    if text(candidate, "shortVersionString") != marketing_version:
+        raise VerificationError("candidate sparkle:shortVersionString does not match manifest")
+    if text(candidate, "minimumSystemVersion") != minimum_version:
+        raise VerificationError(
+            f"candidate minimumSystemVersion is {text(candidate, 'minimumSystemVersion')!r}; "
+            f"expected {minimum_version!r}"
+        )
+    hardware = text(candidate, "hardwareRequirements")
+    if hardware:
+        raise VerificationError(
+            f"universal candidate must not restrict sparkle:hardwareRequirements, found {hardware!r}"
+        )
+
+    enclosure = candidate.find("enclosure")
+    if enclosure is None:
+        raise VerificationError("candidate enclosure is missing")
+    url = (enclosure.get("url") or "").strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        raise VerificationError("candidate enclosure URL must use HTTPS")
+    if Path(parsed.path).name != artifact_name:
+        raise VerificationError(f"candidate enclosure URL does not name {artifact_name}")
+    if args.expected_url_prefix and not url.startswith(args.expected_url_prefix.rstrip("/") + "/"):
+        raise VerificationError("candidate enclosure URL does not use the expected release prefix")
+    candidate_signature = decode_base64(
+        (enclosure.get(f"{{{SPARKLE}}}edSignature") or "").strip(),
+        "candidate enclosure Ed25519 signature",
+        64,
+    )
+
+    if args.artifact:
+        artifact = Path(args.artifact)
+        if artifact.name != artifact_name:
+            raise VerificationError(f"artifact must be named {artifact_name}")
+        try:
+            expected_length = int(enclosure.get("length") or "")
+        except ValueError as exc:
+            raise VerificationError("candidate enclosure length is invalid") from exc
+        actual_length = artifact.stat().st_size
+        if expected_length != actual_length:
+            raise VerificationError(
+                f"candidate enclosure length {expected_length} does not match artifact {actual_length}"
+            )
+        verify_ed25519_signature(
+            artifact,
+            candidate_signature,
+            public_key,
+            "candidate enclosure Ed25519 signature",
+        )
+
+    fixture_expectations = {
+        "10.13": False,
+        "12.6": False,
+        "13.0": True,
+        "14.0": True,
+    }
+    candidate_minimum = version_tuple(text(candidate, "minimumSystemVersion"))
+    for system_version, expected in fixture_expectations.items():
+        eligible = version_tuple(system_version) >= candidate_minimum
+        if eligible != expected:
+            raise VerificationError(
+                f"eligibility fixture {system_version} returned {eligible}; expected {expected}"
+            )
+
+    if args.require_legacy_compatible_entry:
+        legacy_version = str(legacy.get("last_compatible_bundle_version") or "")
+        legacy_marketing = str(legacy.get("last_compatible_marketing_version") or "")
+        legacy_minimum = str(legacy.get("minimum_system_version") or "")
+        legacy_url = str(legacy.get("last_compatible_artifact_url") or "")
+        legacy_sha256 = str(legacy.get("last_compatible_artifact_sha256") or "")
+        if not all((legacy_version, legacy_marketing, legacy_minimum, legacy_url, legacy_sha256)):
+            raise VerificationError("manifest is missing legacy compatible release identity fields")
+
+        version_matches = [item for item in items if text(item, "version") == legacy_version]
+        if not version_matches:
+            raise VerificationError(
+                f"appcast no longer preserves legacy compatible release {legacy_version}"
+            )
+        exact_matches: list[tuple[ET.Element, ET.Element]] = []
+        for item in version_matches:
+            enclosure = item.find("enclosure")
+            if enclosure is None:
+                continue
+            if (
+                text(item, "shortVersionString") == legacy_marketing
+                and text(item, "minimumSystemVersion") == legacy_minimum
+                and (enclosure.get("url") or "").strip() == legacy_url
+            ):
+                exact_matches.append((item, enclosure))
+        if len(exact_matches) != 1:
+            raise VerificationError(
+                "expected one legacy entry matching the manifest marketing version, "
+                f"minimum system version, and enclosure URL; found {len(exact_matches)}"
+            )
+
+        legacy_item, legacy_enclosure = exact_matches[0]
+        if version_tuple(text(legacy_item, "minimumSystemVersion")) > version_tuple("12.999"):
+            raise VerificationError("legacy release entry is not eligible for pre-macOS-13 users")
+        parsed_legacy_url = urllib.parse.urlparse(legacy_url)
+        if parsed_legacy_url.scheme != "https" or not Path(parsed_legacy_url.path).name:
+            raise VerificationError("legacy enclosure URL must identify an HTTPS artifact")
+        legacy_signature = decode_base64(
+            (legacy_enclosure.get(f"{{{SPARKLE}}}edSignature") or "").strip(),
+            "legacy enclosure Ed25519 signature",
+            64,
+        )
+        if not args.legacy_artifact:
+            raise VerificationError(
+                "--legacy-artifact is required with --require-legacy-compatible-entry"
+            )
+        legacy_artifact = Path(args.legacy_artifact)
+        actual_sha256, actual_length = sha256_file(legacy_artifact, "legacy artifact")
+        if actual_sha256 != legacy_sha256:
+            raise VerificationError(
+                f"legacy artifact SHA-256 {actual_sha256} does not match manifest {legacy_sha256}"
+            )
+        try:
+            expected_length = int(legacy_enclosure.get("length") or "")
+        except ValueError as exc:
+            raise VerificationError("legacy enclosure length is invalid") from exc
+        if expected_length != actual_length:
+            raise VerificationError(
+                f"legacy enclosure length {expected_length} does not match artifact {actual_length}"
+            )
+        verify_ed25519_signature(
+            legacy_artifact,
+            legacy_signature,
+            public_key,
+            "legacy enclosure Ed25519 signature",
+        )
+
+    print(
+        f"verified appcast candidate {marketing_version} ({bundle_version}), "
+        f"minimum macOS {minimum_version}, artifact {artifact_name}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except VerificationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

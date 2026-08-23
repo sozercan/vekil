@@ -52,6 +52,16 @@ Entra token refreshes are shared across concurrent requests; waiters can time ou
 
 When `auth_type` is omitted, Vekil uses `bearer` if `api_key` or `api_key_env` is set, otherwise `none`. If `api_key_env` is configured, the referenced environment variable must be set and non-empty at startup.
 
+## Native macOS Guided Editor Scope
+
+The native source adds the Go-owned managed draft/validation/apply boundary and Swift Keychain/form-state foundations without changing the provider schema or routing engine. The current Providers view deliberately keeps the full guided editor and **Validate and Apply** action disabled until the signed cross-version Keychain gate is complete. Go remains responsible for typed draft conversion, deterministic YAML, strict validation, public-model ownership, endpoint policy, and structured field errors.
+
+The guided surface is intended for Copilot, OpenAI Codex, Azure OpenAI API-key/Entra modes, and supported generic OpenAI-compatible and Anthropic-compatible auth/discovery modes. It does **not** edit explicit `model_routes`, ordered failover, `policy_profiles`, custom headers, path overrides, trust metadata, or tool optimizers. Those remain file-owned advanced configuration. Unsupported or out-of-band managed fields must produce drift rather than being silently deleted; use External Configuration for advanced routing.
+
+Public model IDs remain global across providers, and endpoint fields remain declared native allowlists. A UI selection is not evidence of upstream compatibility unless validation or a real probe ran. Dynamic providers still need safe model allowlists when required to avoid ownership collisions.
+
+Managed keys are resolved through the implemented provider-scoped secret resolver from an immutable helper projection rather than `os.Environ`; External Configuration retains the existing auth behavior documented here. The managed transaction and Keychain services are implemented, but the guided editor is not release-enabled. A signed A-to-B Sparkle continuity test is mandatory before Keychain-backed managed providers can ship. See [Provider API Keys](provider-api-keys.md#macos-managed-provider-secrets).
+
 ## Provider Routing
 
 Use `--providers-config` when you want explicit ownership of public model IDs across providers such as GitHub Copilot, Azure OpenAI, OpenAI Codex, or generic OpenAI-compatible and Anthropic-compatible upstreams. The JSON (`.json`) or YAML (`.yaml`/`.yml`) config source may be a local path or an HTTP(S) URL.

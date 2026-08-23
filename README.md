@@ -64,13 +64,13 @@ docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot \
 
 Native binaries are available from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest).
 
-On Apple Silicon Macs, install the native tray app via Homebrew:
+On Apple Silicon Macs, install the published tray app via Homebrew:
 
 ```bash
 brew install --cask sozercan/repo/vekil
 ```
 
-> The app is not signed. Clear quarantine with `xattr -cr /Applications/Vekil.app`. Manual `vekil-macos-arm64.zip` downloads are also on [Releases](https://github.com/sozercan/vekil/releases/latest). See [Tray App (macOS/Linux)](docs/menubar.md).
+> The currently published app is the Go tray shell, is Apple Silicon-only, and is not Developer ID signed. Clear quarantine with `xattr -cr /Applications/Vekil.app`. Manual `vekil-macos-arm64.zip` downloads are also on [Releases](https://github.com/sozercan/vekil/releases/latest). AppKit/SwiftUI and Go-helper source is implemented in this tree, but the native replacement is not a production-signed/notarized release yet; see [macOS App and Linux Tray](docs/menubar.md).
 
 For explicit provider routing, pass a local file or HTTP(S) URL with
 `--providers-config`, such as `/path/to/providers.yaml` or
@@ -80,7 +80,7 @@ Schema-v2 policy routing follows each profile's YAML `mode` by default; an expli
 
 ### Launch a coding agent
 
-The native binary can start a loopback-only proxy, configure the agent for that
+The standalone `vekil` binary can start a loopback-only proxy, configure the agent for that
 session, and clean everything up when the agent exits. Claude Code and Codex
 CLI can use their normal configured or built-in default; Copilot CLI requires an
 explicit model:
@@ -125,22 +125,22 @@ For full setup details, see [Getting Started](docs/getting-started.md), [Configu
 
 Documentation lives under [`docs/`](docs/README.md); start with these:
 
-|                                                              |                                     |
-| ------------------------------------------------------------ | ----------------------------------- |
-| [Getting Started](docs/getting-started.md)                   | Install, run, first auth            |
-| [Configuration](docs/configuration.md)                       | Config map and generic flags        |
-| [Provider Routing](docs/provider-routing.md)                 | Provider auth and route failover    |
-| [Semantic Policy Routing](docs/policy-routing.md)            | Schema-v2 policy selection and gates |
-| [Provider API Keys](docs/provider-api-keys.md)               | Where to get provider keys          |
-| [Tool Optimizers](docs/tool-optimizers.md)                   | Shell rewrite/output reduction      |
-| [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |
-| [Client Examples](docs/clients.md)                           | Copy-paste snippets per client      |
-| [Agent Launchers](docs/agent-launchers.md)                   | One-command coding-agent sessions   |
-| [API Reference](docs/api.md)                                 | Endpoint behavior and compatibility |
-| [Architecture](docs/architecture.md)                         | Package layout and design notes     |
-| [Traffic Dashboard](docs/dashboard.md)                       | Live browser dashboard and stats    |
-| [Tray App](docs/menubar.md)                                  | macOS/Linux menubar usage           |
-| [Development](docs/development.md)                           | Build, test, benchmarks, CI         |
+|                                                    |                                      |
+| -------------------------------------------------- | ------------------------------------ |
+| [Getting Started](docs/getting-started.md)         | Install, run, first auth             |
+| [Configuration](docs/configuration.md)             | Config map and ownership             |
+| [Provider Routing](docs/provider-routing.md)       | Provider auth and route failover     |
+| [Semantic Policy Routing](docs/policy-routing.md)  | Schema-v2 policy selection and gates |
+| [Provider API Keys](docs/provider-api-keys.md)     | Provider keys and Keychain staging   |
+| [Tool Optimizers](docs/tool-optimizers.md)         | Shell rewrite/output reduction       |
+| [Responses WebSocket](docs/responses-websocket.md) | Websocket bridge tuning              |
+| [Client Examples](docs/clients.md)                 | Copy-paste snippets per client       |
+| [Agent Launchers](docs/agent-launchers.md)         | One-command coding-agent sessions    |
+| [API Reference](docs/api.md)                       | Endpoint behavior and compatibility  |
+| [Architecture](docs/architecture.md)               | Package layout and native boundary   |
+| [Traffic Dashboard](docs/dashboard.md)             | Browser/native analytics status      |
+| [macOS App and Linux Tray](docs/menubar.md)        | Current release and native rollout   |
+| [Development](docs/development.md)                 | Build, test, native release gates    |
 
 ## Client Examples
 
