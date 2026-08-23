@@ -173,4 +173,20 @@ final class RuntimeFrameCodecTests: XCTestCase {
         XCTAssertEqual(configuration.mode, .external)
         XCTAssertEqual(configuration.drift, .drifted)
     }
+
+    func testExpectedStartRevisionPrefersTheStoppedSelection() {
+        let state = RuntimeStatePayload(
+            configRevision: "cfg_previous_runtime",
+            service: .stopped,
+            readiness: .unknown,
+            auth: .signedIn,
+            configuration: RuntimeConfigurationState(
+                mode: .external,
+                selectedRevision: "cfg_new_selection",
+                activeRevision: "cfg_previous_runtime"
+            )
+        )
+
+        XCTAssertEqual(state.expectedStartConfigRevision, "cfg_new_selection")
+    }
 }

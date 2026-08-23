@@ -58,7 +58,7 @@ actor RuntimeAppClient: AppRuntimeClient {
         return Self.map(state, identity: identity)
     }
     func start(_ request: AppRuntimeStartRequest) async throws -> AppRuntimeOperationAcceptance {
-        let expected = (await controller.currentState)?.payload.configRevision
+        let expected = (await controller.currentState)?.payload.expectedStartConfigRevision
         let payload = try JSONValue.encode(["expected_config_revision": expected ?? ""])
         return try await submit(.start, payload: payload)
     }

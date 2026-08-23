@@ -41,8 +41,8 @@ public struct RuntimeControllerConfiguration: Sendable, Equatable {
         diagnosticsByteLimit: Int = 64 * 1_024,
         handshakeTimeout: TimeInterval = 5,
         requestTimeout: TimeInterval = 15,
-        shutdownGracePeriod: TimeInterval = 5,
-        forceTerminationGracePeriod: TimeInterval = 1,
+        shutdownGracePeriod: TimeInterval = 10,
+        forceTerminationGracePeriod: TimeInterval = 2,
         restartPolicy: RuntimeRestartPolicy = RuntimeRestartPolicy()
     ) {
         self.process = process
@@ -334,8 +334,7 @@ public actor RuntimeController {
     private var operationWaiters: [String: [CheckedContinuation<RuntimeTrackedOperation, Error>]] = [:]
     private var notificationContinuations: [UUID: AsyncStream<RuntimeControllerNotification>.Continuation] = [:]
     private var scopedNotificationContinuations: [UUID: AsyncStream<RuntimeScopedNotification>.Continuation] = [:]
-    private var lastNotificationLaunchToken: UUID?
-    private var lastNotificationHelperEpoch: String?
+    private var lastNotificationIdentity: RuntimeLaunchIdentity?
     private var terminationWaiters: [UUID: [UUID: TerminationWaiter]] = [:]
     private var completedTerminations: [UUID: RuntimeProcessTermination] = [:]
     private var restartFailureDates: [Date] = []
@@ -654,8 +653,6 @@ public actor RuntimeController {
         )
         self.session = session
         launchToken = session.id
-        lastNotificationLaunchToken = session.id
-        lastNotificationHelperEpoch = nil
         installDrains(for: session)
 
         do {
@@ -824,7 +821,10 @@ public actor RuntimeController {
         session.handshakeTimeoutTask?.cancel()
         self.hello = hello
         helperEpoch = hello.helperEpoch
-        lastNotificationHelperEpoch = hello.helperEpoch
+        lastNotificationIdentity = RuntimeLaunchIdentity(
+            launchToken: session.id,
+            helperEpoch: hello.helperEpoch
+        )
         negotiatedProtocolVersion = event.version
         lastStateRevision = nil
         currentRuntimeGeneration = nil
@@ -1473,8 +1473,15 @@ public actor RuntimeController {
 
     private func publish(_ notification: RuntimeControllerNotification) {
         for continuation in notificationContinuations.values { continuation.yield(notification) }
-        if let token = launchToken ?? lastNotificationLaunchToken {
-            let scoped = RuntimeScopedNotification(launchToken: token, helperEpoch: helperEpoch ?? lastNotificationHelperEpoch, notification: notification)
+        let activeIdentity = launchToken.flatMap { token in
+            helperEpoch.map { RuntimeLaunchIdentity(launchToken: token, helperEpoch: $0) }
+        }
+        if let identity = activeIdentity ?? lastNotificationIdentity {
+            let scoped = RuntimeScopedNotification(
+                launchToken: identity.launchToken,
+                helperEpoch: identity.helperEpoch,
+                notification: notification
+            )
             for continuation in scopedNotificationContinuations.values { continuation.yield(scoped) }
         }
     }

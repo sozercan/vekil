@@ -565,6 +565,14 @@ public struct RuntimeStatePayload: Codable, Sendable, Equatable {
     public var configuration: RuntimeConfigurationState?
     public var baseURL: String?
 
+    public var expectedStartConfigRevision: String? {
+        for revision in [configuration?.selectedRevision, configRevision] {
+            let trimmed = revision?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return nil
+    }
+
     public init(
         helper: RuntimeHelperLifecycle? = nil,
         runtimeGeneration: UInt64? = nil,

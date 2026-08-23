@@ -157,6 +157,29 @@ func TestCanceledConfigSelectionPreservesRestoreFailure(t *testing.T) {
 	}
 }
 
+func TestCanceledStoppedConfigSelectionRestoresPriorSelection(t *testing.T) {
+	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
+	manager, _, h := newConfigSwitchHarness(t, factory)
+	path, _ := writeExternalConfigForSwitchTest(t, "selected-model")
+	ctx, cancel := context.WithCancel(t.Context())
+
+	err := h.switchSelectedConfiguration(ctx, func(opCtx context.Context) error {
+		if err := manager.StageExternal(opCtx, path); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, context.Canceled) || switchErr.Rollback != nil {
+		t.Fatalf("switch error = %+v, want canceled primary with successful restore", err)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeLegacy || selection.SelectedPath != "" || selection.SelectedConfigRevision != LegacyConfigRevision {
+		t.Fatalf("selection after cancellation = %+v", selection)
+	}
+}
+
 func TestConfigSelectionWaitsForNonCancelableStopBeforeRestoringSelection(t *testing.T) {
 	stopStarted := make(chan struct{})
 	releaseStop := make(chan struct{})

@@ -364,9 +364,9 @@ func (c *Controller) runStop(op *activeOperation) {
 		ctx, cancel := c.cleanupContext()
 		err = runtime.Stop(ctx)
 		cancel()
-	}
-	if err == nil && c.observer != nil {
-		err = c.observer.RuntimeDeactivated(context.WithoutCancel(c.rootCtx), generation)
+		if c.observer != nil {
+			err = errors.Join(err, c.observer.RuntimeDeactivated(context.WithoutCancel(c.rootCtx), generation))
+		}
 	}
 
 	c.mu.Lock()
@@ -374,18 +374,19 @@ func (c *Controller) runStop(op *activeOperation) {
 		c.mu.Unlock()
 		return
 	}
+	if c.runtime == runtime {
+		c.runtime = nil
+	}
+	c.state.Readiness = ReadinessUnknown
+	c.state.Addr = ""
 	status := OperationSucceeded
 	if err != nil {
 		status = OperationFailed
 		c.state.Service = ServiceFailed
 		c.state.LastFailureCode = "stop_failed"
 	} else {
-		if c.runtime == runtime {
-			c.runtime = nil
-		}
 		c.state.Service = ServiceStopped
-		c.state.Readiness = ReadinessUnknown
-		c.state.Addr = ""
+		c.state.LastFailureCode = ""
 	}
 	c.completeOperationLocked(op, status, err)
 	c.mu.Unlock()

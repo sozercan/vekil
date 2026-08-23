@@ -9,6 +9,7 @@ public enum ApplicationInstanceGateError: Error { case unsafeDirectory, lockOpen
 
 public final class ApplicationInstanceGate: @unchecked Sendable {
     public static let activationNotification = Notification.Name("com.vekil.menubar.activate-main-window")
+    private static let privateDirectoryMode: mode_t = 0o700
     private let lockFD: Int32, directoryFD: Int32, uid: uid_t, identifier: String
     private let activationName: String
     private var observer: NSObjectProtocol?
@@ -19,44 +20,93 @@ public final class ApplicationInstanceGate: @unchecked Sendable {
     }
 
     public static func acquire(identifier: String = "com.vekil.menubar", baseDirectory: URL? = nil) throws -> ApplicationInstanceGate? {
+        guard !identifier.isEmpty, !identifier.contains("/") else {
+            throw ApplicationInstanceGateError.unsafeLock
+        }
         let uid = getuid()
         let base = (baseDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]).resolvingSymlinksInPath()
-        let appDir = base.appendingPathComponent("vekil")
-        let directory = appDir.appendingPathComponent("Singleton-\(uid)")
-        if !FileManager.default.fileExists(atPath: appDir.path) {
-            try FileManager.default.createDirectory(
-                at: appDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
-            )
-        }
-        if !FileManager.default.fileExists(atPath: directory.path) {
-            try FileManager.default.createDirectory(
-                at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]
-            )
-        }
-        for url in [appDir, directory] {
-            var st = stat()
-            guard lstat(url.path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR, st.st_uid == uid else {
-                throw ApplicationInstanceGateError.unsafeDirectory
-            }
-            chmod(url.path, 0o700)
-        }
-        let dirFD = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
-        guard dirFD >= 0 else { throw ApplicationInstanceGateError.unsafeDirectory }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let baseFD = try openOwnedBaseDirectory(at: base, uid: uid)
+        defer { Darwin.close(baseFD) }
+        let appFD = try openOrCreatePrivateDirectory(named: "vekil", parentFD: baseFD, uid: uid)
+        defer { Darwin.close(appFD) }
+        let dirFD = try openOrCreatePrivateDirectory(
+            named: "Singleton-\(uid)",
+            parentFD: appFD,
+            uid: uid
+        )
         let lockName = "\(identifier)-\(uid).lock"
         let activationName = "activate-\(uid).request"
         let fd = openat(dirFD, lockName, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { Darwin.close(dirFD); throw ApplicationInstanceGateError.lockOpen(errno) }
-        var st = stat(); guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == uid, st.st_nlink == 1 else { Darwin.close(fd); Darwin.close(dirFD); throw ApplicationInstanceGateError.unsafeLock }
-        fchmod(fd, 0o600)
+        var st = stat()
+        guard fstat(fd, &st) == 0,
+              st.st_mode & S_IFMT == S_IFREG,
+              st.st_uid == uid,
+              st.st_nlink == 1,
+              fchmod(fd, 0o600) == 0 else {
+            Darwin.close(fd); Darwin.close(dirFD)
+            throw ApplicationInstanceGateError.unsafeLock
+        }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
-            let request = openat(dirFD, activationName, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0o600)
+            let request = openat(
+                dirFD,
+                activationName,
+                O_CREAT | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+                0o600
+            )
             if request >= 0 {
-                _ = fsync(request); Darwin.close(request); _ = fsync(dirFD)
+                var requestInfo = stat()
+                if fstat(request, &requestInfo) == 0,
+                   requestInfo.st_mode & S_IFMT == S_IFREG,
+                   requestInfo.st_uid == uid,
+                   requestInfo.st_nlink == 1,
+                   fchmod(request, 0o600) == 0,
+                   ftruncate(request, 0) == 0 {
+                    _ = fsync(request)
+                }
+                Darwin.close(request)
+                _ = fsync(dirFD)
             }
             DistributedNotificationCenter.default().postNotificationName(activationNotification, object: identifier, userInfo: ["uid": uid], deliverImmediately: true)
             Darwin.close(fd); Darwin.close(dirFD); return nil
         }
         return ApplicationInstanceGate(lockFD: fd, directoryFD: dirFD, uid: uid, identifier: identifier, activationName: activationName)
+    }
+
+    private static func openOwnedBaseDirectory(at url: URL, uid: uid_t) throws -> Int32 {
+        let fd = Darwin.open(url.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard fd >= 0 else { throw ApplicationInstanceGateError.unsafeDirectory }
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              info.st_mode & S_IFMT == S_IFDIR,
+              info.st_uid == uid,
+              info.st_mode & 0o022 == 0 else {
+            Darwin.close(fd)
+            throw ApplicationInstanceGateError.unsafeDirectory
+        }
+        return fd
+    }
+
+    private static func openOrCreatePrivateDirectory(
+        named name: String,
+        parentFD: Int32,
+        uid: uid_t
+    ) throws -> Int32 {
+        if mkdirat(parentFD, name, privateDirectoryMode) != 0, errno != EEXIST {
+            throw ApplicationInstanceGateError.unsafeDirectory
+        }
+        let fd = openat(parentFD, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard fd >= 0 else { throw ApplicationInstanceGateError.unsafeDirectory }
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              info.st_mode & S_IFMT == S_IFDIR,
+              info.st_uid == uid,
+              fchmod(fd, privateDirectoryMode) == 0 else {
+            Darwin.close(fd)
+            throw ApplicationInstanceGateError.unsafeDirectory
+        }
+        return fd
     }
 
     @MainActor public func observe(_ handler: @escaping @MainActor () -> Void) {
@@ -71,7 +121,7 @@ public final class ApplicationInstanceGate: @unchecked Sendable {
     }
 
     @MainActor private func consume(_ handler: @escaping @MainActor () -> Void) {
-        var st = stat(); guard fstatat(directoryFD, activationName, &st, AT_SYMLINK_NOFOLLOW) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == uid, unlinkat(directoryFD, activationName, 0) == 0 else { return }; handler()
+        var st = stat(); guard fstatat(directoryFD, activationName, &st, AT_SYMLINK_NOFOLLOW) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_uid == uid, st.st_nlink == 1, unlinkat(directoryFD, activationName, 0) == 0 else { return }; handler()
     }
 
     deinit {

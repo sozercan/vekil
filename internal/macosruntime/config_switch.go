@@ -54,6 +54,9 @@ func (h *helper) switchSelectedConfiguration(ctx context.Context, selectConfigur
 		return err
 	}
 	if !wasRunning {
+		if err := ctx.Err(); err != nil {
+			return &ConfigSwitchError{Primary: err, Rollback: h.opts.Configuration.RestoreSelection(previous)}
+		}
 		if err := h.opts.Configuration.CommitSelection(); err != nil {
 			return &ConfigSwitchError{Primary: err, Rollback: h.opts.Configuration.RestoreSelection(previous)}
 		}

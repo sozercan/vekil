@@ -86,6 +86,47 @@ final class ShellSecurityTests: XCTestCase {
         first.observe { activated.fulfill() }
         wait(for: [activated], timeout: 1)
     }
+
+    @MainActor func testSingletonRejectsSymlinkedApplicationDirectory() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let base = root.appendingPathComponent("ApplicationSupport")
+        let outside = root.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: base.appendingPathComponent("vekil"),
+            withDestinationURL: outside
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertThrowsError(
+            try ApplicationInstanceGate.acquire(
+                identifier: "com.vekil.test.symlink-app",
+                baseDirectory: base
+            )
+        )
+    }
+
+    @MainActor func testSingletonRejectsSymlinkedPerUserDirectory() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let base = root.appendingPathComponent("ApplicationSupport")
+        let appDirectory = base.appendingPathComponent("vekil")
+        let outside = root.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: appDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: appDirectory.appendingPathComponent("Singleton-\(getuid())"),
+            withDestinationURL: outside
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertThrowsError(
+            try ApplicationInstanceGate.acquire(
+                identifier: "com.vekil.test.symlink-user",
+                baseDirectory: base
+            )
+        )
+    }
 }
 
 extension ShellSecurityTests {

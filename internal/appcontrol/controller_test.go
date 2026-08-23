@@ -510,7 +510,7 @@ func TestUnexpectedListenerTerminationRetainsOwnershipUntilCleanup(t *testing.T)
 	}
 }
 
-func TestFailedStopRetainsRuntimeAndBlocksReplacement(t *testing.T) {
+func TestFailedStopReleasesRuntimeAndAllowsReplacement(t *testing.T) {
 	runtime := newTestRuntime()
 	runtime.stopErr = errors.New("graceful shutdown reported an error")
 	runtime.leaveDoneOpen = true
@@ -528,10 +528,17 @@ func TestFailedStopRetainsRuntimeAndBlocksReplacement(t *testing.T) {
 	controller.mu.Lock()
 	owned := controller.runtime != nil
 	controller.mu.Unlock()
-	if !owned {
-		t.Fatal("failed Stop released runtime ownership without completed cleanup")
+	if owned {
+		t.Fatal("failed Stop retained runtime ownership after terminal cleanup")
 	}
-	if _, err := controller.Start(t.Context(), ""); !errors.Is(err, ErrRuntimeCleanupPending) {
+	runtime.stopErr = nil
+	restart, err := controller.Start(t.Context(), "")
+	if err != nil {
 		t.Fatalf("Start after failed Stop error = %v", err)
 	}
+	restartResult, err := restart.Wait(t.Context())
+	if err != nil || restartResult.Status != OperationSucceeded {
+		t.Fatalf("restart result=%+v err=%v", restartResult, err)
+	}
+	close(runtime.done)
 }

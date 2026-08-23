@@ -644,6 +644,23 @@ final class RuntimeControllerTests: XCTestCase {
         XCTAssertEqual(factory.receivedConfigurations.count, 1)
     }
 
+    func testDefaultShutdownGraceOutlivesBundledHelperCleanup() {
+        let configuration = RuntimeControllerConfiguration(
+            process: RuntimeProcessConfiguration(
+                executableURL: URL(fileURLWithPath: "/fake/vekil-runtime")
+            ),
+            expectedBundleBuildID: "bundle_test"
+        )
+        let commandBudget = min(
+            configuration.requestTimeout,
+            configuration.shutdownGracePeriod,
+            0.5
+        )
+
+        XCTAssertGreaterThan(configuration.shutdownGracePeriod - commandBudget, 7)
+        XCTAssertGreaterThan(configuration.forceTerminationGracePeriod, 1)
+    }
+
     func testAutomaticRestartPolicyUsesHalfOneTwoSecondDelaysThenStops() async throws {
         let processes = (0..<4).map { _ in FakeRuntimeProcess() }
         for (index, process) in processes.enumerated() {
@@ -694,6 +711,46 @@ final class RuntimeControllerTests: XCTestCase {
         let restartSleeps = clock.recordedSleeps.filter { [0.5, 1.0, 2.0].contains($0) }
         XCTAssertEqual(restartSleeps, [0.5, 1.0, 2.0])
         clock.advance(by: 120)
+    }
+
+    func testPreHandshakeRestartFailureRetainsPreviousScopedIdentity() async throws {
+        let first = FakeRuntimeProcess()
+        configureSuccessfulHandshake(process: first, epoch: "hep_original")
+        let second = FakeRuntimeProcess()
+        second.setRunError(RuntimeTestError.synthetic)
+        var configuration = makeConfiguration()
+        configuration.restartPolicy = RuntimeRestartPolicy(
+            maximumAutomaticRestarts: 1,
+            window: 60,
+            delays: [0]
+        )
+        let controller = RuntimeController(
+            configuration: configuration,
+            processFactory: FakeRuntimeProcessFactory([first, second]),
+            clock: ManualRuntimeClock()
+        )
+        _ = try await controller.connect()
+        let originalSnapshot = await controller.snapshot()
+        let originalIdentity = try XCTUnwrap(originalSnapshot.launchIdentity)
+        let stream = await controller.scopedNotificationStream()
+        let failedNotification = Task { () -> RuntimeScopedNotification? in
+            for await scoped in stream {
+                if case .connectionStateChanged(.failed(_)) = scoped.notification {
+                    return scoped
+                }
+            }
+            return nil
+        }
+
+        first.emitExit(status: 1)
+        try await eventually {
+            await controller.connectionState
+                == .failed(.restartLimitExceeded(maximum: 1, window: 60))
+        }
+
+        let failure = await failedNotification.value
+        XCTAssertEqual(failure?.launchIdentity, originalIdentity)
+        await controller.shutdown()
     }
 
     func testOversizedOutgoingRequestIsRejectedBeforeTransportWrite() async throws {
