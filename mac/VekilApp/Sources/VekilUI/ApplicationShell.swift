@@ -183,6 +183,7 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
     private var window: NSWindow?, statusItem: NSStatusItem?, statusPopover: NSPopover?
     private var cancellables = Set<AnyCancellable>()
     private var terminating = false
+    private var terminationShutdownFinished = false
 
     public init(
         appState: VekilAppState, analytics: AnalyticsViewModel, gate: ApplicationInstanceGate,
@@ -230,14 +231,18 @@ public final class VekilApplicationCoordinator: NSObject, NSApplicationDelegate,
     }
 
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if terminating {
+        if terminationShutdownFinished {
             return .terminateNow
+        }
+        if terminating {
+            return .terminateLater
         }
         persistMainWindowFrame()
         terminating = true
         Task {
             await analytics.store.shutdown()
             await shutdownRuntime()
+            terminationShutdownFinished = true
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
