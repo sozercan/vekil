@@ -19,7 +19,7 @@ import (
 // Set by the bundle build with:
 //
 //	-X main.buildVersion=<marketing-version>
-//	-X main.bundleBuildID=<CFBundleVersion>
+//	-X main.bundleBuildID=<manifest-bundle_build_id>
 var (
 	buildVersion  = "dev"
 	bundleBuildID = "dev"
