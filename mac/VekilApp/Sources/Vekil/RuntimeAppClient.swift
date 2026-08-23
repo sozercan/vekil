@@ -48,10 +48,10 @@ actor RuntimeAppClient: AppRuntimeClient {
     }
     func start(_ request: AppRuntimeStartRequest) async throws -> AppRuntimeOperationAcceptance {
         let expected = (await controller.currentState)?.payload.expectedStartConfigRevision
-        let payload = try JSONValue.encode([
-            "expected_config_revision": expected ?? "",
-            "allows_interactive_authentication": request.allowsInteractiveAuthentication,
-            "reason": request.reason.rawValue,
+        let payload = JSONValue.object([
+            "expected_config_revision": .string(expected ?? ""),
+            "allows_interactive_authentication": .bool(request.allowsInteractiveAuthentication),
+            "reason": .string(request.reason.rawValue),
         ])
         return try await submit(.start, payload: payload)
     }

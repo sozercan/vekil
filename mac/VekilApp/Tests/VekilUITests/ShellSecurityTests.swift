@@ -211,11 +211,11 @@ final class ShellSecurityTests: XCTestCase {
         let compact = source.components(separatedBy: .whitespacesAndNewlines).joined()
 
         XCTAssertTrue(
-            compact.contains(#""allows_interactive_authentication":request.allowsInteractiveAuthentication"#),
+            compact.contains(#""allows_interactive_authentication":.bool(request.allowsInteractiveAuthentication)"#),
             "Start must forward the caller's interactive-authentication policy to the helper"
         )
         XCTAssertTrue(
-            compact.contains(#""reason":request.reason.rawValue"#),
+            compact.contains(#""reason":.string(request.reason.rawValue)"#),
             "Start must forward the caller's start reason to the helper"
         )
     }
