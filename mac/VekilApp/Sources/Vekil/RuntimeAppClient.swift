@@ -2,17 +2,6 @@ import Foundation
 import VekilCore
 import VekilUI
 
-struct ValidatingProcessFactory: RuntimeProcessFactory {
-    let bundleURL: URL
-    let validator: RuntimeHelperValidator
-    private let foundation = FoundationRuntimeProcessFactory()
-    func makeProcess(configuration: RuntimeProcessConfiguration) throws -> any RuntimeProcess {
-        let validated = try validator.validate(bundleURL: bundleURL)
-        guard validated.standardizedFileURL == configuration.executableURL.standardizedFileURL else { throw RuntimeHelperValidationError.outsideBundle }
-        return try foundation.makeProcess(configuration: configuration)
-    }
-}
-
 actor RuntimeAppClient: AppRuntimeClient {
     let controller: RuntimeController
 
@@ -154,7 +143,8 @@ actor RuntimeAppClient: AppRuntimeClient {
                 displayName: config?.selectedPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? (config?.mode == .managed ? "Managed providers" : "Copilot default"),
                 selectedExternalPath: config?.selectedPath, selectedRevision: config?.selectedRevision, activeRevision: config?.activeRevision,
                 drift: AppRuntimeConfigurationDrift(rawValue: config?.drift.rawValue ?? "none"), requiresGitHubAuthentication: payload.auth != .notRequired
-            ), baseURL: baseURL, lastError: config?.lastError.map(map)
+            ), baseURL: baseURL,
+            lastError: config?.lastError.map(map) ?? payload.lastFailure.map(map)
         )
     }
     private static func map(_ error: RuntimeStructuredError) -> AppRuntimeStructuredError {

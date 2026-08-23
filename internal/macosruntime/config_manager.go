@@ -28,6 +28,8 @@ const LegacyConfigRevision = "cfg_legacy_copilot"
 
 var initialManagedCopilotYAML = []byte("schema_version: 2\nproviders:\n  - id: copilot\n    type: copilot\n    default: true\n")
 
+var errRemoteConfigurationNotLoaded = errors.New("remote configuration snapshot is not loaded")
+
 // Paths contains all helper-owned persistence paths. Staged and backup files
 // are transaction-private and contain only secret-free managed YAML.
 type Paths struct {
@@ -260,6 +262,9 @@ func (m *ConfigManager) LoadConfiguration(ctx context.Context) (appcontrol.Confi
 			}
 		}
 		revision, _ := configRevision(body)
+		if revision != state.SelectedConfigRevision {
+			return appcontrol.Configuration{}, errors.New("external configuration changed; reload is required")
+		}
 		m.mu.Lock()
 		m.lastExternalSnapshot = &externalConfigurationSnapshot{
 			path:     path,
@@ -453,6 +458,7 @@ func (m *ConfigManager) CommitSelection() error {
 		if err := m.saveStateLocked(); err != nil {
 			return err
 		}
+		m.promotePreparedExternalSnapshotLocked()
 		m.preparedExternalSnapshot = nil
 		m.rollbackExternalSnapshot = nil
 		m.pruneLastExternalSnapshotLocked()
@@ -464,6 +470,7 @@ func (m *ConfigManager) CommitSelection() error {
 		m.stagedSelection = previous
 		return err
 	}
+	m.promotePreparedExternalSnapshotLocked()
 	m.preparedExternalSnapshot = nil
 	m.rollbackExternalSnapshot = nil
 	m.pruneLastExternalSnapshotLocked()
@@ -527,6 +534,16 @@ func (m *ConfigManager) pruneLastExternalSnapshotLocked() {
 		m.state.SelectedPath, m.state.SelectedConfigRevision,
 	) {
 		m.lastExternalSnapshot = nil
+	}
+}
+
+func (m *ConfigManager) promotePreparedExternalSnapshotLocked() {
+	if m.state.ConfigMode == ConfigModeExternal &&
+		proxy.IsRemoteProvidersConfigSource(m.state.SelectedPath) &&
+		m.preparedExternalSnapshot.matches(
+			m.state.SelectedPath, m.state.SelectedConfigRevision,
+		) {
+		m.lastExternalSnapshot = cloneExternalConfigurationSnapshot(m.preparedExternalSnapshot)
 	}
 }
 
@@ -665,6 +682,8 @@ func (m *ConfigManager) Describe() (ConfigDescription, error) {
 	case ConfigModeExternal:
 		if m.lastExternalSnapshot.matches(m.state.SelectedPath, m.state.SelectedConfigRevision) {
 			body = append([]byte(nil), m.lastExternalSnapshot.body...)
+		} else if proxy.IsRemoteProvidersConfigSource(m.state.SelectedPath) {
+			readErr = errRemoteConfigurationNotLoaded
 		} else {
 			_, body, readErr = loadExternalConfigurationSnapshot(context.Background(), m.state.SelectedPath)
 		}
@@ -682,6 +701,9 @@ func (m *ConfigManager) describeLocked(body []byte, readErr error) ConfigDescrip
 		ManagedOwnershipPresent: m.state.ManagedOwnershipID != "",
 		SecretGeneration:        m.state.SecretGeneration,
 		SecretProjections:       m.secretProjectionRequirementsLocked(),
+	}
+	if m.state.ConfigMode == ConfigModeExternal {
+		description.SelectedRevision = m.state.SelectedConfigRevision
 	}
 	if m.state.ConfigMode == ConfigModeLegacy {
 		description.Available = true
@@ -866,8 +888,11 @@ func loadPersistentState(path string) (PersistentState, bool, error) {
 			state.ConfigMode = ConfigModeExternal
 			state.SelectedPath = selected
 			state.SelectedConfigRevision = ""
-			if _, body, readErr := loadExternalConfigurationSnapshot(context.Background(), selected); readErr == nil {
-				state.SelectedConfigRevision, _ = configRevision(body)
+			if !proxy.IsRemoteProvidersConfigSource(selected) {
+				_, body, readErr := loadExternalConfigurationSnapshot(context.Background(), selected)
+				if readErr == nil {
+					state.SelectedConfigRevision, _ = configRevision(body)
+				}
 			}
 		}
 		return state, true, nil

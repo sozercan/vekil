@@ -41,12 +41,17 @@ public protocol RuntimeProcess: AnyObject, Sendable {
     var standardOutput: AsyncStream<Data> { get }
     var standardError: AsyncStream<Data> { get }
     var termination: AsyncStream<RuntimeProcessTermination> { get }
+    var processIdentifier: Int32? { get }
 
     func run() throws
     func writeStandardInput(_ data: Data) async throws
     func closeStandardInput()
     func terminate()
     func forceTerminate()
+}
+
+extension RuntimeProcess {
+    public var processIdentifier: Int32? { nil }
 }
 
 public protocol RuntimeProcessFactory: Sendable {

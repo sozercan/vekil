@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sozercan/vekil/internal/appcontrol"
@@ -91,7 +92,9 @@ func TestConfigManagerMigratesUnavailableLegacyExternalWithoutLegacyRevision(t *
 
 func TestConfigManagerMigratesLegacyRemoteExternalWithoutExposingSignedURL(t *testing.T) {
 	externalBody := []byte("schema_version: 2\nproviders:\n  - id: remote\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: remote-model\n        endpoints: [/chat/completions]\n")
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
 		_, _ = response.Write(externalBody)
 	}))
 	defer server.Close()
@@ -112,10 +115,12 @@ func TestConfigManagerMigratesLegacyRemoteExternalWithoutExposingSignedURL(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantRevision, _ := configRevision(externalBody)
 	state := manager.State()
-	if state.ConfigMode != ConfigModeExternal || state.SelectedPath != source || state.SelectedConfigRevision != wantRevision {
+	if state.ConfigMode != ConfigModeExternal || state.SelectedPath != source || state.SelectedConfigRevision != "" {
 		t.Fatalf("migrated remote state = %+v", state)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("remote requests during migration = %d, want 0", requests.Load())
 	}
 
 	description, err := manager.Describe()
@@ -123,8 +128,11 @@ func TestConfigManagerMigratesLegacyRemoteExternalWithoutExposingSignedURL(t *te
 		t.Fatal(err)
 	}
 	wantDisplay := server.URL + "/providers.yaml"
-	if description.SelectedPath != wantDisplay || !description.Available || description.ErrorCode != "" {
+	if description.SelectedPath != wantDisplay || description.Available || description.ErrorCode != "config_unavailable" {
 		t.Fatalf("remote description = %+v, want display path %q", description, wantDisplay)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("remote requests during initial description = %d, want 0", requests.Load())
 	}
 	descriptionJSON, err := json.Marshal(description)
 	if err != nil {
@@ -136,6 +144,18 @@ func TestConfigManagerMigratesLegacyRemoteExternalWithoutExposingSignedURL(t *te
 		}
 	}
 
+	description, err = manager.ReloadExternal(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRevision, _ := configRevision(externalBody)
+	if !description.Available || description.SelectedRevision != wantRevision || description.ErrorCode != "" {
+		t.Fatalf("reloaded remote description = %+v", description)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("remote requests after reload = %d, want 1", requests.Load())
+	}
+
 	configuration, err := manager.LoadConfiguration(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -143,6 +163,71 @@ func TestConfigManagerMigratesLegacyRemoteExternalWithoutExposingSignedURL(t *te
 	loaded, ok := configuration.Value.(proxy.ProvidersConfig)
 	if !ok || len(loaded.Providers) != 1 || loaded.Providers[0].ID != "remote" {
 		t.Fatalf("loaded remote configuration = %#v", configuration.Value)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("remote requests after load = %d, want 2", requests.Load())
+	}
+}
+
+func TestVersionedRemoteDescriptionDefersFetchUntilConfigurationLoad(t *testing.T) {
+	externalBody := []byte("schema_version: 2\nproviders:\n  - id: remote\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: remote-model\n        endpoints: [/chat/completions]\n")
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = response.Write(externalBody)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	paths := PathsInDirectory(dir)
+	wantRevision, _ := configRevision(externalBody)
+	persisted, err := json.Marshal(PersistentState{
+		Version:                StateVersion,
+		ConfigMode:             ConfigModeExternal,
+		SelectedPath:           server.URL + "/providers.yaml",
+		SelectedConfigRevision: wantRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.State, persisted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := NewConfigManager(ConfigManagerOptions{Paths: paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	description, err := manager.Describe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if description.Available || description.SelectedRevision != wantRevision || description.ErrorCode != "config_unavailable" {
+		t.Fatalf("initial remote description = %+v", description)
+	}
+	if descriptionRequiresCopilot(description) {
+		t.Fatalf("unavailable explicit configuration requires Copilot: %+v", description)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("remote requests before configuration load = %d, want 0", requests.Load())
+	}
+
+	configuration, err := manager.LoadConfiguration(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.Revision != wantRevision {
+		t.Fatalf("loaded revision = %q, want %q", configuration.Revision, wantRevision)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("remote requests after configuration load = %d, want 1", requests.Load())
+	}
+	description, err = manager.Describe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !description.Available || description.ErrorCode != "" || len(description.Providers) != 1 {
+		t.Fatalf("loaded remote description = %+v", description)
 	}
 }
 
@@ -212,7 +297,7 @@ func TestNewConfigManagerClearsStaleRuntimeActivation(t *testing.T) {
 	}
 }
 
-func TestRuntimeActivationPersistsAcceptedExternalRevision(t *testing.T) {
+func TestExternalEditRequiresReloadBeforeActivation(t *testing.T) {
 	manager := newManagerForTest(t)
 	path, originalRevision := writeExternalConfigForSwitchTest(t, "original-model")
 	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
@@ -227,6 +312,16 @@ func TestRuntimeActivationPersistsAcceptedExternalRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, err := manager.LoadConfiguration(t.Context()); err == nil || !strings.Contains(err.Error(), "reload is required") {
+		t.Fatalf("LoadConfiguration() error = %v, want explicit reload requirement", err)
+	}
+	if state := manager.State(); state.SelectedConfigRevision != originalRevision {
+		t.Fatalf("external edit was silently adopted: %+v", state)
+	}
+
+	if err := manager.StageReloadExternal(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	configuration, err := manager.LoadConfiguration(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -235,6 +330,9 @@ func TestRuntimeActivationPersistsAcceptedExternalRevision(t *testing.T) {
 		t.Fatal("external edit did not produce a new revision")
 	}
 	if err := manager.RuntimeActivated(t.Context(), configuration, 1, "127.0.0.1:1337"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.CommitSelection(); err != nil {
 		t.Fatal(err)
 	}
 

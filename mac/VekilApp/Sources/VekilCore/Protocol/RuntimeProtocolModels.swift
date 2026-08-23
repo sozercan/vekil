@@ -572,6 +572,7 @@ public struct RuntimeStatePayload: Codable, Sendable, Equatable {
     public var runtimeGeneration: UInt64?
     public var configRevision: String?
     public var secretGeneration: UInt64?
+    public var lastFailureCode: String?
     public var service: RuntimeServiceLifecycle
     public var readiness: RuntimeReadiness
     public var auth: RuntimeAuthenticationState
@@ -579,6 +580,91 @@ public struct RuntimeStatePayload: Codable, Sendable, Equatable {
     public var operation: RuntimeOperationState
     public var configuration: RuntimeConfigurationState?
     public var baseURL: String?
+
+    public var lastFailure: RuntimeStructuredError? {
+        let code = lastFailureCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        switch code {
+        case "listener_terminated":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "The proxy listener stopped unexpectedly.",
+                retryable: true,
+                recoveryAction: "retry_start"
+            )
+        case "listener_cleanup_failed":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "The proxy listener stopped and cleanup did not finish.",
+                retryable: true,
+                recoveryAction: "restart_helper"
+            )
+        case "stop_failed":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "The proxy could not stop cleanly.",
+                retryable: true,
+                recoveryAction: "restart_helper"
+            )
+        case "configuration_load_failed":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "The selected provider configuration could not be loaded.",
+                retryable: false,
+                recoveryAction: "open_providers"
+            )
+        case "server_construction_failed":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "Vekil could not initialize the proxy server.",
+                retryable: true,
+                recoveryAction: "retry_start"
+            )
+        case "listener_start_failed":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "Vekil could not start the local proxy listener.",
+                retryable: true,
+                recoveryAction: "retry_start"
+            )
+        case "authentication_failed":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "Provider authentication failed during startup.",
+                retryable: true,
+                recoveryAction: "retry_start"
+            )
+        case "provider_validation_failed":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "Provider model validation failed during startup.",
+                retryable: true,
+                recoveryAction: "open_providers"
+            )
+        case "policy_preflight_failed":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "Policy routing preflight failed during startup.",
+                retryable: true,
+                recoveryAction: "open_providers"
+            )
+        case "readiness_failed":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "The proxy did not become ready.",
+                retryable: true,
+                recoveryAction: "retry_start"
+            )
+        case "operation_failed":
+            return RuntimeStructuredError(
+                code: code,
+                userMessage: "The proxy operation failed.",
+                retryable: true,
+                recoveryAction: "retry_start"
+            )
+        default:
+            return nil
+        }
+    }
 
     public var expectedStartConfigRevision: String? {
         for revision in [configuration?.selectedRevision, configRevision] {
@@ -593,6 +679,7 @@ public struct RuntimeStatePayload: Codable, Sendable, Equatable {
         runtimeGeneration: UInt64? = nil,
         configRevision: String? = nil,
         secretGeneration: UInt64? = nil,
+        lastFailureCode: String? = nil,
         service: RuntimeServiceLifecycle,
         readiness: RuntimeReadiness,
         auth: RuntimeAuthenticationState,
@@ -605,6 +692,7 @@ public struct RuntimeStatePayload: Codable, Sendable, Equatable {
         self.runtimeGeneration = runtimeGeneration
         self.configRevision = configRevision
         self.secretGeneration = secretGeneration
+        self.lastFailureCode = lastFailureCode
         self.service = service
         self.readiness = readiness
         self.auth = auth
@@ -619,6 +707,7 @@ public struct RuntimeStatePayload: Codable, Sendable, Equatable {
         case runtimeGeneration = "runtime_generation"
         case configRevision = "config_revision"
         case secretGeneration = "secret_generation"
+        case lastFailureCode = "last_failure_code"
         case service
         case readiness
         case auth
@@ -635,6 +724,7 @@ public struct RuntimeStatePayload: Codable, Sendable, Equatable {
         runtimeGeneration = try container.decodeIfPresent(UInt64.self, forKey: .runtimeGeneration)
         configRevision = try container.decodeIfPresent(String.self, forKey: .configRevision)
         secretGeneration = try container.decodeIfPresent(UInt64.self, forKey: .secretGeneration)
+        lastFailureCode = try container.decodeIfPresent(String.self, forKey: .lastFailureCode)
         service = try container.decode(RuntimeServiceLifecycle.self, forKey: .service)
         readiness = try container.decode(RuntimeReadiness.self, forKey: .readiness)
         auth = try container.decode(RuntimeAuthenticationState.self, forKey: .auth)
@@ -651,6 +741,7 @@ public struct RuntimeStatePayload: Codable, Sendable, Equatable {
         try container.encodeIfPresent(runtimeGeneration, forKey: .runtimeGeneration)
         try container.encodeIfPresent(configRevision, forKey: .configRevision)
         try container.encodeIfPresent(secretGeneration, forKey: .secretGeneration)
+        try container.encodeIfPresent(lastFailureCode, forKey: .lastFailureCode)
         try container.encode(service, forKey: .service)
         try container.encode(readiness, forKey: .readiness)
         try container.encode(auth, forKey: .auth)

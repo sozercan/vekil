@@ -13,8 +13,52 @@ final class ShellSecurityTests: XCTestCase {
 
     final class SignatureSpy: HelperCodeSignatureValidating, @unchecked Sendable {
         var calls: [URL] = []
-        func validate(at helperURL: URL, matchingApplicationAt applicationURL: URL) throws {
+        var runningCalls: [(Int32, RuntimeHelperCodeIdentity)] = []
+        var runningError: Error?
+        var runningValidation: ((Int32, RuntimeHelperCodeIdentity) throws -> Void)?
+        let identity = RuntimeHelperCodeIdentity(codeDirectoryHash: Data([1, 2, 3]))
+
+        func validate(
+            at helperURL: URL,
+            matchingApplicationAt applicationURL: URL
+        ) throws -> RuntimeHelperCodeIdentity {
             calls.append(helperURL)
+            return identity
+        }
+
+        func validateRunningProcess(
+            identifier: Int32,
+            expectedIdentity: RuntimeHelperCodeIdentity
+        ) throws {
+            runningCalls.append((identifier, expectedIdentity))
+            if let runningError { throw runningError }
+            try runningValidation?(identifier, expectedIdentity)
+        }
+    }
+
+    final class RuntimeProcessSpy: RuntimeProcess, @unchecked Sendable {
+        let standardOutput = AsyncStream<Data> { $0.finish() }
+        let standardError = AsyncStream<Data> { $0.finish() }
+        let termination = AsyncStream<RuntimeProcessTermination> { $0.finish() }
+        let processIdentifier: Int32?
+        var runCount = 0
+        var forceTerminateCount = 0
+
+        init(processIdentifier: Int32? = 42) {
+            self.processIdentifier = processIdentifier
+        }
+
+        func run() throws { runCount += 1 }
+        func writeStandardInput(_: Data) async throws {}
+        func closeStandardInput() {}
+        func terminate() {}
+        func forceTerminate() { forceTerminateCount += 1 }
+    }
+
+    struct RuntimeProcessFactoryStub: RuntimeProcessFactory, @unchecked Sendable {
+        let process: RuntimeProcessSpy
+        func makeProcess(configuration _: RuntimeProcessConfiguration) throws -> any RuntimeProcess {
+            process
         }
     }
 
@@ -27,9 +71,75 @@ final class ShellSecurityTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
         defer { try? FileManager.default.removeItem(at: root) }
         let spy = SignatureSpy()
-        XCTAssertEqual(try RuntimeHelperValidator(signature: spy).validate(bundleURL: bundle).path, helper.path)
+        XCTAssertEqual(
+            try RuntimeHelperValidator(signature: spy).validate(bundleURL: bundle).executableURL.path,
+            helper.path
+        )
         XCTAssertEqual(spy.calls.map(\.path), [helper.path])
         XCTAssertEqual(VekilBundleLayout.helperRelativePath, "Contents/Helpers/vekil-runtime")
+    }
+
+    func testValidatedFactoryChecksRunningCodeIdentity() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let bundle = root.appendingPathComponent("Vekil.app")
+        let helper = VekilBundleLayout.helperURL(bundleURL: bundle)
+        try FileManager.default.createDirectory(
+            at: helper.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("helper".utf8).write(to: helper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let signature = SignatureSpy()
+        let underlying = RuntimeProcessSpy(processIdentifier: 1234)
+        signature.runningValidation = { identifier, identity in
+            XCTAssertEqual(underlying.runCount, 1)
+            XCTAssertEqual(identifier, 1234)
+            XCTAssertEqual(identity, signature.identity)
+        }
+        let factory = ValidatingProcessFactory(
+            bundleURL: bundle,
+            validator: RuntimeHelperValidator(signature: signature),
+            processFactory: RuntimeProcessFactoryStub(process: underlying)
+        )
+        let process = try factory.makeProcess(
+            configuration: RuntimeProcessConfiguration(executableURL: helper)
+        )
+        try process.run()
+
+        XCTAssertEqual(signature.runningCalls.count, 1)
+        XCTAssertEqual(underlying.forceTerminateCount, 0)
+    }
+
+    func testValidatedFactoryTerminatesCodeIdentityMismatch() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let bundle = root.appendingPathComponent("Vekil.app")
+        let helper = VekilBundleLayout.helperURL(bundleURL: bundle)
+        try FileManager.default.createDirectory(
+            at: helper.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("helper".utf8).write(to: helper)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let signature = SignatureSpy()
+        signature.runningError = RuntimeHelperValidationError.codeIdentityMismatch
+        let underlying = RuntimeProcessSpy(processIdentifier: 1234)
+        let factory = ValidatingProcessFactory(
+            bundleURL: bundle,
+            validator: RuntimeHelperValidator(signature: signature),
+            processFactory: RuntimeProcessFactoryStub(process: underlying)
+        )
+        let process = try factory.makeProcess(
+            configuration: RuntimeProcessConfiguration(executableURL: helper)
+        )
+
+        XCTAssertThrowsError(try process.run()) {
+            XCTAssertEqual($0 as? RuntimeHelperValidationError, .codeIdentityMismatch)
+        }
+        XCTAssertEqual(underlying.forceTerminateCount, 1)
     }
 
     func testSymlinkHelperIsRejected() throws {
@@ -150,17 +260,6 @@ final class ShellSecurityTests: XCTestCase {
 }
 
 extension ShellSecurityTests {
-    private struct PackagedValidatingFactory: RuntimeProcessFactory {
-        let bundleURL: URL
-        func makeProcess(configuration: RuntimeProcessConfiguration) throws -> any RuntimeProcess {
-            let validated = try RuntimeHelperValidator().validate(bundleURL: bundleURL)
-            guard validated.standardizedFileURL == configuration.executableURL.standardizedFileURL else {
-                throw RuntimeHelperValidationError.outsideBundle
-            }
-            return try FoundationRuntimeProcessFactory().makeProcess(configuration: configuration)
-        }
-    }
-
     func testPackagedValidatedHelperIntegrationWhenConfigured() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard let bundlePath = environment["VEKIL_TEST_BUNDLE_PATH"],
@@ -181,7 +280,10 @@ extension ShellSecurityTests {
                 expectedBundleBuildID: expectedBuildID,
                 restartPolicy: RuntimeRestartPolicy(maximumAutomaticRestarts: 0)
             ),
-            processFactory: PackagedValidatingFactory(bundleURL: bundleURL)
+            processFactory: ValidatingProcessFactory(
+                bundleURL: bundleURL,
+                validator: RuntimeHelperValidator()
+            )
         )
         do {
             _ = try await controller.connect()

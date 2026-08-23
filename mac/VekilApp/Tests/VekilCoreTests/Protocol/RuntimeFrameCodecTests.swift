@@ -90,6 +90,28 @@ final class RuntimeFrameCodecTests: XCTestCase {
         XCTAssertEqual(device.payload.expiresInSeconds, 900)
     }
 
+    func testStateDecodesAllowlistedRuntimeFailureCode() throws {
+        let state = try JSONDecoder().decode(
+            RuntimeStatePayload.self,
+            from: Data(
+                #"{"service":"failed","readiness":"unknown","auth":"signed_in","last_failure_code":"listener_terminated"}"#.utf8
+            )
+        )
+
+        XCTAssertEqual(state.lastFailureCode, "listener_terminated")
+        XCTAssertEqual(state.lastFailure?.code, "listener_terminated")
+        XCTAssertEqual(state.lastFailure?.userMessage, "The proxy listener stopped unexpectedly.")
+        XCTAssertEqual(state.lastFailure?.recoveryAction, "retry_start")
+
+        let unknown = RuntimeStatePayload(
+            lastFailureCode: "future_private_failure",
+            service: .failed,
+            readiness: .unknown,
+            auth: .signedIn
+        )
+        XCTAssertNil(unknown.lastFailure)
+    }
+
     func testStructuredErrorUsesAllowlistedShape() throws {
         let data = Data(
             #"{"code":"invalid_config","user_message":"Invalid.","retryable":false,"recovery_action":"open_providers","field_errors":[{"path":"providers[0].base_url","code":"invalid_url","message":"Enter a valid URL."}]}"#.utf8

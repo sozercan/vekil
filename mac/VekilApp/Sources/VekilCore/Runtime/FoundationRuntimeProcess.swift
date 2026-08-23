@@ -28,6 +28,13 @@ public final class FoundationRuntimeProcess: RuntimeProcess, @unchecked Sendable
     private var didRun = false
     private var inputClosed = false
 
+    public var processIdentifier: Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        let identifier = process.processIdentifier
+        return didRun && identifier > 0 ? identifier : nil
+    }
+
     public init(configuration: RuntimeProcessConfiguration) {
         process = Process()
         inputPipe = Pipe()

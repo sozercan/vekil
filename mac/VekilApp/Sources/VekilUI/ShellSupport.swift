@@ -19,13 +19,31 @@ public enum VekilBundleLayout {
 }
 
 public protocol HelperCodeSignatureValidating: Sendable {
-    func validate(at helperURL: URL, matchingApplicationAt applicationURL: URL) throws
+    func validate(
+        at helperURL: URL,
+        matchingApplicationAt applicationURL: URL
+    ) throws -> RuntimeHelperCodeIdentity
+    func validateRunningProcess(
+        identifier: Int32,
+        expectedIdentity: RuntimeHelperCodeIdentity
+    ) throws
+}
+
+public struct RuntimeHelperCodeIdentity: Equatable, Sendable {
+    public var codeDirectoryHash: Data
+
+    public init(codeDirectoryHash: Data) {
+        self.codeDirectoryHash = codeDirectoryHash
+    }
 }
 
 public struct SecurityHelperCodeSignatureValidator: HelperCodeSignatureValidating {
     public init() {}
 
-    public func validate(at helperURL: URL, matchingApplicationAt applicationURL: URL) throws {
+    public func validate(
+        at helperURL: URL,
+        matchingApplicationAt applicationURL: URL
+    ) throws -> RuntimeHelperCodeIdentity {
         let helper = try staticCode(at: helperURL)
         let application = try staticCode(at: applicationURL)
         let flags = SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures)
@@ -35,6 +53,31 @@ public struct SecurityHelperCodeSignatureValidator: HelperCodeSignatureValidatin
         }
         guard try teamIdentifier(for: helper) == teamIdentifier(for: application) else {
             throw RuntimeHelperValidationError.signatureIdentityMismatch
+        }
+        return RuntimeHelperCodeIdentity(codeDirectoryHash: try codeDirectoryHash(for: helper))
+    }
+
+    public func validateRunningProcess(
+        identifier: Int32,
+        expectedIdentity: RuntimeHelperCodeIdentity
+    ) throws {
+        var code: SecCode?
+        let attributes = [
+            kSecGuestAttributePid as String: NSNumber(value: identifier)
+        ] as CFDictionary
+        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess,
+              let code else {
+            throw RuntimeHelperValidationError.invalidSignature
+        }
+        let flags = SecCSFlags(rawValue: kSecCSStrictValidate)
+        guard SecCodeCheckValidity(code, flags, nil) == errSecSuccess else {
+            throw RuntimeHelperValidationError.invalidSignature
+        }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+              let staticCode,
+              try codeDirectoryHash(for: staticCode) == expectedIdentity.codeDirectoryHash else {
+            throw RuntimeHelperValidationError.codeIdentityMismatch
         }
     }
 
@@ -55,10 +98,25 @@ public struct SecurityHelperCodeSignatureValidator: HelperCodeSignatureValidatin
         }
         return values[kSecCodeInfoTeamIdentifier as String] as? String
     }
+
+    private func codeDirectoryHash(for code: SecStaticCode) throws -> Data {
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            code, SecCSFlags(rawValue: kSecCSSigningInformation), &information
+        ) == errSecSuccess,
+            let values = information as? [String: Any],
+            let identity = values[kSecCodeInfoUnique as String] as? Data,
+            !identity.isEmpty else {
+            throw RuntimeHelperValidationError.invalidSignature
+        }
+        return identity
+    }
 }
 
 public enum RuntimeHelperValidationError: Error, Equatable, LocalizedError {
-    case outsideBundle, missing, symlink, notRegular, notExecutable, ownerMismatch, invalidSignature, signatureIdentityMismatch
+    case outsideBundle, missing, symlink, notRegular, notExecutable, ownerMismatch
+    case invalidSignature, signatureIdentityMismatch, codeIdentityMismatch
+    case changedDuringValidation, missingProcessIdentifier
     public var errorDescription: String? {
         switch self {
         case .outsideBundle: "The runtime helper is outside Vekil.app."
@@ -69,7 +127,20 @@ public enum RuntimeHelperValidationError: Error, Equatable, LocalizedError {
         case .ownerMismatch: "The runtime helper owner does not match Vekil.app."
         case .invalidSignature: "The runtime helper code signature is invalid."
         case .signatureIdentityMismatch: "The runtime helper signature does not match Vekil.app."
+        case .codeIdentityMismatch: "The running helper does not match the validated runtime helper."
+        case .changedDuringValidation: "The runtime helper changed while Vekil was validating it."
+        case .missingProcessIdentifier: "Vekil could not identify the running helper process."
         }
+    }
+}
+
+public struct ValidatedRuntimeHelper: Equatable, Sendable {
+    public var executableURL: URL
+    public var codeIdentity: RuntimeHelperCodeIdentity
+
+    public init(executableURL: URL, codeIdentity: RuntimeHelperCodeIdentity) {
+        self.executableURL = executableURL
+        self.codeIdentity = codeIdentity
     }
 }
 
@@ -77,7 +148,7 @@ public struct RuntimeHelperValidator: Sendable {
     private let signature: any HelperCodeSignatureValidating
     public init(signature: any HelperCodeSignatureValidating = SecurityHelperCodeSignatureValidator()) { self.signature = signature }
 
-    public func validate(bundleURL: URL) throws -> URL {
+    public func validate(bundleURL: URL) throws -> ValidatedRuntimeHelper {
         let bundle = bundleURL.resolvingSymlinksInPath().standardizedFileURL
         let helper = VekilBundleLayout.helperURL(bundleURL: bundle).standardizedFileURL
         guard helper.path.hasPrefix(bundle.path + "/") else { throw RuntimeHelperValidationError.outsideBundle }
@@ -103,9 +174,107 @@ public struct RuntimeHelperValidator: Sendable {
             throw RuntimeHelperValidationError.notRegular
         }
         let application = bundle.appendingPathComponent("Contents/MacOS/Vekil")
-        try signature.validate(at: helper, matchingApplicationAt: application)
-        return helper
+        let codeIdentity = try signature.validate(at: helper, matchingApplicationAt: application)
+        var final = stat()
+        guard lstat(helper.path, &final) == 0,
+              final.st_mode & S_IFMT == S_IFREG,
+              final.st_ino == after.st_ino,
+              final.st_dev == after.st_dev else {
+            throw RuntimeHelperValidationError.changedDuringValidation
+        }
+        return ValidatedRuntimeHelper(executableURL: helper, codeIdentity: codeIdentity)
     }
+
+    public func validateRunningProcess(
+        identifier: Int32,
+        expectedIdentity: RuntimeHelperCodeIdentity
+    ) throws {
+        try signature.validateRunningProcess(
+            identifier: identifier,
+            expectedIdentity: expectedIdentity
+        )
+    }
+}
+
+public struct ValidatingProcessFactory: RuntimeProcessFactory {
+    private let bundleURL: URL
+    private let validator: RuntimeHelperValidator
+    private let processFactory: any RuntimeProcessFactory
+
+    public init(
+        bundleURL: URL,
+        validator: RuntimeHelperValidator,
+        processFactory: any RuntimeProcessFactory = FoundationRuntimeProcessFactory()
+    ) {
+        self.bundleURL = bundleURL
+        self.validator = validator
+        self.processFactory = processFactory
+    }
+
+    public func makeProcess(
+        configuration: RuntimeProcessConfiguration
+    ) throws -> any RuntimeProcess {
+        let validated = try validator.validate(bundleURL: bundleURL)
+        guard validated.executableURL.standardizedFileURL
+            == configuration.executableURL.standardizedFileURL else {
+            throw RuntimeHelperValidationError.outsideBundle
+        }
+        let process = try processFactory.makeProcess(configuration: configuration)
+        return ValidatedRuntimeProcess(
+            process: process,
+            validator: validator,
+            expectedIdentity: validated.codeIdentity
+        )
+    }
+}
+
+private final class ValidatedRuntimeProcess: RuntimeProcess, @unchecked Sendable {
+    let standardOutput: AsyncStream<Data>
+    let standardError: AsyncStream<Data>
+    let termination: AsyncStream<RuntimeProcessTermination>
+
+    private let process: any RuntimeProcess
+    private let validator: RuntimeHelperValidator
+    private let expectedIdentity: RuntimeHelperCodeIdentity
+
+    var processIdentifier: Int32? { process.processIdentifier }
+
+    init(
+        process: any RuntimeProcess,
+        validator: RuntimeHelperValidator,
+        expectedIdentity: RuntimeHelperCodeIdentity
+    ) {
+        self.process = process
+        self.validator = validator
+        self.expectedIdentity = expectedIdentity
+        standardOutput = process.standardOutput
+        standardError = process.standardError
+        termination = process.termination
+    }
+
+    func run() throws {
+        try process.run()
+        do {
+            guard let identifier = process.processIdentifier else {
+                throw RuntimeHelperValidationError.missingProcessIdentifier
+            }
+            try validator.validateRunningProcess(
+                identifier: identifier,
+                expectedIdentity: expectedIdentity
+            )
+        } catch {
+            process.forceTerminate()
+            throw error
+        }
+    }
+
+    func writeStandardInput(_ data: Data) async throws {
+        try await process.writeStandardInput(data)
+    }
+
+    func closeStandardInput() { process.closeStandardInput() }
+    func terminate() { process.terminate() }
+    func forceTerminate() { process.forceTerminate() }
 }
 
 @MainActor

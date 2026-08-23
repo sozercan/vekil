@@ -109,8 +109,11 @@ func (h *helper) buildStatePayload() runtimeStatePayload {
 }
 
 func descriptionRequiresCopilot(description ConfigDescription) bool {
-	if description.Mode == ConfigModeLegacy || !description.Available {
+	if description.Mode == ConfigModeLegacy {
 		return true
+	}
+	if !description.Available {
+		return false
 	}
 	for _, provider := range description.Providers {
 		if provider.Type == "copilot" {

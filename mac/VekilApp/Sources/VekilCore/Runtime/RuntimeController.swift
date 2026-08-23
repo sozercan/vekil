@@ -677,7 +677,6 @@ public actor RuntimeController {
         )
         self.session = session
         launchToken = session.id
-        installDrains(for: session)
 
         do {
             try process.run()
@@ -692,6 +691,10 @@ public actor RuntimeController {
             return
         }
 
+        // A validating process may inspect the running code identity before
+        // run() returns. Start consuming helper output only after that check
+        // succeeds so an unvalidated replacement cannot enter reconciliation.
+        installDrains(for: session)
         setConnectionState(.awaitingHello)
         let sessionID = session.id
         let timeout = configuration.handshakeTimeout
@@ -920,7 +923,16 @@ public actor RuntimeController {
                 throw error
             }
             try applyReconciliationStateIfNeeded(preparationState)
-            try await restoreProxyIfNeeded(preparationState)
+            do {
+                try await restoreProxyIfNeeded(preparationState)
+            } catch is RuntimeStructuredError {
+                // The replacement helper is healthy. A rejected or failed
+                // proxy start is represented by its operation and state
+                // events, so keep the helper connected for manual recovery.
+                setConnectionState(.connected)
+                resumeConnectionWaiters()
+                return
+            }
             setConnectionState(.connected)
             resumeConnectionWaiters()
         } catch let error as RuntimeControllerError {

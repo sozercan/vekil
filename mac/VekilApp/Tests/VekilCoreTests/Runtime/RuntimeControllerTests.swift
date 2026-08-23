@@ -900,6 +900,147 @@ final class RuntimeControllerTests: XCTestCase {
         XCTAssertEqual(replacementCommands, [.getState, .start])
     }
 
+    func testAutomaticRestartRestoreFailureKeepsReplacementConnected() async throws {
+        let first = FakeRuntimeProcess()
+        first.onRun { [weak first] in
+            first?.emitStandardOutput(try! encodedHello(epoch: "hep_original"))
+        }
+        first.onWrite { [weak first] data in
+            guard let first, let request = try? requestFromLine(data), request.command == .getState else {
+                return
+            }
+            let state = RuntimeStatePayload(
+                runtimeGeneration: 7,
+                configRevision: "cfg_running",
+                service: .running,
+                readiness: .ready,
+                auth: .signedIn
+            )
+            first.emitStandardOutput(
+                try! encodedResponse(
+                    for: request,
+                    epoch: "hep_original",
+                    result: .object([
+                        "state_revision": .integer(1),
+                        "state": try! JSONValue.encode(state),
+                    ])
+                )
+            )
+        }
+
+        let replacement = FakeRuntimeProcess()
+        replacement.onRun { [weak replacement] in
+            replacement?.emitStandardOutput(try! encodedHello(epoch: "hep_replacement"))
+        }
+        replacement.onWrite { [weak replacement] data in
+            guard let replacement, let request = try? requestFromLine(data) else { return }
+            if request.command == .getState {
+                let state = RuntimeStatePayload(
+                    runtimeGeneration: 0,
+                    configRevision: "cfg_running",
+                    service: .stopped,
+                    readiness: .unknown,
+                    auth: .signedIn
+                )
+                replacement.emitStandardOutput(
+                    try! encodedResponse(
+                        for: request,
+                        epoch: "hep_replacement",
+                        result: .object([
+                            "state_revision": .integer(1),
+                            "state": try! JSONValue.encode(state),
+                        ])
+                    )
+                )
+            } else if request.command == .start {
+                replacement.emitStandardOutput(
+                    try! encodedResponse(
+                        for: request,
+                        epoch: "hep_replacement",
+                        result: .object([
+                            "accepted": .bool(true),
+                            "operation_id": .string("op_restore"),
+                        ])
+                    )
+                )
+                let error = RuntimeStructuredError(
+                    code: "authentication_failed",
+                    userMessage: "Provider authentication failed during startup.",
+                    retryable: true,
+                    recoveryAction: "retry_start"
+                )
+                let operation = RuntimeOperationEventPayload(
+                    operationID: "op_restore",
+                    kind: RuntimeOperationKind("start"),
+                    phase: .startupAuthentication,
+                    status: .failed,
+                    runtimeGeneration: 1,
+                    error: error
+                )
+                replacement.emitStandardOutput(
+                    try! RuntimeFrameCodec().encodeLine(
+                        RuntimeEventEnvelope(
+                            version: 1,
+                            event: .operation,
+                            helperEpoch: "hep_replacement",
+                            stateRevision: 2,
+                            payload: try! JSONValue.encode(operation)
+                        )
+                    )
+                )
+                let failed = RuntimeStatePayload(
+                    runtimeGeneration: 1,
+                    configRevision: "cfg_running",
+                    lastFailureCode: "authentication_failed",
+                    service: .failed,
+                    readiness: .notReady,
+                    auth: .signedOut
+                )
+                replacement.emitStandardOutput(
+                    try! RuntimeFrameCodec().encodeLine(
+                        RuntimeEventEnvelope(
+                            version: 1,
+                            event: .state,
+                            helperEpoch: "hep_replacement",
+                            stateRevision: 3,
+                            payload: try! JSONValue.encode(failed)
+                        )
+                    )
+                )
+            }
+        }
+
+        let controller = RuntimeController(
+            configuration: makeConfiguration(
+                restartPolicy: RuntimeRestartPolicy(
+                    maximumAutomaticRestarts: 1,
+                    window: 60,
+                    delays: [0]
+                )
+            ),
+            processFactory: FakeRuntimeProcessFactory([first, replacement]),
+            clock: ManualRuntimeClock(),
+            idGenerator: SequenceRuntimeIDGenerator([
+                "req_original_state", "req_replacement_state", "req_restore_start",
+            ])
+        )
+        _ = try await controller.connect()
+
+        first.emitExit(status: 1)
+
+        try await eventually {
+            let snapshot = await controller.snapshot()
+            return snapshot.connectionState == .connected
+                && snapshot.currentState?.helperEpoch == "hep_replacement"
+                && snapshot.currentState?.payload.service == .failed
+                && snapshot.currentState?.payload.lastFailureCode == "authentication_failed"
+        }
+        let replacementCommands = try replacement.writtenData.map(requestFromLine).map(\.command)
+        XCTAssertEqual(replacementCommands, [.getState, .start])
+        XCTAssertEqual(replacement.terminateCount, 0)
+        XCTAssertEqual(replacement.forceTerminateCount, 0)
+    }
+
     func testPreHandshakeRestartFailureRetainsPreviousScopedIdentity() async throws {
         let first = FakeRuntimeProcess()
         configureSuccessfulHandshake(process: first, epoch: "hep_original")
