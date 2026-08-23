@@ -100,6 +100,27 @@ final class FakeRuntimeProcess: RuntimeProcess, @unchecked Sendable {
         terminationContinuation.finish()
     }
 
+    func emitTerminationBeforeStandardOutputCloses(
+        status: Int32 = 1,
+        reason: RuntimeProcessTerminationReason = .exit
+    ) {
+        lock.lock()
+        guard !hasExited else {
+            lock.unlock()
+            return
+        }
+        hasExited = true
+        lock.unlock()
+
+        errorContinuation.finish()
+        terminationContinuation.yield(RuntimeProcessTermination(status: status, reason: reason))
+        terminationContinuation.finish()
+    }
+
+    func finishStandardOutput() {
+        outputContinuation.finish()
+    }
+
     func setRunError(_ error: Error?) {
         lock.lock()
         runError = error

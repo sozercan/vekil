@@ -690,12 +690,13 @@ public actor RuntimeController {
         let error = session.process.standardError
         let termination = session.process.termination
 
-        session.stdoutTask = Task.detached(priority: .userInitiated) { [weak self] in
+        let stdoutTask = Task.detached(priority: .userInitiated) { [weak self] in
             for await chunk in output {
                 await self?.receiveStandardOutput(chunk, sessionID: sessionID)
             }
             await self?.standardOutputDidClose(sessionID: sessionID)
         }
+        session.stdoutTask = stdoutTask
 
         session.stderrTask = Task.detached(priority: .utility) { [weak self] in
             for await chunk in error {
@@ -705,6 +706,8 @@ public actor RuntimeController {
 
         session.terminationTask = Task.detached(priority: .userInitiated) { [weak self] in
             for await result in termination {
+                await stdoutTask.value
+                guard !Task.isCancelled else { return }
                 await self?.processDidTerminate(result, sessionID: sessionID)
                 return
             }

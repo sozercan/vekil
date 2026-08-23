@@ -553,6 +553,41 @@ final class RuntimeControllerTests: XCTestCase {
         XCTAssertEqual(diagnostics.droppedByteCount, 2)
     }
 
+    func testTerminationWaitsForFinalStandardOutputFrames() async throws {
+        let process = FakeRuntimeProcess()
+        configureSuccessfulHandshake(
+            process: process,
+            stateRevision: 1,
+            runtimeGeneration: 1
+        )
+        let controller = RuntimeController(
+            configuration: makeConfiguration(
+                restartPolicy: RuntimeRestartPolicy(maximumAutomaticRestarts: 0)
+            ),
+            processFactory: FakeRuntimeProcessFactory([process])
+        )
+        _ = try await controller.connect()
+
+        process.emitTerminationBeforeStandardOutputCloses(status: 0)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        process.emitStandardOutput(
+            try stateEvent(
+                epoch: "hep_test",
+                revision: 2,
+                generation: 2,
+                service: .stopped
+            )
+        )
+        process.finishStandardOutput()
+
+        try await eventually {
+            await controller.previousState?.stateRevision == 2
+        }
+        let snapshot = await controller.snapshot()
+        XCTAssertEqual(snapshot.previousState?.payload.runtimeGeneration, 2)
+        XCTAssertNil(snapshot.currentState)
+    }
+
     func testGracefulShutdownSendsControlFrameClosesInputAndSuppressesRestart() async throws {
         let process = FakeRuntimeProcess()
         process.onRun { [weak process] in process?.emitStandardOutput(try! encodedHello()) }

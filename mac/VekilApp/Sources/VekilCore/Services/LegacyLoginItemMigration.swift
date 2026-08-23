@@ -62,7 +62,15 @@ public actor LegacyLaunchAgentMigrator: LegacyLoginItemMigrating {
 
     public func removeOwnedLegacyItem() async throws {
         guard let plist = readOwnedPlist(), Self.isVekilPlist(plist) else { return }
-        _ = try? await runner.run(["bootout", "gui/\(uid)/\(Self.label)"])
+        let arguments = ["bootout", "gui/\(uid)/\(Self.label)"]
+        let status = try await runner.run(arguments)
+        // `launchctl error 113` means the requested service does not exist.
+        guard status == 0 || status == Self.serviceNotFoundStatus else {
+            throw LegacyLoginItemMigrationError.launchctlFailed(
+                arguments: arguments,
+                status: status
+            )
+        }
         var value = stat()
         guard lstat(plistURL.path, &value) == 0 else { return }
         guard value.st_mode & S_IFMT == S_IFREG, value.st_uid == uid else { return }
@@ -101,4 +109,10 @@ public actor LegacyLaunchAgentMigrator: LegacyLoginItemMigrating {
         ) else { return nil }
         return object as? [String: Any]
     }
+
+    private static let serviceNotFoundStatus: Int32 = 113
+}
+
+public enum LegacyLoginItemMigrationError: Error, Sendable, Equatable {
+    case launchctlFailed(arguments: [String], status: Int32)
 }

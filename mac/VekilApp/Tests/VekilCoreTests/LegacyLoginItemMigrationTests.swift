@@ -64,6 +64,42 @@ final class LegacyLoginItemMigrationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: plistURL(foreign).path))
     }
 
+    func testRemovalAcceptsVerifiedNotLoadedStatus() async throws {
+        let home = try makeHome(plist: ownedPlist())
+        defer { try? FileManager.default.removeItem(at: home) }
+        let migrator = LegacyLaunchAgentMigrator(
+            homeDirectory: home,
+            runner: LegacyLaunchctlRunner { _ in 113 }
+        )
+
+        try await migrator.removeOwnedLegacyItem()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: plistURL(home).path))
+    }
+
+    func testRemovalPreservesOwnedItemWhenBootoutFails() async throws {
+        let home = try makeHome(plist: ownedPlist())
+        defer { try? FileManager.default.removeItem(at: home) }
+        let migrator = LegacyLaunchAgentMigrator(
+            homeDirectory: home,
+            runner: LegacyLaunchctlRunner { _ in 5 }
+        )
+
+        do {
+            try await migrator.removeOwnedLegacyItem()
+            XCTFail("Expected launchctl failure")
+        } catch {
+            XCTAssertEqual(
+                error as? LegacyLoginItemMigrationError,
+                .launchctlFailed(
+                    arguments: ["bootout", "gui/\(getuid())/com.vekil.menubar"],
+                    status: 5
+                )
+            )
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: plistURL(home).path))
+    }
+
     private func makeHome(plist: Data) throws -> URL { try makeHome(raw: plist) }
 
     private func makeHome(raw: Data) throws -> URL {
