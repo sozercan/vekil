@@ -26,6 +26,11 @@ mkdir -p "$(dirname "${cask_path}")"
 if [[ -f "${cask_path}" ]]; then
   current_version="$(sed -n 's/^[[:space:]]*version "\([^"]*\)"/\1/p' "${cask_path}" | head -n 1)"
   if [[ -n "${current_version}" ]]; then
+    current_sha256="$(sed -n 's/^[[:space:]]*sha256 "\([0-9a-f]*\)"/\1/p' "${cask_path}" | head -n 1)"
+    if [[ "${current_version}" == "${version}" && "${current_sha256}" != "${sha256}" ]]; then
+      echo "error: refusing to replace Homebrew cask ${current_version} with a different SHA-256" >&2
+      exit 1
+    fi
     python3 - "${current_version}" "${version}" <<'PY_VERSION'
 import re
 import sys

@@ -397,6 +397,11 @@ grep -Fq 'depends_on macos: ">= :ventura"' "${cask}" || fail "Homebrew cask does
 if grep -Eq 'depends_on arch|xattr' "${cask}"; then fail "Homebrew cask retains architecture restriction or quarantine bypass"; fi
 if grep -Fq '.config/vekil' "${cask}"; then fail "Homebrew cask must not delete external configuration roots"; fi
 if grep -Fq 'Application Support/vekil' "${cask}"; then fail "Homebrew cask must preserve managed state and every selectable External Configuration path"; fi
+"${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.15.0 "${sha256}" "${TMP_ROOT}/tap"
+different_sha256="$(printf '%064d' 0)"
+if [[ "${different_sha256}" == "${sha256}" ]]; then different_sha256="$(printf '%064d' 1)"; fi
+expect_failure "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.15.0 "${different_sha256}" "${TMP_ROOT}/tap"
+grep -Fq "sha256 \"${sha256}\"" "${cask}" || fail "same-version digest rejection changed the cask"
 "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.16.0 "${sha256}" "${TMP_ROOT}/tap"
 expect_failure "${REPO_ROOT}/scripts/publish-homebrew-cask.sh" 0.15.0 "${sha256}" "${TMP_ROOT}/tap"
 
