@@ -270,16 +270,28 @@ func (e *providerRequestError) Unwrap() error {
 // an HTTP(S) URL. Remote sources are fetched once per call with a bounded body
 // and timeout; Vekil does not poll them for changes.
 func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
+	cfg, _, err := LoadProvidersConfigSnapshot(context.Background(), path)
+	return cfg, err
+}
+
+// LoadProvidersConfigSnapshot reads, decodes, and validates one immutable
+// local or HTTP(S) source snapshot. Remote reads honor ctx and retain the same
+// timeout, redirect, and response-size limits as LoadProvidersConfigFile.
+func LoadProvidersConfigSnapshot(ctx context.Context, path string) (ProvidersConfig, []byte, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return ProvidersConfig{}, nil
+		return ProvidersConfig{}, nil, nil
 	}
 
-	body, err := readProvidersConfigSource(path)
+	body, err := readProvidersConfigSource(ctx, path)
 	if err != nil {
-		return ProvidersConfig{}, err
+		return ProvidersConfig{}, nil, err
 	}
-	return LoadProvidersConfigBytes(path, body)
+	cfg, err := LoadProvidersConfigBytes(path, body)
+	if err != nil {
+		return ProvidersConfig{}, nil, err
+	}
+	return cfg, body, nil
 }
 
 // LoadProvidersConfigBytes decodes and validates one immutable configuration

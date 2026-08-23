@@ -92,6 +92,27 @@ type externalConfigurationSnapshot struct {
 	body     []byte
 }
 
+func loadExternalConfigurationSnapshot(ctx context.Context, source string) (proxy.ProvidersConfig, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return proxy.ProvidersConfig{}, nil, err
+	}
+	if proxy.IsRemoteProvidersConfigSource(source) {
+		return proxy.LoadProvidersConfigSnapshot(ctx, source)
+	}
+	body, _, err := readSecureFile(source, MaxConfigBytes)
+	if err != nil {
+		return proxy.ProvidersConfig{}, nil, err
+	}
+	cfg, err := proxy.LoadProvidersConfigBytes(source, body)
+	if err != nil {
+		return proxy.ProvidersConfig{}, nil, err
+	}
+	return cfg, body, nil
+}
+
 func cloneExternalConfigurationSnapshot(snapshot *externalConfigurationSnapshot) *externalConfigurationSnapshot {
 	if snapshot == nil {
 		return nil
@@ -222,19 +243,21 @@ func (m *ConfigManager) LoadConfiguration(ctx context.Context) (appcontrol.Confi
 		if path == "" {
 			return appcontrol.Configuration{}, errors.New("external configuration path is missing")
 		}
+		var cfg proxy.ProvidersConfig
 		var body []byte
 		if preparedExternal.matches(path, state.SelectedConfigRevision) {
 			body = append([]byte(nil), preparedExternal.body...)
-		} else {
 			var err error
-			body, _, err = readSecureFile(path, MaxConfigBytes)
+			cfg, err = proxy.LoadProvidersConfigBytes(path, body)
 			if err != nil {
 				return appcontrol.Configuration{}, err
 			}
-		}
-		cfg, err := proxy.LoadProvidersConfigBytes(path, body)
-		if err != nil {
-			return appcontrol.Configuration{}, err
+		} else {
+			var err error
+			cfg, body, err = loadExternalConfigurationSnapshot(ctx, path)
+			if err != nil {
+				return appcontrol.Configuration{}, err
+			}
 		}
 		revision, _ := configRevision(body)
 		m.mu.Lock()
@@ -287,11 +310,8 @@ func (m *ConfigManager) StageExternal(ctx context.Context, path string) error {
 			return err
 		}
 	}
-	body, _, err := readSecureFile(path, MaxConfigBytes)
+	_, body, err := loadExternalConfigurationSnapshot(ctx, path)
 	if err != nil {
-		return err
-	}
-	if _, err := proxy.LoadProvidersConfigBytes(path, body); err != nil {
 		return err
 	}
 	revision, _ := configRevision(body)
@@ -542,6 +562,9 @@ func (m *ConfigManager) EnsureManagedConfiguration() (ConfigDescription, error) 
 	if err := m.recoveryRequiredLocked(); err != nil {
 		return ConfigDescription{}, err
 	}
+	if err := m.recoverInitialManagedCreationIfPresentLocked(); err != nil {
+		return ConfigDescription{}, err
+	}
 
 	if m.state.ManagedOwnershipID != "" {
 		body, _, err := readOwnedFile(m.paths.Managed, MaxConfigBytes)
@@ -569,10 +592,19 @@ func (m *ConfigManager) EnsureManagedConfiguration() (ConfigDescription, error) 
 	if _, err := proxy.LoadProvidersConfigBytes(m.paths.Managed, initialManagedCopilotYAML); err != nil {
 		return ConfigDescription{}, fmt.Errorf("validate initial managed configuration: %w", err)
 	}
-	if err := writeExclusiveFile(m.paths.Managed, initialManagedCopilotYAML); err != nil {
+	if _, err := os.Lstat(m.paths.Journal); err == nil {
+		return ConfigDescription{}, errors.New("managed apply journal already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ConfigDescription{}, fmt.Errorf("inspect managed apply journal: %w", err)
+	}
+	journal := initialManagedCreationJournal()
+	if err := writeApplyJournal(m.paths.Journal, journal); err != nil {
 		return ConfigDescription{}, err
 	}
-	revision, digest := configRevision(initialManagedCopilotYAML)
+	if err := writeExclusiveFile(m.paths.Managed, initialManagedCopilotYAML); err != nil {
+		return ConfigDescription{}, errors.Join(err, removeUncommittedInitialManagedCreation(m.paths))
+	}
+	revision, digest := journal.NewRevision, journal.NewSHA256
 	m.state.ConfigMode = ConfigModeManaged
 	m.state.SelectedPath = m.paths.Managed
 	m.state.SelectedConfigRevision = revision
@@ -581,7 +613,12 @@ func (m *ConfigManager) EnsureManagedConfiguration() (ConfigDescription, error) 
 	m.state.CommittedSHA256 = digest
 	m.state.Providers = []ProviderIdentity{{UUID: m.uuid(), ProviderID: "copilot"}}
 	if err := m.saveStateLocked(); err != nil {
-		_ = removePrivateFile(m.paths.Managed)
+		// The atomic state write may already have renamed the new file before a
+		// directory sync error. Leave both durable artifacts in place so startup
+		// recovery can reconcile either outcome without losing ownership.
+		return ConfigDescription{}, err
+	}
+	if err := removePrivateFile(m.paths.Journal); err != nil {
 		return ConfigDescription{}, err
 	}
 	return m.describeLocked(initialManagedCopilotYAML, nil), nil
@@ -626,7 +663,11 @@ func (m *ConfigManager) Describe() (ConfigDescription, error) {
 	case ConfigModeManaged:
 		body, _, readErr = readOwnedFile(m.paths.Managed, MaxConfigBytes)
 	case ConfigModeExternal:
-		body, _, readErr = readSecureFile(m.state.SelectedPath, MaxConfigBytes)
+		if m.lastExternalSnapshot.matches(m.state.SelectedPath, m.state.SelectedConfigRevision) {
+			body = append([]byte(nil), m.lastExternalSnapshot.body...)
+		} else {
+			_, body, readErr = loadExternalConfigurationSnapshot(context.Background(), m.state.SelectedPath)
+		}
 	default:
 		readErr = fmt.Errorf("unsupported config mode %q", m.state.ConfigMode)
 	}
@@ -636,7 +677,7 @@ func (m *ConfigManager) Describe() (ConfigDescription, error) {
 func (m *ConfigManager) describeLocked(body []byte, readErr error) ConfigDescription {
 	description := ConfigDescription{
 		Mode:                    m.state.ConfigMode,
-		SelectedPath:            m.state.SelectedPath,
+		SelectedPath:            proxy.ProvidersConfigSourceDisplay(m.state.SelectedPath),
 		ActiveRevision:          m.state.ActiveRuntimeRevision,
 		ManagedOwnershipPresent: m.state.ManagedOwnershipID != "",
 		SecretGeneration:        m.state.SecretGeneration,
@@ -825,7 +866,7 @@ func loadPersistentState(path string) (PersistentState, bool, error) {
 			state.ConfigMode = ConfigModeExternal
 			state.SelectedPath = selected
 			state.SelectedConfigRevision = ""
-			if body, _, readErr := readSecureFile(selected, MaxConfigBytes); readErr == nil {
+			if _, body, readErr := loadExternalConfigurationSnapshot(context.Background(), selected); readErr == nil {
 				state.SelectedConfigRevision, _ = configRevision(body)
 			}
 		}

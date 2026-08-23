@@ -130,21 +130,28 @@ public final class AnalyticsViewModel: ObservableObject {
     @Published public private(set) var requests: [StatsProjectedRequest] = []
     public let store: StatsStore
     private var tick: Task<Void, Never>?
+    private var runtimeUpdateTail: Task<Void, Never>?
     private var visibleSurfaces: Set<StatsVisibility> = []
 
     public init(store: StatsStore) { self.store = store }
     public func applyRuntime(_ runtime: AppRuntimeStateSnapshot) {
-        Task {
-            let service = AnalyticsServiceState(rawValue: runtime.service.rawValue) ?? .failed
-            let identity = runtime.runtimeGeneration.map {
-                AnalyticsRuntimeIdentity(
-                    launchIdentity: RuntimeLaunchIdentity(launchToken: runtime.launchToken, helperEpoch: runtime.helperEpoch),
-                    runtimeGeneration: $0
-                )
-            }
-            await store.updateRuntime(identity: identity, serviceState: service)
-            await reload()
+        let service = AnalyticsServiceState(rawValue: runtime.service.rawValue) ?? .failed
+        let identity = runtime.runtimeGeneration.map {
+            AnalyticsRuntimeIdentity(
+                launchIdentity: RuntimeLaunchIdentity(launchToken: runtime.launchToken, helperEpoch: runtime.helperEpoch),
+                runtimeGeneration: $0
+            )
         }
+        let predecessor = runtimeUpdateTail
+        runtimeUpdateTail = Task { [weak self, store] in
+            await predecessor?.value
+            guard !Task.isCancelled else { return }
+            await store.updateRuntime(identity: identity, serviceState: service)
+            await self?.reload()
+        }
+    }
+    func waitForRuntimeUpdates() async {
+        await runtimeUpdateTail?.value
     }
     public func setVisible(_ surface: StatsVisibility, _ visible: Bool) {
         if visible {
@@ -169,7 +176,10 @@ public final class AnalyticsViewModel: ObservableObject {
         }
     }
 
-    deinit { tick?.cancel() }
+    deinit {
+        runtimeUpdateTail?.cancel()
+        tick?.cancel()
+    }
     public func reload() async {
         state = await store.state()
         requests = await store.requests()

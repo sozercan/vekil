@@ -121,6 +121,7 @@ type ProviderSummary struct {
 type ApplyPhase string
 
 const (
+	ApplyPhaseCreating       ApplyPhase = "creating"
 	ApplyPhasePrepared       ApplyPhase = "prepared"
 	ApplyPhaseInstalled      ApplyPhase = "installed"
 	ApplyPhaseCommitted      ApplyPhase = "committed"

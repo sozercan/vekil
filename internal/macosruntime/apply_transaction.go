@@ -404,6 +404,8 @@ func (m *ConfigManager) recoverApplyJournalLocked() error {
 		return err
 	}
 	switch journal.Phase {
+	case ApplyPhaseCreating:
+		return m.recoverInitialManagedCreationLocked(journal)
 	case ApplyPhaseCommitted:
 		return removeApplyArtifacts(m.paths, true)
 	case ApplyPhasePrepared, ApplyPhaseInstalled, ApplyPhaseRollbackFailed:
@@ -439,6 +441,87 @@ func (m *ConfigManager) recoverApplyJournalLocked() error {
 	default:
 		return fmt.Errorf("unsupported managed apply phase %q", journal.Phase)
 	}
+}
+
+func initialManagedCreationJournal() ApplyJournal {
+	revision, digest := configRevision(initialManagedCopilotYAML)
+	return ApplyJournal{
+		Version:     ApplyJournalVersion,
+		OperationID: "initial_managed_create",
+		Phase:       ApplyPhaseCreating,
+		NewRevision: revision,
+		NewSHA256:   digest,
+	}
+}
+
+func (m *ConfigManager) recoverInitialManagedCreationIfPresentLocked() error {
+	journal, err := readApplyJournal(m.paths.Journal)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || strings.Contains(strings.ToLower(err.Error()), "no such file") {
+			return nil
+		}
+		return err
+	}
+	if journal.Phase != ApplyPhaseCreating {
+		return nil
+	}
+	return m.recoverInitialManagedCreationLocked(journal)
+}
+
+func (m *ConfigManager) recoverInitialManagedCreationLocked(journal ApplyJournal) error {
+	expected := initialManagedCreationJournal()
+	if journal.OperationID != expected.OperationID ||
+		journal.NewRevision != expected.NewRevision ||
+		journal.NewSHA256 != expected.NewSHA256 {
+		return errors.New("initial managed creation journal does not match the built-in configuration")
+	}
+
+	// Saving ownership state is the commit boundary. If only journal cleanup
+	// was interrupted, preserve that state and let ordinary drift checks handle
+	// a subsequently changed or removed managed file.
+	if m.state.ManagedOwnershipID != "" {
+		if m.state.CommittedConfigRevision != expected.NewRevision ||
+			m.state.CommittedSHA256 != expected.NewSHA256 {
+			return errors.New("initial managed creation journal conflicts with ownership state")
+		}
+		return removePrivateFile(m.paths.Journal)
+	}
+
+	body, _, err := readOwnedFile(m.paths.Managed, MaxConfigBytes)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || strings.Contains(strings.ToLower(err.Error()), "no such file") {
+			return removePrivateFile(m.paths.Journal)
+		}
+		return err
+	}
+	revision, digest := configRevision(body)
+	if revision != expected.NewRevision || digest != expected.NewSHA256 {
+		return removeUncommittedInitialManagedCreation(m.paths)
+	}
+
+	previous := clonePersistentState(m.state)
+	m.state.ConfigMode = ConfigModeManaged
+	m.state.SelectedPath = m.paths.Managed
+	m.state.SelectedConfigRevision = expected.NewRevision
+	m.state.ManagedOwnershipID = m.uuid()
+	m.state.CommittedConfigRevision = expected.NewRevision
+	m.state.CommittedSHA256 = expected.NewSHA256
+	m.state.Providers = []ProviderIdentity{{UUID: m.uuid(), ProviderID: "copilot"}}
+	if err := m.saveStateLocked(); err != nil {
+		m.state = previous
+		return err
+	}
+	return removePrivateFile(m.paths.Journal)
+}
+
+func removeUncommittedInitialManagedCreation(paths Paths) error {
+	if err := removePrivateFile(paths.Managed); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove incomplete initial managed configuration: %w", err)
+	}
+	if err := removePrivateFile(paths.Journal); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove initial managed creation journal: %w", err)
+	}
+	return nil
 }
 
 func restoreStateFromJournal(state *PersistentState, journal ApplyJournal) {

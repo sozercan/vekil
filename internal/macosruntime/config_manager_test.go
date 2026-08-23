@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,6 +86,87 @@ func TestConfigManagerMigratesUnavailableLegacyExternalWithoutLegacyRevision(t *
 	state := manager.State()
 	if state.ConfigMode != ConfigModeExternal || state.SelectedPath != external || state.SelectedConfigRevision != "" {
 		t.Fatalf("migrated state = %+v", state)
+	}
+}
+
+func TestConfigManagerMigratesLegacyRemoteExternalWithoutExposingSignedURL(t *testing.T) {
+	externalBody := []byte("schema_version: 2\nproviders:\n  - id: remote\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: remote-model\n        endpoints: [/chat/completions]\n")
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write(externalBody)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	paths := PathsInDirectory(dir)
+	source := strings.Replace(server.URL, "http://", "http://signed-user:signed-password@", 1) +
+		"/providers.yaml?signature=signed-query#private-fragment"
+	legacy, err := json.Marshal(map[string]string{"providers_config_path": source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.State, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := NewConfigManager(ConfigManagerOptions{Paths: paths, UUID: func() string { return "uuid" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRevision, _ := configRevision(externalBody)
+	state := manager.State()
+	if state.ConfigMode != ConfigModeExternal || state.SelectedPath != source || state.SelectedConfigRevision != wantRevision {
+		t.Fatalf("migrated remote state = %+v", state)
+	}
+
+	description, err := manager.Describe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDisplay := server.URL + "/providers.yaml"
+	if description.SelectedPath != wantDisplay || !description.Available || description.ErrorCode != "" {
+		t.Fatalf("remote description = %+v, want display path %q", description, wantDisplay)
+	}
+	descriptionJSON, err := json.Marshal(description)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"signed-user", "signed-password", "signed-query", "private-fragment"} {
+		if bytes.Contains(descriptionJSON, []byte(secret)) {
+			t.Fatalf("protocol description exposes %q: %s", secret, descriptionJSON)
+		}
+	}
+
+	configuration, err := manager.LoadConfiguration(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, ok := configuration.Value.(proxy.ProvidersConfig)
+	if !ok || len(loaded.Providers) != 1 || loaded.Providers[0].ID != "remote" {
+		t.Fatalf("loaded remote configuration = %#v", configuration.Value)
+	}
+}
+
+func TestStageRemoteExternalHonorsCancellation(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(started)
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+
+	manager := newManagerForTest(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		result <- manager.StageExternal(ctx, server.URL+"/providers.yaml")
+	}()
+	<-started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("StageExternal() error = %v, want context cancellation", err)
+	}
+	if state := manager.State(); state.ConfigMode != ConfigModeLegacy || state.SelectedPath != "" {
+		t.Fatalf("canceled remote selection changed state: %+v", state)
 	}
 }
 
@@ -213,6 +296,97 @@ func TestEnsureManagedConfigurationUsesExclusiveOwnedPrivateFile(t *testing.T) {
 	preserved, _ := os.ReadFile(unowned.paths.Managed)
 	if string(preserved) != "do not overwrite" {
 		t.Fatalf("unowned file changed: %q", preserved)
+	}
+}
+
+func TestNewConfigManagerRecoversCommittedInitialManagedCreation(t *testing.T) {
+	manager := newManagerForTest(t)
+	journal := initialManagedCreationJournal()
+	if err := writeApplyJournal(manager.paths.Journal, journal); err != nil {
+		t.Fatal(err)
+	}
+	journalBody, err := os.ReadFile(manager.paths.Journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(journalBody, initialManagedCopilotYAML) || bytes.Contains(journalBody, []byte("schema_version")) {
+		t.Fatalf("initial creation journal contains raw configuration: %s", journalBody)
+	}
+	if err := writeExclusiveFile(manager.paths.Managed, initialManagedCopilotYAML); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := NewConfigManager(ConfigManagerOptions{
+		Paths: manager.paths,
+		UUID:  deterministicUUIDs("recovered-owner", "recovered-provider"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := recovered.State()
+	if state.ConfigMode != ConfigModeManaged || state.ManagedOwnershipID != "recovered-owner" ||
+		state.CommittedConfigRevision != journal.NewRevision || state.CommittedSHA256 != journal.NewSHA256 ||
+		len(state.Providers) != 1 || state.Providers[0].UUID != "recovered-provider" {
+		t.Fatalf("recovered initial managed state = %+v", state)
+	}
+	if _, err := os.Stat(manager.paths.Journal); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("initial creation journal remains after recovery: %v", err)
+	}
+}
+
+func TestNewConfigManagerPreservesCommittedInitialManagedStateWhenJournalRemains(t *testing.T) {
+	manager := newManagerForTest(t, "original-owner", "original-provider")
+	if _, err := manager.EnsureManagedConfiguration(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeApplyJournal(manager.paths.Journal, initialManagedCreationJournal()); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := NewConfigManager(ConfigManagerOptions{
+		Paths: manager.paths,
+		UUID:  func() string { return "unexpected-replacement" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := recovered.State()
+	if state.ManagedOwnershipID != "original-owner" || len(state.Providers) != 1 || state.Providers[0].UUID != "original-provider" {
+		t.Fatalf("committed managed identity changed during journal cleanup: %+v", state)
+	}
+	if _, err := os.Stat(manager.paths.Journal); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("initial creation journal remains after committed-state recovery: %v", err)
+	}
+}
+
+func TestNewConfigManagerCleansIncompleteInitialManagedCreationForRetry(t *testing.T) {
+	manager := newManagerForTest(t)
+	if err := writeApplyJournal(manager.paths.Journal, initialManagedCreationJournal()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeExclusiveFile(manager.paths.Managed, []byte("schema_version:")); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := NewConfigManager(ConfigManagerOptions{
+		Paths: manager.paths,
+		UUID:  deterministicUUIDs("retry-owner", "retry-provider"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manager.paths.Managed); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("incomplete managed file remains after recovery: %v", err)
+	}
+	if _, err := os.Stat(manager.paths.Journal); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("initial creation journal remains after recovery: %v", err)
+	}
+	description, err := recovered.EnsureManagedConfiguration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if description.Mode != ConfigModeManaged || recovered.State().ManagedOwnershipID != "retry-owner" {
+		t.Fatalf("managed retry did not complete: description=%+v state=%+v", description, recovered.State())
 	}
 }
 
