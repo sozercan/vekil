@@ -75,7 +75,14 @@ public struct JSONLFrameDecoder: Sendable {
     }
 
     private mutating func appendSegment<S: DataProtocol>(_ segment: S) throws {
-        guard partialFrame.count <= maximumFrameSize - segment.count else {
+        let (combinedByteCount, overflow) = partialFrame.count.addingReportingOverflow(segment.count)
+        let trailingByte = segment.last ?? partialFrame.last
+        let hasProvisionalCR = !overflow
+            && maximumFrameSize < Int.max
+            && combinedByteCount == maximumFrameSize + 1
+            && trailingByte == 0x0D
+        guard !overflow,
+              combinedByteCount <= maximumFrameSize || hasProvisionalCR else {
             partialFrame.removeAll(keepingCapacity: false)
             throw JSONLFrameError.frameTooLarge(limit: maximumFrameSize)
         }

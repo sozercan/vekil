@@ -31,6 +31,32 @@ final class JSONLFramingTests: XCTestCase {
         XCTAssertEqual(decoder.bufferedByteCount, 0)
     }
 
+    func testExactMaximumSizeAcceptsCRLFTogetherAndSplit() throws {
+        let payload = Data("12345678".utf8)
+
+        var together = try JSONLFrameDecoder(maximumFrameSize: payload.count)
+        XCTAssertEqual(
+            try together.append(Data("12345678\r\n".utf8)),
+            [payload]
+        )
+
+        var split = try JSONLFrameDecoder(maximumFrameSize: payload.count)
+        XCTAssertEqual(try split.append(Data("12345678\r".utf8)), [])
+        XCTAssertEqual(split.bufferedByteCount, payload.count + 1)
+        XCTAssertEqual(try split.append(Data("\n".utf8)), [payload])
+        XCTAssertEqual(split.bufferedByteCount, 0)
+    }
+
+    func testProvisionalCRDoesNotPermitOversizePayload() throws {
+        var decoder = try JSONLFrameDecoder(maximumFrameSize: 8)
+        XCTAssertEqual(try decoder.append(Data("12345678\r".utf8)), [])
+
+        XCTAssertThrowsError(try decoder.append(Data("x\n".utf8))) { error in
+            XCTAssertEqual(error as? JSONLFrameError, .frameTooLarge(limit: 8))
+        }
+        XCTAssertEqual(decoder.bufferedByteCount, 0)
+    }
+
     func testSplitOversizeFrameIsRejectedIncrementally() throws {
         var decoder = try JSONLFrameDecoder(maximumFrameSize: 5)
         XCTAssertEqual(try decoder.append(Data("123".utf8)), [])
