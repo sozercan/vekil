@@ -10,7 +10,7 @@ final class LegacyLoginItemMigrationTests: XCTestCase {
 
         let migrator = LegacyLaunchAgentMigrator(
             homeDirectory: home,
-            runner: LegacyLaunchctlRunner { _ in 113 }
+            runner: LegacyLaunchctlRunner { _ in ESRCH }
         )
 
         let intent = await migrator.inspect()
@@ -64,7 +64,7 @@ final class LegacyLoginItemMigrationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let migrator = LegacyLaunchAgentMigrator(
             homeDirectory: home,
-            runner: LegacyLaunchctlRunner { _ in 113 }
+            runner: LegacyLaunchctlRunner { _ in ESRCH }
         )
 
         try await migrator.removeOwnedLegacyItem()

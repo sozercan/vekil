@@ -65,7 +65,7 @@ public actor LegacyLaunchAgentMigrator: LegacyLoginItemMigrating {
         guard let plist = readOwnedPlist(), Self.isVekilPlist(plist) else { return }
         let arguments = ["bootout", "gui/\(uid)/\(Self.label)"]
         let status = try await runner.run(arguments)
-        // `launchctl error 113` means the requested service does not exist.
+        // `launchctl bootout` exits with ESRCH when the service is not loaded.
         guard status == 0 || status == Self.serviceNotFoundStatus else {
             throw LegacyLoginItemMigrationError.launchctlFailed(
                 arguments: arguments,
@@ -111,7 +111,7 @@ public actor LegacyLaunchAgentMigrator: LegacyLoginItemMigrating {
         return object as? [String: Any]
     }
 
-    private static let serviceNotFoundStatus: Int32 = 113
+    private static let serviceNotFoundStatus: Int32 = ESRCH
 }
 
 public enum LegacyLoginItemMigrationError: Error, Sendable, Equatable {
