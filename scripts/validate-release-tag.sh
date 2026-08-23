@@ -8,7 +8,7 @@ set -euo pipefail
 }
 
 release_tag="$1"
-[[ "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+[[ "${release_tag}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
   echo "release tag must be stable semantic version text prefixed by v" >&2
   echo "prerelease tags require a persistent prerelease Sparkle feed" >&2
   exit 1

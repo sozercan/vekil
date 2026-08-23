@@ -45,10 +45,14 @@ sign_appcast() {
     "${appcast_length}" >>"${signed_appcast}"
 }
 
+"${REPO_ROOT}/scripts/validate-release-tag.sh" v0.0.0
 "${REPO_ROOT}/scripts/validate-release-tag.sh" v1.2.3
 expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" v1.2.3-rc.1
 expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" 1.2.3
 expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" v1.2
+expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" v01.2.3
+expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" v1.02.3
+expect_failure "${REPO_ROOT}/scripts/validate-release-tag.sh" v1.2.03
 
 "${MANIFEST_TOOL}" validate-config --config "${CONFIG}"
 expect_failure "${MANIFEST_TOOL}" resolve \
