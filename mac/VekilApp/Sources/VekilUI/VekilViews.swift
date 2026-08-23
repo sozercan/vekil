@@ -1390,17 +1390,6 @@ private enum ClientKind: String, CaseIterable, Identifiable {
   case copilot = "GitHub Copilot CLI"
 
   var id: String { rawValue }
-
-  var commandName: String {
-    switch self {
-    case .claude:
-      return "claude"
-    case .codex:
-      return "codex"
-    case .copilot:
-      return "copilot"
-    }
-  }
 }
 
 public struct ClientSetupView: View {
@@ -1463,14 +1452,6 @@ public struct ClientSetupView: View {
           }
 
           CommandGroup(
-            title: "Launch with Vekil",
-            description:
-              "Vekil supervises an ephemeral proxy and removes the temporary client overlay when the session ends.",
-            command: launchCommand,
-            copyAction: { Task { await app.copyText(launchCommand) } }
-          )
-
-          CommandGroup(
             title: "Connect to this running proxy",
             description:
               "Use these temporary environment variables when you want to keep the current app-managed proxy running.",
@@ -1531,28 +1512,24 @@ public struct ClientSetupView: View {
     ShellArgument.quote(selectedModelID.isEmpty ? "<model-id>" : selectedModelID)
   }
 
-  private var launchCommand: String {
-    "vekil launch \(client.commandName) --model \(commandModelID)"
-  }
-
   private func manualCommand(_ baseURL: URL) -> String {
     let base = baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     switch client {
     case .claude:
       return """
-        env ANTHROPIC_BASE_URL=\(base) \\
+        env ANTHROPIC_BASE_URL=\(ShellArgument.quote(base)) \\
           ANTHROPIC_API_KEY=dummy \\
           claude --model \(commandModelID)
         """
     case .codex:
       return """
         env OPENAI_API_KEY=dummy \\
-          OPENAI_BASE_URL=\(base)/v1 \\
+          OPENAI_BASE_URL=\(ShellArgument.quote(base + "/v1")) \\
           codex -m \(commandModelID)
         """
     case .copilot:
       return """
-        env COPILOT_PROVIDER_BASE_URL=\(base)/v1 \\
+        env COPILOT_PROVIDER_BASE_URL=\(ShellArgument.quote(base + "/v1")) \\
           COPILOT_PROVIDER_TYPE=openai \\
           COPILOT_PROVIDER_WIRE_API=responses \\
           COPILOT_MODEL=\(commandModelID) \\

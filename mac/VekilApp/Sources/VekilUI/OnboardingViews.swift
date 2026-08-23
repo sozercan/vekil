@@ -1271,13 +1271,13 @@ public struct VekilOnboardingView: View {
   private var clientInstructions: String {
     switch client {
     case .claudeCode:
-      return "ANTHROPIC_BASE_URL=\(baseURLString) ANTHROPIC_API_KEY=dummy claude --model \(commandModelID)"
+      return "ANTHROPIC_BASE_URL=\(ShellArgument.quote(baseURLString)) ANTHROPIC_API_KEY=dummy claude --model \(commandModelID)"
     case .codex:
-      return "vekil launch codex --model \(commandModelID)"
+      return "OPENAI_BASE_URL=\(ShellArgument.quote(baseURLString + "/v1")) OPENAI_API_KEY=dummy codex -m \(commandModelID)"
     case .copilot:
-      return "COPILOT_PROVIDER_BASE_URL=\(baseURLString)/v1 COPILOT_PROVIDER_TYPE=openai COPILOT_PROVIDER_WIRE_API=responses COPILOT_MODEL=\(commandModelID) COPILOT_OFFLINE=true copilot"
+      return "COPILOT_PROVIDER_BASE_URL=\(ShellArgument.quote(baseURLString + "/v1")) COPILOT_PROVIDER_TYPE=openai COPILOT_PROVIDER_WIRE_API=responses COPILOT_MODEL=\(commandModelID) COPILOT_OFFLINE=true copilot"
     case .openAICompatible:
-      return "OPENAI_BASE_URL=\(baseURLString)/v1 OPENAI_API_KEY=dummy <client> --model \(commandModelID)"
+      return "OPENAI_BASE_URL=\(ShellArgument.quote(baseURLString + "/v1")) OPENAI_API_KEY=dummy openai-compatible-client --model \(commandModelID)"
     }
   }
 
@@ -1319,7 +1319,7 @@ private enum OnboardingClient: String, CaseIterable, Identifiable {
     case .claudeCode:
       return "Point Claude Code's Anthropic-compatible endpoint at the running Vekil app."
     case .codex:
-      return "Use Vekil's launcher for a supervised Codex session with an isolated temporary overlay."
+      return "Point Codex CLI's OpenAI-compatible endpoint at the running Vekil app."
     case .copilot:
       return "Use Copilot CLI's custom-provider Responses wire API against Vekil's local endpoint."
     case .openAICompatible:
@@ -1329,12 +1329,12 @@ private enum OnboardingClient: String, CaseIterable, Identifiable {
 
   var footnote: String {
     switch self {
-    case .claudeCode, .openAICompatible:
+    case .claudeCode, .codex:
       return "The dummy client key is local placeholder data; provider credentials remain owned by Vekil."
-    case .codex:
-      return "The launcher starts an ephemeral proxy and removes its temporary client overlay when the session ends."
     case .copilot:
       return "Select a direct Responses-capable model from Vekil's advertised catalog."
+    case .openAICompatible:
+      return "Replace openai-compatible-client with your client executable. The dummy key stays local; provider credentials remain owned by Vekil."
     }
   }
 
