@@ -436,6 +436,19 @@ func (o *blockingConfigurationObserver) RuntimeActivated(ctx context.Context, _ 
 }
 func (o *blockingConfigurationObserver) RuntimeDeactivated(context.Context, uint64) error { return nil }
 
+type recordingConfigurationObserver struct {
+	deactivated []uint64
+}
+
+func (o *recordingConfigurationObserver) RuntimeActivated(context.Context, Configuration, uint64, string) error {
+	return nil
+}
+
+func (o *recordingConfigurationObserver) RuntimeDeactivated(_ context.Context, generation uint64) error {
+	o.deactivated = append(o.deactivated, generation)
+	return nil
+}
+
 func TestControllerCancellationDuringActivationCannotCommitSuccess(t *testing.T) {
 	runtime := newTestRuntime()
 	observer := &blockingConfigurationObserver{activated: make(chan struct{}), release: make(chan struct{})}
@@ -539,6 +552,48 @@ func TestFailedStopReleasesRuntimeAndAllowsReplacement(t *testing.T) {
 	restartResult, err := restart.Wait(t.Context())
 	if err != nil || restartResult.Status != OperationSucceeded {
 		t.Fatalf("restart result=%+v err=%v", restartResult, err)
+	}
+	close(runtime.done)
+}
+
+func TestShutdownDeactivatesRuntimeAfterStopError(t *testing.T) {
+	stopErr := errors.New("graceful shutdown reported an error")
+	runtime := newTestRuntime()
+	runtime.stopErr = stopErr
+	runtime.leaveDoneOpen = true
+	observer := &recordingConfigurationObserver{}
+	controller, err := New(Options{
+		ConfigurationSource:   &testSource{cfg: Configuration{Revision: "cfg_test"}},
+		ConfigurationObserver: observer,
+		RuntimeFactory:        &testFactory{runtime: runtime},
+		OperationID:           func() string { return "op_shutdown" },
+		StopTimeout:           time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := controller.Start(t.Context(), "cfg_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, waitErr := start.Wait(t.Context()); waitErr != nil || result.Status != OperationSucceeded {
+		t.Fatalf("start result=%+v err=%v", result, waitErr)
+	}
+
+	if err := controller.Shutdown(t.Context()); !errors.Is(err, stopErr) {
+		t.Fatalf("Shutdown() error = %v, want %v", err, stopErr)
+	}
+	if state := controller.Snapshot(); state.Service != ServiceStopped || state.Addr != "" {
+		t.Fatalf("state after failed shutdown = %+v", state)
+	}
+	controller.mu.Lock()
+	owned := controller.runtime != nil
+	controller.mu.Unlock()
+	if owned {
+		t.Fatal("Shutdown retained runtime ownership after terminal stop error")
+	}
+	if len(observer.deactivated) != 1 || observer.deactivated[0] != 1 {
+		t.Fatalf("deactivated generations = %v, want [1]", observer.deactivated)
 	}
 	close(runtime.done)
 }

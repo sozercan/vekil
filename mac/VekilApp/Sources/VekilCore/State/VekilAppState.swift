@@ -530,6 +530,7 @@ public final class VekilAppState: ObservableObject {
       || runtimeState.configuration.mode == .managed
       || runtimeState.configuration.selectedExternalPath != nil
       || runtimeState.service == .running
+      || openAtLogin
       || hadPersistedNativeSetupEvidence
 
     if recoveredExistingSetup {

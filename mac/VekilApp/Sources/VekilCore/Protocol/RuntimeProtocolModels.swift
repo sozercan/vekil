@@ -482,16 +482,31 @@ public struct RuntimeConfigurationState: Codable, Sendable, Equatable {
         selectedPath = try container.decodeIfPresent(String.self, forKey: .selectedPath)
         selectedRevision = try container.decodeIfPresent(String.self, forKey: .selectedRevision)
         activeRevision = try container.decodeIfPresent(String.self, forKey: .activeRevision)
-        drift = try container.decodeIfPresent(RuntimeConfigurationDrift.self, forKey: .driftStatus)
+        let errorCode = try container.decodeIfPresent(String.self, forKey: .errorCode)
+        let reportedDrift = try container.decodeIfPresent(RuntimeConfigurationDrift.self, forKey: .driftStatus)
             ?? container.decodeIfPresent(RuntimeConfigurationDrift.self, forKey: .drift)
             ?? ((try container.decodeIfPresent(Bool.self, forKey: .drifted) ?? false) ? .drifted : .none)
+        drift = Self.drift(forErrorCode: errorCode) ?? reportedDrift
         lastError = try container.decodeIfPresent(RuntimeStructuredError.self, forKey: .lastError)
         secretProjections = try container.decodeIfPresent(
             [RuntimeSecretProjectionRequirement].self,
             forKey: .secretProjections
         ) ?? []
-        if lastError == nil, let code = try container.decodeIfPresent(String.self, forKey: .errorCode), !code.isEmpty {
+        if lastError == nil, let code = errorCode, !code.isEmpty {
             lastError = RuntimeStructuredError(code: code, userMessage: "The selected configuration is unavailable.", retryable: false, fieldErrors: [])
+        }
+    }
+
+    private static func drift(forErrorCode code: String?) -> RuntimeConfigurationDrift? {
+        switch code {
+        case "missing_config":
+            return .missing
+        case "unsafe_symlink", "unsafe_file_type":
+            return .unsafe
+        case "invalid_config", "config_too_large", "config_unavailable":
+            return .invalid
+        default:
+            return nil
         }
     }
 

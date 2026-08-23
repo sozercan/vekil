@@ -476,6 +476,26 @@ public actor RuntimeController {
         }
     }
 
+    public func refreshSnapshot(timeout: TimeInterval? = nil) async throws -> RuntimeControllerSnapshot {
+        let response = try await send(command: .getState, timeout: timeout)
+        let responseState = try stateEventFromGetStateResponse(response)
+        if let currentState,
+           currentState.helperEpoch == responseState.helperEpoch,
+           currentState.stateRevision >= responseState.stateRevision {
+            return snapshot()
+        }
+        guard acceptRevision(responseState.stateRevision) else {
+            throw RuntimeControllerError.protocolViolation
+        }
+        applyState(responseState)
+        guard let currentState,
+              currentState.helperEpoch == responseState.helperEpoch,
+              currentState.stateRevision >= responseState.stateRevision else {
+            throw RuntimeControllerError.protocolViolation
+        }
+        return snapshot()
+    }
+
     public func submitOperation(
         command: RuntimeCommand,
         payload: JSONValue? = nil,
@@ -867,34 +887,32 @@ public actor RuntimeController {
             } else {
                 preparationState = responseState
             }
-            let context = RuntimeLaunchContext(
-                hello: hello,
-                state: preparationState.payload,
-                isAutomaticRestart: isAutomaticRestart,
-                automaticRestartAttempt: automaticRestartAttempt
-            )
-            let prepared = try await launchPreparation(context)
-            guard session?.id == sessionID else { return }
-
-            for request in prepared {
-                guard request.command == .setSecretProjection else {
-                    throw RuntimeControllerError.invalidLaunchPreparationCommand(request.command)
-                }
-                _ = try await sendInternal(
-                    command: request.command,
-                    payload: request.payload,
-                    timeout: configuration.requestTimeout,
-                    allowDuringReconciliation: true
+            do {
+                let context = RuntimeLaunchContext(
+                    hello: hello,
+                    state: preparationState.payload,
+                    isAutomaticRestart: isAutomaticRestart,
+                    automaticRestartAttempt: automaticRestartAttempt
                 )
-            }
+                let prepared = try await launchPreparation(context)
+                guard session?.id == sessionID else { return }
 
-            if currentState?.helperEpoch != preparationState.helperEpoch
-                || (currentState?.stateRevision ?? 0) < preparationState.stateRevision {
-                guard acceptRevision(preparationState.stateRevision) else {
-                    throw RuntimeControllerError.protocolViolation
+                for request in prepared {
+                    guard request.command == .setSecretProjection else {
+                        throw RuntimeControllerError.invalidLaunchPreparationCommand(request.command)
+                    }
+                    _ = try await sendInternal(
+                        command: request.command,
+                        payload: request.payload,
+                        timeout: configuration.requestTimeout,
+                        allowDuringReconciliation: true
+                    )
                 }
-                applyState(preparationState)
+            } catch {
+                try applyReconciliationStateIfNeeded(preparationState)
+                throw error
             }
+            try applyReconciliationStateIfNeeded(preparationState)
             setConnectionState(.connected)
             resumeConnectionWaiters()
         } catch let error as RuntimeControllerError {
@@ -902,6 +920,18 @@ public actor RuntimeController {
         } catch {
             failSession(sessionID: sessionID, error: .launchPreparationFailed, suppressRestart: true)
         }
+    }
+
+    private func applyReconciliationStateIfNeeded(_ state: RuntimeStateEvent) throws {
+        if let currentState,
+           currentState.helperEpoch == state.helperEpoch,
+           currentState.stateRevision >= state.stateRevision {
+            return
+        }
+        guard acceptRevision(state.stateRevision) else {
+            throw RuntimeControllerError.protocolViolation
+        }
+        applyState(state)
     }
 
     // MARK: Requests and responses

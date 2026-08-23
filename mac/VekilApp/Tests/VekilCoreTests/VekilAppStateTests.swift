@@ -41,6 +41,24 @@ final class VekilAppStateTests: XCTestCase {
     )
   }
 
+  func testRecoveredLoginItemIntentDoesNotForceOnboarding() async {
+    var recovered = AppRuntimeStateSnapshot.connectedStopped
+    recovered.authentication = AppRuntimeAuthentication(state: .signedOut, source: .none)
+    let runtime = RuntimeClientSpy(state: recovered)
+    let preferences = InMemoryVekilPreferencesStore()
+    let login = LoginItemServiceSpy(status: .enabled)
+    let state = makeState(runtime: runtime, preferences: preferences, login: login)
+
+    await assertTrueAsync(await state.initialize())
+
+    XCTAssertTrue(state.openAtLogin)
+    XCTAssertFalse(state.isShowingOnboarding)
+    XCTAssertEqual(
+      preferences.completedOnboardingVersion,
+      VekilAppState.currentOnboardingVersion
+    )
+  }
+
   func testStoredOnboardingCompletionSuppressesAutomaticPresentationButAllowsManualSetup() async {
     let runtime = RuntimeClientSpy()
     let preferences = InMemoryVekilPreferencesStore(completedOnboardingVersion: 1)

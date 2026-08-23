@@ -75,7 +75,25 @@ func (h *helper) switchSelectedConfiguration(ctx context.Context, selectConfigur
 		}
 	}
 	if err != nil {
-		return &ConfigSwitchError{Primary: err, Rollback: h.opts.Configuration.RestoreSelection(previous)}
+		primary := err
+		if restoreErr := h.opts.Configuration.RestoreSelection(previous); restoreErr != nil {
+			return &ConfigSwitchError{Primary: primary, Rollback: restoreErr}
+		}
+		if h.opts.Controller.Snapshot().Service == appcontrol.ServiceRunning {
+			return &ConfigSwitchError{Primary: primary}
+		}
+
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), h.opts.ShutdownTimeout)
+		defer cancel()
+		rollbackStart, rollbackErr := h.opts.Controller.Start(rollbackCtx, previous.SelectedConfigRevision)
+		if rollbackErr == nil {
+			var result appcontrol.OperationResult
+			result, rollbackErr = waitControllerCleanup(h.opts.Controller, rollbackStart, h.opts.ShutdownTimeout)
+			if rollbackErr == nil && result.Status != appcontrol.OperationSucceeded {
+				rollbackErr = result.Err
+			}
+		}
+		return &ConfigSwitchError{Primary: primary, Rollback: rollbackErr}
 	}
 
 	selected := h.opts.Configuration.State()

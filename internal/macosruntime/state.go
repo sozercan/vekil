@@ -59,10 +59,8 @@ func (p *stateProjector) criticalPairLocked(h *helper) (uint64, uint64, eventEnv
 func (p *stateProjector) current(h *helper) (uint64, runtimeStatePayload) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.revision == 0 {
-		p.revision = 1
-		p.last = h.buildStatePayload()
-	}
+	p.revision++
+	p.last = h.buildStatePayload()
 	return p.revision, p.last
 }
 

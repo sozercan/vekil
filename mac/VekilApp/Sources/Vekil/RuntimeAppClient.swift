@@ -53,7 +53,7 @@ actor RuntimeAppClient: AppRuntimeClient {
         }
     }
     func refreshState() async throws -> AppRuntimeStateSnapshot {
-        let snapshot = await controller.snapshot()
+        let snapshot = try await controller.refreshSnapshot()
         guard let identity = snapshot.launchIdentity, let state = snapshot.currentState else { throw RuntimeControllerError.notConnected }
         return Self.map(state, identity: identity)
     }

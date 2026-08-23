@@ -201,11 +201,9 @@ func (c *Controller) Shutdown(ctx context.Context) error {
 	if runtime == nil {
 		return nil
 	}
-	if err := runtime.Stop(ctx); err != nil {
-		return err
-	}
+	err := runtime.Stop(ctx)
 	c.deactivateRuntime(runtime, generation, ServiceStopped, "")
-	return nil
+	return err
 }
 
 func (c *Controller) newOperationLocked(parent context.Context, kind OperationKind, cancelable bool) *activeOperation {

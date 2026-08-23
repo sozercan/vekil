@@ -104,6 +104,37 @@ func TestConfigSelectionFailureRestoresPriorSelectionAndRuntime(t *testing.T) {
 	}
 }
 
+func TestConfigSelectionStopFailureRestoresPriorSelectionAndRuntime(t *testing.T) {
+	stopErr := errors.New("candidate switch stop failed")
+	factory := &revisionRuntimeFactory{newRuntime: func(revision string, call int) *applyRuntime {
+		runtime := newApplyRuntime(nil)
+		if revision == LegacyConfigRevision && call == 1 {
+			runtime.stop = func(context.Context) error { return stopErr }
+		}
+		return runtime
+	}}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	path, _ := writeExternalConfigForSwitchTest(t, "selected-model")
+
+	err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
+		_, selectErr := manager.SelectExternal(ctx, path)
+		return selectErr
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, stopErr) || switchErr.Rollback != nil {
+		t.Fatalf("switch error = %+v, want stop failure with successful restore", err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.RuntimeGeneration != 2 || state.ConfigRevision != LegacyConfigRevision {
+		t.Fatalf("restored runtime = %+v", state)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeLegacy || selection.SelectedPath != "" || selection.SelectedConfigRevision != LegacyConfigRevision {
+		t.Fatalf("restored selection = %+v", selection)
+	}
+}
+
 func TestInvalidExternalSelectionDoesNotStopRunningRuntime(t *testing.T) {
 	factory := &revisionRuntimeFactory{newRuntime: func(string, int) *applyRuntime { return newApplyRuntime(nil) }}
 	manager, controller, h := newConfigSwitchHarness(t, factory)

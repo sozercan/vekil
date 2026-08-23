@@ -87,6 +87,59 @@ final class RuntimeControllerTests: XCTestCase {
         XCTAssertEqual(commands, [.getState, .setSecretProjection])
     }
 
+    func testRefreshSnapshotQueriesHelperAndAppliesFreshState() async throws {
+        let process = FakeRuntimeProcess()
+        let initialState = RuntimeStatePayload(
+            configRevision: "cfg_initial",
+            service: .stopped,
+            readiness: .unknown,
+            auth: .signedIn,
+            configuration: RuntimeConfigurationState(
+                mode: .external,
+                selectedRevision: "cfg_initial"
+            )
+        )
+        let refreshedState = RuntimeStatePayload(
+            configRevision: "cfg_refreshed",
+            service: .stopped,
+            readiness: .unknown,
+            auth: .signedOut,
+            configuration: RuntimeConfigurationState(
+                mode: .external,
+                selectedRevision: "cfg_refreshed",
+                drift: .missing
+            )
+        )
+        process.onRun { [weak process] in
+            process?.emitStandardOutput(try! encodedHello())
+        }
+        process.onWrite { [weak process] data in
+            guard let process, let request = try? requestFromLine(data) else { return }
+            let isRefresh = request.id == "req_refresh"
+            let result = JSONValue.object([
+                "state_revision": .integer(isRefresh ? 2 : 1),
+                "state": try! JSONValue.encode(isRefresh ? refreshedState : initialState),
+            ])
+            process.emitStandardOutput(try! encodedResponse(for: request, result: result))
+        }
+        let controller = RuntimeController(
+            configuration: makeConfiguration(),
+            processFactory: FakeRuntimeProcessFactory([process]),
+            idGenerator: SequenceRuntimeIDGenerator(["req_initial", "req_refresh"])
+        )
+
+        _ = try await controller.connect()
+        let snapshot = try await controller.refreshSnapshot()
+
+        XCTAssertEqual(snapshot.currentState?.stateRevision, 2)
+        XCTAssertEqual(snapshot.currentState?.payload.configRevision, "cfg_refreshed")
+        XCTAssertEqual(snapshot.currentState?.payload.auth, .signedOut)
+        XCTAssertEqual(snapshot.currentState?.payload.configuration?.drift, .missing)
+        let commands = try process.writtenData.map { try requestFromLine($0).command }
+        XCTAssertEqual(commands, [.getState, .getState])
+        await controller.shutdown()
+    }
+
     func testHelloMustBeFirstAndFailureSuppressesRestart() async {
         let process = FakeRuntimeProcess()
         let factory = FakeRuntimeProcessFactory([process])
@@ -750,6 +803,86 @@ final class RuntimeControllerTests: XCTestCase {
 
         let failure = await failedNotification.value
         XCTAssertEqual(failure?.launchIdentity, originalIdentity)
+        await controller.shutdown()
+    }
+
+    func testPostHandshakeRestartPreparationFailurePublishesReplacementStateBeforeFailure() async throws {
+        let first = FakeRuntimeProcess()
+        configureSuccessfulHandshake(process: first, epoch: "hep_original")
+        let second = FakeRuntimeProcess()
+        configureSuccessfulHandshake(process: second, epoch: "hep_replacement")
+        var configuration = makeConfiguration()
+        configuration.restartPolicy = RuntimeRestartPolicy(
+            maximumAutomaticRestarts: 1,
+            window: 60,
+            delays: [0]
+        )
+        let controller = RuntimeController(
+            configuration: configuration,
+            processFactory: FakeRuntimeProcessFactory([first, second]),
+            clock: ManualRuntimeClock(),
+            idGenerator: SequenceRuntimeIDGenerator(["req_original", "req_replacement"]),
+            launchPreparation: { context in
+                if context.isAutomaticRestart {
+                    throw RuntimeTestError.synthetic
+                }
+                return []
+            }
+        )
+        _ = try await controller.connect()
+        let stream = await controller.scopedNotificationStream()
+
+        first.emitExit(status: 1)
+        try await eventually {
+            await controller.connectionState == .failed(.launchPreparationFailed)
+        }
+
+        let snapshot = await controller.snapshot()
+        let replacementIdentity = try XCTUnwrap(snapshot.launchIdentity)
+        XCTAssertEqual(replacementIdentity.helperEpoch, "hep_replacement")
+        XCTAssertEqual(snapshot.currentState?.helperEpoch, "hep_replacement")
+        let notifications = try await withThrowingTaskGroup(
+            of: [RuntimeScopedNotification].self
+        ) { group in
+            group.addTask {
+                var notifications: [RuntimeScopedNotification] = []
+                for await scoped in stream {
+                    try Task.checkCancellation()
+                    notifications.append(scoped)
+                    if case .connectionStateChanged(.failed(.launchPreparationFailed)) = scoped.notification {
+                        return notifications
+                    }
+                }
+                return notifications
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+                throw RuntimeTestError.timedOut
+            }
+            guard let result = try await group.next() else {
+                throw RuntimeTestError.timedOut
+            }
+            group.cancelAll()
+            return result
+        }
+        let replacementStateIndex = try XCTUnwrap(notifications.firstIndex { scoped in
+            guard scoped.launchIdentity == replacementIdentity else { return false }
+            if case let .state(state) = scoped.notification {
+                return state.helperEpoch == "hep_replacement"
+            }
+            return false
+        })
+        let failureIndex = try XCTUnwrap(notifications.firstIndex { scoped in
+            guard scoped.launchIdentity == replacementIdentity else { return false }
+            if case .connectionStateChanged(.failed(.launchPreparationFailed)) = scoped.notification {
+                return true
+            }
+            return false
+        })
+        XCTAssertLessThan(replacementStateIndex, failureIndex)
+
+        second.emitExit(status: 1)
+        try await eventually { await controller.snapshot().launchIdentity == nil }
         await controller.shutdown()
     }
 

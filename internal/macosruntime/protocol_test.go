@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -363,5 +364,45 @@ func TestStateProjectorCriticalPairsAllocateConsecutiveRevisions(t *testing.T) {
 		if pair.state != pair.event+1 {
 			t.Fatalf("critical pair interleaved: event=%d state=%d", pair.event, pair.state)
 		}
+	}
+}
+
+func TestStateProjectorCurrentRebuildsExternalConfigurationState(t *testing.T) {
+	path, initialRevision := writeExternalConfigForSwitchTest(t, "initial-model")
+	manager := newManagerForTest(t)
+	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := appcontrol.New(appcontrol.Options{
+		ConfigurationSource: manager,
+		RuntimeFactory: runtimeFactoryFunc(func(context.Context, appcontrol.Configuration) (appcontrol.Runtime, error) {
+			return newTestRuntimeForHelper(), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &helper{epoch: "hep", opts: HelperOptions{Controller: controller, Configuration: manager}}
+
+	firstStateRevision, first := h.projector.current(h)
+	if first.Configuration.SelectedRevision != initialRevision {
+		t.Fatalf("initial selected revision = %q, want %q", first.Configuration.SelectedRevision, initialRevision)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := bytes.Replace(body, []byte("initial-model"), []byte("updated-model"), 1)
+	if err := os.WriteFile(path, updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	updatedRevision, _ := configRevision(updated)
+
+	refreshedStateRevision, refreshed := h.projector.current(h)
+	if refreshedStateRevision != firstStateRevision+1 {
+		t.Fatalf("refreshed state revision = %d, want %d", refreshedStateRevision, firstStateRevision+1)
+	}
+	if refreshed.Configuration.SelectedRevision != updatedRevision {
+		t.Fatalf("refreshed selected revision = %q, want %q", refreshed.Configuration.SelectedRevision, updatedRevision)
 	}
 }

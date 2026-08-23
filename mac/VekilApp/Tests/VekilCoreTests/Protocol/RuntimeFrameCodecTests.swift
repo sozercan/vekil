@@ -174,6 +174,28 @@ final class RuntimeFrameCodecTests: XCTestCase {
         XCTAssertEqual(configuration.drift, .drifted)
     }
 
+    func testConfigurationErrorsMapToBlockingDriftStates() throws {
+        let cases: [(String, RuntimeConfigurationDrift)] = [
+            ("missing_config", .missing),
+            ("unsafe_symlink", .unsafe),
+            ("unsafe_file_type", .unsafe),
+            ("invalid_config", .invalid),
+            ("config_too_large", .invalid),
+            ("config_unavailable", .invalid),
+        ]
+
+        for (code, expected) in cases {
+            let configuration = try JSONDecoder().decode(
+                RuntimeConfigurationState.self,
+                from: Data(
+                    #"{"selected_mode":"external","drifted":false,"error_code":"\#(code)"}"#.utf8
+                )
+            )
+            XCTAssertEqual(configuration.drift, expected, "error_code=\(code)")
+            XCTAssertEqual(configuration.lastError?.code, code)
+        }
+    }
+
     func testExpectedStartRevisionPrefersTheStoppedSelection() {
         let state = RuntimeStatePayload(
             configRevision: "cfg_previous_runtime",
