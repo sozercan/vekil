@@ -593,9 +593,15 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, bod
 type bodyCopyWriter struct {
 	w        http.ResponseWriter
 	writeErr error
+	prepared bool
 }
 
 func (w *bodyCopyWriter) Write(p []byte) (int, error) {
+	if !w.prepared {
+		w.w.Header().Set("Content-Type", "application/json")
+		w.w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.prepared = true
+	}
 	n, err := w.w.Write(p)
 	if err != nil {
 		w.writeErr = err

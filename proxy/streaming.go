@@ -82,16 +82,25 @@ type commitTrackingResponseWriter struct {
 }
 
 func (w *commitTrackingResponseWriter) WriteHeader(status int) {
+	if !w.committed {
+		setSSEHeaders(w.ResponseWriter)
+	}
 	w.committed = true
 	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *commitTrackingResponseWriter) Write(p []byte) (int, error) {
+	if !w.committed {
+		setSSEHeaders(w.ResponseWriter)
+	}
 	w.committed = true
 	return w.ResponseWriter.Write(p)
 }
 
 func (w *commitTrackingResponseWriter) Flush() {
+	if !w.committed {
+		setSSEHeaders(w.ResponseWriter)
+	}
 	w.committed = true
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
@@ -136,6 +145,7 @@ func parseSSELine(line string) (string, bool) {
 
 func setSSEHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 }
@@ -800,12 +810,17 @@ func consumeOpenAIStreamChunksWithProgress(r io.Reader, onChunk func(models.Open
 
 // flushWriter wraps an http.ResponseWriter and flushes after every Write.
 type flushWriter struct {
-	w        http.ResponseWriter
-	flusher  http.Flusher
-	writeErr error
+	w         http.ResponseWriter
+	flusher   http.Flusher
+	writeErr  error
+	committed bool
 }
 
 func (fw *flushWriter) Write(p []byte) (int, error) {
+	if !fw.committed {
+		setSSEHeaders(fw.w)
+		fw.committed = true
+	}
 	n, err := fw.w.Write(p)
 	if err != nil {
 		// Record that the failure came from writing to the client (e.g. the client

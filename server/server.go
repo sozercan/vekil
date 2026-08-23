@@ -107,17 +107,19 @@ func WithCompactUpstreamMaxAttempts(max int) Option {
 
 type responseRecorder struct {
 	http.ResponseWriter
-	status int
-	bytes  int64
+	status                int
+	bytes                 int64
+	trustedBrowserContent bool
 }
 
 var responseRecorderPool = sync.Pool{
 	New: func() any { return new(responseRecorder) },
 }
 
-func acquireResponseRecorder(w http.ResponseWriter) *responseRecorder {
+func acquireResponseRecorder(w http.ResponseWriter, trustedBrowserContent bool) *responseRecorder {
 	recorder := responseRecorderPool.Get().(*responseRecorder)
 	recorder.ResponseWriter = w
+	recorder.trustedBrowserContent = trustedBrowserContent
 	return recorder
 }
 
@@ -128,19 +130,44 @@ func releaseResponseRecorder(recorder *responseRecorder) {
 	recorder.ResponseWriter = nil
 	recorder.status = 0
 	recorder.bytes = 0
+	recorder.trustedBrowserContent = false
 	responseRecorderPool.Put(recorder)
+}
+
+func (r *responseRecorder) prepareHeaders() {
+	header := r.ResponseWriter.Header()
+	header.Set("X-Content-Type-Options", "nosniff")
+	if r.trustedBrowserContent {
+		return
+	}
+	contentType := strings.TrimSpace(header.Get("Content-Type"))
+	mediaType := contentType
+	if separator := strings.IndexByte(mediaType, ';'); separator >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:separator])
+	}
+	if strings.EqualFold(mediaType, "text/event-stream") {
+		if contentType != "text/event-stream" {
+			header.Set("Content-Type", "text/event-stream")
+		}
+		return
+	}
+	if contentType != "application/json" {
+		header.Set("Content-Type", "application/json")
+	}
 }
 
 func (r *responseRecorder) WriteHeader(status int) {
 	if r.status != 0 {
 		return
 	}
+	r.prepareHeaders()
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
 }
 
 func (r *responseRecorder) Write(p []byte) (int, error) {
 	if r.status == 0 {
+		r.prepareHeaders()
 		r.status = http.StatusOK
 	}
 	n, err := r.ResponseWriter.Write(p)
@@ -149,6 +176,10 @@ func (r *responseRecorder) Write(p []byte) (int, error) {
 }
 
 func (r *responseRecorder) Flush() {
+	if r.status == 0 {
+		r.prepareHeaders()
+		r.status = http.StatusOK
+	}
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -199,6 +230,7 @@ func withInboundAuth(next http.Handler, token string) http.Handler {
 		}
 		if len(provided) != len(token) || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
 			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = io.WriteString(w, `{"error":{"message":"unauthorized"}}`)
@@ -236,7 +268,7 @@ func withProviderValidationGate(next http.Handler, handler startupReadinessGate)
 func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		recorder := acquireResponseRecorder(w)
+		recorder := acquireResponseRecorder(w, servesTrustedBrowserContent(r))
 		defer releaseResponseRecorder(recorder)
 		ctx, summary, ownsSummary := proxy.AcquireRequestSummary(r.Context())
 		if ownsSummary {
@@ -315,6 +347,18 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 			log.Info("request completed", fields...)
 		}
 	})
+}
+
+func servesTrustedBrowserContent(r *http.Request) bool {
+	if r == nil || r.URL == nil || r.Method != http.MethodGet {
+		return false
+	}
+	switch r.URL.Path {
+	case "/dashboard", "/dashboard/uPlot.min.js", "/dashboard/uPlot.min.css":
+		return true
+	default:
+		return false
+	}
 }
 
 // New creates a Server with routes and timeouts configured.

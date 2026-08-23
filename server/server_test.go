@@ -274,6 +274,185 @@ func TestProviderValidationGatePreservesStartupPrecedence(t *testing.T) {
 	}
 }
 
+func TestRequestLogEnforcesSafeResponseContentTypes(t *testing.T) {
+	tests := []struct {
+		name            string
+		method          string
+		path            string
+		contentType     string
+		wantContentType string
+	}{
+		{
+			name:            "API overrides upstream HTML",
+			method:          http.MethodPost,
+			path:            "/v1/responses",
+			contentType:     "text/html; charset=utf-8",
+			wantContentType: "application/json",
+		},
+		{
+			name:            "API defaults missing type to JSON",
+			method:          http.MethodPost,
+			path:            "/v1/messages",
+			wantContentType: "application/json",
+		},
+		{
+			name:            "API preserves JSON",
+			method:          http.MethodPost,
+			path:            "/v1/chat/completions",
+			contentType:     "application/json",
+			wantContentType: "application/json",
+		},
+		{
+			name:            "API preserves SSE",
+			method:          http.MethodPost,
+			path:            "/v1/responses",
+			contentType:     "text/event-stream",
+			wantContentType: "text/event-stream",
+		},
+		{
+			name:            "dashboard preserves HTML",
+			method:          http.MethodGet,
+			path:            "/dashboard",
+			contentType:     "text/html; charset=utf-8",
+			wantContentType: "text/html; charset=utf-8",
+		},
+		{
+			name:            "dashboard preserves JavaScript",
+			method:          http.MethodGet,
+			path:            "/dashboard/uPlot.min.js",
+			contentType:     "text/javascript; charset=utf-8",
+			wantContentType: "text/javascript; charset=utf-8",
+		},
+		{
+			name:            "dashboard preserves CSS",
+			method:          http.MethodGet,
+			path:            "/dashboard/uPlot.min.css",
+			contentType:     "text/css; charset=utf-8",
+			wantContentType: "text/css; charset=utf-8",
+		},
+		{
+			name:            "unknown dashboard asset cannot opt into HTML",
+			method:          http.MethodGet,
+			path:            "/dashboard/evil.html",
+			contentType:     "text/html; charset=utf-8",
+			wantContentType: "application/json",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.contentType != "" {
+					w.Header().Set("Content-Type", tc.contentType)
+				}
+				_, _ = io.WriteString(w, `<script>alert("xss")</script>`)
+			})
+			handler := withRequestLog(next, logger.NewWithWriter(logger.LevelError, io.Discard), nil)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.path, nil))
+
+			resp := recorder.Result()
+			if got := resp.Header.Get("Content-Type"); got != tc.wantContentType {
+				t.Fatalf("Content-Type = %q, want %q", got, tc.wantContentType)
+			}
+			if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+			}
+		})
+	}
+}
+
+func TestServerOverridesExecutableUpstreamContentType(t *testing.T) {
+	const payload = `<script>alert("upstream")</script>`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("upstream path = %q, want /responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, payload)
+	}))
+	defer upstream.Close()
+
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+		WithProxyOptions(proxy.WithProvidersConfig(proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{{
+			ID:             "local",
+			Type:           "openai-compatible",
+			Default:        true,
+			BaseURL:        upstream.URL,
+			AuthType:       "none",
+			ModelDiscovery: "static",
+			Models: []proxy.ProviderModelConfig{{
+				PublicID:  "test-model",
+				Endpoints: []string{"/responses"},
+			}},
+		}}})),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model","input":"reflect me"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recorder, req)
+
+	resp := recorder.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, recorder.Body.String())
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := recorder.Body.String(); got != payload {
+		t.Fatalf("body = %q, want byte-exact upstream payload", got)
+	}
+}
+
+func TestServerPreservesTrustedDashboardContentTypes(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	for _, tc := range []struct {
+		path            string
+		wantStatus      int
+		wantContentType string
+	}{
+		{path: "/dashboard", wantStatus: http.StatusOK, wantContentType: "text/html; charset=utf-8"},
+		{path: "/dashboard/uPlot.min.js", wantStatus: http.StatusOK, wantContentType: "text/javascript; charset=utf-8"},
+		{path: "/dashboard/uPlot.min.css", wantStatus: http.StatusOK, wantContentType: "text/css; charset=utf-8"},
+		{path: "/dashboard/evil.html", wantStatus: http.StatusNotFound, wantContentType: "application/json"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			srv.httpServer.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			resp := recorder.Result()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, recorder.Body.String())
+			}
+			if got := resp.Header.Get("Content-Type"); got != tc.wantContentType {
+				t.Fatalf("Content-Type = %q, want %q", got, tc.wantContentType)
+			}
+			if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+			}
+		})
+	}
+}
+
 func TestServerBlocksNonHealthRoutesWhileStartupAuthenticationPending(t *testing.T) {
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
@@ -593,6 +772,9 @@ func TestStreamingChatCompletionsPassthroughThroughServer(t *testing.T) {
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
 	}
 
 	streamed, _ := io.ReadAll(resp.Body)
@@ -1982,6 +2164,9 @@ func TestInboundAuthProtectsLaunchRoutes(t *testing.T) {
 			srv.httpServer.Handler.ServeHTTP(recorder, req)
 			if recorder.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, tc.wantStatus, recorder.Body.String())
+			}
+			if got := recorder.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
 			}
 		})
 	}
