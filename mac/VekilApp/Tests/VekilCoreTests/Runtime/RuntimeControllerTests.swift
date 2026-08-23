@@ -750,6 +750,7 @@ final class RuntimeControllerTests: XCTestCase {
             try await eventually {
                 await controller.connectionState == .restarting(attempt: attempt + 1, delay: expectedDelay)
             }
+            try await eventually { clock.recordedSleeps.contains(expectedDelay) }
             clock.advance(by: expectedDelay)
             try await eventually { await controller.connectionState == .connected }
         }
