@@ -152,6 +152,9 @@ func safeAPIResponseContentType(contentType string) string {
 	if strings.EqualFold(mediaType, "text/event-stream") {
 		return "text/event-stream"
 	}
+	if strings.EqualFold(mediaType, "text/plain") {
+		return contentType
+	}
 	return "application/json"
 }
 

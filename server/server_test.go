@@ -310,6 +310,13 @@ func TestRequestLogEnforcesSafeResponseContentTypes(t *testing.T) {
 			wantContentType: "text/event-stream",
 		},
 		{
+			name:            "API preserves plain text errors",
+			method:          http.MethodGet,
+			path:            "/v1/responses",
+			contentType:     "text/plain; charset=utf-8",
+			wantContentType: "text/plain; charset=utf-8",
+		},
+		{
 			name:            "dashboard preserves HTML",
 			method:          http.MethodGet,
 			path:            "/dashboard",
@@ -390,6 +397,62 @@ func TestRequestLogEnforcesSafeResponseContentTypes(t *testing.T) {
 	}
 }
 
+func TestServerPreservesPlainTextWebSocketUpgradeError(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
+	resp := recorder.Result()
+	if resp.StatusCode != http.StatusUpgradeRequired {
+		t.Fatalf("status = %d, want 426; body=%s", resp.StatusCode, recorder.Body.String())
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want text/plain; charset=utf-8", got)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := recorder.Body.String(); got != http.StatusText(http.StatusUpgradeRequired)+"\n" {
+		t.Fatalf("body = %q, want Upgrade Required newline", got)
+	}
+}
+
+func TestServerPreservesPlainTextMethodMismatch(t *testing.T) {
+	srv, err := New(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		"127.0.0.1",
+		"0",
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/v1/responses", nil))
+	resp := recorder.Result()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405; body=%s", resp.StatusCode, recorder.Body.String())
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want text/plain; charset=utf-8", got)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := recorder.Body.String(); got != http.StatusText(http.StatusMethodNotAllowed)+"\n" {
+		t.Fatalf("body = %q, want Method Not Allowed newline", got)
+	}
+}
+
 func TestServerOverridesExecutableUpstreamContentType(t *testing.T) {
 	const payload = `<script>alert("upstream")</script>`
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -462,7 +525,7 @@ func TestServerPreservesTrustedDashboardContentTypes(t *testing.T) {
 		{path: "/dashboard", wantStatus: http.StatusOK, wantContentType: "text/html; charset=utf-8"},
 		{path: "/dashboard/uPlot.min.js", wantStatus: http.StatusOK, wantContentType: "text/javascript; charset=utf-8"},
 		{path: "/dashboard/uPlot.min.css", wantStatus: http.StatusOK, wantContentType: "text/css; charset=utf-8"},
-		{path: "/dashboard/evil.html", wantStatus: http.StatusNotFound, wantContentType: "application/json"},
+		{path: "/dashboard/evil.html", wantStatus: http.StatusNotFound, wantContentType: "text/plain; charset=utf-8"},
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
