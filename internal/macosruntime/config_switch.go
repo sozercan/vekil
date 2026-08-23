@@ -50,6 +50,8 @@ func (h *helper) runConfigSelectionOperation(operation *coordinatedOperation, se
 
 func (h *helper) switchSelectedConfiguration(ctx context.Context, selectConfiguration func(context.Context) error) error {
 	previous := h.opts.Configuration.State()
+	h.opts.Configuration.beginSelectionSwitch(previous)
+	defer h.opts.Configuration.endSelectionSwitch()
 	wasRunning := h.opts.Controller.Snapshot().Service == appcontrol.ServiceRunning
 	if err := selectConfiguration(ctx); err != nil {
 		return err

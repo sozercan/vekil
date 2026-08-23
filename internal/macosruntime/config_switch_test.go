@@ -17,18 +17,27 @@ import (
 func writeExternalConfigForSwitchTest(t *testing.T, model string) (string, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "providers.yaml")
-	revision := writeExternalConfigAtPathForSwitchTest(t, path, model)
-	return path, revision
-}
-
-func writeExternalConfigAtPathForSwitchTest(t *testing.T, path, model string) string {
-	t.Helper()
-	body := []byte("schema_version: 2\nproviders:\n  - id: local\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: " + model + "\n        endpoints: [/chat/completions]\n")
+	body := externalConfigBodyForSwitchTest(model)
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	revision, _ := configRevision(body)
-	return revision
+	return path, revision
+}
+
+func externalConfigBodyForSwitchTest(model string) []byte {
+	return []byte("schema_version: 2\nproviders:\n  - id: local\n    type: openai-compatible\n    default: true\n    base_url: https://example.test/v1\n    auth_type: none\n    model_discovery: static\n    models:\n      - public_id: " + model + "\n        endpoints: [/chat/completions]\n")
+}
+
+func replaceExternalConfigForSwitchTest(t *testing.T, path string, body []byte) {
+	t.Helper()
+	replacement := path + ".replacement"
+	if err := os.WriteFile(replacement, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func newConfigSwitchHarness(t *testing.T, factory appcontrol.RuntimeFactory) (*ConfigManager, *appcontrol.Controller, *helper) {
@@ -66,8 +75,7 @@ func TestConfigSelectionWhileRunningRestartsWithSelectedRevision(t *testing.T) {
 	path, revision := writeExternalConfigForSwitchTest(t, "selected-model")
 
 	if err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
-		_, err := manager.SelectExternal(ctx, path)
-		return err
+		return manager.StageExternal(ctx, path)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -93,8 +101,7 @@ func TestConfigSelectionFailureRestoresPriorSelectionAndRuntime(t *testing.T) {
 	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
 
 	err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
-		_, err := manager.SelectExternal(ctx, path)
-		return err
+		return manager.StageExternal(ctx, path)
 	})
 	var switchErr *ConfigSwitchError
 	if !errors.As(err, &switchErr) || switchErr.Rollback != nil {
@@ -107,6 +114,62 @@ func TestConfigSelectionFailureRestoresPriorSelectionAndRuntime(t *testing.T) {
 	selection := manager.State()
 	if selection.ConfigMode != ConfigModeLegacy || selection.SelectedPath != "" || selection.SelectedConfigRevision != LegacyConfigRevision {
 		t.Fatalf("restored selection = %+v", selection)
+	}
+}
+
+func TestExternalReloadUsesValidatedCandidateAndRollbackSnapshots(t *testing.T) {
+	path, previousRevision := writeExternalConfigForSwitchTest(t, "previous-model")
+	candidateBody := externalConfigBodyForSwitchTest("candidate-model")
+	candidateRevision, _ := configRevision(candidateBody)
+	candidateErr := errors.New("candidate start failed")
+	factory := &revisionRuntimeFactory{newRuntime: func(revision string, _ int) *applyRuntime {
+		if revision == candidateRevision {
+			return newApplyRuntime(candidateErr)
+		}
+		return newApplyRuntime(nil)
+	}}
+	manager, controller, h := newConfigSwitchHarness(t, factory)
+	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	startConfigSwitchHarness(t, controller, previousRevision)
+	replaceExternalConfigForSwitchTest(t, path, candidateBody)
+
+	err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
+		if stageErr := manager.StageReloadExternal(ctx); stageErr != nil {
+			return stageErr
+		}
+		replaceExternalConfigForSwitchTest(t, path, []byte("not: [valid"))
+		return nil
+	})
+	var switchErr *ConfigSwitchError
+	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, candidateErr) || switchErr.Rollback != nil {
+		t.Fatalf("switch error = %+v, want candidate failure with successful snapshot rollback", err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != previousRevision {
+		t.Fatalf("restored runtime = %+v", state)
+	}
+	selection := manager.State()
+	if selection.ConfigMode != ConfigModeExternal || selection.SelectedPath != path || selection.SelectedConfigRevision != previousRevision {
+		t.Fatalf("restored selection = %+v", selection)
+	}
+
+	stop, stopErr := controller.Stop(t.Context())
+	if stopErr != nil {
+		t.Fatal(stopErr)
+	}
+	stopResult, stopWaitErr := stop.Wait(t.Context())
+	if stopWaitErr != nil || stopResult.Status != appcontrol.OperationSucceeded {
+		t.Fatalf("stop result=%+v err=%v", stopResult, stopWaitErr)
+	}
+	restart, restartErr := controller.Start(t.Context(), previousRevision)
+	if restartErr != nil {
+		t.Fatal(restartErr)
+	}
+	restartResult, restartWaitErr := restart.Wait(t.Context())
+	if restartWaitErr != nil || restartResult.Status != appcontrol.OperationFailed || restartResult.Err == nil {
+		t.Fatalf("restart result=%+v err=%v, want invalid current file after transaction snapshot expires", restartResult, restartWaitErr)
 	}
 }
 
@@ -124,8 +187,7 @@ func TestConfigSelectionStopFailureRestoresPriorSelectionAndRuntime(t *testing.T
 	path, _ := writeExternalConfigForSwitchTest(t, "selected-model")
 
 	err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
-		_, selectErr := manager.SelectExternal(ctx, path)
-		return selectErr
+		return manager.StageExternal(ctx, path)
 	})
 	var switchErr *ConfigSwitchError
 	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, stopErr) || switchErr.Rollback != nil {
@@ -226,8 +288,7 @@ func TestCanceledRunningConfigSelectionAfterCandidateReadyRestoresPriorRuntime(t
 	h.beforeSelectionCommit = cancel
 
 	err := h.switchSelectedConfiguration(ctx, func(opCtx context.Context) error {
-		_, selectErr := manager.SelectExternal(opCtx, path)
-		return selectErr
+		return manager.StageExternal(opCtx, path)
 	})
 	var switchErr *ConfigSwitchError
 	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, context.Canceled) || switchErr.Rollback != nil {
@@ -276,8 +337,7 @@ func TestConfigSelectionWaitsForNonCancelableStopBeforeRestoringSelection(t *tes
 	done := make(chan error, 1)
 	go func() {
 		done <- h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
-			_, err := manager.SelectExternal(ctx, path)
-			return err
+			return manager.StageExternal(ctx, path)
 		})
 	}()
 
@@ -325,12 +385,15 @@ func TestReloadExternalConfigUsesValidatedSnapshotAcrossRestart(t *testing.T) {
 	}
 	startConfigSwitchHarness(t, controller, oldRevision)
 
-	newRevision := writeExternalConfigAtPathForSwitchTest(t, path, "new-model")
+	candidateBody := externalConfigBodyForSwitchTest("new-model")
+	newRevision, _ := configRevision(candidateBody)
+	replaceExternalConfigForSwitchTest(t, path, candidateBody)
 	if err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
 		if err := manager.StageReloadExternal(ctx); err != nil {
 			return err
 		}
-		return os.WriteFile(path, []byte("not valid: ["), 0o600)
+		replaceExternalConfigForSwitchTest(t, path, []byte("not valid: ["))
+		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -341,43 +404,6 @@ func TestReloadExternalConfigUsesValidatedSnapshotAcrossRestart(t *testing.T) {
 	selection := manager.State()
 	if selection.ConfigMode != ConfigModeExternal || selection.SelectedPath != path || selection.SelectedConfigRevision != newRevision {
 		t.Fatalf("selection = %+v", selection)
-	}
-}
-
-func TestReloadExternalConfigRollbackUsesPriorSnapshot(t *testing.T) {
-	path, oldRevision := writeExternalConfigForSwitchTest(t, "old-model")
-	var newRevision string
-	candidateErr := errors.New("candidate start failed")
-	factory := &revisionRuntimeFactory{newRuntime: func(revision string, _ int) *applyRuntime {
-		if newRevision != "" && revision == newRevision {
-			return newApplyRuntime(candidateErr)
-		}
-		return newApplyRuntime(nil)
-	}}
-	manager, controller, h := newConfigSwitchHarness(t, factory)
-	if _, err := manager.SelectExternal(t.Context(), path); err != nil {
-		t.Fatal(err)
-	}
-	startConfigSwitchHarness(t, controller, oldRevision)
-	newRevision = writeExternalConfigAtPathForSwitchTest(t, path, "new-model")
-
-	err := h.switchSelectedConfiguration(t.Context(), func(ctx context.Context) error {
-		if err := manager.StageReloadExternal(ctx); err != nil {
-			return err
-		}
-		return os.WriteFile(path, []byte("not valid: ["), 0o600)
-	})
-	var switchErr *ConfigSwitchError
-	if !errors.As(err, &switchErr) || !errors.Is(switchErr.Primary, candidateErr) || switchErr.Rollback != nil {
-		t.Fatalf("switch error = %+v, want candidate failure with successful rollback", err)
-	}
-	state := controller.Snapshot()
-	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != oldRevision {
-		t.Fatalf("restored runtime = %+v", state)
-	}
-	selection := manager.State()
-	if selection.ConfigMode != ConfigModeExternal || selection.SelectedPath != path || selection.SelectedConfigRevision != oldRevision {
-		t.Fatalf("restored selection = %+v", selection)
 	}
 }
 

@@ -74,20 +74,38 @@ type ConfigManagerOptions struct {
 type ConfigManager struct {
 	mu sync.Mutex
 
-	paths           Paths
-	uuid            func() string
-	state           PersistentState
-	stagedSelection *PersistentState
-	externalCache   map[externalSnapshotKey][]byte
-	cacheOrder      []externalSnapshotKey
+	paths                 Paths
+	uuid                  func() string
+	state                 PersistentState
+	stagedSelection       *PersistentState
+	selectionSwitchActive bool
+	// The last snapshot represents the currently selected external runtime.
+	// Prepared and rollback snapshots exist only during one selection switch.
+	lastExternalSnapshot     *externalConfigurationSnapshot
+	preparedExternalSnapshot *externalConfigurationSnapshot
+	rollbackExternalSnapshot *externalConfigurationSnapshot
 }
 
-type externalSnapshotKey struct {
+type externalConfigurationSnapshot struct {
 	path     string
 	revision string
+	body     []byte
 }
 
-const maxExternalConfigSnapshots = 8
+func cloneExternalConfigurationSnapshot(snapshot *externalConfigurationSnapshot) *externalConfigurationSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	return &externalConfigurationSnapshot{
+		path:     snapshot.path,
+		revision: snapshot.revision,
+		body:     append([]byte(nil), snapshot.body...),
+	}
+}
+
+func (s *externalConfigurationSnapshot) matches(path, revision string) bool {
+	return s != nil && s.path == strings.TrimSpace(path) && s.revision == revision
+}
 
 // NewConfigManager loads state and resolves any incomplete apply journal before
 // accepting commands.
@@ -176,8 +194,7 @@ func (m *ConfigManager) LoadConfiguration(ctx context.Context) (appcontrol.Confi
 	}
 	m.mu.Lock()
 	state := clonePersistentState(m.state)
-	selectionStaged := m.stagedSelection != nil
-	cachedExternalBody, hasCachedExternalBody := m.externalSnapshotLocked(state.SelectedPath, state.SelectedConfigRevision)
+	preparedExternal := cloneExternalConfigurationSnapshot(m.preparedExternalSnapshot)
 	m.mu.Unlock()
 
 	switch state.ConfigMode {
@@ -205,45 +222,27 @@ func (m *ConfigManager) LoadConfiguration(ctx context.Context) (appcontrol.Confi
 		if path == "" {
 			return appcontrol.Configuration{}, errors.New("external configuration path is missing")
 		}
-		body := cachedExternalBody
-		usedCachedBody := selectionStaged && hasCachedExternalBody
-		if !usedCachedBody {
+		var body []byte
+		if preparedExternal.matches(path, state.SelectedConfigRevision) {
+			body = append([]byte(nil), preparedExternal.body...)
+		} else {
 			var err error
 			body, _, err = readSecureFile(path, MaxConfigBytes)
 			if err != nil {
-				if !hasCachedExternalBody {
-					return appcontrol.Configuration{}, err
-				}
-				body = cachedExternalBody
-				usedCachedBody = true
+				return appcontrol.Configuration{}, err
 			}
 		}
 		cfg, err := proxy.LoadProvidersConfigBytes(path, body)
-		if err != nil {
-			if usedCachedBody {
-				liveBody, _, readErr := readSecureFile(path, MaxConfigBytes)
-				if readErr == nil {
-					cfg, err = proxy.LoadProvidersConfigBytes(path, liveBody)
-					if err == nil {
-						body = liveBody
-						usedCachedBody = false
-					}
-				}
-			}
-			if err != nil && hasCachedExternalBody && (!usedCachedBody || !bytes.Equal(body, cachedExternalBody)) {
-				cfg, err = proxy.LoadProvidersConfigBytes(path, cachedExternalBody)
-				if err == nil {
-					body = cachedExternalBody
-					usedCachedBody = true
-				}
-			}
-		}
 		if err != nil {
 			return appcontrol.Configuration{}, err
 		}
 		revision, _ := configRevision(body)
 		m.mu.Lock()
-		m.rememberExternalSnapshotLocked(path, revision, body)
+		m.lastExternalSnapshot = &externalConfigurationSnapshot{
+			path:     path,
+			revision: revision,
+			body:     append([]byte(nil), body...),
+		}
 		m.mu.Unlock()
 		return appcontrol.Configuration{Revision: revision, Value: cfg}, nil
 	default:
@@ -307,10 +306,17 @@ func (m *ConfigManager) StageExternal(ctx context.Context, path string) error {
 	}
 	previous := clonePersistentState(m.state)
 	m.stagedSelection = &previous
+	if !m.selectionSwitchActive {
+		m.rollbackExternalSnapshot = nil
+	}
+	m.preparedExternalSnapshot = &externalConfigurationSnapshot{
+		path:     path,
+		revision: revision,
+		body:     append([]byte(nil), body...),
+	}
 	m.state.ConfigMode = ConfigModeExternal
 	m.state.SelectedPath = path
 	m.state.SelectedConfigRevision = revision
-	m.rememberExternalSnapshotLocked(path, revision, body)
 	return nil
 }
 
@@ -424,7 +430,13 @@ func (m *ConfigManager) CommitSelection() error {
 		return err
 	}
 	if m.stagedSelection == nil {
-		return m.saveStateLocked()
+		if err := m.saveStateLocked(); err != nil {
+			return err
+		}
+		m.preparedExternalSnapshot = nil
+		m.rollbackExternalSnapshot = nil
+		m.pruneLastExternalSnapshotLocked()
+		return nil
 	}
 	previous := m.stagedSelection
 	m.stagedSelection = nil
@@ -432,6 +444,9 @@ func (m *ConfigManager) CommitSelection() error {
 		m.stagedSelection = previous
 		return err
 	}
+	m.preparedExternalSnapshot = nil
+	m.rollbackExternalSnapshot = nil
+	m.pruneLastExternalSnapshotLocked()
 	return nil
 }
 
@@ -455,37 +470,43 @@ func (m *ConfigManager) RestoreSelection(previous PersistentState) error {
 	m.state.ConfigMode = previous.ConfigMode
 	m.state.SelectedPath = previous.SelectedPath
 	m.state.SelectedConfigRevision = previous.SelectedConfigRevision
+	m.preparedExternalSnapshot = nil
+	if previous.ConfigMode == ConfigModeExternal && m.rollbackExternalSnapshot.matches(
+		previous.SelectedPath, previous.SelectedConfigRevision,
+	) {
+		m.preparedExternalSnapshot = cloneExternalConfigurationSnapshot(m.rollbackExternalSnapshot)
+	}
+	m.rollbackExternalSnapshot = nil
 	return m.saveStateLocked()
 }
 
-func (m *ConfigManager) externalSnapshotLocked(path, revision string) ([]byte, bool) {
-	key := externalSnapshotKey{path: strings.TrimSpace(path), revision: strings.TrimSpace(revision)}
-	if key.path == "" || key.revision == "" || len(m.externalCache) == 0 {
-		return nil, false
+func (m *ConfigManager) beginSelectionSwitch(previous PersistentState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.selectionSwitchActive = true
+	m.preparedExternalSnapshot = nil
+	m.rollbackExternalSnapshot = nil
+	if previous.ConfigMode == ConfigModeExternal && m.lastExternalSnapshot.matches(
+		previous.SelectedPath, previous.SelectedConfigRevision,
+	) {
+		m.rollbackExternalSnapshot = cloneExternalConfigurationSnapshot(m.lastExternalSnapshot)
 	}
-	body, ok := m.externalCache[key]
-	if !ok {
-		return nil, false
-	}
-	return bytes.Clone(body), true
 }
 
-func (m *ConfigManager) rememberExternalSnapshotLocked(path, revision string, body []byte) {
-	key := externalSnapshotKey{path: strings.TrimSpace(path), revision: strings.TrimSpace(revision)}
-	if key.path == "" || key.revision == "" || len(body) == 0 {
-		return
-	}
-	if m.externalCache == nil {
-		m.externalCache = make(map[externalSnapshotKey][]byte, maxExternalConfigSnapshots)
-	}
-	if _, exists := m.externalCache[key]; !exists {
-		m.cacheOrder = append(m.cacheOrder, key)
-	}
-	m.externalCache[key] = bytes.Clone(body)
-	for len(m.cacheOrder) > maxExternalConfigSnapshots {
-		evict := m.cacheOrder[0]
-		m.cacheOrder = m.cacheOrder[1:]
-		delete(m.externalCache, evict)
+func (m *ConfigManager) endSelectionSwitch() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.selectionSwitchActive = false
+	m.preparedExternalSnapshot = nil
+	m.rollbackExternalSnapshot = nil
+	m.pruneLastExternalSnapshotLocked()
+}
+
+func (m *ConfigManager) pruneLastExternalSnapshotLocked() {
+	if m.state.ConfigMode != ConfigModeExternal || !m.lastExternalSnapshot.matches(
+		m.state.SelectedPath, m.state.SelectedConfigRevision,
+	) {
+		m.lastExternalSnapshot = nil
 	}
 }
 
