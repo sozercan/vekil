@@ -90,11 +90,16 @@ func (w *commitTrackingResponseWriter) WriteHeader(status int) {
 }
 
 func (w *commitTrackingResponseWriter) Write(p []byte) (int, error) {
+	writer := w.ResponseWriter
 	if !w.committed {
-		setSSEHeaders(w.ResponseWriter)
+		header := writer.Header()
+		header.Set("Content-Type", "text/event-stream")
+		header.Set("X-Content-Type-Options", "nosniff")
+		header.Set("Cache-Control", "no-cache")
+		header.Set("Connection", "keep-alive")
 	}
 	w.committed = true
-	return w.ResponseWriter.Write(p)
+	return writer.Write(p)
 }
 
 func (w *commitTrackingResponseWriter) Flush() {
@@ -818,7 +823,11 @@ type flushWriter struct {
 
 func (fw *flushWriter) Write(p []byte) (int, error) {
 	if !fw.committed {
-		setSSEHeaders(fw.w)
+		header := fw.w.Header()
+		header.Set("Content-Type", "text/event-stream")
+		header.Set("X-Content-Type-Options", "nosniff")
+		header.Set("Cache-Control", "no-cache")
+		header.Set("Connection", "keep-alive")
 		fw.committed = true
 	}
 	n, err := fw.w.Write(p)

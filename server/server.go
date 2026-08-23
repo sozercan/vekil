@@ -135,25 +135,24 @@ func releaseResponseRecorder(recorder *responseRecorder) {
 }
 
 func (r *responseRecorder) prepareHeaders() {
-	header := r.ResponseWriter.Header()
+	header := r.Header()
 	header.Set("X-Content-Type-Options", "nosniff")
 	if r.trustedBrowserContent {
 		return
 	}
-	contentType := strings.TrimSpace(header.Get("Content-Type"))
+	header.Set("Content-Type", safeAPIResponseContentType(header.Get("Content-Type")))
+}
+
+func safeAPIResponseContentType(contentType string) string {
+	contentType = strings.TrimSpace(contentType)
 	mediaType := contentType
 	if separator := strings.IndexByte(mediaType, ';'); separator >= 0 {
 		mediaType = strings.TrimSpace(mediaType[:separator])
 	}
 	if strings.EqualFold(mediaType, "text/event-stream") {
-		if contentType != "text/event-stream" {
-			header.Set("Content-Type", "text/event-stream")
-		}
-		return
+		return "text/event-stream"
 	}
-	if contentType != "application/json" {
-		header.Set("Content-Type", "application/json")
-	}
+	return "application/json"
 }
 
 func (r *responseRecorder) WriteHeader(status int) {
@@ -166,11 +165,16 @@ func (r *responseRecorder) WriteHeader(status int) {
 }
 
 func (r *responseRecorder) Write(p []byte) (int, error) {
+	writer := r.ResponseWriter
 	if r.status == 0 {
-		r.prepareHeaders()
+		header := writer.Header()
+		header.Set("X-Content-Type-Options", "nosniff")
+		if !r.trustedBrowserContent {
+			header.Set("Content-Type", safeAPIResponseContentType(header.Get("Content-Type")))
+		}
 		r.status = http.StatusOK
 	}
-	n, err := r.ResponseWriter.Write(p)
+	n, err := writer.Write(p)
 	r.bytes += int64(n)
 	return n, err
 }
