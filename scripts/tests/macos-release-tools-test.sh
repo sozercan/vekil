@@ -345,6 +345,20 @@ expect_failure env \
   MACOS_HOMEBREW_INSTALL_TESTED_SHA256="${sha256}" \
   MACOS_FORWARD_REVERT_TESTED_SHA256="${sha256}" \
   "${REPO_ROOT}/scripts/verify-macos-release-gates.sh" "${artifact}" "${sha_file}"
+expect_failure env \
+  MACOS_RELEASE=1 \
+  MACOS_MANAGED_CONFIG_SHIPPING=true \
+  MACOS_N_MINUS_ONE_UPDATE_TESTED_SHA256="${sha256}" \
+  MACOS_HOMEBREW_INSTALL_TESTED_SHA256="${sha256}" \
+  MACOS_FORWARD_REVERT_TESTED_SHA256="${sha256}" \
+  "${REPO_ROOT}/scripts/verify-macos-release-gates.sh" "${artifact}" "${sha_file}"
+expect_failure env \
+  MACOS_RELEASE=1 \
+  MACOS_MANAGED_CONFIG_SHIPPING=2 \
+  MACOS_N_MINUS_ONE_UPDATE_TESTED_SHA256="${sha256}" \
+  MACOS_HOMEBREW_INSTALL_TESTED_SHA256="${sha256}" \
+  MACOS_FORWARD_REVERT_TESTED_SHA256="${sha256}" \
+  "${REPO_ROOT}/scripts/verify-macos-release-gates.sh" "${artifact}" "${sha_file}"
 
 sparkle_fixture="${TMP_ROOT}/sparkle-fixture"
 sparkle_source="${sparkle_fixture}/source"

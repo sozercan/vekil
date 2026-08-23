@@ -35,7 +35,13 @@ require_digest_gate MACOS_HOMEBREW_INSTALL_TESTED_SHA256 \
 require_digest_gate MACOS_FORWARD_REVERT_TESTED_SHA256 \
   "a higher-CFBundleVersion forward-revert recovered from this exact candidate"
 
-if [[ "${MACOS_MANAGED_CONFIG_SHIPPING:-0}" == 1 ]]; then
+managed_config_shipping="${MACOS_MANAGED_CONFIG_SHIPPING:-0}"
+case "${managed_config_shipping}" in
+  0|1) ;;
+  *) die "MACOS_MANAGED_CONFIG_SHIPPING must be 0 or 1" ;;
+esac
+
+if [[ "${managed_config_shipping}" == 1 ]]; then
   require_digest_gate MACOS_KEYCHAIN_CONTINUITY_TESTED_SHA256 \
     "Keychain create/read/update/delete continuity passed across an A-to-B Sparkle update"
 else
