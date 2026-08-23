@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,10 @@ func TestParseOptionsSupportsInjectedHostAndPortZero(t *testing.T) {
 }
 
 func TestRunEmitsLdflagsHelloFirstAndKeepsStdoutProtocolOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("macOS runtime state lock is unavailable on Windows")
+	}
+
 	previousBuild := buildVersion
 	previousBundle := bundleBuildID
 	buildVersion = "1.2.3-test"
@@ -68,6 +73,10 @@ func TestRunEmitsLdflagsHelloFirstAndKeepsStdoutProtocolOnly(t *testing.T) {
 }
 
 func TestRunWaitsForPreviousHelperStateOwner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("macOS runtime state lock is unavailable on Windows")
+	}
+
 	stateDir := t.TempDir()
 	lock, err := macosruntime.AcquireHelperStateLock(
 		context.Background(),
