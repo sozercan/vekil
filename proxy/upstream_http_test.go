@@ -244,6 +244,7 @@ func TestRewriteAnthropicResponseModelJSONFastFallsBackForAmbiguousShapes(t *tes
 		body string
 	}{
 		{name: "duplicate model", body: `{"model":"first","model":"second"}`},
+		{name: "case-folded model alias", body: `{"model":"claude-upstream","Model":"shadow"}`},
 		{name: "escaped model key", body: `{"mo\u0064el":"claude-upstream"}`},
 		{name: "escaped model value", body: `{"model":"claude-\u0075pstream"}`},
 		{name: "nested message", body: `{"model":"claude-upstream","message":{"model":"claude-upstream"}}`},
@@ -254,6 +255,40 @@ func TestRewriteAnthropicResponseModelJSONFastFallsBackForAmbiguousShapes(t *tes
 			_, _, ok := rewriteAnthropicResponseModelJSONFast([]byte(tt.body), json.RawMessage(`"claude-public"`))
 			if ok {
 				t.Fatal("rewriteAnthropicResponseModelJSONFast() ok = true, want fallback")
+			}
+		})
+	}
+}
+
+func TestWriteDirectAnthropicJSONResponseFallsBackForCaseFoldedModelAlias(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "exact then alias", body: `{"id":"msg","model":"claude-upstream","Model":"shadow","content":[]}`},
+		{name: "alias only", body: `{"id":"msg","Model":"claude-upstream","content":[]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Type": []string{"application/json"}, "Content-Length": []string{strconv.Itoa(len(tt.body))}},
+				Body:          io.NopCloser(strings.NewReader(tt.body)),
+				ContentLength: int64(len(tt.body)),
+			}
+			w := httptest.NewRecorder()
+			if err := writeDirectAnthropicJSONResponse(context.Background(), context.Background(), w, resp, "claude-public", "claude-upstream"); err != nil {
+				t.Fatalf("writeDirectAnthropicJSONResponse() error = %v", err)
+			}
+
+			var payload struct {
+				Model string `json:"model"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("json.Unmarshal(response) error = %v", err)
+			}
+			if payload.Model != "claude-public" {
+				t.Fatalf("response model = %q, want claude-public; body=%s", payload.Model, w.Body.String())
 			}
 		})
 	}
@@ -1291,6 +1326,53 @@ func TestRewriteRequestModelForProvider_RewritesGenericJSONModelAndNoopsWhenUnch
 	}
 	if string(unchangedBody) != string(rewrittenBody) {
 		t.Fatalf("rewriteRequestModelForProvider(already mapped) body changed: got %s want %s", unchangedBody, rewrittenBody)
+	}
+}
+
+func TestRewriteRequestModelForProviderFallsBackForCaseFoldedModelAlias(t *testing.T) {
+	body := []byte(`{"model":"public-model","Model":"shadow-model","messages":[{"role":"user","content":"hello"}]}`)
+	tests := []struct {
+		name    string
+		rewrite func() ([]byte, bool, error)
+	}{
+		{
+			name: "ordinary",
+			rewrite: func() ([]byte, bool, error) {
+				return rewriteRequestModelForProvider(body, "upstream-model")
+			},
+		},
+		{
+			name: "validated",
+			rewrite: func() ([]byte, bool, error) {
+				return rewriteRequestModelForProviderFromModelJSONValidated(body, "shadow-model", "upstream-model", json.RawMessage(`"upstream-model"`))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rewritten, changed, err := tt.rewrite()
+			if err != nil {
+				t.Fatalf("rewrite request model: %v", err)
+			}
+			if !changed {
+				t.Fatal("changed = false, want true")
+			}
+			var payload struct {
+				Model    string `json:"model"`
+				Messages []struct {
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.Unmarshal(rewritten, &payload); err != nil {
+				t.Fatalf("json.Unmarshal(rewritten) error = %v", err)
+			}
+			if payload.Model != "upstream-model" {
+				t.Fatalf("rewritten model = %q, want upstream-model; body=%s", payload.Model, rewritten)
+			}
+			if len(payload.Messages) != 1 || payload.Messages[0].Content != "hello" {
+				t.Fatalf("rewritten messages = %+v, want original content", payload.Messages)
+			}
+		})
 	}
 }
 

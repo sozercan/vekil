@@ -977,14 +977,17 @@ func replaceSingleTopLevelRawJSONFieldValidated(body []byte, field string, repla
 		if done {
 			break
 		}
-		if !rawJSONKeyEqual(key, field) {
+		if rawJSONKeyEqual(key, field) {
+			if matchStart >= 0 {
+				return body, false
+			}
+			matchStart = start
+			matchEnd = end
 			continue
 		}
-		if matchStart >= 0 {
+		if rawJSONKeyEqualFold(key, field) {
 			return body, false
 		}
-		matchStart = start
-		matchEnd = end
 	}
 	if matchStart < 0 {
 		return body, false

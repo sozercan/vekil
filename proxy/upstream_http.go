@@ -1280,6 +1280,8 @@ func inspectAnthropicResponseJSONFast(body []byte) (anthropicResponseJSONInspect
 				inspection.modelEnd = end
 				inspection.rewriteModel = true
 			}
+		case rawJSONKeyEqualFold(key, "model"):
+			return anthropicResponseJSONInspection{}, false
 		case rawJSONKeyEqual(key, "message"):
 			if messageSeen {
 				return anthropicResponseJSONInspection{}, false
@@ -1414,27 +1416,30 @@ func rewriteAnthropicModelFields(payload map[string]json.RawMessage, publicModel
 	if len(payload) == 0 || strings.TrimSpace(publicModel) == "" {
 		return false
 	}
+	rawModel, err := json.Marshal(publicModel)
+	if err != nil {
+		return false
+	}
 
-	changed := false
-	if rawJSONString(payload["model"]) != "" {
-		rawModel, err := json.Marshal(publicModel)
-		if err == nil {
-			payload["model"] = rawModel
+	changed := rewriteAnthropicModelField(payload, rawModel)
+
+	var message map[string]json.RawMessage
+	if err := json.Unmarshal(payload["message"], &message); err == nil && len(message) > 0 && rewriteAnthropicModelField(message, rawModel) {
+		if rawMessage, err := json.Marshal(message); err == nil {
+			payload["message"] = rawMessage
 			changed = true
 		}
 	}
 
-	var message map[string]json.RawMessage
-	if err := json.Unmarshal(payload["message"], &message); err == nil && len(message) > 0 && rawJSONString(message["model"]) != "" {
-		rawModel, err := json.Marshal(publicModel)
-		if err == nil {
-			message["model"] = rawModel
-			if rawMessage, err := json.Marshal(message); err == nil {
-				payload["message"] = rawMessage
-				changed = true
-			}
+	return changed
+}
+
+func rewriteAnthropicModelField(payload map[string]json.RawMessage, rawModel json.RawMessage) bool {
+	for key, value := range payload {
+		if strings.EqualFold(key, "model") && rawJSONString(value) != "" {
+			payload["model"] = rawModel
+			return true
 		}
 	}
-
-	return changed
+	return false
 }
