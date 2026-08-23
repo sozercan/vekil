@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestReadOwnedFileRejectsReplacedDirectorySymlink(t *testing.T) {
@@ -42,5 +44,24 @@ func TestReadOwnedFileRejectsReplacedDirectorySymlink(t *testing.T) {
 	}
 	if string(body) != "attacker" {
 		t.Fatalf("path-based external read = %q, want attacker fixture", body)
+	}
+}
+
+func TestSecureFileReadsRejectFIFOWithoutBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, read := range map[string]func(string, int64) ([]byte, fileIdentity, error){
+		"external": readSecureFile,
+		"owned":    readOwnedFile,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := read(path, MaxConfigBytes); err == nil ||
+				!strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("read() error = %v, want regular-file rejection", err)
+			}
+		})
 	}
 }

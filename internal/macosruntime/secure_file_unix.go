@@ -19,7 +19,7 @@ type fileIdentity struct {
 }
 
 func readSecureFile(path string, maxBytes int64) ([]byte, fileIdentity, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fileIdentity{}, secureOpenError(path, err)
 	}
@@ -39,7 +39,7 @@ func readOwnedFile(path string, maxBytes int64) ([]byte, fileIdentity, error) {
 	fd, err := unix.Openat(
 		directory.fd,
 		filepath.Base(path),
-		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK,
 		0,
 	)
 	if err != nil {
