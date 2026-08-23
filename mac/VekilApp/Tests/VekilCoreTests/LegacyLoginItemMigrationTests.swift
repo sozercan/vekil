@@ -95,6 +95,73 @@ final class LegacyLoginItemMigrationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: plistURL(home).path))
     }
 
+    func testRemovalPreservesValidReplacementCreatedDuringBootout() async throws {
+        let home = try makeHome(plist: ownedPlist(marker: "original"))
+        defer { try? FileManager.default.removeItem(at: home) }
+        let target = plistURL(home)
+        let replacement = try ownedPlist(marker: "replacement")
+        let migrator = LegacyLaunchAgentMigrator(
+            homeDirectory: home,
+            runner: LegacyLaunchctlRunner { _ in
+                try FileManager.default.removeItem(at: target)
+                try replacement.write(to: target)
+                return 0
+            }
+        )
+
+        try await migrator.removeOwnedLegacyItem()
+
+        XCTAssertEqual(try Data(contentsOf: target), replacement)
+    }
+
+    func testRemovalPreservesOriginalInodeWhenContentsChangeDuringBootout() async throws {
+        let home = try makeHome(plist: ownedPlist())
+        defer { try? FileManager.default.removeItem(at: home) }
+        let target = plistURL(home)
+        let replacement = try ownedPlist(label: "com.example.foreign")
+        let migrator = LegacyLaunchAgentMigrator(
+            homeDirectory: home,
+            runner: LegacyLaunchctlRunner { _ in
+                let handle = try FileHandle(forWritingTo: target)
+                try handle.truncate(atOffset: 0)
+                try handle.write(contentsOf: replacement)
+                try handle.close()
+                return 0
+            }
+        )
+
+        try await migrator.removeOwnedLegacyItem()
+
+        XCTAssertEqual(try Data(contentsOf: target), replacement)
+    }
+
+    func testRemovalDoesNotFollowReplacedLaunchAgentsDirectoryDuringBootout() async throws {
+        let home = try makeHome(plist: ownedPlist(marker: "original"))
+        defer { try? FileManager.default.removeItem(at: home) }
+        let target = plistURL(home)
+        let launchAgents = target.deletingLastPathComponent()
+        let displaced = launchAgents.appendingPathExtension("previous")
+        let replacement = try ownedPlist(marker: "replacement-directory")
+        let migrator = LegacyLaunchAgentMigrator(
+            homeDirectory: home,
+            runner: LegacyLaunchctlRunner { _ in
+                try FileManager.default.moveItem(at: launchAgents, to: displaced)
+                try FileManager.default.createDirectory(at: launchAgents, withIntermediateDirectories: true)
+                try replacement.write(to: target)
+                return 0
+            }
+        )
+
+        try await migrator.removeOwnedLegacyItem()
+
+        XCTAssertEqual(try Data(contentsOf: target), replacement)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: displaced.appendingPathComponent("com.vekil.menubar.plist").path
+            )
+        )
+    }
+
     private func makeHome(plist: Data) throws -> URL { try makeHome(raw: plist) }
 
     private func makeHome(raw: Data) throws -> URL {
@@ -110,14 +177,19 @@ final class LegacyLoginItemMigrationTests: XCTestCase {
         home.appendingPathComponent("Library/LaunchAgents/com.vekil.menubar.plist")
     }
 
-    private func ownedPlist(label: String = "com.vekil.menubar") throws -> Data {
-        try PropertyListSerialization.data(
-            fromPropertyList: [
-                "Label": label,
-                "ProgramArguments": ["/usr/bin/open", "-b", "com.vekil.menubar"],
-                "RunAtLoad": true,
-                "KeepAlive": false,
-            ],
+    private func ownedPlist(
+        label: String = "com.vekil.menubar",
+        marker: String? = nil
+    ) throws -> Data {
+        var plist: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": ["/usr/bin/open", "-b", "com.vekil.menubar"],
+            "RunAtLoad": true,
+            "KeepAlive": false,
+        ]
+        plist["MigrationTestMarker"] = marker
+        return try PropertyListSerialization.data(
+            fromPropertyList: plist,
             format: .xml,
             options: 0
         )
