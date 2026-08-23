@@ -535,6 +535,43 @@ func TestSignOutClearsCredentialsAfterTerminalStopFailure(t *testing.T) {
 	}
 }
 
+func TestSignOutClearsCredentialsWhenStopFindsListenerAlreadyGone(t *testing.T) {
+	authenticator := &signOutAuthenticator{status: auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceVekil}}
+	manager := newManagerForTest(t)
+	var runtime *applyRuntime
+	controller, err := appcontrol.New(appcontrol.Options{
+		ConfigurationSource: manager,
+		RuntimeFactory: runtimeFactoryFunc(func(context.Context, appcontrol.Configuration) (appcontrol.Runtime, error) {
+			runtime = newApplyRuntime(nil)
+			return &copilotSwitchRuntime{applyRuntime: runtime, usesCopilot: true}, nil
+		}),
+		Authenticator:    authenticator,
+		ReadinessChecker: appcontrol.ReadinessCheckFunc(func(context.Context, string) error { return nil }),
+		StopTimeout:      time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startConfigSwitchHarness(t, controller, LegacyConfigRevision)
+	h := &helper{opts: HelperOptions{
+		Controller: controller, Configuration: manager,
+		Authenticator: authenticator, ShutdownTimeout: time.Second,
+	}}
+	h.beforeControllerStop = func() {
+		terminateRuntimeAndWaitForCleanup(t, controller, runtime)
+	}
+
+	if err := h.signOut(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if authenticator.signOutCalls != 1 || authenticator.Status().SignedIn {
+		t.Fatalf("credentials were not cleared after listener exit: %+v", authenticator)
+	}
+	if _, stopErr := controller.Stop(t.Context()); !errors.Is(stopErr, appcontrol.ErrNotRunning) {
+		t.Fatalf("runtime remained owned after listener exit: %v", stopErr)
+	}
+}
+
 type deviceAuthStub struct{ signOutAuthenticator }
 
 func (a *deviceAuthStub) RequestDeviceCode(context.Context) (*auth.DeviceCodeResponse, error) {

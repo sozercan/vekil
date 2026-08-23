@@ -158,18 +158,23 @@ func (h *helper) commitSelection(ctx context.Context) error {
 func (h *helper) signOut(ctx context.Context) error {
 	var stopErr error
 	if h.opts.Controller.Snapshot().Service == appcontrol.ServiceRunning && h.opts.Controller.UsesCopilot() {
+		if h.beforeControllerStop != nil {
+			h.beforeControllerStop()
+		}
 		stop, err := h.opts.Controller.Stop(ctx)
-		if err != nil {
+		if err != nil && !errors.Is(err, appcontrol.ErrNotRunning) {
 			return err
 		}
-		result, err := waitControllerCleanup(h.opts.Controller, stop, h.opts.ShutdownTimeout)
-		if err != nil {
-			return err
-		}
-		if result.Status != appcontrol.OperationSucceeded {
-			stopErr = result.Err
-			if stopErr == nil {
-				stopErr = fmt.Errorf("stop operation ended with status %s", result.Status)
+		if err == nil {
+			result, waitErr := waitControllerCleanup(h.opts.Controller, stop, h.opts.ShutdownTimeout)
+			if waitErr != nil {
+				return waitErr
+			}
+			if result.Status != appcontrol.OperationSucceeded {
+				stopErr = result.Err
+				if stopErr == nil {
+					stopErr = fmt.Errorf("stop operation ended with status %s", result.Status)
+				}
 			}
 		}
 	}

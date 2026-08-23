@@ -31,6 +31,29 @@ type applyRuntime struct {
 func newApplyRuntime(startErr error) *applyRuntime {
 	return &applyRuntime{startErr: startErr, done: make(chan error, 1)}
 }
+
+func terminateRuntimeAndWaitForCleanup(t *testing.T, controller *appcontrol.Controller, runtime *applyRuntime) {
+	t.Helper()
+	baseline := controller.Snapshot().Revision
+	runtime.done <- errors.New("listener exited before stop admission")
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		state := controller.Snapshot()
+		if state.Revision >= baseline+2 {
+			if state.Service != appcontrol.ServiceFailed || state.LastFailureCode != "listener_terminated" {
+				t.Fatalf("listener cleanup state = %+v", state)
+			}
+			return
+		}
+		select {
+		case <-controller.Updates():
+		case <-timer.C:
+			t.Fatal("listener cleanup did not release the runtime")
+		}
+	}
+}
+
 func (r *applyRuntime) Start(context.Context) error { return r.startErr }
 func (r *applyRuntime) Stop(ctx context.Context) error {
 	r.stopOnce.Do(func() {
@@ -371,6 +394,49 @@ func TestApplyManagedDraftFailedStopRestoresPreviousRuntime(t *testing.T) {
 	var applyErr *ManagedApplyError
 	if !errors.As(err, &applyErr) || !errors.Is(applyErr.Primary, stopFailure) || applyErr.Rollback != nil {
 		t.Fatalf("apply error = %v, want stop failure with successful restore", err)
+	}
+	state := controller.Snapshot()
+	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != initialRevision || state.RuntimeGeneration != 2 {
+		t.Fatalf("restored runtime = %+v", state)
+	}
+	if got := manager.State().CommittedConfigRevision; got != initialRevision {
+		t.Fatalf("restored configuration = %q, want %q", got, initialRevision)
+	}
+	if _, statErr := os.Stat(manager.paths.Journal); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("journal remains: %v", statErr)
+	}
+}
+
+func TestApplyManagedDraftRestoresPreviousRuntimeWhenStopFindsListenerAlreadyGone(t *testing.T) {
+	var initialRuntime *applyRuntime
+	factory := &revisionRuntimeFactory{newRuntime: func(_ string, call int) *applyRuntime {
+		runtime := newApplyRuntime(nil)
+		if call == 1 && initialRuntime == nil {
+			initialRuntime = runtime
+		}
+		return runtime
+	}}
+	manager, controller, h, initialRevision := newApplyHarness(t, factory)
+	start, err := controller.Start(t.Context(), initialRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, waitErr := start.Wait(t.Context()); waitErr != nil || result.Status != appcontrol.OperationSucceeded {
+		t.Fatalf("initial start result=%+v err=%v", result, waitErr)
+	}
+	h.beforeControllerStop = func() {
+		terminateRuntimeAndWaitForCleanup(t, controller, initialRuntime)
+	}
+
+	payload := managedDraftPayload{
+		ExpectedConfigRevision: initialRevision,
+		SecretGeneration:       1,
+		Draft:                  managedApplyDraft(manager.State().Providers[0].UUID, true),
+	}
+	err = h.applyManagedDraft(t.Context(), "op_listener_race", payload)
+	var applyErr *ManagedApplyError
+	if !errors.As(err, &applyErr) || !errors.Is(applyErr.Primary, appcontrol.ErrNotRunning) || applyErr.Rollback != nil {
+		t.Fatalf("apply error = %v, want not-running primary with successful restore", err)
 	}
 	state := controller.Snapshot()
 	if state.Service != appcontrol.ServiceRunning || state.ConfigRevision != initialRevision || state.RuntimeGeneration != 2 {

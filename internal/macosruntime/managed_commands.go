@@ -96,6 +96,9 @@ func (h *helper) applyManagedDraft(ctx context.Context, operationID string, payl
 		return nil
 	}
 
+	if h.beforeControllerStop != nil {
+		h.beforeControllerStop()
+	}
 	stop, err := h.opts.Controller.Stop(ctx)
 	stopAdmitted := err == nil
 	if stopAdmitted {
@@ -106,7 +109,8 @@ func (h *helper) applyManagedDraft(ctx context.Context, operationID string, payl
 		}
 	}
 	if err != nil {
-		if stopAdmitted && h.opts.Controller.Snapshot().Service != appcontrol.ServiceRunning {
+		if errors.Is(err, appcontrol.ErrNotRunning) ||
+			(stopAdmitted && h.opts.Controller.Snapshot().Service != appcontrol.ServiceRunning) {
 			return h.restoreManagedRunningIntent(ctx, tx, candidate, err, false)
 		}
 		return rollbackStopped(err)

@@ -108,6 +108,7 @@ type helper struct {
 	managedCommit         func(*ManagedApplyTransaction) error
 	beforeManagedCommit   func()
 	beforeSelectionCommit func()
+	beforeControllerStop  func()
 }
 
 type frameResult struct {
