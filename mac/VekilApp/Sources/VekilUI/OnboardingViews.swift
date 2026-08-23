@@ -1265,7 +1265,7 @@ public struct VekilOnboardingView: View {
   }
 
   private var commandModelID: String {
-    selectedModelID.isEmpty ? "<model-id>" : selectedModelID
+    ShellArgument.quote(selectedModelID.isEmpty ? "<model-id>" : selectedModelID)
   }
 
   private var clientInstructions: String {

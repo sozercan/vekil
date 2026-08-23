@@ -5,6 +5,12 @@ import Security
 import UniformTypeIdentifiers
 import VekilCore
 
+enum ShellArgument {
+    static func quote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+}
+
 public enum VekilBundleLayout {
     public static let helperRelativePath = "Contents/Helpers/vekil-runtime"
     public static func helperURL(bundleURL: URL) -> URL {

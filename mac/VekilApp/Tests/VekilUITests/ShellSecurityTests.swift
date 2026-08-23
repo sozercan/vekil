@@ -5,6 +5,12 @@ import VekilCore
 @testable import VekilUI
 
 final class ShellSecurityTests: XCTestCase {
+    func testShellArgumentQuotesModelIDs() {
+        XCTAssertEqual(ShellArgument.quote("model name; rm -rf /"), "'model name; rm -rf /'")
+        XCTAssertEqual(ShellArgument.quote("model'$(command)'"), "'model'\"'\"'$(command)'\"'\"''")
+        XCTAssertEqual(ShellArgument.quote("<model-id>"), "'<model-id>'")
+    }
+
     final class SignatureSpy: HelperCodeSignatureValidating, @unchecked Sendable {
         var calls: [URL] = []
         func validate(at helperURL: URL, matchingApplicationAt applicationURL: URL) throws {

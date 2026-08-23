@@ -1528,7 +1528,7 @@ public struct ClientSetupView: View {
   }
 
   private var commandModelID: String {
-    selectedModelID.isEmpty ? "<model-id>" : selectedModelID
+    ShellArgument.quote(selectedModelID.isEmpty ? "<model-id>" : selectedModelID)
   }
 
   private var launchCommand: String {
