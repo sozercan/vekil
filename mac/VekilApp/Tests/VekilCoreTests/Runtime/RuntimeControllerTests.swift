@@ -20,23 +20,35 @@ final class RuntimeControllerTests: XCTestCase {
     func testConnectValidatesHelloThenPreparesAndReconcilesBeforeConnected() async throws {
         let process = FakeRuntimeProcess()
         let factory = FakeRuntimeProcessFactory([process])
-        let ids = SequenceRuntimeIDGenerator(["req_secret", "req_state"])
+        let ids = SequenceRuntimeIDGenerator(["req_state", "req_secret"])
+        let initialState = RuntimeStatePayload(
+            configRevision: "cfg_1",
+            service: .stopped,
+            readiness: .unknown,
+            auth: .signedIn
+        )
+        let initialStateFrame = try RuntimeFrameCodec().encodeLine(
+            RuntimeEventEnvelope(
+                version: 1,
+                event: .state,
+                helperEpoch: "hep_test",
+                stateRevision: 4,
+                payload: try JSONValue.encode(initialState)
+            )
+        )
 
         process.onRun { [weak process] in
-            process?.emitStandardOutput(try! encodedHello())
+            guard let process else { return }
+            var frames = try! encodedHello()
+            frames.append(initialStateFrame)
+            process.emitStandardOutput(frames)
         }
         process.onWrite { [weak process] data in
             guard let process, let request = try? requestFromLine(data) else { return }
             if request.command == .getState {
-                let state = RuntimeStatePayload(
-                    configRevision: "cfg_1",
-                    service: .stopped,
-                    readiness: .unknown,
-                    auth: .signedIn
-                )
                 let result = JSONValue.object([
                     "state_revision": .integer(4),
-                    "state": try! JSONValue.encode(state),
+                    "state": try! JSONValue.encode(initialState),
                 ])
                 process.emitStandardOutput(try! encodedResponse(for: request, result: result))
             } else {
@@ -48,8 +60,9 @@ final class RuntimeControllerTests: XCTestCase {
             configuration: makeConfiguration(),
             processFactory: factory,
             idGenerator: ids,
-            launchPreparation: { _ in
-                [
+            launchPreparation: { context in
+                XCTAssertEqual(context.state.configRevision, "cfg_1")
+                return [
                     RuntimePreparedRequest(
                         command: .setSecretProjection,
                         payload: .object([
@@ -71,7 +84,7 @@ final class RuntimeControllerTests: XCTestCase {
         XCTAssertEqual(snapshot.currentState?.payload.configRevision, "cfg_1")
 
         let commands = try process.writtenData.map { try requestFromLine($0).command }
-        XCTAssertEqual(commands, [.setSecretProjection, .getState])
+        XCTAssertEqual(commands, [.getState, .setSecretProjection])
     }
 
     func testHelloMustBeFirstAndFailureSuppressesRestart() async {

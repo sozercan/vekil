@@ -438,6 +438,7 @@ public struct RuntimeConfigurationState: Codable, Sendable, Equatable {
     public var activeRevision: String?
     public var drift: RuntimeConfigurationDrift
     public var lastError: RuntimeStructuredError?
+    public var secretProjections: [RuntimeSecretProjectionRequirement]
 
     public init(
         mode: RuntimeConfigurationMode,
@@ -445,7 +446,8 @@ public struct RuntimeConfigurationState: Codable, Sendable, Equatable {
         selectedRevision: String? = nil,
         activeRevision: String? = nil,
         drift: RuntimeConfigurationDrift = .none,
-        lastError: RuntimeStructuredError? = nil
+        lastError: RuntimeStructuredError? = nil,
+        secretProjections: [RuntimeSecretProjectionRequirement] = []
     ) {
         self.mode = mode
         self.selectedPath = selectedPath
@@ -453,6 +455,7 @@ public struct RuntimeConfigurationState: Codable, Sendable, Equatable {
         self.activeRevision = activeRevision
         self.drift = drift
         self.lastError = lastError
+        self.secretProjections = secretProjections
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -466,6 +469,7 @@ public struct RuntimeConfigurationState: Codable, Sendable, Equatable {
         case drifted
         case lastError = "last_error"
         case errorCode = "error_code"
+        case secretProjections = "secret_projections"
     }
 
     public init(from decoder: Decoder) throws {
@@ -482,6 +486,10 @@ public struct RuntimeConfigurationState: Codable, Sendable, Equatable {
             ?? container.decodeIfPresent(RuntimeConfigurationDrift.self, forKey: .drift)
             ?? ((try container.decodeIfPresent(Bool.self, forKey: .drifted) ?? false) ? .drifted : .none)
         lastError = try container.decodeIfPresent(RuntimeStructuredError.self, forKey: .lastError)
+        secretProjections = try container.decodeIfPresent(
+            [RuntimeSecretProjectionRequirement].self,
+            forKey: .secretProjections
+        ) ?? []
         if lastError == nil, let code = try container.decodeIfPresent(String.self, forKey: .errorCode), !code.isEmpty {
             lastError = RuntimeStructuredError(code: code, userMessage: "The selected configuration is unavailable.", retryable: false, fieldErrors: [])
         }
@@ -495,6 +503,52 @@ public struct RuntimeConfigurationState: Codable, Sendable, Equatable {
         try container.encodeIfPresent(activeRevision, forKey: .activeRevision)
         try container.encode(drift, forKey: .drift)
         try container.encodeIfPresent(lastError, forKey: .lastError)
+        if !secretProjections.isEmpty {
+            try container.encode(secretProjections, forKey: .secretProjections)
+        }
+    }
+}
+
+public struct RuntimeSecretProjectionRequirement: Codable, Sendable, Equatable {
+    public var configRevision: String
+    public var secretGeneration: UInt64
+    public var secrets: [RuntimeManagedSecretRequirement]
+
+    public init(
+        configRevision: String,
+        secretGeneration: UInt64,
+        secrets: [RuntimeManagedSecretRequirement]
+    ) {
+        self.configRevision = configRevision
+        self.secretGeneration = secretGeneration
+        self.secrets = secrets
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case configRevision = "config_revision"
+        case secretGeneration = "secret_generation"
+        case secrets
+    }
+}
+
+public struct RuntimeManagedSecretRequirement: Codable, Sendable, Equatable, Hashable {
+    public var providerID: String
+    public var providerUUID: String
+    public var role: String
+    public var reference: String
+
+    public init(providerID: String, providerUUID: String, role: String, reference: String) {
+        self.providerID = providerID
+        self.providerUUID = providerUUID
+        self.role = role
+        self.reference = reference
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case providerID = "provider_id"
+        case providerUUID = "provider_uuid"
+        case role
+        case reference
     }
 }
 

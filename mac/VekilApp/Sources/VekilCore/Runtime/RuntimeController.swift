@@ -831,19 +831,48 @@ public actor RuntimeController {
         setConnectionState(.reconciling)
         publish(.hello(hello))
 
-        let context = RuntimeLaunchContext(
-            hello: hello,
-            isAutomaticRestart: session.isAutomaticRestart,
-            automaticRestartAttempt: session.automaticRestartAttempt
-        )
         let sessionID = session.id
+        let isAutomaticRestart = session.isAutomaticRestart
+        let automaticRestartAttempt = session.automaticRestartAttempt
         Task { [weak self] in
-            await self?.reconcile(sessionID: sessionID, context: context)
+            await self?.reconcile(
+                sessionID: sessionID,
+                hello: hello,
+                isAutomaticRestart: isAutomaticRestart,
+                automaticRestartAttempt: automaticRestartAttempt
+            )
         }
     }
 
-    private func reconcile(sessionID: UUID, context: RuntimeLaunchContext) async {
+    private func reconcile(
+        sessionID: UUID,
+        hello: RuntimeHelloPayload,
+        isAutomaticRestart: Bool,
+        automaticRestartAttempt: Int?
+    ) async {
         do {
+            let response = try await sendInternal(
+                command: .getState,
+                payload: nil,
+                timeout: configuration.requestTimeout,
+                allowDuringReconciliation: true
+            )
+            guard session?.id == sessionID else { return }
+            let responseState = try stateEventFromGetStateResponse(response)
+            let preparationState: RuntimeStateEvent
+            if let currentState,
+               currentState.helperEpoch == responseState.helperEpoch,
+               currentState.stateRevision >= responseState.stateRevision {
+                preparationState = currentState
+            } else {
+                preparationState = responseState
+            }
+            let context = RuntimeLaunchContext(
+                hello: hello,
+                state: preparationState.payload,
+                isAutomaticRestart: isAutomaticRestart,
+                automaticRestartAttempt: automaticRestartAttempt
+            )
             let prepared = try await launchPreparation(context)
             guard session?.id == sessionID else { return }
 
@@ -859,14 +888,13 @@ public actor RuntimeController {
                 )
             }
 
-            let response = try await sendInternal(
-                command: .getState,
-                payload: nil,
-                timeout: configuration.requestTimeout,
-                allowDuringReconciliation: true
-            )
-            guard session?.id == sessionID else { return }
-            applyStateFromGetStateResponse(response)
+            if currentState?.helperEpoch != preparationState.helperEpoch
+                || (currentState?.stateRevision ?? 0) < preparationState.stateRevision {
+                guard acceptRevision(preparationState.stateRevision) else {
+                    throw RuntimeControllerError.protocolViolation
+                }
+                applyState(preparationState)
+            }
             setConnectionState(.connected)
             resumeConnectionWaiters()
         } catch let error as RuntimeControllerError {
@@ -1129,17 +1157,26 @@ public actor RuntimeController {
         publish(.operation(tracked))
     }
 
-    private func applyStateFromGetStateResponse(_ response: RuntimeResponseEnvelope) {
-        guard let result = response.result,
-              let decoded = try? result.decode(GetStateResult.self),
-              let payload = decoded.payload else { return }
-        let event = RuntimeStateEvent(
+    private func stateEventFromGetStateResponse(
+        _ response: RuntimeResponseEnvelope
+    ) throws -> RuntimeStateEvent {
+        guard let result = response.result else {
+            throw RuntimeControllerError.missingResponseResult
+        }
+        let decoded: GetStateResult
+        do {
+            decoded = try result.decode(GetStateResult.self)
+        } catch {
+            throw RuntimeControllerError.invalidResponsePayload
+        }
+        guard let payload = decoded.payload else {
+            throw RuntimeControllerError.invalidResponsePayload
+        }
+        return RuntimeStateEvent(
             helperEpoch: response.helperEpoch,
             stateRevision: decoded.stateRevision,
             payload: payload
         )
-        guard acceptRevision(event.stateRevision) else { return }
-        applyState(event)
     }
 
     // MARK: Exit, restart, and shutdown

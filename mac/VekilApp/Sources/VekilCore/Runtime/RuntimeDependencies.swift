@@ -41,21 +41,25 @@ public struct RuntimePreparedRequest: Sendable, Equatable {
 
 public struct RuntimeLaunchContext: Sendable, Equatable {
     public var hello: RuntimeHelloPayload
+    public var state: RuntimeStatePayload
     public var isAutomaticRestart: Bool
     public var automaticRestartAttempt: Int?
 
     public init(
         hello: RuntimeHelloPayload,
+        state: RuntimeStatePayload,
         isAutomaticRestart: Bool,
         automaticRestartAttempt: Int? = nil
     ) {
         self.hello = hello
+        self.state = state
         self.isAutomaticRestart = isAutomaticRestart
         self.automaticRestartAttempt = automaticRestartAttempt
     }
 }
 
 /// Produces launch-scoped control requests, such as the complete active secret
-/// projection. Returned requests run after a valid hello and before `get_state`.
+/// projection. Returned requests run after a valid hello and an initial
+/// `get_state`, but before the controller publishes that state as connected.
 /// The closure must never log or persist secret-bearing payloads.
 public typealias RuntimeLaunchPreparation = @Sendable (RuntimeLaunchContext) async throws -> [RuntimePreparedRequest]

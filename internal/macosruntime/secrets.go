@@ -3,6 +3,7 @@ package macosruntime
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 
@@ -46,8 +47,9 @@ func NewSecretProjectionStore() *SecretProjectionStore {
 	return &SecretProjectionStore{projections: make(map[projectionKey]map[string]string)}
 }
 
-// Set atomically replaces one complete generation. Errors mention only field
-// identity, never secret values.
+// Set atomically installs one complete immutable generation. Re-sending an
+// identical projection is idempotent; conflicting values are rejected. Errors
+// mention only field identity, never secret values.
 func (s *SecretProjectionStore) Set(projection SecretProjection) error {
 	if s == nil {
 		return errors.New("secret projection store is unavailable")
@@ -92,7 +94,14 @@ func (s *SecretProjectionStore) Set(projection SecretProjection) error {
 	if s.projections == nil {
 		s.projections = make(map[projectionKey]map[string]string)
 	}
-	s.projections[projectionKey{revision: revision, generation: projection.SecretGeneration}] = values
+	key := projectionKey{revision: revision, generation: projection.SecretGeneration}
+	if existing, ok := s.projections[key]; ok {
+		if maps.Equal(existing, values) {
+			return nil
+		}
+		return errors.New("secret projection conflicts with existing immutable generation")
+	}
+	s.projections[key] = values
 	return nil
 }
 

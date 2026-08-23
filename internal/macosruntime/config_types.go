@@ -75,16 +75,36 @@ type ManagedCandidate struct {
 // ConfigDescription is the sanitized configuration projection returned to the
 // native shell.
 type ConfigDescription struct {
-	Mode                    ConfigMode        `json:"mode"`
-	SelectedPath            string            `json:"selected_path,omitempty"`
-	SelectedRevision        string            `json:"selected_revision,omitempty"`
-	ActiveRevision          string            `json:"active_revision,omitempty"`
-	Available               bool              `json:"available"`
-	Drifted                 bool              `json:"drifted"`
-	ErrorCode               string            `json:"error_code,omitempty"`
-	ManagedOwnershipPresent bool              `json:"managed_ownership_present"`
-	SecretGeneration        uint64            `json:"secret_generation,omitempty"`
-	Providers               []ProviderSummary `json:"providers,omitempty"`
+	Mode                    ConfigMode                    `json:"mode"`
+	SelectedPath            string                        `json:"selected_path,omitempty"`
+	SelectedRevision        string                        `json:"selected_revision,omitempty"`
+	ActiveRevision          string                        `json:"active_revision,omitempty"`
+	Available               bool                          `json:"available"`
+	Drifted                 bool                          `json:"drifted"`
+	ErrorCode               string                        `json:"error_code,omitempty"`
+	ManagedOwnershipPresent bool                          `json:"managed_ownership_present"`
+	SecretGeneration        uint64                        `json:"secret_generation,omitempty"`
+	Providers               []ProviderSummary             `json:"providers,omitempty"`
+	SecretProjections       []SecretProjectionRequirement `json:"secret_projections,omitempty"`
+}
+
+// SecretProjectionRequirement is the non-secret metadata Swift needs to load
+// one complete Keychain generation after a helper launch. It is present for an
+// owned managed configuration even while External Configuration is selected,
+// so switching back to managed can start without restarting the helper.
+type SecretProjectionRequirement struct {
+	ConfigRevision   string                     `json:"config_revision"`
+	SecretGeneration uint64                     `json:"secret_generation"`
+	Secrets          []ManagedSecretRequirement `json:"secrets"`
+}
+
+// ManagedSecretRequirement maps a stable Keychain identity to the provider-
+// scoped reference embedded in secret-free managed YAML.
+type ManagedSecretRequirement struct {
+	ProviderID   string `json:"provider_id"`
+	ProviderUUID string `json:"provider_uuid"`
+	Role         string `json:"role"`
+	Reference    string `json:"reference"`
 }
 
 // ProviderSummary intentionally excludes credentials, URLs, headers, paths,

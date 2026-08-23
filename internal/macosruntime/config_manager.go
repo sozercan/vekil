@@ -532,6 +532,7 @@ func (m *ConfigManager) describeLocked(body []byte, readErr error) ConfigDescrip
 		ActiveRevision:          m.state.ActiveRuntimeRevision,
 		ManagedOwnershipPresent: m.state.ManagedOwnershipID != "",
 		SecretGeneration:        m.state.SecretGeneration,
+		SecretProjections:       managedSecretProjectionRequirements(m.state),
 	}
 	if m.state.ConfigMode == ConfigModeLegacy {
 		description.Available = true
@@ -566,6 +567,41 @@ func (m *ConfigManager) describeLocked(body []byte, readErr error) ConfigDescrip
 		description.ErrorCode = "invalid_config"
 	}
 	return description
+}
+
+func managedSecretProjectionRequirements(state PersistentState) []SecretProjectionRequirement {
+	if state.ManagedOwnershipID == "" || state.CommittedConfigRevision == "" || state.SecretGeneration == 0 {
+		return nil
+	}
+
+	secrets := make([]ManagedSecretRequirement, 0)
+	for _, provider := range state.Providers {
+		providerID := strings.TrimSpace(provider.ProviderID)
+		providerUUID := strings.TrimSpace(provider.UUID)
+		for _, role := range normalizeSecretRoles(provider.SecretRoles) {
+			secrets = append(secrets, ManagedSecretRequirement{
+				ProviderID:   providerID,
+				ProviderUUID: providerUUID,
+				Role:         role,
+				Reference:    ManagedSecretReference(providerUUID, role, state.SecretGeneration),
+			})
+		}
+	}
+	sort.Slice(secrets, func(i, j int) bool {
+		if secrets[i].ProviderID != secrets[j].ProviderID {
+			return secrets[i].ProviderID < secrets[j].ProviderID
+		}
+		if secrets[i].ProviderUUID != secrets[j].ProviderUUID {
+			return secrets[i].ProviderUUID < secrets[j].ProviderUUID
+		}
+		return secrets[i].Role < secrets[j].Role
+	})
+
+	return []SecretProjectionRequirement{{
+		ConfigRevision:   state.CommittedConfigRevision,
+		SecretGeneration: state.SecretGeneration,
+		Secrets:          secrets,
+	}}
 }
 
 func (m *ConfigManager) saveStateLocked() error {

@@ -35,9 +35,21 @@ MainActor.assumeIsolated {
         process: RuntimeProcessConfiguration(executableURL: helperURL, arguments: helperArguments),
         expectedBundleBuildID: buildID
     )
+    let keychainStore: any KeychainSecretStore = testRoot == nil
+        ? SecurityKeychainSecretStore() : InMemoryKeychainSecretStore()
+    let secretGenerationManager = KeychainSecretGenerationManager(store: keychainStore)
+    let secretProjectionPreparer = RuntimeSecretProjectionPreparer(
+        manager: secretGenerationManager
+    )
     let controller = RuntimeController(
         configuration: configuration,
-        processFactory: ValidatingProcessFactory(bundleURL: bundle.bundleURL, validator: RuntimeHelperValidator())
+        processFactory: ValidatingProcessFactory(
+            bundleURL: bundle.bundleURL,
+            validator: RuntimeHelperValidator()
+        ),
+        launchPreparation: { context in
+            try await secretProjectionPreparer.requests(for: context)
+        }
     )
     let runtimeClient = RuntimeAppClient(controller: controller)
     let updater = SparkleUpdateDriver()
@@ -68,5 +80,10 @@ MainActor.assumeIsolated {
     let application = NSApplication.shared
     application.delegate = coordinator
     application.run()
-    withExtendedLifetime((gate, coordinator, updater, runtimeClient, controller, analytics)) {}
+    withExtendedLifetime(
+        (
+            gate, coordinator, updater, runtimeClient, controller, analytics,
+            keychainStore, secretGenerationManager, secretProjectionPreparer
+        )
+    ) {}
 }
