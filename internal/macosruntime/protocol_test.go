@@ -125,6 +125,50 @@ func TestRequestCacheIdempotencyAndIDReuseConflict(t *testing.T) {
 	}
 }
 
+func TestRequestCacheEvictsOldestCompletedIDsAtCapacity(t *testing.T) {
+	request := func(index int, command string) requestEnvelope {
+		return requestEnvelope{
+			Version: ProtocolMax,
+			ID:      fmt.Sprintf("req_%d", index),
+			Command: command,
+			Payload: json.RawMessage(`{}`),
+		}
+	}
+	response := func(index int) responseEnvelope {
+		return responseEnvelope{Version: ProtocolMax, ID: fmt.Sprintf("req_%d", index), HelperEpoch: "hep", OK: true}
+	}
+
+	var cache requestCache
+	for index := 0; index < maxRequestIDs; index++ {
+		if err := cache.store(request(index, "get_state"), response(index)); err != nil {
+			t.Fatalf("store request %d: %v", index, err)
+		}
+	}
+	if err := cache.store(request(maxRequestIDs, "get_state"), response(maxRequestIDs)); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(cache.entries); got != maxRequestIDs {
+		t.Fatalf("cache entries = %d, want %d", got, maxRequestIDs)
+	}
+	if _, found, _, err := cache.lookup(request(0, "get_state")); err != nil || found {
+		t.Fatalf("oldest lookup = found %v, err %v", found, err)
+	}
+	if got, found, conflict, err := cache.lookup(request(1, "get_state")); err != nil || !found || conflict || got.ID != "req_1" {
+		t.Fatalf("retained lookup = (%+v,%v,%v,%v)", got, found, conflict, err)
+	}
+	if got, found, conflict, err := cache.lookup(request(maxRequestIDs, "get_state")); err != nil || !found || conflict || got.ID != fmt.Sprintf("req_%d", maxRequestIDs) {
+		t.Fatalf("newest lookup = (%+v,%v,%v,%v)", got, found, conflict, err)
+	}
+
+	reused := request(0, "stop")
+	if _, found, _, err := cache.lookup(reused); err != nil || found {
+		t.Fatalf("evicted ID reuse lookup = found %v, err %v", found, err)
+	}
+	if err := cache.store(reused, response(0)); err != nil {
+		t.Fatalf("store evicted ID: %v", err)
+	}
+}
+
 func TestProtocolWriterConcurrentFramesRemainCompleteAndStateNeverRegresses(t *testing.T) {
 	var output bytes.Buffer
 	writer := newProtocolWriter(&output)

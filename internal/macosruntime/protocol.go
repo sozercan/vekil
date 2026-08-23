@@ -269,7 +269,9 @@ type cachedRequest struct {
 }
 
 type requestCache struct {
-	entries map[string]cachedRequest
+	entries      map[string]cachedRequest
+	order        []string
+	nextEviction int
 }
 
 func (c *requestCache) lookup(request requestEnvelope) (responseEnvelope, bool, bool, error) {
@@ -302,7 +304,12 @@ func (c *requestCache) store(request requestEnvelope, response responseEnvelope)
 		return nil
 	}
 	if len(c.entries) >= maxRequestIDs {
-		return errors.New("request id cache is full")
+		oldest := c.order[c.nextEviction]
+		delete(c.entries, oldest)
+		c.order[c.nextEviction] = request.ID
+		c.nextEviction = (c.nextEviction + 1) % maxRequestIDs
+	} else {
+		c.order = append(c.order, request.ID)
 	}
 	c.entries[request.ID] = cachedRequest{fingerprint: fingerprint, response: response}
 	return nil

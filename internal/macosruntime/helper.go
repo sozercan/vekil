@@ -273,11 +273,6 @@ func (h *helper) handleFrame(ctx context.Context, frame []byte) (bool, error) {
 		}
 		return false, h.writer.SendCritical(ctx, cached)
 	}
-	if len(h.cache.entries) >= maxRequestIDs {
-		response := h.errorResponse(request.ID, protocolError("request_cache_full", "The helper request cache is full. Restart Vekil and try again.", true, "restart_helper"))
-		return false, h.writer.SendCritical(ctx, response)
-	}
-
 	response, postSend, shutdown := h.dispatch(ctx, request)
 	if err := h.cache.store(request, response); err != nil {
 		return false, err
