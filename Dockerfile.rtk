@@ -7,7 +7,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /vekil .
 
 FROM debian:trixie-slim AS rtk-downloader
-ARG RTK_VERSION=0.43.0
+ARG RTK_VERSION=0.45.0
 ARG TARGETARCH
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl tar \
