@@ -1208,9 +1208,10 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 				return nil, configPathError(fmt.Sprintf("model_routes[%d].targets[%d].provider", routeIndex, targetIndex), "references unknown provider %q", targetCfg.Provider)
 			}
 			targets = append(targets, targetBinding{
-				id:            targetCfg.ID,
-				provider:      provider,
-				upstreamModel: targetCfg.UpstreamModel,
+				id:                targetCfg.ID,
+				provider:          provider,
+				upstreamModel:     targetCfg.UpstreamModel,
+				upstreamModelJSON: encodeProviderModelJSON(targetCfg.UpstreamModel),
 				wirePolicy: providerRequestPolicy{
 					useMaxCompletionTokens: targetCfg.UseMaxCompletionTokens != nil && *targetCfg.UseMaxCompletionTokens,
 				},

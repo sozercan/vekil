@@ -3011,7 +3011,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			break
 		}
 
-		req, err := h.newProviderJSONRequest(ctx, target.provider, http.MethodPost, dispatchPath, preparedBody, cloneSanitizedRouteHeaders(extraHeaders), "", owner)
+		req, err := h.newProviderJSONInferenceRequest(ctx, target.provider, http.MethodPost, dispatchPath, preparedBody, cloneSanitizedRouteHeaders(extraHeaders), "", owner)
 		if err != nil {
 			failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedNonretryable}
 			failures = append(failures, failure)
@@ -3278,6 +3278,7 @@ func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *route
 	if req == nil {
 		return nil, fmt.Errorf("upstream request is required")
 	}
+	autoDecompressGzip := providerRequestAutoDecompressGzip(req)
 	attemptCtx, attemptCancel := context.WithCancel(req.Context())
 	owner := &routeAttemptTransportOwner{cancel: attemptCancel}
 	req = req.WithContext(attemptCtx)
@@ -3298,6 +3299,7 @@ func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *route
 	if resp.Request == nil {
 		resp.Request = req
 	}
+	maybeAutoDecompressProviderResponse(resp, autoDecompressGzip)
 	resp.Body = &routeAttemptTransportBody{inner: resp.Body, owner: owner, observation: observation}
 	return resp, err
 }

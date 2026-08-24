@@ -1785,12 +1785,19 @@ func markRetryStatsTracked(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.WithValue(context.Background(), retryStatsTrackedContextKey{}, true)
 	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.retryStatsTracked.Store(true)
+		return ctx
+	}
 	return context.WithValue(ctx, retryStatsTrackedContextKey{}, true)
 }
 
 func isRetryStatsTracked(ctx context.Context) bool {
 	if ctx == nil {
 		return false
+	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil && summary.retryStatsTracked.Load() {
+		return true
 	}
 	v, _ := ctx.Value(retryStatsTrackedContextKey{}).(bool)
 	return v

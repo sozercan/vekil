@@ -1,14 +1,18 @@
 package proxy
 
 import (
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -196,6 +200,18 @@ func drainReaderAndClose(reader io.Reader, body io.ReadCloser) {
 // doWithRetry executes an HTTP request with retry on transient failures.
 // The reqFactory is called on each attempt to produce a fresh request body.
 func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*http.Response, error) {
+	return h.doWithRetryMode(reqFactory, false)
+}
+
+// doInferenceWithRetry preserves the inference dispatch contract that one
+// reserved attempt produces one physical send. It therefore bypasses
+// http.Client redirect handling and sends through the configured transport
+// directly; catalog and auxiliary requests keep ordinary Client behavior.
+func (h *ProxyHandler) doInferenceWithRetry(reqFactory func() (*http.Request, error)) (*http.Response, error) {
+	return h.doWithRetryMode(reqFactory, true)
+}
+
+func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error), inference bool) (*http.Response, error) {
 	maxRetries := h.maxRetries
 	if maxRetries == 0 {
 		maxRetries = 3
@@ -232,7 +248,7 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 			return nil, ctxErr
 		}
 
-		resp, err := h.client.Do(req)
+		resp, err := h.sendRetryRequest(req, inference)
 		lifecyclePreempted := errors.Is(context.Cause(req.Context()), errProxyLifecycleShutdown) &&
 			contextTerminationMatches(req.Context(), err)
 		if pending != nil && !lifecyclePreempted {
@@ -311,6 +327,176 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 	}
 	return nil, lastErr
+}
+
+func (h *ProxyHandler) sendRetryRequest(req *http.Request, inference bool) (*http.Response, error) {
+	client := h.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	autoDecompressGzip := providerRequestAutoDecompressGzip(req)
+	exceptionalInferenceClient := client.Timeout != 0 || client.Jar != nil || client.CheckRedirect != nil || req.URL == nil || req.URL.User != nil
+	if !inference || exceptionalInferenceClient {
+		if inference {
+			clone := *client
+			clone.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			}
+			client = &clone
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return resp, err
+		}
+		maybeAutoDecompressProviderResponse(resp, autoDecompressGzip)
+		return resp, nil
+	}
+	if req.RequestURI != "" {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, &url.Error{Op: strings.ToLower(req.Method), URL: req.URL.String(), Err: errors.New("http: Request.RequestURI can't be set in client requests")}
+	}
+	if req.Header == nil {
+		req.Header = make(http.Header)
+	}
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if tlsErr, ok := err.(tls.RecordHeaderError); ok && string(tlsErr.RecordHeader[:]) == "HTTP/" {
+			err = http.ErrSchemeMismatch
+		}
+		return nil, &url.Error{Op: strings.ToLower(req.Method), URL: req.URL.String(), Err: err}
+	}
+	if resp == nil {
+		return nil, &url.Error{Op: strings.ToLower(req.Method), URL: req.URL.String(), Err: fmt.Errorf("http: RoundTripper implementation (%T) returned a nil *Response with a nil error", transport)}
+	}
+	if resp.Body == nil {
+		if resp.ContentLength > 0 && req.Method != http.MethodHead {
+			return nil, &url.Error{Op: strings.ToLower(req.Method), URL: req.URL.String(), Err: fmt.Errorf("http: RoundTripper implementation (%T) returned a *Response with content length %d but a nil Body", transport, resp.ContentLength)}
+		}
+		resp.Body = http.NoBody
+	}
+	if resp.Request == nil {
+		resp.Request = req
+	}
+	maybeAutoDecompressProviderResponse(resp, autoDecompressGzip)
+	return resp, nil
+}
+
+var (
+	errProviderGzipReadInProgress = errors.New("concurrent read on gzip response body")
+	errProviderGzipBodyClosed     = errors.New("read on closed gzip response body")
+	providerGzipReaderPool        = sync.Pool{New: func() any { return new(gzip.Reader) }}
+)
+
+type providerGzipEOFReader struct{}
+
+func (providerGzipEOFReader) Read([]byte) (int, error) { return 0, io.EOF }
+func (providerGzipEOFReader) ReadByte() (byte, error)  { return 0, io.EOF }
+
+func providerGzipReaderPoolGet(body io.Reader) (*gzip.Reader, error) {
+	reader := providerGzipReaderPool.Get().(*gzip.Reader)
+	if err := reader.Reset(body); err != nil {
+		providerGzipReaderPoolPut(reader)
+		return nil, err
+	}
+	return reader, nil
+}
+
+func providerGzipReaderPoolPut(reader *gzip.Reader) {
+	// Reset against a flate.Reader so gzip does not allocate a bufio.Reader,
+	// and so the pooled reader does not retain the completed response body.
+	var empty flate.Reader = providerGzipEOFReader{}
+	_ = reader.Reset(empty)
+	providerGzipReaderPool.Put(reader)
+}
+
+type providerAutoGzipResponseBody struct {
+	body   io.ReadCloser
+	mu     sync.Mutex
+	reader *gzip.Reader
+	state  error
+}
+
+func (b *providerAutoGzipResponseBody) acquire() (*gzip.Reader, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != nil {
+		return nil, b.state
+	}
+	if b.reader == nil {
+		b.state = errProviderGzipReadInProgress
+		b.mu.Unlock()
+		reader, err := providerGzipReaderPoolGet(b.body)
+		b.mu.Lock()
+		if b.state != errProviderGzipReadInProgress {
+			if reader != nil {
+				providerGzipReaderPoolPut(reader)
+			}
+			return nil, b.state
+		}
+		b.reader = reader
+		b.state = err
+		if err != nil {
+			return nil, err
+		}
+	}
+	reader := b.reader
+	b.reader = nil
+	b.state = errProviderGzipReadInProgress
+	return reader, nil
+}
+
+func (b *providerAutoGzipResponseBody) release(reader *gzip.Reader) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == errProviderGzipReadInProgress {
+		b.reader = reader
+		b.state = nil
+		return
+	}
+	providerGzipReaderPoolPut(reader)
+}
+
+func (b *providerAutoGzipResponseBody) Read(p []byte) (int, error) {
+	reader, err := b.acquire()
+	if err != nil {
+		return 0, err
+	}
+	defer b.release(reader)
+	return reader.Read(p)
+}
+
+func (b *providerAutoGzipResponseBody) Close() error {
+	if b == nil || b.body == nil {
+		return nil
+	}
+	b.mu.Lock()
+	if b.state == nil && b.reader != nil {
+		providerGzipReaderPoolPut(b.reader)
+		b.reader = nil
+	}
+	b.state = errProviderGzipBodyClosed
+	b.mu.Unlock()
+	return b.body.Close()
+}
+
+func maybeAutoDecompressProviderResponse(resp *http.Response, enabled bool) {
+	if !enabled || resp == nil || resp.Body == nil || !strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		return
+	}
+	resp.Body = &providerAutoGzipResponseBody{body: resp.Body}
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Content-Length")
+	resp.ContentLength = -1
+	resp.Uncompressed = true
 }
 
 func contextTerminationMatches(ctx context.Context, err error) bool {

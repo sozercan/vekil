@@ -1,6 +1,26 @@
 package proxy
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
+
+func TestAcquireRequestSummaryOwnershipAndReset(t *testing.T) {
+	ctx, summary, owned := AcquireRequestSummary(context.Background())
+	if !owned || summary == nil {
+		t.Fatalf("AcquireRequestSummary() = summary:%p owned:%v, want owned summary", summary, owned)
+	}
+	_, existing, existingOwned := AcquireRequestSummary(ctx)
+	if existingOwned || existing != summary {
+		t.Fatalf("AcquireRequestSummary(existing) = summary:%p owned:%v, want %p false", existing, existingOwned, summary)
+	}
+	summary.setRoute("openai_chat", "gpt-5", false)
+	summary.retryStatsTracked.Store(true)
+	ReleaseRequestSummary(summary)
+	if summary.endpoint != "" || summary.model != "" || summary.retryStatsTracked.Load() {
+		t.Fatalf("released summary retained state: %#v", summary)
+	}
+}
 
 func TestRequestSummaryRouteObservability(t *testing.T) {
 	summary := &RequestSummary{}

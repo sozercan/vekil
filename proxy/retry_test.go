@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -48,6 +50,263 @@ func TestDoWithRetry_SuccessOnFirstTry(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Errorf("expected 1 call, got %d", calls.Load())
+	}
+}
+
+func TestInferenceRetryRejectsRedirectsWhileOrdinaryRetryFollows(t *testing.T) {
+	var redirectedCalls atomic.Int32
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectedCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer redirected.Close()
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirected.URL, http.StatusTemporaryRedirect)
+	}))
+	defer primary.Close()
+
+	h := &ProxyHandler{
+		client:         primary.Client(),
+		maxRetries:     1,
+		retryBaseDelay: time.Millisecond,
+	}
+	request := func() (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, primary.URL, nil)
+	}
+
+	resp, err := h.doInferenceWithRetry(request)
+	if err != nil {
+		t.Fatalf("doInferenceWithRetry() error = %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("inference status = %d, want %d", resp.StatusCode, http.StatusTemporaryRedirect)
+	}
+	if got := redirectedCalls.Load(); got != 0 {
+		t.Fatalf("inference redirect target calls = %d, want 0", got)
+	}
+
+	resp, err = h.doWithRetry(request)
+	if err != nil {
+		t.Fatalf("doWithRetry() error = %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ordinary retry status = %d, want 200", resp.StatusCode)
+	}
+	if got := redirectedCalls.Load(); got != 1 {
+		t.Fatalf("ordinary redirect target calls = %d, want 1", got)
+	}
+}
+
+func TestInferenceRetryExceptionalClientStillRejectsRedirects(t *testing.T) {
+	var redirectedCalls atomic.Int32
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectedCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer redirected.Close()
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirected.URL, http.StatusTemporaryRedirect)
+	}))
+	defer primary.Close()
+
+	client := primary.Client()
+	client.Timeout = time.Second
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return nil
+	}
+	h := &ProxyHandler{
+		client:         client,
+		maxRetries:     1,
+		retryBaseDelay: time.Millisecond,
+	}
+	resp, err := h.doInferenceWithRetry(func() (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, primary.URL, nil)
+	})
+	if err != nil {
+		t.Fatalf("doInferenceWithRetry() error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("inference status = %d, want %d", resp.StatusCode, http.StatusTemporaryRedirect)
+	}
+	if got := redirectedCalls.Load(); got != 0 {
+		t.Fatalf("inference redirect target calls = %d, want 0", got)
+	}
+}
+
+func TestInferenceRetryAutoDecompressesSealedProviderGzipResponse(t *testing.T) {
+	payload := []byte(`{"id":"chatcmpl-test","choices":[]}`)
+	compressed := gzipTestPayload(t, payload)
+	acceptEncoding := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		acceptEncoding <- r.Header.Get("Accept-Encoding")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", strconv.Itoa(len(compressed)))
+		_, _ = w.Write(compressed)
+	}))
+	defer server.Close()
+
+	h := &ProxyHandler{
+		client:         server.Client(),
+		maxRetries:     1,
+		retryBaseDelay: time.Millisecond,
+	}
+	providers, _, _, err := h.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:             "local-openai",
+			Type:           "openai-compatible",
+			Default:        true,
+			BaseURL:        server.URL,
+			AuthType:       "none",
+			ModelDiscovery: "static",
+			Models:         []ProviderModelConfig{{PublicID: "local-chat"}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	provider := providers["local-openai"]
+	requestBody := []byte(`{"model":"local-chat","messages":[]}`)
+	resp, err := h.doInferenceWithRetry(func() (*http.Request, error) {
+		return h.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, requestBody, nil, "")
+	})
+	if err != nil {
+		t.Fatalf("doInferenceWithRetry() error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if got := <-acceptEncoding; got != "gzip" {
+		t.Fatalf("upstream Accept-Encoding = %q, want gzip", got)
+	}
+	assertAutoDecompressedProviderResponse(t, resp, payload)
+}
+
+func TestInferenceRetryPreservesOperatorSuppliedResponseEncoding(t *testing.T) {
+	payload := []byte(`{"ok":true}`)
+	compressed := gzipTestPayload(t, payload)
+	h := &ProxyHandler{
+		maxRetries:     1,
+		retryBaseDelay: time.Millisecond,
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if got := req.Header.Get("Accept-Encoding"); got != "identity" {
+				t.Fatalf("Accept-Encoding = %q, want identity", got)
+			}
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Encoding": []string{"gzip"}, "Content-Length": []string{strconv.Itoa(len(compressed))}},
+				Body:          io.NopCloser(bytes.NewReader(compressed)),
+				ContentLength: int64(len(compressed)),
+				Request:       req,
+			}, nil
+		})},
+	}
+	provider := &providerRuntime{
+		id:           "operator-encoding",
+		kind:         providerTypeOpenAICompatible,
+		baseURL:      "https://upstream.example",
+		authType:     providerAuthTypeNone,
+		extraHeaders: http.Header{"Accept-Encoding": []string{"identity"}},
+		paths:        providerEndpointPaths{chatCompletions: providerEndpointChatCompletions},
+	}
+	if err := sealProviderRequestTemplates(provider); err != nil {
+		t.Fatalf("sealProviderRequestTemplates() error = %v", err)
+	}
+	resp, err := h.doInferenceWithRetry(func() (*http.Request, error) {
+		return h.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, []byte(`{}`), nil, "")
+	})
+	if err != nil {
+		t.Fatalf("doInferenceWithRetry() error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	if got := resp.Header.Get("Content-Length"); got != strconv.Itoa(len(compressed)) {
+		t.Fatalf("Content-Length header = %q, want %d", got, len(compressed))
+	}
+	if resp.ContentLength != int64(len(compressed)) || resp.Uncompressed {
+		t.Fatalf("response metadata = ContentLength %d, Uncompressed %t; want %d, false", resp.ContentLength, resp.Uncompressed, len(compressed))
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if !bytes.Equal(got, compressed) {
+		t.Fatalf("response body was unexpectedly decoded")
+	}
+}
+
+func TestSingleInferenceSendAutoDecompressesAndClosesProviderGzipResponse(t *testing.T) {
+	payload := []byte(`{"ok":true}`)
+	compressed := gzipTestPayload(t, payload)
+	underlying := &trackingReadCloser{reader: bytes.NewReader(compressed)}
+	h := &ProxyHandler{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.Header.Get("Accept-Encoding"); got != "gzip" {
+			t.Fatalf("Accept-Encoding = %q, want gzip", got)
+		}
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Encoding": []string{"gzip"}, "Content-Length": []string{strconv.Itoa(len(compressed))}},
+			Body:          underlying,
+			ContentLength: int64(len(compressed)),
+			Request:       req,
+		}, nil
+	})}}
+	req, err := http.NewRequest(http.MethodPost, "https://upstream.example/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Body = newProviderRequestBody([]byte(`{}`), providerRouteInfo{id: "explicit-provider", kind: string(providerTypeOpenAICompatible)}, true)
+	req.ContentLength = 2
+
+	resp, err := h.singleInferenceSend(req, nil)
+	if err != nil {
+		t.Fatalf("singleInferenceSend() error = %v", err)
+	}
+	assertAutoDecompressedProviderResponse(t, resp, payload)
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("response Close() error = %v", err)
+	}
+	if !underlying.closed {
+		t.Fatal("response Close() did not close compressed upstream body")
+	}
+}
+
+func gzipTestPayload(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(payload); err != nil {
+		t.Fatalf("gzip Write() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("gzip Close() error = %v", err)
+	}
+	return compressed.Bytes()
+}
+
+func assertAutoDecompressedProviderResponse(t *testing.T, resp *http.Response, want []byte) {
+	t.Helper()
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want removed", got)
+	}
+	if got := resp.Header.Get("Content-Length"); got != "" {
+		t.Fatalf("Content-Length header = %q, want removed", got)
+	}
+	if resp.ContentLength != -1 || !resp.Uncompressed {
+		t.Fatalf("response metadata = ContentLength %d, Uncompressed %t; want -1, true", resp.ContentLength, resp.Uncompressed)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("decoded response body = %q, want %q", got, want)
 	}
 }
 

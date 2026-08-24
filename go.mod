@@ -2,6 +2,8 @@ module github.com/sozercan/vekil
 
 go 1.25.0
 
+toolchain go1.27.0
+
 require github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
 
 require (

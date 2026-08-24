@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -610,6 +611,9 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	if provider.apiKey != "generic-key" {
 		t.Fatalf("apiKey = %q, want generic-key", provider.apiKey)
 	}
+	if provider.authValue != "Token generic-key" {
+		t.Fatalf("authValue = %q, want Token generic-key", provider.authValue)
+	}
 	if got := provider.extraHeaders.Get("X-Provider"); got != "local" {
 		t.Fatalf("extra header X-Provider = %q, want local", got)
 	}
@@ -619,6 +623,12 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	if provider.modelDiscovery != providerModelDiscoveryOllama {
 		t.Fatalf("modelDiscovery = %q, want ollama", provider.modelDiscovery)
 	}
+	if !provider.postRequestAutoGzip {
+		t.Fatal("postRequestAutoGzip = false, want automatic gzip for sealed provider requests")
+	}
+	if got := provider.postRequestTemplates[providerEndpointChatCompletions].Header.Get("Accept-Encoding"); got != "gzip" {
+		t.Fatalf("sealed request Accept-Encoding = %q, want gzip", got)
+	}
 
 	model := provider.staticModels["local-chat"]
 	if model.publicID != "local-chat" || model.upstreamModel != "llama3.2:latest" {
@@ -626,6 +636,271 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	}
 	if !reflect.DeepEqual(model.supportedEndpoints, []string{"/chat/completions"}) {
 		t.Fatalf("default openai-compatible endpoints = %v, want [/chat/completions]", model.supportedEndpoints)
+	}
+
+	body := []byte(`{"model":"local-chat"}`)
+	first, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+	if err != nil {
+		t.Fatalf("newProviderJSONRequest() error = %v", err)
+	}
+	if got := first.URL.String(); got != "http://localhost:1234/v1/chat/completions" {
+		t.Fatalf("request URL = %q, want configured Chat URL", got)
+	}
+	if got := first.Header.Get("X-Api-Key"); got != "Token generic-key" {
+		t.Fatalf("request X-Api-Key = %q, want Token generic-key", got)
+	}
+	if got := first.Header.Get("X-Provider"); got != "local" {
+		t.Fatalf("request X-Provider = %q, want local", got)
+	}
+	if first.GetBody == nil {
+		t.Fatal("request GetBody = nil, want replayable configured-provider body")
+	}
+	replay, err := first.GetBody()
+	if err != nil {
+		t.Fatalf("request GetBody() error = %v", err)
+	}
+	replayed, err := io.ReadAll(replay)
+	_ = replay.Close()
+	if err != nil || !reflect.DeepEqual(replayed, body) {
+		t.Fatalf("replayed body = %q, %v; want %q", replayed, err, body)
+	}
+
+	first.Header.Set("X-Api-Key", "mutated")
+	second, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+	if err != nil {
+		t.Fatalf("second newProviderJSONRequest() error = %v", err)
+	}
+	if got := second.Header.Get("X-Api-Key"); got != "Token generic-key" {
+		t.Fatalf("second request X-Api-Key = %q after first mutation, want Token generic-key", got)
+	}
+
+	inference, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+	if err != nil {
+		t.Fatalf("newProviderJSONInferenceRequest() error = %v", err)
+	}
+	if got := inference.Header.Get("Accept-Encoding"); got != "gzip" {
+		t.Fatalf("inference Accept-Encoding = %q, want gzip", got)
+	}
+	if !providerRequestAutoDecompressGzip(inference) {
+		t.Fatal("inference request did not retain automatic gzip response marker")
+	}
+	if inference.GetBody != nil {
+		t.Fatal("inference request GetBody is non-nil; transport replay must remain disabled")
+	}
+	inferenceBody, err := io.ReadAll(inference.Body)
+	_ = inference.Body.Close()
+	if err != nil || !reflect.DeepEqual(inferenceBody, body) {
+		t.Fatalf("inference body = %q, %v; want %q", inferenceBody, err, body)
+	}
+	fallbackInference, err := handler.newProviderJSONInferenceRequest(
+		context.Background(),
+		provider,
+		http.MethodPost,
+		providerEndpointChatCompletions,
+		body,
+		http.Header{"Idempotency-Key": []string{"request-1"}},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("fallback newProviderJSONInferenceRequest() error = %v", err)
+	}
+	if fallbackInference.GetBody != nil {
+		t.Fatal("fallback inference request GetBody is non-nil; transport replay must remain disabled")
+	}
+	if got := fallbackInference.Header.Get("Idempotency-Key"); got != "request-1" {
+		t.Fatalf("fallback inference Idempotency-Key = %q, want request-1", got)
+	}
+	_ = fallbackInference.Body.Close()
+
+	bodyless, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, nil, nil, "")
+	if err != nil {
+		t.Fatalf("bodyless newProviderJSONInferenceRequest() error = %v", err)
+	}
+	if got := bodyless.Header.Get("Accept-Encoding"); got != "" {
+		t.Fatalf("bodyless inference Accept-Encoding = %q, want transport-managed encoding", got)
+	}
+	if bodyless.Body != nil || bodyless.ContentLength != 0 || providerRequestAutoDecompressGzip(bodyless) {
+		t.Fatalf("bodyless inference = Body %T, ContentLength %d, auto-gzip %t; want nil, 0, false", bodyless.Body, bodyless.ContentLength, providerRequestAutoDecompressGzip(bodyless))
+	}
+	if got := provider.postRequestTemplates[providerEndpointChatCompletions].Header.Get("Accept-Encoding"); got != "gzip" {
+		t.Fatalf("bodyless request mutated sealed template Accept-Encoding to %q", got)
+	}
+}
+
+func TestProviderInferenceRequestsIsolateSealedHeadersFromCookieJars(t *testing.T) {
+	tests := []struct {
+		name string
+		send func(*ProxyHandler, *http.Request) (*http.Response, error)
+	}{
+		{
+			name: "retry send",
+			send: func(handler *ProxyHandler, req *http.Request) (*http.Response, error) {
+				return handler.sendRetryRequest(req, true)
+			},
+		},
+		{
+			name: "single send",
+			send: func(handler *ProxyHandler, req *http.Request) (*http.Response, error) {
+				return handler.singleInferenceSend(req, nil)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer server.Close()
+
+			jar, err := cookiejar.New(nil)
+			if err != nil {
+				t.Fatalf("cookiejar.New() error = %v", err)
+			}
+			client := server.Client()
+			client.Jar = jar
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com", client: client}
+			providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+				ID:             "local",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        server.URL,
+				AuthType:       "none",
+				ModelDiscovery: "static",
+				Models:         []ProviderModelConfig{{PublicID: "local-chat"}},
+			}}})
+			if err != nil {
+				t.Fatalf("buildProviders() error = %v", err)
+			}
+			provider := providers["local"]
+			body := []byte(`{"model":"local-chat","messages":[]}`)
+			first, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+			if err != nil {
+				t.Fatalf("newProviderJSONInferenceRequest() error = %v", err)
+			}
+			jar.SetCookies(first.URL, []*http.Cookie{{Name: "session", Value: "one"}})
+
+			resp, err := tt.send(handler, first)
+			if err != nil {
+				t.Fatalf("send() error = %v", err)
+			}
+			_ = resp.Body.Close()
+			if got := first.Header.Get("Cookie"); got != "session=one" {
+				t.Fatalf("first request Cookie = %q, want session=one", got)
+			}
+
+			jar.SetCookies(first.URL, []*http.Cookie{{Name: "session", MaxAge: -1}})
+			second, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+			if err != nil {
+				t.Fatalf("second newProviderJSONInferenceRequest() error = %v", err)
+			}
+			defer func() { _ = second.Body.Close() }()
+			if got := second.Header.Get("Cookie"); got != "" {
+				t.Fatalf("second request inherited Cookie %q from sealed headers", got)
+			}
+			if got := provider.postRequestTemplates[providerEndpointChatCompletions].Header.Get("Cookie"); got != "" {
+				t.Fatalf("sealed template retained Cookie %q", got)
+			}
+		})
+	}
+}
+
+func TestBuildProvidersGenericRequestPreservesOperatorAcceptEncoding(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:             "operator-encoding",
+			Type:           "openai-compatible",
+			Default:        true,
+			BaseURL:        "http://localhost:1234",
+			AuthType:       "none",
+			ExtraHeaders:   map[string]string{"Accept-Encoding": "identity"},
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID: "local-chat",
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	provider := providers["operator-encoding"]
+	if provider == nil {
+		t.Fatal("expected operator-encoding provider")
+	}
+	if provider.postRequestAutoGzip {
+		t.Fatal("postRequestAutoGzip = true with operator-supplied Accept-Encoding")
+	}
+
+	for _, body := range [][]byte{[]byte(`{"model":"local-chat"}`), nil} {
+		req, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+		if err != nil {
+			t.Fatalf("newProviderJSONInferenceRequest(body=%q) error = %v", body, err)
+		}
+		if got := req.Header.Get("Accept-Encoding"); got != "identity" {
+			t.Fatalf("Accept-Encoding = %q, want operator value identity", got)
+		}
+		if providerRequestAutoDecompressGzip(req) {
+			t.Fatal("operator-supplied encoding enabled proxy gzip decompression")
+		}
+	}
+}
+
+func TestProviderMessagesTemplateKeepsConfiguredHeaderPrecedence(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:         "native",
+		Type:       "anthropic-compatible",
+		Default:    true,
+		BaseURL:    "http://localhost:1234",
+		APIKey:     "configured-credential",
+		AuthType:   "api-key-header",
+		AuthHeader: "Anthropic-Version",
+		ExtraHeaders: map[string]string{
+			"Anthropic-Beta": "configured-beta",
+		},
+		ModelDiscovery: "static",
+		Models: []ProviderModelConfig{{
+			PublicID:   "claude-public",
+			Deployment: "claude-upstream",
+			Endpoints:  []string{providerEndpointMessages},
+		}},
+	}}})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	provider := providers["native"]
+	if provider == nil {
+		t.Fatal("expected native provider")
+	}
+
+	req, err := handler.newProviderJSONInferenceRequest(
+		context.Background(),
+		provider,
+		http.MethodPost,
+		providerEndpointMessages,
+		[]byte(`{"model":"claude-upstream"}`),
+		http.Header{
+			"Anthropic-Version":                         []string{"client-version"},
+			"Anthropic-Beta":                            []string{"client-beta"},
+			"Anthropic-Dangerous-Direct-Browser-Access": []string{"true"},
+		},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("newProviderJSONInferenceRequest() error = %v", err)
+	}
+	defer func() { _ = req.Body.Close() }()
+
+	if got := req.Header.Get("Anthropic-Version"); got != "configured-credential" {
+		t.Fatalf("Anthropic-Version = %q, want configured credential", got)
+	}
+	if got := req.Header.Get("Anthropic-Beta"); got != "configured-beta" {
+		t.Fatalf("Anthropic-Beta = %q, want configured provider value", got)
+	}
+	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "true" {
+		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want forwarded value", got)
 	}
 }
 

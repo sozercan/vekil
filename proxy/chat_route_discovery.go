@@ -52,6 +52,16 @@ func (h *ProxyHandler) resolveChatRoute(ctx context.Context, model string) (reso
 	if !h.modelAllowedForRequest(model, providerEndpointChatCompletions) {
 		return resolvedChatRoute{}, modelNotAllowedRequestError(model)
 	}
+	if route, known := h.resolveModelRouteForRequest(model, providerEndpointChatCompletions); known && route != nil && route.legacy {
+		target, ok := route.primaryTarget()
+		if !ok || target.provider == nil {
+			return resolvedChatRoute{}, &providerRequestError{
+				statusCode: http.StatusInternalServerError,
+				err:        fmt.Errorf("no provider available for endpoint %s", providerEndpointChatCompletions),
+			}
+		}
+		return chooseChatRouteFromSnapshot(target.provider, providerModelFromRouteTarget(route, target), true, model)
+	}
 	provider, owner, known := h.resolveProviderModelForRequest(model, providerEndpointChatCompletions)
 	if provider == nil && !known && h.hasClosedConfiguredModelRegistry() {
 		return resolvedChatRoute{}, &providerRequestError{

@@ -139,6 +139,10 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 }
 
 func validateAnthropicOutputConfigEffort(body []byte) error {
+	if err, ok := validateAnthropicOutputConfigEffortFast(body); ok {
+		return err
+	}
+
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(body, &root); err != nil {
 		return nil // The handler reports malformed request JSON before this validation.
@@ -160,6 +164,78 @@ func validateAnthropicOutputConfigEffort(body []byte) error {
 		return fmt.Errorf("output_config.effort must be a non-empty string")
 	}
 	return nil
+}
+
+func validateAnthropicOutputConfigEffortFast(body []byte) (error, bool) {
+	root, ok := newStrictRawJSONObjectScanner(body)
+	if !ok {
+		return nil, false
+	}
+
+	var rawOutputConfig []byte
+	outputConfigSeen := false
+	for {
+		key, start, end, done, scanOK := root.next()
+		if !scanOK {
+			return nil, false
+		}
+		if done {
+			break
+		}
+		if !rawJSONKeyEqual(key, "output_config") {
+			continue
+		}
+		if outputConfigSeen {
+			return nil, false
+		}
+		outputConfigSeen = true
+		rawOutputConfig = bytes.TrimSpace(body[start:end])
+	}
+	if !outputConfigSeen || bytes.Equal(rawOutputConfig, []byte("null")) {
+		return nil, true
+	}
+	if len(rawOutputConfig) == 0 || rawOutputConfig[0] != '{' {
+		return nil, true
+	}
+
+	outputConfig, ok := newStrictRawJSONObjectScanner(rawOutputConfig)
+	if !ok {
+		return nil, false
+	}
+	var rawEffort []byte
+	effortSeen := false
+	for {
+		key, start, end, done, scanOK := outputConfig.next()
+		if !scanOK {
+			return nil, false
+		}
+		if done {
+			break
+		}
+		if !rawJSONKeyEqual(key, "effort") {
+			continue
+		}
+		if effortSeen {
+			return nil, false
+		}
+		effortSeen = true
+		rawEffort = bytes.TrimSpace(rawOutputConfig[start:end])
+	}
+	if !effortSeen {
+		return nil, true
+	}
+
+	contentStart, contentEnd, valueEnd, escaped, stringOK := scanStrictRawJSONString(rawEffort, 0)
+	if !stringOK || valueEnd != len(rawEffort) {
+		return fmt.Errorf("output_config.effort must be a non-empty string"), true
+	}
+	if escaped {
+		return nil, false
+	}
+	if len(bytes.TrimSpace(rawEffort[contentStart:contentEnd])) == 0 {
+		return fmt.Errorf("output_config.effort must be a non-empty string"), true
+	}
+	return nil, true
 }
 
 func mergeSplitAnthropicReplayAssistantTurns(messages []models.OpenAIMessage) []models.OpenAIMessage {

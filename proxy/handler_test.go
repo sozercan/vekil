@@ -40,6 +40,149 @@ func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
 	return h
 }
 
+type handlerTestRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f handlerTestRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestCopyPassthroughHeadersBorrowsImmutableValues(t *testing.T) {
+	src := http.Header{
+		"Connection":   []string{"X-Hop"},
+		"Content-Type": []string{"application/json"},
+		"X-Hop":        []string{"secret"},
+		"X-Multi":      []string{"one", "two"},
+	}
+	dst := http.Header{
+		"X-Local": []string{"keep"},
+		"X-Multi": []string{"stale"},
+	}
+
+	copyPassthroughHeaders(dst, src)
+	if got := dst.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if got := dst.Get("X-Hop"); got != "" {
+		t.Fatalf("hop-by-hop nominated header leaked: %q", got)
+	}
+	if got := dst.Get("X-Local"); got != "keep" {
+		t.Fatalf("proxy-owned header = %q, want keep", got)
+	}
+	dst.Add("X-Multi", "three")
+	if got := src.Values("X-Multi"); !reflect.DeepEqual(got, []string{"one", "two"}) {
+		t.Fatalf("adding a downstream value mutated upstream headers: %v", got)
+	}
+	dst.Set("Content-Type", "text/plain")
+	if got := src.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("setting a downstream value mutated upstream headers: %q", got)
+	}
+}
+
+func TestReadBodyBorrowedUsesSmallKnownLengthBuffer(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","messages":[]}`))
+	body, pooled, err := readBodyBorrowed(req)
+	if err != nil {
+		t.Fatalf("readBodyBorrowed() error = %v", err)
+	}
+	if pooled == nil {
+		t.Fatal("readBodyBorrowed() did not borrow a small known-length buffer")
+	}
+	defer releaseSmallRequestBodyBuffer(pooled)
+	if got, want := cap(*pooled), tinyRequestBodyBufferSize; got != want {
+		t.Fatalf("pooled buffer capacity = %d, want tiny tier %d", got, want)
+	}
+	if got, want := string(body), `{"model":"test","messages":[]}`; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
+func TestReadBodyBorrowedUsesFourKiBTier(t *testing.T) {
+	bodyText := strings.Repeat("x", tinyRequestBodyBufferSize)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(bodyText))
+	body, pooled, err := readBodyBorrowed(req)
+	if err != nil {
+		t.Fatalf("readBodyBorrowed() error = %v", err)
+	}
+	if pooled == nil {
+		t.Fatal("readBodyBorrowed() did not borrow a small known-length buffer")
+	}
+	defer releaseSmallRequestBodyBuffer(pooled)
+	if got, want := cap(*pooled), smallRequestBodyBufferSize; got != want {
+		t.Fatalf("pooled buffer capacity = %d, want small tier %d", got, want)
+	}
+	if got := string(body); got != bodyText {
+		t.Fatalf("body length = %d, want %d", len(got), len(bodyText))
+	}
+}
+
+func TestReadBodyBorrowedFallsBackForUnknownLengthAndCompression(t *testing.T) {
+	t.Run("unknown-length", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+		req.ContentLength = -1
+		body, pooled, err := readBodyBorrowed(req)
+		if err != nil {
+			t.Fatalf("readBodyBorrowed() error = %v", err)
+		}
+		if pooled != nil {
+			t.Fatal("unknown-length body unexpectedly used the small buffer pool")
+		}
+		if got, want := string(body), `{"model":"test"}`; got != want {
+			t.Fatalf("body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("compressed", func(t *testing.T) {
+		var compressed bytes.Buffer
+		writer := gzip.NewWriter(&compressed)
+		_, _ = writer.Write([]byte(`{"model":"test"}`))
+		_ = writer.Close()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", &compressed)
+		req.Header.Set("Content-Encoding", "gzip")
+		body, pooled, err := readBodyBorrowed(req)
+		if err != nil {
+			t.Fatalf("readBodyBorrowed() error = %v", err)
+		}
+		if pooled != nil {
+			t.Fatal("compressed body unexpectedly used the small buffer pool")
+		}
+		if got, want := string(body), `{"model":"test"}`; got != want {
+			t.Fatalf("body = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestReadBodyBorrowedDoesNotTrustShortContentLength(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = io.NopCloser(strings.NewReader("abcdef"))
+	req.ContentLength = 3
+	body, pooled, err := readBodyBorrowed(req)
+	if pooled != nil {
+		defer releaseSmallRequestBodyBuffer(pooled)
+	}
+	if err != nil {
+		t.Fatalf("readBodyBorrowed() error = %v", err)
+	}
+	if got, want := string(body), "abcdef"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
+func TestReadBodyBorrowedRejectsTruncatedDeclaredLength(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-4"}`))
+	req.ContentLength = 100
+	body, pooled, err := readBodyBorrowed(req)
+	if pooled != nil {
+		defer releaseSmallRequestBodyBuffer(pooled)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("readBodyBorrowed() error = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if body != nil {
+		t.Fatalf("readBodyBorrowed() body = %q, want nil", body)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -1387,6 +1530,39 @@ func TestHandleResponses(t *testing.T) {
 	}
 	if result["id"] != "resp-123" {
 		t.Errorf("expected id resp-123, got %v", result["id"])
+	}
+}
+
+func TestHandleResponsesDetachesBorrowedBodyBeforeUpstream(t *testing.T) {
+	const responseBody = `{"id":"resp-native","object":"response","status":"completed","model":"gpt-4","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
+	capturedBody := make(chan io.ReadCloser, 1)
+	h := newRoundTripTestProxyHandler(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		capturedBody <- req.Body
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			Body:          io.NopCloser(strings.NewReader(responseBody)),
+			ContentLength: int64(len(responseBody)),
+			Request:       req,
+		}, nil
+	}))
+
+	reqBody := `{"model":"gpt-4","input":"` + strings.Repeat("x", 1024) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+	h.HandleResponses(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	upstreamBody := <-capturedBody
+	defer func() { _ = upstreamBody.Close() }()
+	gotBody, err := io.ReadAll(upstreamBody)
+	if err != nil {
+		t.Fatalf("read asynchronously retained upstream body: %v", err)
+	}
+	if string(gotBody) != reqBody {
+		t.Fatalf("upstream body was recycled before asynchronous close: got %q, want %q", gotBody, reqBody)
 	}
 }
 
@@ -6785,6 +6961,44 @@ func TestHandleOpenAIChatCompletions_RetriesWithoutInjectedStreamOptions(t *test
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("upstream calls = %d want 2", calls.Load())
+	}
+}
+
+func TestHandleOpenAIChatCompletionsDetachesBorrowedBodyBeforeUpstream(t *testing.T) {
+	const responseBody = `{"id":"chatcmpl-native","object":"chat.completion","created":1,"model":"gpt-upstream","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+	capturedBody := make(chan io.ReadCloser, 1)
+	h := newChatExecutionTestHandler(t, "http://upstream.example", []string{providerEndpointChatCompletions})
+	h.client = &http.Client{Transport: handlerTestRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		capturedBody <- req.Body
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			Body:          io.NopCloser(strings.NewReader(responseBody)),
+			ContentLength: int64(len(responseBody)),
+			Request:       req,
+		}, nil
+	})}
+
+	reqBody := `{"model":"gpt-public","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	upstreamBody := <-capturedBody
+	defer func() { _ = upstreamBody.Close() }()
+	gotBody, err := io.ReadAll(upstreamBody)
+	if err != nil {
+		t.Fatalf("read asynchronously retained upstream body: %v", err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("upstream body was recycled before asynchronous close: %q: %v", gotBody, err)
+	}
+	if got := rawJSONString(payload["model"]); got != "gpt-upstream" {
+		t.Fatalf("upstream model = %q, want gpt-upstream; body=%s", got, gotBody)
 	}
 }
 
@@ -12742,6 +12956,34 @@ func TestOpenAIChatCompletionsNormalizesMissingTopLevelFields(t *testing.T) {
 
 	if _, ok := raw["copilot_usage"]; !ok {
 		t.Fatal("copilot_usage was not preserved")
+	}
+}
+
+func TestOpenAIChatCompletionsRepairsZeroCreatedAndTotalTokens(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-zeroes","object":"chat.completion","created":0,"model":"gpt-4","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":0}}`)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`))
+	w := httptest.NewRecorder()
+	handler.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	var response struct {
+		Created int64              `json:"created"`
+		Usage   models.OpenAIUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Created == 0 {
+		t.Fatal("created = 0, want normalized timestamp")
+	}
+	if response.Usage.PromptTokens != 2 || response.Usage.CompletionTokens != 3 || response.Usage.TotalTokens != 5 {
+		t.Fatalf("usage = %+v, want 2/3/5", response.Usage)
 	}
 }
 

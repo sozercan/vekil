@@ -161,6 +161,17 @@ func TestNewInferenceUpstreamContextPropagatesTrackedMarker(t *testing.T) {
 	}
 }
 
+func TestRetryStatsTrackedUsesExistingRequestSummaryContext(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	tracked := markRetryStatsTracked(ctx)
+	if tracked != ctx {
+		t.Fatal("markRetryStatsTracked added a context layer despite an existing request summary")
+	}
+	if !isRetryStatsTracked(tracked) || !summary.retryStatsTracked.Load() {
+		t.Fatal("request summary did not retain the retry-stats marker")
+	}
+}
+
 // TestMarkRetryStatsTrackedIfInference covers that only inference routes acquire
 // the marker through the middleware helper.
 func TestMarkRetryStatsTrackedIfInference(t *testing.T) {

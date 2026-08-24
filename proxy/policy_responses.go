@@ -110,7 +110,8 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 		writePolicyResponsesExecutionError(w, err, publicModel)
 		return
 	}
-	observeUpstreamHeaders(r.Context(), result.Headers)
+	upstreamHeaders := chatExecutionUpstreamHeaders(result)
+	observeUpstreamHeaders(r.Context(), upstreamHeaders)
 	completion.Model = publicModel
 	observeOpenAIUsage(r.Context(), completion.Usage)
 	h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), completion, h.toolContexts, toolScope, false)
@@ -120,7 +121,7 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadGateway, "failed to translate policy response", "server_error")
 		return
 	}
-	if safeHeaders := policyChatSafeHeaders(result.Headers, publicModel); len(safeHeaders) > 0 {
+	if safeHeaders := policyChatSafeHeaders(upstreamHeaders, publicModel); len(safeHeaders) > 0 {
 		mergeHeaderValues(w.Header(), safeHeaders)
 	}
 	if err := writePolicyResponsesResult(w, response, translated.Stream); err != nil && h.log != nil {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sozercan/vekil/logger"
@@ -17,7 +18,26 @@ import (
 )
 
 func (h *ProxyHandler) newLifecycleUpstreamContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	causeCtx, cancelCause := context.WithCancelCause(h.lifecycleContext())
+	return h.newLifecycleUpstreamContextFrom(h.lifecycleContext(), timeout)
+}
+
+func (h *ProxyHandler) newLifecycleUpstreamContextFrom(lifecycle context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if lifecycle == nil {
+		lifecycle = context.Background()
+	}
+	if !h.ShuttingDown() {
+		ctx, cancel := context.WithTimeout(lifecycle, timeout)
+		// BeginShutdown publishes draining before canceling the lifecycle root.
+		// Keep the ordinary path to one child context, but recheck after creating
+		// it so a context installed in that ordering window still returns with the
+		// proxy-shutdown cause below.
+		if !h.ShuttingDown() || lifecycle.Err() != nil {
+			return ctx, cancel
+		}
+		cancel()
+	}
+
+	causeCtx, cancelCause := context.WithCancelCause(lifecycle)
 	ctx, cancelTimeout := context.WithTimeout(causeCtx, timeout)
 	// BeginShutdown publishes draining before canceling the lifecycle root so
 	// admission closes first. Close that tiny ordering window for children
@@ -54,11 +74,8 @@ func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, 
 	if streaming {
 		timeout = h.effectiveStreamingUpstreamTimeout()
 	}
-	ctx, cancel := h.newLifecycleUpstreamContext(timeout)
-	if isRetryStatsTracked(inbound) {
-		ctx = markRetryStatsTracked(ctx)
-	}
-	return ctx, cancel
+	lifecycle := h.lifecycleContextForRetryStats(isRetryStatsTracked(inbound))
+	return h.newLifecycleUpstreamContextFrom(lifecycle, timeout)
 }
 
 func upstreamStatusCode(err error, fallback int) int {
@@ -74,6 +91,9 @@ func upstreamStatusCode(err error, fallback int) int {
 }
 
 func extractRequestModel(body []byte) string {
+	if model, _, ok := extractTopLevelJSONStringFast(body, "model", false); ok {
+		return model
+	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	tok, err := dec.Token()
 	if err != nil {
@@ -162,6 +182,14 @@ func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*pr
 }
 
 func (h *ProxyHandler) resolveProviderRequestForModel(body []byte, endpoint string, model string) (*providerRuntime, providerModel, []byte, error) {
+	return h.resolveProviderRequestForModelWithValidation(body, endpoint, model, false)
+}
+
+func (h *ProxyHandler) resolveProviderRequestForModelValidated(body []byte, endpoint string, model string) (*providerRuntime, providerModel, []byte, error) {
+	return h.resolveProviderRequestForModelWithValidation(body, endpoint, model, true)
+}
+
+func (h *ProxyHandler) resolveProviderRequestForModelWithValidation(body []byte, endpoint string, model string, bodyValidated bool) (*providerRuntime, providerModel, []byte, error) {
 	if !h.modelAllowedForRequest(model, endpoint) {
 		return nil, providerModel{}, nil, modelNotAllowedRequestError(model)
 	}
@@ -188,7 +216,7 @@ func (h *ProxyHandler) resolveProviderRequestForModel(body []byte, endpoint stri
 		}
 	}
 
-	rewrittenBody, err := prepareResolvedProviderRequestBody(body, model, endpoint, provider, owner)
+	rewrittenBody, err := prepareResolvedProviderRequestBodyWithValidation(body, model, endpoint, provider, owner, bodyValidated)
 	if err != nil {
 		return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
@@ -202,6 +230,17 @@ func prepareResolvedProviderRequestBody(
 	provider *providerRuntime,
 	owner providerModel,
 ) ([]byte, error) {
+	return prepareResolvedProviderRequestBodyWithValidation(body, requestModel, endpoint, provider, owner, false)
+}
+
+func prepareResolvedProviderRequestBodyWithValidation(
+	body []byte,
+	requestModel string,
+	endpoint string,
+	provider *providerRuntime,
+	owner providerModel,
+	bodyValidated bool,
+) ([]byte, error) {
 	if provider == nil {
 		return nil, fmt.Errorf("provider is required")
 	}
@@ -209,7 +248,11 @@ func prepareResolvedProviderRequestBody(
 	rewrittenBody := body
 	if !providerUsesAzureClassicDeploymentPath(provider, endpoint) {
 		var err error
-		rewrittenBody, _, err = rewriteRequestModelForProviderFromModel(body, requestModel, owner.upstreamModel)
+		if bodyValidated {
+			rewrittenBody, _, err = rewriteRequestModelForProviderFromModelJSONValidated(body, requestModel, owner.upstreamModel, owner.upstreamModelJSON)
+		} else {
+			rewrittenBody, _, err = rewriteRequestModelForProviderFromModelJSON(body, requestModel, owner.upstreamModel, owner.upstreamModelJSON)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -276,6 +319,18 @@ func (h *ProxyHandler) postResolvedProviderRequest(
 	body []byte,
 	extraHeaders http.Header,
 ) (*http.Response, error) {
+	return h.postResolvedProviderRequestForModel(ctx, provider, owner, endpoint, body, extraHeaders, extractRequestModel(body))
+}
+
+func (h *ProxyHandler) postResolvedProviderRequestForModel(
+	ctx context.Context,
+	provider *providerRuntime,
+	owner providerModel,
+	endpoint string,
+	body []byte,
+	extraHeaders http.Header,
+	requestModel string,
+) (*http.Response, error) {
 	if provider == nil {
 		return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
 	}
@@ -283,13 +338,13 @@ func (h *ProxyHandler) postResolvedProviderRequest(
 		ctx = context.Background()
 	}
 
-	preparedBody, err := prepareResolvedProviderRequestBody(body, extractRequestModel(body), endpoint, provider, owner)
+	preparedBody, err := prepareResolvedProviderRequestBody(body, requestModel, endpoint, provider, owner)
 	if err != nil {
 		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
-		return h.newProviderJSONRequest(ctx, provider, http.MethodPost, endpoint, preparedBody, extraHeaders, "", owner)
+	return h.doInferenceWithRetry(func() (*http.Request, error) {
+		return h.newProviderJSONInferenceRequest(ctx, provider, http.MethodPost, endpoint, preparedBody, extraHeaders, "", owner)
 	})
 }
 
@@ -373,6 +428,14 @@ func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path str
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, path string, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
+	return h.postJSONEndpointWithHeadersForModelValidation(ctx, path, body, extraHeaders, model, false)
+}
+
+func (h *ProxyHandler) postJSONEndpointWithHeadersForModelValidated(ctx context.Context, path string, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
+	return h.postJSONEndpointWithHeadersForModelValidation(ctx, path, body, extraHeaders, model, true)
+}
+
+func (h *ProxyHandler) postJSONEndpointWithHeadersForModelValidation(ctx context.Context, path string, body []byte, extraHeaders http.Header, model string, bodyValidated bool) (*http.Response, error) {
 	operation := routeOperationFromContext(ctx)
 	if operation == nil {
 		requestedModel := strings.TrimSpace(model)
@@ -445,13 +508,21 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModel(ctx context.Context, 
 		return h.executeExplicitRouteRequest(ctx, route, path, body, extraHeaders, model, stream)
 	}
 
-	provider, owner, rewrittenBody, err := h.resolveProviderRequestForModel(body, path, model)
+	var provider *providerRuntime
+	var owner providerModel
+	var rewrittenBody []byte
+	var err error
+	if bodyValidated {
+		provider, owner, rewrittenBody, err = h.resolveProviderRequestForModelValidated(body, path, model)
+	} else {
+		provider, owner, rewrittenBody, err = h.resolveProviderRequestForModel(body, path, model)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "", owner)
+	return h.doInferenceWithRetry(func() (*http.Request, error) {
+		req, err := h.newProviderJSONInferenceRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "", owner)
 		if err != nil {
 			return nil, err
 		}
@@ -472,7 +543,11 @@ func (h *ProxyHandler) postResponsesWithHeaders(ctx context.Context, body []byte
 }
 
 func (h *ProxyHandler) postResponsesWithHeadersForModel(ctx context.Context, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
-	resp, err := h.postJSONEndpointWithHeadersForModel(ctx, providerEndpointResponses, body, extraHeaders, model)
+	return h.postResponsesWithHeadersForModelValidation(ctx, body, extraHeaders, model, false)
+}
+
+func (h *ProxyHandler) postResponsesWithHeadersForModelValidation(ctx context.Context, body []byte, extraHeaders http.Header, model string, bodyValidated bool) (*http.Response, error) {
+	resp, err := h.postJSONEndpointWithHeadersForModelValidation(ctx, providerEndpointResponses, body, extraHeaders, model, bodyValidated)
 	if err != nil {
 		return nil, err
 	}
@@ -506,8 +581,8 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, bod
 		}
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointMessagesCount, rewrittenBody, extraHeaders, "", owner)
+	return h.doInferenceWithRetry(func() (*http.Request, error) {
+		req, err := h.newProviderJSONInferenceRequest(ctx, provider, http.MethodPost, providerEndpointMessagesCount, rewrittenBody, extraHeaders, "", owner)
 		if err != nil {
 			return nil, err
 		}
@@ -518,9 +593,15 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokens(ctx context.Context, bod
 type bodyCopyWriter struct {
 	w        http.ResponseWriter
 	writeErr error
+	prepared bool
 }
 
 func (w *bodyCopyWriter) Write(p []byte) (int, error) {
+	if !w.prepared {
+		w.w.Header().Set("Content-Type", "application/json")
+		w.w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.prepared = true
+	}
 	n, err := w.w.Write(p)
 	if err != nil {
 		w.writeErr = err
@@ -586,6 +667,10 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) error {
 // responses fail open to passthrough behavior.
 func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string) error {
 	return writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
+		if usage, canonical := inspectCanonicalOpenAIChatCompletionResponse(body, requestedModel); canonical {
+			observeOpenAIUsage(ctx, &usage)
+			return body, false
+		}
 		out, changed, err := normalizeOpenAIChatCompletionResponse(body, requestedModel, time.Now())
 		if err != nil {
 			observeOpenAIUsage(ctx, sniffOpenAIUsage(body))
@@ -611,6 +696,21 @@ func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context,
 // buffered whole. Oversized bodies stream through with usage stats skipped.
 const usageSniffMaxBuffer = 4 << 20 // 4 MiB
 
+const (
+	usageSniffTinyBufferSize  = 512
+	usageSniffSmallBufferSize = 4 << 10
+)
+
+var usageSniffTinyBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, usageSniffTinyBufferSize)
+	return &buffer
+}}
+
+var usageSniffSmallBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, usageSniffSmallBufferSize)
+	return &buffer
+}}
+
 // writePassthroughSniffingUsage writes a non-streaming upstream response to the
 // client while buffering at most usageSniffMaxBuffer bytes so the supplied
 // transform can sniff usage and optionally rewrite the complete body. A 2xx body
@@ -622,6 +722,11 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 	if resp == nil || resp.Body == nil {
 		return &responseBodyWriteError{err: fmt.Errorf("upstream response body is unavailable"), upstream: true}
 	}
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices &&
+		resp.ContentLength >= 0 && resp.ContentLength < usageSniffSmallBufferSize {
+		return writeSmallKnownLengthPassthroughSniffingUsage(w, resp, transform)
+	}
+
 	body := newLifecycleAwareReadCloser(resp.Body, responseRequestContext(resp))
 	defer func() { _ = body.Close() }()
 
@@ -640,7 +745,12 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 	}
 
 	// Read one byte past the cap so we can tell a full body from an oversized one.
-	prefix, err := io.ReadAll(io.LimitReader(body, usageSniffMaxBuffer+1))
+	// Known small Content-Length responses use one exact allocation instead of
+	// constructing a limiter and growing io.ReadAll's default buffer.
+	prefix, pooledBuffer, err := readUsageSniffPrefix(body, resp.ContentLength)
+	if pooledBuffer != nil {
+		defer releaseUsageSniffBuffer(pooledBuffer)
+	}
 	if body.canceledAtFailure() {
 		return newResponseBodyWriteError(resp, context.Canceled, false, true, body.canceledAtFailure())
 	}
@@ -648,6 +758,9 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 		return newResponseBodyWriteError(resp, err, false, true, body.canceledAtFailure())
 	}
 	copyPassthroughHeaders(w.Header(), resp.Header)
+	if resp.ContentLength >= 0 && int64(len(prefix)) > resp.ContentLength {
+		w.Header().Del("Content-Length")
+	}
 
 	if len(prefix) <= usageSniffMaxBuffer {
 		// Whole body fits: parse/transform it, then write the result.
@@ -668,8 +781,8 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 	}
 
 	// Oversized: skip the usage parse and stream prefix + remainder so memory
-	// stays bounded. Total bytes written equal the full body, so any
-	// Content-Length header copied above remains correct.
+	// stays bounded. A proven length mismatch above removes the stale advertised
+	// length before the larger body is written.
 	w.WriteHeader(resp.StatusCode)
 	if _, err := w.Write(prefix); err != nil {
 		return newResponseBodyWriteError(resp, err, true, false, false)
@@ -683,6 +796,151 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 		return newResponseBodyWriteError(resp, err, true, tracked.writeErr == nil, body.canceledAtFailure())
 	}
 	return nil
+}
+
+func writeSmallKnownLengthPassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, transform func([]byte) ([]byte, bool)) error {
+	ctx := responseRequestContext(resp)
+	defer func() { _ = resp.Body.Close() }()
+
+	pooledBuffer := borrowUsageSniffBuffer(resp.ContentLength)
+	defer releaseUsageSniffBuffer(pooledBuffer)
+	prefix := (*pooledBuffer)[:int(resp.ContentLength)+1]
+	n, canceledAtFailure, err := readFullObservingLifecycle(resp.Body, ctx, prefix)
+	longerThanAdvertised := false
+	if canceledAtFailure {
+		return newResponseBodyWriteError(resp, context.Canceled, false, true, true)
+	}
+	switch err {
+	case nil:
+		longerThanAdvertised = true
+		// The body exceeded its advertised length. Continue to the normal cap so
+		// a malformed Content-Length cannot truncate the downstream response.
+		body := newLifecycleAwareReadCloser(resp.Body, ctx)
+		rest, readErr := io.ReadAll(io.LimitReader(body, int64(usageSniffMaxBuffer+1-len(prefix))))
+		prefix = append(prefix, rest...)
+		if body.canceledAtFailure() {
+			return newResponseBodyWriteError(resp, context.Canceled, false, true, true)
+		}
+		if readErr != nil {
+			return newResponseBodyWriteError(resp, readErr, false, true, false)
+		}
+		if len(prefix) > usageSniffMaxBuffer {
+			copyPassthroughHeaders(w.Header(), resp.Header)
+			w.Header().Del("Content-Length")
+			w.WriteHeader(resp.StatusCode)
+			if _, writeErr := w.Write(prefix); writeErr != nil {
+				return newResponseBodyWriteError(resp, writeErr, true, false, false)
+			}
+			tracked := &bodyCopyWriter{w: w}
+			_, copyErr := io.Copy(tracked, body)
+			if body.canceledAtFailure() {
+				return newResponseBodyWriteError(resp, context.Canceled, true, true, true)
+			}
+			if copyErr != nil {
+				return newResponseBodyWriteError(resp, copyErr, true, tracked.writeErr == nil, false)
+			}
+			return nil
+		}
+	case io.EOF, io.ErrUnexpectedEOF:
+		if int64(n) != resp.ContentLength {
+			return newResponseBodyWriteError(resp, io.ErrUnexpectedEOF, false, true, false)
+		}
+		prefix = prefix[:n]
+	default:
+		return newResponseBodyWriteError(resp, err, false, true, false)
+	}
+
+	copyPassthroughHeaders(w.Header(), resp.Header)
+	if longerThanAdvertised {
+		w.Header().Del("Content-Length")
+	}
+	out := prefix
+	changed := false
+	if transform != nil {
+		out, changed = transform(prefix)
+	}
+	if changed {
+		w.Header().Del("Content-Length")
+		w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+	}
+	w.WriteHeader(resp.StatusCode)
+	if _, writeErr := w.Write(out); writeErr != nil {
+		return newResponseBodyWriteError(resp, writeErr, true, false, false)
+	}
+	return nil
+}
+
+func readFullObservingLifecycle(body io.Reader, ctx context.Context, buffer []byte) (n int, canceledAtFailure bool, err error) {
+	for n < len(buffer) && err == nil {
+		var read int
+		read, err = body.Read(buffer[n:])
+		n += read
+		if lifecycleCancellationAtReadFailure(ctx, err) {
+			canceledAtFailure = true
+		}
+	}
+	if n >= len(buffer) {
+		err = nil
+	} else if n > 0 && errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	return n, canceledAtFailure, err
+}
+
+func readUsageSniffPrefix(body io.Reader, contentLength int64) ([]byte, *[]byte, error) {
+	const limit = usageSniffMaxBuffer + 1
+	if contentLength < 0 || contentLength > usageSniffMaxBuffer {
+		prefix, err := io.ReadAll(io.LimitReader(body, limit))
+		return prefix, nil, err
+	}
+
+	var pooledBuffer *[]byte
+	var prefix []byte
+	if contentLength < usageSniffSmallBufferSize {
+		pooledBuffer = borrowUsageSniffBuffer(contentLength)
+		prefix = (*pooledBuffer)[:int(contentLength)+1]
+	} else {
+		prefix = make([]byte, int(contentLength)+1)
+	}
+	n, err := io.ReadFull(body, prefix)
+	switch err {
+	case nil:
+		// The body exceeded its advertised length. Continue to the normal cap so
+		// a malformed Content-Length cannot truncate the downstream response.
+		if len(prefix) >= limit {
+			return prefix, pooledBuffer, nil
+		}
+		rest, readErr := io.ReadAll(io.LimitReader(body, int64(limit-len(prefix))))
+		return append(prefix, rest...), pooledBuffer, readErr
+	case io.EOF, io.ErrUnexpectedEOF:
+		if int64(n) != contentLength {
+			return nil, pooledBuffer, io.ErrUnexpectedEOF
+		}
+		return prefix[:n], pooledBuffer, nil
+	default:
+		return nil, pooledBuffer, err
+	}
+}
+
+func borrowUsageSniffBuffer(contentLength int64) *[]byte {
+	if contentLength < usageSniffTinyBufferSize {
+		return usageSniffTinyBufferPool.Get().(*[]byte)
+	}
+	return usageSniffSmallBufferPool.Get().(*[]byte)
+}
+
+func releaseUsageSniffBuffer(buffer *[]byte) {
+	if buffer == nil {
+		return
+	}
+	switch cap(*buffer) {
+	case usageSniffTinyBufferSize:
+		*buffer = (*buffer)[:usageSniffTinyBufferSize]
+		usageSniffTinyBufferPool.Put(buffer)
+	case usageSniffSmallBufferSize:
+		*buffer = (*buffer)[:usageSniffSmallBufferSize]
+		usageSniffSmallBufferPool.Put(buffer)
+	}
 }
 
 // sniffOpenAIUsage extracts the usage block from a non-streaming OpenAI chat
@@ -712,30 +970,59 @@ func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.R
 	if explicitRoute {
 		maxBodySize = maxLargeRequestBodySize
 	}
-	body, err := readDirectAnthropicJSONBody(bodyReader, maxBodySize)
+	var body []byte
+	var pooledBody *[]byte
+	var err error
+	if resp.ContentLength >= 0 && resp.ContentLength < usageSniffSmallBufferSize {
+		body, pooledBody, err = readDirectAnthropicJSONBodyKnownLength(bodyReader, resp.ContentLength, maxBodySize)
+		if pooledBody != nil {
+			defer releaseUsageSniffBuffer(pooledBody)
+		}
+	} else {
+		body, err = readDirectAnthropicJSONBody(bodyReader, maxBodySize)
+	}
 	if bodyReader.canceledAtFailure() {
 		return newResponseBodyWriteError(resp, context.Canceled, false, true, bodyReader.canceledAtFailure())
 	}
 	if err != nil {
 		return newResponseBodyWriteError(resp, err, false, true, bodyReader.canceledAtFailure())
 	}
+	contentLengthMismatch := resp.ContentLength >= 0 && int64(len(body)) != resp.ContentLength
 
 	var rewritten []byte
 	var changed bool
+	var fastUsage models.AnthropicUsage
+	fastUsageParsed := false
 	if explicitRoute {
 		rewritten, changed, err = normalizeExplicitAnthropicResponseModelJSON(body, publicModel)
 		if err != nil {
 			return newResponseBodyWriteError(resp, err, false, true, false)
 		}
 	} else {
-		rewritten, changed = rewriteAnthropicResponseModelJSON(body, publicModel, upstreamModel)
+		if pooledBody != nil {
+			if inspection, ok := inspectAnthropicResponseJSONFast(body); ok {
+				fastUsage = inspection.usage
+				fastUsageParsed = inspection.usageParsed
+				rewritten, changed, err = rewriteAnthropicResponseModelJSONInPlaceInspected(body, publicModel, upstreamModel, inspection)
+				if err != nil {
+					return newResponseBodyWriteError(resp, err, false, true, false)
+				}
+			}
+		}
+		if rewritten == nil {
+			rewritten, changed = rewriteAnthropicResponseModelJSON(body, publicModel, upstreamModel)
+		}
 	}
 	if resp.StatusCode == http.StatusOK {
-		observeAnthropicUsageBody(ctx, body)
+		if fastUsageParsed {
+			observeAnthropicUsage(ctx, fastUsage)
+		} else {
+			observeAnthropicUsageBody(ctx, rewritten)
+		}
 	}
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
-	if changed {
+	if changed || contentLengthMismatch {
 		w.Header().Del("Content-Length")
 	}
 	if explicitRoute {
@@ -746,6 +1033,42 @@ func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.R
 		return newResponseBodyWriteError(resp, err, true, false, false)
 	}
 	return nil
+}
+
+func readDirectAnthropicJSONBodyKnownLength(body io.Reader, contentLength, maxBodySize int64) ([]byte, *[]byte, error) {
+	if maxBodySize > 0 && contentLength > maxBodySize {
+		return nil, nil, errors.New("explicit route anthropic response exceeds model-normalization limit")
+	}
+	pooledBuffer := borrowUsageSniffBuffer(contentLength)
+	prefix := (*pooledBuffer)[:int(contentLength)+1]
+	n, err := io.ReadFull(body, prefix)
+	switch err {
+	case nil:
+		if maxBodySize > 0 {
+			remaining := maxBodySize + 1 - int64(len(prefix))
+			if remaining <= 0 {
+				return nil, pooledBuffer, errors.New("explicit route anthropic response exceeds model-normalization limit")
+			}
+			rest, readErr := io.ReadAll(io.LimitReader(body, remaining))
+			data := append(prefix, rest...)
+			if readErr != nil {
+				return data, pooledBuffer, readErr
+			}
+			if int64(len(data)) > maxBodySize {
+				return nil, pooledBuffer, errors.New("explicit route anthropic response exceeds model-normalization limit")
+			}
+			return data, pooledBuffer, nil
+		}
+		rest, readErr := io.ReadAll(body)
+		return append(prefix, rest...), pooledBuffer, readErr
+	case io.EOF, io.ErrUnexpectedEOF:
+		if int64(n) != contentLength {
+			return nil, pooledBuffer, io.ErrUnexpectedEOF
+		}
+		return prefix[:n], pooledBuffer, nil
+	default:
+		return nil, pooledBuffer, err
+	}
 }
 
 // readDirectAnthropicJSONBody keeps the historical unbounded legacy read when
@@ -824,6 +1147,12 @@ func rewriteAnthropicResponseModelJSON(body []byte, publicModel, upstreamModel s
 	if publicModel == "" || publicModel == upstreamModel {
 		return body, false
 	}
+	rawPublicModel, err := json.Marshal(publicModel)
+	if err == nil {
+		if rewritten, changed, ok := rewriteAnthropicResponseModelJSONFast(body, rawPublicModel); ok {
+			return rewritten, changed
+		}
+	}
 
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -842,31 +1171,275 @@ func rewriteAnthropicResponseModelJSON(body []byte, publicModel, upstreamModel s
 	return rewritten, true
 }
 
+func rewriteAnthropicResponseModelJSONInPlace(body []byte, publicModel, upstreamModel string) ([]byte, bool, error) {
+	inspection, ok := inspectAnthropicResponseJSONFast(body)
+	if !ok {
+		return nil, false, nil
+	}
+	return rewriteAnthropicResponseModelJSONInPlaceInspected(body, publicModel, upstreamModel, inspection)
+}
+
+func rewriteAnthropicResponseModelJSONInPlaceInspected(body []byte, publicModel, upstreamModel string, inspection anthropicResponseJSONInspection) ([]byte, bool, error) {
+	publicModel = strings.TrimSpace(publicModel)
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	if publicModel == "" || publicModel == upstreamModel {
+		return body, false, nil
+	}
+	rawPublicModel, err := json.Marshal(publicModel)
+	if err != nil {
+		return nil, false, err
+	}
+	if !inspection.rewriteModel {
+		return body, false, nil
+	}
+	rewritten, ok := replaceRawJSONRangeInPlace(body, inspection.modelStart, inspection.modelEnd, rawPublicModel)
+	if !ok {
+		return nil, false, nil
+	}
+	return rewritten, true, nil
+}
+
+// rewriteAnthropicResponseModelJSONFast handles the ordinary Messages response
+// without rebuilding the complete JSON object. It declines ambiguous shapes so
+// the map-based path above retains duplicate-key, escaped-key, and nested
+// message.model behavior.
+func rewriteAnthropicResponseModelJSONFast(body []byte, rawPublicModel json.RawMessage) ([]byte, bool, bool) {
+	if !json.Valid(rawPublicModel) {
+		return body, false, false
+	}
+	modelStart, modelEnd, rewrite, ok := anthropicResponseModelRewriteRange(body)
+	if !ok {
+		return body, false, false
+	}
+	if !rewrite {
+		return body, false, true
+	}
+
+	if modelStart < 0 || modelEnd < modelStart || modelEnd > len(body) {
+		return body, false, false
+	}
+	baseLen := len(body) - (modelEnd - modelStart)
+	maxInt := int(^uint(0) >> 1)
+	if len(rawPublicModel) > maxInt-baseLen {
+		return body, false, false
+	}
+	out := make([]byte, 0, baseLen+len(rawPublicModel))
+	out = append(out, body[:modelStart]...)
+	out = append(out, rawPublicModel...)
+	out = append(out, body[modelEnd:]...)
+	return out, true, true
+}
+
+func anthropicResponseModelRewriteRange(body []byte) (int, int, bool, bool) {
+	inspection, ok := inspectAnthropicResponseJSONFast(body)
+	if !ok {
+		return 0, 0, false, false
+	}
+	return inspection.modelStart, inspection.modelEnd, inspection.rewriteModel, true
+}
+
+type anthropicResponseJSONInspection struct {
+	modelStart   int
+	modelEnd     int
+	rewriteModel bool
+	usage        models.AnthropicUsage
+	usageParsed  bool
+}
+
+func inspectAnthropicResponseJSONFast(body []byte) (anthropicResponseJSONInspection, bool) {
+	object, ok := newStrictRawJSONObjectScanner(body)
+	if !ok {
+		return anthropicResponseJSONInspection{}, false
+	}
+
+	inspection := anthropicResponseJSONInspection{modelStart: -1, modelEnd: -1, usageParsed: true}
+	modelSeen := false
+	messageSeen := false
+	usageSeen := false
+	for {
+		key, start, end, done, scanOK := object.next()
+		if !scanOK {
+			return anthropicResponseJSONInspection{}, false
+		}
+		if done {
+			break
+		}
+		switch {
+		case rawJSONKeyEqual(key, "model"):
+			if modelSeen {
+				return anthropicResponseJSONInspection{}, false
+			}
+			modelSeen = true
+			rawModel := bytes.TrimSpace(body[start:end])
+			contentStart, contentEnd, valueEnd, escaped, stringOK := scanStrictRawJSONString(rawModel, 0)
+			if !stringOK || escaped || valueEnd != len(rawModel) {
+				return anthropicResponseJSONInspection{}, false
+			}
+			if len(bytes.TrimSpace(rawModel[contentStart:contentEnd])) > 0 {
+				inspection.modelStart = start
+				inspection.modelEnd = end
+				inspection.rewriteModel = true
+			}
+		case rawJSONKeyEqualFold(key, "model"):
+			return anthropicResponseJSONInspection{}, false
+		case rawJSONKeyEqual(key, "message"):
+			if messageSeen {
+				return anthropicResponseJSONInspection{}, false
+			}
+			messageSeen = true
+			rawMessage := bytes.TrimSpace(body[start:end])
+			if len(rawMessage) > 0 && rawMessage[0] == '{' {
+				return anthropicResponseJSONInspection{}, false
+			}
+		case rawJSONKeyEqual(key, "usage"):
+			if usageSeen {
+				inspection.usageParsed = false
+				continue
+			}
+			usageSeen = true
+			usage, usageOK := parseAnthropicUsageFast(body[start:end])
+			if !usageOK {
+				inspection.usageParsed = false
+				continue
+			}
+			inspection.usage = usage
+		case rawJSONKeyEqualFold(key, "usage"):
+			inspection.usageParsed = false
+		}
+	}
+	return inspection, true
+}
+
+func parseAnthropicUsageFast(raw []byte) (models.AnthropicUsage, bool) {
+	raw = bytes.TrimSpace(raw)
+	if bytes.Equal(raw, []byte("null")) {
+		return models.AnthropicUsage{}, true
+	}
+	if len(raw) == 0 || raw[0] != '{' {
+		return models.AnthropicUsage{}, true
+	}
+	object, ok := newStrictRawJSONObjectScanner(raw)
+	if !ok {
+		return models.AnthropicUsage{}, false
+	}
+
+	var usage models.AnthropicUsage
+	var seen uint8
+	const (
+		usageFieldInput uint8 = 1 << iota
+		usageFieldOutput
+		usageFieldCacheCreation
+		usageFieldCacheRead
+	)
+	for {
+		key, start, end, done, scanOK := object.next()
+		if !scanOK {
+			return models.AnthropicUsage{}, false
+		}
+		if done {
+			break
+		}
+		var field uint8
+		switch {
+		case rawJSONKeyEqual(key, "input_tokens"):
+			field = usageFieldInput
+		case rawJSONKeyEqual(key, "output_tokens"):
+			field = usageFieldOutput
+		case rawJSONKeyEqual(key, "cache_creation_input_tokens"):
+			field = usageFieldCacheCreation
+		case rawJSONKeyEqual(key, "cache_read_input_tokens"):
+			field = usageFieldCacheRead
+		case rawJSONKeyEqualFold(key, "input_tokens"),
+			rawJSONKeyEqualFold(key, "output_tokens"),
+			rawJSONKeyEqualFold(key, "cache_creation_input_tokens"),
+			rawJSONKeyEqualFold(key, "cache_read_input_tokens"):
+			return models.AnthropicUsage{}, false
+		default:
+			continue
+		}
+		if seen&field != 0 {
+			return models.AnthropicUsage{}, false
+		}
+		seen |= field
+		valueRaw := bytes.TrimSpace(raw[start:end])
+		value := 0
+		if !bytes.Equal(valueRaw, []byte("null")) {
+			var valueOK bool
+			value, valueOK = rawJSONInt(valueRaw)
+			if !valueOK {
+				return models.AnthropicUsage{}, false
+			}
+		}
+		switch field {
+		case usageFieldInput:
+			usage.InputTokens = value
+		case usageFieldOutput:
+			usage.OutputTokens = value
+		case usageFieldCacheCreation:
+			usage.CacheCreationInputTokens = value
+		case usageFieldCacheRead:
+			usage.CacheReadInputTokens = value
+		}
+	}
+	return usage, true
+}
+
+func replaceRawJSONRangeInPlace(body []byte, start, end int, replacement []byte) ([]byte, bool) {
+	if start < 0 || end < start || end > len(body) {
+		return body, false
+	}
+	newLen := len(body) - (end - start)
+	maxInt := int(^uint(0) >> 1)
+	if len(replacement) > maxInt-newLen {
+		return body, false
+	}
+	newLen += len(replacement)
+	if newLen > cap(body) {
+		return body, false
+	}
+
+	oldLen := len(body)
+	replacementEnd := start + len(replacement)
+	if newLen > oldLen {
+		body = body[:newLen]
+		copy(body[replacementEnd:], body[end:oldLen])
+	} else if newLen < oldLen {
+		copy(body[replacementEnd:], body[end:oldLen])
+		clear(body[newLen:oldLen])
+		body = body[:newLen]
+	}
+	copy(body[start:replacementEnd], replacement)
+	return body, true
+}
+
 func rewriteAnthropicModelFields(payload map[string]json.RawMessage, publicModel string) bool {
 	if len(payload) == 0 || strings.TrimSpace(publicModel) == "" {
 		return false
 	}
+	rawModel, err := json.Marshal(publicModel)
+	if err != nil {
+		return false
+	}
 
-	changed := false
-	if rawJSONString(payload["model"]) != "" {
-		rawModel, err := json.Marshal(publicModel)
-		if err == nil {
-			payload["model"] = rawModel
+	changed := rewriteAnthropicModelField(payload, rawModel)
+
+	var message map[string]json.RawMessage
+	if err := json.Unmarshal(payload["message"], &message); err == nil && len(message) > 0 && rewriteAnthropicModelField(message, rawModel) {
+		if rawMessage, err := json.Marshal(message); err == nil {
+			payload["message"] = rawMessage
 			changed = true
 		}
 	}
 
-	var message map[string]json.RawMessage
-	if err := json.Unmarshal(payload["message"], &message); err == nil && len(message) > 0 && rawJSONString(message["model"]) != "" {
-		rawModel, err := json.Marshal(publicModel)
-		if err == nil {
-			message["model"] = rawModel
-			if rawMessage, err := json.Marshal(message); err == nil {
-				payload["message"] = rawMessage
-				changed = true
-			}
+	return changed
+}
+
+func rewriteAnthropicModelField(payload map[string]json.RawMessage, rawModel json.RawMessage) bool {
+	for key, value := range payload {
+		if strings.EqualFold(key, "model") && rawJSONString(value) != "" {
+			payload["model"] = rawModel
+			return true
 		}
 	}
-
-	return changed
+	return false
 }
