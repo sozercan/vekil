@@ -342,7 +342,7 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		if tracked && !summary.StatsSuppressed() {
 			handler.RecordRequest(summary, statsStatus, r.Header.Get("User-Agent"), elapsed)
 		}
-		if log != nil && log.Enabled(logger.LevelInfo) {
+		if log != nil && log.Enabled(logger.LevelWarn) {
 			fields := []logger.Field{
 				logger.F("method", r.Method),
 				logger.F("path", r.URL.Path),

@@ -121,6 +121,21 @@ func TestClaudeCarrierSmokeRestrictsBashToTheHarnessCommand(t *testing.T) {
 	}
 }
 
+func TestLiveCopilotWorkflowGatesClaudeCarrierSmokeOnAvailability(t *testing.T) {
+	workflow, err := os.ReadFile("../.github/workflows/live-copilot-smoke.yaml")
+	if err != nil {
+		t.Fatalf("read live Copilot workflow: %v", err)
+	}
+	match := regexp.MustCompile(`(?m)^      - name: Run live Claude reasoning-carrier restart smoke\n        if: (.+)$`).FindSubmatch(workflow)
+	if match == nil {
+		t.Fatal("live Copilot workflow no longer declares the Claude carrier smoke step")
+	}
+	want := `steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'true'`
+	if got := string(match[1]); got != want {
+		t.Fatalf("Claude carrier smoke gate = %q, want %q", got, want)
+	}
+}
+
 func TestClaudeCarrierSmokeCoversDroppedCarrierFallbackAfterRestart(t *testing.T) {
 	script, err := os.ReadFile("../scripts/live-claude-reasoning-carrier-smoke.sh")
 	if err != nil {

@@ -104,6 +104,9 @@ func (l *Logger) Info(msg string, fields ...Field) {
 
 // Warn logs a message at warn level.
 func (l *Logger) Warn(msg string, fields ...Field) {
+	if !l.Enabled(LevelWarn) {
+		return
+	}
 	l.log(LevelWarn, msg, toMap(fields))
 }
 

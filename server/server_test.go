@@ -824,7 +824,7 @@ func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
 }
 
 // A non-2xx must name why: type, code, param and message on the one line.
-func TestRequestLogWarnsWithErrorDetailOnNonSuccess(t *testing.T) {
+func TestRequestLogAtWarnLevelIncludesErrorDetailOnNonSuccess(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("upstream called at %q; the request must be rejected locally", r.URL.Path)
 	}))
@@ -833,7 +833,7 @@ func TestRequestLogWarnsWithErrorDetailOnNonSuccess(t *testing.T) {
 	var logs bytes.Buffer
 	srv, err := New(
 		auth.NewTestAuthenticator("test-token"),
-		logger.NewWithWriter(logger.LevelInfo, &logs),
+		logger.NewWithWriter(logger.LevelWarn, &logs),
 		"127.0.0.1",
 		"0",
 		WithProxyOptions(copilotChatProxyOptionWithModelDiscovery(upstream.URL)),

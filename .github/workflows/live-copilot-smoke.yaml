@@ -84,7 +84,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run live Claude reasoning-carrier restart smoke
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'true'
         env:
           LIVE_CLAUDE_REASONING_CARRIER_SMOKE_DIR: ${{ runner.temp }}/live-claude-reasoning-carrier-smoke
         run: scripts/live-claude-reasoning-carrier-smoke.sh
