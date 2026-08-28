@@ -872,19 +872,20 @@ func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProv
 		t.Fatalf("NewProxyHandler returned error: %v", err)
 	}
 
-	requestBody, err := json.Marshal(map[string]any{
-		"model": "claude-public",
-		"messages": []any{
-			map[string]any{"role": "user", "content": "Count this"},
-			map[string]any{"role": "assistant", "content": []any{
-				map[string]any{"type": "thinking", "thinking": "", "signature": carrier},
-				map[string]any{"type": "text", "text": "Keep this"},
-			}},
-		},
-	})
+	carrierJSON, err := json.Marshal(carrier)
 	if err != nil {
-		t.Fatalf("marshal request: %v", err)
+		t.Fatalf("marshal carrier signature: %v", err)
 	}
+	requestBody := []byte(fmt.Sprintf(`{
+		"model": "claude-public",
+		"Messages": [
+			{"role": "user", "content": "Count this"},
+			{"Role": "assistant", "Content": [
+				{"type": "thinking", "Type": "text", "thinking": "", "signature": %s, "Signature": "anthropic-native-sig"},
+				{"type": "text", "text": "Keep this"}
+			]}
+		]
+	}`, carrierJSON))
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", bytes.NewReader(requestBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer client-token")

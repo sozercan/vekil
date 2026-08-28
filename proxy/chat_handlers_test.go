@@ -744,13 +744,13 @@ func TestHandleAnthropicMessagesDirectStripsVekilCarriers(t *testing.T) {
 
 	// One assistant turn holding a carrier beside real content, and one holding only a carrier
 	// -- the orphan shape a client produces when it splits a parallel group.
-	body := `{"model":"claude-sonnet-5","max_tokens":64,"messages":[
+	body := `{"model":"claude-sonnet-5","max_tokens":64,"Messages":[
 		{"role":"user","content":"go"},
-		{"role":"assistant","content":[
-			{"type":"thinking","thinking":"","signature":"vekil1.OPAQUECARRIERPAYLOAD"},
+		{"Role":"assistant","Content":[
+			{"type":"thinking","Type":"text","thinking":"","signature":"vekil1.OPAQUECARRIERPAYLOAD","Signature":"anthropic-native-sig"},
 			{"type":"text","text":"working"}]},
 		{"role":"user","content":"again"},
-		{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"vekil1.SECONDCARRIER"}]},
+		{"Role":"assistant","Content":[{"type":"thinking","thinking":"","signature":"vekil1.SECONDCARRIER"}]},
 		{"role":"user","content":"and again"}]}`
 	req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(body))
 	req.Header.Set("Anthropic-Version", "2023-06-01")

@@ -995,75 +995,208 @@ func stripVekilCarrierBlocks(body []byte) ([]byte, int) {
 	// unparsed bytes has the same hole, because the escape can move to any
 	// character. The parse below is the only thing that sees what the peer sees,
 	// and the caller unmarshals this body immediately afterwards regardless.
-	var root map[string]json.RawMessage
-	if json.Unmarshal(body, &root) != nil {
-		return body, 0
-	}
-	var messages []json.RawMessage
-	if raw, ok := root["messages"]; !ok || json.Unmarshal(raw, &messages) != nil {
+	root, ok := decodeOrderedRawJSONObject(body)
+	if !ok {
 		return body, 0
 	}
 	stripped := 0
-	kept := make([]json.RawMessage, 0, len(messages))
-	for _, raw := range messages {
-		var message map[string]json.RawMessage
-		if json.Unmarshal(raw, &message) != nil {
-			kept = append(kept, raw)
+	for i := range root {
+		if !strings.EqualFold(root[i].name, "messages") {
 			continue
 		}
-		var role string
-		if json.Unmarshal(message["role"], &role) != nil || role != "assistant" {
-			kept = append(kept, raw)
+		rewritten, removed, ok := stripVekilCarrierMessages(root[i].value)
+		if !ok || removed == 0 {
 			continue
 		}
-		var blocks []json.RawMessage
-		if json.Unmarshal(message["content"], &blocks) != nil {
-			kept = append(kept, raw)
-			continue
-		}
-		remaining := make([]json.RawMessage, 0, len(blocks))
-		for _, block := range blocks {
-			var header struct {
-				Type      string `json:"type"`
-				Signature string `json:"signature"`
-			}
-			if json.Unmarshal(block, &header) == nil &&
-				(header.Type == "thinking" || header.Type == "redacted_thinking") &&
-				strings.HasPrefix(header.Signature, reasoningCarrierPrefix) {
-				stripped++
-				continue
-			}
-			remaining = append(remaining, block)
-		}
-		if len(remaining) == len(blocks) {
-			kept = append(kept, raw)
-			continue
-		}
-		if len(remaining) == 0 {
-			continue
-		}
-		content, err := json.Marshal(remaining)
-		if err != nil {
-			return body, 0
-		}
-		message["content"] = content
-		rewritten, err := json.Marshal(message)
-		if err != nil {
-			return body, 0
-		}
-		kept = append(kept, rewritten)
+		root[i].value = rewritten
+		stripped += removed
 	}
 	if stripped == 0 {
 		return body, 0
 	}
-	rewrittenMessages, err := json.Marshal(kept)
-	if err != nil {
-		return body, 0
-	}
-	root["messages"] = rewrittenMessages
-	rewritten, err := json.Marshal(root)
-	if err != nil {
+	rewritten, ok := encodeOrderedRawJSONObject(root)
+	if !ok {
 		return body, 0
 	}
 	return rewritten, stripped
+}
+
+type orderedRawJSONMember struct {
+	name  string
+	value json.RawMessage
+}
+
+// decodeOrderedRawJSONObject keeps duplicate members and decoded field names.
+// encoding/json maps discard exact duplicates, while struct decoding accepts
+// case-folded and escaped aliases. The direct-forward sanitizer must see the
+// same names without losing any occurrence that an upstream parser may use.
+func decodeOrderedRawJSONObject(raw []byte) ([]orderedRawJSONMember, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return nil, false
+	}
+	members := make([]orderedRawJSONMember, 0)
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return nil, false
+		}
+		name, ok := key.(string)
+		if !ok {
+			return nil, false
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false
+		}
+		members = append(members, orderedRawJSONMember{name: name, value: value})
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') {
+		return nil, false
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, false
+	}
+	return members, true
+}
+
+func encodeOrderedRawJSONObject(members []orderedRawJSONMember) ([]byte, bool) {
+	var rebuilt bytes.Buffer
+	rebuilt.WriteByte('{')
+	for i := range members {
+		if i > 0 {
+			rebuilt.WriteByte(',')
+		}
+		name, err := json.Marshal(members[i].name)
+		if err != nil || !json.Valid(members[i].value) {
+			return nil, false
+		}
+		rebuilt.Write(name)
+		rebuilt.WriteByte(':')
+		rebuilt.Write(members[i].value)
+	}
+	rebuilt.WriteByte('}')
+	return rebuilt.Bytes(), true
+}
+
+func stripVekilCarrierMessages(raw json.RawMessage) (json.RawMessage, int, bool) {
+	var messages []json.RawMessage
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		return raw, 0, false
+	}
+	stripped := 0
+	kept := make([]json.RawMessage, 0, len(messages))
+	for _, message := range messages {
+		rewritten, removed, keep := stripVekilCarrierMessage(message)
+		stripped += removed
+		if keep {
+			kept = append(kept, rewritten)
+		}
+	}
+	if stripped == 0 {
+		return raw, 0, true
+	}
+	rewritten, err := json.Marshal(kept)
+	if err != nil {
+		return raw, 0, false
+	}
+	return rewritten, stripped, true
+}
+
+func stripVekilCarrierMessage(raw json.RawMessage) (json.RawMessage, int, bool) {
+	members, ok := decodeOrderedRawJSONObject(raw)
+	if !ok || !orderedRawJSONMessageHasAssistantRole(members) {
+		return raw, 0, true
+	}
+
+	stripped := 0
+	remainingMembers := make([]orderedRawJSONMember, 0, len(members))
+	for i := range members {
+		member := members[i]
+		if !strings.EqualFold(member.name, "content") {
+			remainingMembers = append(remainingMembers, member)
+			continue
+		}
+		var blocks []json.RawMessage
+		if err := json.Unmarshal(member.value, &blocks); err != nil {
+			remainingMembers = append(remainingMembers, member)
+			continue
+		}
+		remainingBlocks := make([]json.RawMessage, 0, len(blocks))
+		for _, block := range blocks {
+			if isVekilCarrierBlock(block) {
+				stripped++
+				continue
+			}
+			remainingBlocks = append(remainingBlocks, block)
+		}
+		if len(remainingBlocks) == len(blocks) {
+			remainingMembers = append(remainingMembers, member)
+			continue
+		}
+		if len(remainingBlocks) == 0 {
+			continue
+		}
+		rewritten, err := json.Marshal(remainingBlocks)
+		if err != nil {
+			return raw, 0, true
+		}
+		member.value = rewritten
+		remainingMembers = append(remainingMembers, member)
+	}
+	if stripped == 0 {
+		return raw, 0, true
+	}
+	for i := range remainingMembers {
+		if strings.EqualFold(remainingMembers[i].name, "content") {
+			rewritten, ok := encodeOrderedRawJSONObject(remainingMembers)
+			if !ok {
+				return raw, 0, true
+			}
+			return rewritten, stripped, true
+		}
+	}
+	return nil, stripped, false
+}
+
+func orderedRawJSONMessageHasAssistantRole(members []orderedRawJSONMember) bool {
+	for i := range members {
+		if !strings.EqualFold(members[i].name, "role") {
+			continue
+		}
+		var role string
+		if json.Unmarshal(members[i].value, &role) == nil && role == "assistant" {
+			return true
+		}
+	}
+	return false
+}
+
+func isVekilCarrierBlock(raw json.RawMessage) bool {
+	members, ok := decodeOrderedRawJSONObject(raw)
+	if !ok {
+		return false
+	}
+	thinking := false
+	carrier := false
+	for i := range members {
+		switch {
+		case strings.EqualFold(members[i].name, "type"):
+			var blockType string
+			if json.Unmarshal(members[i].value, &blockType) == nil &&
+				(blockType == "thinking" || blockType == "redacted_thinking") {
+				thinking = true
+			}
+		case strings.EqualFold(members[i].name, "signature"):
+			var signature string
+			if json.Unmarshal(members[i].value, &signature) == nil &&
+				strings.HasPrefix(signature, reasoningCarrierPrefix) {
+				carrier = true
+			}
+		}
+	}
+	return thinking && carrier
 }
