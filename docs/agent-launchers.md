@@ -318,7 +318,7 @@ browser dashboard is not exposed. The end-of-session summary is written to
 stderr so non-interactive agent output on stdout remains pipeline-safe.
 
 If Codex reports an upstream `408 user_request_timeout`, see
-[Upstream 408 request-body timeout](responses.md#upstream-408-request-body-timeout)
+[Troubleshooting](troubleshooting.md#408-user_request_timeout-timed-out-reading-request-body)
 for retry and diagnosis guidance.
 
 ## Credential and process isolation

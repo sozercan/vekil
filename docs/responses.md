@@ -10,34 +10,8 @@ Detailed behavior for Vekil-owned Responses compatibility features. For the gene
 
 `POST /v1/responses` requests are accepted up to `64 MiB` so oversized session replays can reach the proxy-owned compaction fallback instead of failing at the default request-body limit. If upstream rejects a replay-like request with `413 Payload Too Large`, the proxy can compact the older prefix of an array `input` and retry the request with one proxy-owned checkpoint plus the most recent tail items. A request is treated as replay-like only when the body contains prior transcript evidence such as assistant/tool output items or a proxy-owned compaction checkpoint; `previous_response_id` and Codex turn/window headers alone do not trigger summarization. The fallback starts by preserving the configured tail, aligns the tail boundary so tool/function call-output pairs are not split across the checkpoint, and under `413` pressure dynamically halves the preserved tail (`12 -> 6 -> 3 -> 1`, or `len(input)-1` first for shorter replays) and retries until the compacted replay fits or only the latest item remains. The compaction calls share the same attempt budget and chunking controls as `/v1/responses/compact` (`--compact-upstream-chunk-bytes` and `--compact-upstream-max-attempts`). When a provider/model returns `413` for a compaction body, the proxy remembers the smaller target in memory for 30 minutes and starts later compaction fallbacks for that provider/model at the learned target, while the normal no-413 `/v1/responses` fast path remains unchanged. If the internal compaction result is incomplete, lacks nonempty message output text, or exceeds the summary-response limit, Vekil returns the original `413` instead of retrying with an empty or partial checkpoint.
 
-### Upstream 408 request-body timeout
-
-Codex may report an error like this:
-
-```text
-unexpected status 408 Request Timeout: upstream error (408):
-Timed out reading request body. Try again, or use a smaller request size.
-(code=user_request_timeout)
-```
-
-The URL in the error is the local Vekil endpoint because that is where Codex
-connected. The nested `upstream error` means the selected provider returned the
-408 while reading the forwarded body. This is separate from Vekil's `64 MiB`
-inbound request limit. Increasing `--streaming-upstream-timeout` does not address
-it because response streaming has not started yet.
-
-Retry the turn first. Vekil treats HTTP 408 as transient and sends a fresh
-request body within its retry budget. The client may also retry, and every
-attempt receives a new request ID. If the same session keeps failing, compact it
-or start a new session with less history.
-
-Keep the failed request ID and timestamp. For launcher sessions, inspect the
-proxy JSON log path printed in the startup banner. For a normal server, use the
-dashboard or `GET /stats.json`: `status_codes` counts final 408 responses,
-`retries_by_code` counts internal 408 retries, and a newer `recent` entry with
-`status: 200` confirms recovery. If several independent sessions fail in the
-same time window, capture their request IDs before investigating the selected
-provider's ingress path.
+If a client reports `408 user_request_timeout` or "Timed out reading request
+body," see [Troubleshooting](troubleshooting.md#408-user_request_timeout-timed-out-reading-request-body).
 
 Like chat completions, Responses requests are routed by the public `model` ID. Legacy unsupported-model fallback remains on the selected provider. A version-2 `priority_failover` route is different: it may try the next equivalent target in that same public route, but it never falls back to another public model route.
 
