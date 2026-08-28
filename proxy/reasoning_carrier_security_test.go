@@ -617,8 +617,8 @@ func TestAnthropicPolicyContinuationKeepsItsTierWhenTheClassifierDisagrees(t *te
 }
 
 // With the process-local mapping gone, the carrier restores reasoning while rebuilding the
-// function call and its output under the same opaque public ID. The client-held carrier must
-// contain no provider ID that could outlive replay-store expiry or a process restart.
+// function call and its output under the same opaque fallback ID. The client-held carrier
+// contains no separate provider ID.
 func TestAnthropicPolicyContinuationUsesOpaqueIDsAfterStoreLoss(t *testing.T) {
 	h, upstream := newCarrierPolicyFixture(t, policyClassifierSignals{
 		TurnType:  policyTurnTypeLookup,
@@ -641,6 +641,9 @@ func TestAnthropicPolicyContinuationUsesOpaqueIDsAfterStoreLoss(t *testing.T) {
 	call, bound := replay.Calls[toolUseID]
 	if !bound || call.UpstreamID != "" {
 		t.Fatalf("carrier binding for %q exposed provider state: %+v", toolUseID, call)
+	}
+	if _, selfDescribing := responsesChatReplayUpstreamCallID(toolUseID); selfDescribing {
+		t.Fatalf("fixture tool ID %q should exercise the opaque fallback", toolUseID)
 	}
 
 	// What TTL and eviction leave behind: minted ids in the transcript, nothing server-side.

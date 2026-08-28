@@ -472,6 +472,7 @@ validate_claude_stream() {
 import base64
 import json
 import pathlib
+import re
 import sys
 import zlib
 
@@ -518,7 +519,7 @@ if len(tool_uses) != 1:
     fail("Claude did not return exactly one tool_use block")
 tool_use = tool_uses[0]
 tool_id = tool_use.get("id", "")
-if not tool_id.startswith("call_vekil_") or tool_use.get("name") != "Bash":
+if not re.fullmatch(r"call_vekil_v1_[A-Za-z0-9_-]{15}_call_[A-Za-z0-9_-]{1,24}_[A-Za-z0-9_-]{4}", tool_id) or tool_use.get("name") != "Bash":
     fail("Claude returned an unexpected tool id or name")
 if (tool_use.get("input") or {}).get("command") != expected_command:
     fail("Claude changed the controlled delayed tool command")
@@ -565,7 +566,7 @@ for signature in shared_carriers:
     if carrier_matches_tool:
         break
 if not carrier_matches_tool:
-    fail("the carrier did not bind the returned opaque tool id without provider state")
+    fail("the carrier did not bind the returned self-describing tool id without duplicate provider state")
 
 if mode == "first":
     raise SystemExit(0)
@@ -593,7 +594,7 @@ if assistant_text != [final_marker]:
 
 print("PASS isolated-api-key-settings")
 print("PASS carrier-signature-preserved")
-print("PASS carrier-opaque-id-only")
+print("PASS carrier-self-describing-id")
 print("PASS exact-final-sentinel")
 PY_VALIDATE
 }

@@ -526,6 +526,33 @@ type responsesChatVisibleTranscriptFallback struct {
 	carrier  string
 }
 
+// When the replay store and carrier cannot answer, a self-describing ID can
+// still recover the upstream call mapping. It carries no hidden items. The
+// caller rebuilds those from the transcript through reconstructCarriedRestore.
+func selfDescribingRestoredCalls(projected []responsesChatReplayProjectedCall, projectionDigest string) (responsesChatRestoredCalls, bool) {
+	if len(projected) == 0 {
+		return responsesChatRestoredCalls{}, false
+	}
+	calls := make([]responsesChatReplayResolvedCall, len(projected))
+	for i, projectedCall := range projected {
+		upstreamCallID, ok := responsesChatReplayUpstreamCallID(projectedCall.ID)
+		if !ok {
+			return responsesChatRestoredCalls{}, false
+		}
+		calls[i] = responsesChatReplayResolvedCall{
+			ProxyCallID:     projectedCall.ID,
+			UpstreamCallID:  upstreamCallID,
+			Name:            strings.TrimSpace(projectedCall.Name),
+			OutputItemIndex: i,
+		}
+	}
+	return responsesChatRestoredCalls{
+		Key:     "selfid:" + projectionDigest,
+		Calls:   calls,
+		Rebuild: true,
+	}, true
+}
+
 // The store is authoritative while it holds the group and its arguments still match.
 // Clients rewrite arguments; the carrier does not bind them and holds only the client's
 // own ciphertext (see carriedProjectionDigest), so trying it grants no extra reach.
@@ -555,6 +582,19 @@ func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []
 	restored, carrier := carriedRestoredCalls(options.CarriedReasoning, projected, options.ReplayRoute, projectionContent)
 	if carrier == "" {
 		return restored, nil
+	}
+	// The ID alone is route-agnostic. Do not let it answer during target
+	// probing, where another candidate may still hold the full replay group.
+	// DegradeUnrestorableReplay is set only after every candidate refused.
+	if options.DegradeUnrestorableReplay {
+		diverged := "store_missing"
+		if projectionMismatch != nil {
+			diverged = projectionMismatch.diverged
+		}
+		if selfDescribed, ok := selfDescribingRestoredCalls(projected, carriedProjectionDigest(projectionContent, projected)); ok {
+			tally.record(diverged, carrier, responsesChatReplayProjectionFingerprint(projected, content), len(projected), false)
+			return selfDescribed, nil
+		}
 	}
 	if projectionMismatch != nil {
 		if options.DegradeUnrestorableReplay {
@@ -639,12 +679,14 @@ type responsesChatRestoreTally struct {
 	turns       int
 	calls       int
 	degraded    int
+	selfID      int
 	diverged    map[string]int
 	carrier     map[string]int
 	fingerprint string
+	anomalous   bool
 }
 
-func (t *responsesChatRestoreTally) record(diverged, carrier, fingerprint string, calls int) {
+func (t *responsesChatRestoreTally) record(diverged, carrier, fingerprint string, calls int, degraded bool) {
 	if t.diverged == nil {
 		t.diverged, t.carrier = map[string]int{}, map[string]int{}
 	}
@@ -658,9 +700,16 @@ func (t *responsesChatRestoreTally) record(diverged, carrier, fingerprint string
 	t.calls += calls
 	t.diverged[diverged]++
 	t.carrier[carrier]++
-	t.degraded++
+	if degraded {
+		t.degraded++
+	} else {
+		t.selfID++
+	}
 	if t.fingerprint == "" {
 		t.fingerprint = fingerprint
+	}
+	if degraded || diverged != "store_missing" || carrier != "absent" {
+		t.anomalous = true
 	}
 }
 
@@ -686,6 +735,7 @@ func (t *responsesChatRestoreTally) flush(options responsesChatRequestOptions) {
 		logger.F("tool_turns", t.turns),
 		logger.F("tool_calls", t.calls),
 		logger.F("degraded_turns", t.degraded),
+		logger.F("self_describing_turns", t.selfID),
 		logger.F("diverged", t.sole(t.diverged)),
 		logger.F("carrier", t.sole(t.carrier)),
 		logger.F("projection", t.fingerprint),
@@ -701,7 +751,11 @@ func (t *responsesChatRestoreTally) flush(options responsesChatRequestOptions) {
 	if routeID := options.ReplayRoute.RouteID; routeID != "" {
 		fields = append(fields, logger.F("route_id", routeID))
 	}
-	options.Log.Warn("responses replay projection mismatch; continuing without reasoning continuity", fields...)
+	if t.anomalous {
+		options.Log.Warn("responses replay projection mismatch; continuing without reasoning continuity", fields...)
+		return
+	}
+	options.Log.Info("responses replay resolved from self-describing tool-call IDs", fields...)
 }
 
 // Names the guard that rejected the carrier: absent (not in the request at all),
@@ -724,7 +778,7 @@ func logResponsesChatCarrierWedge(options responsesChatRequestOptions, projected
 }
 
 func recordResponsesChatReplayDegrade(tally *responsesChatRestoreTally, projected []responsesChatReplayProjectedCall, content []map[string]any, fallback *responsesChatVisibleTranscriptFallback) {
-	tally.record(fallback.diverged, fallback.carrier, responsesChatReplayProjectionFingerprint(projected, content), len(projected))
+	tally.record(fallback.diverged, fallback.carrier, responsesChatReplayProjectionFingerprint(projected, content), len(projected), true)
 }
 
 // Vekil's own digest, never the projection itself: that is prompt data.
@@ -839,14 +893,19 @@ func responsesFunctionCallItem(callID, name, arguments string) json.RawMessage {
 	return item
 }
 
-// Replay IDs are fixed-width and opaque. Accepting the prefix with any other length would
-// pull client-owned tool-call IDs onto the replay path and expose an unsupported contract.
+// Only the fixed-width opaque shape and exact self-describing mint output are
+// replay IDs. Accepting the prefix plus a broad length range would reroute
+// client-owned tool-call IDs onto the Responses path.
 func isResponsesChatReplayCallID(id string) bool {
 	id = strings.TrimSpace(id)
-	if len(id) != responsesChatReplayIDLength || !strings.HasPrefix(id, responsesChatReplayCallIDPrefix) {
+	if !strings.HasPrefix(id, responsesChatReplayCallIDPrefix) {
 		return false
 	}
-	return isResponsesChatReplayIDCharset(id[len(responsesChatReplayCallIDPrefix):])
+	if len(id) == responsesChatReplayIDLength {
+		return isResponsesChatReplayIDCharset(id[len(responsesChatReplayCallIDPrefix):])
+	}
+	_, ok := responsesChatReplayUpstreamCallID(id)
+	return ok
 }
 
 type translatedSyntheticChatToolCall struct {

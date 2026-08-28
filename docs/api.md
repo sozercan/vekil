@@ -112,29 +112,31 @@ Additional rules:
 
 ### Responses-backed tool continuation
 
-Function calls returned through the adapter use one opaque ID shape:
+Function calls returned in new responses use one of two minted shapes:
 
 ```text
-call_vekil_<22-character-base64url>
+call_vekil_v1_<15-character-nonce>_<upstream-call-id>_<4-character-checksum>  # self-describing; total length never exceeds 64
+call_vekil_<22-character-base64url>                                        # opaque fallback when the upstream ID cannot be embedded
 ```
 
-Clients must return the ID unchanged and must not construct, edit, or parse it. It never embeds the
-upstream provider's `call_id`; that mapping remains only in Vekil's bounded process-local replay
-state. An Anthropic reasoning carrier contains encrypted reasoning, ordering placeholders, and the
-opaque public call bindings needed to validate the visible transcript, but no provider call ID.
+Clients must return either ID unchanged and must not construct, edit, or parse it. The versioned
+shape deliberately embeds the upstream `call_id`. Its per-group nonce prevents an upstream ID reused
+after restart or eviction from matching a newer replay group. The checksum distinguishes
+Vekil-minted replay IDs from plausible native IDs; it is not an authorization key. The opaque shape
+carries no mapping. An Anthropic reasoning carrier contains encrypted reasoning, ordering
+placeholders, and public call bindings, but no separate provider call ID.
 
 Restoring hidden Responses output requires that replay state or a valid reasoning carrier. **The
 carrier is a client obligation, not just the ID.** On `/v1/messages`, reasoning rides in the
 `signature` of an assistant `thinking` block whose text is empty. Return assistant `thinking` blocks
 in history unchanged, signature included. A direct-route continuation can use a valid carrier after
-the replay store is lost to restore hidden reasoning while rebuilding both the function call and its
-output under the opaque `call_vekil_...` ID. If the client drops or rewrites the carrier, Anthropic
-ingress and its count-token probe may instead rebuild only the visible transcript under that same
-opaque ID, losing reasoning continuity. Both paths are sound only because the whole turn is replayed
-in one request with `store: false`, so a `call_id` needs to agree with its own
-`function_call_output` and nothing else. Carrier signatures are cumulatively capped at 2 MiB of the
-client's replayed wire bytes; once the budget is full, or the next complete carrier would cross it,
-Vekil emits no new carrier and later state loss uses the visible-transcript fallback.
+the replay store is lost to restore hidden reasoning. A self-describing ID also restores the original
+upstream call mapping; an opaque ID rebuilds the function call and output under the same proxy ID. If
+the client drops or rewrites the carrier, Anthropic ingress and its count-token probe may instead
+rebuild only the visible transcript. That loses reasoning continuity but still uses the original
+upstream mapping when the ID is self-describing. Carrier signatures are cumulatively capped at 2 MiB
+of the client's replayed wire bytes; once the budget is full, or the next complete carrier would
+cross it, Vekil emits no new carrier and later state loss uses the visible-transcript fallback.
 
 `/v1/chat/completions` and `/v1/responses` do not opt into that visible-transcript fallback; when the
 replay state is unavailable, they return `responses_replay_state_missing`. A **policy profile** also

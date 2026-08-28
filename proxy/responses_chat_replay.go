@@ -27,7 +27,80 @@ const (
 	responsesChatReplayRandomBytes   = 16
 	responsesChatReplayIDLength      = len(responsesChatReplayCallIDPrefix) + 22
 	responsesChatReplayMaxIDAttempts = 1024
+
+	// Anthropic caps tool_use IDs at 64 characters and clients echo minted IDs
+	// verbatim, so an ID that embeds its upstream ID must fit the same limit.
+	responsesChatReplayMaxIDLength = 64
+	// Copilot issues function-call IDs as "call_<opaque>". The marker and version
+	// keep the self-describing namespace narrow. The 88-bit per-group nonce keeps
+	// an upstream ID reused after eviction or restart from matching a newer group.
+	// The checksum provides public integrity, not authority. Route and projection
+	// authority remain in the replay store and signed carrier bindings.
+	responsesChatReplayUpstreamIDMarker     = "call_"
+	responsesChatReplaySelfIDVersion        = "v1_"
+	responsesChatReplaySelfIDNonceBytes     = 11
+	responsesChatReplaySelfIDNonceChars     = 15
+	responsesChatReplaySelfIDChecksumBytes  = 3
+	responsesChatReplaySelfIDChecksumChars  = 4
+	responsesChatReplaySelfIDCanonicalNonce = "AAAAAAAAAAAAAAA"
 )
+
+func responsesChatReplaySelfIDChecksum(nonce, upstreamCallID string) string {
+	sum := sha256.Sum256([]byte("vekil-responses-chat-replay-v1\x00" + nonce + "\x00" + upstreamCallID))
+	return base64.RawURLEncoding.EncodeToString(sum[:responsesChatReplaySelfIDChecksumBytes])
+}
+
+func responsesChatReplaySelfDescribingID(upstreamCallID string) (string, bool) {
+	return responsesChatReplaySelfDescribingIDWithNonce(upstreamCallID, responsesChatReplaySelfIDCanonicalNonce)
+}
+
+func responsesChatReplaySelfDescribingIDWithNonce(upstreamCallID, nonce string) (string, bool) {
+	// Do not trim. A padded ID must fall back to the opaque form rather than mint
+	// an ID that resolves to a different value than the store and carrier bind.
+	if len(upstreamCallID) <= len(responsesChatReplayUpstreamIDMarker) ||
+		!strings.HasPrefix(upstreamCallID, responsesChatReplayUpstreamIDMarker) {
+		return "", false
+	}
+	if len(nonce) != responsesChatReplaySelfIDNonceChars || !isResponsesChatReplayIDCharset(nonce) ||
+		!isResponsesChatReplayIDCharset(upstreamCallID) {
+		return "", false
+	}
+	proxyCallID := responsesChatReplayCallIDPrefix + responsesChatReplaySelfIDVersion + nonce + "_" + upstreamCallID + "_" + responsesChatReplaySelfIDChecksum(nonce, upstreamCallID)
+	if len(proxyCallID) > responsesChatReplayMaxIDLength {
+		return "", false
+	}
+	return proxyCallID, true
+}
+
+// responsesChatReplayUpstreamCallID is the inverse of the self-describing
+// minter. It reads only the ID, so it still works after store expiry or restart.
+func responsesChatReplayUpstreamCallID(proxyCallID string) (string, bool) {
+	proxyCallID = strings.TrimSpace(proxyCallID)
+	prefix := responsesChatReplayCallIDPrefix + responsesChatReplaySelfIDVersion
+	if !strings.HasPrefix(proxyCallID, prefix) {
+		return "", false
+	}
+	body := proxyCallID[len(prefix):]
+	minimum := responsesChatReplaySelfIDNonceChars + 1 + len(responsesChatReplayUpstreamIDMarker) + 1 + responsesChatReplaySelfIDChecksumChars
+	if len(body) < minimum || body[responsesChatReplaySelfIDNonceChars] != '_' || body[len(body)-responsesChatReplaySelfIDChecksumChars-1] != '_' {
+		return "", false
+	}
+	nonce := body[:responsesChatReplaySelfIDNonceChars]
+	upstreamCallID := body[responsesChatReplaySelfIDNonceChars+1 : len(body)-responsesChatReplaySelfIDChecksumChars-1]
+	if minted, ok := responsesChatReplaySelfDescribingIDWithNonce(upstreamCallID, nonce); !ok || minted != proxyCallID {
+		return "", false
+	}
+	return upstreamCallID, true
+}
+
+// preparePublish accounts before the locked minter can detect a collision and
+// choose the opaque fallback. Charge whichever possible form is larger.
+func responsesChatReplayMintedIDSize(upstreamCallID string) int {
+	if proxyCallID, ok := responsesChatReplaySelfDescribingID(upstreamCallID); ok {
+		return max(len(proxyCallID), responsesChatReplayIDLength)
+	}
+	return responsesChatReplayIDLength
+}
 
 // Anthropic's tool_use id charset, shared by both minted shapes.
 func isResponsesChatReplayIDCharset(value string) bool {
@@ -360,10 +433,14 @@ func (s *responsesChatReplayStore) Publish(request responsesChatReplayPublishReq
 	now := s.now()
 	s.expireLocked(now)
 
+	selfIDNonce, err := s.generateSelfIDNonceLocked(prepared.calls)
+	if err != nil {
+		return responsesChatReplayPublished{}, fmt.Errorf("generate Responses replay group nonce: %w", err)
+	}
 	proxyIDs := make([]string, len(prepared.calls))
 	reserved := make(map[string]struct{}, len(prepared.calls))
 	for i := range prepared.calls {
-		proxyID, generateErr := s.generateUniqueCallIDLocked(reserved)
+		proxyID, generateErr := s.generateUniqueCallIDLocked(reserved, prepared.calls[i].upstreamCallID, selfIDNonce)
 		if generateErr != nil {
 			return responsesChatReplayPublished{}, fmt.Errorf("generate Responses replay call ID: %w", generateErr)
 		}
@@ -692,7 +769,36 @@ func (s *responsesChatReplayStore) preparePublish(request responsesChatReplayPub
 	}, nil
 }
 
-func (s *responsesChatReplayStore) generateUniqueCallIDLocked(reserved map[string]struct{}) (string, error) {
+func (s *responsesChatReplayStore) generateSelfIDNonceLocked(calls []responsesChatReplayPreparedCall) (string, error) {
+	needsNonce := false
+	for _, call := range calls {
+		if _, ok := responsesChatReplaySelfDescribingID(call.upstreamCallID); ok {
+			needsNonce = true
+			break
+		}
+	}
+	if !needsNonce {
+		return "", nil
+	}
+	var randomBytes [responsesChatReplaySelfIDNonceBytes]byte
+	if _, err := io.ReadFull(s.random, randomBytes[:]); err != nil {
+		return "", err
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(randomBytes[:])
+	if len(nonce) != responsesChatReplaySelfIDNonceChars {
+		return "", fmt.Errorf("unexpected replay nonce length %d", len(nonce))
+	}
+	return nonce, nil
+}
+
+func (s *responsesChatReplayStore) generateUniqueCallIDLocked(reserved map[string]struct{}, upstreamCallID, selfIDNonce string) (string, error) {
+	if proxyID, ok := responsesChatReplaySelfDescribingIDWithNonce(upstreamCallID, selfIDNonce); ok {
+		_, stored := s.callsByID[proxyID]
+		_, taken := reserved[proxyID]
+		if !stored && !taken {
+			return proxyID, nil
+		}
+	}
 	for attempt := 0; attempt < responsesChatReplayMaxIDAttempts; attempt++ {
 		var randomBytes [responsesChatReplayRandomBytes]byte
 		if _, err := io.ReadFull(s.random, randomBytes[:]); err != nil {
@@ -851,7 +957,7 @@ func replayGroupByteSize(route responsesChatReplayRoute, content []byte, outputI
 		size += len(item)
 	}
 	for _, call := range calls {
-		size += responsesChatReplayIDLength
+		size += responsesChatReplayMintedIDSize(call.upstreamCallID)
 		size += len(call.upstreamCallID) + len(call.name)
 		size += sha256.Size * 2
 		size += replayOptionalDefaultsByteSize(call.visibleOptionalDefaults)

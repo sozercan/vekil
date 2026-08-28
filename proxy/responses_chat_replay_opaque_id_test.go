@@ -9,12 +9,12 @@ import (
 	"testing"
 )
 
-func TestResponsesChatReplayIDsAreOpaqueAndFixedWidth(t *testing.T) {
+func TestResponsesChatReplayFallsBackToOpaqueFixedWidthIDs(t *testing.T) {
 	random := bytes.Repeat([]byte{0x5a}, responsesChatReplayRandomBytes)
 	store := newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{Random: bytes.NewReader(random)})
 	t.Cleanup(func() { _ = store.Close() })
 
-	upstreamID := "call_PROVIDER_SECRET_IDENTIFIER"
+	upstreamID := "PROVIDER_SECRET_IDENTIFIER"
 	published, err := store.Publish(newResponsesChatReplayTestRequest("opaque-id", replayTestCallSpec{
 		upstreamID: upstreamID,
 		name:       "lookup",
@@ -41,6 +41,10 @@ func TestResponsesChatReplayIDRecognitionIsExact(t *testing.T) {
 	if !isResponsesChatReplayCallID(valid) {
 		t.Fatalf("fixed-width opaque ID %q was not recognised", valid)
 	}
+	selfDescribing, ok := responsesChatReplaySelfDescribingID("call_customer_job")
+	if !ok || !isResponsesChatReplayCallID(selfDescribing) {
+		t.Fatalf("self-describing ID %q was not recognised", selfDescribing)
+	}
 	for _, invalid := range []string{
 		"call_vekil_customer_job",
 		"call_vekil_call_customer_job",
@@ -58,7 +62,7 @@ func TestResponsesChatReplayIDRecognitionIsExact(t *testing.T) {
 	}
 }
 
-func TestLiveSmokeCallIDPatternMatchesOpaqueContract(t *testing.T) {
+func TestLiveSmokeCallIDPatternMatchesReplayContract(t *testing.T) {
 	script, err := os.ReadFile("../scripts/live-chat-over-responses-smoke.sh")
 	if err != nil {
 		t.Fatalf("read smoke script: %v", err)
@@ -74,6 +78,10 @@ func TestLiveSmokeCallIDPatternMatchesOpaqueContract(t *testing.T) {
 	valid := responsesChatReplayCallIDPrefix + strings.Repeat("A", 22)
 	if !pattern.MatchString(valid) {
 		t.Errorf("smoke pattern %q rejects opaque replay ID %q", declared[1], valid)
+	}
+	selfDescribing, ok := responsesChatReplaySelfDescribingID("call_customer_job")
+	if !ok || !pattern.MatchString(selfDescribing) {
+		t.Errorf("smoke pattern %q rejects self-describing replay ID %q", declared[1], selfDescribing)
 	}
 	for _, invalid := range []string{
 		"call_vekil_v2_AAAAAAAAAAAAAAA_call_customer_job_AAAA",

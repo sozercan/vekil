@@ -803,11 +803,16 @@ func carriedRestoredCalls(carried map[string]carriedReplay, projected []response
 		}
 		boundCallItems[call.ItemIndex] = struct{}{}
 		lastItemIndex = call.ItemIndex
+		upstreamCallID := projectedCall.ID
+		if selfDescribed, ok := responsesChatReplayUpstreamCallID(projectedCall.ID); ok {
+			upstreamCallID = selfDescribed
+		}
 		calls[i] = responsesChatReplayResolvedCall{
 			ProxyCallID: projectedCall.ID,
-			// Rebuild both sides of the visible call/result pair under the opaque public
-			// ID. A legacy carrier's provider ID is deliberately ignored.
-			UpstreamCallID:  projectedCall.ID,
+			// Self-describing public IDs recover their upstream mapping. Opaque IDs
+			// still rebuild both sides under the same proxy ID. A legacy carrier's
+			// serialized provider ID remains deliberately ignored.
+			UpstreamCallID:  upstreamCallID,
 			Name:            call.Name,
 			OutputItemIndex: call.ItemIndex,
 			OutputItem:      replay.Items[call.ItemIndex],
@@ -879,6 +884,19 @@ func reconstructCarriedRestore(restored responsesChatRestoredCalls, projected []
 		calls[i].OutputItem = responsesFunctionCallItem(calls[i].UpstreamCallID, call.Name, call.Arguments)
 		calls[i].OutputItemIndex = len(items)
 		items = append(items, calls[i].OutputItem)
+	}
+	// An ID-only restore has no carrier placeholders. Rebuild the visible text
+	// and complete ordered call projection directly from the client transcript.
+	if len(restored.OutputItems) == 0 {
+		if assistantText != "" {
+			items = appendAssistantHistoryMessage(items, assistantText)
+		}
+		for i := range calls {
+			rebuild(i)
+		}
+		restored.OutputItems = items
+		restored.Calls = calls
+		return restored
 	}
 	messageSegments, _ := carriedMessageSegments(restored.OutputItems, assistantText)
 	textSlot := -1

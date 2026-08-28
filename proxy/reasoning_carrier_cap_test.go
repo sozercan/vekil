@@ -265,8 +265,12 @@ func TestCarrierPreservesTextAfterCallOrder(t *testing.T) {
 	if callIndex < 0 || textIndex < 0 || callIndex >= textIndex {
 		t.Fatalf("rebuilt order call=%d text=%d, want call before text: %#v", callIndex, textIndex, restored)
 	}
-	if restored[callIndex]["call_id"] != callID {
-		t.Fatalf("rebuilt call ID = %#v, want opaque proxy ID %q", restored[callIndex]["call_id"], callID)
+	wantCallID, ok := responsesChatReplayUpstreamCallID(callID)
+	if !ok {
+		t.Fatalf("fixture minted %q, want a self-describing ID", callID)
+	}
+	if restored[callIndex]["call_id"] != wantCallID {
+		t.Fatalf("rebuilt call ID = %#v, want upstream ID %q", restored[callIndex]["call_id"], wantCallID)
 	}
 }
 
@@ -598,9 +602,9 @@ func TestCarrierBudgetAppliedOnEveryClientPath(t *testing.T) {
 				if !strings.Contains(payload, carrierFixtureCiphertext) {
 					t.Fatalf("delivered carrier lost reasoning ciphertext: %s", payload)
 				}
-				for _, forbidden := range []string{`"upstream_id"`, `"call_id"`, "call_synth_lookup_stream_001"} {
+				for _, forbidden := range []string{`"upstream_id"`, `"call_id"`} {
 					if strings.Contains(payload, forbidden) {
-						t.Fatalf("delivered carrier exposed %q: %s", forbidden, payload)
+						t.Fatalf("delivered carrier serialized a separate provider mapping %q: %s", forbidden, payload)
 					}
 				}
 				replay, ok := decodeReasoningCarrier(signature, nil)
@@ -611,11 +615,11 @@ func TestCarrierBudgetAppliedOnEveryClientPath(t *testing.T) {
 					t.Fatalf("delivered carrier items = %d, want %d", len(replay.Items), tc.wantItems)
 				}
 				if len(replay.Calls) != 1 {
-					t.Fatalf("delivered carrier calls = %d, want one opaque binding", len(replay.Calls))
+					t.Fatalf("delivered carrier calls = %d, want one public-ID binding", len(replay.Calls))
 				}
 				for proxyID, call := range replay.Calls {
 					if !isResponsesChatReplayCallID(proxyID) || call.UpstreamID != "" || call.Name != "lookup_synthetic_widget" {
-						t.Fatalf("carrier binding is not opaque-only: %s -> %+v", proxyID, call)
+						t.Fatalf("carrier binding serialized a separate provider mapping: %s -> %+v", proxyID, call)
 					}
 				}
 			})
