@@ -136,6 +136,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |
 | [Client Examples](docs/clients.md)                           | Copy-paste snippets per client      |
 | [Agent Launchers](docs/agent-launchers.md)                   | One-command coding-agent sessions   |
+| [Troubleshooting](docs/troubleshooting.md)                   | Recovery for client-visible errors  |
 | [API Reference](docs/api.md)                                 | Endpoint behavior and compatibility |
 | [Architecture](docs/architecture.md)                         | Package layout and design notes     |
 | [Traffic Dashboard](docs/dashboard.md)                       | Live browser dashboard and stats    |

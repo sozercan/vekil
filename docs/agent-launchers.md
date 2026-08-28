@@ -317,6 +317,10 @@ The startup banner prints the exact proxy URL and log path. Routes other than
 browser dashboard is not exposed. The end-of-session summary is written to
 stderr so non-interactive agent output on stdout remains pipeline-safe.
 
+If Codex reports an upstream `408 user_request_timeout`, see
+[Troubleshooting](troubleshooting.md#408-user_request_timeout-timed-out-reading-request-body)
+for retry and diagnosis guidance.
+
 ## Credential and process isolation
 
 The child receives a sanitized copy of the parent environment. Vekil removes:

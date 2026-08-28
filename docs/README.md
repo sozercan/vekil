@@ -15,6 +15,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`responses-websocket.md`](responses-websocket.md) | Codex-style `GET /v1/responses` websocket bridge tuning | websocket bridge, auto-compaction, or compact retry knobs change |
 | [`clients.md`](clients.md) | copy-paste client examples | onboarding snippets or client compatibility changes |
 | [`agent-launchers.md`](agent-launchers.md) | one-command coding-agent launchers, lifecycle, logs, and credential isolation | launcher targets, flags, process lifecycle, or child configuration changes |
+| [`troubleshooting.md`](troubleshooting.md) | symptom-based recovery and diagnostic guidance for client-visible failures | a recurring failure gains a known recovery path or new diagnostic evidence |
 | [`api.md`](api.md) | public endpoint map plus cross-surface Chat/Responses compatibility contract | public routes or Chat compatibility behavior changes |
 | [`gemini.md`](gemini.md) | Gemini translation compatibility details | Gemini request/response translation behavior changes |
 | [`responses.md`](responses.md) | native Responses behavior, the Chat-over-Responses boundary, compact, and memory shims | Responses passthrough, Chat adaptation, compaction, or shim behavior changes |
