@@ -710,3 +710,85 @@ func TestInspectOpenAIChatErrorWithEmbeddedProgressIsNotReplaySafe(t *testing.T)
 		t.Fatalf("progress = %q unexpectedly replay safe", result.progress)
 	}
 }
+
+// A carrier is vekil's own state and Anthropic is a different provider. Carrier extraction sits
+// AFTER the direct-forward early return, so a client that keeps our thinking block and switches
+// to a natively-Anthropic model used to forward Copilot's reasoning ciphertext -- and a
+// signature Anthropic never issued -- straight to Anthropic.
+func TestHandleAnthropicMessagesDirectStripsVekilCarriers(t *testing.T) {
+	var raw json.RawMessage
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == providerEndpointModels:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"claude-sonnet-5","supported_endpoints":["/chat/completions","/v1/messages"]}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == providerEndpointMessages:
+			body, _ := io.ReadAll(r.Body)
+			raw = json.RawMessage(body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"msg-native","type":"message","role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithCopilotBaseURL(upstream.URL),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	// One assistant turn holding a carrier beside real content, and one holding only a carrier
+	// -- the orphan shape a client produces when it splits a parallel group.
+	body := `{"model":"claude-sonnet-5","max_tokens":64,"Messages":[
+		{"role":"user","content":"go"},
+		{"Role":"assistant","Content":[
+			{"type":"thinking","Type":"text","thinking":"","signature":"vekil1.OPAQUECARRIERPAYLOAD","Signature":"anthropic-native-sig"},
+			{"type":"text","text":"working"}]},
+		{"role":"user","content":"again"},
+		{"Role":"assistant","Content":[{"type":"thinking","thinking":"","signature":"vekil1.SECONDCARRIER"}]},
+		{"role":"user","content":"and again"}]}`
+	req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(body))
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	rec := httptest.NewRecorder()
+	handler.HandleAnthropicMessages(rec, req)
+
+	if !handler.shouldForwardAnthropicMessagesDirect("claude-sonnet-5") {
+		t.Fatal("fixture did not select direct forwarding; this test would prove nothing")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if len(raw) == 0 {
+		t.Fatal("upstream never received the forwarded request")
+	}
+	if strings.Contains(string(raw), reasoningCarrierPrefix) {
+		t.Fatalf("a vekil carrier reached Anthropic: %s", string(raw))
+	}
+	// The turn that had real content keeps it; the one that was only a carrier is gone, which
+	// is the transcript the client would have sent if vekil had never injected anything.
+	var forwarded models.AnthropicRequest
+	if err := json.Unmarshal(raw, &forwarded); err != nil {
+		t.Fatal(err)
+	}
+	if len(forwarded.Messages) != 4 {
+		t.Fatalf("forwarded %d messages, want 4 (the carrier-only assistant turn dropped): %s", len(forwarded.Messages), string(raw))
+	}
+	if !strings.Contains(string(forwarded.Messages[1].Content), "working") {
+		t.Fatalf("stripping removed the assistant's real content: %s", string(forwarded.Messages[1].Content))
+	}
+	// Dropping a carrier-only turn can leave two user messages adjacent. That is the shape the
+	// client would have had without vekil's injection, and it is strictly better than the two
+	// alternatives -- forwarding an empty content array, or forwarding our carrier. Like
+	// everything else here it is not asserted against live Anthropic.
+	if forwarded.Messages[2].Role != "user" || forwarded.Messages[3].Role != "user" {
+		t.Fatalf("expected the two trailing user turns to survive: %s", string(raw))
+	}
+	if forwarded.MaxTokens == nil || *forwarded.MaxTokens != 64 {
+		t.Fatalf("max_tokens = %v, want the client's 64 preserved through the rewrite", forwarded.MaxTokens)
+	}
+}

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"testing/iotest"
+	"time"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
@@ -139,6 +142,111 @@ func TestExecuteChatCompletionsCanonicalErrorRetainsSafeHeaders(t *testing.T) {
 	}
 }
 
+func TestCaptureNativeChatHTTPErrorClassifiersPreservesBodyReadError(t *testing.T) {
+	const body = `{"error":{"type":"invalid_request_error","code":"bad_value","param":"messages"}}`
+	readErr := errors.New("upstream body failed")
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body: io.NopCloser(io.MultiReader(
+			bytes.NewBufferString(body),
+			iotest.ErrReader(readErr),
+		)),
+	}
+
+	ctx, summary := WithRequestSummary(context.Background())
+	capture := captureNativeChatHTTPErrorClassifiers(resp)
+	capture.observe(ctx)
+	replayed, err := io.ReadAll(resp.Body)
+	if string(replayed) != body {
+		t.Fatalf("replayed body = %q, want %q", replayed, body)
+	}
+	if !errors.Is(err, readErr) {
+		t.Fatalf("replayed error = %v, want %v", err, readErr)
+	}
+	classifiers := map[string]string{}
+	for _, field := range summary.LoggerFields() {
+		if value, ok := field.Value.(string); ok {
+			classifiers[field.Key] = value
+		}
+	}
+	if classifiers["error_type"] != "invalid_request_error" || classifiers["error_code"] != "bad_value" || classifiers["error_param"] != "messages" {
+		t.Fatalf("classifiers = %#v", classifiers)
+	}
+}
+
+func TestCaptureNativeChatHTTPErrorClassifiersDoesNotReadAhead(t *testing.T) {
+	const body = `{"error":{"type":"invalid_request_error","code":"bad_value","param":"messages"}}`
+	started := make(chan struct{})
+	release := make(chan struct{})
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body: &gatedErrorBody{
+			Reader:  bytes.NewBufferString(body),
+			started: started,
+			release: release,
+		},
+	}
+	done := make(chan *upstreamErrorClassifierCapture, 1)
+	go func() { done <- captureNativeChatHTTPErrorClassifiers(resp) }()
+	var capture *upstreamErrorClassifierCapture
+	select {
+	case capture = <-done:
+	case <-time.After(200 * time.Millisecond):
+		close(release)
+		t.Fatal("classifier capture blocked waiting for the upstream error body")
+	}
+	select {
+	case <-started:
+		close(release)
+		t.Fatal("classifier capture read the body before passthrough consumption")
+	default:
+	}
+
+	ctx, summary := WithRequestSummary(context.Background())
+	capture.observe(ctx)
+	close(release)
+	replayed, err := io.ReadAll(resp.Body)
+	if err != nil || string(replayed) != body {
+		t.Fatalf("replayed body = %q, err = %v", replayed, err)
+	}
+	fields := map[string]string{}
+	for _, field := range summary.LoggerFields() {
+		if value, ok := field.Value.(string); ok {
+			fields[field.Key] = value
+		}
+	}
+	if fields["error_type"] != "invalid_request_error" || fields["error_code"] != "bad_value" || fields["error_param"] != "messages" {
+		t.Fatalf("classifiers = %#v", fields)
+	}
+}
+
+type gatedErrorBody struct {
+	io.Reader
+	started chan struct{}
+	release chan struct{}
+	read    bool
+}
+
+func (b *gatedErrorBody) Read(p []byte) (int, error) {
+	if !b.read {
+		b.read = true
+		close(b.started)
+		<-b.release
+	}
+	return b.Reader.Read(p)
+}
+
+func (*gatedErrorBody) Close() error { return nil }
+
+func TestParseResponsesChatErrorDetailsCopiesFlatCopilotMessage(t *testing.T) {
+	details := parseResponsesChatErrorDetails(http.StatusBadRequest, []byte(
+		`{"code":"invalid_request_body","message":"  invalid reasoning effort  "}`,
+	))
+	if details.message != "invalid reasoning effort" || details.code != "invalid_request_body" {
+		t.Fatalf("flat error details = %#v", details)
+	}
+}
+
 func TestExecuteChatCompletionsDoesNotRerouteReplayLikeNativeIDs(t *testing.T) {
 	upstreamCalls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -151,7 +259,7 @@ func TestExecuteChatCompletionsDoesNotRerouteReplayLikeNativeIDs(t *testing.T) {
 	}))
 	defer upstream.Close()
 	h := newChatExecutionTestHandler(t, upstream.URL, []string{providerEndpointChatCompletions, providerEndpointResponses})
-	body := []byte(`{"model":"gpt-public","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_customer_job","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_customer_job","content":"ok"}]}`)
+	body := []byte(`{"model":"gpt-public","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_call_customer_job","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_call_customer_job","content":"ok"}]}`)
 	result, err := h.executeChatCompletions(context.Background(), body, chatExecutionOptions{})
 	if err != nil {
 		t.Fatal(err)

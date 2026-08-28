@@ -2,14 +2,14 @@ name: Live Copilot Smoke
 
 on:
   workflow_dispatch:
-  pull_request:
+  push:
     branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: live-copilot-smoke-${{ github.event.pull_request.number || github.ref }}
+  group: live-copilot-smoke-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -19,34 +19,15 @@ jobs:
     env:
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
     steps:
-      - name: Decide whether live smoke can run
+      - name: Require live smoke credential
         id: gate
-        env:
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
-          ACTOR: ${{ github.actor }}
         run: |
-          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK}" = "true" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=Skipping live smoke for fork pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "${ACTOR}" = "dependabot[bot]" ] && [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=Skipping live smoke for Dependabot pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
             echo "COPILOT_GITHUB_TOKEN repository secret is required for live smoke checks." >&2
             exit 1
           fi
 
           echo "run=true" >> "$GITHUB_OUTPUT"
-
-      - name: Explain skipped live smoke
-        if: steps.gate.outputs.run != 'true'
-        run: echo "${{ steps.gate.outputs.reason }}"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.gate.outputs.run == 'true'
@@ -102,6 +83,12 @@ jobs:
           curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 https://claude.ai/install.sh | bash -s stable
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      - name: Run live Claude reasoning-carrier restart smoke
+        if: steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'true'
+        env:
+          LIVE_CLAUDE_REASONING_CARRIER_SMOKE_DIR: ${{ runner.temp }}/live-claude-reasoning-carrier-smoke
+        run: scripts/live-claude-reasoning-carrier-smoke.sh
+
       - name: Install Gemini CLI
         if: steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'true'
         run: npm install -g @google/gemini-cli@latest
@@ -130,11 +117,14 @@ jobs:
               -e 's/("access_token":"[^"]*")/"access_token":"[REDACTED]"/g' \
               -e 's/("token":"[^"]*")/"token":"[REDACTED]"/g' \
               -e 's/("encrypted_content"[[:space:]]*:[[:space:]]*")[^"]*(")/\1[REDACTED]\2/g' \
+              -e 's/vekil1\.[A-Za-z0-9_-]+/[REDACTED_VEKIL_CARRIER]/g' \
               -e 's/(Please visit https:\/\/github\.com\/login\/device and enter code: )[A-Z0-9-]+/\1[REDACTED]/g'
           }
           for log in \
             "$RUNNER_TEMP/live-compact-smoke/proxy.log" \
             "$RUNNER_TEMP/live-chat-over-responses-smoke/proxy.log" \
+            "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/proxy-initial.log" \
+            "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/proxy-restarted.log" \
             "$RUNNER_TEMP/live-cli-smoke/proxy.log"; do
             if [ -f "$log" ]; then
               echo "--- $log ---"
@@ -153,6 +143,7 @@ jobs:
               -e 's/("access_token":"[^"]*")/"access_token":"[REDACTED]"/g' \
               -e 's/("token":"[^"]*")/"token":"[REDACTED]"/g' \
               -e 's/("encrypted_content"[[:space:]]*:[[:space:]]*")[^"]*(")/\1[REDACTED]\2/g' \
+              -e 's/vekil1\.[A-Za-z0-9_-]+/[REDACTED_VEKIL_CARRIER]/g' \
               -e 's/(Please visit https:\/\/github\.com\/login\/device and enter code: )[A-Z0-9-]+/\1[REDACTED]/g'
           }
           if [ -d "$RUNNER_TEMP/live-compact-smoke" ]; then
@@ -166,7 +157,21 @@ jobs:
             find "$RUNNER_TEMP/live-chat-over-responses-smoke" -maxdepth 1 -type f \
               \( -name '*.json' -o -name '*.txt' -o -name '*.err' \) -print0 | while IFS= read -r -d '' file; do
               echo "--- $file ---"
-              head -c 32768 "$file" | redact
+              redact < "$file" | { head -c 32768; cat >/dev/null; }
+            done
+          fi
+          if [ -d "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke" ]; then
+            for file in \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/summary.txt" \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/selected-model.txt" \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/claude.err" \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/claude-sanitized.json" \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/missing-carrier-single-response.json" \
+              "$RUNNER_TEMP/live-claude-reasoning-carrier-smoke/missing-carrier-complex-response.json"; do
+              if [ -f "$file" ]; then
+                echo "--- $file ---"
+                redact < "$file" | { head -c 32768; cat >/dev/null; }
+              fi
             done
           fi
           if [ -d "$RUNNER_TEMP/live-cli-smoke/outputs" ]; then

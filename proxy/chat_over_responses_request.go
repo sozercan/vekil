@@ -10,7 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/sozercan/vekil/logger"
 )
 
 func newChatInvalidRequest(param, message string) *chatExecutionError {
@@ -24,10 +27,17 @@ func newChatInvalidRequest(param, message string) *chatExecutionError {
 
 type responsesChatRequestOptions struct {
 	UpstreamModel       string
+	CarriedReasoning    map[string]carriedReplay
 	ReplayStore         *responsesChatReplayStore
 	ReplayRoute         responsesChatReplayRoute
+	Log                 *logger.Logger
 	MinimumOutputTokens int
 	DropSamplingParams  bool
+	// Anthropic clients hold their replay state in a transcript they already sent and
+	// cannot repair, so a carrier that cannot answer degrades to the visible turn.
+	// Native Chat owns its history and stays loud. Off while probing candidates: the
+	// refusal is also how a target is chosen, and a degrade would pick the first one.
+	DegradeUnrestorableReplay bool
 }
 
 type responsesChatRequestPlan struct {
@@ -256,9 +266,13 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 	// items. Start with the bounded decoded message count and let append grow it;
 	// avoid arithmetic on an untrusted length in the allocation size.
 	input := make([]json.RawMessage, 0, len(messages))
+	var toolTurnStarts []int
 	calls := make(map[string]string)
 	results := make(map[string]struct{})
-	restoredGroups := make(map[uint64]struct{})
+	restoredGroups := make(map[string]struct{})
+	// Accumulated across the whole request and flushed once on the way out; see
+	// responsesChatRestoreTally for why this is not logged per turn.
+	var tally responsesChatRestoreTally
 	for index, raw := range messages {
 		messageParam := fmt.Sprintf("messages[%d]", index)
 		if _, err := validateChatRawObjectFields(raw, messageParam, "role", "content", "refusal", "name", "tool_calls", "tool_call_id"); err != nil {
@@ -316,6 +330,7 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				input = appendAssistantHistoryMessage(input, assistantText)
 				continue
 			}
+			toolTurnStarts = append(toolTurnStarts, len(input))
 
 			projected := make([]responsesChatReplayProjectedCall, len(message.ToolCalls))
 			syntheticItems := make([]json.RawMessage, len(message.ToolCalls))
@@ -338,47 +353,37 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				return nil, replayChatExecutionError(responsesChatReplayMixedCode, responsesChatReplayMixedMessage)
 			}
 			if replayCalls == 0 {
-				if assistantText := assistantHistoryText(content) + refusal; assistantText != "" {
-					input = appendAssistantHistoryMessage(input, assistantText)
-				}
-				matchedResults := 0
-				for _, projectedCall := range projected {
-					if resultIndex, ok := resultIndices[projectedCall.ID]; ok && resultIndex > index {
-						matchedResults++
-					}
-				}
-				if matchedResults == 0 {
-					return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d]", index), "assistant tool calls require at least one subsequent tool result")
-				}
-				for callIndex, projectedCall := range projected {
-					if matchedResults < len(projected) {
-						if resultIndex, ok := resultIndices[projectedCall.ID]; !ok || resultIndex <= index {
-							continue
-						}
-					}
-					if _, duplicate := calls[projectedCall.ID]; duplicate {
-						return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].tool_calls[%d].id", index, callIndex), "duplicate tool call ID")
-					}
-					calls[projectedCall.ID] = projectedCall.ID
-					input = append(input, syntheticItems[callIndex])
+				input, err = appendVisibleAssistantTurn(input, calls, resultIndices, projected, syntheticItems, assistantHistoryText(content)+refusal, index)
+				if err != nil {
+					return nil, err
 				}
 				continue
 			}
-			if options.ReplayStore == nil {
-				return nil, missingResponsesChatReplayError()
-			}
-			projectionContent, _ := json.Marshal(assistantHistoryText(content))
-			resolution, err := resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
+			restored, err := restoreResponsesChatCalls(options, projected, content, &tally)
 			if err != nil {
-				return nil, mapResponsesChatReplayResolveError(err)
+				return nil, err
 			}
-			if _, duplicate := restoredGroups[resolution.GroupID]; duplicate {
+			if restored.VisibleTranscriptFallback != nil {
+				// A client cannot repair a transcript it already sent. Direct Anthropic ingress
+				// explicitly trades the missing-state 400 for a turn without hidden reasoning;
+				// native Chat never receives this successful fallback result.
+				recordResponsesChatReplayDegrade(&tally, projected, content, restored.VisibleTranscriptFallback)
+				input, err = appendVisibleAssistantTurn(input, calls, resultIndices, projected, syntheticItems, assistantHistoryText(content)+refusal, index)
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if _, duplicate := restoredGroups[restored.Key]; duplicate {
 				return nil, replayChatExecutionError(responsesChatReplayProjectionCode, "Responses replay group appears more than once in the request.")
 			}
-			restoredGroups[resolution.GroupID] = struct{}{}
-			resolvedByProxy := make(map[string]responsesChatReplayResolvedCall, len(resolution.Calls))
+			restoredGroups[restored.Key] = struct{}{}
+			if restored.Rebuild {
+				restored = reconstructCarriedRestore(restored, projected, assistantHistoryText(content))
+			}
+			resolvedByProxy := make(map[string]responsesChatReplayResolvedCall, len(restored.Calls))
 			matchedResults := 0
-			for _, call := range resolution.Calls {
+			for _, call := range restored.Calls {
 				resolvedByProxy[call.ProxyCallID] = call
 				if resultIndex, ok := resultIndices[call.ProxyCallID]; ok && resultIndex > index {
 					matchedResults++
@@ -387,8 +392,8 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			if matchedResults == 0 {
 				return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d]", index), "Responses-backed assistant tool calls require at least one subsequent tool result")
 			}
-			if matchedResults == len(resolution.Calls) {
-				input = append(input, cloneReplayRawMessages(resolution.OutputItems)...)
+			if matchedResults == len(restored.Calls) {
+				input = append(input, cloneReplayRawMessages(restored.OutputItems)...)
 			} else {
 				// Live gpt-5.6-sol rejects a complete parallel call group when only a
 				// subset has outputs. Replay the visible assistant text plus only the
@@ -441,7 +446,352 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 			return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].role", index), "unsupported message role")
 		}
 	}
+	// Only on the way out with a request that survived: a failed translate reports itself,
+	// and the policy tier probe fails routinely by design.
+	tally.flush(options)
+	return trimAgedReasoning(input, toolTurnStarts, options), nil
+}
+
+// Copilot rejects store and previous_response_id, so reasoning rides every later request
+// body: one 1490-turn session replayed 11.3 MB of it, a 100-turn block 0.7 MB of that.
+const reasoningToolTurnBlock = 100
+
+// Upstream caches on strict prefix: probed, 3 words changed near the front took cached
+// from 9012 to 0. Quantising holds the cutoff still per block; the window runs N..2N-1.
+func agedReasoningToolTurns(toolTurns int) int {
+	return max(toolTurns/reasoningToolTurnBlock-1, 0) * reasoningToolTurnBlock
+}
+
+// Only reasoning is droppable: dropping a function_call instead was measured against
+// Copilot as "No tool call found for function call output", so the mandatory floor stays.
+func trimAgedReasoning(input []json.RawMessage, toolTurnStarts []int, options responsesChatRequestOptions) []json.RawMessage {
+	agedTurns := agedReasoningToolTurns(len(toolTurnStarts))
+	if agedTurns == 0 {
+		return input
+	}
+	aged := toolTurnStarts[agedTurns]
+	kept := make([]json.RawMessage, 0, len(input))
+	items, itemBytes, retained := 0, 0, 0
+	for index, item := range input {
+		if itemType, _ := carriedItemHeader(item); itemType == "reasoning" {
+			if index < aged {
+				items++
+				itemBytes += len(item)
+				continue
+			}
+			retained++
+		}
+		kept = append(kept, item)
+	}
+	if items == 0 {
+		return input
+	}
+	logTrimmedReasoning(options, len(toolTurnStarts), agedTurns, items, itemBytes, retained)
+	return kept
+}
+
+// Debug, not warn: past 200 tool turns this is the steady state and fires every turn,
+// where the warns beside it mark continuity vekil expected to keep and lost.
+func logTrimmedReasoning(options responsesChatRequestOptions, toolTurns, agedTurns, items, itemBytes, retained int) {
+	if options.Log == nil {
+		return
+	}
+	// retained_reasoning_items is the window's whole point: a starved request keeps none.
+	options.Log.Debug("trimmed reasoning from tool turns older than the retained window",
+		logger.F("model", options.ReplayRoute.PublicModel),
+		logger.F("tool_turns", toolTurns),
+		logger.F("aged_turns", agedTurns),
+		logger.F("retained_turns", toolTurns-agedTurns),
+		logger.F("reasoning_items", items),
+		logger.F("reasoning_bytes", itemBytes),
+		logger.F("retained_reasoning_items", retained),
+	)
+}
+
+type responsesChatRestoredCalls struct {
+	Key                       string
+	OutputItems               []json.RawMessage
+	Calls                     []responsesChatReplayResolvedCall
+	TextItemIndex             *int
+	VisibleTranscriptFallback *responsesChatVisibleTranscriptFallback
+	// Rebuild marks a carrier restore whose items are not upstream's own and have to be
+	// rebuilt from the transcript before use.
+	Rebuild bool
+}
+
+// A successful, opt-in recovery outcome rather than an error. The caller rebuilds this
+// turn from the visible transcript, using each opaque proxy ID as its stateless call_id.
+type responsesChatVisibleTranscriptFallback struct {
+	diverged string
+	carrier  string
+}
+
+// When the replay store and carrier cannot answer, a self-describing ID can
+// still recover the upstream call mapping. It carries no hidden items. The
+// caller rebuilds those from the transcript through reconstructCarriedRestore.
+func selfDescribingRestoredCalls(projected []responsesChatReplayProjectedCall, projectionDigest string) (responsesChatRestoredCalls, bool) {
+	if len(projected) == 0 {
+		return responsesChatRestoredCalls{}, false
+	}
+	calls := make([]responsesChatReplayResolvedCall, len(projected))
+	for i, projectedCall := range projected {
+		upstreamCallID, ok := responsesChatReplayUpstreamCallID(projectedCall.ID)
+		if !ok {
+			return responsesChatRestoredCalls{}, false
+		}
+		calls[i] = responsesChatReplayResolvedCall{
+			ProxyCallID:     projectedCall.ID,
+			UpstreamCallID:  upstreamCallID,
+			Name:            strings.TrimSpace(projectedCall.Name),
+			OutputItemIndex: i,
+		}
+	}
+	return responsesChatRestoredCalls{
+		Key:     "selfid:" + projectionDigest,
+		Calls:   calls,
+		Rebuild: true,
+	}, true
+}
+
+// The store is authoritative while it holds the group and its arguments still match.
+// Clients rewrite arguments; the carrier does not bind them and holds only the client's
+// own ciphertext (see carriedProjectionDigest), so trying it grants no extra reach.
+func restoreResponsesChatCalls(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, content []map[string]any, tally *responsesChatRestoreTally) (responsesChatRestoredCalls, error) {
+	projectionContent, err := json.Marshal(assistantHistoryText(content))
+	if err != nil {
+		return responsesChatRestoredCalls{}, replayChatExecutionError(responsesChatReplayProjectionCode, responsesChatReplayProjectionMessage)
+	}
+	var projectionMismatch *responsesChatReplayProjectionMismatchError
+	if options.ReplayStore != nil {
+		resolution, err := resolveResponsesChatReplay(options.ReplayStore, options.ReplayRoute, responsesChatReplayAssistantProjection{Content: projectionContent, Calls: projected})
+		if err == nil {
+			return responsesChatRestoredCalls{
+				Key:         "group:" + strconv.FormatUint(resolution.GroupID, 10),
+				OutputItems: resolution.OutputItems,
+				Calls:       resolution.Calls,
+			}, nil
+		}
+		if mapped := mapResponsesChatReplayResolveError(err); !isMissingResponsesChatReplayError(mapped) {
+			var projection *responsesChatReplayProjectionError
+			if !errors.As(err, &projection) {
+				return responsesChatRestoredCalls{}, mapped
+			}
+			projectionMismatch = &responsesChatReplayProjectionMismatchError{error: mapped, diverged: projection.Reason}
+		}
+	}
+	restored, carrier := carriedRestoredCalls(options.CarriedReasoning, projected, options.ReplayRoute, projectionContent)
+	if carrier == "" {
+		return restored, nil
+	}
+	// The ID alone is route-agnostic. Do not let it answer during target
+	// probing, where another candidate may still hold the full replay group.
+	// DegradeUnrestorableReplay is set only after every candidate refused.
+	if options.DegradeUnrestorableReplay {
+		diverged := "store_missing"
+		if projectionMismatch != nil {
+			diverged = projectionMismatch.diverged
+		}
+		if selfDescribed, ok := selfDescribingRestoredCalls(projected, carriedProjectionDigest(projectionContent, projected)); ok {
+			tally.record(diverged, carrier, responsesChatReplayProjectionFingerprint(projected, content), len(projected), false)
+			return selfDescribed, nil
+		}
+	}
+	if projectionMismatch != nil {
+		if options.DegradeUnrestorableReplay {
+			return responsesChatRestoredCalls{VisibleTranscriptFallback: &responsesChatVisibleTranscriptFallback{
+				diverged: projectionMismatch.diverged,
+				carrier:  carrier,
+			}}, nil
+		}
+		return responsesChatRestoredCalls{}, projectionMismatch
+	}
+	if options.DegradeUnrestorableReplay {
+		// Nothing the carrier claimed travels. The caller rebuilds the turn from the
+		// transcript, so a refused carrier is discarded rather than merely tolerated.
+		return responsesChatRestoredCalls{VisibleTranscriptFallback: &responsesChatVisibleTranscriptFallback{
+			diverged: "store_missing",
+			carrier:  carrier,
+		}}, nil
+	}
+	// The reason is known here and was previously discarded, so the wedge this whole
+	// mechanism exists to prevent arrived with no way to tell WHICH guard rejected it.
+	logResponsesChatCarrierWedge(options, projected, carrier)
+	return responsesChatRestoredCalls{}, missingResponsesChatReplayError()
+}
+
+func appendVisibleAssistantTurn(input []json.RawMessage, calls map[string]string, resultIndices map[string]int, projected []responsesChatReplayProjectedCall, items []json.RawMessage, assistantText string, index int) ([]json.RawMessage, error) {
+	if assistantText != "" {
+		input = appendAssistantHistoryMessage(input, assistantText)
+	}
+	matchedResults := 0
+	for _, projectedCall := range projected {
+		if resultIndex, ok := resultIndices[projectedCall.ID]; ok && resultIndex > index {
+			matchedResults++
+		}
+	}
+	if matchedResults == 0 {
+		return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d]", index), "assistant tool calls require at least one subsequent tool result")
+	}
+	for callIndex, projectedCall := range projected {
+		if matchedResults < len(projected) {
+			if resultIndex, ok := resultIndices[projectedCall.ID]; !ok || resultIndex <= index {
+				continue
+			}
+		}
+		if _, duplicate := calls[projectedCall.ID]; duplicate {
+			return nil, newChatInvalidRequest(fmt.Sprintf("messages[%d].tool_calls[%d].id", index, callIndex), "duplicate tool call ID")
+		}
+		calls[projectedCall.ID] = projectedCall.ID
+		input = append(input, items[callIndex])
+	}
 	return input, nil
+}
+
+// Candidate routing needs to distinguish a store-owned projection mismatch from a plain
+// miss so it can retry the exact target. Direct Anthropic fallback converts this error into
+// a successful responsesChatVisibleTranscriptFallback inside restoreResponsesChatCalls.
+type responsesChatReplayProjectionMismatchError struct {
+	error
+	diverged string
+}
+
+func (e *responsesChatReplayProjectionMismatchError) Unwrap() error { return e.error }
+
+func isResponsesChatReplayProjectionError(err error) bool {
+	var mismatch *responsesChatReplayProjectionMismatchError
+	return errors.As(err, &mismatch)
+}
+
+func logCarriedReasoningStarved(log *logger.Logger, starved bool, model string) {
+	if log == nil || !starved {
+		return
+	}
+	log.Warn("reasoning carrier budget exhausted; newest turns lost reasoning continuity",
+		logger.F("model", model),
+		logger.F("budget_bytes", reasoningCarrierRequestBudget),
+	)
+}
+
+// One line per request, not per turn. Measured on a live session: the per-turn form emitted
+// 509 warnings in a single request and 15,779 in half an hour, which buries the anomaly the
+// reason-logging exists to surface. Counts and enumerated reasons only -- never content or IDs.
+type responsesChatRestoreTally struct {
+	turns       int
+	calls       int
+	degraded    int
+	selfID      int
+	diverged    map[string]int
+	carrier     map[string]int
+	fingerprint string
+	anomalous   bool
+}
+
+func (t *responsesChatRestoreTally) record(diverged, carrier, fingerprint string, calls int, degraded bool) {
+	if t.diverged == nil {
+		t.diverged, t.carrier = map[string]int{}, map[string]int{}
+	}
+	if diverged == "" {
+		diverged = "unknown"
+	}
+	if carrier == "" {
+		carrier = "unknown"
+	}
+	t.turns++
+	t.calls += calls
+	t.diverged[diverged]++
+	t.carrier[carrier]++
+	if degraded {
+		t.degraded++
+	} else {
+		t.selfID++
+	}
+	if t.fingerprint == "" {
+		t.fingerprint = fingerprint
+	}
+	if degraded || diverged != "store_missing" || carrier != "absent" {
+		t.anomalous = true
+	}
+}
+
+// The scalar keeps the single-turn shape operators and existing alerts already parse; the
+// breakdown only appears once a request actually mixed reasons.
+func (t *responsesChatRestoreTally) sole(counts map[string]int) string {
+	if len(counts) != 1 {
+		return "mixed"
+	}
+	for reason := range counts {
+		return reason
+	}
+	return "unknown"
+}
+
+func (t *responsesChatRestoreTally) flush(options responsesChatRequestOptions) {
+	if options.Log == nil || t.turns == 0 {
+		return
+	}
+	fields := []logger.Field{
+		logger.F("provider", options.ReplayRoute.ProviderID),
+		logger.F("model", options.ReplayRoute.PublicModel),
+		logger.F("tool_turns", t.turns),
+		logger.F("tool_calls", t.calls),
+		logger.F("degraded_turns", t.degraded),
+		logger.F("self_describing_turns", t.selfID),
+		logger.F("diverged", t.sole(t.diverged)),
+		logger.F("carrier", t.sole(t.carrier)),
+		logger.F("projection", t.fingerprint),
+		logger.F("carried_turns", len(options.CarriedReasoning)),
+	}
+	if len(t.diverged) > 1 {
+		fields = append(fields, logger.F("diverged_counts", t.diverged))
+	}
+	if len(t.carrier) > 1 {
+		fields = append(fields, logger.F("carrier_counts", t.carrier))
+	}
+	// Only the policy path sets a route id; an empty field reads as data loss.
+	if routeID := options.ReplayRoute.RouteID; routeID != "" {
+		fields = append(fields, logger.F("route_id", routeID))
+	}
+	if t.anomalous {
+		options.Log.Warn("responses replay projection mismatch; continuing without reasoning continuity", fields...)
+		return
+	}
+	options.Log.Info("responses replay resolved from self-describing tool-call IDs", fields...)
+}
+
+// Names the guard that rejected the carrier: absent (not in the request at all),
+// route (minted under another model), projection (the turn's content moved), shape,
+// or binding (name/order/index). Counts and enumerated reasons only -- never content.
+func logResponsesChatCarrierWedge(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, carrier string) {
+	if options.Log == nil {
+		return
+	}
+	if carrier == "" {
+		carrier = "unknown"
+	}
+	options.Log.Warn("responses replay unavailable and the carrier could not answer",
+		logger.F("provider", options.ReplayRoute.ProviderID),
+		logger.F("model", options.ReplayRoute.PublicModel),
+		logger.F("tool_calls", len(projected)),
+		logger.F("carrier", carrier),
+		logger.F("carried_turns", len(options.CarriedReasoning)),
+	)
+}
+
+func recordResponsesChatReplayDegrade(tally *responsesChatRestoreTally, projected []responsesChatReplayProjectedCall, content []map[string]any, fallback *responsesChatVisibleTranscriptFallback) {
+	tally.record(fallback.diverged, fallback.carrier, responsesChatReplayProjectionFingerprint(projected, content), len(projected), true)
+}
+
+// Vekil's own digest, never the projection itself: that is prompt data.
+func responsesChatReplayProjectionFingerprint(projected []responsesChatReplayProjectedCall, content []map[string]any) string {
+	projectionContent, err := json.Marshal(assistantHistoryText(content))
+	if err != nil {
+		return ""
+	}
+	canonical, err := canonicalReplayJSONValue(projectionContent)
+	if err != nil {
+		return ""
+	}
+	return carriedProjectionDigest(canonical, projected)
 }
 
 func chatToolResultIndices(messages []json.RawMessage) (map[string]int, error) {
@@ -506,8 +856,9 @@ func mapResponsesChatReplayResolveError(err error) error {
 	return replayChatExecutionError(responsesChatReplayProjectionCode, responsesChatReplayProjectionMessage)
 }
 
+// Every caller passes a package constant, so the message is vekil's own diagnosis.
 func replayChatExecutionError(code, message string) *chatExecutionError {
-	return &chatExecutionError{StatusCode: http.StatusBadRequest, Type: "invalid_request_error", Code: code, Param: "messages", Message: message}
+	return &chatExecutionError{StatusCode: http.StatusBadRequest, Type: "invalid_request_error", Code: code, Param: "messages", Message: message, staticMessage: true}
 }
 
 func translateChatAssistantRefusal(raw json.RawMessage, messageIndex int) (string, error) {
@@ -537,18 +888,24 @@ func appendAssistantHistoryMessage(input []json.RawMessage, text string) []json.
 	return append(input, item)
 }
 
+func responsesFunctionCallItem(callID, name, arguments string) json.RawMessage {
+	item, _ := json.Marshal(map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": arguments})
+	return item
+}
+
+// Only the fixed-width opaque shape and exact self-describing mint output are
+// replay IDs. Accepting the prefix plus a broad length range would reroute
+// client-owned tool-call IDs onto the Responses path.
 func isResponsesChatReplayCallID(id string) bool {
 	id = strings.TrimSpace(id)
-	if len(id) != responsesChatReplayIDLength || !strings.HasPrefix(id, responsesChatReplayCallIDPrefix) {
+	if !strings.HasPrefix(id, responsesChatReplayCallIDPrefix) {
 		return false
 	}
-	for _, char := range id[len(responsesChatReplayCallIDPrefix):] {
-		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' || char == '_' {
-			continue
-		}
-		return false
+	if len(id) == responsesChatReplayIDLength {
+		return isResponsesChatReplayIDCharset(id[len(responsesChatReplayCallIDPrefix):])
 	}
-	return true
+	_, ok := responsesChatReplayUpstreamCallID(id)
+	return ok
 }
 
 type translatedSyntheticChatToolCall struct {
@@ -635,8 +992,9 @@ func translateSyntheticChatToolCall(raw json.RawMessage, messageIndex, callIndex
 		return translatedSyntheticChatToolCall{}, newChatInvalidRequest(param+".type", "only function tool calls and replay-backed custom tool calls are supported")
 	}
 
-	item, _ := json.Marshal(map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": arguments})
-	return translatedSyntheticChatToolCall{ID: callID, Name: name, Arguments: arguments, Item: item}, nil
+	return translatedSyntheticChatToolCall{
+		ID: callID, Name: name, Arguments: arguments, Item: responsesFunctionCallItem(callID, name, arguments),
+	}, nil
 }
 
 func compactChatToolOutput(raw json.RawMessage, messageIndex int) (string, error) {
@@ -696,11 +1054,12 @@ func compactChatToolOutput(raw json.RawMessage, messageIndex int) (string, error
 
 func missingResponsesChatReplayError() *chatExecutionError {
 	return &chatExecutionError{
-		StatusCode: http.StatusBadRequest,
-		Type:       "invalid_request_error",
-		Code:       "responses_replay_state_missing",
-		Param:      "messages",
-		Message:    "Responses-backed tool state is no longer available; restart the assistant tool-call turn.",
+		StatusCode:    http.StatusBadRequest,
+		Type:          "invalid_request_error",
+		Code:          "responses_replay_state_missing",
+		Param:         "messages",
+		Message:       "Responses-backed tool state is no longer available; restart the assistant tool-call turn.",
+		staticMessage: true,
 	}
 }
 
@@ -815,7 +1174,7 @@ func parseChatStreamOptions(raw map[string]json.RawMessage) (bool, error) {
 	}
 	for field := range options {
 		if field != "include_usage" {
-			return false, newChatInvalidRequest("stream_options."+field, "unsupported stream option")
+			return false, newChatInvalidRequestClientField("stream_options", field, "unsupported stream option")
 		}
 	}
 	include := false
@@ -1138,7 +1497,9 @@ func validateChatResponsesTopLevel(raw map[string]json.RawMessage) error {
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
 		field := unknown[0]
-		return newChatInvalidRequest(field, field+" is not supported for Responses-backed Chat completions")
+		// field is the CLIENT's own unknown key, not a name vekil chose; the top level is its
+		// only trusted parent and there is nothing above that, so nothing of it is loggable.
+		return newChatInvalidRequestClientField("", field, field+" is not supported for Responses-backed Chat completions")
 	}
 	if stop, ok := raw["stop"]; ok {
 		empty, err := emptyChatStop(stop)
@@ -1194,11 +1555,7 @@ func decodeChatJSONObject(body []byte, param string) (map[string]json.RawMessage
 			return nil, newChatInvalidRequest(param, "invalid JSON object key")
 		}
 		if _, duplicate := object[key]; duplicate {
-			fieldParam := key
-			if param != "" {
-				fieldParam = param + "." + key
-			}
-			return nil, newChatInvalidRequest(fieldParam, "duplicate JSON field")
+			return nil, newChatInvalidRequestClientField(param, key, "duplicate JSON field")
 		}
 		var value json.RawMessage
 		if err := decoder.Decode(&value); err != nil {
@@ -1233,11 +1590,7 @@ func validateChatRawObjectFields(raw json.RawMessage, param string, allowedField
 	}
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
-		fieldParam := unknown[0]
-		if param != "" {
-			fieldParam = param + "." + unknown[0]
-		}
-		return nil, newChatInvalidRequest(fieldParam, "unsupported JSON field")
+		return nil, newChatInvalidRequestClientField(param, unknown[0], "unsupported JSON field")
 	}
 	return object, nil
 }

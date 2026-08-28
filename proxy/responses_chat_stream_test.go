@@ -75,7 +75,7 @@ func collectResponsesChatStreamChunks(t *testing.T, stream *chatStreamEventStrea
 	if err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
 		chunks = append(chunks, chunk)
 		return nil
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("consumeChatStreamEvents() error = %v", err)
 	}
 	return chunks
@@ -140,6 +140,40 @@ func TestResponsesChatStream_OneToolPublishesReplayBeforeProxyID(t *testing.T) {
 	}
 	if len(resolved.OutputItems) != 1 || !bytes.Contains(resolved.OutputItems[0], []byte(`"call_id":"call_synth_lookup_stream_001"`)) {
 		t.Fatalf("resolved replay = %#v", resolved)
+	}
+}
+
+func TestResponsesChatStream_TrailingCarrierFollowsPrecommitChunks(t *testing.T) {
+	fixture := readResponsesChatStreamFixture(t, "stream_one_tool_call.sse")
+	store := newResponsesChatReplayStore()
+	t.Cleanup(func() { _ = store.Close() })
+	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{
+		PublicModel:       "gpt-public",
+		ReplayStore:       store,
+		ReplayRoute:       responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
+		PrecommitTimeout:  time.Hour,
+		PrecommitMaxBytes: len(fixture) + 1,
+	})
+	if err != nil {
+		t.Fatalf("prepareResponsesChatStream() error = %v", err)
+	}
+	lastChunk, carrier := -1, -1
+	for position := 0; ; position++ {
+		event, nextErr := stream.next()
+		if nextErr != nil {
+			t.Fatalf("stream.next() error = %v", nextErr)
+		}
+		switch event.kind {
+		case chatStreamEventChunk:
+			lastChunk = position
+		case chatStreamEventCarriedReasoning:
+			carrier = position
+		case chatStreamEventSuccess:
+			if lastChunk < 0 || carrier < 0 || carrier <= lastChunk {
+				t.Fatalf("event order last chunk=%d carrier=%d, want every precommit chunk before trailing carrier", lastChunk, carrier)
+			}
+			return
+		}
 	}
 }
 
@@ -281,7 +315,7 @@ func TestResponsesChatStream_PostcommitFailureCarriesUsageAndTypedError(t *testi
 	err = consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
 		chunks = append(chunks, chunk)
 		return nil
-	})
+	}, nil)
 	var streamErr *chatStreamError
 	if !errors.As(err, &streamErr) || streamErr.StatusCode != http.StatusTooManyRequests || streamErr.Code != "too_many_requests" {
 		t.Fatalf("stream error = %#v", err)
@@ -304,7 +338,7 @@ func TestResponsesChatStream_EOFBeforeTerminalIsTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = consumeChatStreamEvents(stream, nil)
+	err = consumeChatStreamEvents(stream, nil, nil)
 	var streamErr *chatStreamError
 	if !errors.As(err, &streamErr) || streamErr.Code != "responses_stream_truncated" {
 		t.Fatalf("error = %#v", err)

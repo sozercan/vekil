@@ -112,17 +112,42 @@ Additional rules:
 
 ### Responses-backed tool continuation
 
-Function calls returned through the adapter use opaque IDs shaped as:
+Function calls returned in new responses use one of two minted shapes:
 
 ```text
-call_vekil_<22-character-base64url>
+call_vekil_v1_<15-character-nonce>_<upstream-call-id>_<4-character-checksum>  # self-describing; total length never exceeds 64
+call_vekil_<22-character-base64url>                                        # opaque fallback when the upstream ID cannot be embedded
 ```
 
-Clients must return these IDs unchanged. They are keys into process-local replay state that retains the exact hidden Responses output needed for tool continuation; upstream `call_id` values are never exposed as the authorization key.
+Clients must return either ID unchanged and must not construct, edit, or parse it. The versioned
+shape deliberately embeds the upstream `call_id`. Its per-group nonce prevents an upstream ID reused
+after restart or eviction from matching a newer replay group. The checksum distinguishes
+Vekil-minted replay IDs from plausible native IDs; it is not an authorization key. The opaque shape
+carries no mapping. An Anthropic reasoning carrier contains encrypted reasoning, ordering
+placeholders, and public call bindings, but no separate provider call ID.
+
+Restoring hidden Responses output requires that replay state or a valid reasoning carrier. **The
+carrier is a client obligation, not just the ID.** On `/v1/messages`, reasoning rides in the
+`signature` of an assistant `thinking` block whose text is empty. Return assistant `thinking` blocks
+in history unchanged, signature included. A direct-route continuation can use a valid carrier after
+the replay store is lost to restore hidden reasoning. A self-describing ID also restores the original
+upstream call mapping; an opaque ID rebuilds the function call and output under the same proxy ID. If
+the client drops or rewrites the carrier, Anthropic ingress and its count-token probe may instead
+rebuild only the visible transcript. That loses reasoning continuity but still uses the original
+upstream mapping when the ID is self-describing. Carrier signatures are cumulatively capped at 2 MiB
+of the client's replayed wire bytes; once the budget is full, or the next complete carrier would
+cross it, Vekil emits no new carrier and later state loss uses the visible-transcript fallback.
+
+`/v1/chat/completions` and `/v1/responses` do not opt into that visible-transcript fallback; when the
+replay state is unavailable, they return `responses_replay_state_missing`. A **policy profile** also
+fails on every surface once the originating process is gone, including `/v1/messages`: its tier is
+recovered from a carrier tag keyed per process, so after a restart or on another replica the planner
+cannot select the original tier. Carrier-backed restoration and visible-transcript degradation are
+therefore direct-route Anthropic behaviors.
 
 For a parallel call group, the assistant `tool_calls` projection must remain complete and in its original order. A complete set of tool-result messages may arrive in any order. If only a non-empty subset of results is available, Vekil replays only the matching prior function calls plus their outputs; this partial projection is required because the verified Responses backend rejected a complete parallel call group paired with only partial outputs. The missing calls may consequently be reissued by the model.
 
-Replay state has an absolute one-hour lifetime and is bounded to 2,048 groups, 2 MiB per group, 64 MiB total, 256 output items per group, and 128 calls per group, with LRU eviction under group/byte pressure. It is memory-only and is lost on restart. Expired, evicted, forged, cross-route, or post-restart `call_vekil_...` IDs fail locally with:
+Replay state has an absolute one-hour lifetime and is bounded to 2,048 groups, 2 MiB per group, 64 MiB total, 256 output items per group, and 128 calls per group, with LRU eviction under group/byte pressure. It is memory-only and is lost on restart. On the surfaces that do not opt into degradation -- `/v1/chat/completions` and `/v1/responses` -- an expired, evicted, forged, cross-route, or post-restart `call_vekil_...` ID fails locally with:
 
 ```text
 HTTP 400

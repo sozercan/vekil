@@ -20,12 +20,14 @@ type responsesChatResponseOptions struct {
 	ReplayRoute        responsesChatReplayRoute
 	ReplayToolDefaults responsesChatReplayToolDefaults
 	UsageOnly          bool
+	Carrier            carrierEmit
 }
 
 type responsesChatJSONResult struct {
-	Response *models.OpenAIResponse
-	Body     []byte
-	Usage    *models.OpenAIUsage
+	Response         *models.OpenAIResponse
+	Body             []byte
+	Usage            *models.OpenAIUsage
+	CarriedReasoning carriedTurn
 }
 
 type responsesChatJSONEnvelope struct {
@@ -36,6 +38,9 @@ type responsesChatJSONEnvelope struct {
 		Type    string `json:"type"`
 		Code    string `json:"code"`
 		Message string `json:"message"`
+		// Copilot puts the offending field here on a terminal failure. Without it a
+		// post-commit failure records a type and a code and no idea where.
+		Param string `json:"param"`
 	} `json:"error"`
 	IncompleteDetails *struct {
 		Reason string `json:"reason"`
@@ -138,6 +143,7 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 	if err != nil {
 		return responsesChatJSONResult{}, err
 	}
+	var carriedReasoning carriedTurn
 	chatToolCalls := make([]models.OpenAIToolCall, 0, len(functionCalls))
 	if len(functionCalls) > 0 {
 		if options.ReplayStore == nil {
@@ -168,6 +174,7 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 			attachChatExecutionErrorUsage(replayErr, usage)
 			return responsesChatJSONResult{}, replayErr
 		}
+		carriedReasoning = carriedTurnFromPublished(options.ReplayRoute, envelope.Output, published, options.Carrier)
 		for _, call := range published.Projection.Calls {
 			chatToolCalls = append(chatToolCalls, models.OpenAIToolCall{
 				ID:       call.ID,
@@ -205,7 +212,7 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 	if len(encoded) > responsesChatMaxJSONBodyBytes {
 		return responsesChatJSONResult{}, newChatServerError("chat_body_too_large", "converted Chat response exceeds the JSON limit")
 	}
-	return responsesChatJSONResult{Response: response, Body: encoded, Usage: usage}, nil
+	return responsesChatJSONResult{Response: response, Body: encoded, Usage: usage, CarriedReasoning: carriedReasoning}, nil
 }
 
 func validateResponsesChatMessageStatus(responseStatus, messageStatus string) error {
@@ -423,8 +430,9 @@ func responsesChatFailedExecutionError(failure *struct {
 	Type    string `json:"type"`
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Param   string `json:"param"`
 }, usage *models.OpenAIUsage) *chatExecutionError {
-	errorType, code, message := "server_error", "response_failed", "upstream Responses generation failed"
+	errorType, code, message, param := "server_error", "response_failed", "upstream Responses generation failed", ""
 	if failure != nil {
 		if strings.TrimSpace(failure.Type) != "" {
 			errorType = strings.TrimSpace(failure.Type)
@@ -435,12 +443,13 @@ func responsesChatFailedExecutionError(failure *struct {
 		if strings.TrimSpace(failure.Message) != "" {
 			message = strings.TrimSpace(failure.Message)
 		}
+		param = strings.TrimSpace(failure.Param)
 	}
 	if failure == nil || strings.TrimSpace(failure.Type) == "" {
 		errorType = responsesChatErrorTypeForCode(code)
 	}
 	status := responsesChatFailureStatus(errorType, code)
-	return &chatExecutionError{StatusCode: status, Type: errorType, Code: code, Message: message, Usage: usage}
+	return &chatExecutionError{StatusCode: status, Type: errorType, Code: code, Param: param, Message: message, Usage: usage, upstreamAuthored: true}
 }
 
 func responsesChatErrorTypeForCode(code string) string {

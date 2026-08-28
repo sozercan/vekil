@@ -43,8 +43,10 @@ type ContentBlock struct {
 	Input     json.RawMessage       `json:"input,omitempty"`
 	ToolUseID string                `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage       `json:"content,omitempty"`
-	Thinking  string                `json:"thinking,omitempty"`
-	Signature string                `json:"signature,omitempty"`
+	// Pointer so an EMPTY thinking text still serialises as "thinking":"".
+	// omitempty drops an empty string, and clients read the field unconditionally.
+	Thinking  *string `json:"thinking,omitempty"`
+	Signature string  `json:"signature,omitempty"`
 }
 
 // AnthropicImageSource describes an image content-block source.

@@ -286,11 +286,21 @@ func parseSystemMessage(raw json.RawMessage) (*models.OpenAIMessage, error) {
 		return nil, fmt.Errorf("system is neither string nor []ContentBlock: %w", err)
 	}
 
+	// Flattening distinct blocks into Chat's one string welds a heading onto the
+	// previous sentence unless a separator goes between them.
 	var sb strings.Builder
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
-			sb.WriteString(derefString(b.Text))
+			text := derefString(b.Text)
+			if text == "" {
+				continue
+			}
+			if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") && !strings.HasSuffix(sb.String(), "\r") &&
+				!strings.HasPrefix(text, "\n") && !strings.HasPrefix(text, "\r") {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(text)
 		default:
 			return nil, fmt.Errorf("unsupported system content block type %q", b.Type)
 		}

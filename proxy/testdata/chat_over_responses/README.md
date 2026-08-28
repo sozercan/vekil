@@ -10,6 +10,7 @@ These fixtures model only the sanitized protocol structures observed during Phas
 | One function call | `nonstream_one_tool_call.json` | `stream_one_tool_call.sse` |
 | Parallel calls / interleaved deltas | `nonstream_parallel_tool_calls.json` | `stream_parallel_interleaved_tool_calls.sse` |
 | Reasoning followed by a final message | `nonstream_reasoning_message_continuation.json` | `stream_reasoning_message_continuation.sse` |
+| Reasoning, then text, then a function call | — | `stream_reasoning_tool_call.sse` |
 | Immediate failure | `nonstream_immediate_failure.json` | `stream_immediate_failure.sse` |
 | Output-token incomplete (`length`) | `nonstream_incomplete_length.json` | `stream_incomplete_length.sse` |
 | Unsupported/malformed semantic type | `nonstream_malformed_unknown_item.json` | `stream_malformed_unknown_event.sse` |

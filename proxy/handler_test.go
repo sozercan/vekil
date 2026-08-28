@@ -806,6 +806,12 @@ func TestHandleAnthropicMessagesCountTokensFallbacksToMaxTokens(t *testing.T) {
 
 func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProvider(t *testing.T) {
 	const upstreamBody = "{\n  \"input_tokens\": 42\n}\n"
+	carrier, err := encodeReasoningCarrier(carriedTurn{Items: []json.RawMessage{
+		json.RawMessage(`{"type":"reasoning","id":"rs_direct","encrypted_content":"OPAQUE"}`),
+	}})
+	if err != nil {
+		t.Fatalf("encode carrier: %v", err)
+	}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Path; got != "/native/messages/count_tokens" {
 			t.Fatalf("expected native count_tokens path /native/messages/count_tokens, got %s", got)
@@ -820,8 +826,15 @@ func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProv
 			t.Fatalf("expected client Authorization stripped, got %q", got)
 		}
 
+		requestBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream request: %v", err)
+		}
+		if strings.Contains(string(requestBytes), reasoningCarrierPrefix) {
+			t.Fatalf("vekil carrier reached direct Anthropic count_tokens: %s", requestBytes)
+		}
 		var upstreamReq models.AnthropicRequest
-		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+		if err := json.Unmarshal(requestBytes, &upstreamReq); err != nil {
 			t.Fatalf("decode upstream request: %v", err)
 		}
 		if upstreamReq.Model != "claude-upstream" {
@@ -859,16 +872,39 @@ func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProv
 		t.Fatalf("NewProxyHandler returned error: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{
+	carrierJSON, err := json.Marshal(carrier)
+	if err != nil {
+		t.Fatalf("marshal carrier signature: %v", err)
+	}
+	requestBody := []byte(fmt.Sprintf(`{
 		"model": "claude-public",
-		"messages": [{"role": "user", "content": "Count this"}]
-	}`))
+		"Messages": [
+			{"role": "user", "content": "Count this"},
+			{"Role": "assistant", "Content": [
+				{"type": "thinking", "Type": "text", "thinking": "", "signature": %s, "Signature": "anthropic-native-sig"},
+				{"type": "text", "text": "Keep this"}
+			]}
+		]
+	}`, carrierJSON))
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", bytes.NewReader(requestBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer client-token")
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	w := httptest.NewRecorder()
 
+	// A valid carrier reaches the per-process key during decode. Direct passthrough must
+	// strip it without entering that path, which also avoids attacker-controlled inflate.
+	var carrierDecoded atomic.Bool
+	restoredCarrierKey := reasoningCarrierKey
+	reasoningCarrierKey = func() []byte {
+		carrierDecoded.Store(true)
+		return restoredCarrierKey()
+	}
+	defer func() { reasoningCarrierKey = restoredCarrierKey }()
 	handler.HandleAnthropicMessagesCountTokens(w, req)
+	if carrierDecoded.Load() {
+		t.Fatal("direct Anthropic count_tokens decoded a carrier before forwarding")
+	}
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusOK {
