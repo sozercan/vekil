@@ -48,22 +48,37 @@ jobs:
 
       - name: Run live compaction smoke check
         if: steps.gate.outputs.run == 'true'
+        id: compact
         env:
           LIVE_COMPACT_SMOKE_DIR: ${{ runner.temp }}/live-compact-smoke
-        run: scripts/live-compact-smoke.sh
+        run: |
+          set +e
+          scripts/live-compact-smoke.sh
+          status=$?
+          set -e
+          if [ "${status}" -eq 75 ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          exit "${status}"
+
+      - name: Explain unavailable Copilot live coverage
+        if: steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'false'
+        run: echo "Skipping the remaining Copilot live checks because the repository credential's monthly quota is exhausted."
 
       - name: Run live Chat-over-Responses smoke check
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'true'
         env:
           LIVE_CHAT_OVER_RESPONSES_SMOKE_DIR: ${{ runner.temp }}/live-chat-over-responses-smoke
         run: scripts/live-chat-over-responses-smoke.sh
 
       - name: Install Codex CLI
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'true'
         run: npm install -g @openai/codex@latest
 
       - name: Install Claude Code
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'true'
         run: |
           curl --fail --silent --show-error --location --connect-timeout 10 --max-time 120 https://claude.ai/install.sh | bash -s stable
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -75,18 +90,18 @@ jobs:
         run: scripts/live-claude-reasoning-carrier-smoke.sh
 
       - name: Install Gemini CLI
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'true'
         run: npm install -g @google/gemini-cli@latest
 
       - name: Show CLI versions
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'true'
         run: |
           codex --version
           claude --version
           gemini --version
 
       - name: Run live CLI smoke checks
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && steps.compact.outputs.available == 'true'
         env:
           LIVE_CLI_SMOKE_DIR: ${{ runner.temp }}/live-cli-smoke
         run: scripts/live-cli-smoke.sh

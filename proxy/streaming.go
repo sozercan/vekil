@@ -36,10 +36,14 @@ func (r *lifecycleAwareReadCloser) Read(p []byte) (int, error) {
 	// context.Canceled. Consult the request context only for that exact class of
 	// read failure; EOF, resets, and deadlines remain provider failures even if
 	// shutdown races immediately afterward.
-	if err != nil && errors.Is(err, context.Canceled) && r.ctx != nil && errors.Is(context.Cause(r.ctx), errProxyLifecycleShutdown) {
+	if lifecycleCancellationAtReadFailure(r.ctx, err) {
 		r.cancellationAtFailure.Store(true)
 	}
 	return n, err
+}
+
+func lifecycleCancellationAtReadFailure(ctx context.Context, err error) bool {
+	return err != nil && errors.Is(err, context.Canceled) && ctx != nil && errors.Is(context.Cause(ctx), errProxyLifecycleShutdown)
 }
 
 func (r *lifecycleAwareReadCloser) canceledAtFailure() bool {
@@ -78,16 +82,30 @@ type commitTrackingResponseWriter struct {
 }
 
 func (w *commitTrackingResponseWriter) WriteHeader(status int) {
+	if !w.committed {
+		setSSEHeaders(w.ResponseWriter)
+	}
 	w.committed = true
 	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *commitTrackingResponseWriter) Write(p []byte) (int, error) {
+	writer := w.ResponseWriter
+	if !w.committed {
+		header := writer.Header()
+		header.Set("Content-Type", "text/event-stream")
+		header.Set("X-Content-Type-Options", "nosniff")
+		header.Set("Cache-Control", "no-cache")
+		header.Set("Connection", "keep-alive")
+	}
 	w.committed = true
-	return w.ResponseWriter.Write(p)
+	return writer.Write(p)
 }
 
 func (w *commitTrackingResponseWriter) Flush() {
+	if !w.committed {
+		setSSEHeaders(w.ResponseWriter)
+	}
 	w.committed = true
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
@@ -132,6 +150,7 @@ func parseSSELine(line string) (string, bool) {
 
 func setSSEHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 }
@@ -796,12 +815,21 @@ func consumeOpenAIStreamChunksWithProgress(r io.Reader, onChunk func(models.Open
 
 // flushWriter wraps an http.ResponseWriter and flushes after every Write.
 type flushWriter struct {
-	w        http.ResponseWriter
-	flusher  http.Flusher
-	writeErr error
+	w         http.ResponseWriter
+	flusher   http.Flusher
+	writeErr  error
+	committed bool
 }
 
 func (fw *flushWriter) Write(p []byte) (int, error) {
+	if !fw.committed {
+		header := fw.w.Header()
+		header.Set("Content-Type", "text/event-stream")
+		header.Set("X-Content-Type-Options", "nosniff")
+		header.Set("Cache-Control", "no-cache")
+		header.Set("Connection", "keep-alive")
+		fw.committed = true
+	}
 	n, err := fw.w.Write(p)
 	if err != nil {
 		// Record that the failure came from writing to the client (e.g. the client

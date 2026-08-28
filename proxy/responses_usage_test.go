@@ -73,6 +73,27 @@ func TestSniffResponsesUsageBody(t *testing.T) {
 	if got := sniffResponsesUsageBody([]byte(`not json`)); !got.isZero() {
 		t.Fatalf("expected zero on bad json, got %+v", got)
 	}
+
+	t.Run("case folded compatibility", func(t *testing.T) {
+		got := sniffResponsesUsageBody([]byte(`{"Usage":{"Input_Tokens":9,"Output_Tokens":4,"Total_Tokens":13,"Input_Tokens_Details":{"Cached_Tokens":3},"Output_Tokens_Details":{"Reasoning_Tokens":2}}}`))
+		if got.InputTokens != 9 || got.OutputTokens != 4 || got.TotalTokens != 13 ||
+			got.InputTokensDetails.CachedTokens != 3 || got.OutputTokensDetails.ReasoningTokens != 2 {
+			t.Fatalf("case-folded usage = %+v", got)
+		}
+	})
+
+	t.Run("escaped key compatibility", func(t *testing.T) {
+		got := sniffResponsesUsageBody([]byte(`{"us\u0061ge":{"input_tok\u0065ns":7,"output_tokens":2,"total_tokens":9}}`))
+		if got.InputTokens != 7 || got.OutputTokens != 2 || got.TotalTokens != 9 {
+			t.Fatalf("escaped-key usage = %+v", got)
+		}
+	})
+
+	t.Run("invalid suffix clears partial usage", func(t *testing.T) {
+		if got := sniffResponsesUsageBody([]byte(`{"usage":{"input_tokens":7}} trailing`)); !got.isZero() {
+			t.Fatalf("invalid suffix usage = %+v, want zero", got)
+		}
+	})
 }
 
 func TestObserveResponsesUsageWritesSummary(t *testing.T) {

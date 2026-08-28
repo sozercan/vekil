@@ -69,6 +69,10 @@ parser.add_argument("--canary-status-sequence", default="")
 parser.add_argument("--canary-message", default="")
 parser.add_argument("--canary-bad-shape", action="store_true")
 parser.add_argument("--hang-chat", action="store_true")
+parser.add_argument("--compact-status", type=int, default=200)
+parser.add_argument("--compact-code", default="")
+parser.add_argument("--replay-status", type=int, default=200)
+parser.add_argument("--replay-code", default="")
 args = parser.parse_args()
 
 MODEL = "deepseek-v4-flash-free"
@@ -100,7 +104,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"data": [
                 {"id": MODEL, "supported_endpoints": ["/chat/completions", "/responses"]},
                 {"id": "mimo-v2.5-free", "supported_endpoints": ["/chat/completions"]},
+                {"id": "hy3-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
+                {"id": "muse-spark-1.2-contributor-free", "supported_endpoints": ["/responses"]},
                 {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
                 {"id": "claude-sonnet-5", "supported_endpoints": ["/chat/completions"]},
             ]})
@@ -109,11 +115,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
-        if length:
-            self.rfile.read(length)
+        body = self.rfile.read(length) if length else b""
         if self.path == "/v1/chat/completions":
             if args.hang_chat:
                 time.sleep(300)
+                return
+            try:
+                model = json.loads(body).get("model")
+            except (AttributeError, json.JSONDecodeError):
+                model = None
+            if model in {"gpt-5.4", "muse-spark-1.2-contributor-free"}:
+                self.send_json(400, {
+                    "error": {"message": f"model {model} does not support /chat/completions"},
+                })
                 return
             global canary_index
             status = CANARY_STATUSES[min(canary_index, len(CANARY_STATUSES) - 1)]
@@ -128,9 +142,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(status, {"error": {"message": message}})
             return
         if self.path == "/v1/responses/compact":
+            if args.compact_status != 200:
+                self.send_json(args.compact_status, {
+                    "error": {
+                        "message": f"mock HTTP {args.compact_status}",
+                        "code": args.compact_code or "mock_error",
+                    }
+                })
+                return
             self.send_json(200, {"output": [{"type": "compaction", "encrypted_content": "opaque"}]})
             return
         if self.path == "/v1/responses":
+            if args.replay_status != 200:
+                self.send_json(args.replay_status, {
+                    "error": {
+                        "message": f"mock HTTP {args.replay_status}",
+                        "code": args.replay_code or "mock_error",
+                    }
+                })
+                return
             self.send_json(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": "VEKIL_COMPACTION_REPLAY_OK"}]}]})
             return
         self.send_json(404, {"error": {"message": "not found"}})
@@ -183,8 +213,17 @@ start_mock_server() {
   local message="${4:-}"
   local bad_shape="${5:-0}"
   local hang_chat="${6:-0}"
+  local compact_status="${7:-200}"
+  local compact_code="${8:-}"
+  local replay_status="${9:-200}"
+  local replay_code="${10:-}"
   local port_file="${case_dir}/port"
-  local args=(--port-file "${port_file}" --canary-status "${status}")
+  local args=(
+    --port-file "${port_file}"
+    --canary-status "${status}"
+    --compact-status "${compact_status}"
+    --replay-status "${replay_status}"
+  )
   if [[ -n "${sequence}" ]]; then
     args+=(--canary-status-sequence "${sequence}")
   fi
@@ -196,6 +235,12 @@ start_mock_server() {
   fi
   if [[ "${hang_chat}" == "1" ]]; then
     args+=(--hang-chat)
+  fi
+  if [[ -n "${compact_code}" ]]; then
+    args+=(--compact-code "${compact_code}")
+  fi
+  if [[ -n "${replay_code}" ]]; then
+    args+=(--replay-code "${replay_code}")
   fi
   mkdir -p "${case_dir}"
   python3 "${TMP_ROOT}/mock_server.py" "${args[@]}" \
@@ -303,6 +348,23 @@ PY_WRAPPED_OUTPUT
     printf '%s
 ' "\${count}" > "\${state_file}"
     if [[ "\${count}" -eq 1 ]]; then
+      exit 42
+    fi
+    printf '%s\n' "\${expected}"
+    ;;
+  fail-first-model)
+    state_file="\$(dirname "\$0")/.\$(basename "\$0").first-model-seen"
+    if [[ ! -e "\${state_file}" ]]; then
+      : > "\${state_file}"
+      printf '%s\n' "\${left}"
+      exit 0
+    fi
+    printf '%s\n' "\${expected}"
+    ;;
+  exit-first-model)
+    state_file="\$(dirname "\$0")/.\$(basename "\$0").first-model-seen"
+    if [[ ! -e "\${state_file}" ]]; then
+      : > "\${state_file}"
       exit 42
     fi
     printf '%s\n' "\${expected}"
@@ -541,6 +603,23 @@ expect_success() {
   record_success "${name}"
 }
 
+expect_exit_code() {
+  local name="$1"
+  local timeout_seconds="$2"
+  local expected="$3"
+  shift 3
+  local case_dir="${TMP_ROOT}/cases/${name//[^a-zA-Z0-9_.-]/_}"
+  mkdir -p "${case_dir}"
+  local rc=0
+  run_bounded "${timeout_seconds}" "${case_dir}/stdout" "${case_dir}/stderr" "$@" || rc=$?
+  if [[ "${rc}" -ne "${expected}" ]]; then
+    record_failure "${name}" "command exited ${rc}, want ${expected}"
+    cat "${case_dir}/stderr" >&2 || true
+    return 1
+  fi
+  record_success "${name}"
+}
+
 port_accepts_tcp() {
   python3 - "$1" <<'PY_PORT_CHECK'
 import socket
@@ -631,6 +710,154 @@ run_zen_classification_case() {
 }
 
 log "Running deterministic smoke reliability regressions"
+
+zen_parser_dir="${TMP_ROOT}/setup/zen-free-label-parser"
+mkdir -p "${zen_parser_dir}"
+cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Paid Model | paid-model | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
+| Big Pickle | big-pickle | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+| Ox Alpha Free | x-preview-f-free | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+| Muse Spark Free | muse-spark-free | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Paid Model | $1.00 | $2.00 | - | - |
+| Big Pickle | Free | Free | Free | - |
+| Ox Alpha Free | Free | Free | Free | - |
+| Muse Spark Free | Free | Free | Free | - |
+
+### Retirement dates
+
+| Model | Date |
+| ----- | ---- |
+| Big Pickle | August 31, 2026 |
+EOF_ZEN_DOC
+cat > "${zen_parser_dir}/expected.tsv" <<'EOF_ZEN_EXPECTED'
+big-pickle	Big Pickle	/chat/completions
+x-preview-f-free	Ox Alpha Free	/chat/completions
+muse-spark-free	Muse Spark Free	/responses
+EOF_ZEN_EXPECTED
+if "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/zen.mdx" > "${zen_parser_dir}/actual.tsv" \
+  && cmp -s "${zen_parser_dir}/expected.tsv" "${zen_parser_dir}/actual.tsv"; then
+  record_success "Zen free-label parser joins pricing labels to endpoint aliases"
+else
+  record_failure "Zen free-label parser joins pricing labels to endpoint aliases" \
+    "$(diff -u "${zen_parser_dir}/expected.tsv" "${zen_parser_dir}/actual.tsv" 2>&1 || true)"
+fi
+
+cat > "${zen_parser_dir}/missing-endpoint.mdx" <<'EOF_ZEN_MISSING'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Paid Model | paid-model | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Missing Free Model | Free | Free | Free | - |
+EOF_ZEN_MISSING
+expect_hard_failure_with_stderr "Zen free-label parser rejects an unmapped free label" 4 \
+  'free pricing label has no endpoint-table entry: Missing Free Model' \
+  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/missing-endpoint.mdx"
+
+cat > "${zen_parser_dir}/duplicate-pricing-label.mdx" <<'EOF_ZEN_DUPLICATE'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Ambiguous Model | ambiguous-model | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Ambiguous Model | $1.00 | $2.00 | - | - |
+| Ambiguous Model | Free | Free | Free | - |
+EOF_ZEN_DUPLICATE
+expect_hard_failure_with_stderr "Zen free-label parser rejects paid/free duplicate labels" 4 \
+  'duplicate pricing label: Ambiguous Model' \
+  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/duplicate-pricing-label.mdx"
+
+cat > "${zen_parser_dir}/render-config.yaml" <<'EOF_ZEN_RENDER_CONFIG'
+header: preserved
+provider:
+    # BEGIN GENERATED: OpenCode Zen free models
+    models:
+      - public_id: stale-model
+        endpoints:
+          - /chat/completions
+    # END GENERATED: OpenCode Zen free models
+footer: preserved
+EOF_ZEN_RENDER_CONFIG
+cat > "${zen_parser_dir}/expected-config.yaml" <<'EOF_ZEN_EXPECTED_CONFIG'
+header: preserved
+provider:
+    # BEGIN GENERATED: OpenCode Zen free models
+    models:
+      - public_id: "big-pickle"
+        endpoints:
+          - /chat/completions
+      - public_id: "muse-spark-free"
+        endpoints:
+          - /responses
+      - public_id: "x-preview-f-free"
+        endpoints:
+          - /chat/completions
+    # END GENERATED: OpenCode Zen free models
+footer: preserved
+EOF_ZEN_EXPECTED_CONFIG
+zen_render_outputs="${zen_parser_dir}/render-outputs"
+: > "${zen_render_outputs}"
+if GITHUB_OUTPUT="${zen_render_outputs}" \
+  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
+  "${zen_parser_dir}/zen.mdx" "${zen_parser_dir}/render-config.yaml" \
+  && cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" \
+  && grep -Fxq 'changed=true' "${zen_render_outputs}"; then
+  record_success "Zen config updater replaces only the generated block with sorted endpoints"
+else
+  record_failure "Zen config updater replaces only the generated block with sorted endpoints" \
+    "$(diff -u "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" 2>&1 || true)"
+fi
+
+: > "${zen_render_outputs}"
+if GITHUB_OUTPUT="${zen_render_outputs}" \
+  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
+  "${zen_parser_dir}/zen.mdx" "${zen_parser_dir}/render-config.yaml" \
+  && cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" \
+  && grep -Fxq 'changed=false' "${zen_render_outputs}"; then
+  record_success "Zen config updater is idempotent"
+else
+  record_failure "Zen config updater is idempotent" "second render changed the generated config"
+fi
+
+cat > "${zen_parser_dir}/messages-free.mdx" <<'EOF_ZEN_MESSAGES'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Claude Free | claude-free | `https://opencode.ai/zen/v1/messages` | `@ai-sdk/anthropic` |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Claude Free | Free | Free | Free | - |
+EOF_ZEN_MESSAGES
+expect_hard_failure_with_stderr "Zen config updater rejects endpoints outside openai-compatible routing" 4 \
+  'unsupported endpoint for openai-compatible Zen example: claude-free -> /messages' \
+  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
+  "${zen_parser_dir}/messages-free.mdx" "${zen_parser_dir}/render-config.yaml"
 
 claude_contract_dir="${TMP_ROOT}/setup/claude-defaults-and-model-preference"
 start_mock_server "${claude_contract_dir}/server" 200
@@ -789,6 +1016,27 @@ if expect_success "compact listener tolerates mixed JSON and plain-text logs" 10
   :
 fi
 
+compact_quota_dir="${TMP_ROOT}/setup/compact-quota"
+start_mock_server "${compact_quota_dir}/server" 200 "" "" 0 0 402 quota_exceeded
+expect_exit_code "compact smoke reports exact Copilot quota exhaustion" 8 75 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${compact_quota_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
+compact_unknown_402_dir="${TMP_ROOT}/setup/compact-unknown-402"
+start_mock_server "${compact_unknown_402_dir}/server" 200 "" "" 0 0 402 payment_required
+expect_exit_code "compact smoke keeps unknown HTTP 402 errors hard" 8 1 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${compact_unknown_402_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
+replay_quota_dir="${TMP_ROOT}/setup/replay-quota"
+start_mock_server "${replay_quota_dir}/server" 200 "" "" 0 0 200 "" 402 quota_exceeded
+expect_exit_code "compact replay keeps quota errors hard" 8 1 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${replay_quota_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
 mixed_raw_dir="${TMP_ROOT}/setup/mixed-log-raw-zen"
 write_healthy_proxy "${mixed_raw_dir}/healthy-proxy"
 if expect_success "raw Zen listener tolerates mixed JSON and plain-text logs" 10 \
@@ -809,6 +1057,48 @@ expect_success "neutral skip only before any client is exercised" 8 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${neutral_port}" LIVE_CLI_SMOKE_DIR="${neutral_dir}/smoke" \
     SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+free_filter_dir="${TMP_ROOT}/setup/free-label-filter"
+start_mock_server "${free_filter_dir}/server" 200
+free_filter_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${free_filter_dir}/bin" pass pass pass
+printf '%s\n' \
+  $'mimo-v2.5-free\tMiMo V2.5 Free\t/chat/completions' \
+  $'muse-spark-1.2-contributor-free\tMuse Spark Free\t/responses' \
+  > "${free_filter_dir}/free-models.tsv"
+free_filter_name="Zen candidates honor parsed free labels"
+if expect_success "${free_filter_name}" 8 \
+  env PATH="${free_filter_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${free_filter_port}" \
+    LIVE_CLI_SMOKE_DIR="${free_filter_dir}/smoke" \
+    ZEN_FREE_MODELS_FILE="${free_filter_dir}/free-models.tsv" \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
+  free_filter_stderr="${TMP_ROOT}/cases/${free_filter_name//[^a-zA-Z0-9_.-]/_}/stderr"
+  if grep -q '^==> Zen candidate models: mimo-v2\.5-free$' "${free_filter_stderr}" \
+    && ! grep -q '^==> Zen candidate models: .*hy3-free' "${free_filter_stderr}" \
+    && ! grep -q '^==> Zen candidate models: .*muse-spark' "${free_filter_stderr}"; then
+    record_success "Zen candidate filtering requires current Free and Chat labels"
+  else
+    record_failure "Zen candidate filtering requires current Free and Chat labels" \
+      "$(cat "${free_filter_stderr}" 2>/dev/null || true)"
+  fi
+fi
+
+no_free_intersection_dir="${TMP_ROOT}/setup/no-free-label-intersection"
+start_mock_server "${no_free_intersection_dir}/server" 200
+no_free_intersection_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${no_free_intersection_dir}/bin" pass pass pass
+printf 'x-preview-f-free\tOx Alpha Free\t/chat/completions\n' \
+  > "${no_free_intersection_dir}/free-models.tsv"
+expect_hard_failure_with_stderr "Zen smoke rejects a stale example with no free-label intersection" 8 \
+  'the Zen example exposes no model currently carrying Free price labels' \
+  env PATH="${no_free_intersection_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${no_free_intersection_port}" \
+    LIVE_CLI_SMOKE_DIR="${no_free_intersection_dir}/smoke" \
+    ZEN_FREE_MODELS_FILE="${no_free_intersection_dir}/free-models.tsv" \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
 retry_dir="${TMP_ROOT}/setup/second-canary-transient"
@@ -863,8 +1153,31 @@ fi
 
 run_zen_classification_case "canary 404 plus transient text is hard" 404 \
   "service temporarily unavailable" 0
+run_zen_classification_case "canary 400 unknown error is hard" 400 \
+  "invalid request" 0
+run_zen_classification_case "canary 401 model unavailable is hard" 401 \
+  "Model is unavailable." 0
 run_zen_classification_case "canary 200 bad shape plus transient text is hard" 200 \
   "service temporarily unavailable" 1
+
+unavailable_model_dir="${TMP_ROOT}/setup/unavailable-zen-model"
+unavailable_model_message="Error from provider (Console): Upstream request failed: Model is unavailable."
+start_mock_server "${unavailable_model_dir}/cli-server" 200 "400,200" "${unavailable_model_message}"
+unavailable_model_cli_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${unavailable_model_dir}/bin" pass pass pass
+expect_success "listed Zen model unavailable falls through to another model" 8 \
+  env PATH="${unavailable_model_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${unavailable_model_cli_port}" \
+    LIVE_CLI_SMOKE_DIR="${unavailable_model_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+start_mock_server "${unavailable_model_dir}/raw-server" 200 "400,200" "${unavailable_model_message}"
+unavailable_model_raw_port="${MOCK_SERVER_PORT}"
+mkdir -p "${unavailable_model_dir}/raw-smoke"
+expect_success "raw Zen smoke treats listed model unavailability as transient" 8 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${unavailable_model_raw_port}" \
+    LIVE_ZEN_SMOKE_DIR="${unavailable_model_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
 
 removed_model_dir="${TMP_ROOT}/setup/removed-zen-model"
 start_mock_server "${removed_model_dir}/server" 401 "" "Model deepseek-v4-flash-free is not supported"
@@ -902,6 +1215,8 @@ expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 
 
 run_zen_case_expect_success "Gemini strict JSON wrapper around complete result normalizes to exact text" pass pass json-wrapped-whole
 run_zen_case_expect_success "Gemini strict JSON wrapper sequence normalizes to exact text" pass pass json-wrapped
+run_zen_case_expect_success "model-specific output mismatch falls through to another candidate" fail-first-model fail-first-model fail-first-model
+run_zen_case_expect_failure "client process failure does not fall through to another model" 200 pass exit-first-model pass
 run_zen_case_expect_failure "Gemini dangling JSON wrapper separator is rejected" 200 pass pass json-wrapped-trailing-separator
 run_zen_case_expect_failure "Gemini three-wrapper sequence is rejected" 200 pass pass json-wrapped-three
 
@@ -929,7 +1244,8 @@ start_mock_server "${case_dir}/server" 200
 port="${MOCK_SERVER_PORT}"
 write_fake_clients "${case_dir}/bin" fork-sleeper pass pass
 child_pid_file="${case_dir}/child.pid"
-expect_hard_failure "fake CLI forks sleeper" 8 \
+expect_hard_failure_with_stderr "fake CLI forks sleeper" 8 \
+  'remained reachable after CLI exited 42; refusing candidate fallback for client failure' \
   env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" \
     FAKE_CLI_CHILD_PID_FILE="${child_pid_file}" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \

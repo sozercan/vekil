@@ -15,6 +15,50 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
+func TestDecodeInternedOpenAIChatRequestModelRawReturnsStableStrings(t *testing.T) {
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:             "local-openai",
+			Type:           string(providerTypeOpenAICompatible),
+			Default:        true,
+			BaseURL:        "http://upstream.test/v1",
+			AuthType:       string(providerAuthTypeNone),
+			ModelDiscovery: string(providerModelDiscoveryStatic),
+			Models: []ProviderModelConfig{{
+				PublicID: "claude-sonnet-4.5",
+			}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	for _, tt := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "exact configured id", raw: `"claude-sonnet-4.5"`, want: "claude-sonnet-4.5"},
+		{name: "trimmed configured id", raw: `"  claude-sonnet-4.5  "`, want: "claude-sonnet-4.5"},
+		{name: "normalized alias fallback", raw: `"claude-sonnet-4-5"`, want: "claude-sonnet-4-5"},
+		{name: "escaped id fallback", raw: `"claude-sonnet-4\u002e5"`, want: "claude-sonnet-4.5"},
+		{name: "unknown id fallback", raw: `"unknown-model"`, want: "unknown-model"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte(tt.raw)
+			got := handler.decodeInternedRequestModelRaw(raw)
+			for i := range raw {
+				raw[i] = 'x'
+			}
+			if got != tt.want {
+				t.Fatalf("decoded model = %q after source mutation, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHandleAnthropicMessages_CopilotNativeMessages(t *testing.T) {
 	t.Run("a model advertising native Messages preserves the Anthropic request", func(t *testing.T) {
 		var modelFetches, messagesPosts, chatPosts int
@@ -107,6 +151,80 @@ func TestHandleAnthropicMessages_CopilotNativeMessages(t *testing.T) {
 			t.Fatalf("response stop reason/sequence = %v/%v, want stop_sequence/</block>", response.StopReason, response.StopSequence)
 		}
 	})
+}
+
+func TestHandleAnthropicMessagesRejectsDuplicateEffortEndingInNull(t *testing.T) {
+	handler := newTestProxyHandler(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("backend should not be called for invalid output_config.effort")
+	})
+	req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(`{
+		"model":"claude-sonnet-4",
+		"messages":[{"role":"user","content":"hello"}],
+		"max_tokens":64,
+		"output_config":{"effort":"high","effort":null}
+	}`))
+	w := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessages(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "output_config.effort must be a non-empty string") {
+		t.Fatalf("body = %q, want effort validation error", w.Body.String())
+	}
+}
+
+func TestHandleAnthropicMessagesDetachesBorrowedDirectBody(t *testing.T) {
+	const requestBody = `{"model":"claude-public","messages":[{"role":"user","content":"hello"}],"max_tokens":64}`
+	const responseBody = `{"id":"msg","type":"message","role":"assistant","model":"claude-public","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+
+	retainedBody := make(chan io.ReadCloser, 1)
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID:       "native",
+			Type:     string(providerTypeAnthropicCompatible),
+			Default:  true,
+			BaseURL:  "http://upstream.test",
+			AuthType: string(providerAuthTypeNone),
+			Models: []ProviderModelConfig{{
+				PublicID:  "claude-public",
+				Endpoints: []string{providerEndpointMessages},
+			}},
+		}}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	handler.client = &http.Client{Transport: handlerTestRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		retainedBody <- req.Body
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			Body:          io.NopCloser(strings.NewReader(responseBody)),
+			ContentLength: int64(len(responseBody)),
+			Request:       req,
+		}, nil
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(requestBody))
+	w := httptest.NewRecorder()
+	handler.HandleAnthropicMessages(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	upstreamBody := <-retainedBody
+	got, err := io.ReadAll(upstreamBody)
+	_ = upstreamBody.Close()
+	if err != nil {
+		t.Fatalf("read retained upstream body: %v", err)
+	}
+	if string(got) != requestBody {
+		t.Fatalf("retained upstream body = %q, want %q", got, requestBody)
+	}
 }
 
 func TestPolicyChatSafeHeadersQuotaAllowlist(t *testing.T) {
@@ -288,6 +406,63 @@ func TestPrepareOpenAIChatCompletionsRequest_ClientStreamOptionsPreserved(t *tes
 	}
 	if mode.injectedClientStreamUsage {
 		t.Fatal("injectedClientStreamUsage = true, want false when client supplied stream_options")
+	}
+}
+
+func TestParseOpenAIChatCompletionsModePreservesCaseInsensitiveJSONFields(t *testing.T) {
+	input := []byte(`{"STREAM":true,"STREAM_OPTIONS":{"INCLUDE_USAGE":true},"TOOLS":[{"type":"function"}]}`)
+	mode := parseOpenAIChatCompletionsMode(input)
+	if !mode.clientRequestedStream {
+		t.Fatal("clientRequestedStream = false, want true")
+	}
+	if !mode.clientRequestedStreamUsage {
+		t.Fatal("clientRequestedStreamUsage = false, want true")
+	}
+	if !mode.requestHasTools {
+		t.Fatal("requestHasTools = false, want true")
+	}
+	if mode.forceUpstreamStream {
+		t.Fatal("forceUpstreamStream = true, want false for client streaming")
+	}
+}
+
+func TestParseOpenAIChatCompletionsModePreservesUnicodeCaseFoldedJSONFields(t *testing.T) {
+	input := []byte(`{"ſtream":true,"ſtream_options":{"include_uſage":true},"toolſ":[{"type":"function"}]}`)
+	if _, ok := parseOpenAIChatCompletionsModeFast(input); ok {
+		t.Fatal("fast parser accepted Unicode case-folded fields")
+	}
+	mode := parseOpenAIChatCompletionsMode(input)
+	if !mode.clientRequestedStream {
+		t.Fatal("clientRequestedStream = false, want true")
+	}
+	if !mode.clientRequestedStreamUsage {
+		t.Fatal("clientRequestedStreamUsage = false, want true")
+	}
+	if !mode.requestHasTools {
+		t.Fatal("requestHasTools = false, want true")
+	}
+	if mode.forceUpstreamStream {
+		t.Fatal("forceUpstreamStream = true, want false for client streaming")
+	}
+}
+
+func TestParseOpenAIChatCompletionsModePreservesDuplicateTypeErrorSemantics(t *testing.T) {
+	tests := []string{
+		`{"stream":1,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
+		`{"stream":true,"stream_options":1,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`,
+		`{"stream":true,"stream_options":{"include_usage":1,"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`,
+		`{"tools":1,"tools":[{"type":"function"}],"messages":[{"role":"user","content":"hi"}]}`,
+	}
+	for _, input := range tests {
+		input := []byte(input)
+		if _, ok := parseOpenAIChatCompletionsModeFast(input); ok {
+			t.Fatalf("fast parser accepted duplicate tracked fields: %s", input)
+		}
+		got := parseOpenAIChatCompletionsMode(input)
+		want := parseOpenAIChatCompletionsModeWithJSON(input)
+		if got != want {
+			t.Fatalf("mode = %#v, want encoding/json result %#v for %s", got, want, input)
+		}
 	}
 }
 

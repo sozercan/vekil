@@ -96,8 +96,27 @@ func TestParseResponsesRequestMetadata(t *testing.T) {
 			want: responsesRequestMetadata{Model: "gpt-5.4"},
 		},
 		{
+			name: "duplicate fields use last value",
+			body: []byte(`{"model":"first","model":" second ","previous_response_id":"old","previous_response_id":" new ","stream":false,"stream":true}`),
+			want: responsesRequestMetadata{Model: "second", PreviousResponseID: "new", Stream: true},
+		},
+		{
+			name: "case folded field names retain decoder compatibility",
+			body: []byte(`{"Model":" gpt-5.4 ","Previous_Response_ID":" resp-123 ","Stream":true}`),
+			want: responsesRequestMetadata{Model: "gpt-5.4", PreviousResponseID: "resp-123", Stream: true},
+		},
+		{
+			name: "escaped field names and values retain decoder compatibility",
+			body: []byte(`{"mo\u0064el":" gpt-5\u002e4 ","previous_response_\u0069d":" resp-123 ","str\u0065am":true}`),
+			want: responsesRequestMetadata{Model: "gpt-5.4", PreviousResponseID: "resp-123", Stream: true},
+		},
+		{
 			name: "invalid json",
 			body: []byte(`{`),
+		},
+		{
+			name: "trailing invalid json clears partial metadata",
+			body: []byte(`{"model":"gpt-5.4","stream":true} trailing`),
 		},
 	}
 

@@ -168,6 +168,7 @@ func (p chatOperationPlan) routeSnapshot() *modelRoute {
 func cloneTargetBindings(candidates []targetBinding) []targetBinding {
 	cloned := append([]targetBinding(nil), candidates...)
 	for index := range cloned {
+		cloned[index].upstreamModelJSON = append([]byte(nil), cloned[index].upstreamModelJSON...)
 		cloned[index].wirePolicy.parallelToolCalls = cloneBoolPtr(cloned[index].wirePolicy.parallelToolCalls)
 		cloned[index].legacyOwner = cloneProviderModelForRoute(cloned[index].legacyOwner)
 	}

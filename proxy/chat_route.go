@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -27,6 +28,14 @@ type resolvedChatRoute struct {
 }
 
 func chooseChatRoute(provider *providerRuntime, owner providerModel, known bool, model string) (resolvedChatRoute, error) {
+	return chooseChatRouteWithOwner(provider, owner, known, model, false)
+}
+
+func chooseChatRouteFromSnapshot(provider *providerRuntime, owner providerModel, known bool, model string) (resolvedChatRoute, error) {
+	return chooseChatRouteWithOwner(provider, owner, known, model, true)
+}
+
+func chooseChatRouteWithOwner(provider *providerRuntime, owner providerModel, known bool, model string, ownerSnapshot bool) (resolvedChatRoute, error) {
 	model = strings.TrimSpace(model)
 	if provider == nil {
 		return resolvedChatRoute{}, &providerRequestError{
@@ -36,10 +45,10 @@ func chooseChatRoute(provider *providerRuntime, owner providerModel, known bool,
 	}
 
 	if chatRouteAllowsEndpoint(provider, owner, known, providerEndpointChatCompletions) {
-		return newResolvedChatRoute(provider, owner, known, model, providerEndpointChatCompletions, chatBackendNativeChat), nil
+		return newResolvedChatRouteWithOwner(provider, owner, known, model, providerEndpointChatCompletions, chatBackendNativeChat, ownerSnapshot), nil
 	}
 	if chatRouteAllowsEndpoint(provider, owner, known, providerEndpointResponses) {
-		return newResolvedChatRoute(provider, owner, known, model, providerEndpointResponses, chatBackendResponses), nil
+		return newResolvedChatRouteWithOwner(provider, owner, known, model, providerEndpointResponses, chatBackendResponses, ownerSnapshot), nil
 	}
 
 	return resolvedChatRoute{}, unsupportedChatRouteError(provider, model)
@@ -56,7 +65,13 @@ func chatRouteAllowsEndpoint(provider *providerRuntime, owner providerModel, kno
 }
 
 func newResolvedChatRoute(provider *providerRuntime, owner providerModel, known bool, publicModel, endpoint string, backend chatBackend) resolvedChatRoute {
-	owner = cloneProviderModelForRoute(owner)
+	return newResolvedChatRouteWithOwner(provider, owner, known, publicModel, endpoint, backend, false)
+}
+
+func newResolvedChatRouteWithOwner(provider *providerRuntime, owner providerModel, known bool, publicModel, endpoint string, backend chatBackend, ownerSnapshot bool) resolvedChatRoute {
+	if !ownerSnapshot {
+		owner = cloneProviderModelForRoute(owner)
+	}
 	upstreamModel := strings.TrimSpace(owner.upstreamModel)
 	if upstreamModel == "" {
 		upstreamModel = strings.TrimSpace(publicModel)
@@ -75,6 +90,11 @@ func newResolvedChatRoute(provider *providerRuntime, owner providerModel, known 
 func cloneProviderModelForRoute(model providerModel) providerModel {
 	model.supportedEndpoints = append([]string(nil), model.supportedEndpoints...)
 	model.parallelToolCalls = cloneBoolPtr(model.parallelToolCalls)
+	if len(model.upstreamModelJSON) == 0 {
+		model.upstreamModelJSON = encodeProviderModelJSON(model.upstreamModel)
+	} else {
+		model.upstreamModelJSON = append(json.RawMessage(nil), model.upstreamModelJSON...)
+	}
 	model.raw = append([]byte(nil), model.raw...)
 	return model
 }

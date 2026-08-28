@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -608,6 +611,9 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	if provider.apiKey != "generic-key" {
 		t.Fatalf("apiKey = %q, want generic-key", provider.apiKey)
 	}
+	if provider.authValue != "Token generic-key" {
+		t.Fatalf("authValue = %q, want Token generic-key", provider.authValue)
+	}
 	if got := provider.extraHeaders.Get("X-Provider"); got != "local" {
 		t.Fatalf("extra header X-Provider = %q, want local", got)
 	}
@@ -617,6 +623,12 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	if provider.modelDiscovery != providerModelDiscoveryOllama {
 		t.Fatalf("modelDiscovery = %q, want ollama", provider.modelDiscovery)
 	}
+	if !provider.postRequestAutoGzip {
+		t.Fatal("postRequestAutoGzip = false, want automatic gzip for sealed provider requests")
+	}
+	if got := provider.postRequestTemplates[providerEndpointChatCompletions].Header.Get("Accept-Encoding"); got != "gzip" {
+		t.Fatalf("sealed request Accept-Encoding = %q, want gzip", got)
+	}
 
 	model := provider.staticModels["local-chat"]
 	if model.publicID != "local-chat" || model.upstreamModel != "llama3.2:latest" {
@@ -624,6 +636,271 @@ func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	}
 	if !reflect.DeepEqual(model.supportedEndpoints, []string{"/chat/completions"}) {
 		t.Fatalf("default openai-compatible endpoints = %v, want [/chat/completions]", model.supportedEndpoints)
+	}
+
+	body := []byte(`{"model":"local-chat"}`)
+	first, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+	if err != nil {
+		t.Fatalf("newProviderJSONRequest() error = %v", err)
+	}
+	if got := first.URL.String(); got != "http://localhost:1234/v1/chat/completions" {
+		t.Fatalf("request URL = %q, want configured Chat URL", got)
+	}
+	if got := first.Header.Get("X-Api-Key"); got != "Token generic-key" {
+		t.Fatalf("request X-Api-Key = %q, want Token generic-key", got)
+	}
+	if got := first.Header.Get("X-Provider"); got != "local" {
+		t.Fatalf("request X-Provider = %q, want local", got)
+	}
+	if first.GetBody == nil {
+		t.Fatal("request GetBody = nil, want replayable configured-provider body")
+	}
+	replay, err := first.GetBody()
+	if err != nil {
+		t.Fatalf("request GetBody() error = %v", err)
+	}
+	replayed, err := io.ReadAll(replay)
+	_ = replay.Close()
+	if err != nil || !reflect.DeepEqual(replayed, body) {
+		t.Fatalf("replayed body = %q, %v; want %q", replayed, err, body)
+	}
+
+	first.Header.Set("X-Api-Key", "mutated")
+	second, err := handler.newProviderJSONRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+	if err != nil {
+		t.Fatalf("second newProviderJSONRequest() error = %v", err)
+	}
+	if got := second.Header.Get("X-Api-Key"); got != "Token generic-key" {
+		t.Fatalf("second request X-Api-Key = %q after first mutation, want Token generic-key", got)
+	}
+
+	inference, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+	if err != nil {
+		t.Fatalf("newProviderJSONInferenceRequest() error = %v", err)
+	}
+	if got := inference.Header.Get("Accept-Encoding"); got != "gzip" {
+		t.Fatalf("inference Accept-Encoding = %q, want gzip", got)
+	}
+	if !providerRequestAutoDecompressGzip(inference) {
+		t.Fatal("inference request did not retain automatic gzip response marker")
+	}
+	if inference.GetBody != nil {
+		t.Fatal("inference request GetBody is non-nil; transport replay must remain disabled")
+	}
+	inferenceBody, err := io.ReadAll(inference.Body)
+	_ = inference.Body.Close()
+	if err != nil || !reflect.DeepEqual(inferenceBody, body) {
+		t.Fatalf("inference body = %q, %v; want %q", inferenceBody, err, body)
+	}
+	fallbackInference, err := handler.newProviderJSONInferenceRequest(
+		context.Background(),
+		provider,
+		http.MethodPost,
+		providerEndpointChatCompletions,
+		body,
+		http.Header{"Idempotency-Key": []string{"request-1"}},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("fallback newProviderJSONInferenceRequest() error = %v", err)
+	}
+	if fallbackInference.GetBody != nil {
+		t.Fatal("fallback inference request GetBody is non-nil; transport replay must remain disabled")
+	}
+	if got := fallbackInference.Header.Get("Idempotency-Key"); got != "request-1" {
+		t.Fatalf("fallback inference Idempotency-Key = %q, want request-1", got)
+	}
+	_ = fallbackInference.Body.Close()
+
+	bodyless, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, nil, nil, "")
+	if err != nil {
+		t.Fatalf("bodyless newProviderJSONInferenceRequest() error = %v", err)
+	}
+	if got := bodyless.Header.Get("Accept-Encoding"); got != "" {
+		t.Fatalf("bodyless inference Accept-Encoding = %q, want transport-managed encoding", got)
+	}
+	if bodyless.Body != nil || bodyless.ContentLength != 0 || providerRequestAutoDecompressGzip(bodyless) {
+		t.Fatalf("bodyless inference = Body %T, ContentLength %d, auto-gzip %t; want nil, 0, false", bodyless.Body, bodyless.ContentLength, providerRequestAutoDecompressGzip(bodyless))
+	}
+	if got := provider.postRequestTemplates[providerEndpointChatCompletions].Header.Get("Accept-Encoding"); got != "gzip" {
+		t.Fatalf("bodyless request mutated sealed template Accept-Encoding to %q", got)
+	}
+}
+
+func TestProviderInferenceRequestsIsolateSealedHeadersFromCookieJars(t *testing.T) {
+	tests := []struct {
+		name string
+		send func(*ProxyHandler, *http.Request) (*http.Response, error)
+	}{
+		{
+			name: "retry send",
+			send: func(handler *ProxyHandler, req *http.Request) (*http.Response, error) {
+				return handler.sendRetryRequest(req, true)
+			},
+		},
+		{
+			name: "single send",
+			send: func(handler *ProxyHandler, req *http.Request) (*http.Response, error) {
+				return handler.singleInferenceSend(req, nil)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer server.Close()
+
+			jar, err := cookiejar.New(nil)
+			if err != nil {
+				t.Fatalf("cookiejar.New() error = %v", err)
+			}
+			client := server.Client()
+			client.Jar = jar
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com", client: client}
+			providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+				ID:             "local",
+				Type:           "openai-compatible",
+				Default:        true,
+				BaseURL:        server.URL,
+				AuthType:       "none",
+				ModelDiscovery: "static",
+				Models:         []ProviderModelConfig{{PublicID: "local-chat"}},
+			}}})
+			if err != nil {
+				t.Fatalf("buildProviders() error = %v", err)
+			}
+			provider := providers["local"]
+			body := []byte(`{"model":"local-chat","messages":[]}`)
+			first, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+			if err != nil {
+				t.Fatalf("newProviderJSONInferenceRequest() error = %v", err)
+			}
+			jar.SetCookies(first.URL, []*http.Cookie{{Name: "session", Value: "one"}})
+
+			resp, err := tt.send(handler, first)
+			if err != nil {
+				t.Fatalf("send() error = %v", err)
+			}
+			_ = resp.Body.Close()
+			if got := first.Header.Get("Cookie"); got != "session=one" {
+				t.Fatalf("first request Cookie = %q, want session=one", got)
+			}
+
+			jar.SetCookies(first.URL, []*http.Cookie{{Name: "session", MaxAge: -1}})
+			second, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+			if err != nil {
+				t.Fatalf("second newProviderJSONInferenceRequest() error = %v", err)
+			}
+			defer func() { _ = second.Body.Close() }()
+			if got := second.Header.Get("Cookie"); got != "" {
+				t.Fatalf("second request inherited Cookie %q from sealed headers", got)
+			}
+			if got := provider.postRequestTemplates[providerEndpointChatCompletions].Header.Get("Cookie"); got != "" {
+				t.Fatalf("sealed template retained Cookie %q", got)
+			}
+		})
+	}
+}
+
+func TestBuildProvidersGenericRequestPreservesOperatorAcceptEncoding(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{
+		Providers: []ProviderConfig{{
+			ID:             "operator-encoding",
+			Type:           "openai-compatible",
+			Default:        true,
+			BaseURL:        "http://localhost:1234",
+			AuthType:       "none",
+			ExtraHeaders:   map[string]string{"Accept-Encoding": "identity"},
+			ModelDiscovery: "static",
+			Models: []ProviderModelConfig{{
+				PublicID: "local-chat",
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	provider := providers["operator-encoding"]
+	if provider == nil {
+		t.Fatal("expected operator-encoding provider")
+	}
+	if provider.postRequestAutoGzip {
+		t.Fatal("postRequestAutoGzip = true with operator-supplied Accept-Encoding")
+	}
+
+	for _, body := range [][]byte{[]byte(`{"model":"local-chat"}`), nil} {
+		req, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+		if err != nil {
+			t.Fatalf("newProviderJSONInferenceRequest(body=%q) error = %v", body, err)
+		}
+		if got := req.Header.Get("Accept-Encoding"); got != "identity" {
+			t.Fatalf("Accept-Encoding = %q, want operator value identity", got)
+		}
+		if providerRequestAutoDecompressGzip(req) {
+			t.Fatal("operator-supplied encoding enabled proxy gzip decompression")
+		}
+	}
+}
+
+func TestProviderMessagesTemplateKeepsConfiguredHeaderPrecedence(t *testing.T) {
+	handler := &ProxyHandler{copilotURL: "https://copilot.example.com"}
+	providers, _, _, err := handler.buildProviders(ProvidersConfig{Providers: []ProviderConfig{{
+		ID:         "native",
+		Type:       "anthropic-compatible",
+		Default:    true,
+		BaseURL:    "http://localhost:1234",
+		APIKey:     "configured-credential",
+		AuthType:   "api-key-header",
+		AuthHeader: "Anthropic-Version",
+		ExtraHeaders: map[string]string{
+			"Anthropic-Beta": "configured-beta",
+		},
+		ModelDiscovery: "static",
+		Models: []ProviderModelConfig{{
+			PublicID:   "claude-public",
+			Deployment: "claude-upstream",
+			Endpoints:  []string{providerEndpointMessages},
+		}},
+	}}})
+	if err != nil {
+		t.Fatalf("buildProviders() error = %v", err)
+	}
+	provider := providers["native"]
+	if provider == nil {
+		t.Fatal("expected native provider")
+	}
+
+	req, err := handler.newProviderJSONInferenceRequest(
+		context.Background(),
+		provider,
+		http.MethodPost,
+		providerEndpointMessages,
+		[]byte(`{"model":"claude-upstream"}`),
+		http.Header{
+			"Anthropic-Version":                         []string{"client-version"},
+			"Anthropic-Beta":                            []string{"client-beta"},
+			"Anthropic-Dangerous-Direct-Browser-Access": []string{"true"},
+		},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("newProviderJSONInferenceRequest() error = %v", err)
+	}
+	defer func() { _ = req.Body.Close() }()
+
+	if got := req.Header.Get("Anthropic-Version"); got != "configured-credential" {
+		t.Fatalf("Anthropic-Version = %q, want configured credential", got)
+	}
+	if got := req.Header.Get("Anthropic-Beta"); got != "configured-beta" {
+		t.Fatalf("Anthropic-Beta = %q, want configured provider value", got)
+	}
+	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "true" {
+		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want forwarded value", got)
 	}
 }
 
@@ -775,6 +1052,341 @@ func TestLoadProvidersConfigFileRejectsEmptyBody(t *testing.T) {
 				t.Fatalf("LoadProvidersConfigFile() error = %v, want empty config error", err)
 			}
 		})
+	}
+}
+
+func TestLoadProvidersConfigFileURL(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "JSON",
+			path: "/providers.json?revision=1",
+			body: `{"providers":[{"id":"remote","type":"openai-compatible","base_url":"http://localhost:1234","auth_type":"none","models":[{"public_id":"remote-model"}]}]}`,
+		},
+		{
+			name: "YAML with query",
+			path: "/providers.yaml?revision=1",
+			body: "providers:\n  - id: remote\n    type: openai-compatible\n    base_url: http://localhost:1234\n    auth_type: none\n    models:\n      - public_id: remote-model\n",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+
+			cfg, err := LoadProvidersConfigFile(server.URL + tc.path)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+			if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "remote" {
+				t.Fatalf("providers = %+v, want one remote provider", cfg.Providers)
+			}
+		})
+	}
+}
+
+func TestParseProvidersConfigURLTreatsFilesystemPathsAsLocal(t *testing.T) {
+	t.Parallel()
+
+	for _, source := range []string{
+		"/tmp/http://providers.yaml",
+		"relative/http://providers.yaml",
+		"C://providers.yaml",
+	} {
+		source := source
+		t.Run(source, func(t *testing.T) {
+			t.Parallel()
+
+			parsed, remote, err := parseProvidersConfigURL(source)
+			if err != nil {
+				t.Fatalf("parseProvidersConfigURL(%q) error = %v", source, err)
+			}
+			if remote || parsed != nil {
+				t.Fatalf("parseProvidersConfigURL(%q) = (%v, %v), want local source", source, parsed, remote)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileLocalPathContainingURLDelimiter(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not permit a colon in this path component")
+	}
+
+	configDir := filepath.Join(t.TempDir(), "http:")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	configPath := filepath.Join(configDir, "providers.yaml")
+	if err := os.WriteFile(configPath, []byte("providers:\n  - id: copilot\n    type: copilot\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	source := configDir + "//providers.yaml"
+	if !strings.Contains(source, "://") {
+		t.Fatalf("test source %q does not contain URL delimiter", source)
+	}
+	cfg, err := LoadProvidersConfigFile(source)
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile(%q) error = %v", source, err)
+	}
+	if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "copilot" {
+		t.Fatalf("providers = %+v, want local Copilot provider", cfg.Providers)
+	}
+}
+
+func TestLoadProvidersConfigFileURLDoesNotRestrictContentNegotiation(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept"); got != "*/*" {
+			http.Error(w, "unsupported Accept header", http.StatusNotAcceptable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-yaml")
+		_, _ = io.WriteString(w, "providers:\n  - id: copilot\n    type: copilot\n")
+	}))
+	defer server.Close()
+
+	cfg, err := LoadProvidersConfigFile(server.URL + "/providers.yaml")
+	if err != nil {
+		t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+	}
+	if len(cfg.Providers) != 1 || cfg.Providers[0].ID != "copilot" {
+		t.Fatalf("providers = %+v, want negotiated YAML config", cfg.Providers)
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsRedirect(t *testing.T) {
+	t.Parallel()
+
+	targetCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/providers.yaml":
+			http.Redirect(w, r, "/redirected.yaml", http.StatusFound)
+		case "/redirected.yaml":
+			targetCalls++
+			_, _ = io.WriteString(w, "providers: []\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 302 Found") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want redirect status failure", err)
+	}
+	if targetCalls != 0 {
+		t.Fatalf("redirect target calls = %d, want 0", targetCalls)
+	}
+}
+
+func TestLoadProvidersConfigFileURLRedactsSensitiveSourceParts(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status.yaml":
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		case "/decode.yaml":
+			_, _ = io.WriteString(w, "providers: [\n")
+		case "/validate.json":
+			_, _ = io.WriteString(w, `{"schema_version":2,"providers":[{"id":"remote","type":"unsupported"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	testCases := []struct {
+		path string
+		want string
+	}{
+		{path: "/status.yaml", want: "unexpected HTTP status 503 Service Unavailable"},
+		{path: "/decode.yaml", want: "decode providers config"},
+		{path: "/validate.json", want: "validate providers config"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.path, func(t *testing.T) {
+			source := strings.Replace(server.URL, "http://", "http://source-user:source-password@", 1) + tc.path + "?signature=signed-secret#fragment-secret"
+			_, err := LoadProvidersConfigFile(source)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want %q", err, tc.want)
+			}
+			for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("LoadProvidersConfigFile() error exposes %q: %v", secret, err)
+				}
+			}
+			if wantSource := server.URL + tc.path; !strings.Contains(err.Error(), wantSource) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want sanitized source %q", err, wantSource)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileURLRedactsRequestError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	server.Close()
+	source := strings.Replace(server.URL, "http://", "http://source-user:source-password@", 1) + "/providers.yaml?signature=signed-secret#fragment-secret"
+
+	_, err := LoadProvidersConfigFile(source)
+	if err == nil || !strings.Contains(err.Error(), "fetch providers config") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want fetch failure", err)
+	}
+	for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("LoadProvidersConfigFile() error exposes %q: %v", secret, err)
+		}
+	}
+	if wantSource := server.URL + "/providers.yaml"; !strings.Contains(err.Error(), wantSource) {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want sanitized source %q", err, wantSource)
+	}
+}
+
+func TestProvidersConfigSourceDisplay(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{name: "local path", source: "/tmp/provider config.yaml", want: "/tmp/provider config.yaml"},
+		{
+			name:   "remote secrets",
+			source: "HTTPS://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret",
+			want:   "https://example.com/providers.yaml",
+		},
+		{name: "local path containing URL delimiter", source: "/tmp/http://providers.yaml", want: "/tmp/http://providers.yaml"},
+		{name: "Windows drive path", source: "C://providers.yaml", want: "C://providers.yaml"},
+		{name: "hostless HTTPS URL", source: "https:/config.example/providers.yaml?signature=signed-secret", want: "https://<invalid>"},
+		{name: "malformed remote", source: "https://source-user:source-password@example.com/%zz?signature=signed-secret", want: "https://<invalid>"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ProvidersConfigSourceDisplay(tc.source); got != tc.want {
+				t.Fatalf("ProvidersConfigSourceDisplay(%q) = %q, want %q", tc.source, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileMalformedURLRedactsSensitiveSourceParts(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{
+			name:   "invalid escape",
+			source: "https://source-user:source-password@example.com/%zz?signature=signed-secret#fragment-secret",
+			want:   `parse providers config URL "https://<invalid>"`,
+		},
+		{
+			name:   "hostless HTTPS",
+			source: "https:/config.example/providers.yaml?signature=signed-secret#fragment-secret",
+			want:   `providers config URL "https://<invalid>" has no host`,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadProvidersConfigFile(tc.source)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadProvidersConfigFile() error = %v, want %q", err, tc.want)
+			}
+			for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("LoadProvidersConfigFile() error exposes %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsHTTPFailure(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 503 Service Unavailable") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want HTTP status failure", err)
+	}
+}
+
+func TestLoadProvidersConfigFileURLCanonicalizesHTTPStatus(t *testing.T) {
+	t.Parallel()
+
+	const reflectedSecret = "signed-query-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("ResponseWriter does not support hijacking")
+			return
+		}
+		connection, response, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("Hijack() error = %v", err)
+			return
+		}
+		defer func() { _ = connection.Close() }()
+		_, _ = io.WriteString(response, "HTTP/1.1 503 "+reflectedSecret+"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		if err := response.Flush(); err != nil {
+			t.Errorf("Flush() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml?signature=" + reflectedSecret)
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 503 Service Unavailable") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want canonical HTTP status failure", err)
+	}
+	if strings.Contains(err.Error(), reflectedSecret) {
+		t.Fatalf("LoadProvidersConfigFile() error exposes reflected query secret: %v", err)
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsOversizedBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat(" ", maxRemoteProvidersConfigBodySize+1))
+	}))
+	defer server.Close()
+
+	_, err := LoadProvidersConfigFile(server.URL + "/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), "response exceeds 4194304 bytes") {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want response-size failure", err)
+	}
+}
+
+func TestLoadProvidersConfigFileURLRejectsUnsupportedScheme(t *testing.T) {
+	t.Parallel()
+
+	_, err := LoadProvidersConfigFile("ftp://example.com/providers.yaml")
+	if err == nil || !strings.Contains(err.Error(), `unsupported scheme "ftp"`) {
+		t.Fatalf("LoadProvidersConfigFile() error = %v, want unsupported-scheme failure", err)
 	}
 }
 

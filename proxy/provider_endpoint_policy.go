@@ -15,6 +15,13 @@ type providerEndpointPolicy struct {
 	allowAnyDiscoveredModelEntry bool
 }
 
+var (
+	providerEndpointsResponsesOnly = []string{providerEndpointResponses}
+	providerEndpointsChatOnly      = []string{providerEndpointChatCompletions}
+	providerEndpointsMessagesOnly  = []string{providerEndpointMessages}
+	providerEndpointsOpenAI        = []string{providerEndpointChatCompletions, providerEndpointResponses}
+)
+
 func providerEndpointPolicyFor(kind providerType) providerEndpointPolicy {
 	paths := providerEndpointPaths{
 		chatCompletions: providerEndpointChatCompletions,
@@ -29,34 +36,34 @@ func providerEndpointPolicyFor(kind providerType) providerEndpointPolicy {
 		paths.messages = ""
 		return providerEndpointPolicy{
 			defaultPaths:             paths,
-			staticModelEndpoints:     endpointList(providerEndpointResponses),
-			dynamicModelEndpoints:    endpointList(providerEndpointResponses),
-			routedRequestEndpoints:   endpointList(providerEndpointResponses),
-			unknownModelEndpoints:    endpointList(providerEndpointResponses),
-			discoveredModelEndpoints: endpointList(providerEndpointResponses),
+			staticModelEndpoints:     providerEndpointsResponsesOnly,
+			dynamicModelEndpoints:    providerEndpointsResponsesOnly,
+			routedRequestEndpoints:   providerEndpointsResponsesOnly,
+			unknownModelEndpoints:    providerEndpointsResponsesOnly,
+			discoveredModelEndpoints: providerEndpointsResponsesOnly,
 		}
 	case providerTypeOpenAICompatible:
 		return providerEndpointPolicy{
 			defaultPaths:                 paths,
-			staticModelEndpoints:         endpointList(providerEndpointChatCompletions),
-			dynamicModelEndpoints:        endpointList(providerEndpointChatCompletions),
-			routedRequestEndpoints:       endpointList(providerEndpointChatCompletions, providerEndpointResponses),
-			unknownModelEndpoints:        endpointList(providerEndpointChatCompletions),
+			staticModelEndpoints:         providerEndpointsChatOnly,
+			dynamicModelEndpoints:        providerEndpointsChatOnly,
+			routedRequestEndpoints:       providerEndpointsOpenAI,
+			unknownModelEndpoints:        providerEndpointsChatOnly,
 			allowAnyDiscoveredModelEntry: true,
 		}
 	case providerTypeAnthropicCompatible:
 		return providerEndpointPolicy{
 			defaultPaths:             paths,
-			staticModelEndpoints:     endpointList(providerEndpointMessages),
-			dynamicModelEndpoints:    endpointList(providerEndpointMessages),
-			routedRequestEndpoints:   endpointList(providerEndpointMessages),
-			unknownModelEndpoints:    endpointList(providerEndpointMessages),
-			discoveredModelEndpoints: endpointList(providerEndpointMessages),
+			staticModelEndpoints:     providerEndpointsMessagesOnly,
+			dynamicModelEndpoints:    providerEndpointsMessagesOnly,
+			routedRequestEndpoints:   providerEndpointsMessagesOnly,
+			unknownModelEndpoints:    providerEndpointsMessagesOnly,
+			discoveredModelEndpoints: providerEndpointsMessagesOnly,
 		}
 	case providerTypeCopilot:
 		return providerEndpointPolicy{
 			defaultPaths:                 paths,
-			staticModelEndpoints:         endpointList(providerEndpointChatCompletions, providerEndpointResponses),
+			staticModelEndpoints:         providerEndpointsOpenAI,
 			allowAnyRoutedRequest:        true,
 			allowAnyUnknownModel:         true,
 			allowAnyDiscoveredModelEntry: true,
@@ -64,7 +71,7 @@ func providerEndpointPolicyFor(kind providerType) providerEndpointPolicy {
 	case providerTypeAzureOpenAI:
 		return providerEndpointPolicy{
 			defaultPaths:                 paths,
-			staticModelEndpoints:         endpointList(providerEndpointChatCompletions, providerEndpointResponses),
+			staticModelEndpoints:         providerEndpointsOpenAI,
 			allowAnyRoutedRequest:        true,
 			allowAnyUnknownModel:         true,
 			allowAnyDiscoveredModelEntry: true,
@@ -72,7 +79,7 @@ func providerEndpointPolicyFor(kind providerType) providerEndpointPolicy {
 	default:
 		return providerEndpointPolicy{
 			defaultPaths:                 paths,
-			staticModelEndpoints:         endpointList(providerEndpointChatCompletions, providerEndpointResponses),
+			staticModelEndpoints:         providerEndpointsOpenAI,
 			allowAnyRoutedRequest:        true,
 			allowAnyUnknownModel:         true,
 			allowAnyDiscoveredModelEntry: true,

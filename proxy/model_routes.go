@@ -33,11 +33,12 @@ type providerRequestPolicy struct {
 }
 
 type targetBinding struct {
-	id            string
-	provider      *providerRuntime
-	upstreamModel string
-	wirePolicy    providerRequestPolicy
-	legacyOwner   providerModel
+	id                string
+	provider          *providerRuntime
+	upstreamModel     string
+	upstreamModelJSON json.RawMessage
+	wirePolicy        providerRequestPolicy
+	legacyOwner       providerModel
 }
 
 type routePolicy struct {
@@ -203,6 +204,29 @@ func (r *modelRouteRegistry) lookupPublicModelEntry(model string) (*publicModelE
 		return nil, false
 	}
 	return r.publicEntries.lookup(model)
+}
+
+// internExactPublicModel returns immutable registry storage for an exact public
+// model ID. Converting raw bytes directly in the map lookup does not allocate;
+// normalized aliases and unknown IDs deliberately retain their owned-string
+// fallback at the request boundary.
+func (ps *providerSetup) internExactPublicModel(raw []byte) (string, bool) {
+	if ps == nil || len(raw) == 0 {
+		return "", false
+	}
+	registry := ps.routeRegistry()
+	if registry == nil {
+		return "", false
+	}
+	snapshot := registry.load()
+	if snapshot == nil || snapshot.publicEntries == nil {
+		return "", false
+	}
+	entry, ok := snapshot.publicEntries.byID[string(raw)]
+	if !ok || entry == nil || entry.id == "" {
+		return "", false
+	}
+	return entry.id, true
 }
 
 func (r *modelRouteRegistry) lookupTerminalRoute(routeID string) (*modelRoute, bool) {
@@ -433,16 +457,20 @@ func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*m
 			},
 		},
 		targets: []targetBinding{{
-			id:            targetID,
-			provider:      provider,
-			upstreamModel: model.upstreamModel,
+			id:                targetID,
+			provider:          provider,
+			upstreamModel:     model.upstreamModel,
+			upstreamModelJSON: encodeProviderModelJSON(model.upstreamModel),
 			wirePolicy: providerRequestPolicy{
 				parallelToolCalls:      cloneBoolPtr(model.parallelToolCalls),
 				dropSamplingParams:     model.dropSamplingParams,
 				dropStopSequences:      model.dropStopSequences,
 				useMaxCompletionTokens: model.useMaxCompletionTokens,
 			},
-			legacyOwner: model,
+			// Seal catalog-owned slices and pointers once when the immutable
+			// registry snapshot is built. Request routing can then reuse this
+			// owner without cloning it on every native Chat request.
+			legacyOwner: cloneProviderModelForRoute(model),
 		}},
 		policy: routePolicy{
 			mode:              routeModePrimaryOnly,
@@ -530,6 +558,12 @@ func providerModelFromRouteTarget(route *modelRoute, target targetBinding) provi
 		if owner.upstreamModel == "" {
 			owner.upstreamModel = target.upstreamModel
 		}
+		if len(owner.upstreamModelJSON) == 0 {
+			owner.upstreamModelJSON = target.upstreamModelJSON
+			if len(owner.upstreamModelJSON) == 0 {
+				owner.upstreamModelJSON = encodeProviderModelJSON(owner.upstreamModel)
+			}
+		}
 		return owner
 	}
 	parallelToolCalls := route.public.policy.parallelToolCalls
@@ -539,6 +573,7 @@ func providerModelFromRouteTarget(route *modelRoute, target targetBinding) provi
 	owner := providerModel{
 		publicID:               route.public.id,
 		upstreamModel:          target.upstreamModel,
+		upstreamModelJSON:      target.upstreamModelJSON,
 		supportedEndpoints:     append([]string(nil), route.public.endpoints...),
 		parallelToolCalls:      cloneBoolPtr(parallelToolCalls),
 		dropSamplingParams:     route.public.policy.dropSamplingParams,

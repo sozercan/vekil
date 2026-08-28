@@ -291,6 +291,11 @@ func TestChatRequestContainsResponsesReplayIDCaseInsensitiveFallback(t *testing.
 			body: `{"messages":[{"role":"user","content":"hello"}],"MESSAGES":[{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA"}]}`,
 			want: false,
 		},
+		{
+			name: "unicode-escaped replay prefix",
+			body: `{"messages":[{"role":"tool","tool_call_id":"call\u005fvekil\u005fAAAAAAAAAAAAAAAAAAAAAA"}]}`,
+			want: true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

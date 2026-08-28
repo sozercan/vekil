@@ -590,8 +590,8 @@ func selectProvidersConfig() {
 	}
 
 	if err := applyProvidersConfigPath(path); err != nil {
-		log.Error("failed to apply providers config", logger.Err(err), logger.F("path", path))
-		showErrorDialog("Providers Config", fmt.Sprintf("Could not use %s.\n\n%v", filepath.Base(path), err))
+		log.Error("failed to apply providers config", logger.Err(err), logger.F("path", proxy.ProvidersConfigSourceDisplay(path)))
+		showErrorDialog("Providers Config", fmt.Sprintf("Could not use %s.\n\n%v", providersConfigDisplayName(path), err))
 	}
 }
 
@@ -765,14 +765,18 @@ func providersMenuTitle() string {
 	case isMenubarConfigLoadError(providersConfigErr):
 		return "Providers: Config unavailable"
 	case providersConfigErr != nil && menubarCfg.ProvidersConfigPath != "":
-		return fmt.Sprintf("Providers: Invalid (%s)", filepath.Base(menubarCfg.ProvidersConfigPath))
+		return fmt.Sprintf("Providers: Invalid (%s)", providersConfigDisplayName(menubarCfg.ProvidersConfigPath))
 	case providersConfigErr != nil:
 		return "Providers: Invalid"
 	case menubarCfg.ProvidersConfigPath == "":
 		return "Providers: Copilot default"
 	default:
-		return fmt.Sprintf("Providers: %s", filepath.Base(menubarCfg.ProvidersConfigPath))
+		return fmt.Sprintf("Providers: %s", providersConfigDisplayName(menubarCfg.ProvidersConfigPath))
 	}
+}
+
+func providersConfigDisplayName(source string) string {
+	return filepath.Base(proxy.ProvidersConfigSourceDisplay(source))
 }
 
 func logProvidersConfigLoadError(err error) {
@@ -780,7 +784,7 @@ func logProvidersConfigLoadError(err error) {
 		log.Error("failed to load menubar config", logger.Err(err))
 		return
 	}
-	log.Error("failed to load providers config", logger.Err(err), logger.F("path", menubarCfg.ProvidersConfigPath))
+	log.Error("failed to load providers config", logger.Err(err), logger.F("path", proxy.ProvidersConfigSourceDisplay(menubarCfg.ProvidersConfigPath)))
 }
 
 func providersConfigUnavailableDialog(err error) (string, string) {

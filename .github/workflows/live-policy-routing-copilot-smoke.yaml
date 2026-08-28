@@ -76,4 +76,13 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         env:
           LIVE_POLICY_ROUTING_SMOKE_DIR: ${{ runner.temp }}/live-policy-routing-copilot-smoke
-        run: scripts/live-policy-routing-copilot-smoke.sh
+        run: |
+          set +e
+          scripts/live-policy-routing-copilot-smoke.sh
+          status=$?
+          set -e
+          if [ "${status}" -eq 75 ]; then
+            echo "Copilot live policy-routing coverage was neutral-skipped because the repository credential is billing- or quota-unavailable."
+            exit 0
+          fi
+          exit "${status}"

@@ -5,12 +5,17 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
 type requestSummaryContextKey struct{}
+
+var requestSummaryPool = sync.Pool{New: func() any {
+	return &RequestSummary{}
+}}
 
 // RequestSummary is a mutable per-request summary populated by handlers and
 // emitted by the server-level request logging middleware.
@@ -57,6 +62,11 @@ type RequestSummary struct {
 	totalTokens               *int
 	cachedTokens              *int
 	reasoningTokens           *int
+	promptTokensValue         int
+	completionTokensValue     int
+	totalTokensValue          int
+	cachedTokensValue         int
+	reasoningTokensValue      int
 	// extraPromptTokens / extraCompletionTokens accumulate out-of-band token
 	// spend that is separate from the turn's own reported usage — e.g. an
 	// internal /responses compaction call made while serving a 413 oversized-
@@ -74,7 +84,8 @@ type RequestSummary struct {
 	// statsSuppressed excludes local shutdown rejections and lifecycle-canceled
 	// in-flight work from provider traffic accounting. A semantic provider failure
 	// already recorded in failureStatus wins and cannot be suppressed afterward.
-	statsSuppressed bool
+	statsSuppressed   bool
+	retryStatsTracked atomic.Bool
 }
 
 // WithRequestSummary attaches a mutable request summary to ctx and returns both
@@ -89,6 +100,30 @@ func WithRequestSummary(ctx context.Context) (context.Context, *RequestSummary) 
 	}
 	summary := &RequestSummary{}
 	return context.WithValue(ctx, requestSummaryContextKey{}, summary), summary
+}
+
+// AcquireRequestSummary attaches a pooled summary when ctx does not already
+// carry one. Server middleware must call ReleaseRequestSummary only when owned
+// is true and only after handler, stats, and logging work has completed.
+func AcquireRequestSummary(ctx context.Context) (context.Context, *RequestSummary, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if existing := RequestSummaryFromContext(ctx); existing != nil {
+		return ctx, existing, false
+	}
+	summary := requestSummaryPool.Get().(*RequestSummary)
+	*summary = RequestSummary{}
+	return context.WithValue(ctx, requestSummaryContextKey{}, summary), summary, true
+}
+
+// ReleaseRequestSummary returns a server-owned summary to the pool.
+func ReleaseRequestSummary(summary *RequestSummary) {
+	if summary == nil {
+		return
+	}
+	*summary = RequestSummary{}
+	requestSummaryPool.Put(summary)
 }
 
 // RequestSummaryFromContext returns the mutable request summary attached to ctx,
@@ -502,18 +537,21 @@ func (s *RequestSummary) setOpenAIUsage(usage *models.OpenAIUsage) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.promptTokens = summaryIntPtr(usage.PromptTokens)
-	s.completionTokens = summaryIntPtr(usage.CompletionTokens)
-	s.totalTokens = summaryIntPtr(usage.TotalTokens)
+	s.promptTokensValue = usage.PromptTokens
+	s.completionTokensValue = usage.CompletionTokens
+	s.totalTokensValue = usage.TotalTokens
+	s.promptTokens = &s.promptTokensValue
+	s.completionTokens = &s.completionTokensValue
+	s.totalTokens = &s.totalTokensValue
 	if usage.PromptTokensDetails != nil {
-		s.cachedTokens = summaryIntPtr(usage.PromptTokensDetails.CachedTokens)
+		s.cachedTokensValue = usage.PromptTokensDetails.CachedTokens
+		s.cachedTokens = &s.cachedTokensValue
 	}
 	if usage.CompletionTokensDetails != nil {
-		s.reasoningTokens = summaryIntPtr(usage.CompletionTokensDetails.ReasoningTokens)
+		s.reasoningTokensValue = usage.CompletionTokensDetails.ReasoningTokens
+		s.reasoningTokens = &s.reasoningTokensValue
 	}
 }
-
-func summaryIntPtr(v int) *int { return &v }
 
 func (s *RequestSummary) setErrorDetail(errType, code, param, message string) {
 	if s == nil {

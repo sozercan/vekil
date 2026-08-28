@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -76,6 +77,21 @@ func TestExtractRequestModel(t *testing.T) {
 			body: `["gpt-4.1"]`,
 			want: "",
 		},
+		{
+			name: "escaped model string",
+			body: `{"model":"gpt-4\u002e1","input":"hello"}`,
+			want: "gpt-4.1",
+		},
+		{
+			name: "first duplicate model is preserved",
+			body: `{"model":"first","model":"second"}`,
+			want: "first",
+		},
+		{
+			name: "escaped model key falls back to decoder",
+			body: `{"mo\u0064el":"gpt-4.1"}`,
+			want: "gpt-4.1",
+		},
 	}
 
 	for _, tt := range tests {
@@ -94,6 +110,263 @@ func TestReadDirectAnthropicJSONBodyRejectsOversizedExplicitResponse(t *testing.
 	}
 	if data != nil {
 		t.Fatalf("readDirectAnthropicJSONBody() data = %q, want nil on oversized response", data)
+	}
+}
+
+func TestReadDirectAnthropicJSONBodyKnownLength(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+		maxBodySize   int64
+		want          string
+		wantErr       error
+		wantLimitErr  bool
+	}{
+		{name: "exact", body: "payload", contentLength: 7, want: "payload"},
+		{name: "longer than advertised", body: "longer payload", contentLength: 4, want: "longer payload"},
+		{name: "truncated", body: "short", contentLength: 10, wantErr: io.ErrUnexpectedEOF},
+		{name: "declared length exceeds explicit route limit", body: "12345", contentLength: 5, maxBodySize: 4, wantLimitErr: true},
+		{name: "explicit route limit", body: "12345", contentLength: 4, maxBodySize: 4, wantLimitErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, pooled, err := readDirectAnthropicJSONBodyKnownLength(strings.NewReader(tt.body), tt.contentLength, tt.maxBodySize)
+			defer releaseUsageSniffBuffer(pooled)
+			switch {
+			case tt.wantLimitErr:
+				if err == nil || !strings.Contains(err.Error(), "exceeds model-normalization limit") {
+					t.Fatalf("readDirectAnthropicJSONBodyKnownLength() error = %v, want limit error", err)
+				}
+			case tt.wantErr != nil:
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("readDirectAnthropicJSONBodyKnownLength() error = %v, want %v", err, tt.wantErr)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("readDirectAnthropicJSONBodyKnownLength() error = %v", err)
+				}
+				if string(got) != tt.want {
+					t.Fatalf("readDirectAnthropicJSONBodyKnownLength() = %q, want %q", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestRewriteAnthropicResponseModelJSONFast(t *testing.T) {
+	body := []byte(`{"id":"msg","model":"claude-upstream","content":[],"usage":{"input_tokens":1,"output_tokens":2}}`)
+	rewritten, changed, ok := rewriteAnthropicResponseModelJSONFast(body, json.RawMessage(`"claude-public"`))
+	if !ok || !changed {
+		t.Fatalf("rewriteAnthropicResponseModelJSONFast() = changed %v, ok %v; want true, true", changed, ok)
+	}
+	want := `{"id":"msg","model":"claude-public","content":[],"usage":{"input_tokens":1,"output_tokens":2}}`
+	if got := string(rewritten); got != want {
+		t.Fatalf("rewriteAnthropicResponseModelJSONFast() = %s, want %s", got, want)
+	}
+}
+
+func TestRewriteAnthropicResponseModelJSONInPlace(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		publicModel string
+	}{
+		{name: "shrink", publicModel: "public"},
+		{name: "grow", publicModel: "claude-public-model-longer-than-upstream"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			original := []byte(`{"id":"msg","model":"upstream","content":[]}`)
+			body := make([]byte, len(original), 256)
+			copy(body, original)
+			rewritten, changed, err := rewriteAnthropicResponseModelJSONInPlace(body, tt.publicModel, "upstream")
+			if err != nil {
+				t.Fatalf("rewriteAnthropicResponseModelJSONInPlace() error = %v", err)
+			}
+			if !changed {
+				t.Fatal("rewriteAnthropicResponseModelJSONInPlace() changed = false, want true")
+			}
+			var payload struct {
+				Model string `json:"model"`
+			}
+			if err := json.Unmarshal(rewritten, &payload); err != nil {
+				t.Fatalf("json.Unmarshal(rewritten) error = %v", err)
+			}
+			if payload.Model != tt.publicModel {
+				t.Fatalf("rewritten model = %q, want %q", payload.Model, tt.publicModel)
+			}
+		})
+	}
+}
+
+func TestRewriteAnthropicResponseModelJSONInPlaceFallsBackWithoutCapacity(t *testing.T) {
+	body := []byte(`{"model":"x"}`)
+	rewritten, changed, err := rewriteAnthropicResponseModelJSONInPlace(body, strings.Repeat("long", 32), "x")
+	if err != nil {
+		t.Fatalf("rewriteAnthropicResponseModelJSONInPlace() error = %v", err)
+	}
+	if rewritten != nil || changed {
+		t.Fatalf("rewriteAnthropicResponseModelJSONInPlace() = %q, %v; want nil, false fallback", rewritten, changed)
+	}
+}
+
+func TestWriteDirectAnthropicJSONResponseInPlaceRewriteRetainsUsage(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	body := `{"id":"msg","type":"message","model":"claude-upstream-model","content":[],"usage":{"input_tokens":7,"output_tokens":3}}`
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/json"}, "Content-Length": []string{strconv.Itoa(len(body))}},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+	w := httptest.NewRecorder()
+	if err := writeDirectAnthropicJSONResponse(ctx, context.Background(), w, resp, "public", "claude-upstream-model"); err != nil {
+		t.Fatalf("writeDirectAnthropicJSONResponse() error = %v", err)
+	}
+	if summary.promptTokens == nil || *summary.promptTokens != 7 ||
+		summary.completionTokens == nil || *summary.completionTokens != 3 ||
+		summary.totalTokens == nil || *summary.totalTokens != 10 {
+		t.Fatalf("usage = prompt:%v completion:%v total:%v, want 7/3/10", summary.promptTokens, summary.completionTokens, summary.totalTokens)
+	}
+	var payload struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(response) error = %v", err)
+	}
+	if payload.Model != "public" {
+		t.Fatalf("response model = %q, want public", payload.Model)
+	}
+}
+
+func TestRewriteAnthropicResponseModelJSONFastFallsBackForAmbiguousShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "duplicate model", body: `{"model":"first","model":"second"}`},
+		{name: "case-folded model alias", body: `{"model":"claude-upstream","Model":"shadow"}`},
+		{name: "escaped model key", body: `{"mo\u0064el":"claude-upstream"}`},
+		{name: "escaped model value", body: `{"model":"claude-\u0075pstream"}`},
+		{name: "nested message", body: `{"model":"claude-upstream","message":{"model":"claude-upstream"}}`},
+		{name: "malformed", body: `{"model":"claude-upstream"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, ok := rewriteAnthropicResponseModelJSONFast([]byte(tt.body), json.RawMessage(`"claude-public"`))
+			if ok {
+				t.Fatal("rewriteAnthropicResponseModelJSONFast() ok = true, want fallback")
+			}
+		})
+	}
+}
+
+func TestWriteDirectAnthropicJSONResponseFallsBackForCaseFoldedModelAlias(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "exact then alias", body: `{"id":"msg","model":"claude-upstream","Model":"shadow","content":[]}`},
+		{name: "alias only", body: `{"id":"msg","Model":"claude-upstream","content":[]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Type": []string{"application/json"}, "Content-Length": []string{strconv.Itoa(len(tt.body))}},
+				Body:          io.NopCloser(strings.NewReader(tt.body)),
+				ContentLength: int64(len(tt.body)),
+			}
+			w := httptest.NewRecorder()
+			if err := writeDirectAnthropicJSONResponse(context.Background(), context.Background(), w, resp, "claude-public", "claude-upstream"); err != nil {
+				t.Fatalf("writeDirectAnthropicJSONResponse() error = %v", err)
+			}
+
+			var payload struct {
+				Model string `json:"model"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("json.Unmarshal(response) error = %v", err)
+			}
+			if payload.Model != "claude-public" {
+				t.Fatalf("response model = %q, want claude-public; body=%s", payload.Model, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestRewriteAnthropicResponseModelJSONFallbackRetainsNestedSemantics(t *testing.T) {
+	body := []byte(`{"model":"claude-upstream","message":{"model":"claude-upstream","content":[]}}`)
+	rewritten, changed := rewriteAnthropicResponseModelJSON(body, "claude-public", "claude-upstream")
+	if !changed {
+		t.Fatal("rewriteAnthropicResponseModelJSON() changed = false, want true")
+	}
+	var payload struct {
+		Model   string `json:"model"`
+		Message struct {
+			Model string `json:"model"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(rewritten, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(rewritten) error = %v", err)
+	}
+	if payload.Model != "claude-public" || payload.Message.Model != "claude-public" {
+		t.Fatalf("rewritten models = %q, %q; want claude-public", payload.Model, payload.Message.Model)
+	}
+}
+
+func TestReadUsageSniffPrefixUsesKnownLengthWithoutTruncatingExtraBytes(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+	}{
+		{name: "exact", body: "payload", contentLength: int64(len("payload"))},
+		{name: "longer than advertised", body: "longer payload", contentLength: 4},
+		{name: "unknown", body: "unknown", contentLength: -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, pooledBuffer, err := readUsageSniffPrefix(strings.NewReader(tt.body), tt.contentLength)
+			defer releaseUsageSniffBuffer(pooledBuffer)
+			if err != nil {
+				t.Fatalf("readUsageSniffPrefix() error = %v", err)
+			}
+			if string(got) != tt.body {
+				t.Fatalf("readUsageSniffPrefix() = %q, want %q", got, tt.body)
+			}
+		})
+	}
+}
+
+func TestReadUsageSniffPrefixRejectsTruncatedKnownLength(t *testing.T) {
+	for _, contentLength := range []int64{20, usageSniffSmallBufferSize} {
+		t.Run(fmt.Sprintf("content-length-%d", contentLength), func(t *testing.T) {
+			got, pooledBuffer, err := readUsageSniffPrefix(strings.NewReader("short"), contentLength)
+			defer releaseUsageSniffBuffer(pooledBuffer)
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("readUsageSniffPrefix() error = %v, want io.ErrUnexpectedEOF", err)
+			}
+			if got != nil {
+				t.Fatalf("readUsageSniffPrefix() = %q, want nil", got)
+			}
+		})
+	}
+}
+
+func TestProviderRouteFromRequestUsesInferenceBodyWithContextFallback(t *testing.T) {
+	bodyRoute := providerRouteInfo{id: "body-provider", kind: string(providerTypeOpenAICompatible)}
+	contextRoute := providerRouteInfo{id: "context-provider", kind: string(providerTypeAzureOpenAI)}
+	ctx := context.WithValue(context.Background(), providerRouteContextKey{}, contextRoute)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	req.Body = newProviderRequestBody([]byte(`{}`), bodyRoute, false)
+	if got, ok := providerRouteFromRequest(req); !ok || got != bodyRoute {
+		t.Fatalf("providerRouteFromRequest() = %+v, %t; want body route %+v", got, ok, bodyRoute)
+	}
+
+	req.Body = http.NoBody
+	if got, ok := providerRouteFromRequest(req); !ok || got != contextRoute {
+		t.Fatalf("providerRouteFromRequest() fallback = %+v, %t; want context route %+v", got, ok, contextRoute)
 	}
 }
 
@@ -1056,6 +1329,53 @@ func TestRewriteRequestModelForProvider_RewritesGenericJSONModelAndNoopsWhenUnch
 	}
 }
 
+func TestRewriteRequestModelForProviderFallsBackForCaseFoldedModelAlias(t *testing.T) {
+	body := []byte(`{"model":"public-model","Model":"shadow-model","messages":[{"role":"user","content":"hello"}]}`)
+	tests := []struct {
+		name    string
+		rewrite func() ([]byte, bool, error)
+	}{
+		{
+			name: "ordinary",
+			rewrite: func() ([]byte, bool, error) {
+				return rewriteRequestModelForProvider(body, "upstream-model")
+			},
+		},
+		{
+			name: "validated",
+			rewrite: func() ([]byte, bool, error) {
+				return rewriteRequestModelForProviderFromModelJSONValidated(body, "shadow-model", "upstream-model", json.RawMessage(`"upstream-model"`))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rewritten, changed, err := tt.rewrite()
+			if err != nil {
+				t.Fatalf("rewrite request model: %v", err)
+			}
+			if !changed {
+				t.Fatal("changed = false, want true")
+			}
+			var payload struct {
+				Model    string `json:"model"`
+				Messages []struct {
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.Unmarshal(rewritten, &payload); err != nil {
+				t.Fatalf("json.Unmarshal(rewritten) error = %v", err)
+			}
+			if payload.Model != "upstream-model" {
+				t.Fatalf("rewritten model = %q, want upstream-model; body=%s", payload.Model, rewritten)
+			}
+			if len(payload.Messages) != 1 || payload.Messages[0].Content != "hello" {
+				t.Fatalf("rewritten messages = %+v, want original content", payload.Messages)
+			}
+		})
+	}
+}
+
 func TestPostChatCompletions_UsesAzureClassicDeploymentURLAndKeepsPublicBodyModel(t *testing.T) {
 	var sawRequest bool
 	azureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1126,9 +1446,187 @@ func TestPostChatCompletions_UsesAzureClassicDeploymentURLAndKeepsPublicBodyMode
 // bytes, for exercising the passthrough/usage-sniff helpers directly.
 func fakeBodyResponse(body string) *http.Response {
 	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(body)),
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+}
+
+func TestWriteSmallKnownLengthPassthroughSniffingUsageHandlesLengthMismatches(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		body          string
+		contentLength int64
+		wantErr       bool
+	}{
+		{name: "exact", body: `{"ok":true}`, contentLength: int64(len(`{"ok":true}`))},
+		{name: "shorter than advertised", body: `{"ok":true}`, contentLength: 100, wantErr: true},
+		{name: "longer than advertised", body: `{"ok":true,"extra":true}`, contentLength: 4},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := fakeBodyResponse(tt.body)
+			resp.ContentLength = tt.contentLength
+			resp.Header.Set("Content-Length", strconv.FormatInt(tt.contentLength, 10))
+			w := httptest.NewRecorder()
+			err := writePassthroughSniffingUsage(w, resp, nil)
+			if tt.wantErr {
+				if !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("writePassthroughSniffingUsage() error = %v, want io.ErrUnexpectedEOF", err)
+				}
+				if w.Body.Len() != 0 {
+					t.Fatalf("body = %q, want no committed partial response", w.Body.String())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("writePassthroughSniffingUsage() error = %v", err)
+			}
+			if got := w.Body.String(); got != tt.body {
+				t.Fatalf("body = %q, want %q", got, tt.body)
+			}
+			if int64(len(tt.body)) > tt.contentLength && w.Header().Get("Content-Length") != "" {
+				t.Fatalf("Content-Length = %q, want removed after mismatch", w.Header().Get("Content-Length"))
+			}
+		})
+	}
+}
+
+func TestWritePassthroughSniffingUsageClearsStaleContentLengthOnRealServer(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		body          string
+		contentLength int64
+	}{
+		{name: "small", body: `{"ok":true}`, contentLength: 4},
+		{name: "general", body: strings.Repeat("x", usageSniffSmallBufferSize+32), contentLength: usageSniffSmallBufferSize},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			writeErr := make(chan error, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				resp := fakeBodyResponse(tt.body)
+				resp.ContentLength = tt.contentLength
+				resp.Header.Set("Content-Length", strconv.FormatInt(tt.contentLength, 10))
+				writeErr <- writePassthroughSniffingUsage(w, resp, nil)
+			}))
+			defer server.Close()
+
+			resp, err := server.Client().Get(server.URL)
+			if err != nil {
+				t.Fatalf("GET downstream response: %v", err)
+			}
+			got, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err := <-writeErr; err != nil {
+				t.Fatalf("writePassthroughSniffingUsage() error = %v", err)
+			}
+			if readErr != nil {
+				t.Fatalf("read downstream response: %v", readErr)
+			}
+			if string(got) != tt.body {
+				t.Fatalf("body length = %d, want %d", len(got), len(tt.body))
+			}
+			if resp.ContentLength == tt.contentLength {
+				t.Fatalf("downstream ContentLength = %d, stale advertised length was retained", resp.ContentLength)
+			}
+		})
+	}
+}
+
+func TestWriteDirectAnthropicJSONResponseClearsStaleContentLengthOnRealServer(t *testing.T) {
+	const body = `{"id":"msg","type":"message","model":"claude-public","content":[],"usage":{"input_tokens":1,"output_tokens":1}}`
+	const advertisedLength = 4
+
+	writeErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type":   []string{"application/json"},
+				"Content-Length": []string{strconv.Itoa(advertisedLength)},
+			},
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: advertisedLength,
+		}
+		writeErr <- writeDirectAnthropicJSONResponse(context.Background(), context.Background(), w, resp, "claude-public", "claude-public")
+	}))
+	defer server.Close()
+
+	resp, err := server.Client().Get(server.URL)
+	if err != nil {
+		t.Fatalf("GET downstream response: %v", err)
+	}
+	got, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err := <-writeErr; err != nil {
+		t.Fatalf("writeDirectAnthropicJSONResponse() error = %v", err)
+	}
+	if readErr != nil {
+		t.Fatalf("read downstream response: %v", readErr)
+	}
+	if string(got) != body {
+		t.Fatalf("body = %q, want %q", got, body)
+	}
+	if resp.ContentLength == advertisedLength {
+		t.Fatalf("downstream ContentLength = %d, stale advertised length was retained", resp.ContentLength)
+	}
+}
+
+func TestBorrowUsageSniffBufferSelectsSizeTier(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		contentLength int64
+		wantCapacity  int
+	}{
+		{name: "tiny", contentLength: usageSniffTinyBufferSize - 1, wantCapacity: usageSniffTinyBufferSize},
+		{name: "small", contentLength: usageSniffTinyBufferSize, wantCapacity: usageSniffSmallBufferSize},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			buffer := borrowUsageSniffBuffer(tt.contentLength)
+			defer releaseUsageSniffBuffer(buffer)
+			if got := cap(*buffer); got != tt.wantCapacity {
+				t.Fatalf("buffer capacity = %d, want %d", got, tt.wantCapacity)
+			}
+		})
+	}
+}
+
+type bytesAndErrorReadCloser struct {
+	body []byte
+	err  error
+	done bool
+}
+
+func (r *bytesAndErrorReadCloser) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, r.err
+	}
+	r.done = true
+	return copy(p, r.body), r.err
+}
+
+func (*bytesAndErrorReadCloser) Close() error { return nil }
+
+func TestWriteSmallKnownLengthPassthroughSniffingUsageCapturesCancellationWithBytes(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(errProxyLifecycleShutdown)
+	body := []byte(`{"ok":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          &bytesAndErrorReadCloser{body: body, err: context.Canceled},
+		ContentLength: int64(len(body) - 1),
+		Request:       req,
+	}
+
+	err := writePassthroughSniffingUsage(httptest.NewRecorder(), resp, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("writePassthroughSniffingUsage() error = %v, want context.Canceled", err)
+	}
+	var writeErr *responseBodyWriteError
+	if !errors.As(err, &writeErr) || !writeErr.cancellationAtFailure || !writeErr.upstream || writeErr.committed {
+		t.Fatalf("responseBodyWriteError = %#v, want precommit upstream lifecycle cancellation", writeErr)
 	}
 }
 

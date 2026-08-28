@@ -22,6 +22,7 @@ type chatCompletionsMode struct {
 	clientRequestedStream      bool
 	clientRequestedStreamUsage bool
 	forceUpstreamStream        bool
+	requestHasTools            bool
 	// injectedStreamUsage is true when the proxy added stream_options.include_usage
 	// to a streamed upstream request. If a strict OpenAI-compatible provider rejects
 	// that optional field with 400, the request can be retried once without it.
@@ -31,6 +32,14 @@ type chatCompletionsMode struct {
 	// in. On the verbatim OpenAI passthrough the resulting upstream usage-only
 	// chunk must be dropped from the client stream (it never requested it).
 	injectedClientStreamUsage bool
+}
+
+type openAIChatRequestInspection struct {
+	modelRaw []byte
+	message  string
+	param    string
+	invalid  bool
+	mode     chatCompletionsMode
 }
 
 type chatCompletionsResponseHandlers struct {
@@ -465,7 +474,7 @@ func (h *ProxyHandler) executeChatCompletionsRouteRequestForModel(ctx context.Co
 
 func (h *ProxyHandler) executeAnthropicMessagesRouteRequest(ctx context.Context, body []byte, headers http.Header, streaming bool, model string) (*http.Response, error) {
 	send := func(attemptCtx context.Context) (*http.Response, error) {
-		return h.postJSONEndpointWithHeadersForModel(attemptCtx, providerEndpointMessages, body, headers, model)
+		return h.postJSONEndpointWithHeadersForModelValidated(attemptCtx, providerEndpointMessages, body, headers, model)
 	}
 	return h.executeExplicitRouteSurfaceRequest(ctx, providerEndpointMessages, streaming, explicitRouteStreamAnthropic, send)
 }
@@ -1338,7 +1347,7 @@ func (h *ProxyHandler) executeChatCompletionsForRequestedModel(ctx context.Conte
 
 	var result chatExecutionResult
 	if route.backend == chatBackendNativeChat {
-		result, err = h.executeResolvedNativeChat(ctx, route, body, options)
+		result, err = h.executeResolvedNativeChat(ctx, route, body)
 	} else {
 		result, err = h.executeResolvedResponsesChat(ctx, route, body, options)
 	}
@@ -1474,6 +1483,20 @@ func (h *ProxyHandler) aggregateExplicitRoutedChatExecution(ctx context.Context,
 }
 
 func parseOpenAIChatCompletionsMode(body []byte) chatCompletionsMode {
+	if mode, ok := parseOpenAIChatCompletionsModeFast(body); ok {
+		return mode
+	}
+	return parseOpenAIChatCompletionsModeWithJSON(body)
+}
+
+func parseOpenAIChatCompletionsModeValidated(body []byte) chatCompletionsMode {
+	if mode, ok := parseOpenAIChatCompletionsModeFastValidated(body); ok {
+		return mode
+	}
+	return parseOpenAIChatCompletionsModeWithJSON(body)
+}
+
+func parseOpenAIChatCompletionsModeWithJSON(body []byte) chatCompletionsMode {
 	var partial struct {
 		Stream        *bool                 `json:"stream,omitempty"`
 		StreamOptions *models.StreamOptions `json:"stream_options,omitempty"`
@@ -1485,15 +1508,258 @@ func parseOpenAIChatCompletionsMode(body []byte) chatCompletionsMode {
 	_ = json.Unmarshal(body, &partial)
 
 	clientRequestedStream := partial.Stream != nil && *partial.Stream
+	requestHasTools := hasNonEmptyTools(partial.Tools)
 	return chatCompletionsMode{
 		clientRequestedStream:      clientRequestedStream,
 		clientRequestedStreamUsage: clientRequestedStream && partial.StreamOptions != nil && partial.StreamOptions.IncludeUsage,
-		forceUpstreamStream:        !clientRequestedStream && hasNonEmptyTools(partial.Tools),
+		forceUpstreamStream:        !clientRequestedStream && requestHasTools,
+		requestHasTools:            requestHasTools,
+	}
+}
+
+func parseOpenAIChatCompletionsModeFast(body []byte) (chatCompletionsMode, bool) {
+	if !json.Valid(body) {
+		return chatCompletionsMode{}, false
+	}
+	return parseOpenAIChatCompletionsModeFastValidated(body)
+}
+
+func parseOpenAIChatCompletionsModeFastValidated(body []byte) (chatCompletionsMode, bool) {
+	object, ok := newRawJSONObjectScanner(body)
+	if !ok {
+		return chatCompletionsMode{}, false
+	}
+	var stream, streamOptions, tools []byte
+	var streamSeen, streamOptionsSeen, toolsSeen bool
+	for {
+		key, start, end, done, scanOK := object.next()
+		if !scanOK {
+			return chatCompletionsMode{}, false
+		}
+		if done {
+			break
+		}
+		switch {
+		case rawJSONKeyEqual(key, "stream"):
+			if streamSeen {
+				return chatCompletionsMode{}, false
+			}
+			streamSeen = true
+			stream = body[start:end]
+		case rawJSONKeyEqual(key, "stream_options"):
+			if streamOptionsSeen {
+				return chatCompletionsMode{}, false
+			}
+			streamOptionsSeen = true
+			streamOptions = body[start:end]
+		case rawJSONKeyEqual(key, "tools"):
+			if toolsSeen {
+				return chatCompletionsMode{}, false
+			}
+			toolsSeen = true
+			tools = body[start:end]
+		default:
+			// encoding/json struct fields match case-insensitively. Preserve that
+			// uncommon compatibility behavior through the existing decoder path.
+			if rawJSONKeyEqualFold(key, "stream") || rawJSONKeyEqualFold(key, "stream_options") || rawJSONKeyEqualFold(key, "tools") {
+				return chatCompletionsMode{}, false
+			}
+		}
+	}
+
+	return parseOpenAIChatCompletionsModeRaw(stream, streamOptions, tools)
+}
+
+func parseOpenAIChatCompletionsModeRaw(stream, streamOptions, tools []byte) (chatCompletionsMode, bool) {
+	clientRequestedStream := false
+	if len(stream) > 0 {
+		switch string(bytes.TrimSpace(stream)) {
+		case "true":
+			clientRequestedStream = true
+		case "false", "null":
+		default:
+			return chatCompletionsMode{}, false
+		}
+	}
+	requestHasTools := false
+	if len(tools) > 0 {
+		requestHasTools, _ = rawJSONHasNonEmptyArrayFast(tools)
+	}
+	includeUsage := false
+	if clientRequestedStream && len(streamOptions) > 0 {
+		var streamOptionsOK bool
+		includeUsage, streamOptionsOK = rawJSONStreamOptionsIncludeUsageFast(streamOptions)
+		if !streamOptionsOK {
+			return chatCompletionsMode{}, false
+		}
+	}
+	return chatCompletionsMode{
+		clientRequestedStream:      clientRequestedStream,
+		clientRequestedStreamUsage: clientRequestedStream && includeUsage,
+		forceUpstreamStream:        !clientRequestedStream && requestHasTools,
+		requestHasTools:            requestHasTools,
+	}, true
+}
+
+func inspectOpenAIChatRequestFast(body []byte) (openAIChatRequestInspection, bool) {
+	object, ok := newStrictRawJSONObjectScanner(body)
+	if !ok {
+		return openAIChatRequestInspection{}, false
+	}
+	return inspectOpenAIChatRequestFastWithScanner(body, &object)
+}
+
+func inspectOpenAIChatRequestFastValidated(body []byte) (openAIChatRequestInspection, bool) {
+	object, ok := newRawJSONObjectScanner(body)
+	if !ok {
+		return openAIChatRequestInspection{}, false
+	}
+	return inspectOpenAIChatRequestFastWithScanner(body, &object)
+}
+
+func inspectOpenAIChatRequestFastWithScanner(body []byte, object *rawJSONObjectScanner) (openAIChatRequestInspection, bool) {
+	var model, messages, toolChoice, tools, responseFormat, stream, streamOptions []byte
+	var streamSeen, streamOptionsSeen, toolsSeen bool
+	for {
+		key, start, end, done, scanOK := object.next()
+		if !scanOK {
+			return openAIChatRequestInspection{}, false
+		}
+		if done {
+			break
+		}
+		value := body[start:end]
+		switch {
+		case rawJSONKeyEqual(key, "model"):
+			model = value
+		case rawJSONKeyEqual(key, "messages"):
+			messages = value
+		case rawJSONKeyEqual(key, "tool_choice"):
+			toolChoice = value
+		case rawJSONKeyEqual(key, "tools"):
+			if toolsSeen {
+				return openAIChatRequestInspection{}, false
+			}
+			toolsSeen = true
+			tools = value
+		case rawJSONKeyEqual(key, "response_format"):
+			responseFormat = value
+		case rawJSONKeyEqual(key, "stream"):
+			if streamSeen {
+				return openAIChatRequestInspection{}, false
+			}
+			streamSeen = true
+			stream = value
+		case rawJSONKeyEqual(key, "stream_options"):
+			if streamOptionsSeen {
+				return openAIChatRequestInspection{}, false
+			}
+			streamOptionsSeen = true
+			streamOptions = value
+		default:
+			if rawJSONKeyEqualFold(key, "stream") || rawJSONKeyEqualFold(key, "stream_options") || rawJSONKeyEqualFold(key, "tools") {
+				return openAIChatRequestInspection{}, false
+			}
+		}
+	}
+
+	mode, ok := parseOpenAIChatCompletionsModeRaw(stream, streamOptions, tools)
+	if !ok {
+		return openAIChatRequestInspection{}, false
+	}
+	message, param, invalid := validateOpenAIChatRequestRaw(messages, toolChoice, tools, responseFormat)
+	return openAIChatRequestInspection{
+		modelRaw: model,
+		message:  message,
+		param:    param,
+		invalid:  invalid,
+		mode:     mode,
+	}, true
+}
+
+func decodeRequestModelRaw(raw []byte) string {
+	raw = bytes.TrimSpace(raw)
+	contentStart, contentEnd, end, escaped, ok := scanRawJSONString(raw, 0)
+	if !ok || end != len(raw) {
+		return ""
+	}
+	if !escaped {
+		return strings.TrimSpace(string(raw[contentStart:contentEnd]))
+	}
+	var model string
+	if err := json.Unmarshal(raw, &model); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(model)
+}
+
+func (h *ProxyHandler) decodeInternedRequestModelRaw(raw []byte) string {
+	raw = bytes.TrimSpace(raw)
+	contentStart, contentEnd, end, escaped, ok := scanRawJSONString(raw, 0)
+	if !ok || end != len(raw) {
+		return ""
+	}
+	if escaped {
+		return decodeRequestModelRaw(raw)
+	}
+	content := bytes.TrimSpace(raw[contentStart:contentEnd])
+	if len(content) == 0 {
+		return ""
+	}
+	if model, ok := h.providerSetup().internExactPublicModel(content); ok {
+		return model
+	}
+	return string(content)
+}
+
+func rawJSONStreamOptionsIncludeUsageFast(raw []byte) (bool, bool) {
+	raw = bytes.TrimSpace(raw)
+	if bytes.Equal(raw, []byte("null")) {
+		return false, true
+	}
+	object, ok := newRawJSONObjectScanner(raw)
+	if !ok {
+		return false, false
+	}
+	var includeUsage []byte
+	includeUsageSeen := false
+	for {
+		key, start, end, done, scanOK := object.next()
+		if !scanOK {
+			return false, false
+		}
+		if done {
+			break
+		}
+		if rawJSONKeyEqual(key, "include_usage") {
+			if includeUsageSeen {
+				return false, false
+			}
+			includeUsageSeen = true
+			includeUsage = raw[start:end]
+		} else if rawJSONKeyEqualFold(key, "include_usage") {
+			return false, false
+		}
+	}
+	if len(includeUsage) == 0 {
+		return false, true
+	}
+	switch string(bytes.TrimSpace(includeUsage)) {
+	case "true":
+		return true, true
+	case "false", "null":
+		return false, true
+	default:
+		return false, false
 	}
 }
 
 func prepareOpenAIChatCompletionsRequest(body []byte) ([]byte, chatCompletionsMode) {
-	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, chatParallelToolCallsDefault)
+	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, chatParallelToolCallsDefault, false)
+}
+
+func prepareOpenAIChatCompletionsRequestValidated(body []byte) ([]byte, chatCompletionsMode) {
+	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, chatParallelToolCallsDefault, true)
 }
 
 type chatParallelToolCallsPreparation uint8
@@ -1505,7 +1771,11 @@ const (
 )
 
 func preparePolicyOpenAIChatCompletionsRequest(body []byte, contract publicModelContract, terminalParallelToolCalls *bool) ([]byte, chatCompletionsMode) {
-	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, policyParallelToolCallsPreparation(contract, terminalParallelToolCalls))
+	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, policyParallelToolCallsPreparation(contract, terminalParallelToolCalls), false)
+}
+
+func preparePolicyOpenAIChatCompletionsRequestValidated(body []byte, contract publicModelContract, terminalParallelToolCalls *bool) ([]byte, chatCompletionsMode) {
+	return prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body, policyParallelToolCallsPreparation(contract, terminalParallelToolCalls), true)
 }
 
 func applyPolicyOpenAIChatParallelToolCalls(body []byte, contract publicModelContract, terminalParallelToolCalls *bool) []byte {
@@ -1530,15 +1800,26 @@ func policyParallelToolCallsPreparation(contract publicModelContract, terminalPa
 	return preparation
 }
 
-func prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body []byte, preparation chatParallelToolCallsPreparation) ([]byte, chatCompletionsMode) {
-	mode := parseOpenAIChatCompletionsMode(body)
+func prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body []byte, preparation chatParallelToolCallsPreparation, validated bool) ([]byte, chatCompletionsMode) {
+	var mode chatCompletionsMode
+	if validated {
+		mode = parseOpenAIChatCompletionsModeValidated(body)
+	} else {
+		mode = parseOpenAIChatCompletionsMode(body)
+	}
+	return prepareOpenAIChatCompletionsRequestWithMode(body, preparation, mode)
+}
+
+func prepareOpenAIChatCompletionsRequestWithMode(body []byte, preparation chatParallelToolCallsPreparation, mode chatCompletionsMode) ([]byte, chatCompletionsMode) {
 	switch preparation {
 	case chatParallelToolCallsForceFalse:
 		body = enforceParallelToolCallsFalse(body)
 	case chatParallelToolCallsOmit:
 		body = omitParallelToolCalls(body)
 	default:
-		body = injectParallelToolCalls(body)
+		if mode.requestHasTools {
+			body = injectParallelToolCalls(body)
+		}
 	}
 	if mode.forceUpstreamStream {
 		body = injectForceStream(body)
@@ -1561,6 +1842,20 @@ func prepareOpenAIChatCompletionsRequestWithParallelToolCalls(body []byte, prepa
 // semantics used by chat preparation: when a request contains duplicate model
 // keys, the last occurrence is the decoded value.
 func extractOpenAIChatCompletionsRequestModel(body []byte) string {
+	if model, _, ok := extractTopLevelJSONStringFast(body, "model", true); ok {
+		return model
+	}
+	return extractOpenAIChatCompletionsRequestModelWithJSON(body)
+}
+
+func extractOpenAIChatCompletionsRequestModelValidated(body []byte) string {
+	if model, _, ok := extractTopLevelJSONStringFastValidated(body, "model", true); ok {
+		return model
+	}
+	return extractOpenAIChatCompletionsRequestModelWithJSON(body)
+}
+
+func extractOpenAIChatCompletionsRequestModelWithJSON(body []byte) string {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return ""
@@ -1655,13 +1950,43 @@ func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 		"Anthropic-Beta",
 		"Anthropic-Dangerous-Direct-Browser-Access",
 	} {
-		for _, value := range r.Header.Values(name) {
-			if trimmed := strings.TrimSpace(value); trimmed != "" {
-				if headers == nil {
-					headers = make(http.Header, 2)
+		values := r.Header.Values(name)
+		if len(values) == 0 {
+			continue
+		}
+		trimmedValues := values
+		borrowed := true
+		kept := 0
+		for index, value := range values {
+			trimmed := strings.TrimSpace(value)
+			if trimmed == "" {
+				if borrowed {
+					trimmedValues = make([]string, 0, len(values))
+					trimmedValues = append(trimmedValues, values[:index]...)
+					borrowed = false
 				}
-				headers.Add(name, trimmed)
+				continue
 			}
+			if trimmed != value && borrowed {
+				trimmedValues = make([]string, 0, len(values))
+				trimmedValues = append(trimmedValues, values[:index]...)
+				borrowed = false
+			}
+			if !borrowed {
+				trimmedValues = append(trimmedValues, trimmed)
+			}
+			kept++
+		}
+		if kept == 0 {
+			continue
+		}
+		if headers == nil {
+			headers = make(http.Header, 3)
+		}
+		if borrowed {
+			headers[name] = values[:len(values):len(values)]
+		} else {
+			headers[name] = trimmedValues[:len(trimmedValues):len(trimmedValues)]
 		}
 	}
 	return headers
@@ -1669,6 +1994,10 @@ func anthropicExtraHeadersFromRequest(r *http.Request) http.Header {
 
 func (h *ProxyHandler) shouldForwardAnthropicMessagesDirect(model string) bool {
 	provider, owner, known := h.resolveProviderModelForRequest(model, providerEndpointMessages)
+	return shouldForwardAnthropicMessagesDirectResolved(provider, owner, known)
+}
+
+func shouldForwardAnthropicMessagesDirectResolved(provider *providerRuntime, owner providerModel, known bool) bool {
 	if provider == nil {
 		return false
 	}
@@ -1689,9 +2018,8 @@ func (h *ProxyHandler) shouldForwardAnthropicCountTokensDirect(model string) boo
 	return provider != nil && provider.kind == providerTypeAnthropicCompatible
 }
 
-func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *http.Request, body []byte, req *models.AnthropicRequest) {
+func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *http.Request, body []byte, req *models.AnthropicRequest, publicModel, upstreamModel string) {
 	streaming := req != nil && req.Stream
-	publicModel, upstreamModel := h.directAnthropicResponseModels(req)
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), streaming)
 	defer upstreamCancel()
@@ -1764,8 +2092,8 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokensForModel(ctx context.Cont
 		}
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
-		return h.newProviderJSONRequest(ctx, provider, http.MethodPost, providerEndpointMessagesCount, rewrittenBody, extraHeaders, "", owner)
+	return h.doInferenceWithRetry(func() (*http.Request, error) {
+		return h.newProviderJSONInferenceRequest(ctx, provider, http.MethodPost, providerEndpointMessagesCount, rewrittenBody, extraHeaders, "", owner)
 	})
 }
 
@@ -1816,9 +2144,13 @@ func (h *ProxyHandler) directAnthropicResponseModels(req *models.AnthropicReques
 	if req == nil {
 		return "", ""
 	}
-	publicModel := strings.TrimSpace(req.Model)
-	upstreamModel := publicModel
 	_, owner, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
+	return directAnthropicResponseModelsResolved(req.Model, owner, known)
+}
+
+func directAnthropicResponseModelsResolved(model string, owner providerModel, known bool) (string, string) {
+	publicModel := strings.TrimSpace(model)
+	upstreamModel := publicModel
 	if !known {
 		return publicModel, upstreamModel
 	}
@@ -1969,7 +2301,10 @@ func translateOpenAIToAnthropicForRequest(resp *models.OpenAIResponse, req *mode
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
 // request to OpenAI format, forwarding to Copilot, and translating the response back.
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
-	body, err := readBody(r)
+	body, pooledBody, err := readBodyBorrowed(r)
+	if pooledBody != nil {
+		defer releaseSmallRequestBodyBuffer(pooledBody)
+	}
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
 			return
@@ -1980,7 +2315,14 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 	defer func() { _ = r.Body.Close() }()
 
-	admissionModel := extractOpenAIChatCompletionsRequestModel(body)
+	var req models.AnthropicRequest
+	decodeErr := json.Unmarshal(body, &req)
+	admissionModel := req.Model
+	if decodeErr != nil {
+		// Preserve early explicit-route admission and error precedence for typed
+		// decode failures without making successful requests scan the body twice.
+		admissionModel = extractOpenAIChatCompletionsRequestModel(body)
+	}
 	h.observePolicyRequestSummary(r.Context(), "anthropic", admissionModel, false)
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), admissionModel, providerEndpointMessages)
 	if err != nil {
@@ -1993,9 +2335,8 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
 	}
 
-	var req models.AnthropicRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		message, _ := jsonDecodeErrorDetails(err, "invalid JSON in request body")
+	if decodeErr != nil {
+		message, _ := jsonDecodeErrorDetails(decodeErr, "invalid JSON in request body")
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", message)
 		return
 	}
@@ -2020,14 +2361,16 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	h.log.Debug("anthropic request",
-		logger.F("model", req.Model),
-		logger.F("stream", req.Stream),
-		logger.F("messages", len(req.Messages)),
-		logger.F("tools", len(req.Tools)),
-	)
+	if h.log != nil && h.log.Enabled(logger.LevelDebug) {
+		h.log.Debug("anthropic request",
+			logger.F("model", req.Model),
+			logger.F("stream", req.Stream),
+			logger.F("messages", len(req.Messages)),
+			logger.F("tools", len(req.Tools)),
+		)
+	}
 
-	provider, _, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
+	provider, owner, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
 	if strings.TrimSpace(req.Model) != "" && !known && providerUsesDynamicModels(provider) {
 		if err := h.refreshUnknownChatRouteProvider(r.Context(), provider); err != nil {
 			if h.handleShutdownError(w, r, r.Context(), err) {
@@ -2037,9 +2380,10 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
 			return
 		}
+		provider, owner, known = h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
 	}
 
-	directAnthropic := h.shouldForwardAnthropicMessagesDirect(req.Model)
+	directAnthropic := shouldForwardAnthropicMessagesDirectResolved(provider, owner, known)
 	providerEndpoint := providerEndpointChatCompletions
 	providerModel := req.Model
 	if directAnthropic {
@@ -2061,7 +2405,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 				return
 			}
 		}
-		h.forwardAnthropicMessagesDirect(w, r, body, &req)
+		body = detachBorrowedRequestBody(body, pooledBody)
+		directPublicModel, directUpstreamModel := directAnthropicResponseModelsResolved(req.Model, owner, known)
+		h.forwardAnthropicMessagesDirect(w, r, body, &req, directPublicModel, directUpstreamModel)
 		return
 	}
 
@@ -2190,7 +2536,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	result, oaiBody, mode = h.retryRoutedChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, oaiBody, mode, providerModel)
 	observeChatExecutionRoute(r.Context(), result)
 	result.observeUpstreamError(r.Context())
-	observeUpstreamHeaders(r.Context(), result.Headers)
+	observeUpstreamHeaders(r.Context(), chatExecutionUpstreamHeaders(result))
 	if result.Backend == chatBackendResponses && len(result.Headers) > 0 {
 		if policyPlan.valid() {
 			result.Headers = policyChatSafeHeaders(result.Headers, publicModel)
@@ -2900,7 +3246,10 @@ func writePolicyChatTerminalError(w http.ResponseWriter, resp *http.Response, pu
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
 // request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, err := readBody(r)
+	bodyBytes, pooledBody, err := readBodyBorrowed(r)
+	if pooledBody != nil {
+		defer releaseSmallRequestBodyBuffer(pooledBody)
+	}
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
 			return
@@ -2910,7 +3259,22 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
-	requestedModel := extractOpenAIChatCompletionsRequestModel(bodyBytes)
+	requestInspection, requestInspectionOK := inspectOpenAIChatRequestFast(bodyBytes)
+	requestJSONValid := requestInspectionOK
+	var requestedModel string
+	if !requestInspectionOK {
+		requestJSONValid = json.Valid(bodyBytes)
+		if requestJSONValid {
+			requestInspection, requestInspectionOK = inspectOpenAIChatRequestFastValidated(bodyBytes)
+		}
+	}
+	if requestInspectionOK {
+		requestedModel = h.decodeInternedRequestModelRaw(requestInspection.modelRaw)
+	} else if requestJSONValid {
+		requestedModel = extractOpenAIChatCompletionsRequestModelValidated(bodyBytes)
+	} else {
+		requestedModel = extractOpenAIChatCompletionsRequestModel(bodyBytes)
+	}
 	h.observePolicyRequestSummary(r.Context(), "openai_chat", requestedModel, false)
 	publicModel := requestedModel
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointChatCompletions)
@@ -2928,7 +3292,16 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		return
 	}
 
-	if message, param, ok := validateOpenAIChatRequest(bodyBytes); ok {
+	var message, param string
+	var invalid bool
+	if requestInspectionOK {
+		message, param, invalid = requestInspection.message, requestInspection.param, requestInspection.invalid
+	} else if requestJSONValid {
+		message, param, invalid = validateOpenAIChatRequestValidated(bodyBytes)
+	} else {
+		message, param, invalid = validateOpenAIChatRequest(bodyBytes)
+	}
+	if invalid {
 		writeOpenAIErrorWithDetails(w, http.StatusBadRequest, message, "invalid_request_error", param, "")
 		return
 	}
@@ -2968,9 +3341,21 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	scope := chatToolExecutionScopeFromHeaders(r.Header)
 	var mode chatCompletionsMode
 	if policyPlan.valid() {
-		bodyBytes, mode = preparePolicyOpenAIChatCompletionsRequest(bodyBytes, policyPlan.contract, terminalParallelToolCalls)
+		if requestInspectionOK {
+			bodyBytes, mode = prepareOpenAIChatCompletionsRequestWithMode(bodyBytes, policyParallelToolCallsPreparation(policyPlan.contract, terminalParallelToolCalls), requestInspection.mode)
+		} else if requestJSONValid {
+			bodyBytes, mode = preparePolicyOpenAIChatCompletionsRequestValidated(bodyBytes, policyPlan.contract, terminalParallelToolCalls)
+		} else {
+			bodyBytes, mode = preparePolicyOpenAIChatCompletionsRequest(bodyBytes, policyPlan.contract, terminalParallelToolCalls)
+		}
 	} else {
-		bodyBytes, mode = prepareOpenAIChatCompletionsRequest(bodyBytes)
+		if requestInspectionOK {
+			bodyBytes, mode = prepareOpenAIChatCompletionsRequestWithMode(bodyBytes, chatParallelToolCallsDefault, requestInspection.mode)
+		} else if requestJSONValid {
+			bodyBytes, mode = prepareOpenAIChatCompletionsRequestValidated(bodyBytes)
+		} else {
+			bodyBytes, mode = prepareOpenAIChatCompletionsRequest(bodyBytes)
+		}
 	}
 	h.observeRequestSummary(r.Context(), "openai_chat", publicModel, mode.clientRequestedStream, providerEndpointChatCompletions)
 	bodyBytes = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), bodyBytes, h.toolContexts, scope)
@@ -3006,6 +3391,10 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 
 	responseModel := explicitRoutePublicModel(route, publicModel)
+	// RoundTripper may finish closing or reading a request body asynchronously
+	// after RoundTrip returns. Detach a borrowed inbound buffer before handing it
+	// to upstream code so the handler can safely return that buffer to its pool.
+	bodyBytes = detachBorrowedRequestBody(bodyBytes, pooledBody)
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, chatExecutionOptions{}, requestedModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
@@ -3045,7 +3434,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	result, bodyBytes, mode = h.retryRoutedChatExecutionWithoutInjectedStreamOptions(upstreamCtx, result, bodyBytes, mode, requestedModel)
 	observeChatExecutionRoute(r.Context(), result)
 	result.observeUpstreamError(r.Context())
-	observeUpstreamHeaders(r.Context(), result.Headers)
+	observeUpstreamHeaders(r.Context(), chatExecutionUpstreamHeaders(result))
 	if policyPlan.valid() && result.Backend == chatBackendResponses && len(result.Headers) > 0 {
 		// routeChatExecutionResult merges Responses-backed headers before its
 		// protocol-specific callbacks run. Replace them with the policy allowlist
@@ -3232,6 +3621,71 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 }
 
 func validateOpenAIChatRequest(body []byte) (string, string, bool) {
+	if message, param, invalid, ok := validateOpenAIChatRequestFast(body); ok {
+		return message, param, invalid
+	}
+	return validateOpenAIChatRequestWithJSON(body)
+}
+
+func validateOpenAIChatRequestValidated(body []byte) (string, string, bool) {
+	if message, param, invalid, ok := validateOpenAIChatRequestFastValidated(body); ok {
+		return message, param, invalid
+	}
+	return validateOpenAIChatRequestWithJSON(body)
+}
+
+func validateOpenAIChatRequestFast(body []byte) (message, param string, invalid, ok bool) {
+	if !json.Valid(body) {
+		return "", "", false, false
+	}
+	return validateOpenAIChatRequestFastValidated(body)
+}
+
+func validateOpenAIChatRequestFastValidated(body []byte) (message, param string, invalid, ok bool) {
+	object, scanOK := newRawJSONObjectScanner(body)
+	if !scanOK {
+		return "", "", false, false
+	}
+	var messages, toolChoice, tools, responseFormat []byte
+	for {
+		key, start, end, done, fieldOK := object.next()
+		if !fieldOK {
+			return "", "", false, false
+		}
+		if done {
+			break
+		}
+		switch {
+		case rawJSONKeyEqual(key, "messages"):
+			messages = body[start:end]
+		case rawJSONKeyEqual(key, "tool_choice"):
+			toolChoice = body[start:end]
+		case rawJSONKeyEqual(key, "tools"):
+			tools = body[start:end]
+		case rawJSONKeyEqual(key, "response_format"):
+			responseFormat = body[start:end]
+		}
+	}
+	message, param, invalid = validateOpenAIChatRequestRaw(messages, toolChoice, tools, responseFormat)
+	return message, param, invalid, true
+}
+
+func validateOpenAIChatRequestRaw(messages, toolChoice, tools, responseFormat []byte) (message, param string, invalid bool) {
+	messagesPresent, _ := rawJSONHasNonEmptyArrayFast(messages)
+	if !messagesPresent {
+		return "messages must be a non-empty array", "messages", true
+	}
+	toolsPresent, _ := rawJSONHasNonEmptyArrayFast(tools)
+	if len(toolChoice) > 0 && openAIToolChoiceRequiresTools(toolChoice) && !toolsPresent {
+		return "tool_choice requires non-empty tools", "tool_choice", true
+	}
+	if len(responseFormat) > 0 && responseFormatMissingJSONSchema(responseFormat) {
+		return "response_format json_schema requires json_schema.schema", "response_format.json_schema.schema", true
+	}
+	return "", "", false
+}
+
+func validateOpenAIChatRequestWithJSON(body []byte) (string, string, bool) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return "", "", false

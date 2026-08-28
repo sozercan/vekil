@@ -177,19 +177,20 @@ func ValidateProvidersConfig(cfg ProvidersConfig) error {
 	return err
 }
 
-// ValidateProvidersConfigFile strictly decodes and validates a provider
-// configuration without starting the server or contacting upstream endpoints.
-func ValidateProvidersConfigFile(path string) error {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return configPathError("providers_config", "path is required")
+// ValidateProvidersConfigFile strictly decodes and validates a local or remote
+// provider configuration without starting the server or contacting provider
+// discovery or inference endpoints.
+func ValidateProvidersConfigFile(source string) error {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return configPathError("providers_config", "source is required")
 	}
-	cfg, err := LoadProvidersConfigFile(path)
+	cfg, err := LoadProvidersConfigFile(source)
 	if err != nil {
 		return err
 	}
 	if err := ValidateProvidersConfig(cfg); err != nil {
-		return fmt.Errorf("validate providers config %q: %w", path, err)
+		return fmt.Errorf("validate providers config %q: %w", ProvidersConfigSourceDisplay(source), err)
 	}
 	return nil
 }
@@ -1207,9 +1208,10 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 				return nil, configPathError(fmt.Sprintf("model_routes[%d].targets[%d].provider", routeIndex, targetIndex), "references unknown provider %q", targetCfg.Provider)
 			}
 			targets = append(targets, targetBinding{
-				id:            targetCfg.ID,
-				provider:      provider,
-				upstreamModel: targetCfg.UpstreamModel,
+				id:                targetCfg.ID,
+				provider:          provider,
+				upstreamModel:     targetCfg.UpstreamModel,
+				upstreamModelJSON: encodeProviderModelJSON(targetCfg.UpstreamModel),
 				wirePolicy: providerRequestPolicy{
 					useMaxCompletionTokens: targetCfg.UseMaxCompletionTokens != nil && *targetCfg.UseMaxCompletionTokens,
 				},

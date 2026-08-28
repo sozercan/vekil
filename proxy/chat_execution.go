@@ -109,7 +109,7 @@ func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []by
 	}
 	var result chatExecutionResult
 	if route.backend == chatBackendNativeChat {
-		result, err = h.executeResolvedNativeChat(ctx, route, chatBody, options)
+		result, err = h.executeResolvedNativeChat(ctx, route, chatBody)
 	} else {
 		result, err = h.executeResolvedResponsesChat(ctx, route, chatBody, options)
 	}
@@ -133,6 +133,13 @@ func rawJSONFieldsExactOrFold(object map[string]json.RawMessage, name string) []
 }
 
 func chatRequestContainsResponsesReplayID(body []byte) bool {
+	// Replay IDs are proxy-owned and always carry this literal prefix. Avoid
+	// decoding the full message tree on ordinary Chat requests, which make up the
+	// overwhelmingly common native-Chat path.
+	if !bytes.Contains(body, []byte(responsesChatReplayCallIDPrefix)) && !bytes.Contains(body, []byte(`\u`)) {
+		return false
+	}
+
 	var request map[string]json.RawMessage
 	if json.Unmarshal(body, &request) != nil {
 		return false
@@ -186,8 +193,8 @@ func chatRequestContainsResponsesReplayID(body []byte) bool {
 	return false
 }
 
-func (h *ProxyHandler) executeResolvedNativeChat(ctx context.Context, route resolvedChatRoute, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
-	resp, err := h.postResolvedProviderRequest(ctx, route.provider, route.owner, providerEndpointChatCompletions, chatBody, nil)
+func (h *ProxyHandler) executeResolvedNativeChat(ctx context.Context, route resolvedChatRoute, chatBody []byte) (chatExecutionResult, error) {
+	resp, err := h.postResolvedProviderRequestForModel(ctx, route.provider, route.owner, providerEndpointChatCompletions, chatBody, nil, route.publicModel)
 	if err != nil {
 		return chatExecutionResult{}, err
 	}
@@ -298,7 +305,7 @@ func (h *ProxyHandler) retryResolvedNativeChat(ctx context.Context, prior chatEx
 	if prior.Backend != chatBackendNativeChat || prior.route.backend != chatBackendNativeChat || prior.route.provider == nil {
 		return chatExecutionResult{}, fmt.Errorf("native Chat retry requires a captured native Chat route")
 	}
-	return h.executeResolvedNativeChat(ctx, prior.route, chatBody, chatExecutionOptions{})
+	return h.executeResolvedNativeChat(ctx, prior.route, chatBody)
 }
 
 func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route resolvedChatRoute, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
@@ -570,6 +577,16 @@ func convertedChatSafeHeaders(src http.Header) http.Header {
 		return nil
 	}
 	return dst
+}
+
+func chatExecutionUpstreamHeaders(result chatExecutionResult) http.Header {
+	if len(result.Headers) > 0 {
+		return result.Headers
+	}
+	if result.Response != nil {
+		return result.Response.Header
+	}
+	return nil
 }
 
 func (h *ProxyHandler) routeChatExecutionResult(

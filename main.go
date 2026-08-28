@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -224,11 +225,19 @@ func runLogout(args []string) {
 	_, _ = fmt.Fprintln(os.Stderr, "Logged out. Vekil will not use GitHub CLI automatically until you run vekil login --github-cli.")
 }
 
-var errProvidersConfigRequired = errors.New("--providers-config PATH is required")
+var errProvidersConfigRequired = errors.New("--providers-config SOURCE is required")
 
 type configValidateOptions struct {
 	providersConfigPath string
 	live                bool
+}
+
+func registerProvidersConfigFlag(fs *flag.FlagSet, defaultValue string) *string {
+	value := fs.String("providers-config", defaultValue, "Path or HTTP(S) URL to JSON or YAML provider configuration")
+	if registered := fs.Lookup("providers-config"); registered != nil {
+		registered.DefValue = proxy.ProvidersConfigSourceDisplay(defaultValue)
+	}
+	return value
 }
 
 type configValidateDeps struct {
@@ -300,7 +309,7 @@ func runConfigValidateWithDeps(args []string, deps configValidateDeps) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(deps.stdout, "Providers config is valid: %s\n", opts.providersConfigPath)
+	_, _ = fmt.Fprintf(deps.stdout, "Providers config is valid: %s\n", proxy.ProvidersConfigSourceDisplay(opts.providersConfigPath))
 	return 0
 }
 
@@ -325,7 +334,7 @@ func parseConfigValidateOptions(args []string) (configValidateOptions, error) {
 	var opts configValidateOptions
 	fs := flag.NewFlagSet("config validate", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	providersConfigPath := fs.String("providers-config", "", "Path to JSON or YAML provider configuration")
+	providersConfigPath := registerProvidersConfigFlag(fs, "")
 	live := fs.Bool("live", false, "Run live policy-classifier protocol preflight for configured policy routes")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
@@ -343,19 +352,19 @@ func parseConfigValidateOptions(args []string) (configValidateOptions, error) {
 }
 
 func writeConfigUsage(w io.Writer) {
-	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config PATH [--live]")
+	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config SOURCE [--live]")
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "Commands:")
 	_, _ = fmt.Fprintln(w, "  validate    Validate a provider configuration without starting the server")
 }
 
 func writeConfigValidateUsage(w io.Writer) {
-	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config PATH [--live]")
+	_, _ = fmt.Fprintln(w, "Usage: vekil config validate --providers-config SOURCE [--live]")
 	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "Validate a provider configuration without starting the server. Validation is offline unless --live is set.")
+	_, _ = fmt.Fprintln(w, "Validate a provider configuration without starting the server. URL sources are fetched; provider discovery and inference remain offline unless --live is set.")
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "Options:")
-	_, _ = fmt.Fprintln(w, "  --providers-config PATH    Path to a JSON or YAML provider configuration (required)")
+	_, _ = fmt.Fprintln(w, "  --providers-config SOURCE  Path or HTTP(S) URL to a JSON or YAML provider configuration (required)")
 	_, _ = fmt.Fprintln(w, "  --live                     Run fixed policy-classifier protocol preflights")
 }
 
@@ -390,7 +399,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
-		providersConfigPath:             fs.String("providers-config", getEnv("PROVIDERS_CONFIG", ""), "Path to JSON or YAML provider configuration"),
+		providersConfigPath:             registerProvidersConfigFlag(fs, getEnv("PROVIDERS_CONFIG", "")),
 		policyRoutingMode:               fs.String("policy-routing", getPolicyRoutingModeEnv(), "Policy routing mode: config (follow providers YAML), off, observe, or enforce"),
 		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
@@ -620,6 +629,8 @@ func stopServeServer(srv serveLifecycleServer, log *logger.Logger) error {
 }
 
 func runServe() {
+	configureServeGC()
+
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -668,6 +679,18 @@ func runServe() {
 	if err := serveUntilContextDone(ctx, srv, authenticator, serveUsesCopilot(srv, providersCfg.UsesCopilot()), log); err != nil {
 		log.Fatal("serve error", logger.Err(err))
 	}
+}
+
+const defaultServeGCPercent = 200
+
+func configureServeGC() {
+	if shouldApplyServeGCDefault(os.Getenv("GOGC")) {
+		debug.SetGCPercent(defaultServeGCPercent)
+	}
+}
+
+func shouldApplyServeGCDefault(value string) bool {
+	return strings.TrimSpace(value) == ""
 }
 
 func getPolicyRoutingModeEnv() string {

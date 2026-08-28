@@ -85,6 +85,25 @@ func TestGetEnvDuration(t *testing.T) {
 	}
 }
 
+func TestShouldApplyServeGCDefault(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "unset or empty", want: true},
+		{name: "whitespace", value: "  ", want: true},
+		{name: "explicit percent", value: "100", want: false},
+		{name: "disabled", value: "off", want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldApplyServeGCDefault(tt.value); got != tt.want {
+				t.Fatalf("shouldApplyServeGCDefault(%q) = %t, want %t", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetEnvBool(t *testing.T) {
 	const envKey = "TEST_BOOL_VAR"
 
@@ -286,6 +305,30 @@ func TestServePolicyRoutingHelpDescribesConfigFollowingDefault(t *testing.T) {
 	}
 }
 
+func TestServeProvidersConfigHelpRedactsEnvironmentDefault(t *testing.T) {
+	source := "https://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret"
+	t.Setenv("PROVIDERS_CONFIG", source)
+
+	var output bytes.Buffer
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(&output)
+	serve := registerServeFlags(fs)
+	if got := *serve.providersConfigPath; got != source {
+		t.Fatalf("providers config default = %q, want original source", got)
+	}
+	fs.PrintDefaults()
+
+	help := output.String()
+	if !strings.Contains(help, "https://example.com/providers.yaml") {
+		t.Fatalf("serve help missing sanitized providers config default:\n%s", help)
+	}
+	for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+		if strings.Contains(help, secret) {
+			t.Fatalf("serve help exposes %q:\n%s", secret, help)
+		}
+	}
+}
+
 func TestServeFlagsRejectInvalidPolicyRoutingMode(t *testing.T) {
 	serve := parseServeFlagsForTest(t, "--policy-routing", "sometimes")
 	if _, err := serve.parsedPolicyRoutingMode(); err == nil {
@@ -317,6 +360,11 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 }
 
 func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	client := &http.Client{Transport: transport}
+	t.Cleanup(transport.CloseIdleConnections)
+
 	upstreamStarted := make(chan struct{})
 	upstreamCanceled := make(chan struct{})
 	releaseUpstream := make(chan struct{})
@@ -368,7 +416,7 @@ func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
 	for {
 		if addr := srv.Addr(); addr != "127.0.0.1:0" {
 			baseURL = "http://" + addr
-			resp, requestErr := http.Get(baseURL + "/healthz")
+			resp, requestErr := client.Get(baseURL + "/healthz")
 			if requestErr == nil {
 				_ = resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
@@ -394,7 +442,7 @@ func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
 	}
 	requestDone := make(chan requestResult, 1)
 	go func() {
-		resp, requestErr := http.Post(
+		resp, requestErr := client.Post(
 			baseURL+"/v1/chat/completions",
 			"application/json",
 			strings.NewReader(`{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}`),
@@ -866,6 +914,12 @@ func TestConfigValidateUsageDescribesNarrowLivePreflight(t *testing.T) {
 	var usage bytes.Buffer
 	writeConfigValidateUsage(&usage)
 	got := usage.String()
+	if !strings.Contains(got, "Path or HTTP(S) URL") {
+		t.Fatalf("config validate usage missing URL source support: %q", got)
+	}
+	if !strings.Contains(got, "URL sources are fetched") {
+		t.Fatalf("config validate usage hides remote source fetches: %q", got)
+	}
 	if !strings.Contains(got, "Run fixed policy-classifier protocol preflights") {
 		t.Fatalf("config validate usage missing narrow live preflight: %q", got)
 	}
@@ -901,6 +955,33 @@ func TestRunConfigValidateSuccess(t *testing.T) {
 	}
 	if got := stdout.String(); got != "Providers config is valid: /tmp/provider config.yaml\n" {
 		t.Fatalf("stdout = %q, want success message", got)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty", got)
+	}
+}
+
+func TestRunConfigValidateSuccessRedactsRemoteSource(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	source := "https://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret"
+
+	code := runConfigWithDeps([]string{"validate", "--providers-config", source}, configValidateDeps{
+		stdout: &stdout,
+		stderr: &stderr,
+		validateProvidersConfigFile: func(got string) error {
+			if got != source {
+				t.Fatalf("ValidateProvidersConfigFile source = %q, want original source", got)
+			}
+			return nil
+		},
+	})
+
+	if code != 0 {
+		t.Fatalf("runConfigWithDeps() code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if got := stdout.String(); got != "Providers config is valid: https://example.com/providers.yaml\n" {
+		t.Fatalf("stdout = %q, want sanitized success message", got)
 	}
 	if got := stderr.String(); got != "" {
 		t.Fatalf("stderr = %q, want empty", got)
@@ -986,7 +1067,7 @@ func TestRunConfigValidateUsageErrorsDoNotValidate(t *testing.T) {
 		{
 			name:     "missing providers config",
 			args:     []string{"validate"},
-			wantText: "--providers-config PATH is required",
+			wantText: "--providers-config SOURCE is required",
 		},
 		{
 			name:     "unknown flag",
@@ -1025,7 +1106,7 @@ func TestRunConfigValidateUsageErrorsDoNotValidate(t *testing.T) {
 				t.Fatalf("stdout = %q, want empty", got)
 			}
 			output := stderr.String()
-			for _, want := range []string{tc.wantText, "Usage: vekil config validate --providers-config PATH"} {
+			for _, want := range []string{tc.wantText, "Usage: vekil config validate --providers-config SOURCE"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("stderr missing %q:\n%s", want, output)
 				}
@@ -1071,7 +1152,7 @@ func TestRunConfigHelpDoesNotValidate(t *testing.T) {
 				t.Fatalf("stdout = %q, want empty", got)
 			}
 			output := stderr.String()
-			for _, want := range []string{"Usage: vekil config validate --providers-config PATH", "validate"} {
+			for _, want := range []string{"Usage: vekil config validate --providers-config SOURCE", "validate"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("help output missing %q:\n%s", want, output)
 				}
@@ -1109,7 +1190,7 @@ func TestRunConfigRejectsMissingOrUnknownCommand(t *testing.T) {
 				t.Fatal("invalid config command called ValidateProvidersConfigFile")
 			}
 			output := stderr.String()
-			for _, want := range []string{tc.wantText, "Usage: vekil config validate --providers-config PATH"} {
+			for _, want := range []string{tc.wantText, "Usage: vekil config validate --providers-config SOURCE"} {
 				if !strings.Contains(output, want) {
 					t.Fatalf("stderr missing %q:\n%s", want, output)
 				}
@@ -1154,6 +1235,35 @@ func TestLaunchPolicyRoutingHelpDescribesConfigFollowingDefault(t *testing.T) {
 	}
 	if !strings.Contains(help, `(default "config")`) {
 		t.Fatalf("launch policy-routing help did not show config default:\n%s", help)
+	}
+}
+
+func TestLaunchProvidersConfigHelpRedactsEnvironmentDefault(t *testing.T) {
+	source := "https://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret"
+	t.Setenv("PROVIDERS_CONFIG", source)
+	target, _ := launchTarget("codex")
+
+	opts, err := parseLaunchAgentOptions(target, nil, io.Discard)
+	if err != nil {
+		t.Fatalf("parseLaunchAgentOptions() error = %v", err)
+	}
+	if opts.providersConfigPath != source {
+		t.Fatalf("providers config default = %q, want original source", opts.providersConfigPath)
+	}
+
+	var stderr bytes.Buffer
+	_, err = parseLaunchAgentOptions(target, []string{"--help"}, &stderr)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("parseLaunchAgentOptions(--help) error = %v, want flag.ErrHelp", err)
+	}
+	help := stderr.String()
+	if !strings.Contains(help, "https://example.com/providers.yaml") {
+		t.Fatalf("launch help missing sanitized providers config default:\n%s", help)
+	}
+	for _, secret := range []string{"source-user", "source-password", "signed-secret", "fragment-secret"} {
+		if strings.Contains(help, secret) {
+			t.Fatalf("launch help exposes %q:\n%s", secret, help)
+		}
 	}
 }
 
@@ -1624,6 +1734,7 @@ func TestLaunchSensitiveEnvironment(t *testing.T) {
 		"MSI_SECRET",
 		"COPILOT_GITHUB_TOKEN",
 		"OPENAI_API_KEY",
+		"PROVIDERS_CONFIG",
 	} {
 		if !slices.Contains(got, want) {
 			t.Fatalf("sensitive env = %#v, missing %q", got, want)
@@ -1659,6 +1770,7 @@ func TestRunLaunchClaudeEndToEndWithStaticProvider(t *testing.T) {
 	t.Setenv("MAIN_LAUNCH_HELPER_CAPTURE", capturePath)
 	t.Setenv("MAIN_LAUNCH_HELPER_TARGET", "claude")
 	t.Setenv("TEST_LAUNCH_PROVIDER_SECRET", "redacted")
+	t.Setenv("PROVIDERS_CONFIG", "https://config.example/providers.yaml?signature=launch-secret")
 
 	var stderr bytes.Buffer
 	code := runLaunchClaude([]string{
@@ -1688,6 +1800,9 @@ func TestRunLaunchClaudeEndToEndWithStaticProvider(t *testing.T) {
 	}
 	if capture["removed_value"] != "" {
 		t.Fatalf("provider secret leaked to child: %q", capture["removed_value"])
+	}
+	if capture["providers_config"] != "" {
+		t.Fatalf("providers config source leaked to child: %q", capture["providers_config"])
 	}
 	if !strings.HasPrefix(capture["base_url"], "http://127.0.0.1:") {
 		t.Fatalf("child base URL = %q", capture["base_url"])
@@ -2104,6 +2219,7 @@ func TestMainLaunchHelperProcess(t *testing.T) {
 		"copilot_wire_api": os.Getenv("COPILOT_PROVIDER_WIRE_API"),
 		"github_token":     os.Getenv("GITHUB_TOKEN"),
 		"removed_value":    os.Getenv("TEST_LAUNCH_PROVIDER_SECRET"),
+		"providers_config": os.Getenv("PROVIDERS_CONFIG"),
 	}
 	body, err := json.Marshal(capture)
 	if err != nil {

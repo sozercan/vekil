@@ -914,7 +914,7 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 }
 
 func (h *ProxyHandler) sendPolicyClassifierNativeChat(ctx context.Context, target targetBinding, owner providerModel, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
-	req, err := h.newProviderJSONRequest(ctx, target.provider, http.MethodPost, providerEndpointChatCompletions, body, headers, "", owner)
+	req, err := h.newProviderJSONInferenceRequest(ctx, target.provider, http.MethodPost, providerEndpointChatCompletions, body, headers, "", owner)
 	if err != nil {
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, true)
 	}
@@ -963,7 +963,7 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 	if err := validatePolicyClassifierNoStore(requestBody, target.provider); err != nil {
 		return policyClassifierHTTPResponse{}, err
 	}
-	req, err := h.newProviderJSONRequest(ctx, target.provider, http.MethodPost, providerEndpointResponses, requestBody, headers, "", owner)
+	req, err := h.newProviderJSONInferenceRequest(ctx, target.provider, http.MethodPost, providerEndpointResponses, requestBody, headers, "", owner)
 	if err != nil {
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, true)
 	}

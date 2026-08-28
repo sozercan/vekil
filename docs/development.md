@@ -95,7 +95,7 @@ make build
 go test -race ./... -count=1
 ```
 
-`vekil config validate` must remain offline. `vekil config validate --live` is an explicit operator smoke that uses a fixed non-user fixture to verify classifier auth/reachability, forced strict function output, non-storage request acceptance, and one physical send. Tests for that command should use controlled local providers so CI remains deterministic.
+`vekil config validate` must remain offline with respect to provider discovery and inference endpoints. When `--providers-config` is an HTTP(S) URL, fetching that config source is the only permitted network request. `vekil config validate --live` is an explicit operator smoke that uses a fixed non-user fixture to verify classifier auth/reachability, forced strict function output, non-storage request acceptance, and one physical send. Tests for both paths should use controlled local servers so CI remains deterministic.
 
 ### Chat-over-Responses suite
 
@@ -230,7 +230,9 @@ It builds the proxy, runs [`scripts/live-compact-smoke.sh`](../scripts/live-comp
 
 The compaction smoke script starts the proxy with a non-interactive GitHub token, waits for `/readyz`, selects a currently available OpenAI/Codex model from `/v1/models`, posts to `/v1/responses/compact`, verifies that the response contains a non-empty compaction item, and replays that compaction item through `/v1/responses`.
 
-The Chat-over-Responses smoke selects a model whose native metadata advertises `/responses` but not `/chat/completions` (preferring `gpt-5.6-sol`), so the public Chat request cannot silently use native Chat. It verifies non-streaming and streaming text, terminal usage and `[DONE]`, omitted-`strict` function tools, opaque `call_vekil_<22-character-base64url>` replay IDs, single-call replay, reversed parallel results, and partial continuation that reissues only the missing call. The workflow hard-fails if no Responses-only model is available rather than falling back to a dual-protocol model.
+The compaction request is also the workflow's availability probe. An exact HTTP 402 response with `error.code: quota_exceeded` makes the script return the dedicated temporary-unavailability status 75; the workflow records a neutral skip and does not install clients or run the remaining credentialed checks. Authentication failures, transport failures, malformed responses, other HTTP 402 errors, and every unknown status remain hard failures.
+
+The Chat-over-Responses smoke selects a model whose native metadata advertises `/responses` but not `/chat/completions` (preferring `gpt-5.6-sol`), so the public Chat request cannot silently use native Chat. It verifies non-streaming and streaming text, terminal usage and `[DONE]`, omitted-`strict` function tools, exact `call_vekil_<22-character-base64url>` IDs, single-call replay, reversed parallel results, and partial continuation that reissues only the missing call. The workflow hard-fails if no Responses-only model is available rather than falling back to a dual-protocol model.
 
 The Claude reasoning-carrier smoke selects a tool-capable Responses-only GPT model, runs Claude Code in `--bare` mode with an isolated home and a `~/.claude/settings.json` that points Anthropic API traffic at Vekil, removes the Copilot credential from the Claude process, and permits only the exact harness-owned Bash command in deny-by-default permission mode. The credentialed proxy binds only to loopback, and its private staged token directory is removed during cleanup while sanitized diagnostics remain available. The command blocks until the harness has fully restarted the proxy, after which the smoke requires an exact final sentinel. The check verifies that Claude reconstructed Vekil's `vekil1` signature delta, that the carrier binds the returned opaque proxy ID without carrying any provider `upstream_id` or function-call `call_id`, and that Claude echoed the matching tool-result ID after Vekil's process-local replay state was gone. That carrier-backed continuation must succeed without degradation while the restarted proxy rebuilds both sides under the opaque ID. The same restarted process then receives carrier-absent histories containing opaque IDs it never minted: one old tool turn, followed by two old turns with a parallel group and reversed results. Both must complete against live Copilot while logs prove `store_missing` visible-transcript degradation rather than carrier restoration. Raw carrier data remains owner-only and is never printed by workflow diagnostics; only fixed assertions, fixed synthetic responses, and a sanitized event summary are shown.
 
@@ -324,6 +326,8 @@ The generated temporary schema-v2 config references `api_key_env` names and neve
 
 Both workflows use isolated loopback ports, reject port `1337`, retry bounded address-in-use races, and verify that every proxy, bridge, and shim listener is released. Do not change either workflow to `pull_request_target`: executing pull-request code with provider credentials would expose secrets to untrusted code. Fork PRs and Dependabot neutral-skip the Copilot check because GitHub withholds secrets; a same-repository run without `COPILOT_GITHUB_TOKEN` fails instead of looking like completed coverage. The manual multi-provider workflow fails when its configuration is missing.
 
+If the private Copilot bridge records HTTP 402 while either delegated Copilot policy harness is failing, the wrapper returns temporary-unavailability status 75 and the PR workflow neutral-skips that live coverage. Other harness failures, including 401/403 credentials, protocol mismatches, timeouts, and unknown upstream statuses, remain hard failures.
+
 These smokes incur real provider cost and are bounded acceptance coverage, not the 75-task pilot/holdout or 5,000-observation production-enforcement evaluation described in the policy-routing release gate. Failure diagnostics are allowlisted, redacted, and truncated; raw generated provider configs are not uploaded.
 
 Run the Copilot-backed gate locally after `make build`:
@@ -338,23 +342,37 @@ Run the true multi-provider harness locally by exporting its variables and secre
 scripts/live-policy-routing-smoke.sh
 ```
 
-For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) starts the proxy on a non-default port with [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml), waits for `/readyz`, and sends one tiny chat completion per OpenCode Zen free model. It needs `curl`, `jq`, and Python for isolated automatic port allocation. Because the Zen free set rotates, the script skips only recognized transient statuses/messages and passes as long as at least one free model responds; unknown statuses and proxy-side faults are hard failures.
+For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) starts the proxy on a non-default port with [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml), waits for `/readyz`, and sends one tiny chat completion per OpenCode Zen free model advertising `/chat/completions`. It needs `curl`, `jq`, and Python for isolated automatic port allocation. Because the Zen free set rotates, the script skips only recognized transient statuses/messages and passes as long as at least one free model responds; unknown statuses and proxy-side faults are hard failures.
 
 ## Live OpenCode Zen CLI Smoke Workflow
 
 The [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow runs the **same** `scripts/live-cli-smoke.sh` harness as the Copilot smoke, but in `SMOKE_PROVIDER=zen` mode: it starts vekil with `examples/opencode-zen-free.yaml` (no credentials) and drives real coding-agent CLIs against the OpenCode Zen free tier. Because it needs no secrets, it runs on **every** pull request, **including external-contributor forks** — unlike the Copilot smoke, which self-skips on forks. It is the only live end-to-end coverage of vekil's generic `openai-compatible` provider routing (config loading, bearer auth, static model catalog, and the per-model endpoint allowlist), which zero-config Copilot startup never exercises.
 
-The Zen harness runs the **GitHub Copilot CLI** (offline BYOK mode, `COPILOT_PROVIDER_WIRE_API=completions`), **Claude Code**, and **Gemini CLI**. Copilot is required; Claude and Gemini become required gates whenever they are installed. Each client must independently produce its exact client-specific prompt sentinel—one passing client cannot mask another. Zen uses a direct text-only prompt because the configured free models advertise Chat text support, not reliable coding-tool execution; the credentialed Copilot smoke retains the file-reading fixture that exercises tools.
+Before starting Vekil, the workflow fetches OpenCode's published Zen documentation and uses [`scripts/parse-opencode-zen-free-models.sh`](../scripts/parse-opencode-zen-free-models.sh) to join the endpoint and pricing tables by display label. Only rows whose input and output prices are both labeled `Free` are eligible for the smoke. The harness intersects that parsed set with the checked-in static example, so aliases such as Ox Alpha's `x-preview-f-free` do not depend on an ID suffix and models that lose their free label are not exercised anonymously.
+
+The separate [`Update OpenCode Zen Free Models`](../.github/workflows/update-opencode-zen-free.yaml) workflow runs daily on trusted `main` code. It resolves OpenCode's mutable `dev` branch to an exact commit, downloads only that revision's `zen.mdx`, and runs [`scripts/update-opencode-zen-free-config.sh`](../scripts/update-opencode-zen-free-config.sh) to replace the marked model block in the example. The renderer sorts IDs, preserves the rest of the file, rejects duplicates, bounds the catalog, and accepts only `/chat/completions` and `/responses`; a free `/messages` model requires an explicit provider-design change instead of being silently emitted under `openai-compatible`. Changed output is validated offline and proposed in a signed PR rather than written directly to `main`.
+
+To reproduce an update locally:
+
+```bash
+curl --fail --location \
+  https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx \
+  | scripts/update-opencode-zen-free-config.sh -
+make build
+./vekil config validate --providers-config examples/opencode-zen-free.yaml
+```
+
+The Zen harness runs the **GitHub Copilot CLI** (offline BYOK mode, `COPILOT_PROVIDER_WIRE_API=completions`), **Claude Code**, and **Gemini CLI**. Copilot is required; Claude and Gemini become required gates whenever they are installed. Each client must independently produce its exact client-specific prompt sentinel on at least one reachable candidate—one passing client cannot mask another, and one weak free model cannot fail a client that works through another candidate. Zen uses a direct text-only prompt and selects only configured free models whose parsed and proxy metadata both advertise `/chat/completions`; Responses-only entries remain routable but are not candidates for this shared Chat-oriented harness. The selected free Chat models are not assumed to support reliable coding-tool execution; the credentialed Copilot smoke retains the file-reading fixture that exercises tools.
 
 After Claude Code 2.1.212 regressed headless output, the workflow pins a verified Claude Code version. Move the pin only after the candidate version passes the live smoke.
 
 For each client/model attempt, a bounded raw chat-completions canary runs first:
 
-- Only upstream conditions evidenced by an HTTP response are skippable: a promotion-ended, exact model-no-longer-supported, rate-limit, or temporary-capacity message on an eligible response, HTTP 408/425/429, or HTTP 5xx. Local curl transport failures and timeouts are hard failures because they can indicate a stuck Vekil handler. Unknown statuses, including 404 and 405, are also hard failures.
-- After a 200 canary, any CLI nonzero exit, timeout, empty result, or mismatched result is a hard failure unless one bounded second canary on that same model proves that a recognized transient appeared between the first probe and the CLI run.
+- Only upstream conditions evidenced by an HTTP response are skippable: an exact listed-model-unavailable HTTP 400, a promotion-ended, exact model-no-longer-supported, rate-limit, or temporary-capacity message on an eligible response, HTTP 408/425/429, or HTTP 5xx. Local curl transport failures and timeouts are hard failures because they can indicate a stuck Vekil handler. Other HTTP 400 responses and unknown statuses, including 404 and 405, are hard failures.
+- After a 200 canary, any CLI nonzero exit, timeout, empty result, or mismatched result gets one bounded second canary on that same model. A recognized transient skips the candidate; a still-reachable but incompatible candidate is recorded and the client must pass another candidate. The job fails if a client exhausts the reachable set without an exact pass.
 - A neutral exit 0 is allowed only when no model was reachable **before any client was exercised**. Once a reachable model has exercised a client, every installed client must pass.
 
-OpenAI Codex CLI is intentionally excluded from Zen mode: current Codex is `/responses`-only and always sends a built-in `web_search` tool with no `name`, which the Zen free upstreams reject during the responses→chat translation. The Copilot CLI covers the same `/responses`-style client via its `completions` wire API. Codex remains covered by the Copilot smoke, where it works against the Copilot upstream.
+OpenAI Codex CLI is intentionally excluded from this Zen harness because its native wire API requires `/responses`, while the shared Copilot/Claude/Gemini matrix deliberately tests `/chat/completions`. Codex can use a configured Zen free model that advertises native `/responses` (currently `muse-spark-1.2-contributor-free`), and Vekil forwards that request directly rather than using Responses-to-Chat translation. Codex remains covered by the Copilot smoke, where it works against the Copilot upstream.
 
 Run it locally after `make build` (requires GitHub Copilot CLI; installed Claude/Gemini CLIs are also enforced):
 
@@ -391,6 +409,8 @@ The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workfl
 The direct-bearer workflow deliberately uses the separate `COPILOT_FINE_GRAINED_PAT` credential described above so fine-grained-PAT authentication remains independently covered.
 
 The credentialed Copilot workflows remain separate from deterministic core CI. `Live Copilot Smoke` runs only from a trusted `main` push or an explicit manual dispatch and fails when `COPILOT_GITHUB_TOKEN` is unavailable. The pull-request-triggered semantic-policy workflow neutral-skips forks and Dependabot because GitHub withholds repository secrets there; a same-repository run without the token fails. The direct-bearer workflow is default-branch-only as described above.
+
+The pull-request workflows also neutral-skip only explicitly detected Copilot billing unavailability: the general smoke requires the exact `quota_exceeded` response described above, while the semantic-policy wrapper requires a bridge-recorded HTTP 402 concurrent with a harness failure. This prevents an exhausted repository account from presenting as a code regression without weakening credential, transport, or protocol failures.
 
 You can also run the same smoke scripts locally after building `vekil`; the CLI smoke script additionally requires those three CLIs to be installed.
 
