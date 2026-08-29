@@ -33,7 +33,7 @@ type StreamOptions struct {
 
 // OpenAIMessage is a single message in an OpenAI conversation.
 type OpenAIMessage struct {
-	Role       string           `json:"role"`
+	Role       string           `json:"role,omitempty"`
 	Content    json.RawMessage  `json:"content,omitempty"`
 	Refusal    json.RawMessage  `json:"refusal,omitempty"`
 	Name       string           `json:"name,omitempty"`
