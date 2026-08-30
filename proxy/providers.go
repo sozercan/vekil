@@ -268,6 +268,13 @@ func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 	if err := decodeProvidersConfigFile(path, body, &cfg); err != nil {
 		return cfg, err
 	}
+	_, remote, err := parseProvidersConfigURL(path)
+	if err != nil {
+		return cfg, err
+	}
+	if err := interpolateProvidersConfigEnv(&cfg, remote); err != nil {
+		return cfg, fmt.Errorf("interpolate providers config %q: %w", ProvidersConfigSourceDisplay(path), err)
+	}
 	validated, err := validateAndNormalizeProvidersConfig(cfg)
 	if err != nil {
 		return cfg, fmt.Errorf("validate providers config %q: %w", ProvidersConfigSourceDisplay(path), err)
