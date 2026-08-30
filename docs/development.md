@@ -408,7 +408,7 @@ The `Live Copilot Smoke` and `Live Copilot Semantic Policy Routing Smoke` workfl
 
 The direct-bearer workflow deliberately uses the separate `COPILOT_FINE_GRAINED_PAT` credential described above so fine-grained-PAT authentication remains independently covered.
 
-The credentialed Copilot workflows remain separate from deterministic core CI. `Live Copilot Smoke` runs only from a trusted `main` push or an explicit manual dispatch and fails when `COPILOT_GITHUB_TOKEN` is unavailable. The pull-request-triggered semantic-policy workflow neutral-skips forks and Dependabot because GitHub withholds repository secrets there; a same-repository run without the token fails. The direct-bearer workflow is default-branch-only as described above.
+The credentialed Copilot workflows remain separate from deterministic core CI. `Live Copilot Smoke` runs only from a trusted `main` push or an explicit manual dispatch and fails when `COPILOT_GITHUB_TOKEN` is unavailable. The pull-request-triggered semantic-policy workflow neutral-skips forks, Dependabot, and any other pull-request run where GitHub withholds the repository secret; an explicit manual dispatch without the token fails. The direct-bearer workflow is default-branch-only as described above.
 
 The pull-request workflows also neutral-skip only explicitly detected Copilot billing unavailability: the general smoke requires the exact `quota_exceeded` response described above, while the semantic-policy wrapper requires a bridge-recorded HTTP 402 concurrent with a harness failure. This prevents an exhausted repository account from presenting as a code regression without weakening credential, transport, or protocol failures.
 
