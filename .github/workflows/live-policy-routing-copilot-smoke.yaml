@@ -50,8 +50,13 @@ jobs:
           fi
 
           if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
-            echo "COPILOT_GITHUB_TOKEN repository secret is required for the Copilot semantic policy-routing smoke." >&2
-            exit 1
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "COPILOT_GITHUB_TOKEN repository secret is required for the Copilot semantic policy-routing smoke." >&2
+              exit 1
+            fi
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping Copilot semantic policy-routing smoke because the repository credential is unavailable to this pull request." >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           echo "run=true" >> "$GITHUB_OUTPUT"

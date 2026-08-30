@@ -59,6 +59,34 @@ Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership 
 
 Remote configs are fetched once when the server, validator, or managed launcher loads them. Each fetch has a 15-second total timeout and a 4 MiB response-body limit; Vekil does not poll the URL or reload changes. Redirects are not followed. Prefer HTTPS because an HTTP response can be modified in transit, and keep credentials in `api_key_env` rather than embedding them in remotely hosted configuration. Startup and validation fail closed when the source cannot be fetched or returns a non-2xx status. User-visible diagnostics omit URL userinfo, query parameters, and fragments so credentials and signed query values are not printed.
 
+### Environment interpolation in local provider configs
+
+Any string value in a local JSON or YAML provider config can reference a non-empty environment variable with `${env:VAR_NAME}`. Interpolation happens after parsing and before validation, supports embedded or multiple references, and fails startup with the field and variable name when a variable is undefined or empty. Variable names must match the shell-compatible form `[A-Za-z_][A-Za-z0-9_]*`; default-value expressions such as `${env:VAR_NAME:-default}` are not supported.
+
+```yaml
+providers:
+  - id: copilot
+    type: copilot
+    default: true
+    exclude_models: [azure-model]
+    headers:
+      default:
+        editor_version: ${env:COPILOT_EDITOR_VERSION}
+  - id: azure
+    type: azure-openai
+    base_url: ${env:AZURE_BASE_URL}
+    api_key: ${env:AZURE_API_KEY}
+    models:
+      - public_id: azure-model
+        deployment: ${env:AZURE_DEPLOYMENT}
+```
+
+Use `\${env:VAR_NAME}` when the resulting value must literally be `${env:VAR_NAME}`. In a YAML double-quoted string or a JSON string, encode that backslash as `\\${env:VAR_NAME}`; YAML plain and single-quoted strings use one backslash.
+
+Interpolation is intentionally disabled for configs loaded from HTTP(S) URLs: an unescaped reference is rejected without reading the host environment. This prevents a remotely controlled config from copying host values into provider requests. Escaped literal references remain valid.
+
+`api_key_env` keeps its existing meaning and is excluded from interpolation: its value is already the name of an environment variable, such as `api_key_env: AZURE_API_KEY`. Prefer `api_key_env` for provider credentials; use `${env:...}` for other host-specific string values or where a direct string field must be populated.
+
 - See [Provider Routing](provider-routing.md) for auth notes, generic-compatible provider fields, provider examples, routing rules, endpoint allowlists, and model metadata.
 - See [Semantic Policy Routing](policy-routing.md) for the schema-v2 `exposure`, `policy_profiles`, provider trust metadata, and classifier data-policy contract. A complete example is checked in at [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml).
 - See [Provider API Keys](provider-api-keys.md) for provider console links and key-to-config mapping.

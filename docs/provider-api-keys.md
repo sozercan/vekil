@@ -10,6 +10,7 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 - Use any environment variable name you want; it only needs to match the provider's `api_key_env` value.
 - Names like `AZURE_OPENAI_API_KEY` or `PROVIDER_API_KEY` in examples are placeholders, not names Vekil treats specially.
 - If `api_key_env` is set in config, that environment variable must be set and non-empty before Vekil starts.
+- Local provider configs also support `${env:VAR_NAME}` in string values, but `api_key_env` itself is not interpolated because it already names a variable. Prefer `api_key_env` for credentials; use [provider-config interpolation](configuration.md#environment-interpolation-in-local-provider-configs) for other host-specific values. HTTP(S)-loaded configs cannot interpolate host environment values.
 - Use `auth_type: none` only for local providers or a trusted private upstream.
 - Keep `models[].endpoints` limited to routes you have validated for that model. Vekil does not infer `/responses` from OpenAI compatibility.
 - Do not paste provider keys into client configs. Clients point at Vekil with dummy local keys; Vekil holds the upstream provider credentials.
@@ -52,7 +53,7 @@ Provider portals, free tiers, and model catalogs change frequently. Treat the li
 After creating a key, add it to your environment under any name you choose and reference that exact name from the provider config:
 
 ```bash
-export PROVIDER_API_KEY=sk-...
+export PROVIDER_API_KEY=<your-api-key>
 ```
 
 ```yaml
