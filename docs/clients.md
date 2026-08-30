@@ -33,6 +33,47 @@ Replay state is byte-bounded, process-local, and expires one hour after the tool
 
 Claude Code and Gemini `countTokens` calls also use the selected model's native backend. Anthropic counting requires reported upstream usage; Gemini counting retains its existing cache and can use a local estimate for transient failures or missing usage.
 
+## Reach a host-run Vekil from a container
+
+The default `127.0.0.1` bind is only reachable from the host. For a client in a Docker container, bind host-run Vekil to the Docker bridge gateway instead. On Linux, discover the gateway (commonly `172.17.0.1`) and start Vekil with either the flag or its equivalent environment variable:
+
+```bash
+vekil --host "$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')"
+# Equivalent: HOST="$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')" vekil
+```
+
+This limits the listener to the bridge address. Binding `0.0.0.0` is a broader fallback, but exposes the proxy on every host interface unless a firewall prevents it.
+
+Docker Desktop provides `host.docker.internal` on macOS and Windows. On Linux and WSL2, add Docker's host-gateway mapping. For Compose:
+
+```yaml
+services:
+  agent:
+    image: your-agent-image
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      ANTHROPIC_BASE_URL: http://host.docker.internal:1337
+      GOOGLE_GEMINI_BASE_URL: http://host.docker.internal:1337
+      COPILOT_PROVIDER_BASE_URL: http://host.docker.internal:1337/v1
+```
+
+For `docker run`, use the equivalent host mapping and pass the setting needed by your client:
+
+```bash
+docker run --add-host=host.docker.internal:host-gateway \
+  -e ANTHROPIC_BASE_URL=http://host.docker.internal:1337 \
+  your-agent-image
+```
+
+Codex does not read `OPENAI_BASE_URL`; configure `openai_base_url = "http://host.docker.internal:1337/v1"` and select that provider as described in [OpenAI Codex CLI](#openai-codex-cli). From inside the container, verify connectivity before starting the client:
+
+```bash
+curl http://host.docker.internal:1337/healthz
+```
+
+Any container that can reach the selected interface can access this unauthenticated proxy and use its configured provider capabilities. Restrict the network accordingly. If a schema-v2 policy profile is effectively in `observe` or `enforce` mode, a non-loopback bind also requires `--policy-routing-allow-remote-single-tenant` or `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT=true`. This is only an acknowledgement; it adds no authentication or tenant isolation.
+
 ## Claude Code
 
 Use [`vekil launch claude`](agent-launchers.md) to start an ephemeral proxy and Claude Code together, or configure an already-running proxy manually:

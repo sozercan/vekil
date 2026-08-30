@@ -50,3 +50,42 @@ Keep the failed request ID and timestamp. Also record the public model or route,
 whether one or several sessions were affected, and the relevant proxy log lines.
 These details distinguish one large session replay from a provider-wide
 ingress problem without exposing the request body.
+
+## Container client gets connection refused or cannot resolve `host.docker.internal`
+
+### Symptom
+
+An agent running in a container cannot connect to a Vekil process running on
+the host. Requests may fail with `connection refused`, `could not resolve host`,
+or a similar name-resolution error even though the proxy works at
+`http://localhost:1337` on the host.
+
+### What to do first
+
+Confirm that Vekil is bound to the Docker bridge gateway, not the default
+`127.0.0.1`. On Linux or WSL2, also add the
+`host.docker.internal:host-gateway` mapping with Compose `extra_hosts` or the
+`docker run --add-host` option. Docker Desktop supplies this hostname on macOS
+and Windows.
+
+Follow [Reach a host-run Vekil from a container](clients.md#reach-a-host-run-vekil-from-a-container)
+for the gateway-discovery, bind, and client configuration examples.
+
+### How to confirm recovery
+
+From the same container and network as the agent, run:
+
+```bash
+curl http://host.docker.internal:1337/healthz
+```
+
+A successful health response confirms both hostname resolution and network
+reachability. Then retry the client with its base URL set to the same host and
+port.
+
+### What to capture if it repeats
+
+Record the host operating system, Docker or Docker Desktop version, container
+network name, the bridge gateway reported by `docker network inspect bridge`,
+the effective Vekil listen address, and the exact DNS or connection error from
+inside the container. Do not include provider credentials.
