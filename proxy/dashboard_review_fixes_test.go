@@ -935,6 +935,14 @@ func TestOpenAIStreamErrorHTTPStatus(t *testing.T) {
 		code, typ string
 		want      int
 	}{
+		{"context_length_exceeded", "invalid_request_error", http.StatusBadRequest},
+		{"", "invalid_request_error", http.StatusBadRequest},
+		{"", "authentication_error", http.StatusUnauthorized},
+		{"permission_denied", "", http.StatusForbidden},
+		{"model_not_found", "", http.StatusNotFound},
+		{"", "conflict_error", http.StatusConflict},
+		{"request_too_large", "", http.StatusRequestEntityTooLarge},
+		{"quota_exceeded", "", http.StatusTooManyRequests},
 		{"too_many_requests", "", http.StatusTooManyRequests},
 		{"model_overloaded", "", http.StatusServiceUnavailable},
 		{"", "rate_limit_error", http.StatusTooManyRequests},

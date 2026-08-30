@@ -109,19 +109,45 @@ func (e *openAIStreamError) httpStatus() int {
 		return http.StatusBadGateway
 	}
 	switch strings.ToLower(strings.TrimSpace(e.Code)) {
-	case "too_many_requests", "rate_limit_exceeded", "rate_limit_error":
+	case "400", "bad_request", "invalid_request", "invalid_request_error",
+		"invalid_prompt", "context_length_exceeded", "invalid_value", "bad_value",
+		"unsupported_parameter":
+		return http.StatusBadRequest
+	case "401", "unauthorized", "authentication_error", "invalid_api_key":
+		return http.StatusUnauthorized
+	case "403", "forbidden", "permission_error", "permission_denied":
+		return http.StatusForbidden
+	case "404", "not_found", "not_found_error", "model_not_found":
+		return http.StatusNotFound
+	case "409", "conflict", "conflict_error":
+		return http.StatusConflict
+	case "413", "request_too_large":
+		return http.StatusRequestEntityTooLarge
+	case "429", "too_many_requests", "rate_limit_exceeded", "rate_limit_error", "quota_exceeded":
 		return http.StatusTooManyRequests
-	case "model_overloaded", "engine_overloaded", "overloaded_error", "service_unavailable":
+	case "503", "model_overloaded", "engine_overloaded", "overloaded_error", "service_unavailable":
 		return http.StatusServiceUnavailable
-	case "gateway_timeout", "timeout":
+	case "504", "gateway_timeout", "timeout":
 		return http.StatusGatewayTimeout
-	case "bad_gateway":
+	case "502", "bad_gateway":
 		return http.StatusBadGateway
 	}
 	switch strings.ToLower(strings.TrimSpace(e.Type)) {
-	case "rate_limit_error", "rate_limit_exceeded":
+	case "invalid_request_error", "user_error":
+		return http.StatusBadRequest
+	case "authentication_error":
+		return http.StatusUnauthorized
+	case "permission_error", "forbidden":
+		return http.StatusForbidden
+	case "not_found_error":
+		return http.StatusNotFound
+	case "conflict_error":
+		return http.StatusConflict
+	case "request_too_large":
+		return http.StatusRequestEntityTooLarge
+	case "rate_limit_error", "rate_limit_exceeded", "too_many_requests":
 		return http.StatusTooManyRequests
-	case "overloaded_error":
+	case "overloaded_error", "model_overloaded", "engine_overloaded", "service_unavailable":
 		return http.StatusServiceUnavailable
 	}
 	return http.StatusBadGateway
