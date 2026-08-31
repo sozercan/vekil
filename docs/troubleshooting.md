@@ -50,3 +50,9 @@ Keep the failed request ID and timestamp. Also record the public model or route,
 whether one or several sessions were affected, and the relevant proxy log lines.
 These details distinguish one large session replay from a provider-wide
 ingress problem without exposing the request body.
+
+## Chat-created validation note
+
+This section was added by an Orka chat-coordinated agent task. It serves as an
+end-to-end validation. Its presence confirms that the coordinated documentation
+edit completed successfully.
