@@ -305,6 +305,22 @@ func TestServePolicyRoutingHelpDescribesConfigFollowingDefault(t *testing.T) {
 	}
 }
 
+func TestServeLogLevelHelpListsAcceptedValuesAndDefault(t *testing.T) {
+	unsetEnvForTest(t, "LOG_LEVEL")
+	var output bytes.Buffer
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(&output)
+	registerServeFlags(fs)
+	fs.PrintDefaults()
+
+	help := output.String()
+	for _, want := range []string{"debug", "info", "warn", "error", "default: info"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("serve log-level help missing %q:\n%s", want, help)
+		}
+	}
+}
+
 func TestServeProvidersConfigHelpRedactsEnvironmentDefault(t *testing.T) {
 	source := "https://source-user:source-password@example.com/providers.yaml?signature=signed-secret#fragment-secret"
 	t.Setenv("PROVIDERS_CONFIG", source)
@@ -333,6 +349,30 @@ func TestServeFlagsRejectInvalidPolicyRoutingMode(t *testing.T) {
 	serve := parseServeFlagsForTest(t, "--policy-routing", "sometimes")
 	if _, err := serve.parsedPolicyRoutingMode(); err == nil {
 		t.Fatal("parsedPolicyRoutingMode() error = nil, want invalid mode error")
+	}
+}
+
+func TestServeFlagsRejectInvalidLogLevel(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "flag", args: []string{"--log-level", "trace"}},
+		{name: "environment"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", "trace")
+			serve := parseServeFlagsForTest(t, tc.args...)
+			_, err := serve.parsedLogLevel()
+			if err == nil {
+				t.Fatal("parsedLogLevel() error = nil, want invalid level error")
+			}
+			for _, want := range []string{"trace", "debug", "info", "warn", "error"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("parsedLogLevel() error = %q, want %q", err, want)
+				}
+			}
+		})
 	}
 }
 
@@ -1235,6 +1275,19 @@ func TestLaunchPolicyRoutingHelpDescribesConfigFollowingDefault(t *testing.T) {
 	}
 	if !strings.Contains(help, `(default "config")`) {
 		t.Fatalf("launch policy-routing help did not show config default:\n%s", help)
+	}
+}
+
+func TestLaunchRejectsInvalidLogLevel(t *testing.T) {
+	target, _ := launchTarget("codex")
+	_, err := parseLaunchAgentOptions(target, []string{"--log-level", "trace"}, io.Discard)
+	if err == nil {
+		t.Fatal("parseLaunchAgentOptions() error = nil, want invalid log level error")
+	}
+	for _, want := range []string{"trace", "debug", "info", "warn", "error"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("parseLaunchAgentOptions() error = %q, want %q", err, want)
+		}
 	}
 }
 

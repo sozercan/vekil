@@ -29,7 +29,7 @@ type launchAgentOptions struct {
 	port                     string
 	tokenDir                 string
 	providersConfigPath      string
-	logLevel                 string
+	logLevel                 logger.Level
 	proxyLogPath             string
 	startupTimeout           time.Duration
 	streamingUpstreamTimeout time.Duration
@@ -145,7 +145,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	port := fs.String("port", "0", "Ephemeral proxy listen port (0 lets the OS choose)")
 	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfig := registerProvidersConfigFlag(fs, getEnv("PROVIDERS_CONFIG", ""))
-	logLevel := fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Proxy log level")
+	logLevel := fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Proxy log level: debug, info, warn, or error (default: info)")
 	proxyLog := fs.String("proxy-log", "", fmt.Sprintf("Proxy JSON log path (default: ~/.config/vekil/logs/launch-%s-*.jsonl)", target.name))
 	startupTimeout := fs.Duration("startup-timeout", getEnvDuration("LAUNCH_STARTUP_TIMEOUT", 2*time.Minute), "Maximum time to authenticate and become ready")
 	streamingTimeout := fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
@@ -176,6 +176,10 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	if err != nil {
 		return opts, fmt.Errorf("--policy-routing: %w", err)
 	}
+	parsedLogLevel, err := logger.ParseLevelStrict(strings.TrimSpace(*logLevel))
+	if err != nil {
+		return opts, fmt.Errorf("--log-level: %w", err)
+	}
 
 	return launchAgentOptions{
 		model:                    strings.TrimSpace(*model),
@@ -183,7 +187,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 		port:                     strconv.Itoa(portNumber),
 		tokenDir:                 strings.TrimSpace(*tokenDir),
 		providersConfigPath:      strings.TrimSpace(*providersConfig),
-		logLevel:                 strings.TrimSpace(*logLevel),
+		logLevel:                 parsedLogLevel,
 		proxyLogPath:             strings.TrimSpace(*proxyLog),
 		startupTimeout:           *startupTimeout,
 		streamingUpstreamTimeout: *streamingTimeout,
@@ -281,7 +285,7 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		return 1
 	}
 	defer func() { _ = logFile.Close() }()
-	log := logger.NewWithWriter(logger.ParseLevel(opts.logLevel), logFile)
+	log := logger.NewWithWriter(opts.logLevel, logFile)
 
 	srv, err := server.New(
 		authenticator,
