@@ -64,6 +64,13 @@ docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot \
 
 Native binaries are available from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest).
 
+The server listens on port `1337` by default. Override it with the `--port`
+flag or the equivalent `PORT` environment variable:
+
+```bash
+vekil --port 8080
+```
+
 On Apple Silicon Macs, install the native tray app via Homebrew:
 
 ```bash
