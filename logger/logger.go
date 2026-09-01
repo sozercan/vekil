@@ -29,17 +29,32 @@ var levelNames = map[Level]string{
 	LevelFatal: "fatal",
 }
 
-// ParseLevel parses a log level string. Defaults to info for unknown values.
+const acceptedLevels = "debug, info, warn, error"
+
+// ParseLevel parses a log level string, defaulting to info for unknown values.
+// Configuration entry points should use ParseLevelStrict so invalid user input
+// is reported instead of silently defaulted.
 func ParseLevel(s string) Level {
+	level, err := ParseLevelStrict(s)
+	if err != nil {
+		return LevelInfo
+	}
+	return level
+}
+
+// ParseLevelStrict parses a configurable log level and rejects unknown values.
+func ParseLevelStrict(s string) (Level, error) {
 	switch s {
 	case "debug":
-		return LevelDebug
+		return LevelDebug, nil
+	case "info":
+		return LevelInfo, nil
 	case "warn":
-		return LevelWarn
+		return LevelWarn, nil
 	case "error":
-		return LevelError
+		return LevelError, nil
 	default:
-		return LevelInfo
+		return LevelInfo, fmt.Errorf("unknown log level %q; accepted values: %s", s, acceptedLevels)
 	}
 }
 

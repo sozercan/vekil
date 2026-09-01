@@ -402,7 +402,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		providersConfigPath:             registerProvidersConfigFlag(fs, getEnv("PROVIDERS_CONFIG", "")),
 		policyRoutingMode:               fs.String("policy-routing", getPolicyRoutingModeEnv(), "Policy routing mode: config (follow providers YAML), off, observe, or enforce"),
 		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
-		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
+		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level: debug, info, warn, or error (default: info)"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
 		copilotPluginVersion:            fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
@@ -427,6 +427,13 @@ func (f serveFlags) parsedPolicyRoutingMode() (proxy.PolicyRoutingMode, error) {
 		return proxy.PolicyRoutingModeConfig, nil
 	}
 	return proxy.ParsePolicyRoutingMode(*f.policyRoutingMode)
+}
+
+func (f serveFlags) parsedLogLevel() (logger.Level, error) {
+	if f.logLevel == nil {
+		return logger.LevelInfo, nil
+	}
+	return logger.ParseLevelStrict(*f.logLevel)
 }
 
 func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
@@ -634,7 +641,12 @@ func runServe() {
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	logLevel, err := serve.parsedLogLevel()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "error: --log-level: %v\n", err)
+		os.Exit(1)
+	}
+	log := logger.New(logLevel)
 
 	policyRoutingMode, err := serve.parsedPolicyRoutingMode()
 	if err != nil {
