@@ -185,3 +185,7 @@ env GEMINI_API_KEY=dummy \
   GEMINI_CLI_NO_RELAUNCH=true \
   gemini -m gemini-2.5-pro -p "Reply with exactly PROXY_OK" -o json
 ```
+
+## Note
+
+This section validates automated PR review tooling.
