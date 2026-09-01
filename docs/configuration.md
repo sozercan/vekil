@@ -31,7 +31,7 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
-Native CLI and tray-app runs default to `127.0.0.1`. Container deployments that publish the proxy port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path.
+Native CLI and tray-app runs default to `127.0.0.1`. A proxy running inside a container that publishes its port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path. In the opposite direction, a proxy running on the host for containerized clients should bind to the Docker bridge gateway rather than every interface; see [Reach a host-run Vekil from a container](clients.md#reach-a-host-run-vekil-from-a-container).
 
 Serve mode defaults Go's garbage-collection target to `GOGC=200` to favor
 throughput while retaining a bounded memory footprint. Whitespace-only `GOGC`
