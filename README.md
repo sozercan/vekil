@@ -64,6 +64,33 @@ docker run --user "$(id -u):$(id -g)" -e HOME=/home/nonroot \
 
 Native binaries are available from [GitHub Releases](https://github.com/sozercan/vekil/releases/latest).
 
+### Use a different port
+
+The native binary listens on port 1337 by default. Choose another port with
+either the flag or environment variable:
+
+```bash
+vekil --port 8080
+PORT=8080 vekil
+```
+
+Update client and API base URLs to use the selected port, for example
+`http://localhost:8080`. With Docker, `-p 127.0.0.1:8080:1337` changes only the
+host-facing port. To also change Vekil's listener inside the container, set a
+matching container port:
+
+```bash
+docker run --rm -e PORT=8080 -p 127.0.0.1:8080:8080 ghcr.io/sozercan/vekil:latest
+```
+
+If startup reports `address already in use`, identify the process listening on
+the default port on Unix-like systems, then stop that process or choose another
+port:
+
+```bash
+lsof -nP -iTCP:1337 -sTCP:LISTEN
+```
+
 On Apple Silicon Macs, install the native tray app via Homebrew:
 
 ```bash
