@@ -924,7 +924,7 @@ func normalizeExplicitOpenAIChatResponseModel(resp *http.Response, publicModel s
 	}
 	var payload map[string]json.RawMessage
 	if json.Unmarshal(prefix, &payload) == nil && payload != nil && !hasNonNullJSONField(payload, "error") {
-		payload["model"] = mustMarshalRaw(publicModel)
+		rewriteOpenAIChatCompletionModelIdentity(payload, publicModel)
 		if rewritten, marshalErr := json.Marshal(payload); marshalErr == nil {
 			prefix = rewritten
 		}

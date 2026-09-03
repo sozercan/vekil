@@ -39,6 +39,70 @@ func openAIChatStreamEventMayCarryChunk(eventType string) bool {
 	}
 }
 
+func rewriteOpenAIChatCompletionModelIdentity(payload map[string]json.RawMessage, publicModel string) bool {
+	publicModel = strings.TrimSpace(publicModel)
+	if payload == nil || publicModel == "" {
+		return false
+	}
+
+	changed := false
+	if jsonRawString(payload["model"]) != publicModel {
+		payload["model"] = mustMarshalRaw(publicModel)
+		changed = true
+	}
+
+	copilotUsageRaw, ok := payload["copilot_usage"]
+	if !ok {
+		return changed
+	}
+	var copilotUsage map[string]json.RawMessage
+	if json.Unmarshal(copilotUsageRaw, &copilotUsage) != nil || copilotUsage == nil {
+		return changed
+	}
+	tokenDetailsRaw, ok := copilotUsage["token_details"]
+	if !ok {
+		return changed
+	}
+	var tokenDetails []json.RawMessage
+	if json.Unmarshal(tokenDetailsRaw, &tokenDetails) != nil {
+		return changed
+	}
+
+	detailsChanged := false
+	for i, detailRaw := range tokenDetails {
+		var detail map[string]json.RawMessage
+		if json.Unmarshal(detailRaw, &detail) != nil || detail == nil {
+			continue
+		}
+		modelRaw, ok := detail["model"]
+		if !ok || !isJSONString(modelRaw) || jsonRawString(modelRaw) == publicModel {
+			continue
+		}
+		detail["model"] = mustMarshalRaw(publicModel)
+		rewritten, err := json.Marshal(detail)
+		if err != nil {
+			continue
+		}
+		tokenDetails[i] = rewritten
+		detailsChanged = true
+	}
+	if !detailsChanged {
+		return changed
+	}
+
+	rewrittenDetails, err := json.Marshal(tokenDetails)
+	if err != nil {
+		return changed
+	}
+	copilotUsage["token_details"] = rewrittenDetails
+	rewrittenUsage, err := json.Marshal(copilotUsage)
+	if err != nil {
+		return changed
+	}
+	payload["copilot_usage"] = rewrittenUsage
+	return true
+}
+
 func (n *openAIChatCompletionChunkNormalizer) normalize(eventType, data string) (string, bool) {
 	// OpenAI chat completion streams usually use unnamed SSE events. Also accept
 	// explicit event names that are equivalent to the default SSE "message" event
