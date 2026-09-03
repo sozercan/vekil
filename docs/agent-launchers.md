@@ -323,10 +323,9 @@ credential names from shell and MCP subprocesses. Inherited GitHub, OpenAI,
 Anthropic, Azure, provider, and telemetry-header credentials are removed.
 
 Foreground local resume and continue arguments are forwarded. Forwarded model,
-custom-agent, secret-environment, connect/session-ID, remote/export/share,
-ACP-server, and non-agent subcommands remain rejected. Copilot's offline launch
-mode cannot resume remote task IDs even though `--resume` accepts task IDs as
-well as local session IDs.
+custom-agent, connect/session-ID, remote/export/share, ACP-server, and non-agent
+subcommands remain rejected. Copilot's offline launch mode cannot resume remote
+task IDs even though `--resume` accepts task IDs as well as local session IDs.
 
 ## Logs and statistics
 
