@@ -944,11 +944,9 @@ func streamExplicitRouteOpenAIChatPassthroughWithLifecycle(
 		if json.Unmarshal([]byte(normalized), &payload) != nil || payload == nil || hasNonNullJSONField(payload, "error") {
 			return normalized, changed
 		}
-		model := strings.TrimSpace(publicModel)
-		if model == "" || jsonRawString(payload["model"]) == model {
+		if !rewriteOpenAIChatCompletionModelIdentity(payload, publicModel) {
 			return normalized, changed
 		}
-		payload["model"] = mustMarshalRaw(model)
 		rewritten, err := json.Marshal(payload)
 		if err != nil {
 			return normalized, changed

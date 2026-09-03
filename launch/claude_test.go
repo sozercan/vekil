@@ -418,9 +418,13 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		{name: "attached init only", args: []string{"--init-only=true"}, want: "initialization-only"},
 		{name: "background", args: []string{"--background"}, want: "detached Claude sessions"},
 		{name: "tmux", args: []string{"--tmux"}, want: "detached Claude sessions"},
-		{name: "model", args: []string{"--model", "responses-only"}, want: "model or session overrides"},
-		{name: "model after prompt", args: []string{"--print", "hello", "--model", "responses-only"}, want: "model or session overrides"},
-		{name: "fallback model", args: []string{"--fallback-model", "other"}, want: "model or session overrides"},
+		{name: "cloud", args: []string{"--cloud"}, want: "detached Claude sessions"},
+		{name: "environment", args: []string{"--environment", "ccpool_test"}, want: "detached Claude sessions"},
+		{name: "teleport", args: []string{"--teleport", "session-id"}, want: "detached Claude sessions"},
+		{name: "remote control", args: []string{"--remote-control"}, want: "detached Claude sessions"},
+		{name: "model", args: []string{"--model", "responses-only"}, want: "model or custom-agent overrides"},
+		{name: "model after prompt", args: []string{"--print", "hello", "--model", "responses-only"}, want: "model or custom-agent overrides"},
+		{name: "fallback model", args: []string{"--fallback-model", "other"}, want: "model or custom-agent overrides"},
 		{name: "dangerous permission bypass", args: []string{"--dangerously-skip-permissions"}, want: "permission bypass"},
 		{name: "enable dangerous permission bypass", args: []string{"--allow-dangerously-skip-permissions"}, want: "permission bypass"},
 		{name: "accept edits permission mode", args: []string{"--permission-mode", "acceptEdits"}, want: "permission mode"},
@@ -428,12 +432,7 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		{name: "bypass permission mode", args: []string{"--permission-mode", "bypassPermissions"}, want: "permission mode"},
 		{name: "dont ask permission mode", args: []string{"--permission-mode=dontAsk"}, want: "permission mode"},
 		{name: "plan permission mode", args: []string{"--permission-mode", "plan"}, want: "permission mode"},
-		{name: "resume", args: []string{"--resume"}, want: "model or session overrides"},
-		{name: "attached short resume", args: []string{"-rsession-id"}, want: "model or session overrides"},
-		{name: "session id", args: []string{"--session-id", "00000000-0000-0000-0000-000000000000"}, want: "model or session overrides"},
-		{name: "attached session id", args: []string{"--session-id=00000000-0000-0000-0000-000000000000"}, want: "model or session overrides"},
-		{name: "custom agent", args: []string{"--agent", "reviewer"}, want: "model or session overrides"},
-		{name: "teleport", args: []string{"--teleport", "session"}, want: "model or session overrides"},
+		{name: "custom agent", args: []string{"--agent", "reviewer"}, want: "model or custom-agent overrides"},
 		{name: "subcommand after option", args: []string{"--verbose", "remote-control"}, want: "agent-management commands"},
 		{name: "subcommand after max turns", args: []string{"--max-turns", "5", "agents"}, want: "agent-management commands"},
 		{name: "subcommand after name", args: []string{"--name", "session", "agents"}, want: "agent-management commands"},
@@ -445,7 +444,14 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		{name: "gateway subcommand", args: []string{"gateway"}, want: "agent-management commands"},
 		{name: "auth subcommand", args: []string{"auth"}, want: "agent-management commands"},
 		{name: "doctor subcommand", args: []string{"doctor"}, want: "agent-management commands"},
+		{name: "import subcommand", args: []string{"import"}, want: "agent-management commands"},
 		{name: "install subcommand", args: []string{"install"}, want: "agent-management commands"},
+		{name: "logs subcommand", args: []string{"logs", "session-id"}, want: "agent-management commands"},
+		{name: "respawn subcommand", args: []string{"respawn", "session-id"}, want: "agent-management commands"},
+		{name: "remove subcommand", args: []string{"rm", "session-id"}, want: "agent-management commands"},
+		{name: "stop subcommand", args: []string{"stop", "session-id"}, want: "agent-management commands"},
+		{name: "kill subcommand", args: []string{"kill", "session-id"}, want: "agent-management commands"},
+		{name: "fork modifier before subcommand", args: []string{"--fork-session", "agents"}, want: "agent-management commands"},
 		{name: "subcommand after delimiter", args: []string{"--", "remote-control"}, want: "agent-management commands"},
 	}
 	for _, tc := range tests {
@@ -459,6 +465,103 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 			})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Prepare() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestClaudeAdapterPreservesForegroundSessionArgs(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	sessionID := "56d7498d-6b2e-47ca-92a6-92ddee84ab25"
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "resume picker", args: []string{"--resume"}},
+		{name: "resume by id", args: []string{"--resume", sessionID}},
+		{name: "resume search matching subcommand", args: []string{"--resume", "agents"}},
+		{name: "attached resume", args: []string{"--resume=" + sessionID}},
+		{name: "short resume picker", args: []string{"-r"}},
+		{name: "short resume by id", args: []string{"-r", sessionID}},
+		{name: "attached short resume", args: []string{"-r" + sessionID}},
+		{name: "continue", args: []string{"--continue"}},
+		{name: "short continue", args: []string{"-c"}},
+		{name: "continue prompt matching subcommand", args: []string{"--continue", "agents"}},
+		{name: "session id", args: []string{"--session-id", sessionID}},
+		{name: "attached session id", args: []string{"--session-id=" + sessionID}},
+		{name: "from pr picker", args: []string{"--from-pr"}},
+		{name: "from pr", args: []string{"--from-pr", "123"}},
+		{name: "attached from pr", args: []string{"--from-pr=https://github.com/example/repo/pull/123"}},
+		{name: "fork resumed session", args: []string{"--resume", sessionID, "--fork-session"}},
+		{name: "fork continued session", args: []string{"--fork-session", "--continue"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+				BaseURL:       "http://127.0.0.1:43210",
+				Model:         ModelInfo{ID: "claude-public", SupportedEndpoints: []string{"/chat/completions"}},
+				Binary:        binary,
+				LocalToken:    "test-token-placeholder",
+				ForwardedArgs: tc.args,
+				DryRun:        true,
+			})
+			if err != nil {
+				t.Fatalf("Prepare(%#v) error = %v", tc.args, err)
+			}
+			t.Cleanup(func() { _ = prepared.Cleanup() })
+			if len(prepared.Args) != len(tc.args)+2 {
+				t.Fatalf("Args = %#v, want managed settings pair followed by %#v", prepared.Args, tc.args)
+			}
+			if got := prepared.Args[2:]; !reflect.DeepEqual(got, tc.args) {
+				t.Fatalf("forwarded args = %#v, want exact argv %#v", got, tc.args)
+			}
+		})
+	}
+}
+
+func TestClaudeAdapterRejectsUnsafeForegroundSessionCombinations(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	sessionID := "56d7498d-6b2e-47ca-92a6-92ddee84ab25"
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "background after resume id", args: []string{"--resume", sessionID, "--background"}, want: "detached Claude sessions"},
+		{name: "background before resume id", args: []string{"--background", "--resume", sessionID}, want: "detached Claude sessions"},
+		{name: "background after resume picker", args: []string{"--resume", "--background"}, want: "detached Claude sessions"},
+		{name: "background after required session id", args: []string{"--session-id", "--background"}, want: "detached Claude sessions"},
+		{name: "tmux after resume", args: []string{"--resume", sessionID, "--tmux"}, want: "detached Claude sessions"},
+		{name: "cloud after continue", args: []string{"--continue", "--cloud"}, want: "detached Claude sessions"},
+		{name: "environment after from pr picker", args: []string{"--from-pr", "--environment", "ccpool_test"}, want: "detached Claude sessions"},
+		{name: "remote control after session id", args: []string{"--session-id", sessionID, "--remote-control"}, want: "detached Claude sessions"},
+		{name: "remote after resume", args: []string{"--resume", sessionID, "--remote"}, want: "detached Claude sessions"},
+		{name: "settings after resume", args: []string{"--resume", sessionID, "--settings", "{}"}, want: "settings-source overrides"},
+		{name: "model after resume", args: []string{"--resume", sessionID, "--model", "other"}, want: "model or custom-agent overrides"},
+		{name: "model before resume", args: []string{"--model", "other", "--resume", sessionID}, want: "model or custom-agent overrides"},
+		{name: "agent after continue", args: []string{"--continue", "--agent", "reviewer"}, want: "model or custom-agent overrides"},
+		{name: "permission bypass after resume", args: []string{"--resume", sessionID, "--dangerously-skip-permissions"}, want: "permission bypass"},
+		{name: "permission bypass before resume", args: []string{"--dangerously-skip-permissions", "--resume", sessionID}, want: "permission bypass"},
+		{name: "permission mode after resume", args: []string{"--resume", sessionID, "--permission-mode", "bypassPermissions"}, want: "permission mode"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+				BaseURL:       "http://127.0.0.1:43210",
+				Model:         ModelInfo{ID: "claude-public", SupportedEndpoints: []string{"/chat/completions"}},
+				Binary:        binary,
+				LocalToken:    "test-token-placeholder",
+				ForwardedArgs: tc.args,
+				DryRun:        true,
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Prepare(%#v) error = %v, want %q", tc.args, err, tc.want)
 			}
 		})
 	}

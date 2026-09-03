@@ -3,6 +3,7 @@ package launch
 import (
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -99,6 +100,49 @@ func TestCopilotAdapterSelectsChatCompletions(t *testing.T) {
 	}
 }
 
+func TestCopilotAdapterPreservesLocalSessionContinuationArgs(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "56d7498d-6b2e-47ca-92a6-92ddee84ab25"
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "continue", args: []string{"--continue"}},
+		{name: "long picker", args: []string{"--resume"}},
+		{name: "long separate value", args: []string{"--resume", "login"}},
+		{name: "long equals value", args: []string{"--resume=" + sessionID}},
+		{name: "short picker", args: []string{"-r"}},
+		{name: "short separate value", args: []string{"-r", "login"}},
+		{name: "short attached value", args: []string{"-r" + sessionID}},
+		{name: "short equals value", args: []string{"-r=" + sessionID}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, err := (CopilotAdapter{}).Prepare(PrepareInput{
+				BaseURL:       "http://127.0.0.1:43210",
+				Model:         ModelInfo{ID: "chat-model", SupportedEndpoints: []string{"/chat/completions"}},
+				Binary:        binary,
+				ForwardedArgs: tc.args,
+				LocalToken:    "token",
+				DryRun:        true,
+			})
+			if err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			if len(prepared.Args) < len(tc.args) {
+				t.Fatalf("prepared args too short: %#v", prepared.Args)
+			}
+			got := prepared.Args[len(prepared.Args)-len(tc.args):]
+			if !slices.Equal(got, tc.args) {
+				t.Fatalf("continuation args = %#v, want exact %#v", got, tc.args)
+			}
+		})
+	}
+}
+
 func TestCopilotAdapterAcceptsPolicyOwnedChatModel(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
@@ -185,12 +229,12 @@ func TestCopilotAdapterRejectsManagedOverridesAndRemoteModes(t *testing.T) {
 		{name: "model", args: []string{"--model", "other"}, want: "model, agent, or environment"},
 		{name: "agent", args: []string{"--agent", "other"}, want: "model, agent, or environment"},
 		{name: "managed safety", args: []string{"--no-remote=false"}, want: "safety overrides"},
-		{name: "connect", args: []string{"--connect=session"}, want: "remote, resumed, or shared"},
-		{name: "continue", args: []string{"--continue"}, want: "remote, resumed, or shared"},
-		{name: "resume", args: []string{"--resume=abc"}, want: "remote, resumed, or shared"},
-		{name: "attached short resume", args: []string{"-rabc"}, want: "remote, resumed, or shared"},
-		{name: "remote", args: []string{"--remote"}, want: "remote, resumed, or shared"},
-		{name: "share", args: []string{"--share-gist"}, want: "remote, resumed, or shared"},
+		{name: "connect", args: []string{"--connect=session"}, want: "remote, session-ID, or shared"},
+		{name: "session id", args: []string{"--session-id", "56d7498d-6b2e-47ca-92a6-92ddee84ab25"}, want: "remote, session-ID, or shared"},
+		{name: "attached session id", args: []string{"--session-id=56d7498d-6b2e-47ca-92a6-92ddee84ab25"}, want: "remote, session-ID, or shared"},
+		{name: "remote", args: []string{"--remote"}, want: "remote, session-ID, or shared"},
+		{name: "remote export", args: []string{"--remote-export"}, want: "remote, session-ID, or shared"},
+		{name: "share", args: []string{"--share-gist"}, want: "remote, session-ID, or shared"},
 		{name: "acp", args: []string{"--acp"}, want: "ACP server"},
 		{name: "login", args: []string{"login"}, want: "not an agent session"},
 		{name: "logout", args: []string{"logout"}, want: "not an agent session"},
