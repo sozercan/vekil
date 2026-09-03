@@ -199,7 +199,8 @@ func validateCopilotForwardedArgs(args []string) error {
 	var positionals []string
 	expectValue := false
 	endOptions := false
-	for _, arg := range args {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		if expectValue {
 			expectValue = false
 			continue
@@ -209,6 +210,12 @@ func validateCopilotForwardedArgs(args []string) error {
 			continue
 		}
 		if !endOptions && strings.HasPrefix(arg, "-") {
+			if arg == "--resume" || arg == "-r" {
+				if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+					i++
+				}
+				continue
+			}
 			switch {
 			case arg == "--model" || strings.HasPrefix(arg, "--model="),
 				arg == "--agent" || strings.HasPrefix(arg, "--agent="):
@@ -219,13 +226,11 @@ func validateCopilotForwardedArgs(args []string) error {
 				arg == "--disable-builtin-mcps" || strings.HasPrefix(arg, "--disable-builtin-mcps="):
 				return fmt.Errorf("copilot launcher safety overrides are managed by Vekil")
 			case arg == "--connect" || strings.HasPrefix(arg, "--connect="),
-				arg == "--continue",
-				arg == "--resume" || strings.HasPrefix(arg, "--resume="), arg == "-r" || strings.HasPrefix(arg, "-r="), (strings.HasPrefix(arg, "-r") && len(arg) > 2),
 				arg == "--session-id" || strings.HasPrefix(arg, "--session-id="),
 				arg == "--remote" || strings.HasPrefix(arg, "--remote="),
 				arg == "--remote-export" || strings.HasPrefix(arg, "--remote-export="),
 				arg == "--share" || strings.HasPrefix(arg, "--share="), arg == "--share-gist":
-				return fmt.Errorf("remote, resumed, or shared Copilot sessions are not supported by an ephemeral Vekil launcher")
+				return fmt.Errorf("remote, session-ID, or shared Copilot modes are not supported by an ephemeral Vekil launcher")
 			case arg == "--acp":
 				return fmt.Errorf("copilot ACP server mode is not supported by an ephemeral Vekil launcher")
 			}

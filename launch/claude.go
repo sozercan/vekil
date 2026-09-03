@@ -171,8 +171,9 @@ func validateClaudeForwardedArgs(args []string) error {
 	expectValue := false
 	seenPositional := false
 	printMode := false
+	foregroundSession := false
 	endOptions := false
-	for _, arg := range args {
+	for index, arg := range args {
 		if expectValue {
 			expectValue = false
 			continue
@@ -196,27 +197,28 @@ func validateClaudeForwardedArgs(args []string) error {
 				arg == "--tmux" || strings.HasPrefix(arg, "--tmux="),
 				arg == "--remote" || strings.HasPrefix(arg, "--remote="),
 				arg == "--cloud" || strings.HasPrefix(arg, "--cloud="),
-				arg == "--remote-control" || strings.HasPrefix(arg, "--remote-control=") || arg == "--rc",
-				arg == "--fork-session":
+				arg == "--environment" || strings.HasPrefix(arg, "--environment="),
+				arg == "--teleport" || strings.HasPrefix(arg, "--teleport="),
+				arg == "--remote-control" || strings.HasPrefix(arg, "--remote-control=") || arg == "--rc":
 				return fmt.Errorf("detached Claude sessions are not supported by an ephemeral Vekil launcher")
 			case arg == "--model" || strings.HasPrefix(arg, "--model="),
 				arg == "--fallback-model" || strings.HasPrefix(arg, "--fallback-model="),
-				arg == "--continue" || arg == "-c",
-				arg == "--resume" || strings.HasPrefix(arg, "--resume=") || arg == "-r" || strings.HasPrefix(arg, "-r"),
-				arg == "--session-id" || strings.HasPrefix(arg, "--session-id="),
-				arg == "--from-pr" || strings.HasPrefix(arg, "--from-pr="),
-				arg == "--teleport" || strings.HasPrefix(arg, "--teleport="),
 				arg == "--agent" || strings.HasPrefix(arg, "--agent="),
 				arg == "--agents" || strings.HasPrefix(arg, "--agents="):
-				return fmt.Errorf("claude model or session overrides are not supported by the managed Vekil launcher")
+				return fmt.Errorf("claude model or custom-agent overrides are not supported by the managed Vekil launcher")
+			case claudeForegroundSessionSelector(arg):
+				foregroundSession = true
+				if claudeSessionSelectorHasOptionalValue(arg) && index+1 < len(args) && !strings.HasPrefix(args[index+1], "-") {
+					expectValue = true
+				}
 			}
-			if claudeOptionRequiresValue(arg) {
+			if claudeOptionRequiresValue(arg) && index+1 < len(args) && !strings.HasPrefix(args[index+1], "-") {
 				expectValue = true
 			}
 			continue
 		}
 		if !seenPositional {
-			if !printMode && claudeNonAgentCommand(arg) {
+			if !printMode && !foregroundSession && claudeNonAgentCommand(arg) {
 				return fmt.Errorf("detached Claude agent-management commands are not supported by an ephemeral Vekil launcher")
 			}
 			seenPositional = true
@@ -264,7 +266,29 @@ func unsupportedClaudePermissionMode(mode string) error {
 func claudeNonAgentCommand(command string) bool {
 	switch command {
 	case "agents", "attach", "auth", "auto-mode", "doctor", "gateway", "install", "mcp",
-		"plugin", "plugins", "project", "remote-control", "setup-token", "ultrareview", "update", "upgrade":
+		"import", "kill", "logs", "plugin", "plugins", "project", "remote-control", "respawn", "rm",
+		"setup-token", "stop", "ultrareview", "update", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func claudeForegroundSessionSelector(arg string) bool {
+	switch {
+	case arg == "--continue" || arg == "-c",
+		arg == "--resume" || strings.HasPrefix(arg, "--resume=") || arg == "-r" || strings.HasPrefix(arg, "-r"),
+		arg == "--session-id" || strings.HasPrefix(arg, "--session-id="),
+		arg == "--from-pr" || strings.HasPrefix(arg, "--from-pr="):
+		return true
+	default:
+		return false
+	}
+}
+
+func claudeSessionSelectorHasOptionalValue(arg string) bool {
+	switch arg {
+	case "--resume", "-r", "--from-pr":
 		return true
 	default:
 		return false

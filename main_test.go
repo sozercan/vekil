@@ -1520,6 +1520,43 @@ func TestRunLaunchCommandDispatchesSupportedTargets(t *testing.T) {
 	}
 }
 
+func TestRunLaunchCommandDryRunForwardsForegroundSessionArgs(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "56d7498d-6b2e-47ca-92a6-92ddee84ab25"
+	tests := []struct {
+		name       string
+		target     string
+		forwarded  []string
+		wantOutput string
+	}{
+		{name: "Claude resume", target: "claude", forwarded: []string{"--resume", sessionID}, wantOutput: `"--resume" "` + sessionID + `"`},
+		{name: "Codex resume", target: "codex", forwarded: []string{"resume", sessionID}, wantOutput: `"resume" "` + sessionID + `"`},
+		{name: "Copilot resume", target: "copilot", forwarded: []string{"--resume=" + sessionID}, wantOutput: `"--resume=` + sessionID + `"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{
+				tc.target,
+				"--model", "test-model",
+				"--binary", binary,
+				"--dry-run",
+				"--",
+			}
+			args = append(args, tc.forwarded...)
+			var stderr bytes.Buffer
+			if code := runLaunchCommand(args, &stderr); code != 0 {
+				t.Fatalf("runLaunchCommand() code = %d; stderr=%s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantOutput) {
+				t.Fatalf("dry-run did not preserve session args %q:\n%s", tc.forwarded, stderr.String())
+			}
+		})
+	}
+}
+
 func TestRunLaunchCommandDryRunUsesConfiguredStaticModelMetadata(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {

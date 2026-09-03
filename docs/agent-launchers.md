@@ -35,6 +35,13 @@ vekil launch codex \
 Arguments after `--` are forwarded to the selected agent:
 
 ```bash
+vekil launch claude --model claude-opus-5 -- \
+  --resume 56d7498d-6b2e-47ca-92a6-92ddee84ab25
+
+vekil launch codex -- resume --last
+
+vekil launch copilot --model gpt-5.4-mini -- --continue
+
 vekil launch codex -- \
   exec --ephemeral --skip-git-repo-check "Review this workspace"
 
@@ -42,10 +49,16 @@ vekil launch copilot --model gpt-5.4-mini -- \
   --allow-all-tools -p "Review this workspace" -s
 ```
 
-Each launcher reserves model, provider, remote-session, resume, and other
-arguments that could replace the validated routing layer or leave work running
-outside the ephemeral proxy lifecycle. To pin Claude Code or Codex CLI, use the
-launcher's `--model` before `--`; forwarded model overrides remain rejected.
+Foreground resume and fork arguments remain attached to the supervised child
+process and are forwarded. Each launcher still reserves model, provider,
+remote-session, background, server, and other arguments that could replace the
+validated routing layer or leave work running outside the ephemeral proxy
+lifecycle. To pin Claude Code or Codex CLI, use the launcher's `--model` before
+`--`; forwarded model overrides remain rejected.
+
+The proxy and its local credential are ephemeral. Agent-owned conversation
+history can persist across launches, and a resumed conversation uses the new
+launch's provider routing and optional model pin.
 
 ## Model selection modes
 
@@ -131,6 +144,9 @@ settings are printed as `unresolved` instead of being guessed.
 ```bash
 vekil launch claude -- --allowed-tools Read
 
+vekil launch claude --model claude-opus-5 -- \
+  --resume 56d7498d-6b2e-47ca-92a6-92ddee84ab25
+
 vekil launch claude --model claude-sonnet-4.5 -- \
   --allowed-tools "Read,Bash(git status:*)"
 ```
@@ -195,14 +211,17 @@ Responses-backed bridge are accepted only for a single-target baseline in
 `off` or `observe`, and that bridge must be one process (the normal loopback
 launcher topology) or use sticky ingress to the replay-owning replica.
 
-Forwarded settings-source, detached-session, resume, model/fallback, incompatible
-permission-mode, and custom-agent overrides are rejected. Use the
-launcher-level `--model` to pin a model; otherwise model selection remains
+Foreground conversation selection, continuation, and fork arguments are
+forwarded. Settings-source, detached or remote session, model/fallback,
+incompatible permission-mode, and custom-agent overrides remain rejected. Use
+the launcher-level `--model` to pin a model; otherwise model selection remains
 delegated to Claude's normal default.
 
 ## OpenAI Codex CLI
 
 ```bash
+vekil launch codex -- resume --last
+
 vekil launch codex -- \
   exec --ephemeral --skip-git-repo-check "Reply with exactly OK"
 
@@ -265,18 +284,20 @@ support `/responses`. Because the launcher cannot know the choice in advance,
 an unknown or incompatible default fails when Codex requests it rather than
 during launcher startup.
 
+Foreground `resume`, `fork`, and `exec resume` commands are forwarded.
 Forwarded `-m`/`--model`, `-c`/`--config`, profile, OSS/local-provider, remote,
-resume/fork, app-server, remote-control, cloud, and non-agent command modes are
-rejected. For a pinned policy-owned model, forwarded `--search`, equivalent
-web-search feature toggles, and attempts to re-enable `code_mode`,
-`code_mode_only`, or `remote_compaction_v2` are also rejected so the
-compatibility safeguards remain authoritative. Use the launcher-level
-`--model` to pin a model; otherwise selection remains delegated to Codex's
-normal default.
+app-server, remote-control, cloud, and non-agent command modes remain rejected.
+For a pinned policy-owned model, forwarded `--search`, equivalent web-search
+feature toggles, and attempts to re-enable `code_mode`, `code_mode_only`, or
+`remote_compaction_v2` are also rejected so the compatibility safeguards remain
+authoritative. Use the launcher-level `--model` to pin a model; otherwise
+selection remains delegated to Codex's normal default.
 
 ## GitHub Copilot CLI
 
 ```bash
+vekil launch copilot --model gpt-5.4-mini -- --continue
+
 vekil launch copilot --model gpt-5.4-mini -- \
   --allow-all-tools -p "Reply with exactly OK" -s
 ```
@@ -301,8 +322,11 @@ MCPs. `--secret-env-vars` removes the local token plus provider and GitHub
 credential names from shell and MCP subprocesses. Inherited GitHub, OpenAI,
 Anthropic, Azure, provider, and telemetry-header credentials are removed.
 
-Forwarded model, custom-agent, secret-environment, connect/resume/session,
-remote/export/share, ACP-server, and non-agent subcommands are rejected.
+Foreground local resume and continue arguments are forwarded. Forwarded model,
+custom-agent, secret-environment, connect/session-ID, remote/export/share,
+ACP-server, and non-agent subcommands remain rejected. Copilot's offline launch
+mode cannot resume remote task IDs even though `--resume` accepts task IDs as
+well as local session IDs.
 
 ## Logs and statistics
 
