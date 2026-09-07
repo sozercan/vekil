@@ -45,6 +45,32 @@ Classifier calls are auxiliary policy operations: they have separate admission/s
 
 Bounded decision provenance includes config, profile, classifier, and binary generation hashes plus enums/counts/latency/failure categories. Secret values do not enter generation hashes. See [Semantic Policy Routing](policy-routing.md#metrics-and-decision-provenance) for the generation definitions and operator gates.
 
+### Task usage
+
+`GET /stats.json` includes an independent `task_usage` ledger for every
+upstream inference send across legacy and explicit routes. It includes retries,
+token-count requests, compaction, memory summaries, policy classification and
+preflight, and dashboard insight generation.
+
+`task_usage.totals` reports sends, completed sends, errors, throttles, summed
+duration, reported token usage, and numeric `copilot_usage` totals.
+`task_usage.by_kind` breaks those values down into `inference`, `token_count`,
+`compaction`, `memory`, `classifier`, and `insight`.
+`task_usage.inflight` includes header wait and response consumption.
+Local validation and admission rejections do not create upstream sends.
+
+`reported_usage_sends` counts sends whose responses supplied inference usage.
+Missing usage is not estimated. Native token-count responses describe input
+size, so their counts do not become spent tokens. Failed and canceled sends
+retain any reported usage, and repeated terminal observations do not double
+count it. Numeric accounting retains only `total_nano_aiu` and `compute_units`;
+provider model details and response content are excluded.
+
+These totals overlap the existing client and route ledgers and must not be
+added to them. They provide a complete scope for comparing task configurations
+when providers report usage. The launcher includes them in its session summary;
+the browser's traffic cards continue to use client-request totals.
+
 ## AI insights (optional)
 
 When an insight model is configured, the dashboard shows a **Generate insights** button. Clicking it sends the current traffic snapshot to that model — through Vekil's own `/v1/chat/completions` path — and renders a short natural-language analysis in a block below the live narrative. The model is told what the static narrative already shows and asked to add to it (error concentration, cost shape, trends, a recommendation) rather than repeat it. The configured public model may be native Chat or native Responses; Responses-only models are served through the same Chat-over-Responses compatibility layer used by external Chat clients.
@@ -67,11 +93,11 @@ Notes:
 - **It spends tokens.** Each click is one short chat-completion against the configured model.
 - **Rate-limited.** The endpoint is single-flight (one generation at a time) with a short cooldown between generations, so repeat or concurrent clicks cannot fan out billable calls.
 - **Fails open.** Any error (no model, timeout, upstream failure, rate-limit) returns a soft error and the dashboard keeps showing its templated narrative.
-- **Self-excluded.** The insight call runs in-process and does not pass through the stats middleware, so it is not counted in traffic and cannot feed back on itself.
+- **Self-excluded from traffic.** The insight call runs in-process and does not pass through the stats middleware. Its upstream usage appears in `task_usage` under `insight`.
 
 ## Data model
 
-Routing observability has two related ledgers:
+The existing routing ledgers keep their meanings alongside the task ledger:
 
 1. The **client-request ledger** records exactly one row/outcome for an inbound HTTP request or WebSocket `response.create` turn. It owns client-visible status, latency, requested public model, provider, and accepted-turn usage. HTTP explicit-route summaries also carry route, final target, send count, and switch count; websocket turns currently expose their route topology through the physical-attempt counters instead.
 2. The **physical-attempt ledger** increments `upstream_attempts` for each explicit-route inference send and `by_target[].attempts` for the selected route/target/provider. Target switches and route exhaustion are separate from legacy same-target retries. `physical_usage` records usage reported by those sends, while `wasted_usage` is the subset from attempts that did not become the accepted client result. A separately bounded `recent_attempts` trace retains normalized outcome, delivery/progress/commitment, retry decision, TTFT, sanitized retry timing, cleanup state, reported usage, and per-attempt request IDs for diagnostics.

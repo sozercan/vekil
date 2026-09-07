@@ -238,6 +238,8 @@ this flow. Vekil instead injects a transient, per-launch
 - `env_key="VEKIL_CODEX_API_KEY"` reads the random local bearer token;
 - `requires_openai_auth=false` prevents Codex/ChatGPT login fallback;
 - `supports_websockets=false` keeps the launcher on deterministic HTTP Responses;
+- generated context budgets prefer the model's prompt/input limit over its
+  total context window, while preserving explicit public catalog overrides;
 - for a policy-owned Chat model, Vekil disables hosted web search, remote
   compaction, Responses Lite, and code-only tool modes; removes Codex's freeform `apply_patch` declaration; and translates
   stateless Responses messages, bounded `text.format` structured-output schemas,
@@ -339,6 +341,14 @@ The startup banner prints the exact proxy URL and log path. Routes other than
 `/healthz` and `/readyz` require the random session token, so the ordinary
 browser dashboard is not exposed. The end-of-session summary is written to
 stderr so non-interactive agent output on stdout remains pipeline-safe.
+
+The summary includes upstream sends, throttles, reported tokens, and numeric
+provider accounting across the full session. Auxiliary rows identify token
+probes, compaction, memory summaries, classifier calls, and dashboard insights.
+Retries contribute their own reported usage. Native token-count results are
+sizing information and do not become spent inference tokens. The launcher waits
+briefly for both client and auxiliary work to settle before reading these
+totals. See [task usage](dashboard.md#task-usage) for reporting limits.
 
 If Codex reports an upstream `408 user_request_timeout`, see
 [Troubleshooting](troubleshooting.md#408-user_request_timeout-timed-out-reading-request-body)

@@ -383,7 +383,10 @@ type serveFlags struct {
 	copilotIntegrationID            *string
 	copilotGitHubAPIVersion         *string
 	copilotOpenAIIntent             *string
+	copilotLargeRequestConcurrency  *int
+	copilotLargeRequestBytes        *int
 	responsesWSEnabled              *bool
+	responsesWSNativeUpstream       *bool
 	responsesWSTurnStateDelta       *bool
 	responsesWSDisableAutoCompact   *bool
 	responsesWSCompactMaxItems      *int
@@ -410,7 +413,10 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		copilotIntegrationID:            fs.String("copilot-integration-id", getEnv("COPILOT_INTEGRATION_ID", ""), "Upstream Copilot copilot-integration-id header"),
 		copilotGitHubAPIVersion:         fs.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header"),
 		copilotOpenAIIntent:             fs.String("copilot-openai-intent", getEnv("COPILOT_OPENAI_INTENT", ""), "Upstream Copilot openai-intent header"),
+		copilotLargeRequestConcurrency:  fs.Int("copilot-large-request-concurrency", getEnvInt("COPILOT_LARGE_REQUEST_CONCURRENCY", 0), "Maximum concurrent large Copilot requests per credential; zero disables admission control"),
+		copilotLargeRequestBytes:        fs.Int("copilot-large-request-bytes", getEnvInt("COPILOT_LARGE_REQUEST_BYTES", proxy.DefaultCopilotLargeRequestThresholdBytes()), "Request body size in bytes that qualifies for Copilot large-request admission control"),
 		responsesWSEnabled:              fs.Bool("responses-ws-enabled", getEnvBool("RESPONSES_WS_ENABLED", false), "Enable proxy-owned Codex websocket bridge on GET /v1/responses"),
+		responsesWSNativeUpstream:       fs.Bool("responses-ws-native-upstream", getEnvBool("RESPONSES_WS_NATIVE_UPSTREAM", false), "Use native upstream Copilot Responses websockets for websocket sessions"),
 		responsesWSTurnStateDelta:       fs.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
 		responsesWSDisableAutoCompact:   fs.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction"),
 		responsesWSCompactMaxItems:      fs.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items"),
@@ -443,6 +449,7 @@ func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
 func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	return proxy.ResponsesWebSocketConfig{
 		Enabled:             *f.responsesWSEnabled,
+		NativeUpstream:      *f.responsesWSNativeUpstream,
 		TurnStateDelta:      *f.responsesWSTurnStateDelta,
 		DisableAutoCompact:  *f.responsesWSDisableAutoCompact,
 		AutoCompactMaxItems: *f.responsesWSCompactMaxItems,
@@ -664,6 +671,7 @@ func runServe() {
 		server.WithCompactUpstreamMaxAttempts(*serve.compactUpstreamMaxAttempts),
 		server.WithPolicyRoutingAllowRemoteSingleTenant(*serve.policyRoutingAllowRemote),
 		server.WithProxyOptions(
+			proxy.WithCopilotLargeRequestConcurrency(*serve.copilotLargeRequestConcurrency, *serve.copilotLargeRequestBytes),
 			proxy.WithProvidersConfig(providersCfg),
 			proxy.WithPolicyRoutingMode(policyRoutingMode),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),

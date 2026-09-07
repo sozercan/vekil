@@ -561,16 +561,10 @@ func convertedChatSafeHeaders(src http.Header) http.Header {
 		return nil
 	}
 	dst := make(http.Header)
-	for key, values := range src {
-		lower := strings.ToLower(strings.TrimSpace(key))
-		allowed := lower == "x-request-id" || lower == "request-id" || lower == "x-github-request-id" ||
-			lower == "openai-processing-ms" || lower == "retry-after" || lower == "x-azure-request-id" ||
-			lower == "openai-request-id" || strings.HasPrefix(lower, "x-ratelimit-") || strings.HasPrefix(lower, "ratelimit-")
-		if !allowed {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
+	copyCopilotDiagnosticHeaders(dst, src)
+	for _, name := range []string{"Request-Id", "Openai-Processing-Ms"} {
+		if value := boundedSingleHeaderValue(src, name); value != "" {
+			dst.Set(name, value)
 		}
 	}
 	if len(dst) == 0 {
@@ -596,7 +590,7 @@ func (h *ProxyHandler) routeChatExecutionResult(
 	mode chatCompletionsMode,
 	handlers chatCompletionsResponseHandlers,
 ) error {
-	if result.Backend == chatBackendResponses && len(result.Headers) > 0 {
+	if len(result.Headers) > 0 {
 		mergeHeaderValues(w.Header(), result.Headers)
 	}
 	if result.Backend == chatBackendNativeChat || result.Response != nil {

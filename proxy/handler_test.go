@@ -6437,7 +6437,7 @@ func TestSetCopilotHeaders(t *testing.T) {
 		{"editor-plugin-version", "copilot-chat/0.26.7"},
 		{"user-agent", "GitHubCopilotChat/0.26.7"},
 		{"copilot-integration-id", "vscode-chat"},
-		{"x-github-api-version", "2025-05-01"},
+		{"x-github-api-version", "2026-08-20"},
 		{"openai-intent", "conversation-panel"},
 		{"Content-Type", "application/json"},
 	}

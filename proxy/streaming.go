@@ -54,6 +54,7 @@ type streamLifecycleHooks struct {
 	transportCanceled      func() bool
 	suppressStats          func()
 	writePrecommitShutdown func()
+	onCopilotUsage         func(json.RawMessage)
 }
 
 func (h streamLifecycleHooks) suppressTransportCancellation(committed bool) bool {
@@ -296,7 +297,7 @@ func classifyOpenAIChatChunkProgress(raw map[string]json.RawMessage) upstreamSem
 	}
 	knownTopLevel := map[string]struct{}{
 		"id": {}, "object": {}, "created": {}, "model": {}, "choices": {},
-		"system_fingerprint": {}, "service_tier": {}, "usage": {},
+		"system_fingerprint": {}, "service_tier": {}, "usage": {}, "copilot_usage": {},
 	}
 	for key, value := range raw {
 		if _, known := knownTopLevel[key]; !known && !rawJSONIsNullOrEmpty(value) {
@@ -306,6 +307,9 @@ func classifyOpenAIChatChunkProgress(raw map[string]json.RawMessage) upstreamSem
 	if usage, ok := raw["usage"]; ok && !rawJSONIsNullOrEmpty(usage) {
 		// A usage frame proves the attempt reached provider-side accounting. Even an
 		// otherwise empty usage-only chunk is therefore beyond a replay-safe preamble.
+		return upstreamProgressTerminalSuccess
+	}
+	if usage, ok := raw["copilot_usage"]; ok && !rawJSONIsNullOrEmpty(usage) {
 		return upstreamProgressTerminalSuccess
 	}
 
@@ -351,7 +355,7 @@ func classifyOpenAIChatDeltaProgress(delta map[string]json.RawMessage) upstreamS
 	progress := upstreamProgressAllowedPreamble
 	known := map[string]struct{}{
 		"role": {}, "content": {}, "tool_calls": {}, "function_call": {},
-		"reasoning": {}, "reasoning_content": {}, "reasoning_text": {},
+		"reasoning": {}, "reasoning_content": {}, "reasoning_text": {}, "reasoning_opaque": {},
 		"refusal": {}, "audio": {},
 	}
 	for key, value := range delta {
@@ -362,7 +366,7 @@ func classifyOpenAIChatDeltaProgress(delta map[string]json.RawMessage) upstreamS
 			if !rawJSONIsNullOrEmpty(value) {
 				progress = mergeUpstreamSemanticProgress(progress, upstreamProgressToolActivity)
 			}
-		case "content", "reasoning", "reasoning_content", "reasoning_text", "refusal", "audio":
+		case "content", "reasoning", "reasoning_content", "reasoning_text", "reasoning_opaque", "refusal", "audio":
 			if rawJSONHasSemanticValue(value) {
 				progress = mergeUpstreamSemanticProgress(progress, upstreamProgressSemanticOutput)
 			}
@@ -1043,7 +1047,7 @@ func streamOpenAIPassthrough(
 				transformedCurrentData = &data
 			}
 		}
-		if !dropInjectedUsage && onUsage == nil && aggregator == nil {
+		if !dropInjectedUsage && onUsage == nil && aggregator == nil && lifecycle.onCopilotUsage == nil {
 			return true
 		}
 
@@ -1051,12 +1055,27 @@ func streamOpenAIPassthrough(
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			return true
 		}
+		if lifecycle.onCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			lifecycle.onCopilotUsage(chunk.CopilotUsage)
+		}
 		if chunk.Usage != nil {
 			if onUsage != nil {
 				onUsage(chunk.Usage)
 			}
 			if dropInjectedUsage && len(chunk.Choices) == 0 {
-				dropCurrent = true
+				if rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+					dropCurrent = true
+				} else {
+					// Standard usage may be injected for local accounting, but a
+					// shared frame can also carry upstream billing metadata.
+					var payload map[string]json.RawMessage
+					if json.Unmarshal([]byte(data), &payload) == nil {
+						delete(payload, "usage")
+						encoded, _ := json.Marshal(payload)
+						transformed := string(encoded)
+						transformedCurrentData = &transformed
+					}
+				}
 			}
 		}
 		if aggregator != nil {
@@ -1633,6 +1652,9 @@ func streamOpenAIToAnthropicWithLifecycle(
 	onUsage := firstOpenAIUsageCallback(onUsageCallbacks)
 
 	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+		if lifecycle.onCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			lifecycle.onCopilotUsage(chunk.CopilotUsage)
+		}
 		if onUsage != nil && chunk.Usage != nil {
 			onUsage(chunk.Usage)
 		}
@@ -2055,6 +2077,8 @@ type aggregatedOpenAIChoice struct {
 	contentPresent    bool
 	refusal           strings.Builder
 	refusalPresent    bool
+	reasoningText     strings.Builder
+	reasoningOpaque   strings.Builder
 	toolCalls         map[int]*models.OpenAIToolCall
 	toolCallArguments map[int]*strings.Builder
 	finishReason      *string
@@ -2117,6 +2141,9 @@ func (a *openAIResponseAggregator) addChunk(chunk models.OpenAIStreamChunk) {
 	if chunk.Usage != nil {
 		a.response.Usage = chunk.Usage
 	}
+	if !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+		a.response.CopilotUsage = bytes.Clone(chunk.CopilotUsage)
+	}
 
 	for _, choice := range chunk.Choices {
 		a.addChoice(choice)
@@ -2129,6 +2156,8 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 	if choice.Delta.Role != "" {
 		aggChoice.role = choice.Delta.Role
 	}
+	aggChoice.reasoningText.WriteString(choice.Delta.ReasoningText)
+	aggChoice.reasoningOpaque.WriteString(choice.Delta.ReasoningOpaque)
 
 	if choice.Delta.Content != nil && !bytes.Equal(bytes.TrimSpace(choice.Delta.Content), []byte("null")) {
 		var text string
@@ -2250,7 +2279,11 @@ func (a *openAIResponseAggregator) buildResponseWithOptions(options openAIRespon
 }
 
 func (a *openAIResponseAggregator) buildMessage(choice *aggregatedOpenAIChoice, options openAIResponseBuildOptions) models.OpenAIMessage {
-	message := models.OpenAIMessage{Role: choice.role}
+	message := models.OpenAIMessage{
+		Role:            choice.role,
+		ReasoningText:   choice.reasoningText.String(),
+		ReasoningOpaque: choice.reasoningOpaque.String(),
+	}
 	if choice.contentPresent {
 		content, _ := json.Marshal(choice.content.String())
 		message.Content = content

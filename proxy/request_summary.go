@@ -67,6 +67,7 @@ type RequestSummary struct {
 	totalTokensValue          int
 	cachedTokensValue         int
 	reasoningTokensValue      int
+	copilotUsage              copilotUsageTotals
 	// extraPromptTokens / extraCompletionTokens accumulate out-of-band token
 	// spend that is separate from the turn's own reported usage — e.g. an
 	// internal /responses compaction call made while serving a 413 oversized-
@@ -723,6 +724,18 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	}
 	if s.totalTokens != nil {
 		fields = append(fields, logger.F("total_tokens", *s.totalTokens))
+	}
+	if s.cachedTokens != nil {
+		fields = append(fields, logger.F("cached_tokens", *s.cachedTokens))
+	}
+	if s.reasoningTokens != nil {
+		fields = append(fields, logger.F("reasoning_tokens", *s.reasoningTokens))
+	}
+	if s.copilotUsage.TotalNanoAIU > 0 {
+		fields = append(fields, logger.F("total_nano_aiu", s.copilotUsage.TotalNanoAIU))
+	}
+	if s.copilotUsage.ComputeUnits > 0 {
+		fields = append(fields, logger.F("compute_units", s.copilotUsage.ComputeUnits))
 	}
 	if s.statsSuppressed {
 		fields = append(fields, logger.F("stats_suppressed", true))

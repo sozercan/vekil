@@ -12,7 +12,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`policy-routing.md`](policy-routing.md) | schema-v2 semantic policy routing, classifier privacy/trust, modes, fallbacks, metrics, evaluation, and rollout gates | policy schema, classifier behavior, supported surfaces, telemetry, or release gates change |
 | [`provider-api-keys.md`](provider-api-keys.md) | where to get provider API keys and how to map them into providers config | provider signup/key URLs or auth field guidance changes |
 | [`tool-optimizers.md`](tool-optimizers.md) | optional shell command rewrite and tool-output reduction config | optimizer config or behavior changes |
-| [`responses-websocket.md`](responses-websocket.md) | Codex-style `GET /v1/responses` websocket bridge tuning | websocket bridge, auto-compaction, or compact retry knobs change |
+| [`responses-websocket.md`](responses-websocket.md) | Codex-style `GET /v1/responses` bridge, experimental native Copilot transport, and session limits | websocket transports, envelopes, auto-compaction, or compact retry knobs change |
 | [`clients.md`](clients.md) | copy-paste client examples | onboarding snippets or client compatibility changes |
 | [`agent-launchers.md`](agent-launchers.md) | one-command coding-agent launchers, lifecycle, logs, and credential isolation | launcher targets, flags, process lifecycle, or child configuration changes |
 | [`troubleshooting.md`](troubleshooting.md) | symptom-based recovery and diagnostic guidance for client-visible failures | a recurring failure gains a known recovery path or new diagnostic evidence |
@@ -20,7 +20,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`gemini.md`](gemini.md) | Gemini translation compatibility details | Gemini request/response translation behavior changes |
 | [`responses.md`](responses.md) | native Responses behavior, the Chat-over-Responses boundary, compact, and memory shims | Responses passthrough, Chat adaptation, compaction, or shim behavior changes |
 | [`architecture.md`](architecture.md) | package responsibilities, route registry/executor, Chat execution seam, replay safety, and data flow | implementation boundaries or design decisions change |
-| [`dashboard.md`](dashboard.md) | live browser traffic dashboard, route/attempt metrics, AI insights, and `/stats.json` | dashboard metrics, endpoints, insight routing, or stats behavior change |
+| [`dashboard.md`](dashboard.md) | live browser dashboard, route/attempt and full-task metrics, policy evidence, AI insights, and `/stats.json` | dashboard metrics, endpoints, insight routing, or stats behavior change |
 | [`menubar.md`](menubar.md) | macOS/Linux tray app usage | tray behavior or packaging changes |
 | [`development.md`](development.md) | build, test, route-safety, policy-routing, and Chat-over-Responses matrices, benchmark/evaluation baselines, and CI workflows | local dev, test gates, benchmark commands, evaluation gates, or CI change |
 

@@ -61,7 +61,10 @@ Websocket bridge behavior:
 - if upstream rejects delta replay, the proxy automatically falls back to full replay
 - if the first meaningful streamed upstream event is a transient `response.failed` admission error or a top-level Responses `error` event, including an uncoded Azure quota failure corroborated by headers, the bridge sends a wrapped websocket error frame instead of relaying the raw terminal event; synthesized `Retry-After` metadata is included when only reset telemetry is available
 
-This websocket bridge is a proxy transport adaptation layered over upstream HTTP `/responses`. It is not the same feature as provider-native websocket or realtime APIs such as Azure `/realtime`.
+The default websocket bridge adapts upstream HTTP `/responses`. The separate
+`--responses-ws-native-upstream` option enables experimental persistent Copilot
+Responses connections with stricter recovery limits. It does not enable Azure
+`/realtime`. See [native transport limits](responses-websocket.md#experimental-native-upstream-transport).
 
 For a schema-version-2 route, the first provider-backed websocket turn may use safe precommit failover. Once that target is exposed, the session pins to the exact route/target; later turns, delta/full replay, and auto-compaction remain on it, and an unavailable pinned target fails closed. Cross-target session migration is not implemented. Drain sessions before a version-1 or older-binary rollback.
 

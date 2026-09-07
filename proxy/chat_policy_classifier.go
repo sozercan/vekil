@@ -300,24 +300,35 @@ func validatePolicyClassifierSignals(signals policyClassifierSignals) error {
 // unavailable/uncertain fallbacks before invoking it. Invalid or abstaining
 // values conservatively return powerful.
 func mapPolicySignals(signals policyClassifierSignals, facts policyClassifierFacts) policyTier {
+	tier, _ := mapPolicySignalsWithReason(signals, facts)
+	return tier
+}
+
+func mapPolicySignalsWithReason(signals policyClassifierSignals, facts policyClassifierFacts) (policyTier, string) {
 	if signals.Abstain || validatePolicyClassifierSignals(signals) != nil {
-		return policyTierPowerful
+		return policyTierPowerful, "uncertain_signals"
 	}
 	switch signals.TurnType {
 	case policyTurnTypePlanning, policyTurnTypeDebug, policyTurnTypeReview, policyTurnTypeExploration:
-		return policyTierPowerful
+		return policyTierPowerful, "complex_turn"
 	}
 	switch signals.CodeScope {
 	case policyCodeScopeMultiFile, policyCodeScopeCrossModule, policyCodeScopeUnknown:
-		return policyTierPowerful
+		return policyTierPowerful, "broad_scope"
 	}
-	if signals.RiskLevel == policyRiskLevelHigh ||
-		signals.ModifyingToolCallCountEstimate >= 2 ||
-		signals.RequiresCodebaseContext ||
-		facts.taskOrContextTruncated() {
-		return policyTierPowerful
+	if signals.RiskLevel == policyRiskLevelHigh {
+		return policyTierPowerful, "high_risk"
 	}
-	return policyTierLightweight
+	if signals.ModifyingToolCallCountEstimate >= 2 {
+		return policyTierPowerful, "multiple_modifications"
+	}
+	if signals.RequiresCodebaseContext {
+		return policyTierPowerful, "codebase_context"
+	}
+	if facts.taskOrContextTruncated() {
+		return policyTierPowerful, "truncated_context"
+	}
+	return policyTierLightweight, "bounded_task"
 }
 
 // mapPolicyClassifierResult applies fallback precedence before the pure signal

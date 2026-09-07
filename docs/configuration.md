@@ -30,6 +30,8 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 | `--policy-routing-allow-remote-single-tenant` | `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT` | `false` | Acknowledge running policy `observe`/`enforce` on a non-loopback bind for one trusted tenant. This adds no authentication or tenant isolation. |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
+| `--copilot-large-request-concurrency` | `COPILOT_LARGE_REQUEST_CONCURRENCY` | `0` | Optional concurrent large Copilot request limit per provider and credential; zero disables it |
+| `--copilot-large-request-bytes` | `COPILOT_LARGE_REQUEST_BYTES` | `262144` | Payload byte threshold for the optional large-request limit |
 
 Native CLI and tray-app runs default to `127.0.0.1`. Container deployments that publish the proxy port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path.
 
@@ -50,8 +52,34 @@ These overrides only affect Copilot-backed upstream requests. For provider-level
 | `--copilot-plugin-version` | `COPILOT_PLUGIN_VERSION` | `copilot-chat/0.26.7` | Upstream `editor-plugin-version` header |
 | `--copilot-user-agent` | `COPILOT_USER_AGENT` | `GitHubCopilotChat/0.26.7` | Upstream `user-agent` header |
 | `--copilot-integration-id` | `COPILOT_INTEGRATION_ID` | credential-aware | Upstream `copilot-integration-id` header; direct `ghu_` catalog/Chat requests default to `copilot-language-server`, while its Responses fallback and other credentials default to `vscode-chat` |
-| `--copilot-github-api-version` | `COPILOT_GITHUB_API_VERSION` | `2025-05-01` | Upstream `x-github-api-version` header |
+| `--copilot-github-api-version` | `COPILOT_GITHUB_API_VERSION` | `2026-08-20` | Upstream `x-github-api-version` header |
 | `--copilot-openai-intent` | `COPILOT_OPENAI_INTENT` | unset (`conversation-panel` for chat/responses) | Upstream `openai-intent` header |
+
+Vekil forwards explicit caller `X-Initiator` values of `user` or `agent`,
+`X-Interaction-Id`, and `X-Client-Session-Id` to Copilot inference requests.
+Each value must be unambiguous, contain no control characters, and fit within
+1,024 bytes. Authentication and integration settings come from the server's
+provider configuration.
+
+## Controlling upstream pressure
+
+Recognized Copilot account, model, and integration throttles create a shared,
+process-local cooldown for that scope. Vekil preserves long `Retry-After`
+values and returns the upstream response when the reset exceeds the request's
+remaining time budget. After a cooldown expires, one request probes recovery.
+See [throttling diagnostics](troubleshooting.md) for reset and request-ID details.
+
+To limit overlapping large requests, set
+`COPILOT_LARGE_REQUEST_CONCURRENCY=1`. The default size threshold is 256 KiB.
+Waiting requests honor cancellation and shutdown; the queue and shared state are
+bounded. Small requests and native token-count calls do not occupy these slots.
+This setting controls local concurrency; upstream quotas still apply.
+
+To reduce token use, configure [tool-output reduction](tool-optimizers.md) and,
+where appropriate, [policy tier reasoning effort](policy-routing.md).
+Use the full-task totals in [`/stats.json`](dashboard.md) to include classifiers,
+retries, and compaction when comparing configurations. These controls remain
+explicit so operators can evaluate their effect on task quality.
 
 ## Provider Configs
 
@@ -85,4 +113,8 @@ At server startup, effective `enforce` profiles must pass live preflight before 
 
 ## Responses WebSocket Bridge
 
-The Codex-style `GET /v1/responses` websocket bridge is disabled by default and remains a proxy-owned transport over upstream HTTP `/responses`. See [Responses WebSocket Bridge](responses-websocket.md) for websocket flags, auto-compaction settings, chunked compaction knobs, and a debug run example.
+The Codex-style `GET /v1/responses` websocket bridge is disabled by default.
+When enabled it uses upstream HTTP `/responses` by default. A separate
+`--responses-ws-native-upstream` option enables experimental native Copilot
+connections. See [Responses WebSocket Bridge](responses-websocket.md) for its
+limits, websocket flags, and compaction settings.

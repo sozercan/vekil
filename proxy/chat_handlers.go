@@ -228,7 +228,7 @@ func inspectPolicyOpenAIStreamChunk(eventType, data string) (*policyOpenAIStream
 		return nil, false
 	}
 	if hasCaseFoldedJSONFieldAlias(raw,
-		"id", "object", "created", "model", "choices", "usage", "moderation",
+		"id", "object", "created", "model", "choices", "usage", "copilot_usage", "moderation",
 		"system_fingerprint", "service_tier", "prompt_filter_results", "prompt_annotations",
 	) {
 		return nil, false
@@ -239,6 +239,11 @@ func inspectPolicyOpenAIStreamChunk(eventType, data string) (*policyOpenAIStream
 	}
 	if object := strings.TrimSpace(chunk.Object); object != "" && object != "chat.completion.chunk" {
 		return nil, false
+	}
+	if usageRaw, ok := raw["copilot_usage"]; ok && !rawJSONIsNullOrEmpty(usageRaw) {
+		if !recognizedPolicyChatAccounting(usageRaw) {
+			return nil, false
+		}
 	}
 	if recognizedFoundryPromptFilterAnnotation(raw) {
 		return nil, true
@@ -287,7 +292,7 @@ func inspectPolicyOpenAIStreamChunk(eventType, data string) (*policyOpenAIStream
 				}
 				if hasCaseFoldedJSONFieldAlias(delta,
 					"role", "content", "refusal", "name", "tool_calls", "tool_call_id",
-					"function_call", "reasoning", "reasoning_content", "reasoning_text", "audio",
+					"function_call", "reasoning", "reasoning_content", "reasoning_text", "reasoning_opaque", "audio",
 				) {
 					return nil, false
 				}
@@ -314,13 +319,64 @@ func inspectPolicyOpenAIStreamChunk(eventType, data string) (*policyOpenAIStream
 
 	usageRaw, hasUsage := raw["usage"]
 	if !hasUsage || rawJSONIsNullOrEmpty(usageRaw) {
-		return nil, false
+		return nil, !rawJSONIsNullOrEmpty(raw["copilot_usage"])
 	}
 	var usage models.OpenAIUsage
 	if json.Unmarshal(usageRaw, &usage) != nil {
 		return nil, false
 	}
 	return nil, true
+}
+
+func recognizedPolicyChatAccounting(raw json.RawMessage) bool {
+	usage, err := decodeChatJSONObject(raw, "copilot_usage")
+	if err != nil || usage == nil {
+		return false
+	}
+	for name, value := range usage {
+		switch name {
+		case "total_nano_aiu", "compute_units":
+			if !validPolicyAccountingNumber(value) {
+				return false
+			}
+		case "token_details":
+			var details []json.RawMessage
+			if json.Unmarshal(value, &details) != nil {
+				return false
+			}
+			for _, rawDetail := range details {
+				detail, err := decodeChatJSONObject(rawDetail, "copilot_usage.token_details")
+				if err != nil || detail == nil {
+					return false
+				}
+				for key, item := range detail {
+					switch key {
+					case "model", "token_type":
+						if !rawJSONIsNullOrEmpty(item) && !isJSONString(item) {
+							return false
+						}
+					case "token_count", "batch_size", "cost_per_batch":
+						if !validPolicyAccountingNumber(item) {
+							return false
+						}
+					default:
+						return false
+					}
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validPolicyAccountingNumber(raw json.RawMessage) bool {
+	if rawJSONIsNullOrEmpty(raw) {
+		return true
+	}
+	var number float64
+	return json.Unmarshal(raw, &number) == nil && number >= 0
 }
 
 func terminatePolicySSEEvent(event []byte) []byte {
@@ -1446,7 +1502,8 @@ func (h *ProxyHandler) aggregateExplicitRoutedChatExecution(ctx context.Context,
 		return result, nil
 	}
 
-	response, finalResp, err := h.aggregateExplicitChatCompletionsResponse(ctx, result.Response, body, mode, aggregateStreamToResponseWithProgress)
+	var successfulHeaders http.Header
+	response, finalResp, err := h.aggregateExplicitChatCompletionsResponse(ctx, result.Response, body, mode, aggregateStreamToResponseWithProgress, &successfulHeaders)
 	if err != nil {
 		return chatExecutionResult{}, err
 	}
@@ -1470,7 +1527,7 @@ func (h *ProxyHandler) aggregateExplicitRoutedChatExecution(ctx context.Context,
 	result.Response = nil
 	result.Completion = response
 	result.Usage = response.Usage
-	result.Headers = nil
+	result.Headers = convertedChatSafeHeaders(successfulHeaders)
 	// routeChatExecutionResult treats a native backend as an HTTP response.
 	// Aggregation has already converted this result to a canonical completion.
 	result.Backend = 0
@@ -2014,8 +2071,8 @@ func shouldForwardAnthropicMessagesDirectResolved(provider *providerRuntime, own
 }
 
 func (h *ProxyHandler) shouldForwardAnthropicCountTokensDirect(model string) bool {
-	provider, _, _ := h.resolveProviderModelForRequest(model, providerEndpointMessages)
-	return provider != nil && provider.kind == providerTypeAnthropicCompatible
+	provider, owner, known := h.resolveProviderModelForRequest(model, providerEndpointMessages)
+	return shouldForwardAnthropicMessagesDirectResolved(provider, owner, known)
 }
 
 func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *http.Request, body []byte, req *models.AnthropicRequest, publicModel, upstreamModel string) {
@@ -2085,7 +2142,7 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokensForModel(ctx context.Cont
 	if err != nil {
 		return nil, err
 	}
-	if provider.kind != providerTypeAnthropicCompatible {
+	if !shouldForwardAnthropicMessagesDirectResolved(provider, owner, true) {
 		return nil, &providerRequestError{
 			statusCode: http.StatusBadRequest,
 			err:        fmt.Errorf("provider %q does not support %s", provider.id, providerEndpointMessagesCount),
@@ -2098,7 +2155,7 @@ func (h *ProxyHandler) postAnthropicMessagesCountTokensForModel(ctx context.Cont
 }
 
 func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, r *http.Request, body []byte, model string) {
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), model, providerEndpointMessages)
@@ -2301,6 +2358,7 @@ func translateOpenAIToAnthropicForRequest(resp *models.OpenAIResponse, req *mode
 // HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
 // request to OpenAI format, forwarding to Copilot, and translating the response back.
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
 	body, pooledBody, err := readBodyBorrowed(r)
 	if pooledBody != nil {
 		defer releaseSmallRequestBodyBuffer(pooledBody)
@@ -2462,6 +2520,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
+	upstreamCtx = withAnthropicChatCacheControl(upstreamCtx, &req)
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, route, err := h.withChatExecutionRoute(upstreamCtx, r.Context(), providerModel, oaiBody)
 	if err != nil {
@@ -2589,6 +2648,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	if len(result.Headers) > 0 {
 		observeUpstreamHeaders(r.Context(), result.Headers)
 	}
+	if policyPlan.valid() {
+		result.Headers = policyChatSafeHeaders(result.Headers, publicModel)
+	}
 
 	if result.Response != nil && result.Response.StatusCode != http.StatusOK {
 		resp := result.Response
@@ -2609,6 +2671,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			logger.F("request_bytes", len(oaiBody)),
 			logger.F("response_bytes", len(errBody)),
 		)
+		mergeHeaderValues(w.Header(), result.Headers)
 		writeAnthropicError(w, resp.StatusCode, mapAnthropicUpstreamStatus(resp.StatusCode), detail)
 		return
 	}
@@ -2637,8 +2700,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
 			tracked := &commitTrackingResponseWriter{ResponseWriter: w}
 			err := streamChatEventsToAnthropic(tracked, stream, publicModel, "msg_"+uuid.New().String(), chatStreamEventCallbacks{
-				OnUsage: openAIChatStreamUsageCallback(r.Context()),
-				OnFinal: h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
+				OnUsage:        openAIChatStreamUsageCallback(r.Context()),
+				OnCopilotUsage: func(raw json.RawMessage) { observeCopilotUsage(r.Context(), raw) },
+				OnFinal:        h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
 			})
 			if h.handleCanonicalChatStreamLifecycleError(w, r, upstreamCtx, tracked.committed, err, func() {
 				writeAnthropicShutdownSSEEvent(tracked)
@@ -2662,6 +2726,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
+			observeCopilotUsage(r.Context(), oaiResp.CopilotUsage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 			anthropicResp := prependCarriedReasoning(
 				translateOpenAIToAnthropicForRequest(oaiResp, &responseReq), result.carrier())
@@ -2680,6 +2745,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			}
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &oaiResp, h.toolContexts, scope, false)
+			observeCopilotUsage(r.Context(), oaiResp.CopilotUsage)
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			w.Header().Set("Content-Type", "application/json")
 			return json.NewEncoder(w).Encode(prependCarriedReasoning(
@@ -2725,10 +2791,11 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 }
 
 // HandleAnthropicMessagesCountTokens handles POST /v1/messages/count_tokens.
-// OpenAI-compatible upstreams do not expose a token-count endpoint, so this uses
-// the same minimal chat-completions probe as the Gemini countTokens adapter and
-// returns the upstream prompt token count in Anthropic's response shape.
+// Native Messages providers use their count endpoint. Other providers use a
+// minimal Chat probe and return its prompt token count in Anthropic's shape.
 func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
+	r = r.WithContext(withTaskInferenceKind(r.Context(), taskTokenCount))
 	body, err := readBody(r)
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
@@ -2777,7 +2844,19 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 
-	directAnthropic := h.shouldForwardAnthropicCountTokensDirect(req.Model)
+	provider, owner, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
+	if strings.TrimSpace(req.Model) != "" && !known && providerUsesDynamicModels(provider) {
+		if err := h.refreshUnknownChatRouteProvider(r.Context(), provider); err != nil {
+			if h.handleShutdownError(w, r, r.Context(), err) {
+				return
+			}
+			statusCode := upstreamStatusCode(err, http.StatusBadRequest)
+			writeAnthropicError(w, statusCode, mapAnthropicUpstreamStatus(statusCode), err.Error())
+			return
+		}
+		provider, owner, known = h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
+	}
+	directAnthropic := shouldForwardAnthropicMessagesDirectResolved(provider, owner, known)
 	providerEndpoint := providerEndpointChatCompletions
 	providerModel := req.Model
 	if directAnthropic {
@@ -2857,8 +2936,9 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		publicModel = policyPlan.publicID
 	}
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
+	upstreamCtx = withAnthropicChatCacheControl(upstreamCtx, &req)
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withChatExecutionRoute(upstreamCtx, suppressRouteAttemptStats(r.Context()), providerModel, policyBody)
 	if err != nil {
@@ -3246,6 +3326,7 @@ func writePolicyChatTerminalError(w http.ResponseWriter, resp *http.Response, pu
 // HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
 // request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
 	bodyBytes, pooledBody, err := readBodyBorrowed(r)
 	if pooledBody != nil {
 		defer releaseSmallRequestBodyBuffer(pooledBody)
@@ -3532,9 +3613,10 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
 			tracked := &commitTrackingResponseWriter{ResponseWriter: w}
 			err := streamChatEventsToOpenAI(tracked, stream, chatStreamEventCallbacks{
-				DropUsage: !mode.clientRequestedStreamUsage,
-				OnUsage:   openAIChatStreamUsageCallback(r.Context()),
-				OnFinal:   h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
+				DropUsage:      !mode.clientRequestedStreamUsage,
+				OnUsage:        openAIChatStreamUsageCallback(r.Context()),
+				OnCopilotUsage: func(raw json.RawMessage) { observeCopilotUsage(r.Context(), raw) },
+				OnFinal:        h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
 			})
 			if h.handleCanonicalChatStreamLifecycleError(w, r, upstreamCtx, tracked.committed, err, func() {
 				_ = writeOpenAIChatSSEError(tracked, &chatExecutionError{
@@ -3566,7 +3648,13 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		aggregate: func(oaiResp *models.OpenAIResponse) {
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			normalizeOpenAIChatCompletionStruct(oaiResp, responseModel)
+			if routeOperation != nil && len(oaiResp.CopilotUsage) > 0 {
+				payload := map[string]json.RawMessage{"copilot_usage": oaiResp.CopilotUsage}
+				rewriteOpenAIChatCompletionModelIdentity(payload, responseModel)
+				oaiResp.CopilotUsage = payload["copilot_usage"]
+			}
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
+			observeCopilotUsage(r.Context(), oaiResp.CopilotUsage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(oaiResp)

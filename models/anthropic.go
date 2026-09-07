@@ -35,14 +35,15 @@ type AnthropicMessage struct {
 // The Type field determines which other fields are populated
 // (text, image, tool_use, tool_result, thinking).
 type ContentBlock struct {
-	Type      string                `json:"type"`
-	Text      *string               `json:"text,omitempty"`
-	Source    *AnthropicImageSource `json:"source,omitempty"`
-	ID        string                `json:"id,omitempty"`
-	Name      string                `json:"name,omitempty"`
-	Input     json.RawMessage       `json:"input,omitempty"`
-	ToolUseID string                `json:"tool_use_id,omitempty"`
-	Content   json.RawMessage       `json:"content,omitempty"`
+	Type         string                `json:"type"`
+	Text         *string               `json:"text,omitempty"`
+	Source       *AnthropicImageSource `json:"source,omitempty"`
+	ID           string                `json:"id,omitempty"`
+	Name         string                `json:"name,omitempty"`
+	Input        json.RawMessage       `json:"input,omitempty"`
+	ToolUseID    string                `json:"tool_use_id,omitempty"`
+	Content      json.RawMessage       `json:"content,omitempty"`
+	CacheControl json.RawMessage       `json:"cache_control,omitempty"`
 	// Pointer so an EMPTY thinking text still serialises as "thinking":"".
 	// omitempty drops an empty string, and clients read the field unconditionally.
 	Thinking  *string `json:"thinking,omitempty"`
@@ -59,9 +60,10 @@ type AnthropicImageSource struct {
 
 // AnthropicTool defines a tool available for the model to call.
 type AnthropicTool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"input_schema"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 // AnthropicThinking configures extended thinking. Type can be "enabled"

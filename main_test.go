@@ -359,6 +359,27 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsTrafficOptions(t *testing.T) {
+	t.Setenv("RESPONSES_WS_NATIVE_UPSTREAM", "false")
+	t.Setenv("COPILOT_LARGE_REQUEST_CONCURRENCY", "0")
+	t.Setenv("COPILOT_LARGE_REQUEST_BYTES", "262144")
+	defaults := parseServeFlagsForTest(t)
+	if defaults.responsesWebSocketConfig().NativeUpstream || *defaults.copilotLargeRequestConcurrency != 0 || *defaults.copilotLargeRequestBytes != 262144 {
+		t.Fatal("traffic options should preserve disabled defaults")
+	}
+	t.Setenv("RESPONSES_WS_NATIVE_UPSTREAM", "true")
+	t.Setenv("COPILOT_LARGE_REQUEST_CONCURRENCY", "2")
+	t.Setenv("COPILOT_LARGE_REQUEST_BYTES", "131072")
+	configured := parseServeFlagsForTest(t)
+	if !configured.responsesWebSocketConfig().NativeUpstream || *configured.copilotLargeRequestConcurrency != 2 || *configured.copilotLargeRequestBytes != 131072 {
+		t.Fatal("traffic options did not use environment configuration")
+	}
+	override := parseServeFlagsForTest(t, "--responses-ws-native-upstream=false", "--copilot-large-request-concurrency=1", "--copilot-large-request-bytes=65536")
+	if override.responsesWebSocketConfig().NativeUpstream || *override.copilotLargeRequestConcurrency != 1 || *override.copilotLargeRequestBytes != 65536 {
+		t.Fatal("traffic option flags did not override environment configuration")
+	}
+}
+
 func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DisableKeepAlives = true

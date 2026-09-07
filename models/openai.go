@@ -33,12 +33,15 @@ type StreamOptions struct {
 
 // OpenAIMessage is a single message in an OpenAI conversation.
 type OpenAIMessage struct {
-	Role       string           `json:"role,omitempty"`
-	Content    json.RawMessage  `json:"content,omitempty"`
-	Refusal    json.RawMessage  `json:"refusal,omitempty"`
-	Name       string           `json:"name,omitempty"`
-	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
+	Role                string           `json:"role,omitempty"`
+	Content             json.RawMessage  `json:"content,omitempty"`
+	Refusal             json.RawMessage  `json:"refusal,omitempty"`
+	Name                string           `json:"name,omitempty"`
+	ToolCalls           []OpenAIToolCall `json:"tool_calls,omitempty"`
+	ToolCallID          string           `json:"tool_call_id,omitempty"`
+	ReasoningText       string           `json:"reasoning_text,omitempty"`
+	ReasoningOpaque     string           `json:"reasoning_opaque,omitempty"`
+	CopilotCacheControl json.RawMessage  `json:"copilot_cache_control,omitempty"`
 }
 
 // OpenAIContentPart is a multimodal content part in a chat message.
@@ -56,8 +59,9 @@ type OpenAIImageURL struct {
 
 // OpenAITool defines a tool (function) available for the model to call.
 type OpenAITool struct {
-	Type     string         `json:"type"`
-	Function OpenAIFunction `json:"function"`
+	Type                string          `json:"type"`
+	Function            OpenAIFunction  `json:"function"`
+	CopilotCacheControl json.RawMessage `json:"copilot_cache_control,omitempty"`
 }
 
 // OpenAIFunction describes a function the model may call.
@@ -84,13 +88,14 @@ type OpenAIFunctionCall struct {
 
 // OpenAIResponse is the non-streaming response from the OpenAI Chat Completions API.
 type OpenAIResponse struct {
-	ID                string         `json:"id"`
-	Object            string         `json:"object"`
-	Created           int64          `json:"created"`
-	Model             string         `json:"model"`
-	Choices           []OpenAIChoice `json:"choices"`
-	Usage             *OpenAIUsage   `json:"usage,omitempty"`
-	SystemFingerprint string         `json:"system_fingerprint,omitempty"`
+	ID                string          `json:"id"`
+	Object            string          `json:"object"`
+	Created           int64           `json:"created"`
+	Model             string          `json:"model"`
+	Choices           []OpenAIChoice  `json:"choices"`
+	Usage             *OpenAIUsage    `json:"usage,omitempty"`
+	SystemFingerprint string          `json:"system_fingerprint,omitempty"`
+	CopilotUsage      json.RawMessage `json:"copilot_usage,omitempty"`
 }
 
 // OpenAIChoice is a single completion choice in an OpenAI response.
@@ -105,6 +110,7 @@ type OpenAIUsage struct {
 	PromptTokens            int                            `json:"prompt_tokens"`
 	CompletionTokens        int                            `json:"completion_tokens"`
 	TotalTokens             int                            `json:"total_tokens"`
+	ReasoningTokens         int                            `json:"reasoning_tokens,omitempty"`
 	PromptTokensDetails     *OpenAIPromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
 	CompletionTokensDetails *OpenAICompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
@@ -128,6 +134,7 @@ type OpenAIStreamChunk struct {
 	Choices           []OpenAIStreamChoice `json:"choices"`
 	Usage             *OpenAIUsage         `json:"usage,omitempty"`
 	SystemFingerprint string               `json:"system_fingerprint,omitempty"`
+	CopilotUsage      json.RawMessage      `json:"copilot_usage,omitempty"`
 }
 
 // OpenAIStreamChoice is a single choice within a streaming chunk.

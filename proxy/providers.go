@@ -2671,6 +2671,10 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 // common path does not need a per-attempt header-map clone. Client.Do adds jar
 // cookies to the request header, so clients with a cookie jar retain isolation.
 func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
+	body, err := applyAnthropicChatCacheControl(ctx, provider, path, body)
+	if err != nil {
+		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
 	req, err := h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
 	if err == nil && req != nil {
 		// Inference retries reserve every physical send explicitly. Disable the
@@ -2684,6 +2688,13 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 		if client != nil && client.Jar != nil {
 			req.Header = shallowCloneHeader(req.Header)
 		}
+		if provider != nil && provider.kind == providerTypeCopilot && h.auth != nil {
+			bearer := strings.TrimSpace(strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "))
+			req = withCopilotInferenceRequest(req, provider, path, body, h.auth.CredentialFingerprint(bearer))
+		} else {
+			req = withCopilotInferenceRequest(req, provider, path, body)
+		}
+		req = withTaskInferenceRequest(req, path)
 	}
 	return req, err
 }

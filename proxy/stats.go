@@ -124,7 +124,7 @@ func (u statsTokenUsage) normalized() statsTokenUsage {
 		u.TotalTokens = 0
 	}
 	if u.TotalTokens == 0 {
-		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+		u.TotalTokens = policyStatsSaturatingAdd(u.PromptTokens, u.CompletionTokens)
 	}
 	return u
 }
@@ -134,11 +134,11 @@ func (u *statsTokenUsage) add(other statsTokenUsage) {
 		return
 	}
 	other = other.normalized()
-	u.PromptTokens += other.PromptTokens
-	u.CompletionTokens += other.CompletionTokens
-	u.TotalTokens += other.TotalTokens
-	u.CachedTokens += other.CachedTokens
-	u.ReasoningTokens += other.ReasoningTokens
+	u.PromptTokens = policyStatsSaturatingAdd(u.PromptTokens, other.PromptTokens)
+	u.CompletionTokens = policyStatsSaturatingAdd(u.CompletionTokens, other.CompletionTokens)
+	u.TotalTokens = policyStatsSaturatingAdd(u.TotalTokens, other.TotalTokens)
+	u.CachedTokens = policyStatsSaturatingAdd(u.CachedTokens, other.CachedTokens)
+	u.ReasoningTokens = policyStatsSaturatingAdd(u.ReasoningTokens, other.ReasoningTokens)
 }
 
 func statsTokenUsageFromResponses(usage responsesUsage) statsTokenUsage {
@@ -171,6 +171,7 @@ type statsErrorRow struct {
 
 // statsSnapshot is the payload served at GET /stats.json.
 type statsSnapshot struct {
+	TaskUsage     taskUsageSnapshot      `json:"task_usage"`
 	UptimeSeconds int64                  `json:"uptime_seconds"`
 	Inflight      int64                  `json:"inflight"`
 	Totals        statsTotals            `json:"totals"`
@@ -251,6 +252,7 @@ type targetAttemptCounter struct {
 // per-second series uses a lazy ring buffer so no background goroutine is
 // needed. The clock is injectable for deterministic tests.
 type statsCollector struct {
+	taskUsage   taskUsageCollector
 	mu          sync.Mutex
 	start       time.Time
 	now         func() time.Time
@@ -609,10 +611,6 @@ func (r *routeAttemptRecord) complete(completion routeAttemptCompletion) {
 	}
 	if completion.RetryAfterSeconds != nil {
 		value := max(*completion.RetryAfterSeconds, 0)
-		maxSeconds := int64(maxRetryAfter / time.Second)
-		if value > maxSeconds {
-			value = maxSeconds
-		}
 		if value > 0 {
 			row.RetryAfterSeconds = &value
 		}
@@ -1144,6 +1142,7 @@ func (c *statsCollector) snapshot() statsSnapshot {
 	totals.LatencyP50, totals.LatencyP95, totals.LatencyP99 = c.latencyPercentiles()
 
 	return statsSnapshot{
+		TaskUsage:             c.taskUsage.snapshot(),
 		UptimeSeconds:         int64(now.Sub(c.start).Seconds()),
 		Inflight:              c.inflight.Load(),
 		Totals:                totals,

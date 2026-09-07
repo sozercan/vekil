@@ -332,7 +332,7 @@ func extractResponsesNamedObject(buf, key []byte) ([]byte, bool) {
 
 func isResponsesTerminalType(eventType string) bool {
 	switch strings.TrimSpace(eventType) {
-	case "response.completed", "response.failed", "response.incomplete", "error":
+	case "response.completed", "response.failed", "response.incomplete", "response.cancelled", "response.canceled", "error":
 		return true
 	default:
 		return false
@@ -1082,6 +1082,7 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 		logResponsesPrecommitTranslated(h, result, model, failureHeaders)
 		if result.failure != nil {
 			observeResponsesUsage(r.Context(), result.failure.Response.Usage)
+			h.observeCopilotResponseFailure(resp.Request, *result.failure, failureHeaders)
 		}
 		prepared.abort()
 		errorCode, errorParam := "", ""
@@ -1124,7 +1125,11 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	if h != nil {
 		store = h.toolContexts
 	}
-	streamResponsesPipeWithFailureLog(r.Context(), h, w, resp.Body, resp.Header, store, toolScope, lifecycleHooks...)
+	streamCtx := r.Context()
+	if resp.Request != nil {
+		streamCtx = context.WithValue(streamCtx, responsesUpstreamRequestContextKey{}, resp.Request)
+	}
+	streamResponsesPipeWithFailureLog(streamCtx, h, w, resp.Body, resp.Header, store, toolScope, lifecycleHooks...)
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
@@ -1197,11 +1202,21 @@ func (h *ProxyHandler) prepareResponsesStream(waitCtx, streamCtx context.Context
 }
 
 func (h *ProxyHandler) prepareResponsesStreamWithGrace(waitCtx, streamCtx context.Context, model string, cancellationGrace time.Duration, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
-	resp, result, translatedHeaders, err := prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx, cancellationGrace, request)
+	var upstreamRequest *http.Request
+	resp, result, translatedHeaders, err := prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx, cancellationGrace, func() (*http.Response, error) {
+		response, requestErr := request()
+		if response != nil {
+			upstreamRequest = response.Request
+		}
+		return response, requestErr
+	})
 	if err != nil || result == nil {
 		return resp, nil, nil, err
 	}
 	if result.decision == responsesPeekDecisionTranslate {
+		if result.failure != nil && upstreamRequest != nil && routeOperationFromContext(upstreamRequest.Context()) == nil {
+			h.observeCopilotResponseFailure(upstreamRequest, *result.failure, translatedHeaders)
+		}
 		logResponsesPrecommitTranslated(h, *result, model, translatedHeaders)
 		return nil, result, translatedHeaders, nil
 	}
@@ -1509,7 +1524,7 @@ func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName s
 	event.Type = terminalType
 	result.preamble = terminalType == "response.created" || terminalType == "response.in_progress"
 	switch terminalType {
-	case "response.completed", "response.failed", "response.incomplete", "error":
+	case "response.completed", "response.failed", "response.incomplete", "response.cancelled", "response.canceled", "error":
 		terminal := event
 		result.terminal = &terminal
 		if terminalType == "response.failed" || terminalType == "error" {
@@ -1921,7 +1936,7 @@ func responsesPrecommitErrorMessage(event responsesWebSocketStreamEvent, status 
 }
 
 func responsesUpstreamRequestID(headers http.Header) string {
-	for _, name := range []string{"X-Request-Id", "X-Azure-Request-Id", "Openai-Request-Id"} {
+	for _, name := range []string{"X-Copilot-Service-Request-Id", "X-Request-Id", "X-Azure-Request-Id", "Openai-Request-Id"} {
 		if value := strings.TrimSpace(headerGetCI(headers, name)); value != "" {
 			return value
 		}
@@ -2084,6 +2099,8 @@ func nextResponsesSSEMessage(buf []byte, allowBOM bool) (responsesSSEMessage, in
 	}
 }
 
+type responsesUpstreamRequestContextKey struct{}
+
 type responsesFailureTap struct {
 	h                   *ProxyHandler
 	upstreamHeaders     http.Header
@@ -2110,7 +2127,7 @@ type responsesFailureTap struct {
 	// usageTail is a bounded rolling window of the most recent raw stream bytes.
 	usageTail []byte
 	// terminalSeen is set after a parsed terminal Responses event. A clean EOF
-	// before response.completed/failed/incomplete means the committed stream was
+	// before a terminal response means the committed stream was
 	// truncated and should not be counted as a successful 200.
 	terminalSeen bool
 }
@@ -2299,7 +2316,7 @@ func (t *responsesFailureTap) finishOverflowEvent() {
 	// from fragments; completed remains successful, while failure terminals retain
 	// a conservative 502 plus best-effort usage.
 	switch t.overflowEvent.Type {
-	case "response.completed":
+	case "response.completed", "response.cancelled", "response.canceled":
 		t.terminalSeen = true
 	case "response.failed", "response.incomplete", "error":
 		t.terminalSeen = true
@@ -2375,6 +2392,8 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	if eventName != "" &&
 		eventName != "response.created" &&
 		eventName != "response.completed" &&
+		eventName != "response.cancelled" &&
+		eventName != "response.canceled" &&
 		eventName != "response.output_item.done" &&
 		eventName != "response.failed" &&
 		eventName != "response.incomplete" &&
@@ -2393,11 +2412,8 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	} else if eventType == "" {
 		event.Type = eventName
 	}
-	switch eventName {
-	case "response.completed", "response.failed", "response.incomplete", "error":
+	if isResponsesTerminalType(eventName) {
 		t.terminalSeen = true
-	}
-	if eventName == "response.completed" || eventName == "response.failed" || eventName == "response.incomplete" || eventName == "error" {
 		// Record token usage from every terminal event. Failed and incomplete
 		// responses can still carry billable partial usage. This is best-effort: a
 		// response.completed larger than responsesFailureTapMaxBuffer is dropped
@@ -2457,6 +2473,9 @@ func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocke
 	// rate limits (429) and overloads (503) keep their exact status rather than
 	// all collapsing to bad-gateway.
 	failureHeaders := responsesFailureHeaders(event, t.upstreamHeaders)
+	if upstreamRequest, _ := t.ctx.Value(responsesUpstreamRequestContextKey{}).(*http.Request); upstreamRequest != nil {
+		t.h.observeCopilotResponseFailure(upstreamRequest, event, failureHeaders)
+	}
 	failureStatus, _, _, _ := responsesWebSocketStreamFailureDetails(event, failureHeaders)
 	if failureStatus == 0 {
 		failureStatus = http.StatusBadGateway

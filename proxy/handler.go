@@ -62,7 +62,7 @@ const (
 	defaultCopilotUserAgent           = "GitHubCopilotChat/0.26.7"
 	defaultCopilotIntegrationID       = "vscode-chat"
 	directGitHubAppIntegrationID      = "copilot-language-server"
-	defaultCopilotGitHubAPIVersion    = "2025-05-01"
+	defaultCopilotGitHubAPIVersion    = "2026-08-20"
 	defaultCopilotOpenAIIntent        = "conversation-panel"
 	defaultResponsesWSCompactMaxItems = 8
 	defaultResponsesWSCompactMaxBytes = 32 << 10
@@ -138,6 +138,7 @@ type CopilotHeaderProfilesConfig struct {
 // Codex-style GET /v1/responses clients.
 type ResponsesWebSocketConfig struct {
 	Enabled             bool
+	NativeUpstream      bool
 	TurnStateDelta      bool
 	DisableAutoCompact  bool
 	AutoCompactMaxItems int
@@ -251,6 +252,7 @@ type ProxyHandler struct {
 	client                           *http.Client
 	copilotURL                       string
 	copilotHeaders                   CopilotHeaderConfig
+	copilotTraffic                   copilotTrafficController
 	providersConfig                  ProvidersConfig
 	allowedModels                    map[string]struct{}
 	providersState                   *providerSetup
@@ -807,6 +809,9 @@ func (h *ProxyHandler) lifecycleStreamHooks(observeCtx context.Context, canceled
 		writePrecommitShutdown = precommit[0]
 	}
 	return streamLifecycleHooks{
+		onCopilotUsage: func(raw json.RawMessage) {
+			observeCopilotUsage(observeCtx, raw)
+		},
 		transportCanceled: func() bool {
 			return h.ShuttingDown() && canceledAtFailure != nil && canceledAtFailure()
 		},
@@ -1217,6 +1222,9 @@ func clearCopilotHeaders(headers http.Header) {
 		"x-github-api-version",
 		"x-request-id",
 		"openai-intent",
+		"x-initiator",
+		"x-interaction-id",
+		"x-client-session-id",
 	} {
 		headers.Del(header)
 	}
@@ -1257,6 +1265,7 @@ func (h *ProxyHandler) setCopilotHeadersForProvider(req *http.Request, token str
 		cfg = provider.headerProfiles.profileForEndpointRaw(endpoint, cfg)
 	}
 	setCopilotHeadersForEndpoint(req, token, cfg, endpoint)
+	copyCopilotRequestMetadata(req.Header, copilotRequestMetadataFromContext(req.Context()))
 }
 
 var hopByHopHeaders = map[string]struct{}{
@@ -2153,12 +2162,12 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 	})
 }
 
-var upstreamRequestIDHeaderNames = []string{"X-Request-Id", "X-Azure-Request-Id", "Openai-Request-Id"}
+var upstreamRequestIDHeaderNames = []string{"X-Request-Id", "X-Copilot-Service-Request-Id", "X-Github-Request-Id", "X-Azure-Request-Id", "Openai-Request-Id"}
 
 // UpstreamRequestID returns the first recognized upstream request id from headers.
 func UpstreamRequestID(headers http.Header) string {
 	for _, name := range upstreamRequestIDHeaderNames {
-		if value := headers.Get(name); value != "" {
+		if value := boundedSingleHeaderValue(headers, name); value != "" {
 			return value
 		}
 	}
@@ -2171,13 +2180,9 @@ func writeOpenAIErrorWithRetryAfter(w http.ResponseWriter, status int, message, 
 
 func writeOpenAIErrorWithRetryAfterDetails(w http.ResponseWriter, status int, message, errType, retryAfter string, upstreamHeaders http.Header, param, code string) {
 	w.Header().Set("Content-Type", "application/json")
+	copyCopilotDiagnosticHeaders(w.Header(), upstreamHeaders)
 	if retryAfter != "" {
 		w.Header().Set("Retry-After", retryAfter)
-	}
-	for _, name := range upstreamRequestIDHeaderNames {
-		for _, value := range headerValuesCI(upstreamHeaders, name) {
-			w.Header().Add(name, value)
-		}
 	}
 	var paramValue interface{}
 	if strings.TrimSpace(param) != "" {

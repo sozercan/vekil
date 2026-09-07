@@ -143,8 +143,12 @@ func TestPhysicalAttemptLedgerPrimaryFailureSecondarySuccess(t *testing.T) {
 	if first.StatusCode != http.StatusTooManyRequests || first.Outcome != routeAttemptOutcomeRejected || first.RetryDecision != routeRetrySwitchTarget {
 		t.Fatalf("primary outcome = %+v", first)
 	}
-	if first.RetryAfterSeconds == nil || *first.RetryAfterSeconds != int64(maxRetryAfter/time.Second) {
-		t.Fatalf("primary retry-after = %v, want clamped %d", first.RetryAfterSeconds, int64(maxRetryAfter/time.Second))
+	if first.RetryAfterSeconds == nil {
+		t.Fatal("primary retry-after is missing")
+	}
+	// The oversized header saturates time.Duration, then rounds up to seconds.
+	if *first.RetryAfterSeconds != 9223372037 {
+		t.Fatalf("primary retry-after = %d, want 9223372037", *first.RetryAfterSeconds)
 	}
 	if first.ReportedUsage == nil || first.ReportedUsage.TotalTokens != 5 {
 		t.Fatalf("primary reported usage = %+v, want 5", first.ReportedUsage)
@@ -300,8 +304,8 @@ func TestPhysicalAttemptLedgerBoundsAndRedactsRecentTrace(t *testing.T) {
 				t.Errorf("%s retained control characters: %q", label, value)
 			}
 		}
-		if attempt.RetryAfterSeconds == nil || *attempt.RetryAfterSeconds != int64(maxRetryAfter/time.Second) {
-			t.Errorf("retry-after = %v, want clamped %d", attempt.RetryAfterSeconds, int64(maxRetryAfter/time.Second))
+		if attempt.RetryAfterSeconds == nil || *attempt.RetryAfterSeconds != retryAfter {
+			t.Errorf("retry-after = %v, want %d", attempt.RetryAfterSeconds, retryAfter)
 		}
 	}
 }

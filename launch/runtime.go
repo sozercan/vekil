@@ -52,6 +52,32 @@ type statsSnapshot struct {
 	Totals     statsTotals      `json:"totals"`
 	ByModel    []statsBreakdown `json:"by_model"`
 	ByProvider []statsBreakdown `json:"by_provider"`
+	TaskUsage  taskUsageStats   `json:"task_usage"`
+}
+
+type taskUsageTotals struct {
+	Sends     int64 `json:"sends"`
+	Errors    int64 `json:"errors"`
+	Throttled int64 `json:"throttled"`
+	Usage     struct {
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+		CachedTokens     int64 `json:"cached_tokens"`
+		ReasoningTokens  int64 `json:"reasoning_tokens"`
+	} `json:"usage"`
+	CopilotUsage struct {
+		TotalNanoAIU int64 `json:"total_nano_aiu"`
+		ComputeUnits int64 `json:"compute_units"`
+	} `json:"copilot_usage"`
+}
+
+type taskUsageStats struct {
+	Inflight int64           `json:"inflight"`
+	Totals   taskUsageTotals `json:"totals"`
+	ByKind   []struct {
+		Kind string `json:"kind"`
+		taskUsageTotals
+	} `json:"by_kind"`
 }
 
 type commandOutcome struct {
@@ -685,7 +711,7 @@ func fetchSettledStats(ctx context.Context, baseURL, localToken string) (statsSn
 		if err != nil {
 			return statsSnapshot{}, err
 		}
-		if snapshot.Inflight <= 0 {
+		if snapshot.Inflight <= 0 && snapshot.TaskUsage.Inflight <= 0 {
 			return snapshot, nil
 		}
 
@@ -702,7 +728,7 @@ func fetchSettledStats(ctx context.Context, baseURL, localToken string) (statsSn
 }
 
 func printSessionSummary(w io.Writer, snapshot statsSnapshot) {
-	if snapshot.Totals.Requests == 0 {
+	if snapshot.Totals.Requests == 0 && snapshot.TaskUsage.Totals.Sends == 0 {
 		return
 	}
 	_, _ = fmt.Fprintln(w)
@@ -734,5 +760,18 @@ func printSessionSummary(w io.Writer, snapshot statsSnapshot) {
 			_, _ = fmt.Fprintf(w, ", %d errors", row.Errors)
 		}
 		_, _ = fmt.Fprintln(w, ")")
+	}
+	if totals := snapshot.TaskUsage.Totals; totals.Sends > 0 {
+		_, _ = fmt.Fprintf(w, "  upstream: %d sends, %d errors, %d throttled\n", totals.Sends, totals.Errors, totals.Throttled)
+		_, _ = fmt.Fprintf(w, "  spent:    %d in, %d out, %d cached, %d reasoning\n", totals.Usage.PromptTokens, totals.Usage.CompletionTokens, totals.Usage.CachedTokens, totals.Usage.ReasoningTokens)
+		for _, row := range snapshot.TaskUsage.ByKind {
+			if row.Kind == "inference" || row.Sends == 0 {
+				continue
+			}
+			_, _ = fmt.Fprintf(w, "  auxiliary %s: %d sends, %d in, %d out\n", row.Kind, row.Sends, row.Usage.PromptTokens, row.Usage.CompletionTokens)
+		}
+		if usage := totals.CopilotUsage; usage.TotalNanoAIU > 0 || usage.ComputeUnits > 0 {
+			_, _ = fmt.Fprintf(w, "  accounting: %d nano-AIU, %d compute units\n", usage.TotalNanoAIU, usage.ComputeUnits)
+		}
 	}
 }

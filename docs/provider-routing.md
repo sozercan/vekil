@@ -238,7 +238,12 @@ An OpenAI-family route may use Copilot, Azure, or static OpenAI-compatible targe
 
 Schema-v2 policy selection is narrower than this general explicit-route matrix. Both terminal routes and the classifier route must support canonical Chat execution through either native `/chat/completions` or Vekil's bounded Chat-over-Responses adapter. Copilot-backed Responses routes authenticate and adapt in process, so `vekil launch` remains a single command. The policy public ID still advertises `/chat/completions` and accepts text/function-tool OpenAI Chat, translated Anthropic Messages/counting, and bounded stateless Responses compatibility. It is rejected on the Responses websocket, compact/memory routes, hosted/custom tools, Gemini, multimodal input, and stateful `previous_response_id`. Process-local `call_vekil_*` continuations remain bound to their originating terminal route/tier; opaque downstream-bridge replay still requires the documented single-target `off`/`observe` baseline and sticky ingress. Direct public routes keep the general matrix above.
 
-The optional websocket bridge is still transport adaptation over HTTP `/responses`. Its first provider-backed `response.create` may use the same safe precommit route failover; after a successful target is exposed, the session is pinned to that exact route/target and later turns fail closed rather than migrate. See [Responses WebSocket Bridge](responses-websocket.md).
+The optional websocket bridge uses upstream HTTP `/responses` by default. Its
+first provider-backed `response.create` may use the same safe precommit route
+failover; after a successful target is exposed, the session is pinned to that
+exact route/target. Experimental native Copilot connections additionally
+prohibit retry or migration after sending a create. See
+[Responses WebSocket Bridge](responses-websocket.md).
 
 ### Exact state binding and process-local limits
 

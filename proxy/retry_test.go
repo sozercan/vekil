@@ -810,9 +810,13 @@ func TestParseRetryAfter(t *testing.T) {
 		{"abc", 0, false},
 		{"5", 5 * time.Second, true},
 		{"120", 120 * time.Second, true},
-		{"999999", maxRetryAfter, true},
-		{"10000000000", maxRetryAfter, true},
-		{"9223372036854775808", maxRetryAfter, true},
+		{"86400", 24 * time.Hour, true},
+		{"604800", 7 * 24 * time.Hour, true},
+		{"999999", 999999 * time.Second, true},
+		{"9223372036", 9223372036 * time.Second, true},
+		{"9223372037", maxRetryAfterDuration, true},
+		{"10000000000", maxRetryAfterDuration, true},
+		{"9223372036854775808", maxRetryAfterDuration, true},
 		{"Wed, 21 Oct 2015 07:28:00 GMT", 0, false},
 	}
 
@@ -826,15 +830,15 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
-func TestParseRetryAfterVeryLongDecimalRemainsInternallyCapped(t *testing.T) {
+func TestParseRetryAfterVeryLongDecimalSaturatesDurationWithoutOverflow(t *testing.T) {
 	value := strings.Repeat("9", 64*1024)
 	delay, ok := parseRetryAfter(value)
-	if !ok || delay != maxRetryAfter {
-		t.Fatalf("parseRetryAfter(%d-digit decimal) = (%v, %v), want (%v, true)", len(value), delay, ok, maxRetryAfter)
+	if !ok || delay != maxRetryAfterDuration {
+		t.Fatalf("parseRetryAfter(%d-digit decimal) = (%v, %v), want (%v, true)", len(value), delay, ok, maxRetryAfterDuration)
 	}
 }
 
-func TestParseRetryAfter_HTTPDateAndClamp(t *testing.T) {
+func TestParseRetryAfter_HTTPDatePreservesLongReset(t *testing.T) {
 	future := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
 	dur, ok := parseRetryAfter(future)
 	if !ok {
@@ -846,8 +850,8 @@ func TestParseRetryAfter_HTTPDateAndClamp(t *testing.T) {
 
 	farFuture := time.Now().Add(24 * time.Hour).UTC().Format(http.TimeFormat)
 	dur, ok = parseRetryAfter(farFuture)
-	if !ok || dur != maxRetryAfter {
-		t.Fatalf("far future duration = (%v, %v), want (%v, true)", dur, ok, maxRetryAfter)
+	if !ok || dur < 24*time.Hour-2*time.Second || dur > 24*time.Hour {
+		t.Fatalf("far future duration = (%v, %v), want about 24 hours", dur, ok)
 	}
 }
 
@@ -859,7 +863,7 @@ func TestDurationSecondsCeil(t *testing.T) {
 		{delay: 500 * time.Millisecond, want: 1},
 		{delay: time.Second, want: 1},
 		{delay: 1500 * time.Millisecond, want: 2},
-		{delay: maxRetryAfter, want: 300},
+		{delay: 5 * time.Minute, want: 300},
 	}
 	for _, tt := range tests {
 		if got := durationSecondsCeil(tt.delay); got != tt.want {

@@ -209,6 +209,7 @@ func (h *ProxyHandler) openAIChatStreamFinalResponseCallback(ctx context.Context
 	return func(oaiResp *models.OpenAIResponse) {
 		if oaiResp != nil {
 			observeOpenAIUsage(ctx, oaiResp.Usage)
+			observeCopilotUsage(ctx, oaiResp.CopilotUsage)
 		}
 		h.maybeRewriteOrCaptureOpenAIChatToolCommands(ctx, oaiResp, store, scope, false)
 	}
@@ -320,6 +321,7 @@ func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Cont
 	}
 
 	return writePassthroughSniffingUsage(w, resp, func(bodyBytes []byte) ([]byte, bool) {
+		observeChatCopilotUsage(ctx, bodyBytes)
 		normalizedBody, normalized, normalizeErr := normalizeOpenAIChatCompletionResponse(bodyBytes, requestedModel, time.Now())
 		if normalizeErr == nil {
 			bodyBytes = normalizedBody

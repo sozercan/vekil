@@ -5,8 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"math"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -16,7 +14,6 @@ const (
 	policyDefaultProfileConcurrency = 4
 	policyBreakerFailureThreshold   = 5
 	policyBreakerCooldown           = 30 * time.Second
-	policyBreakerMaxRetryAfter      = 60 * time.Second
 )
 
 type policyAdmissionPool struct {
@@ -275,58 +272,7 @@ func (b *policyBreaker) openLocked(until time.Time) {
 }
 
 func parsePolicyBreakerRetryAfter(value string, now time.Time) (time.Duration, bool) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0, false
-	}
-	if seconds, ok := parsePolicyRetryAfterSeconds(value); ok {
-		delay := time.Duration(seconds) * time.Second
-		if delay > policyBreakerMaxRetryAfter {
-			delay = policyBreakerMaxRetryAfter
-		}
-		return delay, delay > 0
-	}
-	retryAt, err := http.ParseTime(value)
-	if err != nil {
-		return 0, false
-	}
-	delay := retryAt.Sub(now)
-	if delay <= 0 {
-		return 0, false
-	}
-	if delay > policyBreakerMaxRetryAfter {
-		delay = policyBreakerMaxRetryAfter
-	}
-	return delay, true
-}
-
-func parsePolicyRetryAfterSeconds(value string) (int64, bool) {
-	if value == "" {
-		return 0, false
-	}
-	const maxSeconds = int64(policyBreakerMaxRetryAfter / time.Second)
-	var parsed int64
-	clamped := false
-	for index := 0; index < len(value); index++ {
-		if value[index] < '0' || value[index] > '9' {
-			return 0, false
-		}
-		if clamped {
-			continue
-		}
-		digit := int64(value[index] - '0')
-		if parsed > (maxSeconds-digit)/10 {
-			parsed = maxSeconds
-			clamped = true
-			continue
-		}
-		parsed = parsed*10 + digit
-		if parsed > maxSeconds {
-			parsed = maxSeconds
-			clamped = true
-		}
-	}
-	return parsed, parsed > 0
+	return parseRetryAfterAt(value, now)
 }
 
 type policyClassifierRuntime struct {

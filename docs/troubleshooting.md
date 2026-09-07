@@ -4,6 +4,44 @@ Start with the status code or error text shown by the client. Each entry explain
 what the error means, what to try first, how to confirm recovery, and what to
 capture if it keeps happening.
 
+## `429`: upstream rate limit
+
+Keep the `Retry-After` response header. Vekil preserves long resets and returns
+the upstream response immediately when another attempt cannot fit within the
+request timeout. It also honors `retry-after-ms` and exhausted quota reset
+headers. Increasing the timeout does not increase the upstream quota.
+
+For recognized Copilot limits with a valid reset, Vekil shares a process-local
+cooldown across affected requests. Model limits apply to that model and
+credential, account and weekly limits apply across models for that credential,
+and integration limits apply to that integration within the configured provider.
+An active cooldown returns 429 without sending another inference request. After
+the reset, one request probes availability before queued callers continue.
+Cooldown records are bounded and lost on restart.
+
+Configured priority failover can still use an unaffected compatible target.
+Requests with provider-bound state retain their selected target. Switching models
+within the same account does not avoid an account or weekly cooldown.
+
+If several large sessions repeatedly hit limits together, enable optional
+admission for large Copilot requests:
+
+```bash
+vekil --copilot-large-request-concurrency 4
+```
+
+The default size threshold is 256 KiB of request JSON. This threshold is a local
+byte measurement, not an upstream token estimate. Requests below it continue
+normally. Large requests wait for a permit held until an active response closes;
+disconnects, request deadlines, and shutdown stop waiting requests. A full local
+admission queue returns 503. The limit is disabled by default and does not change
+upstream quotas. See [configuration](configuration.md) for both admission knobs.
+
+To investigate repeated throttling, record the error code, reset, timestamp, and
+`X-Copilot-Service-Request-Id` when present. Quota snapshot and usage-rate-limit
+headers provide additional account-specific diagnostics. Avoid sharing request
+contents or credentials.
+
 ## `408 user_request_timeout`: timed out reading request body
 
 ### Symptom

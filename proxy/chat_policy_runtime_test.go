@@ -195,53 +195,99 @@ func TestPolicyBreakerThresholdCooldownAndHalfOpen(t *testing.T) {
 	}
 }
 
-func TestPolicyBreakerRetryAfterImmediateAndCapped(t *testing.T) {
+func TestPolicyBreakerRetryAfterPreservesLongResetsAndSingleProbe(t *testing.T) {
 	start := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
-	now := start
-	breaker := newPolicyBreaker(func() time.Time { return now })
-	permit, ok := breaker.tryAcquire()
-	if !ok {
-		t.Fatal("initial permit rejected")
+	for _, tc := range []struct {
+		name  string
+		reset string
+		delay time.Duration
+	}{
+		{"two minutes", "120", 2 * time.Minute},
+		{"weekly seconds", " 604800 ", 7 * 24 * time.Hour},
+		{"weekly date", start.Add(7 * 24 * time.Hour).Format(http.TimeFormat), 7 * 24 * time.Hour},
+		{"duration overflow", "9223372037", maxRetryAfterDuration},
+		{"integer overflow", "999999999999999999999999999999999999", maxRetryAfterDuration},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := start
+			breaker := newPolicyBreaker(func() time.Time { return now })
+			permit, ok := breaker.tryAcquire()
+			if !ok {
+				t.Fatal("initial permit rejected")
+			}
+			permit.recordFailure(policyClassifierFailure{Category: policyClassifierFailureRateLimited, RetryAfter: tc.reset, AffectsBreaker: true})
+			for _, offset := range []time.Duration{0, 61 * time.Second, tc.delay - time.Nanosecond} {
+				now = start.Add(offset)
+				if _, ok := breaker.tryAcquire(); ok {
+					t.Fatalf("probe admitted after %s before upstream reset %s", offset, tc.delay)
+				}
+			}
+			now = start.Add(tc.delay)
+			const concurrent = 16
+			probes := make(chan *policyBreakerPermit, concurrent)
+			var wg sync.WaitGroup
+			for range concurrent {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					probe, admitted := breaker.tryAcquire()
+					if admitted {
+						probes <- probe
+					}
+				}()
+			}
+			wg.Wait()
+			close(probes)
+			if len(probes) != 1 {
+				t.Fatalf("admitted %d concurrent reset probes, want 1", len(probes))
+			}
+			probe := <-probes
+			if !probe.halfOpen {
+				t.Fatal("reset probe was not half-open")
+			}
+			probe.recordSuccess()
+			if permit, ok := breaker.tryAcquire(); !ok {
+				t.Fatal("successful reset probe did not close breaker")
+			} else {
+				permit.releaseNeutral()
+			}
+		})
 	}
-	permit.recordFailure(policyClassifierFailure{
-		Category:       policyClassifierFailureRateLimited,
-		RetryAfter:     "120",
-		AffectsBreaker: true,
-	})
-	if _, ok := breaker.tryAcquire(); ok {
-		t.Fatal("429 Retry-After did not open immediately")
-	}
-	now = start.Add(59 * time.Second)
-	if _, ok := breaker.tryAcquire(); ok {
-		t.Fatal("Retry-After cap expired too early")
-	}
-	now = start.Add(60 * time.Second)
-	halfOpen, ok := breaker.tryAcquire()
-	if !ok || !halfOpen.halfOpen {
-		t.Fatal("Retry-After was not capped at 60 seconds")
-	}
-	halfOpen.recordSuccess()
+}
 
-	now = start
-	breaker = newPolicyBreaker(func() time.Time { return now })
-	retryAt := start.Add(45 * time.Second).Format(http.TimeFormat)
-	permit, _ = breaker.tryAcquire()
-	permit.recordFailure(policyClassifierFailure{Category: policyClassifierFailureRateLimited, RetryAfter: retryAt, AffectsBreaker: true})
-	now = start.Add(44 * time.Second)
-	if _, ok := breaker.tryAcquire(); ok {
-		t.Fatal("HTTP-date Retry-After expired too early")
-	}
-	now = start.Add(45 * time.Second)
-	if probe, ok := breaker.tryAcquire(); !ok {
-		t.Fatal("HTTP-date Retry-After did not expire")
-	} else {
-		probe.recordSuccess()
-	}
-
-	for _, invalid := range []string{"", "0", "-1", "1.5", "999x"} {
-		if delay, ok := parsePolicyBreakerRetryAfter(invalid, start); ok || delay != 0 {
-			t.Errorf("parsePolicyBreakerRetryAfter(%q) = (%v, %v), want invalid", invalid, delay, ok)
-		}
+func TestPolicyBreakerInvalidRetryAfterRetainsDefaultCooldown(t *testing.T) {
+	start := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	for _, invalid := range []string{"", "0", "-1", "1.5", "999x", "999999999999999999999999999999999999x", start.Add(-time.Hour).Format(http.TimeFormat)} {
+		t.Run(invalid, func(t *testing.T) {
+			if delay, ok := parsePolicyBreakerRetryAfter(invalid, start); ok || delay != 0 {
+				t.Fatalf("parsePolicyBreakerRetryAfter(%q) = (%v, %v), want invalid", invalid, delay, ok)
+			}
+			now := start
+			breaker := newPolicyBreaker(func() time.Time { return now })
+			failure := policyClassifierFailure{Category: policyClassifierFailureRateLimited, RetryAfter: invalid, AffectsBreaker: true}
+			for attempt := range policyBreakerFailureThreshold {
+				permit, ok := breaker.tryAcquire()
+				if !ok {
+					t.Fatalf("invalid reset opened breaker before failure threshold at attempt %d", attempt+1)
+				}
+				permit.recordFailure(failure)
+			}
+			for range 2 {
+				now = now.Add(policyBreakerCooldown - time.Nanosecond)
+				if _, ok := breaker.tryAcquire(); ok {
+					t.Fatal("invalid reset shortened default cooldown")
+				}
+				now = now.Add(time.Nanosecond)
+				probe, ok := breaker.tryAcquire()
+				if !ok || !probe.halfOpen {
+					t.Fatal("invalid reset prevented probe after default cooldown")
+				}
+				if _, ok := breaker.tryAcquire(); ok {
+					t.Fatal("invalid reset admitted concurrent half-open probe")
+				}
+				probe.recordFailure(failure)
+			}
+		})
 	}
 }
 

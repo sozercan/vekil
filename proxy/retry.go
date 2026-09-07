@@ -23,7 +23,8 @@ import (
 const (
 	upstreamErrorDetailDrainTimeout = 250 * time.Millisecond
 	maxRetryBackoff                 = 30 * time.Second
-	maxRetryAfter                   = 5 * time.Minute
+	maxRetryWaitWithoutDeadline     = 5 * time.Minute
+	maxRetryAfterDuration           = time.Duration(1<<63 - 1)
 )
 
 // retryable returns true for status codes that warrant a retry.
@@ -77,10 +78,15 @@ func backoff(base time.Duration, attempt int) time.Duration {
 // parseRetryAfter extracts a delay from a Retry-After header value.
 // It supports both delay-seconds ("120") and HTTP-date values.
 func parseRetryAfter(value string) (time.Duration, bool) {
+	return parseRetryAfterAt(value, time.Now())
+}
+
+func parseRetryAfterAt(value string, now time.Time) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
 	if value == "" {
 		return 0, false
 	}
-	if seconds, ok := parsePositiveDecimalClamped(value, int64(maxRetryAfter/time.Second)); ok {
+	if seconds, ok := parsePositiveDecimalClamped(value, int64(maxRetryAfterDuration/time.Second)+1); ok {
 		return retryAfterDurationFromSeconds(seconds), true
 	}
 
@@ -88,29 +94,35 @@ func parseRetryAfter(value string) (time.Duration, bool) {
 	if err != nil {
 		return 0, false
 	}
-	delay := time.Until(retryAt)
+	delay := retryAt.Sub(now)
 	if delay <= 0 {
 		return 0, false
 	}
-	return clampRetryAfter(delay), true
-}
-
-func clampRetryAfter(delay time.Duration) time.Duration {
-	if delay > maxRetryAfter {
-		return maxRetryAfter
-	}
-	return delay
+	return delay, true
 }
 
 func retryAfterDurationFromSeconds(seconds int64) time.Duration {
 	if seconds <= 0 {
 		return 0
 	}
-	maxSeconds := int64(maxRetryAfter / time.Second)
-	if seconds >= maxSeconds {
-		return maxRetryAfter
+	maxSeconds := int64(maxRetryAfterDuration / time.Second)
+	if seconds > maxSeconds {
+		return maxRetryAfterDuration
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+// A reset beyond the request deadline is useful to the caller, but cannot
+// schedule another attempt within this operation. Callers without a deadline
+// retain a bounded wait instead of sleeping for an account's multi-day reset.
+func retryDelayFitsBudget(ctx context.Context, delay time.Duration) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		return delay < time.Until(deadline)
+	}
+	return delay <= maxRetryWaitWithoutDeadline
 }
 
 func parsePositiveDecimalClamped(value string, max int64) (int64, bool) {
@@ -248,7 +260,29 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 			return nil, ctxErr
 		}
 
+		var permit *copilotInferencePermit
+		if inference {
+			if rejected := h.maybeRejectNativeResponsesRequest(req); rejected != nil {
+				if req.Body != nil {
+					_ = req.Body.Close()
+				}
+				return rejected, nil
+			}
+			var blocked *http.Response
+			permit, blocked, err = h.acquireCopilotInference(req)
+			if err != nil || blocked != nil {
+				if req.Body != nil {
+					_ = req.Body.Close()
+				}
+				if err != nil && pending != nil && pending.upstreamErr != nil &&
+					(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+					return nil, pending.upstreamErr
+				}
+				return blocked, err
+			}
+		}
 		resp, err := h.sendRetryRequest(req, inference)
+		h.finishCopilotInference(req, resp, err, permit)
 		lifecyclePreempted := errors.Is(context.Cause(req.Context()), errProxyLifecycleShutdown) &&
 			contextTerminationMatches(req.Context(), err)
 		if pending != nil && !lifecyclePreempted {
@@ -265,7 +299,7 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 			}
 			if attempt < maxRetries-1 {
 				delay := backoff(retryDelay, attempt)
-				if req.Context().Err() != nil {
+				if !retryDelayFitsBudget(req.Context(), delay) {
 					return nil, err
 				}
 				if ctxErr := sleepWithContext(req.Context(), delay); ctxErr != nil {
@@ -284,6 +318,10 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 		}
 
 		retryAfterHeader := resp.Header.Get("Retry-After")
+		retryAfterDelay, _ := selectResponsesRetryAfter(resp.Header)
+		if retryAfterHeader == "" {
+			retryAfterHeader = retryAfterDelay
+		}
 		upstreamErr := &upstreamError{
 			statusCode: resp.StatusCode,
 			retryAfter: retryAfterHeader,
@@ -296,15 +334,15 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 				drainAndClose(resp.Body)
 				return nil, upstreamErr
 			}
-			// Drain and close body before retry to allow connection reuse.
-			drainAndClose(resp.Body)
-			if req.Context().Err() != nil {
-				return nil, upstreamErr
-			}
 			delay := backoff(retryDelay, attempt)
-			if ra, ok := parseRetryAfter(retryAfterHeader); ok && ra > delay {
+			if ra, ok := parseRetryAfter(retryAfterDelay); ok && ra > delay {
 				delay = ra
 			}
+			if !retryDelayFitsBudget(req.Context(), delay) {
+				return resp, nil
+			}
+			// Drain and close body before retry to allow connection reuse.
+			drainAndClose(resp.Body)
 			if req.Context().Err() != nil {
 				return nil, upstreamErr
 			}
@@ -330,6 +368,11 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 }
 
 func (h *ProxyHandler) sendRetryRequest(req *http.Request, inference bool) (*http.Response, error) {
+	if inference {
+		if resp, handled, err := h.maybeSendNativeResponses(req); handled {
+			return resp, err
+		}
+	}
 	client := h.client
 	if client == nil {
 		client = http.DefaultClient
@@ -344,11 +387,17 @@ func (h *ProxyHandler) sendRetryRequest(req *http.Request, inference bool) (*htt
 			}
 			client = &clone
 		}
+		var receipt *taskInferenceSend
+		if inference && req.URL != nil && req.RequestURI == "" {
+			receipt = h.beginTaskInferenceSend(req)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
+			receipt.finish(resp, err)
 			return resp, err
 		}
 		maybeAutoDecompressProviderResponse(resp, autoDecompressGzip)
+		receipt.finish(resp, nil)
 		return resp, nil
 	}
 	if req.RequestURI != "" {
@@ -364,8 +413,10 @@ func (h *ProxyHandler) sendRetryRequest(req *http.Request, inference bool) (*htt
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
+	receipt := h.beginTaskInferenceSend(req)
 	resp, err := transport.RoundTrip(req)
 	if err != nil {
+		receipt.finish(resp, err)
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
@@ -375,11 +426,15 @@ func (h *ProxyHandler) sendRetryRequest(req *http.Request, inference bool) (*htt
 		return nil, &url.Error{Op: strings.ToLower(req.Method), URL: req.URL.String(), Err: err}
 	}
 	if resp == nil {
-		return nil, &url.Error{Op: strings.ToLower(req.Method), URL: req.URL.String(), Err: fmt.Errorf("http: RoundTripper implementation (%T) returned a nil *Response with a nil error", transport)}
+		err := &url.Error{Op: strings.ToLower(req.Method), URL: req.URL.String(), Err: fmt.Errorf("http: RoundTripper implementation (%T) returned a nil *Response with a nil error", transport)}
+		receipt.finish(nil, err)
+		return nil, err
 	}
 	if resp.Body == nil {
 		if resp.ContentLength > 0 && req.Method != http.MethodHead {
-			return nil, &url.Error{Op: strings.ToLower(req.Method), URL: req.URL.String(), Err: fmt.Errorf("http: RoundTripper implementation (%T) returned a *Response with content length %d but a nil Body", transport, resp.ContentLength)}
+			err := &url.Error{Op: strings.ToLower(req.Method), URL: req.URL.String(), Err: fmt.Errorf("http: RoundTripper implementation (%T) returned a *Response with content length %d but a nil Body", transport, resp.ContentLength)}
+			receipt.finish(resp, err)
+			return nil, err
 		}
 		resp.Body = http.NoBody
 	}
@@ -387,6 +442,7 @@ func (h *ProxyHandler) sendRetryRequest(req *http.Request, inference bool) (*htt
 		resp.Request = req
 	}
 	maybeAutoDecompressProviderResponse(resp, autoDecompressGzip)
+	receipt.finish(resp, nil)
 	return resp, nil
 }
 

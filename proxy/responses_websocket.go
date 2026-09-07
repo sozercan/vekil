@@ -125,10 +125,11 @@ var responsesWebSocketUpgrader = websocket.Upgrader{
 type responsesWebSocketCreateRequest struct {
 	Type               string            `json:"type"`
 	Model              string            `json:"model"`
-	Input              []json.RawMessage `json:"input"`
+	Input              []json.RawMessage `json:"-"`
 	PreviousResponseID string            `json:"previous_response_id,omitempty"`
 	Generate           *bool             `json:"generate,omitempty"`
 	ClientMetadata     map[string]string `json:"client_metadata,omitempty"`
+	Headers            map[string]string `json:"headers,omitempty"`
 	signatureValue     string
 	upstreamFields     []responsesWebSocketJSONField
 }
@@ -230,6 +231,8 @@ type responsesWebSocketSession struct {
 	lastSignature           string
 	historyItems            []json.RawMessage
 	historyBytes            int
+	nativeUpstream          *responsesNativeUpstream
+	nativeResetPending      bool
 	toolContexts            *ToolExecutionContextStore
 	toolScope               string
 	handlerDone             chan struct{}
@@ -309,6 +312,7 @@ type responsesWebSocketStreamResult struct {
 	responseID  string
 	outputItems []json.RawMessage
 	usage       responsesUsage
+	cancelled   bool
 }
 
 type responsesWebSocketHistoryCompaction struct {
@@ -381,9 +385,15 @@ func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.R
 
 	conn.SetReadLimit(maxRequestBodySize)
 	session := newResponsesWebSocketSession(conn, r)
+	if h.responsesWebSocketConfig().NativeUpstream {
+		session.nativeUpstream = newResponsesNativeUpstream(session.ctx)
+	}
 	registered := false
 	defer func() {
 		session.beginClosing()
+		if session.nativeUpstream != nil {
+			session.nativeUpstream.close()
+		}
 		session.hardClose()
 		if registered {
 			h.unregisterResponsesWebSocketSession(session)
@@ -1029,6 +1039,7 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 			baseHeaders.Add(name, value)
 		}
 	}
+	copyCopilotRequestMetadata(baseHeaders, r.Header)
 
 	return &responsesWebSocketSession{
 		conn:         conn,
@@ -1054,6 +1065,19 @@ func parseResponsesWebSocketCreateRequest(payload []byte) (*responsesWebSocketCr
 	if err := json.Unmarshal(payload, &raw); err != nil {
 		return nil, fmt.Errorf("invalid JSON in websocket request")
 	}
+	for key, value := range raw {
+		canonical := strings.ToLower(key)
+		switch canonical {
+		case "type", "model", "input", "previous_response_id", "generate", "client_metadata", "initiator", "headers", "stream", "stream_id":
+			if key != canonical {
+				if _, duplicate := raw[canonical]; duplicate {
+					return nil, fmt.Errorf("duplicate websocket field %q", canonical)
+				}
+				delete(raw, key)
+				raw[canonical] = value
+			}
+		}
+	}
 
 	var request responsesWebSocketCreateRequest
 	if err := json.Unmarshal(payload, &request); err != nil {
@@ -1062,8 +1086,27 @@ func parseResponsesWebSocketCreateRequest(payload []byte) (*responsesWebSocketCr
 	if request.Type != "response.create" {
 		return nil, fmt.Errorf("unsupported websocket request type %q", request.Type)
 	}
+	if _, ok := raw["stream_id"]; ok {
+		return nil, fmt.Errorf("stream_id is unsupported; websocket requests are serialized")
+	}
+	if stream, ok := raw["stream"]; ok && !bytes.Equal(bytes.TrimSpace(stream), []byte("true")) {
+		return nil, fmt.Errorf("websocket requests require stream: true when stream is supplied")
+	}
+	if input, ok := raw["input"]; ok && !bytes.Equal(bytes.TrimSpace(input), []byte("null")) {
+		if err := json.Unmarshal(input, &request.Input); err != nil {
+			var text string
+			if err := json.Unmarshal(input, &text); err != nil {
+				return nil, fmt.Errorf("input must be a string or array")
+			}
+			item, _ := json.Marshal(map[string]string{"role": "user", "content": text})
+			request.Input = []json.RawMessage{item}
+		}
+	}
 	if request.Input == nil {
 		request.Input = []json.RawMessage{}
+	}
+	if err := validateResponsesWebSocketHeaders(request.Headers); err != nil {
+		return nil, err
 	}
 	signatureValue, upstreamFields, err := prepareResponsesWebSocketRequest(raw)
 	if err != nil {
@@ -1079,13 +1122,13 @@ func prepareResponsesWebSocketRequest(raw map[string]json.RawMessage) (string, [
 	keys := make([]string, 0, len(raw))
 	for key, value := range raw {
 		switch key {
-		case "type", "input", "previous_response_id", "generate", "client_metadata", "initiator":
+		case "type", "input", "previous_response_id", "generate", "client_metadata", "initiator", "headers", "stream":
 		default:
 			signatureBody[key] = value
 		}
 
 		switch key {
-		case "type", "input", "previous_response_id", "generate", "client_metadata", "initiator", "stream":
+		case "type", "input", "previous_response_id", "generate", "client_metadata", "initiator", "headers", "stream":
 		default:
 			keys = append(keys, key)
 		}
@@ -1440,6 +1483,8 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 					return http.StatusBadGateway, usage, true
 				}
 				return http.StatusOK, usage, true
+			case "response.cancelled", "response.canceled":
+				return http.StatusOK, usage, true
 			case "response.failed", "error":
 				if terminalPeek.status != 0 {
 					return terminalPeek.status, usage, true
@@ -1483,6 +1528,9 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 
 	if request.Generate != nil && !*request.Generate {
+		if s.nativeUpstream != nil && request.PreviousResponseID == "" {
+			s.nativeResetPending = true
+		}
 		responseID := "vekil-ws-" + uuid.NewString()
 		s.rememberPlannedResponse(plan, responseID, nil)
 		s.logRequestMetrics(h, request, responseID, metrics)
@@ -1504,6 +1552,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
+	upstreamCtx = withCopilotRequestMetadata(upstreamCtx, s.requestHeaders(request, false))
 	// The websocket bridge records each turn as tracked traffic (recordTurnStats),
 	// so mark the per-turn upstream context as retry-trackable too — otherwise a
 	// retryable 429/503 on a turn would be invisible in the dashboard retry
@@ -1680,7 +1729,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	if routeOperation != nil {
 		routeOperation.setCommitment(downstreamCommitmentProtocolFrame)
 	}
-	streamResult, err := s.streamUpstreamResponse(h, resp.Body, resp.Header, recordTurn)
+	streamResult, err := s.streamUpstreamResponseWithRequest(h, resp.Body, resp.Header, resp.Request, recordTurn)
 	if err != nil {
 		if errors.Is(err, errResponsesWebSocketClientWrite) ||
 			(s.ctx != nil && s.ctx.Err() != nil && errors.Is(err, context.Canceled)) {
@@ -1715,6 +1764,25 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	_ = resp.Body.Close()
 	bodyClosed = true
 	finishUpstream()
+	if streamResult.cancelled {
+		// Cancellation has billable usage but does not publish resumable history.
+		s.turnState = ""
+		recordTurn(http.StatusOK, streamResult.usage)
+		return nil
+	}
+	if s.nativeUpstream.started() {
+		// The upstream connection owns completed history. Only locally staged
+		// generate:false input is retained between native turns.
+		s.lastResponseID = streamResult.responseID
+		s.lastSignature = plan.signature
+		s.historyItems = nil
+		s.historyBytes = 0
+		s.nativeResetPending = false
+		s.nativeUpstream.rememberResponse(streamResult.responseID)
+		recordTurn(http.StatusOK, streamResult.usage)
+		s.logRequestMetrics(h, request, streamResult.responseID, metrics)
+		return nil
+	}
 
 	if metrics.pendingCompactedHistory != nil {
 		s.historyItems = cloneRawMessages(metrics.pendingCompactedHistory)
@@ -1759,6 +1827,12 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 		compactionChecked: true,
 		compactionTrigger: responsesInputContainsCompactionTrigger(request.Input),
 	}
+	if s.nativeUpstream.started() && plan.hasCompactionTrigger() {
+		return responsesWebSocketRequestPlan{}, fmt.Errorf("compaction_trigger is unavailable on a native upstream websocket; compact over HTTP and reconnect with full input")
+	}
+	if s.nativeUpstream != nil && len(request.Input) > responsesNativeMaxPendingItems {
+		return responsesWebSocketRequestPlan{}, fmt.Errorf("websocket input exceeds session item limit")
+	}
 	if request.PreviousResponseID == "" {
 		plan.resetHistory = true
 		plan.fullReplaySegments = [][]json.RawMessage{request.Input}
@@ -1772,6 +1846,14 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	}
 
 	plan.fullReplaySegments = [][]json.RawMessage{s.historyItems, request.Input}
+	if s.nativeUpstream != nil {
+		if len(s.historyItems)+len(request.Input) > responsesNativeMaxPendingItems || rawMessageSegmentsSize(plan.fullReplaySegments...) > maxRequestBodySize {
+			return responsesWebSocketRequestPlan{}, fmt.Errorf("staged websocket input exceeds session limits")
+		}
+	}
+	if s.nativeUpstream.started() {
+		return plan, nil
+	}
 	cfg := h.responsesWebSocketConfig()
 	plan.useTurnStateDelta = cfg.TurnStateDelta && s.turnState != "" && !plan.hasCompactionTrigger()
 	return plan, nil
@@ -1779,6 +1861,9 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 
 func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan, metrics *responsesWebSocketRequestMetrics) (*http.Response, bool, bool, error) {
 	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta)
+	if s.nativeUpstream.started() {
+		return resp, request.PreviousResponseID != "" && !s.nativeResetPending, false, err
+	}
 	if err != nil || resp == nil {
 		return resp, plan.useTurnStateDelta, false, err
 	}
@@ -1856,6 +1941,15 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 		}
 		return compactionResp, err
 	}
+	if s.nativeUpstream != nil {
+		previousID := ""
+		if request.PreviousResponseID != "" && !s.nativeResetPending {
+			previousID = s.nativeUpstream.previousResponseID()
+		}
+		ctx = context.WithValue(ctx, responsesNativeRequestContextKey{}, &responsesNativeRequest{
+			upstream: s.nativeUpstream, model: request.Model, previousResponseID: previousID, headers: headers,
+		})
+	}
 	resp, err := h.postResponsesWithHeadersForModel(ctx, bodyBytes, headers, request.Model)
 	attachResponsesWebSocketOperationID(resp, operation)
 	if operation != nil && operation.pinnedTarget() != "" {
@@ -1885,6 +1979,11 @@ func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCr
 			if name != "" && !strings.EqualFold(name, "X-Codex-Turn-State") {
 				headers.Set(name, trimmed)
 			}
+		}
+	}
+	for name, value := range request.Headers {
+		if responsesWebSocketRequestHeaderAllowed(name) {
+			headers.Set(name, strings.TrimSpace(value))
 		}
 	}
 
@@ -2297,6 +2396,10 @@ func (s *responsesWebSocketSession) terminalResponseOutputItems(h *ProxyHandler,
 }
 
 func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body io.Reader, headers http.Header, recordTerminal func(int, responsesUsage)) (responsesWebSocketStreamResult, error) {
+	return s.streamUpstreamResponseWithRequest(h, body, headers, nil, recordTerminal)
+}
+
+func (s *responsesWebSocketSession) streamUpstreamResponseWithRequest(h *ProxyHandler, body io.Reader, headers http.Header, upstreamRequest *http.Request, recordTerminal func(int, responsesUsage)) (responsesWebSocketStreamResult, error) {
 	var result responsesWebSocketStreamResult
 
 	// Emit a synthetic metadata event so WebSocket clients can discover the
@@ -2338,6 +2441,9 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 		}
 		failureStatus := 0
 		if parsedEvent && (event.Type == "response.failed" || event.Type == "error") {
+			if upstreamRequest != nil && routeOperationFromContext(upstreamRequest.Context()) == nil {
+				h.observeCopilotResponseFailure(upstreamRequest, event, responsesFailureHeaders(event, headers))
+			}
 			failureStatus, _, _, _ = responsesWebSocketStreamFailureDetails(event, headers)
 			if failureStatus != 0 {
 				result.usage = event.Response.Usage
@@ -2399,14 +2505,19 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 			if !event.Response.Usage.isZero() {
 				result.usage = event.Response.Usage
 			}
-			if len(result.outputItems) == 0 {
-				if terminalItems, present := s.terminalResponseOutputItems(h, data); present {
-					result.outputItems = terminalItems
-				}
+			if terminalItems, present := s.terminalResponseOutputItems(h, data); present {
+				result.outputItems = terminalItems
 			}
 			if validCompletedEvent && recordTerminal != nil {
 				// A structurally valid provider completion is authoritative before
 				// client delivery or post-terminal auto-compaction can fail or stall.
+				recordTerminal(http.StatusOK, result.usage)
+			}
+		}
+		if parsedEvent && (event.Type == "response.cancelled" || event.Type == "response.canceled") {
+			result.cancelled = true
+			result.usage = event.Response.Usage
+			if recordTerminal != nil {
 				recordTerminal(http.StatusOK, result.usage)
 			}
 		}
@@ -2429,9 +2540,11 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 				if h != nil {
 					h.maybeRewriteOrCaptureToolCommandItem(s.ctx, event.Item, s.toolContexts, s.toolScope, false)
 				}
-				result.outputItems = append(result.outputItems, cloneRawMessage(event.Item))
+				if !s.nativeUpstream.started() {
+					result.outputItems = append(result.outputItems, cloneRawMessage(event.Item))
+				}
 			}
-		case "response.completed", "response.incomplete":
+		case "response.completed", "response.incomplete", "response.cancelled", "response.canceled":
 			return errResponsesWebSocketStreamTerminal
 		case "response.failed", "error":
 			if writeErr := s.sendUpstreamStreamFailure(event, headers); writeErr != nil {
@@ -2454,6 +2567,9 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 	if err != nil && !errors.Is(err, errResponsesWebSocketStreamTerminal) {
 		return result, err
 	}
+	if result.cancelled {
+		return result, nil
+	}
 
 	if sawCompleted {
 		if !completedResponseIDValid {
@@ -2467,7 +2583,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 		}
 		return result, nil
 	}
-	return result, fmt.Errorf("stream ended before response.completed or response.incomplete")
+	return result, fmt.Errorf("stream ended before response.completed, response.incomplete, or response.cancelled")
 }
 
 func (s *responsesWebSocketSession) writeJSON(payload interface{}) error {

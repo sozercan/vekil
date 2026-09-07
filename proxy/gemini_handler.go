@@ -43,6 +43,7 @@ type geminiCountTokensCacheEntry struct {
 // HandleGeminiModels routes Gemini-native model actions to the corresponding
 // translation handler.
 func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
 	model, action, err := parseGeminiPath(r.URL.Path)
 	if err != nil {
 		h.writeGeminiProtocolError(w, err)
@@ -421,6 +422,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 }
 
 func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, pathModel string) {
+	r = r.WithContext(withTaskInferenceKind(r.Context(), taskTokenCount))
 	body, err := readBody(r)
 	if err != nil {
 		if h.handleShutdownError(w, r, nil, err) {
@@ -449,7 +451,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	}
 	h.observeRequestSummary(r.Context(), "gemini_count_tokens", pathModel, false, providerEndpointChatCompletions)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, suppressRouteAttemptStats(r.Context()), oaiReq.Model, providerEndpointChatCompletions)

@@ -35,6 +35,10 @@ type ModelCapabilities struct {
 type ModelCapabilityLimits struct {
 	MaxContextWindowTokens int64 `json:"max_context_window_tokens,omitempty"`
 	MaxPromptTokens        int64 `json:"max_prompt_tokens,omitempty"`
+	MaxPrompt              int64 `json:"max_prompt,omitempty"`
+	MaxInputTokens         int64 `json:"max_input_tokens,omitempty"`
+	ContextWindow          int64 `json:"context_window,omitempty"`
+	ContextWindowTokens    int64 `json:"context_window_tokens,omitempty"`
 	MaxOutputTokens        int64 `json:"max_output_tokens,omitempty"`
 }
 

@@ -155,6 +155,30 @@ Record the full baseline SHA, candidate SHA, Go version, OS/architecture, `GOMAX
 
 `BenchmarkChatRouteLegacyDirectResolutionRequestBuild` and `BenchmarkChatRouteExplicitPriorityOneTargetRequestBuild` provide the direct legacy-versus-route request-build baseline. `BenchmarkChatRouteLegacyDirectTransport` and `BenchmarkChatRouteExplicitPrimaryOnlyTransport` add deterministic `http.Client`/`RoundTripper` dispatch coverage without network variability. `BenchmarkExplicitRoutePreparedStreamTTFT` measures held-preamble handoff and reports `ttft-ns/op`; `BenchmarkRouteAttemptStatsConcurrentContention` measures concurrent physical-attempt accounting; and `BenchmarkExplicitRouteTwoTargetFailover64MiB` verifies exactly two sends and reports allocation pressure at the maximum request boundary. These checked-in benchmarks provide the scenarios, but the ten-sample baseline/candidate `benchstat` comparison remains release evidence that must be captured on a controlled machine rather than asserted from one local run.
 
+### Native Responses transport benchmark
+
+`BenchmarkResponsesTransportNativeUpstream` compares the default HTTP bridge
+with an established native websocket using the same fixed 400-message history.
+It reports uploaded bytes per continuation along with latency and allocations:
+
+```bash
+GOMAXPROCS=8 go test ./proxy -run '^$' -bench '^BenchmarkResponsesTransportNativeUpstream$' -benchmem -count=3
+```
+
+On an Apple M1 Max, darwin/arm64, Go 1.27.1, three one-second local samples
+measured:
+
+| Transport | Uploaded bytes/turn | Time/turn | Allocated bytes/turn |
+|-----------|--------------------:|----------:|---------------------:|
+| HTTP bridge | 140,921 | 591 to 653 µs | 318 to 320 KB |
+| Native websocket | 176 | 173 to 178 µs | about 119 KB |
+
+Both endpoints are local deterministic fixtures. These numbers cover warm
+transport and history construction; they do not establish live provider latency,
+quota changes, model performance, or reconnect behavior. The native transport
+remains opt-in, and its [session limits](responses-websocket.md#experimental-native-upstream-transport)
+are part of the compatibility contract.
+
 ## Policy evaluation and release evidence
 
 Policy enforcement is an operator release gate, not an automatic consequence of merging the implementation. Keep the global ceiling `off` until all evaluation criteria in [Semantic Policy Routing](policy-routing.md#evaluation-gates-before-enforcement) pass.

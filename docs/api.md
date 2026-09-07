@@ -14,11 +14,29 @@ The native-Chat path supports the existing text/image/tool-use subset, system me
 
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
+Native Chat translation preserves reasoning text and opaque signatures through
+Anthropic thinking blocks and subsequent assistant history. Supported Anthropic
+cache hints map to Copilot message/tool `copilot_cache_control` only when the
+original cache boundary can be represented exactly. Unrepresentable boundaries
+fail explicitly. Tool-result images and other unsupported multimodal tool
+results also fail before a translated Chat send; native Messages forwarding
+retains its upstream content contract.
+
 ## `POST /v1/messages/count_tokens` (Anthropic)
 
 Schema-v2 policy public IDs translate count-token input to the canonical Chat probe, select the policy terminal under the active mode, suppress normal traffic statistics for the probe, and return the selected upstream's reported prompt-token usage.
 
-Anthropic count-tokens compatibility for clients such as Claude Code. For Chat-compatible providers, Vekil translates the Messages request to Chat Completions, sends a small non-streaming probe through the same Chat execution layer, and returns reported `usage.prompt_tokens` as Anthropic `input_tokens`. A native Chat model uses a one-output-token probe. Responses-native models require `max_output_tokens: 16`, so Vekil uses that upstream minimum, omits unsupported sampling controls, consumes usage only, and does not publish any tool replay state from the discarded probe completion. For `anthropic-compatible` providers, Vekil directly forwards count-tokens requests to `{messages_path}/count_tokens`.
+Anthropic count-tokens compatibility for clients such as Claude Code. A Copilot
+model whose discovered capabilities support native Messages uses
+`/v1/messages/count_tokens` directly. Model access checks and transcript
+normalization still apply. For other Chat-compatible models, Vekil translates
+the request to canonical Chat, sends a small non-streaming probe, and returns
+reported `usage.prompt_tokens` as Anthropic `input_tokens`. A native Chat model
+uses a one-output-token probe. Responses-native models require
+`max_output_tokens: 16`, so Vekil uses that upstream minimum, omits unsupported
+sampling controls, consumes usage only, and does not publish tool replay state
+from the discarded completion. For `anthropic-compatible` providers, Vekil
+forwards count-tokens requests to `{messages_path}/count_tokens`.
 
 This endpoint is a compatibility probe rather than a local tokenizer. It can make a small upstream inference request, counts follow the owning provider's reported prompt-token usage, and missing usage is an error rather than a local estimate.
 
@@ -83,6 +101,13 @@ A native Chat request remains near-zero-copy. Successful non-streaming responses
 A Responses-backed request is not passthrough. Vekil validates the supported Chat request shape, converts it to Responses input, converts the result to one canonical Chat choice, and rejects unsupported fields rather than silently dropping them. Direct `/v1/responses` behavior is separate; the adapter does not invoke the public Responses handler, compaction shims, or websocket bridge.
 
 Streamed traffic records terminal usage when the selected backend provides it. On native Chat, Vekil may inject `stream_options.include_usage` when the client omitted it; that proxy-injected usage chunk is consumed internally and not forwarded to a client that did not request it. Responses streams use their terminal usage data directly. A client-supplied `stream_options.include_usage` is honored.
+
+Native Chat preserves `reasoning_text`, `reasoning_opaque`, reasoning-token
+details, and `copilot_usage` through forced-stream aggregation. Accounting-only
+chunks remain observable even when a proxy-injected standard usage chunk is
+hidden. Reasoning or accounting progress prevents unsafe target failover.
+Numeric accounting is included in request summaries and full-task statistics;
+policy responses retain their existing public-model redaction.
 
 ### Responses-backed Chat request subset
 

@@ -95,7 +95,7 @@ func rewriteResponsesModelObject(payload map[string]json.RawMessage, publicModel
 
 func responsesLifecycleEventHasResponse(eventType string) bool {
 	switch strings.TrimSpace(eventType) {
-	case "response.queued", "response.created", "response.in_progress", "response.completed", "response.failed", "response.incomplete":
+	case "response.queued", "response.created", "response.in_progress", "response.completed", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 		return true
 	default:
 		return false

@@ -323,7 +323,7 @@ Defaults:
 
 - open after five consecutive infrastructure failures;
 - 30-second cooldown;
-- an authoritative `429 Retry-After` opens immediately, capped at 60 seconds;
+- an authoritative `429 Retry-After` opens immediately and prevents probes until that reset, including long decimal and HTTP-date resets;
 - one half-open probe; and
 - any successful classifier HTTP exchange closes the breaker, even if its semantic payload is uncertain.
 
@@ -410,7 +410,13 @@ Policy telemetry must be attributable per profile and per declared request-size/
 
 Observe analysis is not representative unless admission is at least 95% in every declared bucket or the missing population is evaluated separately. Observe data is supplementary operational evidence, not causal proof of quality, because all observed requests still execute the baseline tier.
 
-Each bounded decision record carries IDs/enums/counts, latency/failure categories, and these generations:
+`GET /stats.json` exposes the last 256 decisions, newest first, under
+`policy_routing.recent_decisions`. Each record contains the public profile,
+proxy operation ID, effective mode, actual and optional shadow tier, selected
+reasoning effort, a fixed mapping reason, validated classifier signals, bounded
+counts, latency, and failure category. Observe classification adds its shadow
+record after the baseline dispatch. These records also carry the following
+generations:
 
 - `configGeneration`: canonical normalized complete providers configuration;
 - `profileGeneration`: normalized profile, including its tier route/effort objects, derived public contract, terminal route IDs, and effective profile-wide request policy;
