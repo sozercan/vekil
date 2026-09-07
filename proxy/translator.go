@@ -314,10 +314,10 @@ func parseSystemMessage(raw json.RawMessage) (*models.OpenAIMessage, error) {
 }
 
 func translateMessage(msg models.AnthropicMessage) ([]models.OpenAIMessage, error) {
-	return translateMessageWithCacheControl(msg, false)
+	return translateMessageWithNativeExtensions(msg, false)
 }
 
-func translateMessageWithCacheControl(msg models.AnthropicMessage, preserveCacheControl bool) ([]models.OpenAIMessage, error) {
+func translateMessageWithNativeExtensions(msg models.AnthropicMessage, preserveNativeExtensions bool) ([]models.OpenAIMessage, error) {
 	// Try string content first
 	var s string
 	if err := json.Unmarshal(msg.Content, &s); err == nil {
@@ -336,11 +336,13 @@ func translateMessageWithCacheControl(msg models.AnthropicMessage, preserveCache
 	var multimodalParts []models.OpenAIContentPart
 	var toolCalls []models.OpenAIToolCall
 	var cacheControl json.RawMessage
+	var reasoningText, reasoningOpaque string
+	thinkingSeen := false
 
 	for _, block := range blocks {
 		switch block.Type {
 		case "text":
-			if preserveCacheControl {
+			if preserveNativeExtensions {
 				cacheControl = block.CacheControl
 			}
 			appendTextContentPart(&textParts, &multimodalParts, derefString(block.Text))
@@ -350,14 +352,14 @@ func translateMessageWithCacheControl(msg models.AnthropicMessage, preserveCache
 			if err != nil {
 				return nil, err
 			}
-			if preserveCacheControl {
+			if preserveNativeExtensions {
 				cacheControl = block.CacheControl
 			}
 			flushTextContentPart(&textParts, &multimodalParts)
 			multimodalParts = append(multimodalParts, *part)
 
 		case "tool_use":
-			if preserveCacheControl {
+			if preserveNativeExtensions {
 				cacheControl = block.CacheControl
 			}
 			arguments := block.Input
@@ -384,26 +386,40 @@ func translateMessageWithCacheControl(msg models.AnthropicMessage, preserveCache
 				ToolCallID: block.ToolUseID,
 				Content:    contentJSON,
 			}
-			if preserveCacheControl {
+			if preserveNativeExtensions {
 				toolMessage.CopilotCacheControl = block.CacheControl
 			}
 			result = append(result, toolMessage)
 
 		case "thinking", "redacted_thinking":
-			// skip thinking blocks
+			// Responses replay carriers have a separate decoder. Native fields
+			// are added only after selecting a provider that supports them.
+			if !preserveNativeExtensions || msg.Role != "assistant" || strings.HasPrefix(block.Signature, reasoningCarrierPrefix) {
+				continue
+			}
+			if block.Type == "redacted_thinking" {
+				return nil, fmt.Errorf("redacted_thinking cannot be represented on native Chat")
+			}
+			if thinkingSeen {
+				// Each signature authenticates one block; joining signatures
+				// would manufacture an invalid opaque value.
+				return nil, fmt.Errorf("multiple thinking blocks cannot be represented in one native Chat message")
+			}
+			thinkingSeen = true
+			reasoningText, reasoningOpaque = derefString(block.Thinking), block.Signature
 
 		default:
 			return nil, fmt.Errorf("unsupported content block type %q", block.Type)
 		}
 	}
-	// Build the primary message for text/tool_use blocks.
+	// Build the primary message for text, tool_use, and native thinking blocks.
 	// When tool_calls are present, prepend before tool_result messages so
 	// assistant→tool ordering is preserved.  When only text is present
 	// (e.g. a user message carrying both text and tool_results), append
 	// after the tool_result messages so tool responses stay adjacent to
 	// the preceding assistant tool_calls.
-	if textParts.Len() > 0 || len(multimodalParts) > 0 || len(toolCalls) > 0 {
-		m := models.OpenAIMessage{Role: msg.Role, CopilotCacheControl: cacheControl}
+	if textParts.Len() > 0 || len(multimodalParts) > 0 || len(toolCalls) > 0 || reasoningText != "" || reasoningOpaque != "" {
+		m := models.OpenAIMessage{Role: msg.Role, CopilotCacheControl: cacheControl, ReasoningText: reasoningText, ReasoningOpaque: reasoningOpaque}
 		switch {
 		case len(multimodalParts) > 0:
 			content, _ := json.Marshal(multimodalParts)
@@ -508,35 +524,36 @@ func extractToolResultContent(raw json.RawMessage) (string, error) {
 	return sb.String(), nil
 }
 
-type anthropicChatCacheContextKey struct{}
+type anthropicChatExtensionsContextKey struct{}
 
-func withAnthropicChatCacheControl(ctx context.Context, req *models.AnthropicRequest) context.Context {
+func withAnthropicChatExtensions(ctx context.Context, req *models.AnthropicRequest) context.Context {
 	if req == nil {
 		return ctx
 	}
-	hasCache := hasAnthropicBlockCacheControl(req.System)
+	hasExtensions := hasAnthropicChatExtensions(req.System, false)
 	for _, message := range req.Messages {
-		if hasCache {
+		if hasExtensions {
 			break
 		}
-		hasCache = hasAnthropicBlockCacheControl(message.Content)
+		hasExtensions = hasAnthropicChatExtensions(message.Content, message.Role == "assistant")
 	}
 	for _, tool := range req.Tools {
-		hasCache = hasCache || !rawJSONIsNullOrEmpty(tool.CacheControl)
+		hasExtensions = hasExtensions || !rawJSONIsNullOrEmpty(tool.CacheControl)
 	}
-	if !hasCache {
+	if !hasExtensions {
 		return ctx
 	}
-	return context.WithValue(ctx, anthropicChatCacheContextKey{}, req)
+	return context.WithValue(ctx, anthropicChatExtensionsContextKey{}, req)
 }
 
-func hasAnthropicBlockCacheControl(raw json.RawMessage) bool {
+func hasAnthropicChatExtensions(raw json.RawMessage, assistant bool) bool {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || raw[0] != '[' {
 		return false
 	}
 	var blocks []struct {
 		Type         string          `json:"type"`
+		Signature    string          `json:"signature"`
 		CacheControl json.RawMessage `json:"cache_control"`
 		Content      json.RawMessage `json:"content"`
 	}
@@ -545,6 +562,9 @@ func hasAnthropicBlockCacheControl(raw json.RawMessage) bool {
 	}
 	for _, block := range blocks {
 		if !rawJSONIsNullOrEmpty(block.CacheControl) {
+			return true
+		}
+		if assistant && (block.Type == "thinking" || block.Type == "redacted_thinking") && !strings.HasPrefix(block.Signature, reasoningCarrierPrefix) {
 			return true
 		}
 		if block.Type == "tool_result" {
@@ -563,34 +583,41 @@ func hasAnthropicBlockCacheControl(raw json.RawMessage) bool {
 	return false
 }
 
-type anthropicChatCacheEdit struct {
+type anthropicChatMessageEdit struct {
 	index       int
+	insert      bool
 	original    models.OpenAIMessage
 	replacement []models.OpenAIMessage
 }
 
-// Cache hints are mapped only after native Chat is selected. Keeping them out of
-// canonical Chat preserves strict Responses validation and provider portability.
-func applyAnthropicChatCacheControl(ctx context.Context, provider *providerRuntime, path string, body []byte) ([]byte, error) {
+// Provider-specific thinking and cache fields are mapped only after native Chat
+// is selected, preserving strict Responses validation and provider portability.
+func applyAnthropicChatExtensions(ctx context.Context, provider *providerRuntime, path string, body []byte) ([]byte, error) {
 	if provider == nil || provider.kind != providerTypeCopilot || path != providerEndpointChatCompletions {
 		return body, nil
 	}
-	req, _ := ctx.Value(anthropicChatCacheContextKey{}).(*models.AnthropicRequest)
+	req, _ := ctx.Value(anthropicChatExtensionsContextKey{}).(*models.AnthropicRequest)
 	if req == nil {
 		return body, nil
 	}
-	var edits []anthropicChatCacheEdit
+	var edits []anthropicChatMessageEdit
 	messageCount := 0
 	appendEdits := func(original, replacement []models.OpenAIMessage) error {
+		if len(original) == 0 && len(replacement) == 1 {
+			// Canonical Chat omits thinking-only messages. Restore them at
+			// their original position once native Chat has been selected.
+			edits = append(edits, anthropicChatMessageEdit{index: messageCount, insert: true, replacement: replacement})
+			return nil
+		}
 		if len(original) != len(replacement) {
 			if len(original) != 1 {
 				return fmt.Errorf("cache_control cannot split a message containing tool calls or results")
 			}
-			edits = append(edits, anthropicChatCacheEdit{index: messageCount, original: original[0], replacement: replacement})
+			edits = append(edits, anthropicChatMessageEdit{index: messageCount, original: original[0], replacement: replacement})
 		} else {
 			for i := range original {
-				if !rawJSONIsNullOrEmpty(replacement[i].CopilotCacheControl) {
-					edits = append(edits, anthropicChatCacheEdit{index: messageCount + i, original: original[i], replacement: replacement[i : i+1]})
+				if !rawJSONIsNullOrEmpty(replacement[i].CopilotCacheControl) || replacement[i].ReasoningText != "" || replacement[i].ReasoningOpaque != "" {
+					edits = append(edits, anthropicChatMessageEdit{index: messageCount + i, original: original[i], replacement: replacement[i : i+1]})
 				}
 			}
 		}
@@ -617,7 +644,7 @@ func applyAnthropicChatCacheControl(ctx context.Context, provider *providerRunti
 		if err != nil {
 			return nil, err
 		}
-		replacement, err := nativeChatCacheMessages(message)
+		replacement, err := nativeChatAnthropicMessages(message)
 		if err != nil {
 			return nil, err
 		}
@@ -639,23 +666,38 @@ func applyAnthropicChatCacheControl(ctx context.Context, provider *providerRunti
 	}
 	var payload map[string]json.RawMessage
 	if json.Unmarshal(body, &payload) != nil || payload == nil {
-		return nil, fmt.Errorf("invalid Chat request while mapping cache_control")
+		return nil, fmt.Errorf("invalid Chat request while mapping native metadata")
 	}
 	if len(edits) > 0 {
 		var messages []json.RawMessage
 		if json.Unmarshal(payload["messages"], &messages) != nil || len(messages) != messageCount {
-			return nil, fmt.Errorf("cache_control cannot be mapped after message history changes")
+			return nil, fmt.Errorf("native Chat metadata cannot be mapped after message history changes")
 		}
 		out := make([]json.RawMessage, 0, len(messages))
 		next := 0
 		for _, edit := range edits {
 			out = append(out, messages[next:edit.index]...)
+			if edit.insert {
+				encoded, _ := json.Marshal(edit.replacement[0])
+				out = append(out, encoded)
+				next = edit.index
+				continue
+			}
 			var current map[string]json.RawMessage
 			if json.Unmarshal(messages[edit.index], &current) != nil || jsonRawString(current["role"]) != edit.original.Role || jsonRawString(current["tool_call_id"]) != edit.original.ToolCallID {
-				return nil, fmt.Errorf("cache_control cannot be mapped after message identity changes")
+				return nil, fmt.Errorf("native Chat metadata cannot be mapped after message identity changes")
 			}
 			if len(edit.replacement) == 1 {
-				current["copilot_cache_control"] = edit.replacement[0].CopilotCacheControl
+				replacement := edit.replacement[0]
+				if !rawJSONIsNullOrEmpty(replacement.CopilotCacheControl) {
+					current["copilot_cache_control"] = replacement.CopilotCacheControl
+				}
+				if replacement.ReasoningText != "" {
+					current["reasoning_text"], _ = json.Marshal(replacement.ReasoningText)
+				}
+				if replacement.ReasoningOpaque != "" {
+					current["reasoning_opaque"], _ = json.Marshal(replacement.ReasoningOpaque)
+				}
 				encoded, _ := json.Marshal(current)
 				out = append(out, encoded)
 			} else {
@@ -755,7 +797,7 @@ func nativeChatSystemCacheMessages(raw json.RawMessage) ([]models.OpenAIMessage,
 	return out, nil
 }
 
-func nativeChatCacheMessages(message models.AnthropicMessage) ([]models.OpenAIMessage, error) {
+func nativeChatAnthropicMessages(message models.AnthropicMessage) ([]models.OpenAIMessage, error) {
 	var blocks []models.ContentBlock
 	if json.Unmarshal(message.Content, &blocks) != nil {
 		return translateMessage(message)
@@ -829,7 +871,7 @@ func nativeChatCacheMessages(message models.AnthropicMessage) ([]models.OpenAIMe
 			continue
 		}
 		content, _ := json.Marshal(blocks[start : i+1])
-		part, err := translateMessageWithCacheControl(models.AnthropicMessage{Role: message.Role, Content: content}, true)
+		part, err := translateMessageWithNativeExtensions(models.AnthropicMessage{Role: message.Role, Content: content}, true)
 		if err != nil {
 			return nil, err
 		}
@@ -841,11 +883,11 @@ func nativeChatCacheMessages(message models.AnthropicMessage) ([]models.OpenAIMe
 	}
 	if !canSplit {
 		content, _ := json.Marshal(blocks)
-		return translateMessageWithCacheControl(models.AnthropicMessage{Role: message.Role, Content: content}, true)
+		return translateMessageWithNativeExtensions(models.AnthropicMessage{Role: message.Role, Content: content}, true)
 	}
 	if start < len(blocks) {
 		content, _ := json.Marshal(blocks[start:])
-		part, err := translateMessageWithCacheControl(models.AnthropicMessage{Role: message.Role, Content: content}, true)
+		part, err := translateMessageWithNativeExtensions(models.AnthropicMessage{Role: message.Role, Content: content}, true)
 		if err != nil {
 			return nil, err
 		}

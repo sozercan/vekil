@@ -76,15 +76,32 @@ func TestNativeChatForcedStreamPreservesReasoningAndAccounting(t *testing.T) {
 func TestNativeChatAnthropicNonStreamingPreservesReasoning(t *testing.T) {
 	for _, signatureOnly := range []bool{false, true} {
 		t.Run(map[bool]string{false: "thinking and signature", true: "signature only"}[signatureOnly], func(t *testing.T) {
+			wantThinking := "inspect the input"
+			if signatureOnly {
+				wantThinking = ""
+			}
 			var sends atomic.Int32
 			h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-				sends.Add(1)
+				turn := sends.Add(1)
 				var request models.OpenAIRequest
 				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 					t.Error(err)
 				}
 				if r.URL.Path != providerEndpointChatCompletions || request.Stream == nil || !*request.Stream {
 					t.Errorf("upstream path/stream = %q/%v", r.URL.Path, request.Stream)
+				}
+				if turn == 2 {
+					if len(request.Messages) != 3 {
+						t.Errorf("replayed messages = %+v", request.Messages)
+					} else {
+						assistant, result := request.Messages[1], request.Messages[2]
+						if assistant.Role != "assistant" || assistant.ReasoningText != wantThinking || assistant.ReasoningOpaque != "opaque-signature" || len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].ID != "call_lookup" {
+							t.Errorf("replayed assistant lost native reasoning or tool call: %+v", assistant)
+						}
+						if result.Role != "tool" || result.ToolCallID != "call_lookup" || jsonRawString(result.Content) != "found" {
+							t.Errorf("replayed tool result changed: %+v", result)
+						}
+					}
 				}
 				stream := nativeChatExtensionStream()
 				if signatureOnly {
@@ -107,10 +124,6 @@ func TestNativeChatAnthropicNonStreamingPreservesReasoning(t *testing.T) {
 				t.Fatalf("aggregated content = %s, want thinking followed by tool use", recorder.Body.String())
 			}
 			thinking, tool := response.Content[0], response.Content[1]
-			wantThinking := "inspect the input"
-			if signatureOnly {
-				wantThinking = ""
-			}
 			if thinking.Type != "thinking" || thinking.Thinking == nil || *thinking.Thinking != wantThinking || thinking.Signature != "opaque-signature" {
 				t.Fatalf("native reasoning changed: %+v", thinking)
 			}
@@ -119,6 +132,16 @@ func TestNativeChatAnthropicNonStreamingPreservesReasoning(t *testing.T) {
 			}
 			if response.Model != "chat-model" || response.StopReason == nil || *response.StopReason != "tool_use" || response.Usage.InputTokens != 12 || response.Usage.OutputTokens != 5 {
 				t.Fatalf("aggregated response contract changed: %+v", response)
+			}
+			history, err := json.Marshal(response.Content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			followup := `{"model":"chat-model","stream":false,"max_tokens":64,"messages":[{"role":"user","content":"lookup"},{"role":"assistant","content":` + string(history) + `},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_lookup","content":"found"}]}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`
+			recorder = httptest.NewRecorder()
+			h.HandleAnthropicMessages(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(followup)))
+			if recorder.Code != http.StatusOK || sends.Load() != 2 {
+				t.Fatalf("follow-up status/sends = %d/%d: %s", recorder.Code, sends.Load(), recorder.Body.String())
 			}
 		})
 	}

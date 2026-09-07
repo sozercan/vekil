@@ -15,12 +15,17 @@ The native-Chat path supports the existing text/image/tool-use subset, system me
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
 Native Chat translation preserves reasoning text and opaque signatures through
-Anthropic thinking blocks and subsequent assistant history. Supported Anthropic
-cache hints map to Copilot message/tool `copilot_cache_control` only when the
-original cache boundary can be represented exactly. Unrepresentable boundaries
-fail explicitly. Tool-result images and other unsupported multimodal tool
-results also fail before a translated Chat send; native Messages forwarding
-retains its upstream content contract.
+Anthropic thinking blocks. Subsequent assistant history restores a single native
+thinking block per message when dispatching to Copilot Chat, including messages
+containing only a signature. Multiple independent thinking blocks in one message
+and native `redacted_thinking` blocks fail explicitly because Chat's single
+text/signature pair cannot represent them faithfully. Vekil's Responses reasoning
+carriers are decoded separately and never forwarded as native signatures.
+Supported Anthropic cache hints map to Copilot message/tool
+`copilot_cache_control` only when the original cache boundary can be represented
+exactly. Unrepresentable boundaries fail explicitly. Tool-result images and other
+unsupported multimodal tool results also fail before a translated Chat send;
+native Messages forwarding retains its upstream content contract.
 
 ## `POST /v1/messages/count_tokens` (Anthropic)
 

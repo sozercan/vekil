@@ -2520,7 +2520,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
-	upstreamCtx = withAnthropicChatCacheControl(upstreamCtx, &req)
+	upstreamCtx = withAnthropicChatExtensions(upstreamCtx, &req)
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, route, err := h.withChatExecutionRoute(upstreamCtx, r.Context(), providerModel, oaiBody)
 	if err != nil {
@@ -2938,7 +2938,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
-	upstreamCtx = withAnthropicChatCacheControl(upstreamCtx, &req)
+	upstreamCtx = withAnthropicChatExtensions(upstreamCtx, &req)
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withChatExecutionRoute(upstreamCtx, suppressRouteAttemptStats(r.Context()), providerModel, policyBody)
 	if err != nil {
