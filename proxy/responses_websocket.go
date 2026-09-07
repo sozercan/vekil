@@ -1061,6 +1061,9 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 }
 
 func parseResponsesWebSocketCreateRequest(payload []byte) (*responsesWebSocketCreateRequest, error) {
+	if err := rejectDuplicateJSONMappingKeys(payload); err != nil {
+		return nil, fmt.Errorf("invalid JSON in websocket request: %w", err)
+	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &raw); err != nil {
 		return nil, fmt.Errorf("invalid JSON in websocket request")
@@ -1551,7 +1554,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		})
 	}
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(s.ctx, true)
 	upstreamCtx = withCopilotRequestMetadata(upstreamCtx, s.requestHeaders(request, false))
 	// The websocket bridge records each turn as tracked traffic (recordTurnStats),
 	// so mark the per-turn upstream context as retry-trackable too — otherwise a
@@ -1692,6 +1695,9 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}()
 
 	if err := s.prepareExplicitRouteSuccessResponse(h, resp, explicitRoute, routeOperation, plan); err != nil {
+		if s.nativeUpstream.started() {
+			s.nativeUpstream.close()
+		}
 		recordTurn(http.StatusBadGateway, responsesUsage{})
 		if s.isClosing() || h.upstreamShutdownStarted() {
 			return err
@@ -1731,6 +1737,12 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 	streamResult, err := s.streamUpstreamResponseWithRequest(h, resp.Body, resp.Header, resp.Request, recordTurn)
 	if err != nil {
+		// The native reader recognizes terminal framing before the shared parser
+		// validates its contents. An invalid terminal must retire the session even
+		// when closing its body would otherwise preserve the connection.
+		if s.nativeUpstream.started() {
+			s.nativeUpstream.close()
+		}
 		if errors.Is(err, errResponsesWebSocketClientWrite) ||
 			(s.ctx != nil && s.ctx.Err() != nil && errors.Is(err, context.Canceled)) {
 			recordDisconnected(0, streamResult.usage, s.clientClosePrecedesShutdown(h))

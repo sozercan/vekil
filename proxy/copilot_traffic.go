@@ -447,9 +447,9 @@ func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Resp
 		permit.release()
 		return
 	}
-	if resp.StatusCode != http.StatusTooManyRequests {
-		permit.finishProbes()
-	}
+	// A successful HTTP status can still carry a streamed rate-limit failure.
+	// Keep recovery probes reserved until the consumer observes the outcome and
+	// closes the body, installing any renewed cooldown before waking waiters.
 	retryAfter, _ := selectResponsesRetryAfter(resp.Header)
 	resp.Body = &copilotTrafficBody{
 		ReadCloser: resp.Body, permit: permit, status: resp.StatusCode,

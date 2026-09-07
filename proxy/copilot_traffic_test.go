@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -327,6 +328,176 @@ func TestCopilotCooldownExpiredResetAdmitsSingleProbe(t *testing.T) {
 		}
 	}
 	waitForCopilotTrafficWaiters(t, h, 0)
+}
+
+type copilotProbeCloseObserver struct {
+	io.ReadCloser
+	controller *copilotTrafficController
+	key        copilotCooldownKey
+	observed   chan bool
+}
+
+func (b *copilotProbeCloseObserver) Close() error {
+	b.controller.mu.Lock()
+	entry := b.controller.cooldowns[b.key]
+	renewed := entry != nil && entry.until.After(b.controller.timeNow())
+	b.controller.mu.Unlock()
+	select {
+	case b.observed <- renewed:
+	default:
+	}
+	return b.ReadCloser.Close()
+}
+
+func TestCopilotCooldownStreamProbeRenewsBeforeRelease(t *testing.T) {
+	for _, path := range []string{"HTTP", "legacy websocket", "explicit route"} {
+		t.Run(path, func(t *testing.T) {
+			provider := explicitRouteTestProvider("copilot", "http://upstream.example", "credential")
+			provider.kind = providerTypeCopilot
+			h, route := explicitRouteTestHandler(t, http.DefaultClient, routeModePrimaryOnly, 1, 1, provider)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var clock atomic.Int64
+			clock.Store(time.Now().UnixNano())
+			h.copilotTraffic.now = func() time.Time { return time.Unix(0, clock.Load()) }
+			req := copilotTrafficTestRequest(t, ctx, "copilot", "http://upstream.example", "credential", "editor", "model", 0)
+			metadata := copilotTrafficTestMetadata(t, req)
+			h.copilotTraffic.observeThrottle(metadata, 429, "10", []byte(`{"error":{"code":"user_model_rate_limited"}}`))
+			clock.Add(int64(11 * time.Second))
+			probe, blocked, err := h.acquireCopilotInference(req)
+			if probe == nil || blocked != nil || err != nil {
+				t.Fatalf("recovery probe = %v, response=%v error=%v", probe, blocked, err)
+			}
+			defer probe.release()
+			type acquireResult struct {
+				response *http.Response
+				err      error
+			}
+			const concurrent = 8
+			results := make(chan acquireResult, concurrent)
+			for range concurrent {
+				go func() {
+					permit, response, acquireErr := h.acquireCopilotInference(req)
+					permit.release()
+					results <- acquireResult{response, acquireErr}
+				}()
+			}
+			waitForCopilotTrafficWaiters(t, h, concurrent)
+			reader, writer := io.Pipe()
+			defer func() { _ = writer.Close(); _ = reader.Close() }()
+			closed := make(chan bool, 1)
+			response := routeExecutorTestResponse(req, http.StatusOK, http.Header{"Content-Type": {"text/event-stream"}, "Retry-After": {"30"}}, "")
+			response.Body = &copilotProbeCloseObserver{ReadCloser: reader, controller: &h.copilotTraffic, key: metadata.keys[0], observed: closed}
+			h.finishCopilotInference(req, response, nil, probe)
+			defer func() { _ = response.Body.Close() }()
+			h.copilotTraffic.mu.Lock()
+			entry := h.copilotTraffic.cooldowns[metadata.keys[0]]
+			reserved := entry != nil && entry.probe != nil
+			h.copilotTraffic.mu.Unlock()
+			if !reserved {
+				t.Fatal("HTTP 200 headers released the recovery probe before its streamed outcome")
+			}
+			processed := make(chan int, 1)
+			go func() {
+				switch path {
+				case "HTTP":
+					recorder := httptest.NewRecorder()
+					peekAndForwardResponsesWithConfig(h, recorder, req, response, ctx, nil, "model", time.Second, responsesPrecommitMaxPeekBytes, "")
+					processed <- recorder.Code
+				case "legacy websocket":
+					accepted, result, _, prepareErr := h.prepareResponsesStream(ctx, ctx, "model", func() (*http.Response, error) { return response, nil })
+					if accepted != nil || result == nil || prepareErr != nil {
+						processed <- 0
+						return
+					}
+					processed <- result.status
+				case "explicit route":
+					accepted, failure := h.prepareExplicitResponsesStream(ctx, newRouteOperation(route, ctx), route, route.targets[0], response)
+					if accepted != nil || failure == nil {
+						processed <- 0
+						return
+					}
+					processed <- failure.statusCode
+				}
+			}()
+			_, err = io.WriteString(writer, "event: response.failed\ndata: "+`{"type":"response.failed","response":{"id":"resp-probe","error":{"type":"rate_limit_error","code":"user_model_rate_limited","message":"slow down"}}}`+"\n\n")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = writer.Close()
+			select {
+			case renewed := <-closed:
+				if !renewed {
+					t.Fatal("response cleanup began before the streamed failure renewed the cooldown")
+				}
+			case <-ctx.Done():
+				t.Fatal("streamed failure did not close the probe response")
+			}
+			if status := <-processed; status != http.StatusTooManyRequests {
+				t.Fatalf("streamed failure status = %d", status)
+			}
+			for range concurrent {
+				select {
+				case result := <-results:
+					if result.err != nil || result.response == nil || result.response.StatusCode != 429 || result.response.Header.Get("Retry-After") != "30" {
+						t.Fatalf("queued request escaped renewed cooldown: %+v", result)
+					}
+					_ = result.response.Body.Close()
+				case <-ctx.Done():
+					t.Fatal("queued request did not resume after the probe finished")
+				}
+			}
+			waitForCopilotTrafficWaiters(t, h, 0)
+		})
+	}
+}
+
+func TestCopilotLegacyWebSocketAdmissionDisconnectRemovesWaiter(t *testing.T) {
+	var sends atomic.Int32
+	finishFirst := make(chan struct{})
+	defer close(finishFirst)
+	h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if sends.Add(1) != 1 {
+			http.Error(w, "unexpected queued dispatch", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: "+`{"type":"response.created","response":{"id":"resp-active"}}`+"\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-finishFirst:
+		case <-r.Context().Done():
+		}
+	})
+	h.stats = newStatsCollector()
+	WithCopilotLargeRequestConcurrency(1, 1)(h)
+	server := startResponsesWebSocketProxyServer(t, h)
+	first := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = first.Close() }()
+	second := mustDialResponsesWebSocket(t, server, nil)
+	defer func() { _ = second.Close() }()
+	request := newResponsesWebSocketCreateRequest(nil)
+	if err := first.WriteJSON(request); err != nil {
+		t.Fatal(err)
+	}
+	if frame := mustReadWebSocketJSONSkipMetadata(t, first); frame["type"] != "response.created" {
+		t.Fatalf("active turn = %#v", frame)
+	}
+	if err := second.WriteJSON(request); err != nil {
+		t.Fatal(err)
+	}
+	waitForCopilotTrafficWaiters(t, h, 1)
+	_ = second.Close()
+	waitForCopilotTrafficWaiters(t, h, 0)
+	h.copilotTraffic.mu.Lock()
+	active := 0
+	for _, group := range h.copilotTraffic.groups {
+		active += group.active
+	}
+	h.copilotTraffic.mu.Unlock()
+	if sends.Load() != 1 || active != 1 || h.stats.taskUsage.snapshot().Totals.Sends != 1 {
+		t.Fatalf("disconnect changed active work: sends=%d active=%d task=%+v", sends.Load(), active, h.stats.taskUsage.snapshot())
+	}
 }
 
 func TestCopilotLargeRequestAdmissionHoldsUntilClose(t *testing.T) {

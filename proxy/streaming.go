@@ -1776,6 +1776,7 @@ type anthropicStreamState struct {
 
 	nextBlockIndex      int
 	textBlockIndex      int
+	thinkingBlockIndex  int
 	storedFinishReason  string
 	storedUsage         *models.OpenAIUsage
 	toolCallBlockIndex  map[int]int
@@ -1792,6 +1793,7 @@ func newAnthropicStreamState(w http.ResponseWriter, model string, requestID stri
 		model:               model,
 		requestID:           requestID,
 		textBlockIndex:      -1,
+		thinkingBlockIndex:  -1,
 		toolCallBlockIndex:  make(map[int]int),
 		openToolCallIndexes: make(map[int]struct{}),
 	}
@@ -1874,6 +1876,11 @@ func (s *anthropicStreamState) consumeChunk(chunk models.OpenAIStreamChunk) bool
 }
 
 func (s *anthropicStreamState) consumeChoice(choice models.OpenAIStreamChoice) bool {
+	if choice.Delta.ReasoningText != "" || choice.Delta.ReasoningOpaque != "" {
+		if !s.emitNativeReasoning(choice.Delta.ReasoningText, choice.Delta.ReasoningOpaque) {
+			return false
+		}
+	}
 	if choice.Delta.Content != nil {
 		var text string
 		if err := json.Unmarshal(choice.Delta.Content, &text); err == nil && text != "" {
@@ -1905,6 +1912,9 @@ func (s *anthropicStreamState) consumeChoice(choice models.OpenAIStreamChoice) b
 }
 
 func (s *anthropicStreamState) emitText(text string) bool {
+	if !s.closeThinkingBlock() {
+		return false
+	}
 	if !s.closeOpenToolBlocks() {
 		return false
 	}
@@ -1967,6 +1977,9 @@ func (s *anthropicStreamState) consumeToolCall(toolCall models.OpenAIToolCall) b
 }
 
 func (s *anthropicStreamState) startToolCall(toolIndex int, toolCall models.OpenAIToolCall) bool {
+	if !s.closeThinkingBlock() {
+		return false
+	}
 	if !s.closeTextBlock() {
 		return false
 	}
@@ -1995,6 +2008,50 @@ func (s *anthropicStreamState) startToolCall(toolIndex int, toolCall models.Open
 	}
 
 	s.openToolCallIndexes[toolIndex] = struct{}{}
+	return true
+}
+
+func (s *anthropicStreamState) emitNativeReasoning(thinking, signature string) bool {
+	if !s.closeTextBlock() || !s.closeOpenToolBlocks() {
+		return false
+	}
+	if s.thinkingBlockIndex < 0 {
+		s.thinkingBlockIndex = s.nextBlockIndex
+		s.nextBlockIndex++
+		if !s.emit("content_block_start", models.AnthropicStreamEvent{
+			Type:         "content_block_start",
+			Index:        intVal(s.thinkingBlockIndex),
+			ContentBlock: &models.ContentBlock{Type: "thinking", Thinking: stringPtr("")},
+		}) {
+			return false
+		}
+	}
+	if thinking != "" && !s.emit("content_block_delta", models.AnthropicStreamEvent{
+		Type:  "content_block_delta",
+		Index: intVal(s.thinkingBlockIndex),
+		Delta: &models.AnthropicDelta{Type: "thinking_delta", Thinking: thinking},
+	}) {
+		return false
+	}
+	// Native signatures are already provider-owned and must be returned intact.
+	return signature == "" || s.emit("content_block_delta", models.AnthropicStreamEvent{
+		Type:  "content_block_delta",
+		Index: intVal(s.thinkingBlockIndex),
+		Delta: &models.AnthropicDelta{Type: "signature_delta", Signature: signature},
+	})
+}
+
+func (s *anthropicStreamState) closeThinkingBlock() bool {
+	if s.thinkingBlockIndex < 0 {
+		return true
+	}
+	if !s.emit("content_block_stop", models.AnthropicStreamEvent{
+		Type:  "content_block_stop",
+		Index: intVal(s.thinkingBlockIndex),
+	}) {
+		return false
+	}
+	s.thinkingBlockIndex = -1
 	return true
 }
 
@@ -2043,6 +2100,9 @@ func (s *anthropicStreamState) closeOpenToolBlocks() bool {
 }
 
 func (s *anthropicStreamState) finish() bool {
+	if !s.closeThinkingBlock() {
+		return false
+	}
 	if !s.closeTextBlock() {
 		return false
 	}
@@ -2326,6 +2386,9 @@ func (s *anthropicStreamState) emitCarriedReasoning(turn carriedTurn) bool {
 	signature, err := encodeReasoningCarrier(turn)
 	if err != nil || signature == "" {
 		return true // nothing to carry, or an encode problem: not fatal to the turn
+	}
+	if !s.closeThinkingBlock() {
+		return false
 	}
 	// Both, and in finish()'s order. emitText closes tool blocks and startToolCall closes the
 	// text block, so each of those only ever has one kind open to worry about; the carrier is

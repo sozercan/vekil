@@ -548,10 +548,11 @@ func (s *RequestSummary) setOpenAIUsage(usage *models.OpenAIUsage) {
 		s.cachedTokensValue = usage.PromptTokensDetails.CachedTokens
 		s.cachedTokens = &s.cachedTokensValue
 	}
-	if usage.CompletionTokensDetails != nil {
+	s.reasoningTokensValue = usage.ReasoningTokens
+	if usage.CompletionTokensDetails != nil && usage.CompletionTokensDetails.ReasoningTokens > 0 {
 		s.reasoningTokensValue = usage.CompletionTokensDetails.ReasoningTokens
-		s.reasoningTokens = &s.reasoningTokensValue
 	}
+	s.reasoningTokens = &s.reasoningTokensValue
 }
 
 func (s *RequestSummary) setErrorDetail(errType, code, param, message string) {

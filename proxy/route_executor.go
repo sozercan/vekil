@@ -3169,12 +3169,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		if stream && resp.StatusCode == http.StatusOK {
 			accepted, streamFailure := h.prepareExplicitResponsesStream(ctx, operation, route, target, resp)
 			if streamFailure != nil {
-				if metadata, ok := req.Context().Value(copilotInferenceRequestContextKey{}).(copilotInferenceRequest); ok {
-					var upstreamErr *upstreamError
-					if errors.As(streamFailure.err, &upstreamErr) {
-						h.copilotTraffic.observeThrottle(metadata, streamFailure.statusCode, streamFailure.retryAfter, upstreamErr.body)
-					}
-				}
 				streamFailure.attribution = attribution
 				if streamFailure.decision == "" {
 					streamFailure.decision = routeRetrySuppressedProgress
@@ -3548,6 +3542,9 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 	transportOwner := routeAttemptTransportOwnership(resp.Body)
 	prepared := newResponsesPreparedStreamWithPolicy(resp, responsesPrecommitMaxPeekBytes, true, true)
 	result, hasResult, awaitSource, err := prepared.await(operation.inbound, ctx, responsesPrecommitPeekTimeout)
+	if hasResult && result.failure != nil {
+		h.observeCopilotResponseFailure(resp.Request, *result.failure, responsesFailureHeaders(*result.failure, resp.Header))
+	}
 	if err != nil {
 		cleanupDone := prepared.abortAndWait(upstreamErrorDetailDrainTimeout)
 		delivery := requestDeliveredOrAmbiguous

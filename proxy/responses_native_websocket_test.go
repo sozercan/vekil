@@ -178,6 +178,64 @@ func TestResponsesNativeWebSocketFailureDoesNotReconnect(t *testing.T) {
 	}
 }
 
+func TestResponsesNativeWebSocketInvalidTerminalRetiresSession(t *testing.T) {
+	for _, terminal := range []string{"response.completed", "response.incomplete"} {
+		t.Run(terminal, func(t *testing.T) {
+			var connections, frames atomic.Int32
+			closed := make(chan struct{}, 1)
+			h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				connections.Add(1)
+				defer func() { _ = conn.Close(); closed <- struct{}{} }()
+				for {
+					if _, _, err := conn.ReadMessage(); err != nil {
+						return
+					}
+					frames.Add(1)
+					// Valid JSON and terminal framing, but no resumable response ID.
+					if err := conn.WriteJSON(map[string]any{"type": terminal, "response": map[string]any{"output": []any{}}}); err != nil {
+						return
+					}
+				}
+			})
+			h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+			h.stats = newStatsCollector()
+			conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
+			defer func() { _ = conn.Close() }()
+			request := newResponsesWebSocketCreateRequest(nil)
+			if err := conn.WriteJSON(request); err != nil {
+				t.Fatal(err)
+			}
+			frame := mustReadWebSocketJSONSkipMetadata(t, conn)
+			if frame["type"] == terminal {
+				frame = mustReadWebSocketJSONSkipMetadata(t, conn)
+			}
+			if frame["type"] != "error" || frame["status_code"] != float64(http.StatusBadGateway) {
+				t.Fatalf("invalid terminal result = %#v", frame)
+			}
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatal("invalid terminal left the upstream connection open")
+			}
+			if err := conn.WriteJSON(request); err != nil {
+				t.Fatal(err)
+			}
+			frame = mustReadWebSocketJSONSkipMetadata(t, conn)
+			if frame["type"] != "error" || frame["status_code"] != float64(http.StatusConflict) {
+				t.Fatalf("retired session accepted another turn: %#v", frame)
+			}
+			if connections.Load() != 1 || frames.Load() != 1 || h.stats.taskUsage.snapshot().Totals.Sends != 1 {
+				t.Fatalf("invalid terminal reconnected or resent: connections=%d frames=%d task=%+v", connections.Load(), frames.Load(), h.stats.taskUsage.snapshot())
+			}
+		})
+	}
+}
+
 func TestResponsesNativeWebSocketPinnedRouteAndCancellation(t *testing.T) {
 	var primaryFrames, secondaryCalls atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

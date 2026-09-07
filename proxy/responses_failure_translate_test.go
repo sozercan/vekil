@@ -2257,7 +2257,7 @@ func TestPrepareResponsesStreamPreservesTerminalWhenInboundCancellationWins(t *t
 	for i := 0; i < 20; i++ {
 		waitCtx, cancelWait := context.WithCancel(context.Background())
 		cancelWait()
-		resp, result, _, err := prepareResponsesStreamAttemptWithGrace(waitCtx, context.Background(), 100*time.Millisecond, func() (*http.Response, error) {
+		resp, result, _, err := prepareResponsesStreamAttemptWithGrace(nil, waitCtx, context.Background(), 100*time.Millisecond, func() (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -2518,7 +2518,7 @@ func TestPrepareResponsesStreamAttemptCommitsUpstreamCanceledTerminal(t *testing
 	streamCtx, cancelStream := context.WithCancel(context.Background())
 	cancelStream()
 	stream := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-upstream-cancel\",\"output\":[{\"type\":\"message\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
-	resp, result, _, err := prepareResponsesStreamAttemptWithGrace(context.Background(), streamCtx, 100*time.Millisecond, func() (*http.Response, error) {
+	resp, result, _, err := prepareResponsesStreamAttemptWithGrace(nil, context.Background(), streamCtx, 100*time.Millisecond, func() (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},

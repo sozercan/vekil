@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -69,6 +70,130 @@ func TestNativeChatForcedStreamPreservesReasoningAndAccounting(t *testing.T) {
 	}
 	if recorder.Header().Get("X-Copilot-Service-Request-Id") != "service-attempt" || recorder.Header().Get("X-Quota-Snapshot-Chat") != "remaining=10" {
 		t.Fatalf("converted headers = %v", recorder.Header())
+	}
+}
+
+func TestNativeChatAnthropicStreamPreservesReasoningBlocks(t *testing.T) {
+	h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != providerEndpointChatCompletions {
+			t.Errorf("upstream path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		stream := buildSSEStream(
+			`{"choices":[{"index":0,"delta":{"reasoning_text":"inspect "}}]}`,
+			`{"choices":[{"index":0,"delta":{"reasoning_text":"input","reasoning_opaque":"opaque-"}}]}`,
+			`{"choices":[{"index":0,"delta":{"reasoning_opaque":"signature","content":"answer"}}]}`,
+			`{"choices":[{"index":0,"delta":{"reasoning_text":"verify","reasoning_opaque":"second-signature"}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"reasoning_text":"finish","reasoning_opaque":"last-signature"},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		)
+		defer func() { _ = stream.Close() }()
+		_, _ = io.Copy(w, stream)
+	})
+	recorder := httptest.NewRecorder()
+	h.HandleAnthropicMessages(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"chat-model","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"lookup"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	type block struct{ kind, text, signature string }
+	var blocks []block
+	openIndex := -1
+	stopped := false
+	for _, wire := range parseSSEEvents(recorder.Body.String()) {
+		var event models.AnthropicStreamEvent
+		if err := json.Unmarshal([]byte(wire.Data), &event); err != nil {
+			t.Fatal(err)
+		}
+		switch event.Type {
+		case "content_block_start":
+			if openIndex != -1 || event.Index == nil || *event.Index != len(blocks) || event.ContentBlock == nil {
+				t.Fatalf("invalid block ordering: %s", recorder.Body.String())
+			}
+			openIndex = *event.Index
+			blocks = append(blocks, block{kind: event.ContentBlock.Type})
+		case "content_block_delta":
+			if event.Index == nil || *event.Index != openIndex || openIndex < 0 || event.Delta == nil {
+				t.Fatalf("delta outside open block: %s", wire.Data)
+			}
+			switch event.Delta.Type {
+			case "thinking_delta":
+				if blocks[openIndex].kind != "thinking" {
+					t.Fatalf("thinking delta in %s block", blocks[openIndex].kind)
+				}
+				blocks[openIndex].text += event.Delta.Thinking
+			case "signature_delta":
+				if blocks[openIndex].kind != "thinking" {
+					t.Fatalf("signature delta in %s block", blocks[openIndex].kind)
+				}
+				blocks[openIndex].signature += event.Delta.Signature
+			case "text_delta":
+				blocks[openIndex].text += event.Delta.Text
+			case "input_json_delta":
+				blocks[openIndex].text += event.Delta.PartialJSON
+			}
+		case "content_block_stop":
+			if event.Index == nil || *event.Index != openIndex || openIndex < 0 {
+				t.Fatalf("stop outside open block: %s", wire.Data)
+			}
+			openIndex = -1
+		case "message_stop":
+			stopped = true
+		case "error":
+			t.Fatalf("stream failed: %s", wire.Data)
+		}
+	}
+	want := []block{
+		{kind: "thinking", text: "inspect input", signature: "opaque-signature"},
+		{kind: "text", text: "answer"},
+		{kind: "thinking", text: "verify", signature: "second-signature"},
+		{kind: "tool_use", text: "{}"},
+		{kind: "thinking", text: "finish", signature: "last-signature"},
+	}
+	if !reflect.DeepEqual(blocks, want) || openIndex != -1 || !stopped {
+		t.Fatalf("reasoning stream = %+v, open=%d stopped=%t; want %+v", blocks, openIndex, stopped, want)
+	}
+}
+
+func TestNativeChatReasoningUsageReachesClientLedger(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, tc := range []struct {
+			name    string
+			details *models.OpenAICompletionTokensDetails
+			want    int
+		}{
+			{name: "top level", want: 3},
+			{name: "nested precedence", details: &models.OpenAICompletionTokensDetails{ReasoningTokens: 2}, want: 2},
+			{name: "empty nested fallback", details: &models.OpenAICompletionTokensDetails{}, want: 3},
+		} {
+			t.Run(tc.name+map[bool]string{false: " JSON", true: " SSE"}[stream], func(t *testing.T) {
+				usage := &models.OpenAIUsage{PromptTokens: 12, CompletionTokens: 5, TotalTokens: 17, ReasoningTokens: 3, CompletionTokensDetails: tc.details}
+				h := newTestProxyHandler(t, func(w http.ResponseWriter, _ *http.Request) {
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: "+mustMarshal(t, models.OpenAIStreamChunk{Usage: usage})+"\n\ndata: [DONE]\n\n")
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(models.OpenAIResponse{Usage: usage})
+				})
+				h.stats = newStatsCollector()
+				ctx, summary := WithRequestSummary(context.Background())
+				body := mustMarshal(t, map[string]any{"model": "chat-model", "stream": stream, "messages": []map[string]string{{"role": "user", "content": "hello"}}})
+				recorder := httptest.NewRecorder()
+				h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx))
+				if recorder.Code != http.StatusOK {
+					t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+				}
+				if got := readSummaryForStats(summary).reasoning; got != tc.want {
+					t.Fatalf("summary reasoning tokens = %d, want %d", got, tc.want)
+				}
+				h.RecordRequest(summary, recorder.Code, "test", 0)
+				if got := h.stats.snapshot().Totals.ReasoningTokens; got != int64(tc.want) {
+					t.Fatalf("client ledger reasoning tokens = %d, want %d", got, tc.want)
+				}
+			})
+		}
 	}
 }
 

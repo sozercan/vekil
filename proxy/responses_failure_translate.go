@@ -598,7 +598,7 @@ func mergeResponsesStreamErrorHeaders(root, nested map[string]json.RawMessage) m
 	if len(root) == 0 && len(nested) == 0 {
 		return nil
 	}
-	merged := make(map[string]json.RawMessage, len(root)+len(nested))
+	merged := make(map[string]json.RawMessage, len(root))
 	add := func(headers map[string]json.RawMessage) {
 		for name, value := range headers {
 			name = strings.TrimSpace(name)
@@ -1026,6 +1026,9 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 
 	prepared := newResponsesPreparedStream(resp, maxPeekBytes, true)
 	result, hasResult, awaitSource, err := prepared.await(r.Context(), upstreamCtx, peekTimeout)
+	if hasResult && result.failure != nil {
+		h.observeCopilotResponseFailure(resp.Request, *result.failure, responsesFailureHeaders(*result.failure, resp.Header))
+	}
 	// Inbound cancellation owns the downstream response even if the peek pump
 	// publishes a simultaneous passthrough decision. Do not race a 200 header
 	// against a client that has already gone away.
@@ -1082,7 +1085,6 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 		logResponsesPrecommitTranslated(h, result, model, failureHeaders)
 		if result.failure != nil {
 			observeResponsesUsage(r.Context(), result.failure.Response.Usage)
-			h.observeCopilotResponseFailure(resp.Request, *result.failure, failureHeaders)
 		}
 		prepared.abort()
 		errorCode, errorParam := "", ""
@@ -1133,10 +1135,10 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 }
 
 func prepareResponsesStreamAttempt(waitCtx, streamCtx context.Context, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
-	return prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx, responsesPeekCancellationGrace, request)
+	return prepareResponsesStreamAttemptWithGrace(nil, waitCtx, streamCtx, responsesPeekCancellationGrace, request)
 }
 
-func prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx context.Context, cancellationGrace time.Duration, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
+func prepareResponsesStreamAttemptWithGrace(h *ProxyHandler, waitCtx, streamCtx context.Context, cancellationGrace time.Duration, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
 	resp, err := request()
 	if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
 		return resp, nil, nil, err
@@ -1144,9 +1146,15 @@ func prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx context.Context, 
 
 	prepared := newResponsesPreparedStream(resp, responsesPrecommitMaxPeekBytes, true)
 	result, hasResult, awaitSource, err := prepared.await(waitCtx, streamCtx, responsesPrecommitPeekTimeout)
+	if hasResult && result.failure != nil {
+		h.observeCopilotResponseFailure(resp.Request, *result.failure, responsesFailureHeaders(*result.failure, resp.Header))
+	}
 	if err != nil {
 		terminal, hasTerminal, outcome, hasOutcome := prepared.awaitCancellationResolution(cancellationGrace)
 		if hasTerminal {
+			if terminal.failure != nil {
+				h.observeCopilotResponseFailure(resp.Request, *terminal.failure, responsesFailureHeaders(*terminal.failure, resp.Header))
+			}
 			terminal.decision = responsesPeekDecisionPassthrough
 			if awaitSource == responsesPreparedAwaitInbound {
 				prepared.abort()
@@ -1202,21 +1210,11 @@ func (h *ProxyHandler) prepareResponsesStream(waitCtx, streamCtx context.Context
 }
 
 func (h *ProxyHandler) prepareResponsesStreamWithGrace(waitCtx, streamCtx context.Context, model string, cancellationGrace time.Duration, request func() (*http.Response, error)) (*http.Response, *peekResult, http.Header, error) {
-	var upstreamRequest *http.Request
-	resp, result, translatedHeaders, err := prepareResponsesStreamAttemptWithGrace(waitCtx, streamCtx, cancellationGrace, func() (*http.Response, error) {
-		response, requestErr := request()
-		if response != nil {
-			upstreamRequest = response.Request
-		}
-		return response, requestErr
-	})
+	resp, result, translatedHeaders, err := prepareResponsesStreamAttemptWithGrace(h, waitCtx, streamCtx, cancellationGrace, request)
 	if err != nil || result == nil {
 		return resp, nil, nil, err
 	}
 	if result.decision == responsesPeekDecisionTranslate {
-		if result.failure != nil && upstreamRequest != nil && routeOperationFromContext(upstreamRequest.Context()) == nil {
-			h.observeCopilotResponseFailure(upstreamRequest, *result.failure, translatedHeaders)
-		}
 		logResponsesPrecommitTranslated(h, *result, model, translatedHeaders)
 		return nil, result, translatedHeaders, nil
 	}
@@ -1799,7 +1797,8 @@ func classifyPrecommitResponsesFailure(event responsesWebSocketStreamEvent) (int
 
 func classifyResponsesErrorCode(code string) (int, string, bool) {
 	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "429", "too_many_requests", "rate_limit_exceeded", "rate_limit_error", "quota_exceeded":
+	case "429", "too_many_requests", "rate_limit_exceeded", "rate_limit_error", "quota_exceeded",
+		"user_model_rate_limited", "user_global_rate_limited", "user_weekly_rate_limited", "integration_rate_limited":
 		return http.StatusTooManyRequests, "rate_limit_error", true
 	case "503", "model_overloaded", "engine_overloaded", "overloaded_error", "service_unavailable":
 		return http.StatusServiceUnavailable, "server_error", true
