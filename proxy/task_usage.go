@@ -302,6 +302,10 @@ func (b *taskUsageBody) publish(usage statsTokenUsage, haveUsage bool, copilot c
 	c := b.collector
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var durationMS int64
+	if complete && !b.completed {
+		durationMS = max(time.Since(b.start).Milliseconds(), 0)
+	}
 	for _, row := range []*taskUsageTotals{&c.totals, &c.kinds[b.kind]} {
 		row.Usage.add(delta)
 		row.CopilotUsage.add(copilotDelta)
@@ -316,7 +320,7 @@ func (b *taskUsageBody) publish(usage statsTokenUsage, haveUsage bool, copilot c
 		}
 		if complete && !b.completed {
 			row.Completed++
-			row.DurationMS = policyStatsSaturatingAdd(row.DurationMS, max(time.Since(b.start).Milliseconds(), 0))
+			row.DurationMS = policyStatsSaturatingAdd(row.DurationMS, durationMS)
 		}
 	}
 	if complete && !b.completed {
