@@ -646,7 +646,7 @@ func applyAnthropicChatCacheControl(ctx context.Context, provider *providerRunti
 		if json.Unmarshal(payload["messages"], &messages) != nil || len(messages) != messageCount {
 			return nil, fmt.Errorf("cache_control cannot be mapped after message history changes")
 		}
-		out := make([]json.RawMessage, 0, len(messages)+len(edits))
+		out := make([]json.RawMessage, 0, len(messages))
 		next := 0
 		for _, edit := range edits {
 			out = append(out, messages[next:edit.index]...)
