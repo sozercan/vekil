@@ -694,6 +694,10 @@ func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Cont
 		if aggregateErr != nil && lifecycleBody.canceledAtFailure() {
 			aggregateErr = context.Canceled
 		}
+		var streamErr *openAIStreamError
+		if errors.As(aggregateErr, &streamErr) {
+			streamErr.headers = convertedChatSafeHeaders(resp.Header)
+		}
 		if operation == nil || operation.route == nil || operation.route.legacy {
 			if aggregateErr == nil {
 				captureSuccessfulHeaders(resp)

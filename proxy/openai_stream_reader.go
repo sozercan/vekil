@@ -99,6 +99,9 @@ type openAIStreamError struct {
 	Type    string
 	Code    string
 	Message string
+	// Safe metadata belongs to the response that produced this error, including
+	// when route failover later selects it as the canonical failure.
+	headers http.Header
 }
 
 // httpStatus maps an OpenAI-style stream error to an HTTP status so a
