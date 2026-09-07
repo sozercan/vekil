@@ -926,6 +926,14 @@ func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *mode
 		choice := resp.Choices[0]
 		msg := choice.Message
 
+		if msg.ReasoningText != "" || msg.ReasoningOpaque != "" {
+			content = append(content, models.ContentBlock{
+				Type:      "thinking",
+				Thinking:  stringPtr(msg.ReasoningText),
+				Signature: msg.ReasoningOpaque,
+			})
+		}
+
 		// Try to extract text content (skip empty/whitespace — Anthropic
 		// rejects text blocks that contain no non-whitespace characters).
 		if len(msg.Content) > 0 {

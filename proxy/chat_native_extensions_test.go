@@ -73,6 +73,57 @@ func TestNativeChatForcedStreamPreservesReasoningAndAccounting(t *testing.T) {
 	}
 }
 
+func TestNativeChatAnthropicNonStreamingPreservesReasoning(t *testing.T) {
+	for _, signatureOnly := range []bool{false, true} {
+		t.Run(map[bool]string{false: "thinking and signature", true: "signature only"}[signatureOnly], func(t *testing.T) {
+			var sends atomic.Int32
+			h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				sends.Add(1)
+				var request models.OpenAIRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				if r.URL.Path != providerEndpointChatCompletions || request.Stream == nil || !*request.Stream {
+					t.Errorf("upstream path/stream = %q/%v", r.URL.Path, request.Stream)
+				}
+				stream := nativeChatExtensionStream()
+				if signatureOnly {
+					stream = strings.ReplaceAll(stream, `"reasoning_text":"inspect "`, `"reasoning_text":""`)
+					stream = strings.ReplaceAll(stream, `"reasoning_text":"the input"`, `"reasoning_text":""`)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, stream)
+			})
+			recorder := httptest.NewRecorder()
+			h.HandleAnthropicMessages(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"chat-model","stream":false,"max_tokens":64,"messages":[{"role":"user","content":"lookup"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`)))
+			if recorder.Code != http.StatusOK || sends.Load() != 1 {
+				t.Fatalf("status/sends = %d/%d: %s", recorder.Code, sends.Load(), recorder.Body.String())
+			}
+			var response models.AnthropicResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if len(response.Content) != 2 {
+				t.Fatalf("aggregated content = %s, want thinking followed by tool use", recorder.Body.String())
+			}
+			thinking, tool := response.Content[0], response.Content[1]
+			wantThinking := "inspect the input"
+			if signatureOnly {
+				wantThinking = ""
+			}
+			if thinking.Type != "thinking" || thinking.Thinking == nil || *thinking.Thinking != wantThinking || thinking.Signature != "opaque-signature" {
+				t.Fatalf("native reasoning changed: %+v", thinking)
+			}
+			if tool.Type != "tool_use" || tool.ID != "call_lookup" || tool.Name != "lookup" || string(tool.Input) != "{}" {
+				t.Fatalf("tool result changed: %+v", tool)
+			}
+			if response.Model != "chat-model" || response.StopReason == nil || *response.StopReason != "tool_use" || response.Usage.InputTokens != 12 || response.Usage.OutputTokens != 5 {
+				t.Fatalf("aggregated response contract changed: %+v", response)
+			}
+		})
+	}
+}
+
 func TestNativeChatAnthropicStreamPreservesReasoningBlocks(t *testing.T) {
 	h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != providerEndpointChatCompletions {
