@@ -140,12 +140,13 @@ type responsesWebSocketJSONField struct {
 }
 
 type responsesWebSocketStreamEvent struct {
-	Type     string                     `json:"type"`
-	Code     string                     `json:"code,omitempty"`
-	Message  string                     `json:"message,omitempty"`
-	Param    string                     `json:"param,omitempty"`
-	Headers  map[string]json.RawMessage `json:"headers,omitempty"`
-	Response struct {
+	Type         string                     `json:"type"`
+	Code         string                     `json:"code,omitempty"`
+	Message      string                     `json:"message,omitempty"`
+	Param        string                     `json:"param,omitempty"`
+	Headers      map[string]json.RawMessage `json:"headers,omitempty"`
+	CopilotUsage json.RawMessage            `json:"copilot_usage,omitempty"`
+	Response     struct {
 		ID                string                                    `json:"id"`
 		Error             responsesWebSocketStreamError             `json:"error"`
 		IncompleteDetails responsesWebSocketStreamIncompleteDetails `json:"incomplete_details"`

@@ -41,6 +41,30 @@ func copilotTrafficTestMetadata(t *testing.T, req *http.Request) copilotInferenc
 	return metadata
 }
 
+func expireCopilotTrafficTestCooldown(t *testing.T, h *ProxyHandler, req *http.Request) {
+	t.Helper()
+	metadata := copilotTrafficTestMetadata(t, req)
+	h.copilotTraffic.observeThrottle(metadata, http.StatusTooManyRequests, "30", []byte(`{"error":{"code":"user_global_rate_limited"}}`))
+	h.copilotTraffic.mu.Lock()
+	h.copilotTraffic.cooldowns[metadata.keys[1]].until = time.Time{}
+	h.copilotTraffic.mu.Unlock()
+}
+
+func expireCopilotLegacyTestCooldown(t *testing.T, h *ProxyHandler) {
+	t.Helper()
+	body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+	provider, owner, body, err := h.resolveProviderRequest(body, providerEndpointResponses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := h.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointResponses, body, nil, "", owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = req.Body.Close() }()
+	expireCopilotTrafficTestCooldown(t, h, req)
+}
+
 func waitForCopilotTrafficWaiters(t *testing.T, h *ProxyHandler, want int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -452,7 +476,7 @@ func TestCopilotCooldownStreamProbeRenewsBeforeRelease(t *testing.T) {
 	}
 }
 
-func TestCopilotLegacyWebSocketAdmissionDisconnectRemovesWaiter(t *testing.T) {
+func TestCopilotLegacyWebSocketProbeDisconnectRemovesWaiter(t *testing.T) {
 	var sends atomic.Int32
 	finishFirst := make(chan struct{})
 	defer close(finishFirst)
@@ -470,7 +494,7 @@ func TestCopilotLegacyWebSocketAdmissionDisconnectRemovesWaiter(t *testing.T) {
 		}
 	})
 	h.stats = newStatsCollector()
-	WithCopilotLargeRequestConcurrency(1, 1)(h)
+	expireCopilotLegacyTestCooldown(t, h)
 	server := startResponsesWebSocketProxyServer(t, h)
 	first := mustDialResponsesWebSocket(t, server, nil)
 	defer func() { _ = first.Close() }()
@@ -491,8 +515,10 @@ func TestCopilotLegacyWebSocketAdmissionDisconnectRemovesWaiter(t *testing.T) {
 	waitForCopilotTrafficWaiters(t, h, 0)
 	h.copilotTraffic.mu.Lock()
 	active := 0
-	for _, group := range h.copilotTraffic.groups {
-		active += group.active
+	for _, cooldown := range h.copilotTraffic.cooldowns {
+		if cooldown.probe != nil {
+			active++
+		}
 	}
 	h.copilotTraffic.mu.Unlock()
 	if sends.Load() != 1 || active != 1 || h.stats.taskUsage.snapshot().Totals.Sends != 1 {
@@ -500,61 +526,12 @@ func TestCopilotLegacyWebSocketAdmissionDisconnectRemovesWaiter(t *testing.T) {
 	}
 }
 
-func TestCopilotLargeRequestAdmissionHoldsUntilClose(t *testing.T) {
-	var sends atomic.Int32
-	h := &ProxyHandler{maxRetries: 1, client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		sends.Add(1)
-		return routeExecutorTestResponse(req, http.StatusOK, nil, `{"choices":[]}`), nil
-	})}}
-	WithCopilotLargeRequestConcurrency(1, 256)(h)
-	request := func(size int) func() (*http.Request, error) {
-		return func() (*http.Request, error) {
-			return copilotTrafficTestRequest(t, context.Background(), "copilot", "http://upstream.example", "credential", "editor", "model", size), nil
-		}
-	}
-	first, err := h.doInferenceWithRetry(request(1024))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = first.Body.Close() }()
-	_, _ = io.Copy(io.Discard, first.Body)
-	second := make(chan *http.Response, 1)
-	errorsCh := make(chan error, 1)
-	go func() {
-		resp, sendErr := h.doInferenceWithRetry(request(1024))
-		second <- resp
-		errorsCh <- sendErr
-	}()
-	waitForCopilotTrafficWaiters(t, h, 1)
-	small, err := h.doInferenceWithRetry(request(0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = small.Body.Close()
-	if got := sends.Load(); got != 2 {
-		t.Fatalf("sends before closing first large response = %d, want large + small only", got)
-	}
-	_ = first.Body.Close()
-	select {
-	case resp := <-second:
-		if err := <-errorsCh; err != nil || resp == nil {
-			t.Fatalf("queued send: response=%v err=%v", resp, err)
-		}
-		_ = resp.Body.Close()
-	case <-time.After(time.Second):
-		t.Fatal("closing active response did not release queued request")
-	}
-	if got := sends.Load(); got != 3 || len(h.copilotTraffic.groups) != 0 {
-		t.Fatalf("admission cleanup: sends=%d groups=%d", got, len(h.copilotTraffic.groups))
-	}
-}
-
-func TestCopilotAdmissionCancellationBeforeDispatch(t *testing.T) {
+func TestCopilotProbeCancellationBeforeDispatch(t *testing.T) {
 	for _, reason := range []string{"client disconnect", "request deadline", "shutdown"} {
 		t.Run(reason, func(t *testing.T) {
 			h := &ProxyHandler{}
-			WithCopilotLargeRequestConcurrency(1, 1)(h)
 			firstReq := copilotTrafficTestRequest(t, context.Background(), "copilot", "http://upstream.example", "credential", "editor", "model", 0)
+			expireCopilotTrafficTestCooldown(t, h, firstReq)
 			first, _, err := h.acquireCopilotInference(firstReq)
 			if err != nil {
 				t.Fatal(err)
@@ -596,14 +573,14 @@ func TestCopilotAdmissionCancellationBeforeDispatch(t *testing.T) {
 			}
 			waitForCopilotTrafficWaiters(t, h, 0)
 			first.release()
-			if len(h.copilotTraffic.groups) != 0 {
-				t.Fatal("canceled waiter retained admission state")
+			if len(h.copilotTraffic.cooldowns) != 0 {
+				t.Fatal("canceled waiter retained probe state")
 			}
 		})
 	}
 }
 
-func TestCopilotAuxiliaryAdmissionDisconnectRemovesWaiter(t *testing.T) {
+func TestCopilotAuxiliaryProbeDisconnectRemovesWaiter(t *testing.T) {
 	for _, tc := range []struct {
 		name, path, body string
 		handle           func(*ProxyHandler, http.ResponseWriter, *http.Request)
@@ -648,7 +625,7 @@ func TestCopilotAuxiliaryAdmissionDisconnectRemovesWaiter(t *testing.T) {
 			})
 			t.Cleanup(h.BeginShutdown)
 			h.stats = newStatsCollector()
-			WithCopilotLargeRequestConcurrency(1, 1)(h)
+			expireCopilotLegacyTestCooldown(t, h)
 			firstDone, queuedDone := make(chan struct{}), make(chan struct{})
 			first := httptest.NewRecorder()
 			go func() {
@@ -695,36 +672,38 @@ func TestCopilotAuxiliaryAdmissionDisconnectRemovesWaiter(t *testing.T) {
 				t.Fatalf("canceled admission changed completed-send accounting: %+v", usage)
 			}
 			h.copilotTraffic.mu.Lock()
-			groups := len(h.copilotTraffic.groups)
+			cooldowns := len(h.copilotTraffic.cooldowns)
 			h.copilotTraffic.mu.Unlock()
-			if groups != 0 {
-				t.Fatalf("completed requests retained %d admission groups", groups)
+			if cooldowns != 0 {
+				t.Fatalf("completed requests retained %d cooldowns", cooldowns)
 			}
 		})
 	}
 }
 
-func TestCopilotAdmissionTransportFailureReleasesPermit(t *testing.T) {
+func TestCopilotProbeTransportFailureReleasesPermit(t *testing.T) {
 	h := &ProxyHandler{maxRetries: 1, client: &http.Client{Transport: retryRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("connection failed")
 	})}}
-	WithCopilotLargeRequestConcurrency(1, 1)(h)
+	req := copilotTrafficTestRequest(t, context.Background(), "copilot", "http://upstream.example", "credential", "editor", "model", 0)
+	expireCopilotTrafficTestCooldown(t, h, req)
 	_, err := h.doInferenceWithRetry(func() (*http.Request, error) {
 		return copilotTrafficTestRequest(t, context.Background(), "copilot", "http://upstream.example", "credential", "editor", "model", 0), nil
 	})
-	if err == nil || len(h.copilotTraffic.groups) != 0 {
-		t.Fatalf("failed send retained admission permit: error=%v groups=%d", err, len(h.copilotTraffic.groups))
+	if err == nil || len(h.copilotTraffic.cooldowns) != 0 {
+		t.Fatalf("failed send retained probe: error=%v cooldowns=%d", err, len(h.copilotTraffic.cooldowns))
 	}
 }
 
-func TestCopilotAdmissionTaskUsageTracksOnlyActualDispatch(t *testing.T) {
+func TestCopilotProbeTaskUsageTracksOnlyActualDispatch(t *testing.T) {
 	started, releaseHeaders := make(chan struct{}), make(chan struct{})
 	h := &ProxyHandler{maxRetries: 1, stats: newStatsCollector(), client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		close(started)
 		<-releaseHeaders
 		return routeExecutorTestResponse(req, http.StatusOK, nil, `{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,"reasoning_tokens":2},"copilot_usage":{"total_nano_aiu":9,"compute_units":4}}`), nil
 	})}}
-	WithCopilotLargeRequestConcurrency(1, 1)(h)
+	req := copilotTrafficTestRequest(t, context.Background(), "copilot", "http://upstream.example", "credential", "editor", "model", 0)
+	expireCopilotTrafficTestCooldown(t, h, req)
 	t.Cleanup(func() {
 		select {
 		case <-releaseHeaders:

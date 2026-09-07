@@ -383,8 +383,6 @@ type serveFlags struct {
 	copilotIntegrationID            *string
 	copilotGitHubAPIVersion         *string
 	copilotOpenAIIntent             *string
-	copilotLargeRequestConcurrency  *int
-	copilotLargeRequestBytes        *int
 	responsesWSEnabled              *bool
 	responsesWSNativeUpstream       *bool
 	responsesWSTurnStateDelta       *bool
@@ -413,8 +411,6 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		copilotIntegrationID:            fs.String("copilot-integration-id", getEnv("COPILOT_INTEGRATION_ID", ""), "Upstream Copilot copilot-integration-id header"),
 		copilotGitHubAPIVersion:         fs.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header"),
 		copilotOpenAIIntent:             fs.String("copilot-openai-intent", getEnv("COPILOT_OPENAI_INTENT", ""), "Upstream Copilot openai-intent header"),
-		copilotLargeRequestConcurrency:  fs.Int("copilot-large-request-concurrency", getEnvInt("COPILOT_LARGE_REQUEST_CONCURRENCY", 0), "Maximum concurrent large Copilot requests per credential; zero disables admission control"),
-		copilotLargeRequestBytes:        fs.Int("copilot-large-request-bytes", getEnvInt("COPILOT_LARGE_REQUEST_BYTES", proxy.DefaultCopilotLargeRequestThresholdBytes()), "Request body size in bytes that qualifies for Copilot large-request admission control"),
 		responsesWSEnabled:              fs.Bool("responses-ws-enabled", getEnvBool("RESPONSES_WS_ENABLED", false), "Enable proxy-owned Codex websocket bridge on GET /v1/responses"),
 		responsesWSNativeUpstream:       fs.Bool("responses-ws-native-upstream", getEnvBool("RESPONSES_WS_NATIVE_UPSTREAM", false), "Use native upstream Copilot Responses websockets for websocket sessions"),
 		responsesWSTurnStateDelta:       fs.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
@@ -671,7 +667,6 @@ func runServe() {
 		server.WithCompactUpstreamMaxAttempts(*serve.compactUpstreamMaxAttempts),
 		server.WithPolicyRoutingAllowRemoteSingleTenant(*serve.policyRoutingAllowRemote),
 		server.WithProxyOptions(
-			proxy.WithCopilotLargeRequestConcurrency(*serve.copilotLargeRequestConcurrency, *serve.copilotLargeRequestBytes),
 			proxy.WithProvidersConfig(providersCfg),
 			proxy.WithPolicyRoutingMode(policyRoutingMode),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),

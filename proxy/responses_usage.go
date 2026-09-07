@@ -360,16 +360,17 @@ type anthropicStreamUsageAccumulator struct {
 	haveOutput    bool
 }
 
-func (a *anthropicStreamUsageAccumulator) observe(data []byte) {
+func (a *anthropicStreamUsageAccumulator) observe(data []byte) json.RawMessage {
 	var event struct {
 		Type    string `json:"type"`
 		Message *struct {
 			Usage *models.AnthropicUsage `json:"usage"`
 		} `json:"message"`
-		Usage *models.AnthropicUsage `json:"usage"`
+		Usage        *models.AnthropicUsage `json:"usage"`
+		CopilotUsage json.RawMessage        `json:"copilot_usage"`
 	}
 	if err := json.Unmarshal(data, &event); err != nil {
-		return
+		return event.CopilotUsage
 	}
 	switch event.Type {
 	case "message_start":
@@ -389,6 +390,7 @@ func (a *anthropicStreamUsageAccumulator) observe(data []byte) {
 			a.haveOutput = true
 		}
 	}
+	return event.CopilotUsage
 }
 
 // anthropicStreamErrorStatus inspects an Anthropic SSE data payload and, if it

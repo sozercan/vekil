@@ -15,9 +15,6 @@ type policyDecisionRecord struct {
 	ToolCount         int
 	InputBytes        int
 	Truncated         bool
-	MappingReason     string
-	Signals           policyClassifierSignals
-	HasSignals        bool
 }
 
 // chatOperationPlan is the sealed logical execution snapshot produced before

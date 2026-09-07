@@ -155,7 +155,7 @@ func (s *taskInferenceSend) finish(resp *http.Response, sendErr error) {
 func (s *taskInferenceSend) finishResponse(resp *http.Response, sendErr error) {
 	state, req := s.state, s.req
 	if sendErr != nil || resp == nil {
-		state.publish(statsTokenUsage{}, false, copilotUsageTotals{}, true, true, false)
+		state.publish(statsTokenUsage{}, false, copilotUsageTotals{}, true, false)
 		return
 	}
 	state.failed = resp.StatusCode >= http.StatusBadRequest
@@ -175,7 +175,7 @@ func (s *taskInferenceSend) finishResponse(resp *http.Response, sendErr error) {
 		}
 	}
 	if resp.Body == nil || resp.Body == http.NoBody {
-		state.publish(statsTokenUsage{}, false, copilotUsageTotals{}, true, true, state.throttled)
+		state.publish(statsTokenUsage{}, false, copilotUsageTotals{}, true, state.throttled)
 		return
 	}
 	state.inner = resp.Body
@@ -224,7 +224,7 @@ func (b *taskUsageBody) Read(p []byte) (int, error) {
 			finishErr = errRouteAttemptBodyClosedEarly
 		}
 		b.observer.finish(errors.Is(finishErr, io.EOF), finishErr)
-		b.publishObserver(true)
+		b.publishObserver()
 	}
 	return n, err
 }
@@ -240,13 +240,13 @@ func (b *taskUsageBody) Close() error {
 		b.mu.Unlock()
 		if finish {
 			b.observer.finish(false, errRouteAttemptBodyClosedEarly)
-			b.publishObserver(true)
+			b.publishObserver()
 		}
 	})
 	return b.closeErr
 }
 
-func (b *taskUsageBody) publishObserver(complete bool) {
+func (b *taskUsageBody) publishObserver() {
 	o := b.observer
 	o.mu.Lock()
 	usage, haveUsage := o.usage, o.haveUsage
@@ -271,7 +271,7 @@ func (b *taskUsageBody) publishObserver(complete bool) {
 		failed = b.failed || !valid
 	}
 	o.mu.Unlock()
-	b.publish(usage, haveUsage, copilot, complete, failed, throttled)
+	b.publish(usage, haveUsage, copilot, failed, throttled)
 }
 
 func (b *taskUsageBody) canceledAtFailure() bool {
@@ -289,7 +289,7 @@ func (b *taskUsageBody) routeAttemptTransportOwnership() *routeAttemptTransportO
 	return routeAttemptTransportOwnership(b.inner)
 }
 
-func (b *taskUsageBody) publish(usage statsTokenUsage, haveUsage bool, copilot copilotUsageTotals, complete, failed, throttled bool) {
+func (b *taskUsageBody) publish(usage statsTokenUsage, haveUsage bool, copilot copilotUsageTotals, failed, throttled bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delta := statsTokenUsageDelta(usage, b.accounted)
@@ -303,7 +303,7 @@ func (b *taskUsageBody) publish(usage statsTokenUsage, haveUsage bool, copilot c
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var durationMS int64
-	if complete && !b.completed {
+	if !b.completed {
 		durationMS = max(time.Since(b.start).Milliseconds(), 0)
 	}
 	for _, row := range []*taskUsageTotals{&c.totals, &c.kinds[b.kind]} {
@@ -318,16 +318,16 @@ func (b *taskUsageBody) publish(usage statsTokenUsage, haveUsage bool, copilot c
 		if throttled && !b.throttleCounted {
 			row.Throttled++
 		}
-		if complete && !b.completed {
+		if !b.completed {
 			row.Completed++
 			row.DurationMS = policyStatsSaturatingAdd(row.DurationMS, durationMS)
 		}
 	}
-	if complete && !b.completed {
+	if !b.completed {
 		c.inflight--
 	}
 	b.reported = b.reported || haveUsage
 	b.errorCounted = b.errorCounted || failed
 	b.throttleCounted = b.throttleCounted || throttled
-	b.completed = b.completed || complete
+	b.completed = true
 }

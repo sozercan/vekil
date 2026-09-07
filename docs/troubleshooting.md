@@ -30,19 +30,8 @@ Configured priority failover can still use an unaffected compatible target.
 Requests with provider-bound state retain their selected target. Switching models
 within the same account does not avoid an account or weekly cooldown.
 
-If several large sessions repeatedly hit limits together, enable optional
-admission for large Copilot requests:
-
-```bash
-vekil --copilot-large-request-concurrency 4
-```
-
-The default size threshold is 256 KiB of request JSON. This threshold is a local
-byte measurement, not an upstream token estimate. Requests below it continue
-normally. Large requests wait for a permit held until an active response closes;
-disconnects, request deadlines, and shutdown stop waiting requests. A full local
-admission queue returns 503. The limit is disabled by default and does not change
-upstream quotas. See [configuration](configuration.md) for both admission knobs.
+Requests waiting for a recovery probe honor disconnects, request deadlines, and
+shutdown. The number of waiters is bounded; excess requests receive 503.
 
 To investigate repeated throttling, record the error code, reset, timestamp, and
 `X-Copilot-Service-Request-Id` when present. Quota snapshot and usage-rate-limit

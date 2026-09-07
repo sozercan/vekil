@@ -410,13 +410,7 @@ Policy telemetry must be attributable per profile and per declared request-size/
 
 Observe analysis is not representative unless admission is at least 95% in every declared bucket or the missing population is evaluated separately. Observe data is supplementary operational evidence, not causal proof of quality, because all observed requests still execute the baseline tier.
 
-`GET /stats.json` exposes the last 256 decisions, newest first, under
-`policy_routing.recent_decisions`. Each record contains the public profile,
-proxy operation ID, effective mode, actual and optional shadow tier, selected
-reasoning effort, a fixed mapping reason, validated classifier signals, bounded
-counts, latency, and failure category. Observe classification adds its shadow
-record after the baseline dispatch. These records also carry the following
-generations:
+Each bounded decision record carries IDs/enums/counts, latency/failure categories, and these generations:
 
 - `configGeneration`: canonical normalized complete providers configuration;
 - `profileGeneration`: normalized profile, including its tier route/effort objects, derived public contract, terminal route IDs, and effective profile-wide request policy;

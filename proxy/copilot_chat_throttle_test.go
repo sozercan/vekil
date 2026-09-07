@@ -189,7 +189,6 @@ func TestCopilotChatStreamCloseJoinsPendingRead(t *testing.T) {
 	for _, throttle := range []bool{false, true} {
 		t.Run(fmt.Sprintf("throttle=%t", throttle), func(t *testing.T) {
 			h := &ProxyHandler{}
-			WithCopilotLargeRequestConcurrency(1, 1)(h)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			var clock atomic.Int64
@@ -261,8 +260,10 @@ func TestCopilotChatStreamCloseJoinsPendingRead(t *testing.T) {
 				t.Fatal("stream close did not release its queued request")
 			}
 			waitForCopilotTrafficWaiters(t, h, 0)
-			if len(h.copilotTraffic.groups) != 0 {
-				t.Fatal("closed stream retained admission state")
+			for _, cooldown := range h.copilotTraffic.cooldowns {
+				if cooldown.probe != nil {
+					t.Fatal("closed stream retained a recovery probe")
+				}
 			}
 		})
 	}

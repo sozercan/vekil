@@ -14,31 +14,10 @@ import (
 )
 
 const (
-	copilotLargeRequestThresholdBytes = 256 << 10
-	maxCopilotTrafficEntries          = 256
-	maxCopilotAdmissionWaiters        = 256
-	maxCopilotLargeRequestConcurrency = 1024
-	maxCopilotThrottleEvidenceBytes   = 4 << 10
+	maxCopilotTrafficEntries        = 256
+	maxCopilotProbeWaiters          = 256
+	maxCopilotThrottleEvidenceBytes = 4 << 10
 )
-
-// DefaultCopilotLargeRequestThresholdBytes is the payload size at which the
-// optional Copilot concurrency limit applies. This is a byte threshold, not a
-// token estimate or an upstream quota limit.
-func DefaultCopilotLargeRequestThresholdBytes() int {
-	return copilotLargeRequestThresholdBytes
-}
-
-// WithCopilotLargeRequestConcurrency limits concurrent large Copilot inference
-// requests per provider and credential. Zero disables admission. Permits remain
-// held until the upstream response body is closed.
-func WithCopilotLargeRequestConcurrency(maxConcurrent, thresholdBytes int) Option {
-	return func(h *ProxyHandler) {
-		h.copilotTraffic.maxConcurrent = min(max(maxConcurrent, 0), maxCopilotLargeRequestConcurrency)
-		if thresholdBytes > 0 {
-			h.copilotTraffic.thresholdBytes = thresholdBytes
-		}
-	}
-}
 
 type copilotThrottleScope uint8
 
@@ -56,9 +35,8 @@ type copilotCooldownKey struct {
 }
 
 type copilotInferenceRequest struct {
-	keys      [3]copilotCooldownKey
-	endpoint  string
-	bodyBytes int
+	keys     [3]copilotCooldownKey
+	endpoint string
 }
 
 type copilotInferenceRequestContextKey struct{}
@@ -90,8 +68,7 @@ func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, e
 			{scope: copilotThrottleAccount, identity: account},
 			{scope: copilotThrottleIntegration, identity: integration},
 		},
-		endpoint:  endpoint,
-		bodyBytes: len(body),
+		endpoint: endpoint,
 	}
 	return req.WithContext(context.WithValue(req.Context(), copilotInferenceRequestContextKey{}, metadata))
 }
@@ -114,20 +91,11 @@ type copilotCooldown struct {
 	probe chan struct{}
 }
 
-type copilotAdmissionGroup struct {
-	active  int
-	waiting int
-	changed chan struct{}
-}
-
 type copilotTrafficController struct {
-	mu             sync.Mutex
-	maxConcurrent  int
-	thresholdBytes int
-	cooldowns      map[copilotCooldownKey]*copilotCooldown
-	groups         map[[32]byte]*copilotAdmissionGroup
-	waiters        int
-	now            func() time.Time
+	mu        sync.Mutex
+	cooldowns map[copilotCooldownKey]*copilotCooldown
+	waiters   int
+	now       func() time.Time
 }
 
 func (c *copilotTrafficController) timeNow() time.Time {
@@ -146,17 +114,15 @@ type copilotProbeReservation struct {
 type copilotInferencePermit struct {
 	controller *copilotTrafficController
 	metadata   copilotInferenceRequest
-	group      *copilotAdmissionGroup
 	probes     []copilotProbeReservation
-	probeOnce  sync.Once
 	once       sync.Once
 }
 
-func (p *copilotInferencePermit) finishProbes() {
+func (p *copilotInferencePermit) release() {
 	if p == nil || p.controller == nil {
 		return
 	}
-	p.probeOnce.Do(func() {
+	p.once.Do(func() {
 		c := p.controller
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -170,27 +136,6 @@ func (p *copilotInferencePermit) finishProbes() {
 				delete(c.cooldowns, reservation.key)
 			}
 			close(reservation.probe)
-		}
-	})
-}
-
-func (p *copilotInferencePermit) release() {
-	if p == nil {
-		return
-	}
-	p.once.Do(func() {
-		p.finishProbes()
-		if p.group == nil {
-			return
-		}
-		c := p.controller
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		p.group.active--
-		close(p.group.changed)
-		p.group.changed = make(chan struct{})
-		if p.group.active == 0 && p.group.waiting == 0 {
-			delete(c.groups, p.metadata.keys[1].identity)
 		}
 	})
 }
@@ -250,40 +195,12 @@ func (h *ProxyHandler) acquireCopilotInference(req *http.Request) (*copilotInfer
 			c.mu.Unlock()
 			return nil, copilotCooldownResponse(req, metadata.endpoint, code, delay), nil
 		}
-		threshold := c.thresholdBytes
-		if threshold <= 0 {
-			threshold = copilotLargeRequestThresholdBytes
-		}
-		var group *copilotAdmissionGroup
-		if c.maxConcurrent > 0 && metadata.bodyBytes >= threshold {
-			group = c.groups[metadata.keys[1].identity]
-			if group == nil {
-				if len(c.groups) >= maxCopilotTrafficEntries {
-					c.mu.Unlock()
-					return nil, nil, copilotAdmissionUnavailable()
-				}
-				group = &copilotAdmissionGroup{changed: make(chan struct{})}
-				if c.groups == nil {
-					c.groups = make(map[[32]byte]*copilotAdmissionGroup)
-				}
-				c.groups[metadata.keys[1].identity] = group
-			}
-			if group.active >= c.maxConcurrent {
-				wait = group.changed
-			}
-		}
 		if wait != nil {
-			if c.waiters >= maxCopilotAdmissionWaiters {
-				if group != nil && group.active == 0 && group.waiting == 0 {
-					delete(c.groups, metadata.keys[1].identity)
-				}
+			if c.waiters >= maxCopilotProbeWaiters {
 				c.mu.Unlock()
-				return nil, nil, copilotAdmissionUnavailable()
+				return nil, nil, &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("too many requests waiting for rate-limit recovery; retry after the active probe finishes")}
 			}
 			c.waiters++
-			if group != nil {
-				group.waiting++
-			}
 			c.mu.Unlock()
 			select {
 			case <-ctx.Done():
@@ -292,20 +209,10 @@ func (h *ProxyHandler) acquireCopilotInference(req *http.Request) (*copilotInfer
 			}
 			c.mu.Lock()
 			c.waiters--
-			if group != nil {
-				group.waiting--
-				if group.active == 0 && group.waiting == 0 {
-					delete(c.groups, metadata.keys[1].identity)
-				}
-			}
 			c.mu.Unlock()
 			continue
 		}
 		var permit *copilotInferencePermit
-		if group != nil {
-			group.active++
-			permit = &copilotInferencePermit{controller: c, metadata: metadata, group: group}
-		}
 		for _, key := range metadata.keys {
 			if entry := c.cooldowns[key]; entry != nil {
 				if permit == nil {
@@ -322,10 +229,6 @@ func (h *ProxyHandler) acquireCopilotInference(req *http.Request) (*copilotInfer
 		}
 		return permit, nil, nil
 	}
-}
-
-func copilotAdmissionUnavailable() error {
-	return &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("large-request admission is full; retry when an active request finishes")}
 }
 
 func copilotCooldownResponse(req *http.Request, endpoint, code string, delay time.Duration) *http.Response {
@@ -499,7 +402,7 @@ func (b *copilotTrafficBody) observe() {
 		if complete {
 			b.permit.controller.observeThrottle(b.permit.metadata, b.status, b.retryAfter, prefix)
 		}
-		b.permit.finishProbes()
+		b.permit.release()
 	})
 }
 

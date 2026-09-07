@@ -30,8 +30,6 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 | `--policy-routing-allow-remote-single-tenant` | `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT` | `false` | Acknowledge running policy `observe`/`enforce` on a non-loopback bind for one trusted tenant. This adds no authentication or tenant isolation. |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
-| `--copilot-large-request-concurrency` | `COPILOT_LARGE_REQUEST_CONCURRENCY` | `0` | Optional concurrent large Copilot request limit per provider and credential; zero disables it |
-| `--copilot-large-request-bytes` | `COPILOT_LARGE_REQUEST_BYTES` | `262144` | Payload byte threshold for the optional large-request limit |
 
 Native CLI and tray-app runs default to `127.0.0.1`. Container deployments that publish the proxy port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path.
 
@@ -68,12 +66,6 @@ process-local cooldown for that scope. Vekil preserves long `Retry-After`
 values and returns the upstream response when the reset exceeds the request's
 remaining time budget. After a cooldown expires, one request probes recovery.
 See [throttling diagnostics](troubleshooting.md) for reset and request-ID details.
-
-To limit overlapping large requests, set
-`COPILOT_LARGE_REQUEST_CONCURRENCY=1`. The default size threshold is 256 KiB.
-Waiting requests honor cancellation and shutdown; the queue and shared state are
-bounded. Small requests and native token-count calls do not occupy these slots.
-This setting controls local concurrency; upstream quotas still apply.
 
 To reduce token use, configure [tool-output reduction](tool-optimizers.md) and,
 where appropriate, [policy tier reasoning effort](policy-routing.md).

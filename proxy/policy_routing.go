@@ -620,7 +620,6 @@ func (c *chatPolicyRoutingController) enforce(ctx context.Context, profile *comp
 		InputBytes:        len(input.OriginalBody),
 		Truncated:         facts.truncated(),
 	}
-	decision.MappingReason, decision.Signals, decision.HasSignals = policyResultEvidence(result, facts)
 	return c.sealPlan(profile, input, facts, tier, decision), nil
 }
 
@@ -652,7 +651,6 @@ func (c *chatPolicyRoutingController) launchObservation(ctx context.Context, pro
 		return
 	}
 	c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, Sampled: true, Admitted: true, ActualTier: profile.baselineTier.String()})
-	evidenceOperationID := input.OperationID
 	go func() {
 		defer c.h.endLifecycleWorker()
 		defer lease.release()
@@ -672,14 +670,6 @@ func (c *chatPolicyRoutingController) launchObservation(ctx context.Context, pro
 			observation.ShadowTier = shadow.String()
 		}
 		c.stats.record(observation)
-		reason, safeSignals, hasSignals := policyResultEvidence(result, facts)
-		c.recordDecisionEvidence(profile, chatPolicyInput{OperationID: evidenceOperationID}, policyDecisionRecord{
-			Category: "shadow", ActualTier: profile.baselineTier, ShadowTier: shadow,
-			MappingReason: reason, Signals: safeSignals, HasSignals: hasSignals,
-			FailureCategory: string(result.Failure.Category), ClassifierLatency: latency.Milliseconds(),
-			MessageCount: facts.Counts.Messages, ToolCount: facts.Counts.FunctionTools,
-			InputBytes: facts.Counts.RequestOriginalBytes, Truncated: facts.truncated(),
-		})
 	}()
 }
 
@@ -768,8 +758,6 @@ func (c *chatPolicyRoutingController) sealPlan(profile *compiledPolicyProfile, i
 	decision.ToolCount = facts.Counts.FunctionTools
 	decision.InputBytes = len(input.OriginalBody)
 	decision.Truncated = decision.Truncated || facts.truncated()
-	decision.ActualTier = tier
-	c.recordDecisionEvidence(profile, input, decision)
 	return newChatOperationPlan(chatOperationPlanOptions{
 		OperationID:             input.OperationID,
 		EntryID:                 profile.entry.id,
@@ -798,8 +786,6 @@ func (c *chatPolicyRoutingController) sealRoutePlan(profile *compiledPolicyProfi
 	decision.ToolCount = facts.Counts.FunctionTools
 	decision.InputBytes = len(input.OriginalBody)
 	decision.Truncated = decision.Truncated || facts.truncated()
-	decision.ActualTier = tier
-	c.recordDecisionEvidence(profile, input, decision)
 	return newChatOperationPlan(chatOperationPlanOptions{
 		OperationID:             input.OperationID,
 		EntryID:                 profile.entry.id,

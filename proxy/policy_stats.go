@@ -151,9 +151,8 @@ type policyStatsProfileState struct {
 }
 
 type policyStatsSnapshot struct {
-	RecentDecisions []policyDecisionEvidence     `json:"recent_decisions"`
-	Totals          policyStatsMetricsSnapshot   `json:"totals"`
-	Profiles        []policyStatsProfileSnapshot `json:"profiles"`
+	Totals   policyStatsMetricsSnapshot   `json:"totals"`
+	Profiles []policyStatsProfileSnapshot `json:"profiles"`
 }
 
 type policyStatsProfileSnapshot struct {
@@ -230,12 +229,9 @@ type policyStatsLatencySnapshot struct {
 // collector. A single mutex makes a complete observation atomic across global,
 // profile, and traffic-bucket views and makes snapshots race-safe.
 type policyStatsCollector struct {
-	decisions    []policyDecisionEvidence
-	decisionNext int
-	decisionSize int
-	mu           sync.Mutex
-	totals       policyStatsMetricsCounter
-	profiles     map[string]*policyStatsProfileCounter
+	mu       sync.Mutex
+	totals   policyStatsMetricsCounter
+	profiles map[string]*policyStatsProfileCounter
 }
 
 type policyStatsProfileCounter struct {
@@ -324,9 +320,8 @@ const (
 
 func emptyPolicyStatsSnapshot() policyStatsSnapshot {
 	return policyStatsSnapshot{
-		RecentDecisions: make([]policyDecisionEvidence, 0),
-		Totals:          (policyStatsMetricsCounter{}).snapshot(),
-		Profiles:        make([]policyStatsProfileSnapshot, 0),
+		Totals:   (policyStatsMetricsCounter{}).snapshot(),
+		Profiles: make([]policyStatsProfileSnapshot, 0),
 	}
 }
 
@@ -389,9 +384,8 @@ func (c *policyStatsCollector) snapshot() policyStatsSnapshot {
 	defer c.mu.Unlock()
 
 	result := policyStatsSnapshot{
-		RecentDecisions: c.recentDecisionsLocked(),
-		Totals:          c.totals.snapshot(),
-		Profiles:        make([]policyStatsProfileSnapshot, 0, len(c.profiles)),
+		Totals:   c.totals.snapshot(),
+		Profiles: make([]policyStatsProfileSnapshot, 0, len(c.profiles)),
 	}
 	profileNames := make([]string, 0, len(c.profiles))
 	for profile := range c.profiles {

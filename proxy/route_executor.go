@@ -2259,21 +2259,16 @@ func (o *routeAttemptResponseObserver) applyStreamingTerminal(outcome routeAttem
 
 func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) bool {
 	data = strings.TrimSpace(data)
-	if o.captureCopilotUsage && (o.endpoint == providerEndpointResponses || o.endpoint == providerEndpointMessages) {
-		var envelope struct {
-			Usage json.RawMessage `json:"copilot_usage"`
-		}
-		if json.Unmarshal([]byte(data), &envelope) == nil {
-			if usage, ok := parseCopilotUsage(envelope.Usage); ok {
-				o.copilotUsage.merge(usage)
-			}
-		}
-	}
 	switch o.endpoint {
 	case providerEndpointResponses:
 		return o.observeResponsesEvent(eventType, data)
 	case providerEndpointMessages:
-		o.anthropic.observe([]byte(data))
+		billing := o.anthropic.observe([]byte(data))
+		if o.captureCopilotUsage {
+			if usage, ok := parseCopilotUsage(billing); ok {
+				o.copilotUsage.merge(usage)
+			}
+		}
 		inspection := inspectAnthropicStreamEvent(eventType, data)
 		if inspection.failure != nil {
 			if !o.applyStreamingTerminal(routeAttemptOutcomeFailed, upstreamProgressTerminalFailure) {
@@ -2323,7 +2318,13 @@ func (o *routeAttemptResponseObserver) observeResponsesEvent(eventType, data str
 	if data == "[DONE]" {
 		return o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
 	}
-	event, err := parseResponsesStreamEvent(data)
+	var event responsesWebSocketStreamEvent
+	err := json.Unmarshal([]byte(data), &event)
+	if o.captureCopilotUsage {
+		if usage, ok := parseCopilotUsage(event.CopilotUsage); ok {
+			o.copilotUsage.merge(usage)
+		}
+	}
 	if err != nil {
 		if !o.terminal {
 			o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressUnknown)

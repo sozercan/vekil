@@ -1976,10 +1976,6 @@ func TestPolicyResponsesReplayBoundPlanCarriesTierReasoningEffort(t *testing.T) 
 			if plan.decision.Category != "replay_binding" || plan.selectedTier != tc.tier {
 				t.Fatalf("plan decision/tier = %q/%s, want replay_binding/%s", plan.decision.Category, plan.selectedTier, tc.tier)
 			}
-			evidence := h.policyRoutingController.(*chatPolicyRoutingController).PolicyStatsSnapshot().RecentDecisions
-			if len(evidence) != 1 || evidence[0].Category != "replay_pinned" || evidence[0].MappingReason != "replay_pinned" || evidence[0].ActualTier != tc.tier.String() || evidence[0].ReasoningEffort != tc.effort {
-				t.Fatalf("replay decision evidence = %+v", evidence)
-			}
 			if plan.selectedReasoningEffort != tc.effort {
 				t.Fatalf("selected reasoning effort = %q, want %q", plan.selectedReasoningEffort, tc.effort)
 			}
