@@ -71,3 +71,29 @@ func TestFetchSettledStatsWaitsForAuxiliarySends(t *testing.T) {
 		t.Fatalf("summary returned before auxiliary work settled: %+v, calls=%d", snapshot, calls.Load())
 	}
 }
+
+func TestFetchSettledStatsWaitsForUndispatchedAuxiliaryWork(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch calls.Add(1) {
+		case 1:
+			_, _ = fmt.Fprint(w, `{"inflight":0,"auxiliary_inflight":1,"task_usage":{"inflight":0,"totals":{"sends":0}}}`)
+		case 2:
+			_, _ = fmt.Fprint(w, `{"inflight":0,"auxiliary_inflight":1,"task_usage":{"inflight":1,"totals":{"sends":1}}}`)
+		default:
+			_, _ = fmt.Fprint(w, `{"inflight":0,"auxiliary_inflight":0,"task_usage":{"inflight":0,"totals":{"sends":1,"usage":{"prompt_tokens":8,"completion_tokens":2}}}}`)
+		}
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	snapshot, err := fetchSettledStats(ctx, server.URL, "local-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 3 || snapshot.TaskUsage.Totals.Sends != 1 || snapshot.TaskUsage.Totals.Usage.PromptTokens != 8 {
+		t.Fatalf("summary omitted queued auxiliary work: %+v, calls=%d", snapshot, calls.Load())
+	}
+}

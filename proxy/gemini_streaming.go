@@ -86,6 +86,9 @@ func streamOpenAIToGeminiWithLifecycle(
 	onUsage := firstOpenAIUsageCallback(onUsageCallbacks)
 
 	sawDone, err := consumeOpenAIStreamChunks(body, func(chunk models.OpenAIStreamChunk) bool {
+		if lifecycle.onCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			lifecycle.onCopilotUsage(chunk.CopilotUsage)
+		}
 		if onUsage != nil && chunk.Usage != nil {
 			onUsage(chunk.Usage)
 		}

@@ -171,19 +171,20 @@ type statsErrorRow struct {
 
 // statsSnapshot is the payload served at GET /stats.json.
 type statsSnapshot struct {
-	TaskUsage     taskUsageSnapshot      `json:"task_usage"`
-	UptimeSeconds int64                  `json:"uptime_seconds"`
-	Inflight      int64                  `json:"inflight"`
-	Totals        statsTotals            `json:"totals"`
-	Status        map[string]int64       `json:"status"`
-	StatusCodes   []statsErrorRow        `json:"status_codes"`
-	Errors        []statsErrorRow        `json:"errors"`
-	Series        []statsSeriesPoint     `json:"series"`
-	ByModel       []statsBreakdown       `json:"by_model"`
-	ByProvider    []statsBreakdown       `json:"by_provider"`
-	ByAgent       []statsBreakdown       `json:"by_agent"`
-	ByRoute       []statsBreakdown       `json:"by_route"`
-	ByTarget      []statsTargetBreakdown `json:"by_target"`
+	TaskUsage         taskUsageSnapshot      `json:"task_usage"`
+	UptimeSeconds     int64                  `json:"uptime_seconds"`
+	Inflight          int64                  `json:"inflight"`
+	AuxiliaryInflight int64                  `json:"auxiliary_inflight"`
+	Totals            statsTotals            `json:"totals"`
+	Status            map[string]int64       `json:"status"`
+	StatusCodes       []statsErrorRow        `json:"status_codes"`
+	Errors            []statsErrorRow        `json:"errors"`
+	Series            []statsSeriesPoint     `json:"series"`
+	ByModel           []statsBreakdown       `json:"by_model"`
+	ByProvider        []statsBreakdown       `json:"by_provider"`
+	ByAgent           []statsBreakdown       `json:"by_agent"`
+	ByRoute           []statsBreakdown       `json:"by_route"`
+	ByTarget          []statsTargetBreakdown `json:"by_target"`
 	// PhysicalUsage counts usage reported by explicit-route upstream sends.
 	// WastedUsage is the subset reported by attempts that did not become an
 	// accepted client-visible result. Both ledgers are additive to, and do not
@@ -1882,7 +1883,16 @@ func (h *ProxyHandler) AddResponsesTurnUsage(record responsesTurnStatsRecord, us
 func (h *ProxyHandler) HandleStatsJSON(w http.ResponseWriter, r *http.Request) {
 	var snap statsSnapshot
 	if h != nil && h.stats != nil {
+		// Sample activity in scheduling order before totals: a client request
+		// can register a detached worker, which can start an upstream send.
+		// Reversing the order can report idle with totals from before that work.
+		inflight := h.stats.inflight.Load()
+		h.lifecycleWorkersMu.Lock()
+		auxiliaryInflight := int64(h.lifecycleWorkersActive)
+		h.lifecycleWorkersMu.Unlock()
 		snap = h.stats.snapshot()
+		snap.Inflight = inflight
+		snap.AuxiliaryInflight = auxiliaryInflight
 	}
 	snap.PolicyRouting = emptyPolicyStatsSnapshot()
 	if h != nil {

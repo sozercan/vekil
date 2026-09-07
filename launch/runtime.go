@@ -48,11 +48,12 @@ type statsBreakdown struct {
 }
 
 type statsSnapshot struct {
-	Inflight   int64            `json:"inflight"`
-	Totals     statsTotals      `json:"totals"`
-	ByModel    []statsBreakdown `json:"by_model"`
-	ByProvider []statsBreakdown `json:"by_provider"`
-	TaskUsage  taskUsageStats   `json:"task_usage"`
+	Inflight          int64            `json:"inflight"`
+	AuxiliaryInflight int64            `json:"auxiliary_inflight"`
+	Totals            statsTotals      `json:"totals"`
+	ByModel           []statsBreakdown `json:"by_model"`
+	ByProvider        []statsBreakdown `json:"by_provider"`
+	TaskUsage         taskUsageStats   `json:"task_usage"`
 }
 
 type taskUsageTotals struct {
@@ -711,7 +712,7 @@ func fetchSettledStats(ctx context.Context, baseURL, localToken string) (statsSn
 		if err != nil {
 			return statsSnapshot{}, err
 		}
-		if snapshot.Inflight <= 0 && snapshot.TaskUsage.Inflight <= 0 {
+		if snapshot.Inflight <= 0 && snapshot.AuxiliaryInflight <= 0 && snapshot.TaskUsage.Inflight <= 0 {
 			return snapshot, nil
 		}
 

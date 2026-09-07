@@ -58,6 +58,9 @@ duration, reported token usage, and numeric `copilot_usage` totals.
 `compaction`, `memory`, `classifier`, and `insight`.
 `task_usage.inflight` includes header wait and response consumption.
 Local validation and admission rejections do not create upstream sends.
+The top-level `auxiliary_inflight` counts registered background workers,
+including classifiers waiting to dispatch, through completion. These workers
+may overlap active sends; their count is separate from the usage ledger.
 
 `reported_usage_sends` counts sends whose responses supplied inference usage.
 Missing usage is not estimated. Native token-count responses describe input

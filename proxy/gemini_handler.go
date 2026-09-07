@@ -179,6 +179,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		writeAggregatedResponse := func(oaiResp *models.OpenAIResponse) {
 			markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
+			observeCopilotUsage(r.Context(), oaiResp.CopilotUsage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
@@ -242,6 +243,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 					return err
 				}
 				observeOpenAIUsage(r.Context(), parsed.Usage)
+				observeCopilotUsage(r.Context(), parsed.CopilotUsage)
 				h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &parsed, h.toolContexts, scope, false)
 
 				markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
@@ -307,6 +309,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 
 	writeAggregatedResponse := func(oaiResp *models.OpenAIResponse) {
 		observeOpenAIUsage(r.Context(), oaiResp.Usage)
+		observeCopilotUsage(r.Context(), oaiResp.CopilotUsage)
 		h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), oaiResp, h.toolContexts, scope, false)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(TranslateOpenAIToGemini(oaiResp))
@@ -363,8 +366,9 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	if result.Stream != nil {
 		tracked := &commitTrackingResponseWriter{ResponseWriter: w}
 		err := streamChatEventsToGemini(tracked, result.Stream, chatStreamEventCallbacks{
-			OnUsage: openAIChatStreamUsageCallback(r.Context()),
-			OnFinal: h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
+			OnUsage:        openAIChatStreamUsageCallback(r.Context()),
+			OnCopilotUsage: func(raw json.RawMessage) { observeCopilotUsage(r.Context(), raw) },
+			OnFinal:        h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope),
 		})
 		if h.handleCanonicalChatStreamLifecycleError(w, r, upstreamCtx, tracked.committed, err, func() {
 			_ = writeGeminiSSEData(tracked, models.GeminiErrorResponse{
@@ -406,6 +410,7 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 				return err
 			}
 			observeOpenAIUsage(r.Context(), parsed.Usage)
+			observeCopilotUsage(r.Context(), parsed.CopilotUsage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &parsed, h.toolContexts, scope, false)
 
 			w.Header().Set("Content-Type", "application/json")

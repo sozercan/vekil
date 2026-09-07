@@ -981,6 +981,31 @@ func TestParseSystemMessageDoesNotDoubleExistingNewlines(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
+
+			var blocks []models.ContentBlock
+			if err := json.Unmarshal([]byte(tc.raw), &blocks); err != nil {
+				t.Fatal(err)
+			}
+			blocks[0].CacheControl = json.RawMessage(`{"type":"ephemeral"}`)
+			cachedRaw, err := json.Marshal(blocks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cached, err := nativeChatSystemCacheMessages(cachedRaw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var joined strings.Builder
+			for _, message := range cached {
+				var text string
+				if err := json.Unmarshal(message.Content, &text); err != nil {
+					t.Fatal(err)
+				}
+				joined.WriteString(text)
+			}
+			if joined.String() != tc.want {
+				t.Fatalf("cached system text = %q, want %q", joined.String(), tc.want)
+			}
 		})
 	}
 }

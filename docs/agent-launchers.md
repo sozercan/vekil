@@ -347,8 +347,11 @@ provider accounting across the full session. Auxiliary rows identify token
 probes, compaction, memory summaries, classifier calls, and dashboard insights.
 Retries contribute their own reported usage. Native token-count results are
 sizing information and do not become spent inference tokens. The launcher waits
-briefly for both client and auxiliary work to settle before reading these
-totals. See [task usage](dashboard.md#task-usage) for reporting limits.
+up to two seconds for client requests, registered background workers, and
+upstream sends to settle before printing these totals. This includes classifiers
+that have been scheduled but have not dispatched yet. If work remains active at
+the deadline, the summary is omitted. See [task usage](dashboard.md#task-usage)
+for reporting limits.
 
 If Codex reports an upstream `408 user_request_timeout`, see
 [Troubleshooting](troubleshooting.md#408-user_request_timeout-timed-out-reading-request-body)

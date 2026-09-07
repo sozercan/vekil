@@ -129,6 +129,88 @@ func TestTaskUsageAuxiliaryKindsAndCustomEndpoint(t *testing.T) {
 	}
 }
 
+type taskUsagePausedClassifier struct {
+	policyClassifier
+	started chan struct{}
+	resume  <-chan struct{}
+}
+
+func (c *taskUsagePausedClassifier) Classify(ctx context.Context, facts policyClassifierFacts) (policyClassifierSignals, error) {
+	close(c.started)
+	select {
+	case <-c.resume:
+		return c.policyClassifier.Classify(ctx, facts)
+	case <-ctx.Done():
+		return policyClassifierSignals{}, context.Cause(ctx)
+	}
+}
+
+func TestTaskUsageStatsIncludesUndispatchedClassifier(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeObserve)
+	cfg.PolicyProfiles[0].Classifier.TimeoutMS = 5000
+	h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeObserve))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	profile := h.policyRoutingController.(*chatPolicyRoutingController).profiles[cfg.PolicyProfiles[0].ID]
+	resume := make(chan struct{})
+	release := sync.OnceFunc(func() { close(resume) })
+	classifier := &taskUsagePausedClassifier{policyClassifier: profile.classifierAdapter, started: make(chan struct{}), resume: resume}
+	profile.classifierAdapter = classifier
+	t.Cleanup(func() {
+		release()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := h.WaitLifecycleWorkers(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+
+	w := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"coding-economy","messages":[{"role":"user","content":"plan a refactor"}]}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	select {
+	case <-classifier.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("observe classifier did not start")
+	}
+	readStats := func() (int64, taskUsageSnapshot) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		h.HandleStatsJSON(w, httptest.NewRequest(http.MethodGet, "/stats.json", nil))
+		var snapshot struct {
+			AuxiliaryInflight int64             `json:"auxiliary_inflight"`
+			TaskUsage         taskUsageSnapshot `json:"task_usage"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		return snapshot.AuxiliaryInflight, snapshot.TaskUsage
+	}
+	workers, usage := readStats()
+	if workers != 1 || usage.Inflight != 0 || usage.Totals.Sends != 2 {
+		t.Fatalf("pending classifier was hidden or counted as a send: workers=%d usage=%+v", workers, usage)
+	}
+	release()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.WaitLifecycleWorkers(ctx); err != nil {
+		t.Fatal(err)
+	}
+	workers, usage = readStats()
+	if workers != 0 || usage.Inflight != 0 || usage.Totals.Sends != 3 || usage.Totals.Usage.PromptTokens != 22 {
+		t.Fatalf("settled stats omitted classifier usage: workers=%d usage=%+v", workers, usage)
+	}
+}
+
 func TestTaskUsageStreamKeepsEarlyAccounting(t *testing.T) {
 	var body strings.Builder
 	fmt.Fprint(&body, "data: ", `{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18},"copilot_usage":{"total_nano_aiu":31,"compute_units":2}}`, "\n\n")
