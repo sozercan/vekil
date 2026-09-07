@@ -17,14 +17,15 @@ var copilotRequestMetadataHeaderNames = []string{
 
 const diagnosticHeaderValueLimit = 1024
 
-// Caller attribution is optional. Copy only explicit, unambiguous values;
-// provider credentials and integration headers remain server-owned.
+// Caller attribution is optional. Replace destination attribution with only
+// explicit, unambiguous values; provider credentials remain server-owned.
 func copyCopilotRequestMetadata(dst, src http.Header) {
 	if dst == nil {
 		return
 	}
 	for _, name := range copilotRequestMetadataHeaderNames {
 		value := boundedSingleHeaderValue(src, name)
+		deleteHeaderCI(dst, name)
 		if value == "" {
 			continue
 		}
@@ -33,6 +34,15 @@ func copyCopilotRequestMetadata(dst, src http.Header) {
 		}
 		dst.Set(name, value)
 	}
+}
+
+func copilotRequestMetadataHeaderName(name string) string {
+	for _, allowed := range copilotRequestMetadataHeaderNames {
+		if strings.EqualFold(name, allowed) {
+			return allowed
+		}
+	}
+	return ""
 }
 
 func withCopilotRequestMetadata(ctx context.Context, headers http.Header) context.Context {
@@ -63,11 +73,19 @@ func copyCopilotRequestMetadataContext(dst, src context.Context) context.Context
 }
 
 func boundedSingleHeaderValue(headers http.Header, name string) string {
-	values := headerValuesCI(headers, name)
-	if len(values) != 1 {
-		return ""
+	var value string
+	found := false
+	for key, values := range headers {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		if found || len(values) != 1 {
+			return ""
+		}
+		value = values[0]
+		found = true
 	}
-	value := strings.TrimSpace(values[0])
+	value = strings.TrimSpace(value)
 	if len(value) == 0 || len(value) > diagnosticHeaderValueLimit {
 		return ""
 	}

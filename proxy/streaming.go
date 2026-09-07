@@ -1765,6 +1765,9 @@ func aggregateStreamToResponseWithProgressOptions(body io.ReadCloser, options op
 			return nil, progress, err
 		}
 	}
+	if err := aggregator.nativeReasoningError(); err != nil {
+		return nil, progress, err
+	}
 
 	return aggregator.buildResponseWithOptions(options), progress, nil
 }
@@ -2132,16 +2135,20 @@ func (s *anthropicStreamState) finish() bool {
 }
 
 type aggregatedOpenAIChoice struct {
-	role              string
-	content           strings.Builder
-	contentPresent    bool
-	refusal           strings.Builder
-	refusalPresent    bool
-	reasoningText     strings.Builder
-	reasoningOpaque   strings.Builder
-	toolCalls         map[int]*models.OpenAIToolCall
-	toolCallArguments map[int]*strings.Builder
-	finishReason      *string
+	role                     string
+	content                  strings.Builder
+	contentPresent           bool
+	refusal                  strings.Builder
+	refusalPresent           bool
+	reasoningText            strings.Builder
+	reasoningOpaque          strings.Builder
+	nativeReasoningSeen      bool
+	nativeReasoningOpen      bool
+	nativeReasoningSeparated bool
+	nativeReasoningSigned    bool
+	toolCalls                map[int]*models.OpenAIToolCall
+	toolCallArguments        map[int]*strings.Builder
+	finishReason             *string
 }
 
 type openAIResponseBuildOptions struct {
@@ -2216,16 +2223,19 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 	if choice.Delta.Role != "" {
 		aggChoice.role = choice.Delta.Role
 	}
-	aggChoice.reasoningText.WriteString(choice.Delta.ReasoningText)
-	aggChoice.reasoningOpaque.WriteString(choice.Delta.ReasoningOpaque)
+	aggChoice.appendNativeReasoning(choice.Delta.ReasoningText, choice.Delta.ReasoningOpaque)
 
 	if choice.Delta.Content != nil && !bytes.Equal(bytes.TrimSpace(choice.Delta.Content), []byte("null")) {
 		var text string
 		if err := json.Unmarshal(choice.Delta.Content, &text); err == nil {
 			aggChoice.contentPresent = true
 			aggChoice.content.WriteString(text)
+			if text != "" {
+				aggChoice.nativeReasoningOpen = false
+			}
 		} else {
 			a.invalidContentDelta = true
+			aggChoice.nativeReasoningOpen = false
 		}
 	}
 	if choice.Delta.Refusal != nil && !bytes.Equal(bytes.TrimSpace(choice.Delta.Refusal), []byte("null")) {
@@ -2233,12 +2243,17 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 		if err := json.Unmarshal(choice.Delta.Refusal, &refusal); err == nil {
 			aggChoice.refusalPresent = true
 			aggChoice.refusal.WriteString(refusal)
+			if refusal != "" {
+				aggChoice.nativeReasoningOpen = false
+			}
 		} else {
 			a.invalidRefusalDelta = true
+			aggChoice.nativeReasoningOpen = false
 		}
 	}
 
 	for _, toolCall := range choice.Delta.ToolCalls {
+		aggChoice.nativeReasoningOpen = false
 		toolIndex := 0
 		if toolCall.Index != nil {
 			toolIndex = *toolCall.Index
@@ -2267,6 +2282,44 @@ func (a *openAIResponseAggregator) addChoice(choice models.OpenAIStreamChoice) {
 		finishReason := *choice.FinishReason
 		aggChoice.finishReason = &finishReason
 	}
+}
+
+func (c *aggregatedOpenAIChoice) appendNativeReasoning(thinking, signature string) {
+	if thinking == "" && signature == "" {
+		return
+	}
+	if c.nativeReasoningSeen && !c.nativeReasoningOpen {
+		c.nativeReasoningSeparated = true
+	}
+	c.nativeReasoningSeen, c.nativeReasoningOpen = true, true
+	c.nativeReasoningSigned = c.nativeReasoningSigned || signature != ""
+	if c.nativeReasoningSeparated && c.nativeReasoningSigned {
+		// One Chat text/signature pair cannot authenticate separate thinking
+		// blocks. Non-streaming callers reject this after consuming usage. A
+		// streaming tool-capture callback still gets text/tools, but no invented
+		// signature or partially authenticated reasoning.
+		c.reasoningText.Reset()
+		c.reasoningOpaque.Reset()
+		return
+	}
+	c.reasoningText.WriteString(thinking)
+	c.reasoningOpaque.WriteString(signature)
+}
+
+func (a *openAIResponseAggregator) nativeReasoningError() error {
+	for _, choice := range a.choicesByIndex {
+		if choice.nativeReasoningSeparated && choice.nativeReasoningSigned {
+			return &chatExecutionError{
+				StatusCode:    http.StatusBadGateway,
+				Type:          "server_error",
+				Code:          "unsupported_native_reasoning_blocks",
+				Message:       "multiple native reasoning blocks with opaque signatures cannot be aggregated into one non-streaming response; use streaming to preserve the blocks",
+				Usage:         a.response.Usage,
+				staticMessage: true,
+			}
+		}
+	}
+	return nil
 }
 
 func (a *openAIResponseAggregator) policyTextDeltaError() error {

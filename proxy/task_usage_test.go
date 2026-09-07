@@ -95,6 +95,44 @@ func TestTaskUsageNativeCountIsSizingOnly(t *testing.T) {
 	}
 }
 
+func TestTaskUsageCancellationAccounting(t *testing.T) {
+	for _, status := range []string{"cancelled", "canceled"} {
+		response := `{"id":"resp-accounting","status":"` + status + `","usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}`
+		terminal := "event: response." + status + "\ndata: " + `{"type":"response.` + status + `","response":` + response + "}\n\n"
+		pending := "event: response.in_progress\ndata: " + `{"type":"response.in_progress","response":{"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}` + "\n\n"
+		for _, tc := range []struct {
+			name, contentType, body   string
+			statusCode                int
+			readErr                   error
+			wantErrors, wantThrottles int64
+		}{
+			{name: "JSON terminal", contentType: "application/json", body: response, statusCode: http.StatusOK},
+			{name: "SSE terminal", contentType: "text/event-stream", body: terminal, statusCode: http.StatusOK},
+			{name: "cancellation after terminal", contentType: "text/event-stream", body: terminal, statusCode: http.StatusOK, readErr: context.Canceled},
+			{name: "HTTP failure", contentType: "application/json", body: response, statusCode: http.StatusTooManyRequests, wantErrors: 1, wantThrottles: 1},
+			{name: "transport cancellation", contentType: "text/event-stream", body: pending, statusCode: http.StatusOK, readErr: context.Canceled, wantErrors: 1},
+			{name: "transport deadline", contentType: "text/event-stream", body: pending, statusCode: http.StatusOK, readErr: context.DeadlineExceeded, wantErrors: 1},
+			{name: "missing terminal", contentType: "text/event-stream", body: pending, statusCode: http.StatusOK, wantErrors: 1},
+		} {
+			t.Run(status+"/"+tc.name, func(t *testing.T) {
+				h := &ProxyHandler{stats: newStatsCollector()}
+				var reader io.Reader = strings.NewReader(tc.body)
+				if tc.readErr != nil {
+					reader = io.MultiReader(reader, &fixedErrorReadCloser{err: tc.readErr})
+				}
+				resp := &http.Response{StatusCode: tc.statusCode, Header: http.Header{"Content-Type": {tc.contentType}}, Body: io.NopCloser(reader)}
+				h.beginTaskInferenceSend(httptest.NewRequest(http.MethodPost, providerEndpointResponses, nil)).finish(resp, nil)
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				snapshot := h.stats.taskUsage.snapshot()
+				if snapshot.Inflight != 0 || snapshot.Totals.Sends != 1 || snapshot.Totals.Completed != 1 || snapshot.Totals.Errors != tc.wantErrors || snapshot.Totals.Throttled != tc.wantThrottles || snapshot.Totals.Usage.TotalTokens != 9 {
+					t.Fatalf("cancellation accounting = %+v", snapshot)
+				}
+			})
+		}
+	}
+}
+
 func TestTaskUsageAuxiliaryKindsAndCustomEndpoint(t *testing.T) {
 	h := &ProxyHandler{stats: newStatsCollector(), client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Request: req,

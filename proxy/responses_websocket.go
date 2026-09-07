@@ -2009,30 +2009,34 @@ func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCr
 	headers := make(http.Header)
 	mergeHeaderValues(headers, s.baseHeaders)
 
+	var clientAttribution http.Header
 	for key, value := range request.ClientMetadata {
 		trimmed := strings.TrimSpace(value)
-		if trimmed == "" {
+		name := responsesWebSocketMetadataHeaderName(key)
+		if name == "" && strings.HasPrefix(key, responsesWebSocketRequestHeaderPrefix) {
+			name = strings.TrimSpace(strings.TrimPrefix(key, responsesWebSocketRequestHeaderPrefix))
+		}
+		if name == "" || strings.EqualFold(name, "X-Codex-Turn-State") {
 			continue
 		}
-
-		if name := responsesWebSocketMetadataHeaderName(key); name != "" {
-			headers.Set(name, trimmed)
-			continue
-		}
-
-		switch {
-		case strings.HasPrefix(key, responsesWebSocketRequestHeaderPrefix):
-			name := strings.TrimSpace(strings.TrimPrefix(key, responsesWebSocketRequestHeaderPrefix))
-			if name != "" && !strings.EqualFold(name, "X-Codex-Turn-State") {
-				headers.Set(name, trimmed)
+		if attributionName := copilotRequestMetadataHeaderName(name); attributionName != "" {
+			if clientAttribution == nil {
+				clientAttribution = make(http.Header)
 			}
+			clientAttribution.Add(attributionName, trimmed)
+		} else if trimmed != "" {
+			headers.Set(name, trimmed)
 		}
 	}
+	mergeHeaderValues(headers, clientAttribution)
 	for name, value := range request.Headers {
 		if responsesWebSocketRequestHeaderAllowed(name) {
 			headers.Set(name, strings.TrimSpace(value))
 		}
 	}
+	// Both HTTP requests and native create frames use these headers. Validate
+	// attribution after all per-turn overrides and before either transport.
+	copyCopilotRequestMetadata(headers, headers)
 
 	if includeTurnState && s.turnState != "" {
 		headers.Set("X-Codex-Turn-State", s.turnState)
@@ -2075,6 +2079,9 @@ func responsesWebSocketTurnMetadataKey(turnMetadata string) string {
 }
 
 func responsesWebSocketMetadataHeaderName(key string) string {
+	if name := copilotRequestMetadataHeaderName(strings.TrimSpace(key)); name != "" {
+		return name
+	}
 	switch strings.ToLower(strings.TrimSpace(key)) {
 	case "x-codex-installation-id":
 		return "X-Codex-Installation-Id"

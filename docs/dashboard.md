@@ -66,7 +66,10 @@ may overlap active sends; their count is separate from the usage ledger.
 Missing usage is not estimated. Native token-count responses describe input
 size, so their counts do not become spent tokens. Failed and canceled sends
 retain any reported usage, and repeated terminal observations do not double
-count it. Numeric accounting retains only `total_nano_aiu` and `compute_units`;
+count it. A successful HTTP reply containing a `response.cancelled` or
+`response.canceled` terminal completes the send without adding a task error.
+Transport cancellation before a terminal still counts as an error.
+Numeric accounting retains only `total_nano_aiu` and `compute_units`;
 provider model details and response content are excluded.
 
 These totals overlap the existing client and route ledgers and must not be

@@ -21,6 +21,13 @@ containing only a signature. Multiple independent thinking blocks in one message
 and native `redacted_thinking` blocks fail explicitly because Chat's single
 text/signature pair cannot represent them faithfully. Vekil's Responses reasoning
 carriers are decoded separately and never forwarded as native signatures.
+Streaming preserves separate native thinking blocks and joins signature fragments
+only within the same block. If native reasoning resumes after text, refusal, or
+tool activity and any block carries an opaque signature, forced-stream aggregation
+returns `502` because the intermediate Chat message has only one text/signature
+pair. It does not return a joined signature or replayable tool history. Streaming
+can deliver these separate blocks, but native Chat still rejects replaying multiple independent
+thinking blocks in one assistant message.
 Supported Anthropic cache hints map to Copilot message/tool
 `copilot_cache_control` only when the original cache boundary can be represented
 exactly. Unrepresentable boundaries fail explicitly. Tool-result images and other
@@ -108,9 +115,12 @@ A Responses-backed request is not passthrough. Vekil validates the supported Cha
 Streamed traffic records terminal usage when the selected backend provides it. On native Chat, Vekil may inject `stream_options.include_usage` when the client omitted it; that proxy-injected usage chunk is consumed internally and not forwarded to a client that did not request it. Responses streams use their terminal usage data directly. A client-supplied `stream_options.include_usage` is honored.
 
 Native Chat preserves `reasoning_text`, `reasoning_opaque`, reasoning-token
-details, and `copilot_usage` through forced-stream aggregation. Accounting-only
-chunks remain observable even when a proxy-injected standard usage chunk is
-hidden. Reasoning or accounting progress prevents unsafe target failover.
+details, and `copilot_usage` through forced-stream aggregation. Separate native
+reasoning blocks containing an opaque signature cannot fit Chat's single
+text/signature pair, so non-streaming aggregation returns `502`; contiguous
+signature fragments and unsigned reasoning text retain their existing behavior.
+Accounting-only chunks remain observable even when a proxy-injected standard usage
+chunk is hidden. Reasoning or accounting progress prevents unsafe target failover.
 Numeric accounting is included in request summaries and full-task statistics;
 policy responses retain their existing public-model redaction.
 

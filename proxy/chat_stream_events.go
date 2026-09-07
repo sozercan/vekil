@@ -413,6 +413,9 @@ func aggregateChatStreamEventsWithOptions(stream *chatStreamEventStream, options
 			return nil, err
 		}
 	}
+	if err := aggregator.nativeReasoningError(); err != nil {
+		return nil, err
+	}
 	return aggregator.buildResponseWithOptions(options), nil
 }
 

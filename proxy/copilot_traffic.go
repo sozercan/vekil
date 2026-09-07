@@ -57,6 +57,7 @@ type copilotCooldownKey struct {
 
 type copilotInferenceRequest struct {
 	keys      [3]copilotCooldownKey
+	endpoint  string
 	bodyBytes int
 }
 
@@ -89,6 +90,7 @@ func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, e
 			{scope: copilotThrottleAccount, identity: account},
 			{scope: copilotThrottleIntegration, identity: integration},
 		},
+		endpoint:  endpoint,
 		bodyBytes: len(body),
 	}
 	return req.WithContext(context.WithValue(req.Context(), copilotInferenceRequestContextKey{}, metadata))
@@ -246,7 +248,7 @@ func (h *ProxyHandler) acquireCopilotInference(req *http.Request) (*copilotInfer
 		if active != nil {
 			code, delay := active.code, active.until.Sub(now)
 			c.mu.Unlock()
-			return nil, copilotCooldownResponse(req, code, delay), nil
+			return nil, copilotCooldownResponse(req, metadata.endpoint, code, delay), nil
 		}
 		threshold := c.thresholdBytes
 		if threshold <= 0 {
@@ -326,11 +328,15 @@ func copilotAdmissionUnavailable() error {
 	return &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("large-request admission is full; retry when an active request finishes")}
 }
 
-func copilotCooldownResponse(req *http.Request, code string, delay time.Duration) *http.Response {
-	body, _ := json.Marshal(map[string]any{"error": map[string]string{
+func copilotCooldownResponse(req *http.Request, endpoint, code string, delay time.Duration) *http.Response {
+	envelope := map[string]any{"error": map[string]string{
 		"type": "rate_limit_error", "code": code,
 		"message": "The upstream rate limit is still active. Retry after the indicated delay.",
-	}})
+	}}
+	if endpoint == providerEndpointMessages {
+		envelope["type"] = "error"
+	}
+	body, _ := json.Marshal(envelope)
 	return &http.Response{
 		StatusCode: http.StatusTooManyRequests,
 		Header: http.Header{

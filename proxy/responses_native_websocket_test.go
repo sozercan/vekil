@@ -301,6 +301,9 @@ func TestResponsesNativeWebSocketPinnedRouteAndCancellation(t *testing.T) {
 	if stats.Totals.Requests != 2 || stats.Totals.Errors != 0 || stats.Totals.TotalTokens != 9 {
 		t.Fatalf("cancelled route accounting = %+v", stats.Totals)
 	}
+	if stats.TaskUsage.Totals.Sends != 2 || stats.TaskUsage.Totals.Errors != 0 || stats.TaskUsage.Totals.Usage.TotalTokens != 9 {
+		t.Fatalf("cancelled route task accounting = %+v", stats.TaskUsage)
+	}
 }
 
 func TestResponsesNativeWebSocketNonCopilotUsesHTTP(t *testing.T) {
@@ -813,7 +816,7 @@ func TestResponsesNativeWebSocketCanceledClosesWithUsage(t *testing.T) {
 		t.Fatalf("retired native connection response = %#v", frame)
 	}
 	stats = h.stats.snapshot()
-	if sends.Load() != 1 || stats.TaskUsage.Totals.Sends != 1 || stats.TaskUsage.Totals.Usage.TotalTokens != 9 {
+	if sends.Load() != 1 || stats.TaskUsage.Totals.Sends != 1 || stats.TaskUsage.Totals.Errors != 0 || stats.TaskUsage.Totals.Usage.TotalTokens != 9 {
 		t.Fatalf("cancelled native task accounting = sends:%d task:%+v", sends.Load(), stats.TaskUsage)
 	}
 }

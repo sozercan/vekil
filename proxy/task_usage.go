@@ -250,7 +250,10 @@ func (b *taskUsageBody) publishObserver(complete bool) {
 	o := b.observer
 	o.mu.Lock()
 	usage, haveUsage := o.usage, o.haveUsage
-	failed := b.failed || (o.outcome != routeAttemptOutcomeSucceeded && o.outcome != routeAttemptOutcomeInFlight)
+	// A provider cancellation terminal completes a successful HTTP exchange.
+	// Cancellation before a terminal still indicates an interrupted send.
+	terminalCancellation := o.terminal && o.outcome == routeAttemptOutcomeCanceled
+	failed := b.failed || (!terminalCancellation && o.outcome != routeAttemptOutcomeSucceeded && o.outcome != routeAttemptOutcomeInFlight)
 	throttled := b.throttled || o.statusCode == http.StatusTooManyRequests
 	copilot := o.copilotUsage
 	if !o.streaming {
