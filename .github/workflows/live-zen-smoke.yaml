@@ -88,7 +88,17 @@ jobs:
           LIVE_CLI_SMOKE_DIR: ${{ runner.temp }}/live-zen-cli-smoke
           SMOKE_CLI_TIMEOUT_SECONDS: "120"
           SMOKE_CURL_MAX_TIME_SECONDS: "45"
-        run: scripts/live-cli-smoke.sh
+        run: |
+          zen_smoke_config="$RUNNER_TEMP/opencode-zen-smoke.yaml"
+          zen_smoke_session_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          cp "$PROVIDERS_CONFIG" "$zen_smoke_config"
+          cat >> "$zen_smoke_config" <<EOF
+              extra_headers:
+                User-Agent: vekil-live-smoke/1
+                x-opencode-session: "$zen_smoke_session_id"
+          EOF
+          ./vekil config validate --providers-config "$zen_smoke_config"
+          PROVIDERS_CONFIG="$zen_smoke_config" scripts/live-cli-smoke.sh
 
       - name: Show proxy log on failure
         if: failure()
