@@ -28,6 +28,14 @@ returns `502` because the intermediate Chat message has only one text/signature
 pair. It does not return a joined signature or replayable tool history. Streaming
 can deliver these separate blocks, but native Chat still rejects replaying multiple independent
 thinking blocks in one assistant message.
+On explicit model routes, native signatures bind to the issuing target,
+credential, and physical model. Replay keeps that target even when it is
+unavailable or in cooldown. Unknown, expired, conflicting, or cross-route
+signatures fail locally with `400`. Bindings use the shared process-local
+24-hour state index, so continuations require the same Vekil process. Streaming
+binds each complete thinking block before exposing its closing frame and retains
+at most 2 MiB of unfinished signatures across 128 choices, with an 8 MiB event
+limit. Direct OpenAI Chat `reasoning_opaque` uses the same ownership rules.
 Supported Anthropic cache hints map to Copilot message/tool
 `copilot_cache_control` only when the original cache boundary can be represented
 exactly. Unrepresentable boundaries fail explicitly. Tool-result images and other

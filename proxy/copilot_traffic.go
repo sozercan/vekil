@@ -439,28 +439,41 @@ func (h *ProxyHandler) observeCopilotResponseFailure(req *http.Request, event re
 }
 
 func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Response, err error, permit *copilotInferencePermit) {
+	if h == nil || err != nil || resp == nil || resp.Body == nil {
+		permit.release()
+		return
+	}
+	metadata, known := req.Context().Value(copilotInferenceRequestContextKey{}).(copilotInferenceRequest)
+	if permit != nil {
+		metadata, known = permit.metadata, true
+	}
+	if !known {
+		return
+	}
+	retryAfter, _ := selectResponsesRetryAfter(resp.Header)
+	contentType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
+	observeChat := metadata.endpoint == providerEndpointChatCompletions && resp.StatusCode == http.StatusOK &&
+		strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
+	if observeChat {
+		_, observeChat = parseRetryAfterAt(retryAfter, h.copilotTraffic.timeNow())
+	}
 	if permit == nil {
-		if h == nil || err != nil || resp == nil || resp.StatusCode != http.StatusTooManyRequests {
-			return
-		}
-		metadata, ok := req.Context().Value(copilotInferenceRequestContextKey{}).(copilotInferenceRequest)
-		if !ok {
+		if resp.StatusCode != http.StatusTooManyRequests && !observeChat {
 			return
 		}
 		permit = &copilotInferencePermit{controller: &h.copilotTraffic, metadata: metadata}
 	}
-	if err != nil || resp == nil || resp.Body == nil {
-		permit.release()
-		return
-	}
 	// A successful HTTP status can still carry a streamed rate-limit failure.
 	// Keep recovery probes reserved until the consumer observes the outcome and
 	// closes the body, installing any renewed cooldown before waking waiters.
-	retryAfter, _ := selectResponsesRetryAfter(resp.Header)
-	resp.Body = &copilotTrafficBody{
+	body := &copilotTrafficBody{
 		ReadCloser: resp.Body, permit: permit, status: resp.StatusCode,
 		retryAfter: retryAfter,
 	}
+	if observeChat {
+		body.chat = &copilotChatThrottleObserver{}
+	}
+	resp.Body = body
 }
 
 type copilotTrafficBody struct {
@@ -471,6 +484,7 @@ type copilotTrafficBody struct {
 	mu          sync.Mutex
 	prefix      []byte
 	complete    bool
+	chat        *copilotChatThrottleObserver
 	observeOnce sync.Once
 	closeOnce   sync.Once
 	closeErr    error
@@ -490,6 +504,15 @@ func (b *copilotTrafficBody) observe() {
 }
 
 func (b *copilotTrafficBody) Read(p []byte) (int, error) {
+	if b.chat != nil {
+		// Close first cancels the inner read, then takes this mutex in observe.
+		// Finish inspecting any returned frame before it can release the probe.
+		b.mu.Lock()
+		n, err := b.ReadCloser.Read(p)
+		b.chat.observe(p[:n], err == io.EOF, b.observeChatEvent)
+		b.mu.Unlock()
+		return n, err
+	}
 	n, err := b.ReadCloser.Read(p)
 	if b.status == http.StatusTooManyRequests {
 		b.mu.Lock()
@@ -502,6 +525,89 @@ func (b *copilotTrafficBody) Read(p []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+func (b *copilotTrafficBody) observeChatEvent(eventType, data string) bool {
+	if strings.TrimSpace(data) == "[DONE]" {
+		return false
+	}
+	if streamErr, failure := parseOpenAIStreamError(eventType, data); failure {
+		// The shared validator requires a complete, bounded JSON object with a
+		// recognized code. Generated text and malformed error events cannot set
+		// shared cooldowns, even when their text mentions a rate-limit code.
+		body := []byte(data)
+		if code, scope := copilotThrottleCode(body); scope != copilotThrottleUnknown && code == streamErr.Code {
+			b.permit.controller.observeThrottle(b.permit.metadata, http.StatusTooManyRequests, b.retryAfter, body)
+		}
+		return false
+	}
+	return true
+}
+
+// Retain at most one bounded SSE event. Observation does not read ahead or
+// rewrite bytes, so every Chat consumer also covers forced-stream aggregation.
+type copilotChatThrottleObserver struct {
+	frame        []byte
+	lineNonempty bool
+	pendingCR    bool
+	overflow     bool
+	done         bool
+}
+
+func (o *copilotChatThrottleObserver) observe(p []byte, eof bool, onData func(string, string) bool) {
+	if o.done {
+		return
+	}
+	for _, c := range p {
+		if o.pendingCR {
+			o.pendingCR = false
+			if c == '\n' {
+				continue
+			}
+		}
+		if c == '\r' || c == '\n' {
+			o.pendingCR = c == '\r'
+			if !o.lineNonempty {
+				if !o.dispatch(onData) {
+					o.done = true
+					return
+				}
+				continue
+			}
+			o.lineNonempty = false
+			c = '\n'
+		} else {
+			o.lineNonempty = true
+		}
+		if !o.overflow {
+			if len(o.frame) >= maxCopilotThrottleEvidenceBytes {
+				o.overflow = true
+				o.frame = o.frame[:0]
+			} else {
+				o.frame = append(o.frame, c)
+			}
+		}
+	}
+	if eof {
+		_ = o.dispatch(onData)
+		o.done = true
+	}
+}
+
+func (o *copilotChatThrottleObserver) dispatch(onData func(string, string) bool) bool {
+	defer func() { o.frame = o.frame[:0]; o.overflow = false }()
+	if o.overflow {
+		return true
+	}
+	var accumulator sseDataAccumulator
+	for lines := string(o.frame); lines != ""; {
+		line, rest, _ := strings.Cut(lines, "\n")
+		if !accumulator.consumeLine(line, onData) {
+			return false
+		}
+		lines = rest
+	}
+	return accumulator.dispatch(onData)
 }
 
 func (b *copilotTrafficBody) Close() error {

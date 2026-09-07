@@ -706,6 +706,9 @@ func (h *ProxyHandler) aggregateExplicitChatCompletionsResponse(ctx context.Cont
 			return response, nil, aggregateErr
 		}
 		if aggregateErr == nil {
+			if err := h.bindNativeReasoningCompletion(resp, response); err != nil {
+				return nil, nil, err
+			}
 			progress = mergeUpstreamSemanticProgress(progress, upstreamProgressTerminalSuccess)
 			operation.updateAcceptedRouteAttempt(info.targetID, progress, downstreamCommitmentNone)
 			captureSuccessfulHeaders(resp)
@@ -946,7 +949,7 @@ func explicitRoutePublicModel(route *modelRoute, fallback string) string {
 	return fallback
 }
 
-func normalizeExplicitOpenAIChatResponseModel(resp *http.Response, publicModel string) error {
+func (h *ProxyHandler) normalizeExplicitOpenAIChatResponseModel(resp *http.Response, publicModel string) error {
 	if resp == nil || resp.Body == nil || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil
 	}
@@ -980,6 +983,11 @@ func normalizeExplicitOpenAIChatResponseModel(resp *http.Response, publicModel s
 	}
 	var payload map[string]json.RawMessage
 	if json.Unmarshal(prefix, &payload) == nil && payload != nil && !hasNonNullJSONField(payload, "error") {
+		if choices, exists := payload["choices"]; exists {
+			if err := h.bindNativeReasoningJSONChoices(resp, choices); err != nil {
+				return err
+			}
+		}
 		rewriteOpenAIChatCompletionModelIdentity(payload, publicModel)
 		if rewritten, marshalErr := json.Marshal(payload); marshalErr == nil {
 			prefix = rewritten
@@ -1418,6 +1426,11 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 	if operation == nil || operation.route == nil || operation.route.legacy {
 		return h.executeChatCompletionsForRequestedModel(ctx, body, options, requestedModel)
 	}
+	var err error
+	ctx, err = h.applyNativeReasoningRequestBinding(ctx, operation, body)
+	if err != nil {
+		return chatExecutionResult{}, err
+	}
 	if plan, planned := operation.policyPlan(); planned && plan.selectedReasoningEffort != "" {
 		var err error
 		body, err = forcePolicyOpenAIChatReasoningEffort(body, plan.selectedReasoningEffort)
@@ -1432,6 +1445,9 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 		return chatExecutionResult{}, err
 	}
 	if endpoint == providerEndpointResponses {
+		if _, bound := ctx.Value(nativeReasoningOwnerContextKey{}).(stateBindingOwner); bound {
+			return chatExecutionResult{}, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("native reasoning state requires native Chat execution")}
+		}
 		return h.executeExplicitResponsesChat(ctx, operation.route, body, requestedModel, options)
 	}
 
@@ -2743,6 +2759,9 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 				}
 				return err
 			}
+			if err := h.bindNativeReasoningCompletion(resp, &oaiResp); err != nil {
+				return err
+			}
 			observeOpenAIUsage(r.Context(), oaiResp.Usage)
 			h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), &oaiResp, h.toolContexts, scope, false)
 			observeCopilotUsage(r.Context(), oaiResp.CopilotUsage)
@@ -3572,7 +3591,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 
 	if routeOperation != nil && result.Backend == chatBackendNativeChat && result.Response != nil && !mode.clientRequestedStream && !mode.forceUpstreamStream {
-		if normalizeErr := normalizeExplicitOpenAIChatResponseModel(result.Response, responseModel); normalizeErr != nil {
+		if normalizeErr := h.normalizeExplicitOpenAIChatResponseModel(result.Response, responseModel); normalizeErr != nil {
 			if h.handleResponseBodyWriteError(w, r, upstreamCtx, "openai", normalizeErr) {
 				return
 			}

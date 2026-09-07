@@ -19,6 +19,12 @@ An active cooldown returns 429 without sending another inference request. After
 the reset, one request probes availability before queued callers continue.
 Cooldown records are bounded and lost on restart.
 
+The same rules apply when a Chat stream returns a structured throttle after
+HTTP `200`, including requests streamed internally for tool-call aggregation.
+A recovery probe that repeats the throttle renews the cooldown before queued
+requests continue. An already-started client stream reports the error in its
+stream; a non-streaming request returns `429`.
+
 Configured priority failover can still use an unaffected compatible target.
 Requests with provider-bound state retain their selected target. Switching models
 within the same account does not avoid an account or weekly cooldown.
