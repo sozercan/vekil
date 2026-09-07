@@ -374,7 +374,7 @@ func (b *copilotProbeCloseObserver) Close() error {
 }
 
 func TestCopilotCooldownStreamProbeRenewsBeforeRelease(t *testing.T) {
-	for _, path := range []string{"HTTP", "legacy websocket", "explicit route"} {
+	for _, path := range []string{"HTTP", "legacy websocket", "explicit route", "Responses-backed Chat"} {
 		t.Run(path, func(t *testing.T) {
 			provider := explicitRouteTestProvider("copilot", "http://upstream.example", "credential")
 			provider.kind = providerTypeCopilot
@@ -385,6 +385,9 @@ func TestCopilotCooldownStreamProbeRenewsBeforeRelease(t *testing.T) {
 			clock.Store(time.Now().UnixNano())
 			h.copilotTraffic.now = func() time.Time { return time.Unix(0, clock.Load()) }
 			req := copilotTrafficTestRequest(t, ctx, "copilot", "http://upstream.example", "credential", "editor", "model", 0)
+			if path == "Responses-backed Chat" {
+				req = withCopilotInferenceRequest(req, provider, providerEndpointResponses, []byte(`{"model":"model"}`))
+			}
 			metadata := copilotTrafficTestMetadata(t, req)
 			h.copilotTraffic.observeThrottle(metadata, 429, "10", []byte(`{"error":{"code":"user_model_rate_limited"}}`))
 			clock.Add(int64(11 * time.Second))
@@ -442,9 +445,20 @@ func TestCopilotCooldownStreamProbeRenewsBeforeRelease(t *testing.T) {
 						return
 					}
 					processed <- failure.statusCode
+				case "Responses-backed Chat":
+					stream, streamErr := translateResponsesSSEToChat(ctx, response.Body, responsesChatResponseOptions{PublicModel: "model"})
+					if stream != nil {
+						stream.stop(context.Canceled)
+					}
+					var failure *chatExecutionError
+					if !errors.As(streamErr, &failure) {
+						processed <- 0
+						return
+					}
+					processed <- failure.StatusCode
 				}
 			}()
-			_, err = io.WriteString(writer, "event: response.failed\ndata: "+`{"type":"response.failed","response":{"id":"resp-probe","error":{"type":"rate_limit_error","code":"user_model_rate_limited","message":"slow down"}}}`+"\n\n")
+			_, err = io.WriteString(writer, "event: response.failed\ndata: "+`{"type":"response.failed","sequence_number":0,"response":{"id":"resp-probe","status":"failed","error":{"type":"rate_limit_error","code":"user_model_rate_limited","message":"slow down"}}}`+"\n\n")
 			if err != nil {
 				t.Fatal(err)
 			}

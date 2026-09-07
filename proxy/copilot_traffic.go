@@ -335,10 +335,14 @@ func (h *ProxyHandler) observeCopilotResponseFailure(req *http.Request, event re
 	if !ok {
 		return
 	}
+	h.copilotTraffic.observeResponsesFailure(metadata, event, headers)
+}
+
+func (c *copilotTrafficController) observeResponsesFailure(metadata copilotInferenceRequest, event responsesWebSocketStreamEvent, headers http.Header) {
 	streamErr := responsesStreamEventError(event)
 	body, _ := json.Marshal(map[string]string{"code": streamErr.Code})
 	retryAfter, _ := selectResponsesRetryAfter(headers)
-	h.copilotTraffic.observeThrottle(metadata, http.StatusTooManyRequests, retryAfter, body)
+	c.observeThrottle(metadata, http.StatusTooManyRequests, retryAfter, body)
 }
 
 func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Response, err error, permit *copilotInferencePermit) {
@@ -355,9 +359,9 @@ func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Resp
 	}
 	retryAfter, _ := selectResponsesRetryAfter(resp.Header)
 	contentType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
-	observeStream := (metadata.endpoint == providerEndpointChatCompletions || metadata.endpoint == providerEndpointMessages) && resp.StatusCode == http.StatusOK &&
+	observeStream := resp.StatusCode == http.StatusOK &&
 		strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
-	if observeStream {
+	if observeStream && metadata.endpoint != providerEndpointResponses {
 		_, observeStream = parseRetryAfterAt(retryAfter, h.copilotTraffic.timeNow())
 	}
 	if permit == nil {
@@ -374,7 +378,13 @@ func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Resp
 		retryAfter: retryAfter,
 	}
 	if observeStream {
-		body.stream = &copilotThrottleStreamObserver{}
+		body.stream = &copilotThrottleStreamObserver{maxBytes: maxCopilotThrottleEvidenceBytes}
+		if metadata.endpoint == providerEndpointResponses {
+			// Failed Responses can include output before the error. Match the
+			// accepted event limit so that output cannot hide a valid reset.
+			body.stream.maxBytes = openAIStreamScannerMaxBuffer
+			body.headers = resp.Header.Clone()
+		}
 	}
 	resp.Body = body
 }
@@ -384,6 +394,7 @@ type copilotTrafficBody struct {
 	permit      *copilotInferencePermit
 	status      int
 	retryAfter  string
+	headers     http.Header
 	mu          sync.Mutex
 	prefix      []byte
 	complete    bool
@@ -431,6 +442,35 @@ func (b *copilotTrafficBody) Read(p []byte) (int, error) {
 }
 
 func (b *copilotTrafficBody) observeStreamEvent(eventType, data string) bool {
+	if b.permit.metadata.endpoint == providerEndpointResponses {
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(data), &envelope) != nil {
+			return true
+		}
+		typ := strings.TrimSpace(envelope.Type)
+		if typ == "" {
+			typ = strings.TrimSpace(eventType)
+		} else if named := strings.TrimSpace(eventType); named != "" && named != typ {
+			return true
+		}
+		switch typ {
+		case "response.failed", "error":
+			event, err := parseResponsesStreamEvent(data)
+			if err != nil || rejectDuplicateJSONMappingKeys([]byte(data)) != nil {
+				return true
+			}
+			event.Type = typ
+			headers := responsesFailureHeaders(event, b.headers)
+			b.permit.controller.observeResponsesFailure(b.permit.metadata, event, headers)
+			return false
+		case "response.completed", "response.incomplete", "response.cancelled", "response.canceled":
+			return rejectDuplicateJSONMappingKeys([]byte(data)) != nil
+		default:
+			return true
+		}
+	}
 	var failureCode string
 	if b.permit.metadata.endpoint == providerEndpointMessages {
 		body := []byte(data)
@@ -465,9 +505,10 @@ func (b *copilotTrafficBody) observeStreamEvent(eventType, data string) bool {
 }
 
 // Retain at most one bounded SSE event. Observation does not read ahead or
-// rewrite bytes, covering native Messages passthrough and Chat aggregation.
+// rewrite bytes, covering native Messages, Responses, and Chat aggregation.
 type copilotThrottleStreamObserver struct {
 	frame        []byte
+	maxBytes     int
 	lineNonempty bool
 	pendingCR    bool
 	overflow     bool
@@ -500,7 +541,7 @@ func (o *copilotThrottleStreamObserver) observe(p []byte, eof bool, onData func(
 			o.lineNonempty = true
 		}
 		if !o.overflow {
-			if len(o.frame) >= maxCopilotThrottleEvidenceBytes {
+			if len(o.frame) >= o.maxBytes {
 				o.overflow = true
 				o.frame = o.frame[:0]
 			} else {

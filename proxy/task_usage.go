@@ -168,6 +168,9 @@ func (s *taskInferenceSend) finishResponse(resp *http.Response, sendErr error) {
 	state.observer = newRouteAttemptResponseObserver(nil, nil, routeAttemptTrace{StatusCode: resp.StatusCode}, nil,
 		endpoint, strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream"), nil)
 	state.observer.captureCopilotUsage = true
+	// A finished generation may stop at its output limit without failing the
+	// physical send. Route attempts retain their stricter completion contract.
+	state.observer.acceptIncompleteResponses = true
 	if !state.observer.streaming && state.observer.envelope != nil {
 		state.observer.envelope.fields = append(state.observer.envelope.fields, routeAttemptJSONField{name: "copilot_usage", maxBytes: 64 << 10})
 		if state.nativeCount {

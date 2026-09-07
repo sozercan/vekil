@@ -95,10 +95,10 @@ func TestTaskUsageNativeCountIsSizingOnly(t *testing.T) {
 	}
 }
 
-func TestTaskUsageCancellationAccounting(t *testing.T) {
+func TestTaskUsageResponsesTerminalAccounting(t *testing.T) {
 	const billing = `"copilot_usage":{"total_nano_aiu":31,"compute_units":2}`
-	for _, status := range []string{"cancelled", "canceled"} {
-		response := `{"id":"resp-accounting","status":"` + status + `","usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9},` + billing + `}`
+	for _, status := range []string{"completed", "incomplete", "cancelled", "canceled"} {
+		response := `{"id":"resp-accounting","status":"` + status + `","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9},` + billing + `}`
 		terminal := "event: response." + status + "\ndata: " + `{"type":"response.` + status + `","response":` + response + `,` + billing + "}\n\n"
 		pending := "event: response.in_progress\ndata: " + `{"type":"response.in_progress","response":{"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}},` + billing + "}\n\n"
 		for _, tc := range []struct {
@@ -114,6 +114,7 @@ func TestTaskUsageCancellationAccounting(t *testing.T) {
 			{name: "transport cancellation", contentType: "text/event-stream", body: pending, statusCode: http.StatusOK, readErr: context.Canceled, wantErrors: 1},
 			{name: "transport deadline", contentType: "text/event-stream", body: pending, statusCode: http.StatusOK, readErr: context.DeadlineExceeded, wantErrors: 1},
 			{name: "missing terminal", contentType: "text/event-stream", body: pending, statusCode: http.StatusOK, wantErrors: 1},
+			{name: "failed terminal", contentType: "text/event-stream", body: pending + "data: " + `{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}` + "\n\n", statusCode: http.StatusOK, wantErrors: 1, wantThrottles: 1},
 		} {
 			t.Run(status+"/"+tc.name, func(t *testing.T) {
 				h := &ProxyHandler{stats: newStatsCollector()}
@@ -127,10 +128,10 @@ func TestTaskUsageCancellationAccounting(t *testing.T) {
 				_ = resp.Body.Close()
 				snapshot := h.stats.taskUsage.snapshot()
 				if snapshot.Inflight != 0 || snapshot.Totals.Sends != 1 || snapshot.Totals.Completed != 1 || snapshot.Totals.Errors != tc.wantErrors || snapshot.Totals.Throttled != tc.wantThrottles || snapshot.Totals.Usage.TotalTokens != 9 {
-					t.Fatalf("cancellation accounting = %+v", snapshot)
+					t.Fatalf("terminal accounting = %+v", snapshot)
 				}
 				if snapshot.Totals.CopilotUsage != (copilotUsageTotals{TotalNanoAIU: 31, ComputeUnits: 2}) {
-					t.Fatalf("cancellation lost reported billing: %+v", snapshot.Totals.CopilotUsage)
+					t.Fatalf("terminal lost reported billing: %+v", snapshot.Totals.CopilotUsage)
 				}
 			})
 		}

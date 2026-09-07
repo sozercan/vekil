@@ -47,8 +47,13 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 			}
 			captured <- request
 			id := fmt.Sprintf("resp-native-%d", frames.Add(1))
+			status := "completed"
+			if id == "resp-native-1" {
+				status = "incomplete"
+			}
 			if err := conn.WriteJSON(map[string]any{
-				"type": "response.completed", "response": map[string]any{
+				"type": "response." + status, "response": map[string]any{
+					"status": status, "incomplete_details": map[string]string{"reason": "max_output_tokens"},
 					"id": id, "output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]string{"type": "output_text", "text": "done"}}}},
 					"usage": map[string]int{"input_tokens": 7, "output_tokens": 2, "total_tokens": 9},
 				},
@@ -72,7 +77,11 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 		if err := conn.WriteJSON(request); err != nil {
 			t.Fatal(err)
 		}
-		if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "response.completed" {
+		terminal := "response.completed"
+		if turn == 1 {
+			terminal = "response.incomplete"
+		}
+		if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != terminal {
 			t.Fatalf("turn %d response = %#v", turn, frame)
 		}
 		upstream := <-captured

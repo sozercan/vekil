@@ -2041,35 +2041,36 @@ func routeAttemptDiagnosticHeaders(headers http.Header) http.Header {
 type routeAttemptResponseObserver struct {
 	mu sync.Mutex
 
-	record              *routeAttemptRecord
-	operation           *routeOperation
-	inboundCtx          context.Context
-	attemptCtx          context.Context
-	trace               routeAttemptTrace
-	send                *routeSendObservation
-	endpoint            string
-	streaming           bool
-	headers             http.Header
-	statusCode          int
-	outcome             routeAttemptOutcome
-	progress            upstreamSemanticProgress
-	commitment          downstreamCommitment
-	decision            routeRetryDecision
-	retryAfter          *int64
-	upstreamID          string
-	usage               statsTokenUsage
-	haveUsage           bool
-	captureCopilotUsage bool
-	copilotUsage        copilotUsageTotals
-	terminal            bool
-	cleanupTimedOut     bool
-	line                []byte
-	lineOverflow        bool
-	linePendingCR       bool
-	sse                 sseDataAccumulator
-	tail                routeAttemptTailBuffer
-	envelope            *routeAttemptEnvelopeExtractor
-	anthropic           anthropicStreamUsageAccumulator
+	record                    *routeAttemptRecord
+	operation                 *routeOperation
+	inboundCtx                context.Context
+	attemptCtx                context.Context
+	trace                     routeAttemptTrace
+	send                      *routeSendObservation
+	endpoint                  string
+	streaming                 bool
+	headers                   http.Header
+	statusCode                int
+	outcome                   routeAttemptOutcome
+	progress                  upstreamSemanticProgress
+	commitment                downstreamCommitment
+	decision                  routeRetryDecision
+	retryAfter                *int64
+	upstreamID                string
+	usage                     statsTokenUsage
+	haveUsage                 bool
+	captureCopilotUsage       bool
+	copilotUsage              copilotUsageTotals
+	acceptIncompleteResponses bool
+	terminal                  bool
+	cleanupTimedOut           bool
+	line                      []byte
+	lineOverflow              bool
+	linePendingCR             bool
+	sse                       sseDataAccumulator
+	tail                      routeAttemptTailBuffer
+	envelope                  *routeAttemptEnvelopeExtractor
+	anthropic                 anthropicStreamUsageAccumulator
 }
 
 func newRouteAttemptResponseObserver(record *routeAttemptRecord, operation *routeOperation, trace routeAttemptTrace, send *routeSendObservation, endpoint string, streaming bool, headers http.Header) *routeAttemptResponseObserver {
@@ -2223,6 +2224,12 @@ func (o *routeAttemptResponseObserver) observeOverflowedSSEEvent() bool {
 	switch eventType {
 	case "response.completed":
 		o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
+	case "response.incomplete":
+		if o.acceptIncompleteResponses {
+			o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
+		} else if o.applyStreamingTerminal(routeAttemptOutcomeFailed, upstreamProgressTerminalFailure) {
+			o.statusCode = http.StatusBadGateway
+		}
 	case "response.cancelled", "response.canceled":
 		o.applyStreamingTerminal(routeAttemptOutcomeCanceled, upstreamProgressTerminalFailure)
 	default:
@@ -2345,6 +2352,9 @@ func (o *routeAttemptResponseObserver) observeResponsesEvent(eventType, data str
 	case "response.cancelled", "response.canceled":
 		return o.applyStreamingTerminal(routeAttemptOutcomeCanceled, upstreamProgressTerminalFailure)
 	case "response.failed", "response.incomplete", "error":
+		if event.Type == "response.incomplete" && o.acceptIncompleteResponses {
+			return o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
+		}
 		failureHeaders := responsesFailureHeaders(event, o.headers)
 		status, _, ok := classifyResponsesFailure(event, failureHeaders)
 		if !ok || status == 0 {
@@ -2601,8 +2611,13 @@ func (o *routeAttemptResponseObserver) inspectNonStreamingLocked() {
 				o.outcome = routeAttemptOutcomeSucceeded
 				o.terminal = true
 			case "failed", "incomplete":
-				o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressTerminalFailure)
-				o.outcome = routeAttemptOutcomeFailed
+				if strings.EqualFold(strings.TrimSpace(status), "incomplete") && o.acceptIncompleteResponses {
+					o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressTerminalSuccess)
+					o.outcome = routeAttemptOutcomeSucceeded
+				} else {
+					o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressTerminalFailure)
+					o.outcome = routeAttemptOutcomeFailed
+				}
 				o.terminal = true
 			case "cancelled", "canceled":
 				o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressTerminalFailure)
