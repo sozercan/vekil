@@ -349,13 +349,9 @@ func (h *ProxyHandler) postResolvedProviderRequestForModel(
 		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 
-	resp, err := h.doInferenceWithRetry(func() (*http.Request, error) {
+	return h.doInferenceWithRetry(func() (*http.Request, error) {
 		return h.newProviderJSONInferenceRequest(ctx, provider, http.MethodPost, endpoint, preparedBody, extraHeaders, "", owner)
 	})
-	if err == nil {
-		h.bindLegacyNativeReasoningStreamResponse(resp)
-	}
-	return resp, err
 }
 
 // maybeRetryResolvedResponsesWithoutUnverifiableEncryptedContent mirrors the
@@ -531,17 +527,13 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModelValidation(ctx context
 		return nil, err
 	}
 
-	resp, err := h.doInferenceWithRetry(func() (*http.Request, error) {
+	return h.doInferenceWithRetry(func() (*http.Request, error) {
 		req, err := h.newProviderJSONInferenceRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "", owner)
 		if err != nil {
 			return nil, err
 		}
 		return req, nil
 	})
-	if err == nil {
-		h.bindLegacyNativeReasoningStreamResponse(resp)
-	}
-	return resp, err
 }
 
 func (h *ProxyHandler) postChatCompletions(ctx context.Context, body []byte) (*http.Response, error) {
@@ -693,7 +685,7 @@ func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w 
 		}
 		observeOpenAIUsage(ctx, sniffOpenAIUsage(out))
 		return out, changed
-	}, h.legacyNativeReasoningJSONBinding(resp))
+	})
 }
 
 func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context, w http.ResponseWriter, resp *http.Response) error {
@@ -730,17 +722,17 @@ var usageSniffSmallBufferPool = sync.Pool{New: func() any {
 // writePassthroughSniffingUsage writes a non-streaming upstream response to the
 // client while buffering at most usageSniffMaxBuffer bytes so the supplied
 // transform can sniff usage and optionally rewrite the complete body. A 2xx body
-// that fits the cap is validated before copying headers, then passed to
-// transform; if transform reports a rewrite, Content-Length is adjusted.
-// Oversized bodies stream through without validation or transformation so
-// proxy memory stays bounded. Non-2xx responses fall back to a plain copy.
-func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, transform func([]byte) ([]byte, bool), beforeWrite ...func([]byte) error) error {
+// that fits the cap is buffered and passed to transform; if transform reports a
+// rewrite, Content-Length is adjusted. Oversized bodies stream through without a
+// transform so proxy memory stays bounded. Non-2xx responses and read errors
+// fall back to a plain copy.
+func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, transform func([]byte) ([]byte, bool)) error {
 	if resp == nil || resp.Body == nil {
 		return &responseBodyWriteError{err: fmt.Errorf("upstream response body is unavailable"), upstream: true}
 	}
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices &&
 		resp.ContentLength >= 0 && resp.ContentLength < usageSniffSmallBufferSize {
-		return writeSmallKnownLengthPassthroughSniffingUsage(w, resp, transform, beforeWrite...)
+		return writeSmallKnownLengthPassthroughSniffingUsage(w, resp, transform)
 	}
 
 	body := newLifecycleAwareReadCloser(resp.Body, responseRequestContext(resp))
@@ -772,15 +764,6 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 	}
 	if err != nil {
 		return newResponseBodyWriteError(resp, err, false, true, body.canceledAtFailure())
-	}
-	if len(prefix) <= usageSniffMaxBuffer {
-		for _, validate := range beforeWrite {
-			if validate != nil {
-				if err := validate(prefix); err != nil {
-					return newResponseBodyWriteError(resp, err, false, true, false)
-				}
-			}
-		}
 	}
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	if resp.ContentLength >= 0 && int64(len(prefix)) > resp.ContentLength {
@@ -823,7 +806,7 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 	return nil
 }
 
-func writeSmallKnownLengthPassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, transform func([]byte) ([]byte, bool), beforeWrite ...func([]byte) error) error {
+func writeSmallKnownLengthPassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, transform func([]byte) ([]byte, bool)) error {
 	ctx := responseRequestContext(resp)
 	defer func() { _ = resp.Body.Close() }()
 
@@ -875,13 +858,6 @@ func writeSmallKnownLengthPassthroughSniffingUsage(w http.ResponseWriter, resp *
 		return newResponseBodyWriteError(resp, err, false, true, false)
 	}
 
-	for _, validate := range beforeWrite {
-		if validate != nil {
-			if err := validate(prefix); err != nil {
-				return newResponseBodyWriteError(resp, err, false, true, false)
-			}
-		}
-	}
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	if longerThanAdvertised {
 		w.Header().Del("Content-Length")

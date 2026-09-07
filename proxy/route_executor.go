@@ -2992,14 +2992,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 	if operation.route != route {
 		return nil, fmt.Errorf("route operation for %q cannot execute route %q", operation.route.public.id, route.public.id)
 	}
-	if endpoint == providerEndpointChatCompletions {
-		var err error
-		ctx, err = h.applyNativeReasoningRequestBinding(ctx, operation, body)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	attemptNow := time.Now
 	if h != nil && h.stats != nil && h.stats.now != nil {
 		attemptNow = h.stats.now
@@ -3041,25 +3033,18 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		}
 
 		req, err := h.newProviderJSONInferenceRequest(ctx, target.provider, http.MethodPost, dispatchPath, preparedBody, cloneSanitizedRouteHeaders(extraHeaders), "", owner)
-		responseInfo := explicitRouteResponseInfo{
-			routeID:    route.public.routeID,
-			publicID:   route.public.id,
-			targetID:   target.id,
-			providerID: target.provider.id,
-		}
-		if err == nil && endpoint == providerEndpointChatCompletions {
-			responseInfo.nativeReasoningIdentity = nativeReasoningRequestIdentity(req, preparedBody)
-			if err = validateNativeReasoningRequestOwner(req.Context(), responseInfo, target.provider); err != nil && req.Body != nil {
-				_ = req.Body.Close()
-			}
-		}
 		if err != nil {
 			failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedNonretryable}
 			failures = append(failures, failure)
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
 			break
 		}
-		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), responseInfo))
+		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), explicitRouteResponseInfo{
+			routeID:    route.public.routeID,
+			publicID:   route.public.id,
+			targetID:   target.id,
+			providerID: target.provider.id,
+		}))
 		req.GetBody = nil
 		if rejected := h.maybeRejectNativeResponsesRequest(req); rejected != nil {
 			if req.Body != nil {
@@ -3138,10 +3123,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 
 		resp, sendErr := h.singleInferenceSend(req, observation)
 		h.finishCopilotInference(req, resp, sendErr, permit)
-		if sendErr == nil && endpoint == providerEndpointChatCompletions && resp != nil && resp.StatusCode == http.StatusOK && resp.Body != nil &&
-			(parseOpenAIChatCompletionsModeValidated(preparedBody).clientRequestedStream || strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")) {
-			resp.Body = &nativeReasoningBindingBody{ReadCloser: resp.Body, h: h, info: responseInfo}
-		}
 		if resp != nil {
 			sanitizeExplicitRouteResponseHeaders(resp.Header)
 		}

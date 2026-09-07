@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -201,7 +200,7 @@ func TestAnthropicNativeChatCacheControlPreservesPromptBoundaries(t *testing.T) 
 				seen <- request
 				if request.Stream != nil && *request.Stream {
 					w.Header().Set("Content-Type", "text/event-stream")
-					_, _ = io.WriteString(w, nativeChatExtensionStream())
+					_, _ = io.WriteString(w, nativeChatAccountingStream())
 				} else {
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = io.WriteString(w, `{"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"length"}],"usage":{"prompt_tokens":23,"completion_tokens":1,"total_tokens":24}}`)
@@ -297,8 +296,8 @@ func TestAnthropicNativeChatCacheControlKeepsOptimizedToolOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := withAnthropicChatExtensions(context.Background(), &request)
-	got, err := applyAnthropicChatExtensions(ctx, &providerRuntime{kind: providerTypeCopilot}, providerEndpointChatCompletions, body)
+	ctx := withAnthropicChatCacheControl(context.Background(), &request)
+	got, err := applyAnthropicChatCacheControl(ctx, &providerRuntime{kind: providerTypeCopilot}, providerEndpointChatCompletions, body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,9 +310,9 @@ func TestAnthropicNativeChatCacheControlKeepsOptimizedToolOutput(t *testing.T) {
 	}
 }
 
-func TestAnthropicNativeExtensionsLeaveStrictResponsesContractsUnchanged(t *testing.T) {
+func TestAnthropicCacheControlPreservesResponsesContract(t *testing.T) {
 	var request models.AnthropicRequest
-	if err := json.Unmarshal([]byte(`{"model":"chat-model","messages":[{"role":"user","content":[{"type":"text","text":"go","cache_control":{"type":"ephemeral"}}]},{"role":"assistant","content":[{"type":"thinking","thinking":"inspect","signature":"native-signature"},{"type":"text","text":"answer"}]}],"tools":[{"name":"lookup","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}]}`), &request); err != nil {
+	if err := json.Unmarshal([]byte(`{"model":"chat-model","messages":[{"role":"user","content":[{"type":"text","text":"go","cache_control":{"type":"ephemeral"}}]},{"role":"assistant","content":[{"type":"text","text":"answer"}]}],"tools":[{"name":"lookup","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}]}`), &request); err != nil {
 		t.Fatal(err)
 	}
 	canonical, err := TranslateAnthropicToOpenAI(&request)
@@ -324,13 +323,13 @@ func TestAnthropicNativeExtensionsLeaveStrictResponsesContractsUnchanged(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(body), "cache_control") || strings.Contains(string(body), "reasoning_") {
-		t.Fatalf("native-only fields reached canonical Chat: %s", body)
+	if strings.Contains(string(body), "cache_control") {
+		t.Fatalf("cache control reached canonical Chat: %s", body)
 	}
 	if _, err := translateChatRequestToResponses(body, responsesChatRequestOptions{}); err != nil {
 		t.Fatalf("canonical Responses translation failed: %v", err)
 	}
-	ctx := withAnthropicChatExtensions(context.Background(), &request)
+	ctx := withAnthropicChatCacheControl(context.Background(), &request)
 	for _, route := range []struct {
 		kind providerType
 		path string
@@ -338,9 +337,9 @@ func TestAnthropicNativeExtensionsLeaveStrictResponsesContractsUnchanged(t *test
 		{kind: providerTypeCopilot, path: providerEndpointResponses},
 		{kind: providerTypeOpenAICompatible, path: providerEndpointChatCompletions},
 	} {
-		got, err := applyAnthropicChatExtensions(ctx, &providerRuntime{kind: route.kind}, route.path, body)
+		got, err := applyAnthropicChatCacheControl(ctx, &providerRuntime{kind: route.kind}, route.path, body)
 		if err != nil || !bytes.Equal(got, body) {
-			t.Fatalf("extension mapping changed %s %s: %s, error = %v", route.kind, route.path, got, err)
+			t.Fatalf("cache control mapping changed %s %s: %s, error = %v", route.kind, route.path, got, err)
 		}
 	}
 	for _, direct := range []struct {
@@ -349,146 +348,11 @@ func TestAnthropicNativeExtensionsLeaveStrictResponsesContractsUnchanged(t *test
 	}{
 		{`{"model":"chat-model","messages":[{"role":"user","content":"go","copilot_cache_control":{"type":"ephemeral"}}]}`, "copilot_cache_control"},
 		{`{"model":"chat-model","messages":[{"role":"user","content":"go"}],"tools":[{"type":"function","copilot_cache_control":{"type":"ephemeral"},"function":{"name":"lookup","parameters":{"type":"object"}}}]}`, "copilot_cache_control"},
-		{`{"model":"chat-model","messages":[{"role":"assistant","content":"answer","reasoning_text":"inspect"}]}`, "reasoning_text"},
-		{`{"model":"chat-model","messages":[{"role":"assistant","content":"answer","reasoning_opaque":"native-signature"}]}`, "reasoning_opaque"},
 	} {
 		_, err := translateChatRequestToResponses([]byte(direct.body), responsesChatRequestOptions{})
 		var executionErr *chatExecutionError
 		if !errors.As(err, &executionErr) || executionErr.StatusCode != http.StatusBadRequest || !strings.Contains(executionErr.Param, direct.field) {
 			t.Fatalf("strict public Chat %s field error = %v", direct.field, err)
 		}
-	}
-}
-
-func TestAnthropicNativeChatReasoningHistory(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		content   string
-		thinking  string
-		signature string
-		text      string
-		cached    bool
-	}{
-		{
-			name:      "signature-only message",
-			content:   `[{"type":"thinking","thinking":"","signature":"native-signature"}]`,
-			signature: "native-signature",
-		},
-		{
-			name:     "thinking-only message",
-			content:  `[{"type":"thinking","thinking":"inspect"}]`,
-			thinking: "inspect",
-		},
-		{
-			name:      "thinking with cache boundary",
-			content:   `[{"type":"thinking","thinking":"inspect","signature":"native-signature"},{"type":"text","text":"answer","cache_control":{"type":"ephemeral"}}]`,
-			thinking:  "inspect",
-			signature: "native-signature",
-			text:      "answer",
-			cached:    true,
-		},
-		{
-			name:      "carriers stay separate",
-			content:   `[{"type":"thinking","thinking":"carrier text","signature":"vekil1.OPAQUE"},{"type":"thinking","thinking":"inspect","signature":"native-signature"},{"type":"redacted_thinking","signature":"vekil1.OTHER"},{"type":"text","text":"answer"}]`,
-			thinking:  "inspect",
-			signature: "native-signature",
-			text:      "answer",
-		},
-		{
-			name:    "carrier alone is not native reasoning",
-			content: `[{"type":"thinking","thinking":"carrier text","signature":"vekil1.OPAQUE"},{"type":"text","text":"answer"}]`,
-			text:    "answer",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var sends atomic.Int32
-			h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-				turn := sends.Add(1)
-				var request models.OpenAIRequest
-				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-					t.Error(err)
-				}
-				if tc.signature != "" && turn == 1 {
-					content, _ := json.Marshal(tc.text)
-					message := models.OpenAIMessage{
-						Role: "assistant", Content: content, ReasoningText: tc.thinking, ReasoningOpaque: tc.signature,
-					}
-					if request.Stream != nil && *request.Stream {
-						w.Header().Set("Content-Type", "text/event-stream")
-						chunk, _ := json.Marshal(models.OpenAIStreamChunk{Choices: []models.OpenAIStreamChoice{{Delta: message, FinishReason: stringPtr("stop")}}})
-						_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", chunk)
-					} else {
-						w.Header().Set("Content-Type", "application/json")
-						if err := json.NewEncoder(w).Encode(models.OpenAIResponse{Choices: []models.OpenAIChoice{{Message: message}}}); err != nil {
-							t.Error(err)
-						}
-					}
-					return
-				}
-				if r.URL.Path != providerEndpointChatCompletions || len(request.Messages) != 3 {
-					t.Errorf("path/messages = %s/%+v", r.URL.Path, request.Messages)
-				} else {
-					assistant := request.Messages[1]
-					if assistant.Role != "assistant" || assistant.ReasoningText != tc.thinking || assistant.ReasoningOpaque != tc.signature || jsonRawString(assistant.Content) != tc.text || !rawJSONIsNullOrEmpty(assistant.CopilotCacheControl) != tc.cached {
-						t.Errorf("native history changed: %+v", assistant)
-					}
-					if jsonRawString(request.Messages[0].Content) != "go" || jsonRawString(request.Messages[2].Content) != "continue" {
-						t.Errorf("message ordering changed: %+v", request.Messages)
-					}
-				}
-				if request.Stream != nil && *request.Stream {
-					w.Header().Set("Content-Type", "text/event-stream")
-					_, _ = io.WriteString(w, "data: "+`{"choices":[{"index":0,"delta":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":1,"total_tokens":13}}`+"\n\ndata: [DONE]\n\n")
-				} else {
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = io.WriteString(w, `{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":1,"total_tokens":13}}`)
-				}
-			})
-			wantSends := int32(2)
-			if tc.signature != "" {
-				first := httptest.NewRecorder()
-				h.HandleAnthropicMessages(first, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"chat-model","max_tokens":64,"messages":[{"role":"user","content":"go"}]}`)))
-				content := nativeReasoningBindingContent(t, first)
-				if len(content) == 0 || content[0].Signature != tc.signature {
-					t.Fatalf("initial response did not issue the native signature: %+v", content)
-				}
-				wantSends++
-			}
-			body := `{"model":"chat-model","max_tokens":64,"messages":[{"role":"user","content":"go"},{"role":"assistant","content":` + tc.content + `},{"role":"user","content":"continue"}]}`
-			for _, countTokens := range []bool{false, true} {
-				recorder := httptest.NewRecorder()
-				request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
-				if countTokens {
-					request.URL.Path += "/count_tokens"
-					h.HandleAnthropicMessagesCountTokens(recorder, request)
-				} else {
-					h.HandleAnthropicMessages(recorder, request)
-				}
-				if recorder.Code != http.StatusOK {
-					t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
-				}
-			}
-			if sends.Load() != wantSends {
-				t.Fatalf("sends = %d, want %d including signature issuance", sends.Load(), wantSends)
-			}
-		})
-	}
-}
-
-func TestAnthropicNativeChatRejectsUnrepresentableThinking(t *testing.T) {
-	for _, content := range []string{
-		`[{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"answer"}]`,
-		`[{"type":"thinking","thinking":"first","signature":"first-signature"},{"type":"thinking","thinking":"second","signature":"second-signature"},{"type":"text","text":"answer"}]`,
-	} {
-		t.Run(content, func(t *testing.T) {
-			var sends atomic.Int32
-			h := newTestProxyHandler(t, func(w http.ResponseWriter, _ *http.Request) { sends.Add(1); w.WriteHeader(http.StatusNoContent) })
-			body := `{"model":"chat-model","max_tokens":64,"messages":[{"role":"user","content":"go"},{"role":"assistant","content":` + content + `},{"role":"user","content":"continue"}]}`
-			recorder := httptest.NewRecorder()
-			h.HandleAnthropicMessages(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
-			if recorder.Code != http.StatusBadRequest || sends.Load() != 0 || !strings.Contains(recorder.Body.String(), "thinking") {
-				t.Fatalf("status/sends = %d/%d: %s", recorder.Code, sends.Load(), recorder.Body.String())
-			}
-		})
 	}
 }

@@ -568,7 +568,7 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 		}
 	})
 
-	t.Run("native thinking stays outside canonical Chat", func(t *testing.T) {
+	t.Run("thinking and redacted_thinking blocks skipped", func(t *testing.T) {
 		content := `[{"type":"thinking","thinking":"deep thought","signature":"sig"},{"type":"redacted_thinking","data":"secret"},{"type":"text","text":"Here is my answer"}]`
 		req := &models.AnthropicRequest{
 			Model:     "claude-3-opus",
@@ -594,9 +594,6 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 		}
 		if len(msg.ToolCalls) != 0 {
 			t.Errorf("expected 0 tool calls, got %d", len(msg.ToolCalls))
-		}
-		if msg.ReasoningText != "" || msg.ReasoningOpaque != "" {
-			t.Fatalf("provider-specific reasoning reached canonical Chat: %+v", msg)
 		}
 	})
 

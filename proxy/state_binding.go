@@ -43,9 +43,6 @@ const (
 type stateBindingOwner struct {
 	routeID  string
 	targetID string
-	// Native Chat signatures also require the original credential and physical
-	// model. Other state types retain their existing route/target ownership.
-	nativeIdentity [sha256.Size]byte
 }
 
 func (o stateBindingOwner) valid() bool {
