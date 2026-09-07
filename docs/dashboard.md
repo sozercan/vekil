@@ -71,6 +71,9 @@ count it. A successful HTTP reply containing a `response.cancelled` or
 Transport cancellation before a terminal still counts as an error.
 Numeric accounting retains only `total_nano_aiu` and `compute_units`;
 provider model details and response content are excluded.
+Billing is collected from Chat, Responses, and native Anthropic replies,
+including SSE and native Responses WebSocket streams. Repeated cumulative
+billing totals count once per send; totals from separate sends are added.
 
 These totals overlap the existing client and route ledgers and must not be
 added to them. They provide a complete scope for comparing task configurations

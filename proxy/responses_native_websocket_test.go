@@ -52,6 +52,7 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 					"id": id, "output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]string{"type": "output_text", "text": "done"}}}},
 					"usage": map[string]int{"input_tokens": 7, "output_tokens": 2, "total_tokens": 9},
 				},
+				"copilot_usage": map[string]int{"total_nano_aiu": 31, "compute_units": 2},
 			}); err != nil {
 				return
 			}
@@ -122,6 +123,15 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 	}
 	if connections.Load() != 1 || frames.Load() != 3 || httpPosts.Load() != 0 {
 		t.Fatalf("transport counts = connections:%d frames:%d HTTP:%d", connections.Load(), frames.Load(), httpPosts.Load())
+	}
+	deadline := time.Now().Add(time.Second)
+	taskUsage := h.stats.taskUsage.snapshot()
+	for taskUsage.Totals.Completed < 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		taskUsage = h.stats.taskUsage.snapshot()
+	}
+	if taskUsage.Inflight != 0 || taskUsage.Totals.Sends != 3 || taskUsage.Totals.Completed != 3 || taskUsage.Totals.Errors != 0 || taskUsage.Totals.CopilotUsage != (copilotUsageTotals{TotalNanoAIU: 93, ComputeUnits: 6}) {
+		t.Fatalf("native turn billing = %+v", taskUsage)
 	}
 	stats := h.stats.snapshot()
 	if stats.Totals.Requests != 3 || stats.Totals.PromptTokens != 21 || stats.Totals.TotalTokens != 27 {

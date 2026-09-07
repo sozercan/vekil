@@ -96,10 +96,11 @@ func TestTaskUsageNativeCountIsSizingOnly(t *testing.T) {
 }
 
 func TestTaskUsageCancellationAccounting(t *testing.T) {
+	const billing = `"copilot_usage":{"total_nano_aiu":31,"compute_units":2}`
 	for _, status := range []string{"cancelled", "canceled"} {
-		response := `{"id":"resp-accounting","status":"` + status + `","usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}`
-		terminal := "event: response." + status + "\ndata: " + `{"type":"response.` + status + `","response":` + response + "}\n\n"
-		pending := "event: response.in_progress\ndata: " + `{"type":"response.in_progress","response":{"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}` + "\n\n"
+		response := `{"id":"resp-accounting","status":"` + status + `","usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9},` + billing + `}`
+		terminal := "event: response." + status + "\ndata: " + `{"type":"response.` + status + `","response":` + response + `,` + billing + "}\n\n"
+		pending := "event: response.in_progress\ndata: " + `{"type":"response.in_progress","response":{"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}},` + billing + "}\n\n"
 		for _, tc := range []struct {
 			name, contentType, body   string
 			statusCode                int
@@ -127,6 +128,9 @@ func TestTaskUsageCancellationAccounting(t *testing.T) {
 				snapshot := h.stats.taskUsage.snapshot()
 				if snapshot.Inflight != 0 || snapshot.Totals.Sends != 1 || snapshot.Totals.Completed != 1 || snapshot.Totals.Errors != tc.wantErrors || snapshot.Totals.Throttled != tc.wantThrottles || snapshot.Totals.Usage.TotalTokens != 9 {
 					t.Fatalf("cancellation accounting = %+v", snapshot)
+				}
+				if snapshot.Totals.CopilotUsage != (copilotUsageTotals{TotalNanoAIU: 31, ComputeUnits: 2}) {
+					t.Fatalf("cancellation lost reported billing: %+v", snapshot.Totals.CopilotUsage)
 				}
 			})
 		}

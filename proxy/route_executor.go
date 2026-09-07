@@ -2259,6 +2259,16 @@ func (o *routeAttemptResponseObserver) applyStreamingTerminal(outcome routeAttem
 
 func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) bool {
 	data = strings.TrimSpace(data)
+	if o.captureCopilotUsage && (o.endpoint == providerEndpointResponses || o.endpoint == providerEndpointMessages) {
+		var envelope struct {
+			Usage json.RawMessage `json:"copilot_usage"`
+		}
+		if json.Unmarshal([]byte(data), &envelope) == nil {
+			if usage, ok := parseCopilotUsage(envelope.Usage); ok {
+				o.copilotUsage.merge(usage)
+			}
+		}
+	}
 	switch o.endpoint {
 	case providerEndpointResponses:
 		return o.observeResponsesEvent(eventType, data)
