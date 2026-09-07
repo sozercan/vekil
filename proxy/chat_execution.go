@@ -309,6 +309,9 @@ func (h *ProxyHandler) retryResolvedNativeChat(ctx context.Context, prior chatEx
 }
 
 func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route resolvedChatRoute, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
+	if err := rejectNativeReasoningResponsesReplay(ctx, chatBody); err != nil {
+		return chatExecutionResult{}, err
+	}
 	replayRoute := responsesChatReplayRoute{
 		ProviderID:    route.provider.id,
 		PublicModel:   route.publicModel,

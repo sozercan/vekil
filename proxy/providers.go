@@ -2695,6 +2695,14 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 			req = withCopilotInferenceRequest(req, provider, path, body)
 		}
 		req = withTaskInferenceRequest(req, path)
+		boundRequest, bindingErr := h.prepareLegacyNativeReasoningRequest(req, provider, path, body)
+		if bindingErr != nil {
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			return nil, bindingErr
+		}
+		req = boundRequest
 	}
 	return req, err
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -402,10 +403,27 @@ func TestAnthropicNativeChatReasoningHistory(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var sends atomic.Int32
 			h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-				sends.Add(1)
+				turn := sends.Add(1)
 				var request models.OpenAIRequest
 				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 					t.Error(err)
+				}
+				if tc.signature != "" && turn == 1 {
+					content, _ := json.Marshal(tc.text)
+					message := models.OpenAIMessage{
+						Role: "assistant", Content: content, ReasoningText: tc.thinking, ReasoningOpaque: tc.signature,
+					}
+					if request.Stream != nil && *request.Stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						chunk, _ := json.Marshal(models.OpenAIStreamChunk{Choices: []models.OpenAIStreamChoice{{Delta: message, FinishReason: stringPtr("stop")}}})
+						_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", chunk)
+					} else {
+						w.Header().Set("Content-Type", "application/json")
+						if err := json.NewEncoder(w).Encode(models.OpenAIResponse{Choices: []models.OpenAIChoice{{Message: message}}}); err != nil {
+							t.Error(err)
+						}
+					}
+					return
 				}
 				if r.URL.Path != providerEndpointChatCompletions || len(request.Messages) != 3 {
 					t.Errorf("path/messages = %s/%+v", r.URL.Path, request.Messages)
@@ -426,6 +444,16 @@ func TestAnthropicNativeChatReasoningHistory(t *testing.T) {
 					_, _ = io.WriteString(w, `{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":1,"total_tokens":13}}`)
 				}
 			})
+			wantSends := int32(2)
+			if tc.signature != "" {
+				first := httptest.NewRecorder()
+				h.HandleAnthropicMessages(first, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"chat-model","max_tokens":64,"messages":[{"role":"user","content":"go"}]}`)))
+				content := nativeReasoningBindingContent(t, first)
+				if len(content) == 0 || content[0].Signature != tc.signature {
+					t.Fatalf("initial response did not issue the native signature: %+v", content)
+				}
+				wantSends++
+			}
 			body := `{"model":"chat-model","max_tokens":64,"messages":[{"role":"user","content":"go"},{"role":"assistant","content":` + tc.content + `},{"role":"user","content":"continue"}]}`
 			for _, countTokens := range []bool{false, true} {
 				recorder := httptest.NewRecorder()
@@ -440,8 +468,8 @@ func TestAnthropicNativeChatReasoningHistory(t *testing.T) {
 					t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
 				}
 			}
-			if sends.Load() != 2 {
-				t.Fatalf("sends = %d, want one per endpoint", sends.Load())
+			if sends.Load() != wantSends {
+				t.Fatalf("sends = %d, want %d including signature issuance", sends.Load(), wantSends)
 			}
 		})
 	}

@@ -20,6 +20,12 @@ const (
 )
 
 type nativeReasoningOwnerContextKey struct{}
+type legacyNativeReasoningResponseContextKey struct{}
+
+type legacyNativeReasoningResponseInfo struct {
+	owner     explicitRouteResponseInfo
+	streaming bool
+}
 
 // Canonical Anthropic translation omits native signatures until the provider
 // is selected. Inspect the original history as well as raw Chat extensions so
@@ -84,29 +90,108 @@ func (h *ProxyHandler) applyNativeReasoningRequestBinding(ctx context.Context, o
 	if len(tokens) == 0 {
 		return ctx, nil
 	}
-	store, err := h.ensureStateBindingStore()
+	owner, err := h.resolveNativeReasoningRequestOwner(operation.route.public.routeID, tokens)
 	if err != nil {
 		return ctx, err
 	}
-	result := store.resolveForRoute(operation.route.public.routeID, tokens)
-	if result.outcome != stateBindingLookupKnown {
-		h.RecordStateBindingMiss()
-		message := "conflicting native reasoning state for explicit model route"
-		if result.outcome == stateBindingLookupUnknown {
-			message = "unknown native reasoning state for explicit model route; state may have expired, been evicted, or been issued by another Vekil process"
-		}
-		return ctx, &providerRequestError{statusCode: http.StatusBadRequest, err: errors.New(message)}
-	}
-	if _, ok := operation.route.targetByID(result.owner.targetID); !ok {
+	if _, ok := operation.route.targetByID(owner.targetID); !ok {
 		h.RecordStateBindingMiss()
 		return ctx, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("native reasoning state is bound to an unavailable route target")}
 	}
-	if err := operation.forcePinnedTarget(result.owner.targetID); err != nil {
+	if err := operation.forcePinnedTarget(owner.targetID); err != nil {
 		h.RecordStateBindingMiss()
 		return ctx, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("native reasoning state conflicts with the selected route target")}
 	}
 	h.RecordStateBindingHit()
-	return context.WithValue(ctx, nativeReasoningOwnerContextKey{}, result.owner), nil
+	return context.WithValue(ctx, nativeReasoningOwnerContextKey{}, owner), nil
+}
+
+func (h *ProxyHandler) resolveNativeReasoningRequestOwner(routeID string, tokens []stateBindingToken) (stateBindingOwner, error) {
+	store, err := h.ensureStateBindingStore()
+	if err != nil {
+		return stateBindingOwner{}, err
+	}
+	result := store.resolveForRoute(routeID, tokens)
+	if result.outcome != stateBindingLookupKnown {
+		h.RecordStateBindingMiss()
+		message := "conflicting native reasoning state for model route"
+		if result.outcome == stateBindingLookupUnknown {
+			message = "unknown native reasoning state for model route; state may have expired, been evicted, or been issued by another Vekil process"
+		}
+		return stateBindingOwner{}, &providerRequestError{statusCode: http.StatusBadRequest, err: errors.New(message)}
+	}
+	return result.owner, nil
+}
+
+func rejectNativeReasoningResponsesReplay(ctx context.Context, body []byte) error {
+	tokens, err := extractNativeReasoningRequestState(ctx, body)
+	if err != nil {
+		return &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
+	if len(tokens) > 0 {
+		return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("native reasoning state requires native Chat execution")}
+	}
+	return nil
+}
+
+// Provider-only routes have no route operation, but their opaque reasoning
+// still belongs to the authenticated provider and physical model. Keep this
+// metadata separate from explicit-route model normalization and failover.
+func (h *ProxyHandler) prepareLegacyNativeReasoningRequest(req *http.Request, provider *providerRuntime, path string, body []byte) (*http.Request, error) {
+	if path != providerEndpointChatCompletions || len(body) == 0 {
+		return req, nil
+	}
+	ctx := req.Context()
+	if operation := routeOperationFromContext(ctx); operation != nil && operation.route != nil && !operation.route.legacy {
+		return req, nil
+	}
+	info := explicitRouteResponseInfo{
+		// ':' cannot occur in configured explicit route IDs.
+		routeID:                 "legacy:" + provider.id,
+		publicID:                extractRequestModel(body),
+		targetID:                provider.id,
+		providerID:              provider.id,
+		nativeReasoningIdentity: nativeReasoningRequestIdentity(req, body),
+	}
+	tokens, err := extractNativeReasoningRequestState(ctx, body)
+	if err != nil {
+		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
+	if len(tokens) > 0 {
+		owner, err := h.resolveNativeReasoningRequestOwner(info.routeID, tokens)
+		if err != nil {
+			return nil, err
+		}
+		ctx = context.WithValue(ctx, nativeReasoningOwnerContextKey{}, owner)
+		if err := validateNativeReasoningRequestOwner(ctx, info, provider); err != nil {
+			h.RecordStateBindingMiss()
+			return nil, err
+		}
+		h.RecordStateBindingHit()
+	}
+	metadata := legacyNativeReasoningResponseInfo{owner: info, streaming: parseOpenAIChatCompletionsModeValidated(body).clientRequestedStream}
+	return req.WithContext(context.WithValue(ctx, legacyNativeReasoningResponseContextKey{}, metadata)), nil
+}
+
+func nativeReasoningResponseInfoFromResponse(resp *http.Response) (explicitRouteResponseInfo, bool) {
+	if info, ok := explicitRouteResponseInfoFromResponse(resp); ok {
+		return info, true
+	}
+	if resp == nil || resp.Request == nil {
+		return explicitRouteResponseInfo{}, false
+	}
+	metadata, ok := resp.Request.Context().Value(legacyNativeReasoningResponseContextKey{}).(legacyNativeReasoningResponseInfo)
+	return metadata.owner, ok
+}
+
+func (h *ProxyHandler) bindLegacyNativeReasoningStreamResponse(resp *http.Response) {
+	if resp == nil || resp.Request == nil || resp.StatusCode != http.StatusOK || resp.Body == nil {
+		return
+	}
+	metadata, ok := resp.Request.Context().Value(legacyNativeReasoningResponseContextKey{}).(legacyNativeReasoningResponseInfo)
+	if ok && (metadata.streaming || strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")) {
+		resp.Body = &nativeReasoningBindingBody{ReadCloser: resp.Body, h: h, info: metadata.owner}
+	}
 }
 
 // Use the source credential identity for Copilot so service-token refresh does
@@ -154,8 +239,8 @@ func (h *ProxyHandler) bindNativeReasoningTokens(info explicitRouteResponseInfo,
 }
 
 func (h *ProxyHandler) bindNativeReasoningCompletion(resp *http.Response, completion *models.OpenAIResponse) error {
-	info, explicit := explicitRouteResponseInfoFromResponse(resp)
-	if !explicit || completion == nil {
+	info, known := nativeReasoningResponseInfoFromResponse(resp)
+	if !known || completion == nil {
 		return nil
 	}
 	var tokens []stateBindingToken
@@ -168,8 +253,8 @@ func (h *ProxyHandler) bindNativeReasoningCompletion(resp *http.Response, comple
 }
 
 func (h *ProxyHandler) bindNativeReasoningJSONChoices(resp *http.Response, raw json.RawMessage) error {
-	info, explicit := explicitRouteResponseInfoFromResponse(resp)
-	if !explicit {
+	info, known := nativeReasoningResponseInfoFromResponse(resp)
+	if !known {
 		return nil
 	}
 	var choices []struct {
@@ -187,6 +272,27 @@ func (h *ProxyHandler) bindNativeReasoningJSONChoices(resp *http.Response, raw j
 		}
 	}
 	return h.bindNativeReasoningTokens(info, tokens)
+}
+
+// Raw provider-only JSON retains the existing bounded inspection window. An
+// oversized response passes through without registering replay state.
+func (h *ProxyHandler) legacyNativeReasoningJSONBinding(resp *http.Response) func([]byte) error {
+	if resp == nil || resp.Request == nil {
+		return nil
+	}
+	if _, ok := resp.Request.Context().Value(legacyNativeReasoningResponseContextKey{}).(legacyNativeReasoningResponseInfo); !ok {
+		return nil
+	}
+	return func(body []byte) error {
+		var payload struct {
+			Choices json.RawMessage `json:"choices"`
+			Error   json.RawMessage `json:"error"`
+		}
+		if json.Unmarshal(body, &payload) != nil || !rawJSONIsNullOrEmpty(payload.Error) || rawJSONIsNullOrEmpty(payload.Choices) {
+			return nil
+		}
+		return h.bindNativeReasoningJSONChoices(resp, payload.Choices)
+	}
 }
 
 // Observe complete blocks before Read returns their closing frame. A client

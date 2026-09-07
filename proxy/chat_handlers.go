@@ -2261,6 +2261,9 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 			}
 			return err
 		}
+		if err := h.bindNativeReasoningCompletion(resp, oaiResp); err != nil {
+			return err
+		}
 		handlers.aggregate(oaiResp)
 		return nil
 	}

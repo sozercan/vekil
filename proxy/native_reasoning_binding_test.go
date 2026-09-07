@@ -580,11 +580,14 @@ func TestNativeReasoningBindingStreamingSignatureAfterFinishReason(t *testing.T)
 	}
 }
 
-func nativeReasoningBindingRawRequest(t *testing.T, streaming, tools bool, assistant *models.OpenAIMessage) *http.Request {
+func nativeReasoningBindingRawRequest(t *testing.T, streaming, tools bool, assistant *models.OpenAIMessage, model ...string) *http.Request {
 	t.Helper()
 	request := models.OpenAIRequest{
 		Model: "public-model", Stream: &streaming,
 		Messages: []models.OpenAIMessage{{Role: "user", Content: json.RawMessage(`"lookup"`)}},
+	}
+	if len(model) > 0 {
+		request.Model = model[0]
 	}
 	if tools {
 		request.Tools = []models.OpenAITool{{Type: "function", Function: models.OpenAIFunction{Name: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)}}}
