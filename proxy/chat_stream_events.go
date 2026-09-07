@@ -269,6 +269,8 @@ func addChatStreamChunkForToolCapture(aggregator *openAIResponseAggregator, chun
 	for i := range toolOnly.Choices {
 		toolOnly.Choices[i].Delta.Content = nil
 		toolOnly.Choices[i].Delta.Refusal = nil
+		toolOnly.Choices[i].Delta.ReasoningText = ""
+		toolOnly.Choices[i].Delta.ReasoningOpaque = ""
 	}
 	aggregator.addChunk(toolOnly)
 }
@@ -410,6 +412,9 @@ func aggregateChatStreamEventsWithOptions(stream *chatStreamEventStream, options
 		if err := aggregator.policyTextDeltaError(); err != nil {
 			return nil, err
 		}
+	}
+	if err := aggregator.nativeReasoningError(); err != nil {
+		return nil, err
 	}
 	return aggregator.buildResponseWithOptions(options), nil
 }

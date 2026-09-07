@@ -2671,7 +2671,7 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 // common path does not need a per-attempt header-map clone. Client.Do adds jar
 // cookies to the request header, so clients with a cookie jar retain isolation.
 func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
-	body, err := applyAnthropicChatCacheControl(ctx, provider, path, body)
+	body, err := applyAnthropicChatExtensions(ctx, provider, path, body)
 	if err != nil {
 		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
@@ -2695,6 +2695,14 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 			req = withCopilotInferenceRequest(req, provider, path, body)
 		}
 		req = withTaskInferenceRequest(req, path)
+		boundRequest, bindingErr := h.prepareLegacyNativeReasoningRequest(req, provider, path, body)
+		if bindingErr != nil {
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			return nil, bindingErr
+		}
+		req = boundRequest
 	}
 	return req, err
 }

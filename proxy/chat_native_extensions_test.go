@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,14 +15,16 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-func nativeChatAccountingStream() string {
-	return "data: " + `{"id":"chat-extensions","object":"chat.completion.chunk","model":"physical-terminal","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
+func nativeChatExtensionStream() string {
+	return "data: " + `{"id":"chat-extensions","object":"chat.completion.chunk","model":"physical-terminal","choices":[{"index":0,"delta":{"role":"assistant","reasoning_text":"inspect "}}]}` + "\n\n" +
+		"data: " + `{"id":"chat-extensions","object":"chat.completion.chunk","model":"physical-terminal","choices":[{"index":0,"delta":{"reasoning_text":"the input","reasoning_opaque":"opaque-"}}]}` + "\n\n" +
+		"data: " + `{"id":"chat-extensions","object":"chat.completion.chunk","model":"physical-terminal","choices":[{"index":0,"delta":{"reasoning_opaque":"signature","tool_calls":[{"index":0,"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
 		"data: " + `{"id":"chat-extensions","object":"chat.completion.chunk","model":"physical-terminal","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17,"reasoning_tokens":3}}` + "\n\n" +
 		"data: " + `{"id":"chat-extensions","object":"chat.completion.chunk","model":"physical-terminal","choices":[],"copilot_usage":{"total_nano_aiu":27,"compute_units":2,"token_details":[{"model":"physical-terminal","token_type":"input","token_count":12,"batch_size":1000000,"cost_per_batch":30}]}}` + "\n\n" +
 		"data: [DONE]\n\n"
 }
 
-func TestNativeChatForcedStreamPreservesAccounting(t *testing.T) {
+func TestNativeChatForcedStreamPreservesReasoningAndAccounting(t *testing.T) {
 	var requests atomic.Int32
 	h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -35,7 +38,7 @@ func TestNativeChatForcedStreamPreservesAccounting(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("X-Copilot-Service-Request-Id", "service-attempt")
 		w.Header().Set("X-Quota-Snapshot-Chat", "remaining=10")
-		_, _ = io.WriteString(w, nativeChatAccountingStream())
+		_, _ = io.WriteString(w, nativeChatExtensionStream())
 	})
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"chat-model","messages":[{"role":"user","content":"lookup"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`))
 	recorder := httptest.NewRecorder()
@@ -51,7 +54,7 @@ func TestNativeChatForcedStreamPreservesAccounting(t *testing.T) {
 		t.Fatalf("choices = %+v", response.Choices)
 	}
 	message := response.Choices[0].Message
-	if message.Role != "assistant" || len(message.ToolCalls) != 1 || message.ToolCalls[0].ID != "call_lookup" {
+	if message.ReasoningText != "inspect the input" || message.ReasoningOpaque != "opaque-signature" || len(message.ToolCalls) != 1 {
 		t.Fatalf("aggregated message = %+v", message)
 	}
 	if response.Usage == nil || response.Usage.ReasoningTokens != 3 {
@@ -67,6 +70,162 @@ func TestNativeChatForcedStreamPreservesAccounting(t *testing.T) {
 	}
 	if recorder.Header().Get("X-Copilot-Service-Request-Id") != "service-attempt" || recorder.Header().Get("X-Quota-Snapshot-Chat") != "remaining=10" {
 		t.Fatalf("converted headers = %v", recorder.Header())
+	}
+}
+
+func TestNativeChatAnthropicNonStreamingPreservesReasoning(t *testing.T) {
+	for _, signatureOnly := range []bool{false, true} {
+		t.Run(map[bool]string{false: "thinking and signature", true: "signature only"}[signatureOnly], func(t *testing.T) {
+			wantThinking := "inspect the input"
+			if signatureOnly {
+				wantThinking = ""
+			}
+			var sends atomic.Int32
+			h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				turn := sends.Add(1)
+				var request models.OpenAIRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				if r.URL.Path != providerEndpointChatCompletions || request.Stream == nil || !*request.Stream {
+					t.Errorf("upstream path/stream = %q/%v", r.URL.Path, request.Stream)
+				}
+				if turn == 2 {
+					if len(request.Messages) != 3 {
+						t.Errorf("replayed messages = %+v", request.Messages)
+					} else {
+						assistant, result := request.Messages[1], request.Messages[2]
+						if assistant.Role != "assistant" || assistant.ReasoningText != wantThinking || assistant.ReasoningOpaque != "opaque-signature" || len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].ID != "call_lookup" {
+							t.Errorf("replayed assistant lost native reasoning or tool call: %+v", assistant)
+						}
+						if result.Role != "tool" || result.ToolCallID != "call_lookup" || jsonRawString(result.Content) != "found" {
+							t.Errorf("replayed tool result changed: %+v", result)
+						}
+					}
+				}
+				stream := nativeChatExtensionStream()
+				if signatureOnly {
+					stream = strings.ReplaceAll(stream, `"reasoning_text":"inspect "`, `"reasoning_text":""`)
+					stream = strings.ReplaceAll(stream, `"reasoning_text":"the input"`, `"reasoning_text":""`)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, stream)
+			})
+			recorder := httptest.NewRecorder()
+			h.HandleAnthropicMessages(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"chat-model","stream":false,"max_tokens":64,"messages":[{"role":"user","content":"lookup"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`)))
+			if recorder.Code != http.StatusOK || sends.Load() != 1 {
+				t.Fatalf("status/sends = %d/%d: %s", recorder.Code, sends.Load(), recorder.Body.String())
+			}
+			var response models.AnthropicResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if len(response.Content) != 2 {
+				t.Fatalf("aggregated content = %s, want thinking followed by tool use", recorder.Body.String())
+			}
+			thinking, tool := response.Content[0], response.Content[1]
+			if thinking.Type != "thinking" || thinking.Thinking == nil || *thinking.Thinking != wantThinking || thinking.Signature != "opaque-signature" {
+				t.Fatalf("native reasoning changed: %+v", thinking)
+			}
+			if tool.Type != "tool_use" || tool.ID != "call_lookup" || tool.Name != "lookup" || string(tool.Input) != "{}" {
+				t.Fatalf("tool result changed: %+v", tool)
+			}
+			if response.Model != "chat-model" || response.StopReason == nil || *response.StopReason != "tool_use" || response.Usage.InputTokens != 12 || response.Usage.OutputTokens != 5 {
+				t.Fatalf("aggregated response contract changed: %+v", response)
+			}
+			history, err := json.Marshal(response.Content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			followup := `{"model":"chat-model","stream":false,"max_tokens":64,"messages":[{"role":"user","content":"lookup"},{"role":"assistant","content":` + string(history) + `},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_lookup","content":"found"}]}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`
+			recorder = httptest.NewRecorder()
+			h.HandleAnthropicMessages(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(followup)))
+			if recorder.Code != http.StatusOK || sends.Load() != 2 {
+				t.Fatalf("follow-up status/sends = %d/%d: %s", recorder.Code, sends.Load(), recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestNativeChatAnthropicStreamPreservesReasoningBlocks(t *testing.T) {
+	h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != providerEndpointChatCompletions {
+			t.Errorf("upstream path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		stream := buildSSEStream(
+			`{"choices":[{"index":0,"delta":{"reasoning_text":"inspect "}}]}`,
+			`{"choices":[{"index":0,"delta":{"reasoning_text":"input","reasoning_opaque":"opaque-"}}]}`,
+			`{"choices":[{"index":0,"delta":{"reasoning_opaque":"signature","content":"answer"}}]}`,
+			`{"choices":[{"index":0,"delta":{"reasoning_text":"verify","reasoning_opaque":"second-signature"}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"reasoning_text":"finish","reasoning_opaque":"last-signature"},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		)
+		defer func() { _ = stream.Close() }()
+		_, _ = io.Copy(w, stream)
+	})
+	recorder := httptest.NewRecorder()
+	h.HandleAnthropicMessages(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"chat-model","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"lookup"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	type block struct{ kind, text, signature string }
+	var blocks []block
+	openIndex := -1
+	stopped := false
+	for _, wire := range parseSSEEvents(recorder.Body.String()) {
+		var event models.AnthropicStreamEvent
+		if err := json.Unmarshal([]byte(wire.Data), &event); err != nil {
+			t.Fatal(err)
+		}
+		switch event.Type {
+		case "content_block_start":
+			if openIndex != -1 || event.Index == nil || *event.Index != len(blocks) || event.ContentBlock == nil {
+				t.Fatalf("invalid block ordering: %s", recorder.Body.String())
+			}
+			openIndex = *event.Index
+			blocks = append(blocks, block{kind: event.ContentBlock.Type})
+		case "content_block_delta":
+			if event.Index == nil || *event.Index != openIndex || openIndex < 0 || event.Delta == nil {
+				t.Fatalf("delta outside open block: %s", wire.Data)
+			}
+			switch event.Delta.Type {
+			case "thinking_delta":
+				if blocks[openIndex].kind != "thinking" {
+					t.Fatalf("thinking delta in %s block", blocks[openIndex].kind)
+				}
+				blocks[openIndex].text += event.Delta.Thinking
+			case "signature_delta":
+				if blocks[openIndex].kind != "thinking" {
+					t.Fatalf("signature delta in %s block", blocks[openIndex].kind)
+				}
+				blocks[openIndex].signature += event.Delta.Signature
+			case "text_delta":
+				blocks[openIndex].text += event.Delta.Text
+			case "input_json_delta":
+				blocks[openIndex].text += event.Delta.PartialJSON
+			}
+		case "content_block_stop":
+			if event.Index == nil || *event.Index != openIndex || openIndex < 0 {
+				t.Fatalf("stop outside open block: %s", wire.Data)
+			}
+			openIndex = -1
+		case "message_stop":
+			stopped = true
+		case "error":
+			t.Fatalf("stream failed: %s", wire.Data)
+		}
+	}
+	want := []block{
+		{kind: "thinking", text: "inspect input", signature: "opaque-signature"},
+		{kind: "text", text: "answer"},
+		{kind: "thinking", text: "verify", signature: "second-signature"},
+		{kind: "tool_use", text: "{}"},
+		{kind: "thinking", text: "finish", signature: "last-signature"},
+	}
+	if !reflect.DeepEqual(blocks, want) || openIndex != -1 || !stopped {
+		t.Fatalf("reasoning stream = %+v, open=%d stopped=%t; want %+v", blocks, openIndex, stopped, want)
 	}
 }
 
@@ -112,12 +271,12 @@ func TestNativeChatReasoningUsageReachesClientLedger(t *testing.T) {
 	}
 }
 
-func TestPolicyChatPreservesAccountingAndPublicIdentity(t *testing.T) {
+func TestPolicyChatExtensionsPreserveAccountingAndPublicIdentity(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(map[bool]string{false: "aggregate", true: "stream"}[stream], func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = io.WriteString(w, nativeChatAccountingStream())
+				_, _ = io.WriteString(w, nativeChatExtensionStream())
 			}))
 			defer upstream.Close()
 			h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
@@ -137,7 +296,7 @@ func TestPolicyChatPreservesAccountingAndPublicIdentity(t *testing.T) {
 			if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "event: error") {
 				t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
 			}
-			for _, want := range []string{`"copilot_usage"`, `"total_nano_aiu":27`, `"model":"coding-economy"`} {
+			for _, want := range []string{`"reasoning_text"`, `"reasoning_opaque"`, `"copilot_usage"`, `"total_nano_aiu":27`, `"model":"coding-economy"`} {
 				if !strings.Contains(recorder.Body.String(), want) {
 					t.Fatalf("response lost %s: %s", want, recorder.Body.String())
 				}
@@ -149,8 +308,8 @@ func TestPolicyChatPreservesAccountingAndPublicIdentity(t *testing.T) {
 	}
 }
 
-func TestPolicySanitizedChatAcceptsAccounting(t *testing.T) {
-	body := newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(nativeChatAccountingStream())))
+func TestPolicySanitizedChatAcceptsReasoningAndAccounting(t *testing.T) {
+	body := newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(nativeChatExtensionStream())))
 	defer func() { _ = body.Close() }()
 	got, err := io.ReadAll(body)
 	if err != nil || strings.Contains(string(got), "event: error") || !strings.Contains(string(got), `"copilot_usage"`) {
@@ -165,6 +324,8 @@ func TestPolicySanitizedChatAcceptsAccounting(t *testing.T) {
 		`{"choices":[],"copilot_usage":{"token_details":[{"model":"a","model":"b"}]}}`,
 		`{"choices":[],"copilot_usage":{"total_nano_aiu":"physical-terminal"}}`,
 		`{"choices":[],"copilot_usage":{"compute_units":-1}}`,
+		`{"choices":[{"index":0,"delta":{"reasoning_opaque":42}}]}`,
+		`{"choices":[{"index":0,"delta":{"reasoning_opaque":"sig","Reasoning_Opaque":null}}]}`,
 	} {
 		if recognizedPolicyOpenAIStreamChunk("", malformed) {
 			t.Fatalf("accepted malformed extension chunk: %s", malformed)
@@ -172,24 +333,30 @@ func TestPolicySanitizedChatAcceptsAccounting(t *testing.T) {
 	}
 }
 
-func TestNativeChatAccountingProgressPreventsFailover(t *testing.T) {
-	const frame = `{"choices":[],"copilot_usage":{"total_nano_aiu":27}}`
-	var secondaryCalls atomic.Int32
-	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: "+frame+"\n\nevent: error\ndata: "+`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`+"\n\n")
-	}))
-	defer primary.Close()
-	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		secondaryCalls.Add(1)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer secondary.Close()
-	h := newExplicitRouteSurfaceHandler(t, providerTypeAzureOpenAI, providerEndpointChatCompletions, primary.URL, secondary.URL)
-	recorder := httptest.NewRecorder()
-	h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model","messages":[{"role":"user","content":"lookup"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`)))
-	if recorder.Code != http.StatusTooManyRequests || secondaryCalls.Load() != 0 {
-		t.Fatalf("status/secondary = %d/%d: %s", recorder.Code, secondaryCalls.Load(), recorder.Body.String())
+func TestNativeChatExtensionProgressPreventsFailover(t *testing.T) {
+	for _, frame := range []string{
+		`{"choices":[{"index":0,"delta":{"reasoning_opaque":"signature"}}]}`,
+		`{"choices":[],"copilot_usage":{"total_nano_aiu":27}}`,
+	} {
+		t.Run(frame, func(t *testing.T) {
+			var secondaryCalls atomic.Int32
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: "+frame+"\n\nevent: error\ndata: "+`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`+"\n\n")
+			}))
+			defer primary.Close()
+			secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				secondaryCalls.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer secondary.Close()
+			h := newExplicitRouteSurfaceHandler(t, providerTypeAzureOpenAI, providerEndpointChatCompletions, primary.URL, secondary.URL)
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model","messages":[{"role":"user","content":"lookup"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`)))
+			if recorder.Code != http.StatusTooManyRequests || secondaryCalls.Load() != 0 {
+				t.Fatalf("status/secondary = %d/%d: %s", recorder.Code, secondaryCalls.Load(), recorder.Body.String())
+			}
+		})
 	}
 }
 

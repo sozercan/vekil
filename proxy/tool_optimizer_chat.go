@@ -343,5 +343,5 @@ func (h *ProxyHandler) maybeWriteOptimizedOpenAIChatPassthrough(ctx context.Cont
 			return bodyBytes, normalized
 		}
 		return rewritten, true
-	})
+	}, h.legacyNativeReasoningJSONBinding(resp))
 }

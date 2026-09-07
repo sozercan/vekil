@@ -39,6 +39,8 @@ type OpenAIMessage struct {
 	Name                string           `json:"name,omitempty"`
 	ToolCalls           []OpenAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID          string           `json:"tool_call_id,omitempty"`
+	ReasoningText       string           `json:"reasoning_text,omitempty"`
+	ReasoningOpaque     string           `json:"reasoning_opaque,omitempty"`
 	CopilotCacheControl json.RawMessage  `json:"copilot_cache_control,omitempty"`
 }
 

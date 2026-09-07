@@ -14,6 +14,33 @@ The native-Chat path supports the existing text/image/tool-use subset, system me
 
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
+Native Chat translation preserves reasoning text and opaque signatures through
+Anthropic thinking blocks. Subsequent assistant history restores a single native
+thinking block per message when dispatching to Copilot Chat, including messages
+containing only a signature. Multiple independent thinking blocks in one message
+and native `redacted_thinking` blocks fail explicitly because Chat's single
+text/signature pair cannot represent them faithfully. Vekil's Responses reasoning
+carriers are decoded separately and never forwarded as native signatures.
+Streaming preserves separate native thinking blocks and joins signature fragments
+only within the same block. If native reasoning resumes after text, refusal, or
+tool activity and any block carries an opaque signature, forced-stream aggregation
+returns `502` because the intermediate Chat message has only one text/signature
+pair. It does not return a joined signature or replayable tool history. Streaming
+can deliver these separate blocks, but native Chat still rejects replaying multiple independent
+thinking blocks in one assistant message.
+Native signatures bind to the issuing target, credential, and physical model in
+zero-config mode, schema-v1 provider routing, and explicit model routes. Replay
+requires the same owner; an explicit route keeps that target even when it is
+unavailable or in cooldown. Unknown, expired, conflicting, cross-route, or
+changed-owner signatures fail locally with `400`. Bindings use the shared process-local
+24-hour state index, so continuations require the same Vekil process. Streaming
+binds each complete thinking block before exposing its closing frame and retains
+at most 2 MiB of unfinished signatures across 128 choices, with an 8 MiB event
+limit. Direct OpenAI Chat `reasoning_opaque` uses the same ownership rules.
+Zero-config and schema-v1 raw Chat JSON responses register signatures within the
+existing 4 MiB inspection window. Larger responses pass through unchanged, but
+new signatures in them remain unbound and replay returns `400`. Translated
+Anthropic JSON and SSE use their existing response and event bounds.
 Supported Anthropic cache hints map to Copilot message/tool
 `copilot_cache_control` only when the original cache boundary can be represented
 exactly. Unrepresentable boundaries fail explicitly. Tool-result images and other
@@ -100,10 +127,13 @@ A Responses-backed request is not passthrough. Vekil validates the supported Cha
 
 Streamed traffic records terminal usage when the selected backend provides it. On native Chat, Vekil may inject `stream_options.include_usage` when the client omitted it; that proxy-injected usage chunk is consumed internally and not forwarded to a client that did not request it. Responses streams use their terminal usage data directly. A client-supplied `stream_options.include_usage` is honored.
 
-Native Chat preserves reasoning-token details and `copilot_usage` through
-forced-stream aggregation.
+Native Chat preserves `reasoning_text`, `reasoning_opaque`, reasoning-token
+details, and `copilot_usage` through forced-stream aggregation. Separate native
+reasoning blocks containing an opaque signature cannot fit Chat's single
+text/signature pair, so non-streaming aggregation returns `502`; contiguous
+signature fragments and unsigned reasoning text retain their existing behavior.
 Accounting-only chunks remain observable even when a proxy-injected standard usage
-chunk is hidden. Accounting progress prevents unsafe target failover.
+chunk is hidden. Reasoning or accounting progress prevents unsafe target failover.
 Numeric accounting is included in request summaries and full-task statistics;
 policy responses retain their existing public-model redaction.
 

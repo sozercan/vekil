@@ -249,6 +249,17 @@ prohibit retry or migration after sending a create. See
 
 Provider-issued state is bound to one exact `{route_id, target_id}`. This includes adapter-marked response IDs, trusted `X-Codex-Turn-State`, non-proxy opaque `encrypted_content`, and other opaque reasoning/session handles. Known state pins the owning target and disables failover. All supplied state values must agree; malformed, conflicting, cross-route, or mixed known/unknown state on an explicit `/responses` operation fails locally without an upstream call. A token observed from different owners becomes a conflict tombstone and remains fail-closed until that record expires or is evicted.
 
+Native Chat also binds `reasoning_opaque` and translated Anthropic thinking
+signatures to their issuing target, credential, and physical model in zero-config
+mode, provider-only version-1 routing, and explicit routes.
+Replay must use the same owner; target failure or cooldown cannot move it to a
+fallback. Credential or model changes reject the continuation before an inference
+send, while Copilot service-token refresh preserves source credential identity.
+Unknown, expired, mixed, or cross-route signatures fail locally with `400`.
+These signatures share the bounded state index and process-affinity requirement
+below. See the [API contract](api.md) for streaming bounds, the legacy raw JSON
+inspection limit, and supported history.
+
 There is one narrow first-use exception for a client-supplied Responses `conversation` ID. When that conversation is the request's only explicit state and the route can select exactly one eligible Responses target, Vekil atomically binds the ID to that target before dispatch and hard-pins the operation. This covers a one-target route and a multi-target `primary_only` route whose configured primary is eligible. An unknown conversation on a multi-target `priority_failover` route remains fail-closed because ownership is ambiguous; other unknown provider state also remains fail-closed. `previous_response_id` cannot be combined with `conversation`. Vekil exposes no public conversation-registration endpoint and accepts no client target hint.
 
 The binding index is bounded to 262,144 entries with a 24-hour absolute TTL and is process-local. Capacity eviction, expiry, restart, or sending the next request to another Vekil process makes a prior binding unknown. For ordinary provider state that fails closed. A conversation-only request on a currently deterministic route can instead take the bootstrap path, which cannot distinguish genuine first use from a lost prior binding; keep the process affinity and deterministic target stable for the lifetime of active conversations. Lookups update recency for eviction but do not extend the absolute TTL; observing the same token again from the same owner refreshes it. **Every explicit Responses route that accepts provider-issued state requires one Vekil process or sticky ingress to the process that owns the binding**, including one-target and `primary_only` routes. Responses-backed Chat tool continuations use a separate process-local replay store and have the same affinity/restart constraint. Vekil does not migrate Responses state, replay a WebSocket session onto another target, or infer portability from user-provided strings. Durable/shared bindings and proxy-signed target hints are future work.
