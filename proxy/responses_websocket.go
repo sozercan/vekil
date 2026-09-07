@@ -1839,10 +1839,11 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 		compactionChecked: true,
 		compactionTrigger: responsesInputContainsCompactionTrigger(request.Input),
 	}
+	nativeInputLimits := s.nativeInputLimitsApply(h, request.Model)
 	if s.nativeUpstream.started() && plan.hasCompactionTrigger() {
 		return responsesWebSocketRequestPlan{}, fmt.Errorf("compaction_trigger is unavailable on a native upstream websocket; compact over HTTP and reconnect with full input")
 	}
-	if s.nativeUpstream != nil && len(request.Input) > responsesNativeMaxPendingItems {
+	if nativeInputLimits && len(request.Input) > responsesNativeMaxPendingItems {
 		return responsesWebSocketRequestPlan{}, fmt.Errorf("websocket input exceeds session item limit")
 	}
 	if request.PreviousResponseID == "" {
@@ -1858,7 +1859,7 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	}
 
 	plan.fullReplaySegments = [][]json.RawMessage{s.historyItems, request.Input}
-	if s.nativeUpstream != nil {
+	if nativeInputLimits {
 		if len(s.historyItems)+len(request.Input) > responsesNativeMaxPendingItems || rawMessageSegmentsSize(plan.fullReplaySegments...) > maxRequestBodySize {
 			return responsesWebSocketRequestPlan{}, fmt.Errorf("staged websocket input exceeds session limits")
 		}
@@ -1869,6 +1870,35 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	cfg := h.responsesWebSocketConfig()
 	plan.useTurnStateDelta = cfg.TurnStateDelta && s.turnState != "" && !plan.hasCompactionTrigger()
 	return plan, nil
+}
+
+func (s *responsesWebSocketSession) nativeInputLimitsApply(h *ProxyHandler, model string) bool {
+	if s.nativeUpstream == nil || h == nil {
+		return false
+	}
+	if s.nativeUpstream.started() {
+		return true
+	}
+	if route, known := h.resolveModelRouteForRequest(model, providerEndpointResponses); known && route != nil {
+		if s.explicitTargetID != "" {
+			target, ok := route.targetByID(s.explicitTargetID)
+			return ok && target.provider != nil && target.provider.kind == providerTypeCopilot
+		}
+		targets := route.targets
+		if route.policy.mode == routeModePrimaryOnly && len(targets) > 0 {
+			targets = targets[:1]
+		}
+		for _, target := range targets {
+			if target.provider == nil || target.provider.kind != providerTypeCopilot {
+				// Mixed routes validate again after target selection. A possible
+				// native fallback must not constrain an HTTP-backed primary.
+				return false
+			}
+		}
+		return len(targets) > 0
+	}
+	provider, _, _ := h.resolveProviderModelForRequest(model, providerEndpointResponses)
+	return provider != nil && provider.kind == providerTypeCopilot
 }
 
 func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan, metrics *responsesWebSocketRequestMetrics) (*http.Response, bool, bool, error) {
@@ -1958,9 +1988,14 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 		if request.PreviousResponseID != "" && !s.nativeResetPending {
 			previousID = s.nativeUpstream.previousResponseID()
 		}
-		ctx = context.WithValue(ctx, responsesNativeRequestContextKey{}, &responsesNativeRequest{
+		marker := &responsesNativeRequest{
 			upstream: s.nativeUpstream, model: request.Model, previousResponseID: previousID, headers: headers,
-		})
+			inputBytes: rawMessageSegmentsSize(inputSegments...), stagedInput: request.PreviousResponseID != "",
+		}
+		for _, segment := range inputSegments {
+			marker.inputItems += len(segment)
+		}
+		ctx = context.WithValue(ctx, responsesNativeRequestContextKey{}, marker)
 	}
 	resp, err := h.postResponsesWithHeadersForModel(ctx, bodyBytes, headers, request.Model)
 	attachResponsesWebSocketOperationID(resp, operation)

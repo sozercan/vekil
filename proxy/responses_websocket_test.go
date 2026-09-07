@@ -6916,9 +6916,13 @@ func mustDialResponsesWebSocket(t *testing.T, server *httptest.Server, headers h
 	return conn
 }
 
-func mustReadWebSocketJSON(t *testing.T, conn *websocket.Conn) map[string]interface{} {
+func mustReadWebSocketJSON(t *testing.T, conn *websocket.Conn, timeouts ...time.Duration) map[string]interface{} {
 	t.Helper()
-	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	timeout := 2 * time.Second
+	if len(timeouts) > 0 {
+		timeout = timeouts[0]
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		t.Fatalf("failed to set read deadline: %v", err)
 	}
 	_, data, err := conn.ReadMessage()
@@ -6934,10 +6938,10 @@ func mustReadWebSocketJSON(t *testing.T, conn *websocket.Conn) map[string]interf
 
 // mustReadWebSocketJSONSkipMetadata reads the next WebSocket frame, skipping
 // over any synthetic codex.response.metadata frames injected by the proxy.
-func mustReadWebSocketJSONSkipMetadata(t *testing.T, conn *websocket.Conn) map[string]interface{} {
+func mustReadWebSocketJSONSkipMetadata(t *testing.T, conn *websocket.Conn, timeouts ...time.Duration) map[string]interface{} {
 	t.Helper()
 	for {
-		payload := mustReadWebSocketJSON(t, conn)
+		payload := mustReadWebSocketJSON(t, conn, timeouts...)
 		if payload["type"] != "codex.response.metadata" {
 			return payload
 		}
@@ -8144,8 +8148,9 @@ func TestHandleResponsesWebSocket_OversizedTerminalFailureRetainsUsage(t *testin
 
 	done := make(chan error, 1)
 	go func() { done <- session.handleCreateRequest(handler, request) }()
-	_ = mustReadWebSocketJSON(t, clientConn) // metadata
-	wrapped := mustReadWebSocketJSON(t, clientConn)
+	// Allow parsing the oversized payload under race instrumentation.
+	_ = mustReadWebSocketJSON(t, clientConn, 15*time.Second) // metadata
+	wrapped := mustReadWebSocketJSON(t, clientConn, 15*time.Second)
 	if got := int(wrapped["status_code"].(float64)); got != http.StatusBadGateway {
 		t.Fatalf("wrapped status = %d, want 502", got)
 	}

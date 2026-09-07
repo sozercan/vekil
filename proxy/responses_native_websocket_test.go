@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -303,14 +304,38 @@ func TestResponsesNativeWebSocketPinnedRouteAndCancellation(t *testing.T) {
 }
 
 func TestResponsesNativeWebSocketNonCopilotUsesHTTP(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		counts []int
+	}{
+		{name: "small input", counts: []int{0}},
+		{name: "large initial input", counts: []int{responsesNativeMaxPendingItems + 1}},
+		{name: "large combined history", counts: []int{2500, 2000}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testResponsesNativeNonCopilotHTTPHistory(t, tc.counts)
+		})
+	}
+}
+
+func testResponsesNativeNonCopilotHTTPHistory(t *testing.T, counts []int) {
+	t.Helper()
 	var posts atomic.Int32
+	seen := make(chan int, len(counts))
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("provider request method = %s", r.Method)
 		}
-		posts.Add(1)
+		var body struct {
+			Input []json.RawMessage `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		seen <- len(body.Input)
+		turn := posts.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\"}}\n\n")
+		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http-%d\"}}\n\n", turn)
 	}))
 	defer upstream.Close()
 	h, err := NewProxyHandler(nil, logger.New(logger.LevelError), WithProvidersConfig(ProvidersConfig{
@@ -325,11 +350,181 @@ func TestResponsesNativeWebSocketNonCopilotUsesHTTP(t *testing.T) {
 	defer h.BeginShutdown()
 	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 	defer func() { _ = conn.Close() }()
-	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
-		t.Fatal(err)
+	total := 0
+	for turn, count := range counts {
+		input := make([]any, count)
+		for i := range input {
+			input[i] = map[string]string{"role": "user", "content": "small input"}
+		}
+		request := newResponsesWebSocketCreateRequest(input)
+		if turn > 0 {
+			request["previous_response_id"] = fmt.Sprintf("resp-http-%d", turn)
+		}
+		if err := conn.WriteJSON(request); err != nil {
+			t.Fatal(err)
+		}
+		if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "response.completed" || posts.Load() != int32(turn+1) {
+			t.Fatalf("HTTP provider result = %#v, sends %d", frame, posts.Load())
+		}
+		total += count
+		if got := <-seen; got != total {
+			t.Fatalf("HTTP input count = %d, want %d", got, total)
+		}
 	}
-	if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "response.completed" || posts.Load() != 1 {
-		t.Fatalf("HTTP provider result = %#v, sends %d", frame, posts.Load())
+}
+
+func TestResponsesNativeWebSocketCredentialBinding(t *testing.T) {
+	var connections, frames atomic.Int32
+	closed := make(chan struct{}, 1)
+	h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		connections.Add(1)
+		defer func() { _ = conn.Close(); closed <- struct{}{} }()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			turn := frames.Add(1)
+			if err := conn.WriteJSON(map[string]any{"type": "response.completed", "response": map[string]any{"id": fmt.Sprintf("resp-credential-%d", turn), "output": []any{}}}); err != nil {
+				return
+			}
+		}
+	})
+	u := newResponsesNativeUpstream(context.Background())
+	defer u.close()
+	provider := &providerRuntime{id: "copilot", kind: providerTypeCopilot}
+	newRequest := func(bearer, source string) *http.Request {
+		t.Helper()
+		body := []byte(`{"model":"gpt-5.4","stream":true,"input":[]}`)
+		ctx := context.WithValue(context.Background(), responsesNativeRequestContextKey{}, &responsesNativeRequest{upstream: u, model: "gpt-5.4"})
+		ctx = context.WithValue(ctx, providerRouteContextKey{}, providerRouteInfo{id: provider.id, kind: string(provider.kind)})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.copilotURL+"/responses", strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		return withCopilotInferenceRequest(req, provider, providerEndpointResponses, body, sha256.Sum256([]byte(source)))
+	}
+	for _, bearer := range []string{"service-token-one", "refreshed-service-token"} {
+		resp, handled, err := h.maybeSendNativeResponses(newRequest(bearer, "source-one"))
+		if err != nil || !handled || resp == nil {
+			t.Fatalf("same-source dispatch = %v/%v/%v", resp, handled, err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil || resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "response.completed") {
+			t.Fatalf("service-token refresh changed session identity: status=%d body=%s error=%v", resp.StatusCode, body, readErr)
+		}
+	}
+	resp, handled, err := h.maybeSendNativeResponses(newRequest("other-service-token", "source-two"))
+	if err != nil || !handled || resp == nil {
+		t.Fatalf("changed-source rejection = %v/%v/%v", resp, handled, err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil || resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "credential") {
+		t.Fatalf("changed source reused native session: status=%d body=%s error=%v", resp.StatusCode, body, readErr)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("credential change did not close the old upstream session")
+	}
+	if connections.Load() != 1 || frames.Load() != 2 {
+		t.Fatalf("credential change dispatched or reconnected: connections=%d frames=%d", connections.Load(), frames.Load())
+	}
+	if rejection := h.maybeRejectNativeResponsesRequest(newRequest("service-token-one", "source-one")); rejection == nil || rejection.StatusCode != http.StatusConflict {
+		t.Fatalf("retired session became reusable: %+v", rejection)
+	} else {
+		_ = rejection.Body.Close()
+	}
+}
+
+func TestResponsesNativeWebSocketInputLimitsBeforeDispatch(t *testing.T) {
+	inputItems := func(count int, text string) []any {
+		items := make([]any, count)
+		for i := range items {
+			items[i] = map[string]string{"role": "user", "content": text}
+		}
+		return items
+	}
+	for _, tc := range []struct {
+		name       string
+		explicit   bool
+		stageCount int
+		inputCount int
+		largeText  bool
+	}{
+		{name: "initial items", inputCount: responsesNativeMaxPendingItems + 1},
+		{name: "initial mixed-route items", explicit: true, inputCount: responsesNativeMaxPendingItems + 1},
+		{name: "staged mixed-route items", explicit: true, stageCount: 2500, inputCount: 2000},
+		{name: "staged mixed-route bytes", explicit: true, stageCount: 1, inputCount: 1, largeText: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sends atomic.Int32
+			h := newTestProxyHandler(t, func(w http.ResponseWriter, _ *http.Request) {
+				sends.Add(1)
+				http.Error(w, "unexpected upstream send", http.StatusBadGateway)
+			})
+			model := "gpt-5.4"
+			if tc.explicit {
+				provider := explicitRouteTestProvider("primary", h.copilotURL, "")
+				provider.kind = providerTypeCopilot
+				provider.paths = providerEndpointPolicyFor(providerTypeCopilot).defaultEndpointPaths()
+				h, _ = explicitRouteTestHandler(t, h.client, routeModePriorityFailover, 2, 2, provider, explicitRouteTestProvider("secondary", h.copilotURL, "other-key"))
+				h.auth = auth.NewTestAuthenticator("test-token")
+				h.log = logger.New(logger.LevelError)
+				model = "public-model"
+			}
+			h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+			h.stats = newStatsCollector()
+			if tc.largeText {
+				h.streamingUpstreamTimeout = 15 * time.Second
+			}
+			conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
+			defer func() { _ = conn.Close() }()
+			text := "small input"
+			readTimeout := 2 * time.Second
+			if tc.largeText {
+				text = strings.Repeat("x", maxRequestBodySize/2)
+				// Allow both 5 MiB input passes under race instrumentation.
+				readTimeout = 15 * time.Second
+			}
+			request := newResponsesWebSocketCreateRequest(inputItems(tc.inputCount, text))
+			request["model"] = model
+			if tc.stageCount > 0 {
+				staged := newResponsesWebSocketCreateRequest(inputItems(tc.stageCount, text))
+				staged["model"], staged["generate"] = model, false
+				if err := conn.WriteJSON(staged); err != nil {
+					t.Fatal(err)
+				}
+				_ = mustReadWebSocketJSONSkipMetadata(t, conn, readTimeout)
+				completed := mustReadWebSocketJSONSkipMetadata(t, conn, readTimeout)
+				if completed["type"] != "response.completed" {
+					t.Fatalf("warmup = %#v", completed)
+				}
+				request["previous_response_id"] = websocketResponseID(t, completed)
+			}
+			if err := conn.WriteJSON(request); err != nil {
+				t.Fatal(err)
+			}
+			frame := mustReadWebSocketJSONSkipMetadata(t, conn, readTimeout)
+			if frame["type"] != "error" || frame["status_code"] != float64(http.StatusBadRequest) {
+				t.Fatalf("oversized native input = %#v", frame)
+			}
+			encoded, _ := json.Marshal(frame)
+			if !strings.Contains(string(encoded), "limit") {
+				t.Fatalf("input was rejected for an unexpected reason: %s", encoded)
+			}
+			stats := h.stats.snapshot()
+			if sends.Load() != 0 || stats.UpstreamAttempts != 0 || stats.TaskUsage.Totals.Sends != 0 {
+				t.Fatalf("oversized native input reached dispatch: transport=%d attempts=%d task=%d", sends.Load(), stats.UpstreamAttempts, stats.TaskUsage.Totals.Sends)
+			}
+		})
 	}
 }
 

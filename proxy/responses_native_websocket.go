@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -31,6 +32,9 @@ type responsesNativeRequest struct {
 	model              string
 	previousResponseID string
 	headers            http.Header
+	inputItems         int
+	inputBytes         int
+	stagedInput        bool
 }
 
 type responsesNativeFrame struct {
@@ -51,6 +55,7 @@ type responsesNativeUpstream struct {
 	mu         sync.Mutex
 	conn       *websocket.Conn
 	binding    string
+	credential [32]byte
 	model      string
 	responseID string
 	turn       *responsesNativeTurn
@@ -164,7 +169,7 @@ func (h *ProxyHandler) maybeRejectNativeResponsesRequest(req *http.Request) *htt
 		u.mu.Unlock()
 		return responsesNativeErrorResponse(req, http.StatusConflict, errResponsesNativeClosed.Error())
 	}
-	started, binding := u.conn != nil, u.binding
+	started, binding, credential := u.conn != nil, u.binding, u.credential
 	u.mu.Unlock()
 	if !known || provider.kind != string(providerTypeCopilot) {
 		if started {
@@ -174,6 +179,18 @@ func (h *ProxyHandler) maybeRejectNativeResponsesRequest(req *http.Request) *htt
 	}
 	if started && binding != responsesNativeRequestBinding(req, provider.id, marker.model) {
 		return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model")
+	}
+	if started && credential != responsesNativeRequestCredential(req) {
+		u.close()
+		return responsesNativeErrorResponse(req, http.StatusConflict, "native upstream websocket credential changed; reconnect with full input")
+	}
+	// Validate only after selecting native transport. Other providers keep the
+	// HTTP bridge's input contract even when native transport is enabled.
+	if marker.inputItems > responsesNativeMaxPendingItems {
+		return responsesNativeErrorResponse(req, http.StatusBadRequest, "websocket input exceeds session item limit")
+	}
+	if marker.stagedInput && marker.inputBytes > maxRequestBodySize {
+		return responsesNativeErrorResponse(req, http.StatusBadRequest, "staged websocket input exceeds session limits")
 	}
 	if _, err := responsesNativeTurnHeaders(marker.headers); err != nil {
 		return responsesNativeErrorResponse(req, http.StatusBadRequest, err.Error())
@@ -189,6 +206,19 @@ func (h *ProxyHandler) maybeRejectNativeResponsesRequest(req *http.Request) *htt
 func responsesNativeRequestBinding(req *http.Request, providerID, model string) string {
 	info, _ := explicitRouteResponseInfoFromResponse(&http.Response{Request: req})
 	return providerID + "\x00" + req.URL.String() + "\x00" + info.routeID + "\x00" + info.targetID + "\x00" + model
+}
+
+func responsesNativeRequestCredential(req *http.Request) [32]byte {
+	if metadata, ok := req.Context().Value(copilotInferenceRequestContextKey{}).(copilotInferenceRequest); ok {
+		for _, key := range metadata.keys {
+			if key.scope == copilotThrottleAccount {
+				// This identity uses the source credential, so service-token
+				// refreshes keep the same account binding.
+				return key.identity
+			}
+		}
+	}
+	return sha256.Sum256([]byte(req.Header.Get("Authorization")))
 }
 
 // maybeSendNativeResponses runs after provider resolution, auth, admission and
@@ -229,11 +259,17 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 	}
 	info, _ := explicitRouteResponseInfoFromResponse(&http.Response{Request: req})
 	binding := responsesNativeRequestBinding(req, provider.id, marker.model)
+	credential := responsesNativeRequestCredential(req)
 	u := marker.upstream
 	u.mu.Lock()
 	if u.closed {
 		u.mu.Unlock()
 		return responsesNativeErrorResponse(req, http.StatusConflict, errResponsesNativeClosed.Error()), true, nil
+	}
+	if u.conn != nil && u.credential != credential {
+		u.mu.Unlock()
+		u.close()
+		return responsesNativeErrorResponse(req, http.StatusConflict, "native upstream websocket credential changed; reconnect with full input"), true, nil
 	}
 	if u.conn != nil && (u.binding != binding || u.model != model) {
 		u.mu.Unlock()
@@ -267,7 +303,7 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 			_ = conn.Close()
 			return nil, true, context.Canceled
 		}
-		u.conn, u.binding, u.model = conn, binding, model
+		u.conn, u.binding, u.model, u.credential = conn, binding, model, credential
 		u.mu.Unlock()
 		go u.readPump(conn)
 	}

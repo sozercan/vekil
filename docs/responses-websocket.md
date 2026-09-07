@@ -52,14 +52,20 @@ the first turn, continuations send new input with the last response ID, reducing
 history uploads. Other providers retain the HTTP bridge. This option does not
 enable Azure `/realtime`.
 
-The connection stays bound to its provider, target, and model. Once a create
+The connection stays bound to its source credential, provider, target, and model.
+Refreshing a service token for the same source credential preserves the session;
+changing the source credential closes it and returns a 409 error. Once a create
 has been sent, Vekil does not reconnect, resend it, or migrate the session after
 failure. Recovery requires a new downstream connection with full input.
 Automatic HTTP compaction is disabled after native connection establishment;
 standalone compact and memory endpoints continue to use HTTP.
 
-Native staging is bounded to 4,096 items and 10 MiB. Downstream messages retain
-the 10 MiB limit; upstream messages must fit below 8 MiB including SSE framing.
+Native input is limited to 4,096 pending items before dispatch; staged continuations
+also have a 10 MiB limit. Copilot-only and established native sessions enforce
+these bounds during local staging. Mixed routes validate them after target
+selection, so other providers' HTTP-backed sessions retain their input contract.
+Downstream messages retain the 10 MiB limit; upstream messages must fit below
+8 MiB including SSE framing.
 The session remains serialized and honors cancellation, shutdown, provider TLS
 and proxy configuration, and shared admission limits.
 
