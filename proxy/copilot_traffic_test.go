@@ -603,6 +603,107 @@ func TestCopilotAdmissionCancellationBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestCopilotAuxiliaryAdmissionDisconnectRemovesWaiter(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, body string
+		handle           func(*ProxyHandler, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name: "compact", path: "/v1/responses/compact",
+			body:   `{"model":"gpt-5.4","input":"history"}`,
+			handle: (*ProxyHandler).HandleCompact,
+		},
+		{
+			name: "memory", path: "/v1/memories/trace_summarize",
+			body:   `{"model":"gpt-5.4","traces":[{"id":"trace","content":"history"}]}`,
+			handle: (*ProxyHandler).HandleMemorySummarize,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sends atomic.Int32
+			started, release := make(chan struct{}), make(chan struct{})
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+			h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != providerEndpointResponses {
+					t.Errorf("unexpected upstream path: %s", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				if sends.Add(1) == 1 {
+					close(started)
+					select {
+					case <-release:
+					case <-r.Context().Done():
+						return
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"resp-summary","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[{\"trace_summary\":\"trace\",\"memory_summary\":\"memory\"}]"}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`)
+			})
+			t.Cleanup(h.BeginShutdown)
+			h.stats = newStatsCollector()
+			WithCopilotLargeRequestConcurrency(1, 1)(h)
+			firstDone, queuedDone := make(chan struct{}), make(chan struct{})
+			first := httptest.NewRecorder()
+			go func() {
+				defer close(firstDone)
+				tc.handle(h, first, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)))
+			}()
+			select {
+			case <-started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("first request did not dispatch")
+			}
+			ctx, disconnect := context.WithCancel(context.Background())
+			defer disconnect()
+			queued := httptest.NewRecorder()
+			queuedBody := strings.Replace(tc.body, "history", "queued history", 1)
+			go func() {
+				defer close(queuedDone)
+				tc.handle(h, queued, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(queuedBody)).WithContext(ctx))
+			}()
+			waitForCopilotTrafficWaiters(t, h, 1)
+			disconnect()
+			select {
+			case <-queuedDone:
+				waitForCopilotTrafficWaiters(t, h, 0)
+				if usage := h.stats.taskUsage.snapshot(); usage.Inflight != 1 || usage.Totals.Sends != 1 {
+					t.Fatalf("disconnect changed active inference accounting: %+v", usage)
+				}
+			case <-time.After(2 * time.Second):
+				t.Error("disconnected auxiliary request remained queued")
+			}
+			close(release)
+			for _, done := range []<-chan struct{}{firstDone, queuedDone} {
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("auxiliary handler did not finish after releasing admission")
+				}
+			}
+			if first.Code != http.StatusOK || queued.Code == http.StatusOK || sends.Load() != 1 {
+				t.Fatalf("statuses/sends = %d/%d/%d, want successful active work and no queued send", first.Code, queued.Code, sends.Load())
+			}
+			usage := h.stats.taskUsage.snapshot()
+			if usage.Inflight != 0 || usage.Totals.Sends != 1 || usage.Totals.Completed != 1 || usage.Totals.Errors != 0 || usage.Totals.Usage.TotalTokens != 3 {
+				t.Fatalf("canceled admission changed completed-send accounting: %+v", usage)
+			}
+			h.copilotTraffic.mu.Lock()
+			groups := len(h.copilotTraffic.groups)
+			h.copilotTraffic.mu.Unlock()
+			if groups != 0 {
+				t.Fatalf("completed requests retained %d admission groups", groups)
+			}
+		})
+	}
+}
+
 func TestCopilotAdmissionTransportFailureReleasesPermit(t *testing.T) {
 	h := &ProxyHandler{maxRetries: 1, client: &http.Client{Transport: retryRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("connection failed")

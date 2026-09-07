@@ -718,7 +718,7 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(true)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), true)
 	defer upstreamCancel()
 	upstreamCtx = withCopilotRequestMetadata(upstreamCtx, r.Header)
 	model := rawJSONString(body["model"])
@@ -845,7 +845,7 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	}
 	reqBody, _ := json.Marshal(responsesReq)
 
-	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContext(false)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
 	defer upstreamCancel()
 	upstreamCtx = withCopilotRequestMetadata(upstreamCtx, r.Header)
 	upstreamCtx = withTaskInferenceKind(upstreamCtx, taskMemory)
