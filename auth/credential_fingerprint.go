@@ -13,18 +13,18 @@ func (a *Authenticator) CredentialFingerprint(bearer string) [32]byte {
 	if bearer == "" {
 		return [32]byte{}
 	}
-	source := bearer
+	fingerprint := sha256.Sum256([]byte(bearer))
 	if a != nil {
 		a.mu.RLock()
-		if bearer == a.copilotToken && a.accessToken != "" {
-			source = a.accessToken
+		if bearer == a.copilotToken && a.copilotSourceFingerprint != ([32]byte{}) {
+			fingerprint = a.copilotSourceFingerprint
 		}
 		a.mu.RUnlock()
 		a.responsesMu.Lock()
 		if bearer == a.responsesToken && a.responsesSourceToken != "" {
-			source = a.responsesSourceToken
+			fingerprint = sha256.Sum256([]byte(a.responsesSourceToken))
 		}
 		a.responsesMu.Unlock()
 	}
-	return sha256.Sum256([]byte(source))
+	return fingerprint
 }

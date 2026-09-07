@@ -4,6 +4,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,11 +65,12 @@ var (
 // handles the device code flow, legacy token-cache migration, and shared
 // refreshes whose waiters can stop independently when their contexts expire.
 type Authenticator struct {
-	tokenDir     string
-	accessToken  string
-	copilotToken string
-	tokenExpiry  time.Time
-	mu           sync.RWMutex
+	tokenDir                 string
+	accessToken              string
+	copilotToken             string
+	copilotSourceFingerprint [32]byte
+	tokenExpiry              time.Time
+	mu                       sync.RWMutex
 
 	refreshMu   sync.Mutex
 	refreshCall *authTokenCall
@@ -141,6 +144,11 @@ type CopilotTokenResponse struct {
 	Token        string `json:"token"`
 	ExpiresAt    int64  `json:"expires_at"`
 	ErrorDetails string `json:"error_details,omitempty"`
+}
+
+type copilotTokenCache struct {
+	CopilotTokenResponse
+	SourceFingerprint string `json:"source_fingerprint,omitempty"`
 }
 
 // AuthPreferences stores explicit authentication preferences shared by the
@@ -745,6 +753,7 @@ func (a *Authenticator) performRefresh(ctx context.Context, envToken string, for
 		if a.accessToken != envToken {
 			a.accessToken = envToken
 			a.copilotToken = ""
+			a.copilotSourceFingerprint = [32]byte{}
 			a.tokenExpiry = time.Time{}
 		}
 		if err := a.useGitHubCredential(ctx, envToken, true); err != nil {
@@ -772,6 +781,7 @@ func (a *Authenticator) useGitHubCredential(ctx context.Context, accessToken str
 	}
 	if isSupportedCopilotBearer(accessToken) {
 		a.copilotToken = accessToken
+		a.copilotSourceFingerprint = sha256.Sum256([]byte(accessToken))
 		a.tokenExpiry = time.Now().Add(directBearerTTL)
 		return nil
 	}
@@ -1024,6 +1034,7 @@ func (a *Authenticator) SignOut() error {
 	a.mu.Lock()
 	a.accessToken = ""
 	a.copilotToken = ""
+	a.copilotSourceFingerprint = [32]byte{}
 	a.tokenExpiry = time.Time{}
 
 	var errs []error
@@ -1065,11 +1076,13 @@ func (a *Authenticator) SignInWithGitHubCLI(ctx context.Context) error {
 
 	previousAccessToken := a.accessToken
 	previousCopilotToken := a.copilotToken
+	previousSourceFingerprint := a.copilotSourceFingerprint
 	previousTokenExpiry := a.tokenExpiry
 
 	if err := a.useGitHubCLICopilotToken(ctx); err != nil {
 		a.accessToken = previousAccessToken
 		a.copilotToken = previousCopilotToken
+		a.copilotSourceFingerprint = previousSourceFingerprint
 		a.tokenExpiry = previousTokenExpiry
 		return err
 	}
@@ -1123,6 +1136,7 @@ func (a *Authenticator) exchangeLegacyCopilotToken(ctx context.Context, accessTo
 	}
 
 	a.copilotToken = ctResp.Token
+	a.copilotSourceFingerprint = sha256.Sum256([]byte(accessToken))
 	a.tokenExpiry = time.Unix(ctResp.ExpiresAt-300, 0)
 
 	if persist {
@@ -1470,23 +1484,40 @@ func (a *Authenticator) loadCopilotToken() error {
 	if err != nil {
 		return err
 	}
-	var ctResp CopilotTokenResponse
+	var ctResp copilotTokenCache
 	if err := json.Unmarshal(data, &ctResp); err != nil {
 		return err
 	}
 	if time.Now().Unix() >= ctResp.ExpiresAt-300 {
 		return fmt.Errorf("copilot token expired")
 	}
+	var fingerprint [32]byte
+	if ctResp.SourceFingerprint != "" {
+		decoded, err := hex.DecodeString(ctResp.SourceFingerprint)
+		if err != nil || len(decoded) != len(fingerprint) {
+			return fmt.Errorf("invalid cached source credential fingerprint")
+		}
+		copy(fingerprint[:], decoded)
+		if fingerprint == ([32]byte{}) {
+			return fmt.Errorf("invalid cached source credential fingerprint")
+		}
+	}
 	a.copilotToken = ctResp.Token
+	// Older caches have no proven source association. Keep those bearers
+	// isolated instead of assigning them to the current access-token file.
+	a.copilotSourceFingerprint = fingerprint
 	a.tokenExpiry = time.Unix(ctResp.ExpiresAt-300, 0)
 	return nil
 }
 
 func (a *Authenticator) saveCopilotToken() error {
-	data, err := json.Marshal(CopilotTokenResponse{
-		Token:     a.copilotToken,
-		ExpiresAt: a.tokenExpiry.Add(300 * time.Second).Unix(),
-	})
+	cache := copilotTokenCache{CopilotTokenResponse: CopilotTokenResponse{
+		Token: a.copilotToken, ExpiresAt: a.tokenExpiry.Add(300 * time.Second).Unix(),
+	}}
+	if a.copilotSourceFingerprint != ([32]byte{}) {
+		cache.SourceFingerprint = hex.EncodeToString(a.copilotSourceFingerprint[:])
+	}
+	data, err := json.Marshal(cache)
 	if err != nil {
 		return err
 	}

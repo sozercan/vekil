@@ -54,9 +54,12 @@ enable Azure `/realtime`.
 
 The connection stays bound to its source credential, provider, target, and model.
 Refreshing a service token for the same source credential preserves the session;
-changing the source credential closes it and returns a 409 error. Once a create
-has been sent, Vekil does not reconnect, resend it, or migrate the session after
-failure. Recovery requires a new downstream connection with full input.
+changing the source credential closes it and returns a 409 error. New service-token
+caches retain a fingerprint of the issuing credential across restarts. Older caches
+without this metadata remain usable, but their first refresh can require a new
+connection because Vekil cannot verify their issuing credential. Once a create has
+been sent, Vekil does not reconnect, resend it, or migrate the session after failure.
+Recovery requires a new downstream connection with full input.
 Automatic HTTP compaction is disabled after native connection establishment;
 standalone compact and memory endpoints continue to use HTTP.
 
