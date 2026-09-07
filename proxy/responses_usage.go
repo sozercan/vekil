@@ -401,6 +401,7 @@ func anthropicStreamErrorStatus(data []byte) (int, bool) {
 		Type  string `json:"type"`
 		Error *struct {
 			Type string `json:"type"`
+			Code string `json:"code"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(data, &event); err != nil {
@@ -412,6 +413,10 @@ func anthropicStreamErrorStatus(data []byte) (int, bool) {
 	errType := ""
 	if event.Error != nil {
 		errType = strings.ToLower(strings.TrimSpace(event.Error.Type))
+		switch strings.ToLower(strings.TrimSpace(event.Error.Code)) {
+		case "user_model_rate_limited", "user_global_rate_limited", "user_weekly_rate_limited", "integration_rate_limited":
+			return http.StatusTooManyRequests, true
+		}
 	}
 	switch errType {
 	case "rate_limit_error", "rate_limit_exceeded":

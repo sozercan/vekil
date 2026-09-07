@@ -19,8 +19,9 @@ An active cooldown returns 429 without sending another inference request. After
 the reset, one request probes availability before queued callers continue.
 Cooldown records are bounded and lost on restart.
 
-The same rules apply when a Chat stream returns a structured throttle after
-HTTP `200`, including requests streamed internally for tool-call aggregation.
+The same rules apply when a Chat or native Messages stream returns a structured
+throttle after HTTP `200`, including Chat requests streamed internally for
+tool-call aggregation.
 A recovery probe that repeats the throttle renews the cooldown before queued
 requests continue. An already-started client stream reports the error in its
 stream; a non-streaming request returns `429`.

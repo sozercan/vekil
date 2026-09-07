@@ -452,13 +452,13 @@ func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Resp
 	}
 	retryAfter, _ := selectResponsesRetryAfter(resp.Header)
 	contentType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
-	observeChat := metadata.endpoint == providerEndpointChatCompletions && resp.StatusCode == http.StatusOK &&
+	observeStream := (metadata.endpoint == providerEndpointChatCompletions || metadata.endpoint == providerEndpointMessages) && resp.StatusCode == http.StatusOK &&
 		strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
-	if observeChat {
-		_, observeChat = parseRetryAfterAt(retryAfter, h.copilotTraffic.timeNow())
+	if observeStream {
+		_, observeStream = parseRetryAfterAt(retryAfter, h.copilotTraffic.timeNow())
 	}
 	if permit == nil {
-		if resp.StatusCode != http.StatusTooManyRequests && !observeChat {
+		if resp.StatusCode != http.StatusTooManyRequests && !observeStream {
 			return
 		}
 		permit = &copilotInferencePermit{controller: &h.copilotTraffic, metadata: metadata}
@@ -470,8 +470,8 @@ func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Resp
 		ReadCloser: resp.Body, permit: permit, status: resp.StatusCode,
 		retryAfter: retryAfter,
 	}
-	if observeChat {
-		body.chat = &copilotChatThrottleObserver{}
+	if observeStream {
+		body.stream = &copilotThrottleStreamObserver{}
 	}
 	resp.Body = body
 }
@@ -484,7 +484,7 @@ type copilotTrafficBody struct {
 	mu          sync.Mutex
 	prefix      []byte
 	complete    bool
-	chat        *copilotChatThrottleObserver
+	stream      *copilotThrottleStreamObserver
 	observeOnce sync.Once
 	closeOnce   sync.Once
 	closeErr    error
@@ -504,12 +504,12 @@ func (b *copilotTrafficBody) observe() {
 }
 
 func (b *copilotTrafficBody) Read(p []byte) (int, error) {
-	if b.chat != nil {
+	if b.stream != nil {
 		// Close first cancels the inner read, then takes this mutex in observe.
 		// Finish inspecting any returned frame before it can release the probe.
 		b.mu.Lock()
 		n, err := b.ReadCloser.Read(p)
-		b.chat.observe(p[:n], err == io.EOF, b.observeChatEvent)
+		b.stream.observe(p[:n], err == io.EOF, b.observeStreamEvent)
 		b.mu.Unlock()
 		return n, err
 	}
@@ -527,26 +527,43 @@ func (b *copilotTrafficBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (b *copilotTrafficBody) observeChatEvent(eventType, data string) bool {
-	if strings.TrimSpace(data) == "[DONE]" {
-		return false
-	}
-	if streamErr, failure := parseOpenAIStreamError(eventType, data); failure {
-		// The shared validator requires a complete, bounded JSON object with a
-		// recognized code. Generated text and malformed error events cannot set
-		// shared cooldowns, even when their text mentions a rate-limit code.
+func (b *copilotTrafficBody) observeStreamEvent(eventType, data string) bool {
+	var failureCode string
+	if b.permit.metadata.endpoint == providerEndpointMessages {
 		body := []byte(data)
-		if code, scope := copilotThrottleCode(body); scope != copilotThrottleUnknown && code == streamErr.Code {
-			b.permit.controller.observeThrottle(b.permit.metadata, http.StatusTooManyRequests, b.retryAfter, body)
+		if anthropicStreamDataIsMessageStop(body) && rejectDuplicateJSONMappingKeys(body) == nil {
+			return false
 		}
-		return false
+		// Content-block endings are not message endings: a later native
+		// Messages error can still renew this request's cooldown.
+		failure := inspectAnthropicStreamEvent(eventType, data).failure
+		if failure == nil {
+			return true
+		}
+		failureCode = failure.code
+	} else {
+		if strings.TrimSpace(data) == "[DONE]" {
+			return false
+		}
+		streamErr, failure := parseOpenAIStreamError(eventType, data)
+		if !failure {
+			return true
+		}
+		failureCode = streamErr.Code
 	}
-	return true
+	// The shared validator requires a complete, bounded JSON object with a
+	// recognized code. Generated text and malformed error events cannot set
+	// shared cooldowns, even when their text mentions a rate-limit code.
+	body := []byte(data)
+	if code, scope := copilotThrottleCode(body); scope != copilotThrottleUnknown && code == failureCode {
+		b.permit.controller.observeThrottle(b.permit.metadata, http.StatusTooManyRequests, b.retryAfter, body)
+	}
+	return false
 }
 
 // Retain at most one bounded SSE event. Observation does not read ahead or
-// rewrite bytes, so every Chat consumer also covers forced-stream aggregation.
-type copilotChatThrottleObserver struct {
+// rewrite bytes, covering native Messages passthrough and Chat aggregation.
+type copilotThrottleStreamObserver struct {
 	frame        []byte
 	lineNonempty bool
 	pendingCR    bool
@@ -554,7 +571,7 @@ type copilotChatThrottleObserver struct {
 	done         bool
 }
 
-func (o *copilotChatThrottleObserver) observe(p []byte, eof bool, onData func(string, string) bool) {
+func (o *copilotThrottleStreamObserver) observe(p []byte, eof bool, onData func(string, string) bool) {
 	if o.done {
 		return
 	}
@@ -594,7 +611,7 @@ func (o *copilotChatThrottleObserver) observe(p []byte, eof bool, onData func(st
 	}
 }
 
-func (o *copilotChatThrottleObserver) dispatch(onData func(string, string) bool) bool {
+func (o *copilotThrottleStreamObserver) dispatch(onData func(string, string) bool) bool {
 	defer func() { o.frame = o.frame[:0]; o.overflow = false }()
 	if o.overflow {
 		return true
