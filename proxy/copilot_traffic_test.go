@@ -386,6 +386,7 @@ func TestCopilotCooldownStreamProbeRenewsBeforeRelease(t *testing.T) {
 			h.copilotTraffic.now = func() time.Time { return time.Unix(0, clock.Load()) }
 			req := copilotTrafficTestRequest(t, ctx, "copilot", "http://upstream.example", "credential", "editor", "model", 0)
 			if path == "Responses-backed Chat" {
+				req = req.WithContext(context.WithValue(req.Context(), responsesChatStreamContextKey{}, true))
 				req = withCopilotInferenceRequest(req, provider, providerEndpointResponses, []byte(`{"model":"model"}`))
 			}
 			metadata := copilotTrafficTestMetadata(t, req)

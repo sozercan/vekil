@@ -17,6 +17,8 @@ import (
 
 const responsesChatMinimumOutputTokens = 16
 
+type responsesChatStreamContextKey struct{}
+
 type chatExecutionError struct {
 	StatusCode int
 	Type       string
@@ -333,6 +335,7 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 	if plan.Stream {
 		headers = make(http.Header)
 		headers.Set("Accept", "text/event-stream")
+		ctx = context.WithValue(ctx, responsesChatStreamContextKey{}, true)
 	}
 	resp, err := h.postResolvedProviderRequest(ctx, route.provider, route.owner, route.nativeEndpoint, requestBody, headers)
 	if err != nil {

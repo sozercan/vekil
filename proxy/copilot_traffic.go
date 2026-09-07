@@ -359,7 +359,10 @@ func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Resp
 	}
 	retryAfter, _ := selectResponsesRetryAfter(resp.Header)
 	contentType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
-	observeStream := resp.StatusCode == http.StatusOK &&
+	// Responses passthrough and WebSockets already observe failures in their
+	// prepared stream. The typed Chat adapter needs observation at body reads.
+	responsesChat, _ := req.Context().Value(responsesChatStreamContextKey{}).(bool)
+	observeStream := (metadata.endpoint != providerEndpointResponses || responsesChat) && resp.StatusCode == http.StatusOK &&
 		strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
 	if observeStream && metadata.endpoint != providerEndpointResponses {
 		_, observeStream = parseRetryAfterAt(retryAfter, h.copilotTraffic.timeNow())

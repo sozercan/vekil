@@ -144,6 +144,7 @@ func TestCopilotResponsesStreamThrottleRequiresStructuredEvidence(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			h := &ProxyHandler{}
 			req := copilotTrafficTestRequest(t, context.Background(), "copilot", "http://upstream.example", "credential", "editor", "model", 0)
+			req = req.WithContext(context.WithValue(req.Context(), responsesChatStreamContextKey{}, true))
 			req = withCopilotInferenceRequest(req, &providerRuntime{id: "copilot", kind: providerTypeCopilot}, providerEndpointResponses, []byte(`{"model":"model"}`))
 			resp := routeExecutorTestResponse(req, http.StatusOK, http.Header{"Content-Type": {"text/event-stream"}, "Retry-After": {"60"}}, "")
 			resp.Body = io.NopCloser(&copilotChatThrottleChunkReader{Reader: strings.NewReader(tc.body), chunk: 4093})
