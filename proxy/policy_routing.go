@@ -1130,6 +1130,7 @@ func readPolicyClassifierUsage(body []byte) policyStatsTokenUsage {
 			PromptTokens        int64 `json:"prompt_tokens"`
 			CompletionTokens    int64 `json:"completion_tokens"`
 			TotalTokens         int64 `json:"total_tokens"`
+			ReasoningTokens     int64 `json:"reasoning_tokens"`
 			PromptTokensDetails *struct {
 				CachedTokens int64 `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
@@ -1148,6 +1149,9 @@ func readPolicyClassifierUsage(body []byte) policyStatsTokenUsage {
 	}
 	if envelope.Usage.CompletionTokensDetails != nil {
 		usage.ReasoningTokens = envelope.Usage.CompletionTokensDetails.ReasoningTokens
+	}
+	if usage.ReasoningTokens <= 0 {
+		usage.ReasoningTokens = envelope.Usage.ReasoningTokens
 	}
 	return usage.normalized()
 }

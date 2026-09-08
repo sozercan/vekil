@@ -532,6 +532,11 @@ func inspectCanonicalOpenAIUsage(decoder *json.Decoder) (*models.OpenAIUsage, bo
 			if !totalOK {
 				return nil, false
 			}
+		case "reasoning_tokens":
+			usage.ReasoningTokens, ok = decodeCanonicalInt(decoder)
+			if !ok {
+				return nil, false
+			}
 		case "prompt_tokens_details":
 			var details *models.OpenAIPromptTokensDetails
 			if err := decoder.Decode(&details); err != nil {
@@ -548,6 +553,7 @@ func inspectCanonicalOpenAIUsage(decoder *json.Decoder) (*models.OpenAIUsage, bo
 			if strings.EqualFold(key, "prompt_tokens") ||
 				strings.EqualFold(key, "completion_tokens") ||
 				strings.EqualFold(key, "total_tokens") ||
+				strings.EqualFold(key, "reasoning_tokens") ||
 				strings.EqualFold(key, "prompt_tokens_details") ||
 				strings.EqualFold(key, "completion_tokens_details") {
 				return nil, false

@@ -230,6 +230,11 @@ func TestInspectCanonicalOpenAIChatCompletionResponseFast(t *testing.T) {
 			body:           `{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":1,"Prompt_Tokens":4,"completion_tokens":2,"Completion_Tokens":5,"total_tokens":3,"Total_Tokens":9}}`,
 		},
 		{
+			name:           "case-folded reasoning token alias falls back",
+			requestedModel: "public-model",
+			body:           `{"id":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"Reasoning_Tokens":2}}`,
+		},
+		{
 			name:           "escaped key falls back",
 			requestedModel: "public-model",
 			body:           `{"\u0069d":"chat-1","object":"chat.completion","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,

@@ -90,7 +90,12 @@ func TestNativeChatReasoningUsageReachesClientLedger(t *testing.T) {
 						return
 					}
 					w.Header().Set("Content-Type", "application/json")
-					_ = json.NewEncoder(w).Encode(models.OpenAIResponse{Usage: usage})
+					finishReason := "stop"
+					_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+						ID: "chat-accounting", Object: "chat.completion", Created: 1, Model: "chat-model",
+						Choices: []models.OpenAIChoice{{Index: 0, Message: models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)}, FinishReason: &finishReason}},
+						Usage:   usage,
+					})
 				})
 				h.stats = newStatsCollector()
 				ctx, summary := WithRequestSummary(context.Background())
