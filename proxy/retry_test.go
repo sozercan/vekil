@@ -1104,9 +1104,13 @@ func TestDoWithRetryPreservesRetryableStatusWhenShutdownStopsRetry(t *testing.T)
 		name       string
 		status     int
 		cancelWhen string
+		headers    http.Header
 	}{
 		{name: "429 before drain", status: http.StatusTooManyRequests, cancelWhen: "before-drain"},
 		{name: "503 during backoff", status: http.StatusServiceUnavailable, cancelWhen: "backoff"},
+		{name: "malformed retry delay before drain", status: http.StatusTooManyRequests, cancelWhen: "before-drain", headers: http.Header{"Retry-After": {"invalid"}, "Retry-After-Ms": {"2000"}}},
+		{name: "malformed retry delay during backoff", status: http.StatusServiceUnavailable, cancelWhen: "backoff", headers: http.Header{"Retry-After": {"invalid"}, "Retry-After-Ms": {"2000"}}},
+		{name: "malformed retry delay with exhausted quota", status: http.StatusTooManyRequests, cancelWhen: "backoff", headers: http.Header{"Retry-After": {"invalid"}, "X-Ratelimit-Remaining-Requests": {"0"}, "X-Ratelimit-Reset-Requests": {"2"}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			responseReady := make(chan struct{})
@@ -1124,6 +1128,9 @@ func TestDoWithRetryPreservesRetryableStatusWhenShutdownStopsRetry(t *testing.T)
 						},
 						Body:    body,
 						Request: req,
+					}
+					for name, values := range tt.headers {
+						resp.Header[name] = values
 					}
 					if tt.cancelWhen == "before-drain" {
 						close(responseReady)
@@ -1166,6 +1173,11 @@ func TestDoWithRetryPreservesRetryableStatusWhenShutdownStopsRetry(t *testing.T)
 			}
 			if upstreamErr.retryAfter != "2" || upstreamErr.headers.Get("X-Upstream-Status") != "preserved" {
 				t.Fatalf("upstream metadata = retry-after:%q headers:%v", upstreamErr.retryAfter, upstreamErr.headers)
+			}
+			w := httptest.NewRecorder()
+			writeOpenAIUpstreamRequestFailure(w, upstreamErr.statusCode, err)
+			if got := w.Header().Get("Retry-After"); got != "2" {
+				t.Fatalf("translated Retry-After = %q, want 2", got)
 			}
 			if errors.Is(err, context.Canceled) {
 				t.Fatalf("retryable status was replaced by shutdown cancellation: %v", err)

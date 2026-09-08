@@ -319,7 +319,7 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 
 		retryAfterHeader := resp.Header.Get("Retry-After")
 		retryAfterDelay, _ := selectResponsesRetryAfter(resp.Header)
-		if retryAfterHeader == "" {
+		if _, valid := retryAfterHeaderSeconds(retryAfterHeader); !valid {
 			retryAfterHeader = retryAfterDelay
 		}
 		upstreamErr := &upstreamError{
