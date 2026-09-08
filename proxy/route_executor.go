@@ -2062,6 +2062,7 @@ type routeAttemptResponseObserver struct {
 	captureCopilotUsage       bool
 	copilotUsage              copilotUsageTotals
 	acceptIncompleteResponses bool
+	requireResponsesTerminal  bool
 	terminal                  bool
 	cleanupTimedOut           bool
 	line                      []byte
@@ -2323,6 +2324,9 @@ func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) b
 
 func (o *routeAttemptResponseObserver) observeResponsesEvent(eventType, data string) bool {
 	if data == "[DONE]" {
+		if o.requireResponsesTerminal {
+			return false
+		}
 		return o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
 	}
 	var event responsesWebSocketStreamEvent

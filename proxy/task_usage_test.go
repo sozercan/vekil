@@ -109,11 +109,15 @@ func TestTaskUsageResponsesTerminalAccounting(t *testing.T) {
 		}{
 			{name: "JSON terminal", contentType: "application/json", body: response, statusCode: http.StatusOK},
 			{name: "SSE terminal", contentType: "text/event-stream", body: terminal, statusCode: http.StatusOK},
+			{name: "SSE terminal with Chat sentinel", contentType: "text/event-stream", body: terminal + "data: [DONE]\n\n", statusCode: http.StatusOK},
+			{name: "Chat sentinel before SSE terminal", contentType: "text/event-stream", body: pending + "data: [DONE]\n\n" + terminal, statusCode: http.StatusOK},
 			{name: "cancellation after terminal", contentType: "text/event-stream", body: terminal, statusCode: http.StatusOK, readErr: context.Canceled},
 			{name: "HTTP failure", contentType: "application/json", body: response, statusCode: http.StatusTooManyRequests, wantErrors: 1, wantThrottles: 1},
 			{name: "transport cancellation", contentType: "text/event-stream", body: pending, statusCode: http.StatusOK, readErr: context.Canceled, wantErrors: 1},
 			{name: "transport deadline", contentType: "text/event-stream", body: pending, statusCode: http.StatusOK, readErr: context.DeadlineExceeded, wantErrors: 1},
 			{name: "missing terminal", contentType: "text/event-stream", body: pending, statusCode: http.StatusOK, wantErrors: 1},
+			{name: "Chat sentinel without terminal", contentType: "text/event-stream", body: pending + "data: [DONE]\n\n", statusCode: http.StatusOK, wantErrors: 1},
+			{name: "Chat sentinel before cancellation", contentType: "text/event-stream", body: pending + "data: [DONE]\n\n", statusCode: http.StatusOK, readErr: context.Canceled, wantErrors: 1},
 			{name: "failed terminal", contentType: "text/event-stream", body: pending + "data: " + `{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}` + "\n\n", statusCode: http.StatusOK, wantErrors: 1, wantThrottles: 1},
 		} {
 			t.Run(status+"/"+tc.name, func(t *testing.T) {

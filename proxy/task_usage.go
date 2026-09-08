@@ -171,6 +171,8 @@ func (s *taskInferenceSend) finishResponse(resp *http.Response, sendErr error) {
 	// A finished generation may stop at its output limit without failing the
 	// physical send. Route attempts retain their stricter completion contract.
 	state.observer.acceptIncompleteResponses = true
+	// Chat's [DONE] sentinel does not finish a Responses send.
+	state.observer.requireResponsesTerminal = true
 	if !state.observer.streaming && state.observer.envelope != nil {
 		state.observer.envelope.fields = append(state.observer.envelope.fields, routeAttemptJSONField{name: "copilot_usage", maxBytes: 64 << 10})
 		if state.nativeCount {

@@ -18,6 +18,7 @@ func TestTaskUsagePublicStreamingBilling(t *testing.T) {
 	for _, tc := range []struct {
 		name, endpoint, request string
 		events                  []string
+		wantErrors              int64
 	}{
 		{
 			name: "Responses", endpoint: providerEndpointResponses,
@@ -30,6 +31,16 @@ func TestTaskUsagePublicStreamingBilling(t *testing.T) {
 				`{"type":"response.completed","response":{"id":"resp-billing","output":[],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}},` + finalBilling + `}`,
 				`{"type":"response.completed","response":{"id":"resp-billing","output":[],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}},` + finalBilling + `}`,
 			},
+		},
+		{
+			name: "Responses missing terminal with Chat sentinel", endpoint: providerEndpointResponses,
+			request: `{"model":"billing-model","input":"hello","stream":true}`,
+			events: []string{
+				`{"type":"response.in_progress","response":{"id":"resp-billing","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}},` + finalBilling + `}`,
+				`{"type":"response.output_text.delta","delta":"partial"}`,
+				"[DONE]",
+			},
+			wantErrors: 1,
 		},
 		{
 			name: "Anthropic", endpoint: providerEndpointMessages,
@@ -49,7 +60,7 @@ func TestTaskUsagePublicStreamingBilling(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var stream strings.Builder
 			for _, event := range tc.events {
-				if !json.Valid([]byte(event)) {
+				if event != "[DONE]" && !json.Valid([]byte(event)) {
 					t.Fatalf("invalid fixture: %s", event)
 				}
 				stream.WriteString("data: " + event + "\n\n")
@@ -96,7 +107,7 @@ func TestTaskUsagePublicStreamingBilling(t *testing.T) {
 			}
 			snapshot := stats.TaskUsage
 			totals := snapshot.Totals
-			if snapshot.Inflight != 0 || totals.Sends != 1 || totals.Completed != 1 || totals.Errors != 0 || totals.ReportedUsageSends != 1 || totals.Usage.TotalTokens != 18 {
+			if snapshot.Inflight != 0 || totals.Sends != 1 || totals.Completed != 1 || totals.Errors != tc.wantErrors || totals.ReportedUsageSends != 1 || totals.Usage.TotalTokens != 18 {
 				t.Fatalf("stream ledger = %+v", snapshot)
 			}
 			if totals.CopilotUsage != (copilotUsageTotals{TotalNanoAIU: 31, ComputeUnits: 2}) {
