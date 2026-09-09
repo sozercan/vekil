@@ -17,25 +17,112 @@ import (
 )
 
 func TestCredentialFingerprintPreservesRequestIdentity(t *testing.T) {
-	want := sha256.Sum256([]byte("source-one"))
-	a := &Authenticator{accessToken: "source-one", copilotToken: "chat-token", copilotSourceFingerprint: want, responsesSourceToken: "source-one", responsesToken: "responses-token"}
-	for _, bearer := range []string{"source-one", "chat-token", "responses-token"} {
-		if got := a.CredentialFingerprint(bearer); got != want {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "")
+	want := sha256.Sum256([]byte("ghu_source-one"))
+	a := NewTestAuthenticatorWithResponsesToken("ghu_source-one", "responses-token")
+	for _, get := range []func(context.Context) (Credential, error){a.GetCredential, a.GetResponsesCredential} {
+		credential, err := get(context.Background())
+		if err != nil || credential.SourceFingerprint != want {
 			t.Fatal("bearers for one credential have different fingerprints")
 		}
 	}
+	first, err := a.GetResponsesCredential(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.responsesMu.Lock()
 	a.responsesToken = "refreshed-token"
-	if a.CredentialFingerprint("refreshed-token") != want {
+	a.responsesMu.Unlock()
+	refreshed, err := a.GetResponsesCredential(context.Background())
+	if err != nil || refreshed.Token != "refreshed-token" || refreshed.SourceFingerprint != first.SourceFingerprint {
 		t.Fatal("service token refresh changed the source fingerprint")
 	}
-	a.accessToken, a.copilotToken = "source-two", "chat-two"
-	a.copilotSourceFingerprint = sha256.Sum256([]byte("source-two"))
-	a.responsesSourceToken, a.responsesToken = "source-two", "responses-two"
-	if a.CredentialFingerprint("chat-token") == a.CredentialFingerprint("chat-two") {
+	a.mu.Lock()
+	a.copilotToken = "ghu_source-two"
+	a.copilotSourceFingerprint = sha256.Sum256([]byte("ghu_source-two"))
+	a.mu.Unlock()
+	current, err := a.GetCredential(context.Background())
+	if err != nil || current.SourceFingerprint == first.SourceFingerprint || first.SourceFingerprint != want {
 		t.Fatal("old in-flight bearer inherited another login")
 	}
-	if a.CredentialFingerprint("") != ([32]byte{}) {
-		t.Fatal("empty bearer has a fingerprint")
+}
+
+func TestCredentialCapturesSourceBeforeSharedResultIsPublished(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "")
+	for _, device := range []bool{false, true} {
+		for _, nextSource := range []string{"source-one", "source-two"} {
+			t.Run(fmt.Sprintf("device=%t/source=%s", device, nextSource), func(t *testing.T) {
+				want := sha256.Sum256([]byte("source-one"))
+				a := NewTestAuthenticator("issued-bearer")
+				a.copilotSourceFingerprint = want
+				rotate := func() {
+					a.mu.Lock()
+					a.copilotToken = "refreshed-bearer"
+					a.copilotSourceFingerprint = sha256.Sum256([]byte(nextSource))
+					a.mu.Unlock()
+				}
+				get := a.GetCredential
+				if device {
+					a.beforeDeviceCallFinalize = rotate
+					get = a.getTokenWithDeviceFlow
+				} else {
+					a.beforeRefreshCallFinalize = rotate
+				}
+				credential, err := get(context.Background())
+				if err != nil || credential.Token != "issued-bearer" || credential.SourceFingerprint != want {
+					t.Fatalf("issued bearer lost its source during refresh: %v", err)
+				}
+				current, err := a.GetCredential(context.Background())
+				if err != nil || current.Token != "refreshed-bearer" || current.SourceFingerprint != sha256.Sum256([]byte(nextSource)) {
+					t.Fatalf("refreshed bearer has the wrong source: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestResponsesCredentialKeepsSourceDuringExchange(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "")
+	const source = "ghu_original-source"
+	for _, nextSource := range []string{source, "ghu_replacement-source"} {
+		t.Run(nextSource, func(t *testing.T) {
+			a := NewTestAuthenticator(source)
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				call := calls.Add(1)
+				wantSource := source
+				if call > 1 {
+					wantSource = nextSource
+				}
+				if r.Header.Get("Authorization") != "token "+wantSource {
+					t.Error("Responses exchange used a different source credential")
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if call == 1 {
+					a.mu.Lock()
+					a.copilotToken = nextSource
+					a.copilotSourceFingerprint = sha256.Sum256([]byte(nextSource))
+					a.mu.Unlock()
+				}
+				_ = json.NewEncoder(w).Encode(CopilotTokenResponse{
+					Token: fmt.Sprintf("responses-bearer-%d", call), ExpiresAt: time.Now().Add(time.Hour).Unix(),
+				})
+			}))
+			defer server.Close()
+			a.client, a.copilotBaseURL = server.Client(), server.URL
+			first, err := a.GetResponsesCredential(context.Background())
+			if err != nil || first.Token != "responses-bearer-1" || first.SourceFingerprint != sha256.Sum256([]byte(source)) {
+				t.Fatalf("Responses bearer lost its source during exchange: %v", err)
+			}
+			a.responsesMu.Lock()
+			a.responsesTokenExpiry = time.Time{}
+			a.responsesMu.Unlock()
+			current, err := a.GetResponsesCredential(context.Background())
+			if err != nil || current.Token != "responses-bearer-2" || current.SourceFingerprint != sha256.Sum256([]byte(nextSource)) || calls.Load() != 2 {
+				t.Fatalf("refreshed Responses bearer has the wrong source: %v", err)
+			}
+		})
 	}
 }
 
@@ -90,12 +177,12 @@ func TestCredentialFingerprintCachedTokenLifecycle(t *testing.T) {
 			}
 			writeSource(originalSource)
 			original := newAuth()
-			first, err := original.GetTokenNonInteractive(context.Background())
+			first, err := original.GetCredential(context.Background())
 			if err != nil || calls.Load() != 1 {
 				t.Fatalf("initial authentication: error=%v exchanges=%d", err, calls.Load())
 			}
 			want := sha256.Sum256([]byte(originalSource))
-			if original.CredentialFingerprint(first) != want {
+			if first.SourceFingerprint != want {
 				t.Fatal("initial bearer lost its issuing credential")
 			}
 			cache, err := os.ReadFile(filepath.Join(dir, "api-key.json"))
@@ -107,11 +194,11 @@ func TestCredentialFingerprintCachedTokenLifecycle(t *testing.T) {
 			}
 			writeSource(tc.nextSource)
 			restarted := newAuth()
-			cached, err := restarted.GetResponsesToken(context.Background())
-			if err != nil || cached != first || calls.Load() != 1 {
+			cached, err := restarted.GetResponsesCredential(context.Background())
+			if err != nil || cached.Token != first.Token || calls.Load() != 1 {
 				t.Fatalf("cached startup repeated authentication: error=%v exchanges=%d", err, calls.Load())
 			}
-			if restarted.CredentialFingerprint(cached) != want {
+			if cached.SourceFingerprint != want {
 				t.Error("cached bearer lost its issuing credential after restart")
 			}
 			reject.Store(tc.failRefresh)
@@ -120,27 +207,34 @@ func TestCredentialFingerprintCachedTokenLifecycle(t *testing.T) {
 				if err == nil || calls.Load() != 2 {
 					t.Fatalf("replacement refresh: error=%v exchanges=%d", err, calls.Load())
 				}
-				if restarted.CredentialFingerprint(cached) != want {
+				if cached.SourceFingerprint != want {
 					t.Error("failed replacement assigned its credential to the cached bearer")
 				}
 				return
 			}
-			if err != nil || refreshed == cached || calls.Load() != 2 {
+			if err != nil || refreshed == cached.Token || calls.Load() != 2 {
 				t.Fatalf("service-token refresh: error=%v exchanges=%d", err, calls.Load())
 			}
+			if cached.SourceFingerprint != want {
+				t.Error("in-flight bearer lost its issuing credential after refresh")
+			}
+			current, err := restarted.GetCredential(context.Background())
+			if err != nil || current.Token != refreshed {
+				t.Fatalf("refreshed credential: error=%v", err)
+			}
 			nextWant := sha256.Sum256([]byte(tc.nextSource))
-			if restarted.CredentialFingerprint(refreshed) != nextWant {
+			if current.SourceFingerprint != nextWant {
 				t.Fatal("refreshed bearer has the wrong issuing credential")
 			}
-			if tc.nextSource == originalSource && restarted.CredentialFingerprint(refreshed) != original.CredentialFingerprint(first) {
+			if tc.nextSource == originalSource && current.SourceFingerprint != first.SourceFingerprint {
 				t.Fatal("same-credential refresh changed session identity")
 			}
-			if tc.nextSource != originalSource && restarted.CredentialFingerprint(refreshed) == original.CredentialFingerprint(first) {
+			if tc.nextSource != originalSource && current.SourceFingerprint == first.SourceFingerprint {
 				t.Fatal("replacement credential inherited the previous session identity")
 			}
 			loadedAgain := newAuth()
-			last, err := loadedAgain.GetTokenNonInteractive(context.Background())
-			if err != nil || last != refreshed || calls.Load() != 2 || loadedAgain.CredentialFingerprint(last) != nextWant {
+			last, err := loadedAgain.GetCredential(context.Background())
+			if err != nil || last.Token != refreshed || calls.Load() != 2 || last.SourceFingerprint != nextWant {
 				t.Fatalf("refreshed cache lost its identity: error=%v exchanges=%d", err, calls.Load())
 			}
 		})
@@ -161,11 +255,11 @@ func TestCredentialFingerprintLegacyCacheDoesNotAssumeCurrentSource(t *testing.T
 		t.Fatal(err)
 	}
 	a := &Authenticator{tokenDir: dir, accessToken: "different-memory-source"}
-	token, err := a.GetTokenNonInteractive(context.Background())
-	if err != nil || token != "legacy-cached-bearer" {
+	credential, err := a.GetCredential(context.Background())
+	if err != nil || credential.Token != "legacy-cached-bearer" {
 		t.Fatalf("legacy cache is no longer usable: %v", err)
 	}
-	if a.CredentialFingerprint(token) != sha256.Sum256([]byte(token)) {
+	if credential.SourceFingerprint != sha256.Sum256([]byte(credential.Token)) {
 		t.Fatal("legacy cache assumed an unverified source credential")
 	}
 }
@@ -201,19 +295,20 @@ func TestCredentialFingerprintGitHubCLIRefreshWithoutPersistence(t *testing.T) {
 	if err := a.SignInWithGitHubCLI(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	first, err := a.GetResponsesToken(context.Background())
+	first, err := a.GetResponsesCredential(context.Background())
 	if err != nil || calls.Load() != 1 {
 		t.Fatalf("CLI authentication: error=%v exchanges=%d", err, calls.Load())
 	}
 	want := sha256.Sum256([]byte(source))
-	if a.CredentialFingerprint(first) != want {
+	if first.SourceFingerprint != want {
 		t.Fatal("CLI bearer lost its issuing credential")
 	}
 	refreshed, err := a.RefreshTokenNonInteractive(context.Background())
-	if err != nil || refreshed == first || calls.Load() != 2 {
+	if err != nil || refreshed == first.Token || calls.Load() != 2 {
 		t.Fatalf("CLI refresh: error=%v exchanges=%d", err, calls.Load())
 	}
-	if a.CredentialFingerprint(refreshed) != want {
+	current, err := a.GetCredential(context.Background())
+	if err != nil || current.Token != refreshed || current.SourceFingerprint != want || first.SourceFingerprint != want {
 		t.Fatal("CLI refresh changed session identity")
 	}
 	for _, filename := range []string{"access-token", "api-key.json"} {
@@ -257,11 +352,11 @@ func TestCredentialFingerprintMalformedCacheRefreshes(t *testing.T) {
 				t.Fatal(err)
 			}
 			a.client, a.directClient, a.copilotBaseURL = server.Client(), server.Client(), server.URL
-			token, err := a.GetTokenNonInteractive(context.Background())
-			if err != nil || token != "recovered-service-token" || calls.Load() != 1 {
+			credential, err := a.GetCredential(context.Background())
+			if err != nil || credential.Token != "recovered-service-token" || calls.Load() != 1 {
 				t.Fatalf("malformed cache did not reauthenticate: error=%v exchanges=%d", err, calls.Load())
 			}
-			if a.CredentialFingerprint(token) != sha256.Sum256([]byte(source)) {
+			if credential.SourceFingerprint != sha256.Sum256([]byte(source)) {
 				t.Fatal("recovered bearer lost its issuing credential")
 			}
 		})

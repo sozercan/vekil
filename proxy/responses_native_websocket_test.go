@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -420,6 +419,7 @@ func testResponsesNativeNonCopilotHTTPHistory(t *testing.T, counts []int) {
 }
 
 func TestResponsesNativeWebSocketCredentialBinding(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "")
 	var connections, frames atomic.Int32
 	closed := make(chan struct{}, 1)
 	h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -452,8 +452,11 @@ func TestResponsesNativeWebSocketCredentialBinding(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		req.Header.Set("Authorization", "Bearer "+bearer)
-		return withCopilotInferenceRequest(req, provider, providerEndpointResponses, body, sha256.Sum256([]byte(source)))
+		h.auth = auth.NewTestAuthenticatorWithResponsesToken("ghu_"+source, bearer)
+		if err := h.applyProviderHeaders(req, provider, providerEndpointResponses); err != nil {
+			t.Fatal(err)
+		}
+		return withCopilotInferenceRequest(req, provider, providerEndpointResponses, body)
 	}
 	for _, bearer := range []string{"service-token-one", "refreshed-service-token"} {
 		resp, handled, err := h.maybeSendNativeResponses(newRequest(bearer, "source-one"))

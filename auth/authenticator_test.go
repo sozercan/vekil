@@ -2488,11 +2488,11 @@ func TestGetTokenDeviceLeaderCancellationDoesNotCancelLiveWaiter(t *testing.T) {
 		err   error
 	}, 1)
 	go func() {
-		token, err := a.getTokenWithDeviceFlow(context.Background())
+		credential, err := a.getTokenWithDeviceFlow(context.Background())
 		waiterDone <- struct {
 			token string
 			err   error
-		}{token: token, err: err}
+		}{token: credential.Token, err: err}
 	}()
 	waitForAuthDeviceWaiters(t, a, 2)
 	cancelLeader()
@@ -2689,11 +2689,11 @@ func TestSignOutInvalidatesInFlightDeviceResults(t *testing.T) {
 	}, 2)
 	for range 2 {
 		go func() {
-			token, err := a.getTokenWithDeviceFlow(context.Background())
+			credential, err := a.getTokenWithDeviceFlow(context.Background())
 			results <- struct {
 				token string
 				err   error
-			}{token: token, err: err}
+			}{token: credential.Token, err: err}
 		}()
 	}
 	waitForAuthDeviceWaiters(t, a, 2)
@@ -2728,21 +2728,21 @@ func TestSignOutInvalidatesCompletedSharedResults(t *testing.T) {
 	generation := a.generation.Load()
 	refresh := &authTokenCall{
 		done:       make(chan struct{}),
-		token:      "stale-refresh-token",
+		credential: Credential{Token: "stale-refresh-token"},
 		waiters:    1,
 		completed:  true,
 		generation: generation,
 	}
 	device := &authTokenCall{
 		done:       make(chan struct{}),
-		token:      "stale-device-token",
+		credential: Credential{Token: "stale-device-token"},
 		waiters:    1,
 		completed:  true,
 		generation: generation,
 	}
 	responses := &authTokenCall{
 		done:       make(chan struct{}),
-		token:      "stale-responses-token",
+		credential: Credential{Token: "stale-responses-token"},
 		waiters:    1,
 		completed:  true,
 		generation: generation,
@@ -2754,11 +2754,11 @@ func TestSignOutInvalidatesCompletedSharedResults(t *testing.T) {
 	if err := a.SignOut(); err != nil {
 		t.Fatalf("SignOut() error = %v", err)
 	}
-	if token, err, _ := a.waitForRefreshCall(context.Background(), refresh); token != "" || !errors.Is(err, ErrNotAuthenticated) {
-		t.Fatalf("completed refresh result = (%q, %v), want ErrNotAuthenticated", token, err)
+	if credential, err, _ := a.waitForRefreshCall(context.Background(), refresh); credential != (Credential{}) || !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("completed refresh result = (%v, %v), want ErrNotAuthenticated", credential, err)
 	}
-	if token, err := a.waitForDeviceCall(context.Background(), device); token != "" || !errors.Is(err, ErrNotAuthenticated) {
-		t.Fatalf("completed device result = (%q, %v), want ErrNotAuthenticated", token, err)
+	if credential, err := a.waitForDeviceCall(context.Background(), device); credential != (Credential{}) || !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("completed device result = (%v, %v), want ErrNotAuthenticated", credential, err)
 	}
 	if token, err, _ := a.waitForResponsesCall(context.Background(), responses); token != "" || !errors.Is(err, ErrNotAuthenticated) {
 		t.Fatalf("completed Responses result = (%q, %v), want ErrNotAuthenticated", token, err)

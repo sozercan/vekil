@@ -41,12 +41,13 @@ type copilotInferenceRequest struct {
 
 type copilotInferenceRequestContextKey struct{}
 type copilotAdmissionInboundContextKey struct{}
+type copilotSourceFingerprintContextKey struct{}
 
 // Only fixed-size fingerprints enter shared state. Including provider and
 // origin prevents credentials reused by different providers from sharing a
 // cooldown. Integration limits intentionally cover credentials within that
 // provider only.
-func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, endpoint string, body []byte, sourceFingerprint ...[32]byte) *http.Request {
+func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, endpoint string, body []byte) *http.Request {
 	if req == nil || req.URL == nil || provider == nil || provider.kind != providerTypeCopilot {
 		return req
 	}
@@ -57,8 +58,8 @@ func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, e
 	}
 	origin := req.URL.Scheme + "://" + strings.ToLower(req.URL.Host)
 	credential := sha256.Sum256([]byte(req.Header.Get("Authorization")))
-	if len(sourceFingerprint) > 0 {
-		credential = sourceFingerprint[0]
+	if sourceFingerprint, ok := req.Context().Value(copilotSourceFingerprintContextKey{}).([32]byte); ok {
+		credential = sourceFingerprint
 	}
 	account := copilotTrafficFingerprint(provider.id, origin, string(credential[:]))
 	integration := copilotTrafficFingerprint(provider.id, origin, req.Header.Get("Copilot-Integration-ID"))

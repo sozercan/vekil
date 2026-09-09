@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sozercan/vekil/auth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -2508,17 +2509,18 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 
 	switch provider.kind {
 	case providerTypeCopilot:
-		var token string
+		var credential auth.Credential
 		var err error
 		if endpoint == providerEndpointResponses {
-			token, err = h.auth.GetResponsesToken(req.Context())
+			credential, err = h.auth.GetResponsesCredential(req.Context())
 		} else {
-			token, err = h.auth.GetToken(req.Context())
+			credential, err = h.auth.GetCredential(req.Context())
 		}
 		if err != nil {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
 		}
-		h.setCopilotHeadersForProvider(req, token, provider, endpoint)
+		h.setCopilotHeadersForProvider(req, credential.Token, provider, endpoint)
+		*req = *req.WithContext(context.WithValue(req.Context(), copilotSourceFingerprintContextKey{}, credential.SourceFingerprint))
 	case providerTypeAzureOpenAI:
 		clearCopilotHeaders(req.Header)
 		mergeHeaderValues(req.Header, provider.extraHeaders)
@@ -2688,12 +2690,7 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 		if client != nil && client.Jar != nil {
 			req.Header = shallowCloneHeader(req.Header)
 		}
-		if provider != nil && provider.kind == providerTypeCopilot && h.auth != nil {
-			bearer := strings.TrimSpace(strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "))
-			req = withCopilotInferenceRequest(req, provider, path, body, h.auth.CredentialFingerprint(bearer))
-		} else {
-			req = withCopilotInferenceRequest(req, provider, path, body)
-		}
+		req = withCopilotInferenceRequest(req, provider, path, body)
 		req = withTaskInferenceRequest(req, path)
 	}
 	return req, err

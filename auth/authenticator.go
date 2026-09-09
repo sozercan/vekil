@@ -110,7 +110,7 @@ type authTokenCall struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	done       chan struct{}
-	token      string
+	credential Credential
 	err        error
 	waiters    int
 	completed  bool
@@ -295,13 +295,15 @@ func (a *Authenticator) hasValidCopilotTokenOnDisk() bool {
 // GetToken returns a usable Copilot API bearer, refreshing it if necessary.
 // It is safe for concurrent use.
 func (a *Authenticator) GetToken(ctx context.Context) (string, error) {
-	return a.getToken(ctx, !a.DisableAutoDeviceFlow)
+	credential, err := a.GetCredential(ctx)
+	return credential.Token, err
 }
 
 // GetTokenNonInteractive returns a valid Copilot API token without falling
 // back to the interactive device-code flow.
 func (a *Authenticator) GetTokenNonInteractive(ctx context.Context) (string, error) {
-	return a.getToken(ctx, false)
+	credential, err := a.getToken(ctx, false)
+	return credential.Token, err
 }
 
 // GetResponsesToken returns the credential used for Copilot /responses
@@ -310,14 +312,8 @@ func (a *Authenticator) GetTokenNonInteractive(ctx context.Context) (string, err
 // Responses. That fallback is cached in memory only and keyed to the active
 // GitHub credential. Other supported credentials remain direct bearers.
 func (a *Authenticator) GetResponsesToken(ctx context.Context) (string, error) {
-	token, err := a.GetToken(ctx)
-	if err != nil {
-		return "", err
-	}
-	if !strings.HasPrefix(strings.TrimSpace(token), "ghu_") {
-		return token, nil
-	}
-	return a.runSharedResponsesToken(ctx, token)
+	credential, err := a.GetResponsesCredential(ctx)
+	return credential.Token, err
 }
 
 // RefreshTokenNonInteractive reloads existing GitHub authentication without
@@ -325,7 +321,8 @@ func (a *Authenticator) GetResponsesToken(ctx context.Context) (string, error) {
 // GetTokenNonInteractive, it bypasses any cached Copilot bearer.
 func (a *Authenticator) RefreshTokenNonInteractive(ctx context.Context) (string, error) {
 	envToken, _ := lookupAccessTokenFromEnv()
-	return a.runSharedRefresh(ctx, envToken, true)
+	credential, err := a.runSharedRefresh(ctx, envToken, true)
+	return credential.Token, err
 }
 
 // IsInteractiveLoginRequired reports whether resolving the error should fall
@@ -334,7 +331,7 @@ func IsInteractiveLoginRequired(err error) bool {
 	return errors.Is(err, ErrNotAuthenticated) || errors.Is(err, ErrInvalidAccessToken)
 }
 
-func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (string, error) {
+func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (Credential, error) {
 	if envToken, _ := lookupAccessTokenFromEnv(); envToken != "" {
 		return a.getTokenFromEnv(ctx, envToken)
 	}
@@ -344,32 +341,32 @@ func (a *Authenticator) getToken(ctx context.Context, allowDeviceFlow bool) (str
 		return token, nil
 	}
 	if !allowDeviceFlow || !IsInteractiveLoginRequired(err) {
-		return "", err
+		return Credential{}, err
 	}
 
 	return a.getTokenWithDeviceFlow(ctx)
 }
 
-func (a *Authenticator) getTokenWithoutDeviceFlow(ctx context.Context) (string, error) {
+func (a *Authenticator) getTokenWithoutDeviceFlow(ctx context.Context) (Credential, error) {
 	return a.runSharedRefresh(ctx, "", false)
 }
 
-func (a *Authenticator) getTokenWithDeviceFlow(ctx context.Context) (string, error) {
+func (a *Authenticator) getTokenWithDeviceFlow(ctx context.Context) (Credential, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if a.signingOut.Load() {
-		return "", ErrNotAuthenticated
+		return Credential{}, ErrNotAuthenticated
 	}
 
 	a.deviceCallMu.Lock()
 	if err := ctx.Err(); err != nil {
 		a.deviceCallMu.Unlock()
-		return "", err
+		return Credential{}, err
 	}
 	if a.signingOut.Load() {
 		a.deviceCallMu.Unlock()
-		return "", ErrNotAuthenticated
+		return Credential{}, ErrNotAuthenticated
 	}
 	if call := a.deviceCall; call != nil && !call.abandoned {
 		call.waiters++
@@ -393,18 +390,18 @@ func (a *Authenticator) getTokenWithDeviceFlow(ctx context.Context) (string, err
 }
 
 func (a *Authenticator) executeDeviceCall(call *authTokenCall) {
-	var token string
+	var credential Credential
 	var err error
 	if lockErr := a.acquireDeviceFlow(call.ctx); lockErr != nil {
 		err = lockErr
 	} else {
 		// Another goroutine or process may have completed sign-in while this
 		// call waited for the interactive-login slot.
-		token, err = a.getToken(call.ctx, false)
+		credential, err = a.getToken(call.ctx, false)
 		if err != nil && IsInteractiveLoginRequired(err) && call.ctx.Err() == nil && !a.signingOut.Load() {
 			err = a.deviceCodeFlow(call.ctx)
 			if err == nil {
-				token, err = a.getToken(call.ctx, false)
+				credential, err = a.getToken(call.ctx, false)
 			}
 		}
 		a.releaseDeviceFlow()
@@ -416,12 +413,12 @@ func (a *Authenticator) executeDeviceCall(call *authTokenCall) {
 
 	a.deviceCallMu.Lock()
 	if call.abandoned {
-		token = ""
+		credential = Credential{}
 		if err == nil {
 			err = context.Canceled
 		}
 	}
-	call.token = token
+	call.credential = credential
 	call.err = err
 	call.completed = true
 	if a.deviceCall == call {
@@ -432,7 +429,7 @@ func (a *Authenticator) executeDeviceCall(call *authTokenCall) {
 	a.deviceCallMu.Unlock()
 }
 
-func (a *Authenticator) waitForDeviceCall(ctx context.Context, call *authTokenCall) (string, error) {
+func (a *Authenticator) waitForDeviceCall(ctx context.Context, call *authTokenCall) (Credential, error) {
 	completed := false
 	select {
 	case <-call.done:
@@ -449,39 +446,39 @@ func (a *Authenticator) waitForDeviceCall(ctx context.Context, call *authTokenCa
 		}
 		call.cancel()
 	}
-	token, err := call.token, call.err
+	credential, err := call.credential, call.err
 	a.deviceCallMu.Unlock()
 
 	if !completed {
-		return "", ctx.Err()
+		return Credential{}, ctx.Err()
 	}
 	if a.signingOut.Load() || call.generation != a.generation.Load() {
-		return "", ErrNotAuthenticated
+		return Credential{}, ErrNotAuthenticated
 	}
-	return token, err
+	return credential, err
 }
 
-func (a *Authenticator) getTokenFromEnv(ctx context.Context, envToken string) (string, error) {
+func (a *Authenticator) getTokenFromEnv(ctx context.Context, envToken string) (Credential, error) {
 	return a.runSharedRefresh(ctx, envToken, false)
 }
 
-func (a *Authenticator) runSharedRefresh(ctx context.Context, envToken string, force bool) (string, error) {
+func (a *Authenticator) runSharedRefresh(ctx context.Context, envToken string, force bool) (Credential, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if a.signingOut.Load() {
-		return "", ErrNotAuthenticated
+		return Credential{}, ErrNotAuthenticated
 	}
 
 	for {
 		a.refreshMu.Lock()
 		if err := ctx.Err(); err != nil {
 			a.refreshMu.Unlock()
-			return "", err
+			return Credential{}, err
 		}
 		if a.signingOut.Load() {
 			a.refreshMu.Unlock()
-			return "", ErrNotAuthenticated
+			return Credential{}, ErrNotAuthenticated
 		}
 		if call := a.refreshCall; call != nil && !call.abandoned {
 			call.waiters++
@@ -514,7 +511,7 @@ func (a *Authenticator) runSharedRefresh(ctx context.Context, envToken string, f
 }
 
 func (a *Authenticator) executeRefreshCall(call *authTokenCall) {
-	token, err := a.performRefresh(call.ctx, call.envToken, call.force)
+	credential, err := a.performRefresh(call.ctx, call.envToken, call.force)
 
 	if a.beforeRefreshCallFinalize != nil {
 		a.beforeRefreshCallFinalize()
@@ -522,12 +519,12 @@ func (a *Authenticator) executeRefreshCall(call *authTokenCall) {
 
 	a.refreshMu.Lock()
 	if call.abandoned {
-		token = ""
+		credential = Credential{}
 		if err == nil {
 			err = context.Canceled
 		}
 	}
-	call.token = token
+	call.credential = credential
 	call.err = err
 	call.completed = true
 	if a.refreshCall == call {
@@ -538,7 +535,7 @@ func (a *Authenticator) executeRefreshCall(call *authTokenCall) {
 	a.refreshMu.Unlock()
 }
 
-func (a *Authenticator) waitForRefreshCall(ctx context.Context, call *authTokenCall) (string, error, bool) {
+func (a *Authenticator) waitForRefreshCall(ctx context.Context, call *authTokenCall) (Credential, error, bool) {
 	completed := false
 	select {
 	case <-call.done:
@@ -555,16 +552,16 @@ func (a *Authenticator) waitForRefreshCall(ctx context.Context, call *authTokenC
 		}
 		call.cancel()
 	}
-	token, err := call.token, call.err
+	credential, err := call.credential, call.err
 	a.refreshMu.Unlock()
 
 	if !completed {
-		return "", ctx.Err(), false
+		return Credential{}, ctx.Err(), false
 	}
 	if a.signingOut.Load() || call.generation != a.generation.Load() {
-		return "", ErrNotAuthenticated, false
+		return Credential{}, ErrNotAuthenticated, false
 	}
-	return token, err, true
+	return credential, err, true
 }
 
 func (a *Authenticator) runSharedResponsesToken(ctx context.Context, sourceToken string) (string, error) {
@@ -636,7 +633,7 @@ func (a *Authenticator) executeResponsesCall(call *authTokenCall) {
 		a.responsesToken = token
 		a.responsesTokenExpiry = expires
 	}
-	call.token = token
+	call.credential.Token = token
 	call.err = err
 	call.completed = true
 	if a.responsesCall == call {
@@ -664,7 +661,7 @@ func (a *Authenticator) waitForResponsesCall(ctx context.Context, call *authToke
 		}
 		call.cancel()
 	}
-	token, err := call.token, call.err
+	token, err := call.credential.Token, call.err
 	a.responsesMu.Unlock()
 
 	if !completed {
@@ -725,24 +722,24 @@ func (a *Authenticator) abandonSharedAuthCalls() {
 	a.responsesMu.Unlock()
 }
 
-func (a *Authenticator) performRefresh(ctx context.Context, envToken string, force bool) (string, error) {
+func (a *Authenticator) performRefresh(ctx context.Context, envToken string, force bool) (Credential, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return Credential{}, err
 	}
 	if !force {
 		if envToken != "" {
 			if a.accessToken == envToken && a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
-				return a.copilotToken, nil
+				return a.credentialLocked(), nil
 			}
 		} else {
 			if a.copilotToken != "" && time.Now().Before(a.tokenExpiry) {
-				return a.copilotToken, nil
+				return a.credentialLocked(), nil
 			}
 			if err := a.loadCopilotToken(); err == nil {
-				return a.copilotToken, nil
+				return a.credentialLocked(), nil
 			}
 		}
 	}
@@ -757,15 +754,15 @@ func (a *Authenticator) performRefresh(ctx context.Context, envToken string, for
 			a.tokenExpiry = time.Time{}
 		}
 		if err := a.useGitHubCredential(ctx, envToken, true); err != nil {
-			return "", err
+			return Credential{}, err
 		}
-		return a.copilotToken, nil
+		return a.credentialLocked(), nil
 	}
 
 	if err := a.refreshToken(ctx, false); err != nil {
-		return "", err
+		return Credential{}, err
 	}
-	return a.copilotToken, nil
+	return a.credentialLocked(), nil
 }
 
 // useGitHubCredential keeps supported GitHub credentials on the direct path
