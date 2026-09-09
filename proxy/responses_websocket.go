@@ -2496,7 +2496,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponseWithRequest(h *ProxyHa
 		}
 		failureStatus := 0
 		if parsedEvent && (event.Type == "response.failed" || event.Type == "error") {
-			if upstreamRequest != nil && routeOperationFromContext(upstreamRequest.Context()) == nil {
+			if upstreamRequest != nil {
 				h.observeCopilotResponseFailure(upstreamRequest, event, responsesFailureHeaders(event, headers))
 			}
 			failureStatus, _, _, _ = responsesWebSocketStreamFailureDetails(event, headers)

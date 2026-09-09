@@ -118,6 +118,96 @@ func TestCopilotResponsesBackedChatStreamThrottleCreatesCooldown(t *testing.T) {
 	}
 }
 
+func TestCopilotExplicitWebSocketLateThrottleCreatesCooldown(t *testing.T) {
+	for _, tc := range []struct {
+		name, failure string
+		headers       http.Header
+	}{
+		{
+			name: "HTTP reset", headers: http.Header{"Retry-After": {"86400"}},
+			failure: `{"type":"response.failed","response":{"id":"resp-late","status":"failed","error":{"code":"user_model_rate_limited","message":"model reset"}}}`,
+		},
+		{
+			name:    "embedded reset",
+			failure: `{"type":"error","code":"user_model_rate_limited","message":"model reset","headers":{"retry-after-ms":86400000}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sends atomic.Int32
+			releaseFailure := make(chan struct{}, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if sends.Add(1) != 1 {
+					http.Error(w, "unexpected second upstream send", http.StatusInternalServerError)
+					return
+				}
+				mergeHeaderValues(w.Header(), tc.headers)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: "+`{"type":"response.created","response":{"id":"resp-late","status":"in_progress","output":[]}}`+"\n\n"+
+					"data: "+`{"type":"response.output_text.delta","delta":"hello"}`+"\n\n")
+				w.(http.Flusher).Flush()
+				select {
+				case <-releaseFailure:
+				case <-r.Context().Done():
+					return
+				}
+				_, _ = io.WriteString(w, "data: "+tc.failure+"\n\n")
+			}))
+			defer upstream.Close()
+			defer close(releaseFailure)
+			provider := explicitRouteTestProvider("copilot", upstream.URL, "")
+			provider.kind = providerTypeCopilot
+			provider.paths = providerEndpointPolicyFor(providerTypeCopilot).defaultEndpointPaths()
+			h, _ := explicitRouteTestHandler(t, upstream.Client(), routeModePrimaryOnly, 1, 1, provider)
+			h.auth = auth.NewTestAuthenticator("test-token")
+			h.log = logger.NewWithWriter(logger.LevelError, io.Discard)
+			h.stats = newStatsCollector()
+			h.responsesWS = ResponsesWebSocketConfig{Enabled: true, DisableAutoCompact: true}
+			now := time.Now()
+			h.copilotTraffic.now = func() time.Time { return now }
+			conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
+			defer func() { _ = conn.Close() }()
+			request := newResponsesWebSocketCreateRequest(nil)
+			request["model"] = "public-model"
+			if err := conn.WriteJSON(request); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"response.created", "response.output_text.delta"} {
+				if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != want {
+					t.Fatalf("progress frame = %#v, want %s", frame, want)
+				}
+			}
+			releaseFailure <- struct{}{}
+			for {
+				frame := mustReadWebSocketJSONSkipMetadata(t, conn)
+				if frame["type"] == "error" && frame["status_code"] == float64(http.StatusTooManyRequests) {
+					break
+				}
+				if frame["type"] != "response.failed" && frame["type"] != "error" {
+					t.Fatalf("late throttle frame = %#v", frame)
+				}
+			}
+			if err := conn.WriteJSON(request); err != nil {
+				t.Fatal(err)
+			}
+			frame := mustReadWebSocketJSONSkipMetadata(t, conn)
+			headers := make(http.Header)
+			if rawHeaders, ok := frame["headers"].(map[string]any); ok {
+				for name, value := range rawHeaders {
+					if value, ok := value.(string); ok {
+						headers.Set(name, value)
+					}
+				}
+			}
+			if frame["type"] != "error" || frame["status_code"] != float64(http.StatusTooManyRequests) || headers.Get("Retry-After") != "86400" || sends.Load() != 1 {
+				t.Fatalf("next turn escaped cooldown: sends=%d frame=%#v", sends.Load(), frame)
+			}
+			if usage := h.stats.taskUsage.snapshot(); usage.Totals.Sends != 1 || usage.Inflight != 0 {
+				t.Fatalf("local cooldown rejection counted as an upstream send: %+v", usage)
+			}
+		})
+	}
+}
+
 func TestCopilotResponsesStreamThrottleRequiresStructuredEvidence(t *testing.T) {
 	const failure = `{"type":"response.failed","response":{"status":"failed","error":{"code":"user_model_rate_limited"}}}`
 	frame := "data: " + failure + "\n\n"
