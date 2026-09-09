@@ -142,6 +142,44 @@ func TestTaskUsageResponsesTerminalAccounting(t *testing.T) {
 	}
 }
 
+func TestTaskUsageAnthropicRequiresMessageStop(t *testing.T) {
+	start := "event: message_start\ndata: " + `{"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":1}}}` + "\n\n"
+	blockStop := "event: content_block_stop\ndata: " + `{"type":"content_block_stop","index":0}` + "\n\n"
+	delta := "event: message_delta\ndata: " + `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}` + "\n\n"
+	stop := "event: message_stop\ndata: " + `{"type":"message_stop"}` + "\n\n"
+	for _, tc := range []struct {
+		name, body             string
+		readErr                error
+		wantErrors, wantOutput int64
+	}{
+		{name: "truncated after block", body: start + blockStop, wantErrors: 1, wantOutput: 1},
+		{name: "truncated after delta", body: start + blockStop + delta, wantErrors: 1, wantOutput: 2},
+		{name: "message stop", body: start + blockStop + delta + stop, wantOutput: 2},
+		{name: "event name fallback", body: start + delta + "event: message_stop\ndata: {}\n\n", wantOutput: 2},
+		{name: "canceled before stop", body: start + blockStop + delta, readErr: context.Canceled, wantErrors: 1, wantOutput: 2},
+		{name: "canceled after stop", body: start + blockStop + delta + stop, readErr: context.Canceled, wantOutput: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &ProxyHandler{stats: newStatsCollector()}
+			var reader io.Reader = strings.NewReader(tc.body)
+			if tc.readErr != nil {
+				reader = io.MultiReader(reader, &fixedErrorReadCloser{err: tc.readErr})
+			}
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(reader)}
+			h.beginTaskInferenceSend(httptest.NewRequest(http.MethodPost, providerEndpointMessages, nil)).finish(resp, nil)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			snapshot := h.stats.taskUsage.snapshot()
+			if snapshot.Inflight != 0 || snapshot.Totals.Sends != 1 || snapshot.Totals.Completed != 1 || snapshot.Totals.Errors != tc.wantErrors {
+				t.Fatalf("Anthropic terminal accounting = %+v", snapshot)
+			}
+			if snapshot.Totals.Usage.PromptTokens != 7 || snapshot.Totals.Usage.CompletionTokens != tc.wantOutput {
+				t.Fatalf("Anthropic terminal lost partial usage: %+v", snapshot.Totals.Usage)
+			}
+		})
+	}
+}
+
 func TestTaskUsageAuxiliaryKindsAndCustomEndpoint(t *testing.T) {
 	h := &ProxyHandler{stats: newStatsCollector(), client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Request: req,

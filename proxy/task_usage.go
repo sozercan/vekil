@@ -173,6 +173,7 @@ func (s *taskInferenceSend) finishResponse(resp *http.Response, sendErr error) {
 	state.observer.acceptIncompleteResponses = true
 	// Chat's [DONE] sentinel does not finish a Responses send.
 	state.observer.requireResponsesTerminal = true
+	state.observer.requireMessageStop = true
 	if !state.observer.streaming && state.observer.envelope != nil {
 		state.observer.envelope.fields = append(state.observer.envelope.fields, routeAttemptJSONField{name: "copilot_usage", maxBytes: 64 << 10})
 		if state.nativeCount {

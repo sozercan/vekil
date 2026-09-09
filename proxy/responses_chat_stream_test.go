@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"strings"
@@ -57,6 +58,34 @@ func TestResponsesChatStream_TextFixture(t *testing.T) {
 	}
 	if !reflect.DeepEqual(chunks[4].Usage, wantUsage) || len(chunks[4].Choices) != 0 {
 		t.Fatalf("usage chunk = %#v, want %#v", chunks[4], wantUsage)
+	}
+}
+
+func TestResponsesChatStreamPreservesBillingPublicIdentity(t *testing.T) {
+	const billing = `{"total_nano_aiu":27,"compute_units":2,"token_details":[{"model":"physical-terminal"}]}`
+	fixture := bytes.Replace(readResponsesChatStreamFixture(t, "stream_text.sse"),
+		[]byte(`"type":"response.completed"`), []byte(`"type":"response.completed","copilot_usage":`+billing), 1)
+	stream, err := prepareResponsesChatStream(t.Context(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{PublicModel: "gpt-public"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	var observed copilotUsageTotals
+	err = streamChatEventsToOpenAI(recorder, stream, chatStreamEventCallbacks{
+		DropUsage: true,
+		OnCopilotUsage: func(raw json.RawMessage) {
+			observed, _ = parseCopilotUsage(raw)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed != (copilotUsageTotals{TotalNanoAIU: 27, ComputeUnits: 2}) {
+		t.Fatalf("observed accounting = %+v", observed)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "physical-terminal") || !strings.Contains(body, `"copilot_usage"`) || !strings.Contains(body, `"token_details":[{"model":"gpt-public"}]`) {
+		t.Fatalf("canonical stream lost accounting or leaked model identity: %s", body)
 	}
 }
 

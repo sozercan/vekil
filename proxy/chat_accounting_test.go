@@ -213,6 +213,99 @@ func TestPolicyResponsesPreservesRequestAccounting(t *testing.T) {
 	}
 }
 
+func TestResponsesBackedPolicyRequestAccounting(t *testing.T) {
+	const billing = `{"total_nano_aiu":27,"compute_units":2,"token_details":[{"model":"physical-terminal"}]}`
+	const terminalPrefix = "event: response.completed\ndata: "
+	streamPrefix, terminalData, ok := strings.Cut(string(readResponsesChatStreamFixture(t, "stream_text.sse")), terminalPrefix)
+	if !ok {
+		t.Fatal("fixture has no response.completed event")
+	}
+	for _, tc := range []struct {
+		name                                    string
+		stream, aggregate, eventBilling, tokens bool
+	}{
+		{name: "JSON", tokens: true},
+		{name: "JSON billing only"},
+		{name: "stream event billing", stream: true, eventBilling: true, tokens: true},
+		{name: "stream response billing only", stream: true},
+		{name: "aggregate event billing only", aggregate: true, eventBilling: true},
+		{name: "aggregate response billing", aggregate: true, tokens: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var event map[string]any
+			if err := json.Unmarshal([]byte(terminalData), &event); err != nil {
+				t.Fatal(err)
+			}
+			response, ok := event["response"].(map[string]any)
+			if !ok {
+				t.Fatal("fixture has no response object")
+			}
+			response["model"] = "physical-terminal"
+			response["copilot_usage"] = json.RawMessage(billing)
+			if !tc.tokens {
+				delete(response, "usage")
+			}
+			jsonBody := mustMarshal(t, response)
+			if tc.eventBilling {
+				delete(response, "copilot_usage")
+				event["copilot_usage"] = json.RawMessage(billing)
+			}
+			streamBody := streamPrefix + terminalPrefix + mustMarshal(t, event) + "\n\n"
+			var sends atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sends.Add(1)
+				var request struct {
+					Stream bool `json:"stream"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				if r.URL.Path != providerEndpointResponses || request.Stream != (tc.stream || tc.aggregate) {
+					t.Errorf("upstream path/stream = %q/%v", r.URL.Path, request.Stream)
+				}
+				if request.Stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, streamBody)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, jsonBody)
+			}))
+			defer upstream.Close()
+			cfg := policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)
+			cfg.ModelRoutes[0].Endpoints = []string{providerEndpointResponses}
+			h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeOff))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			body := map[string]any{"model": "coding-economy", "input": "hello", "stream": tc.stream, "store": false}
+			if tc.aggregate {
+				body["tools"] = []any{map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}}}
+			}
+			ctx, summary := WithRequestSummary(t.Context())
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(mustMarshal(t, body))).WithContext(ctx)
+			recorder := httptest.NewRecorder()
+			h.HandleResponses(recorder, request)
+			if recorder.Code != http.StatusOK || sends.Load() != 1 {
+				t.Fatalf("status/sends = %d/%d: %s", recorder.Code, sends.Load(), recorder.Body.String())
+			}
+			summary.mu.Lock()
+			got := summary.copilotUsage
+			summary.mu.Unlock()
+			if want := (copilotUsageTotals{TotalNanoAIU: 27, ComputeUnits: 2}); got != want {
+				t.Errorf("request accounting = %+v, want %+v", got, want)
+			}
+			for _, hidden := range []string{"physical-terminal", "copilot_usage", "token_details"} {
+				if strings.Contains(recorder.Body.String(), hidden) {
+					t.Errorf("policy Responses body leaked %q", hidden)
+				}
+			}
+		})
+	}
+}
+
 func TestPolicySanitizedChatAcceptsAccounting(t *testing.T) {
 	body := newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(nativeChatAccountingStream())))
 	defer func() { _ = body.Close() }()

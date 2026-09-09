@@ -2063,6 +2063,7 @@ type routeAttemptResponseObserver struct {
 	copilotUsage              copilotUsageTotals
 	acceptIncompleteResponses bool
 	requireResponsesTerminal  bool
+	requireMessageStop        bool
 	terminal                  bool
 	cleanupTimedOut           bool
 	line                      []byte
@@ -2277,7 +2278,7 @@ func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) b
 				o.copilotUsage.merge(usage)
 			}
 		}
-		inspection := inspectAnthropicStreamEvent(eventType, data)
+		inspection := inspectAnthropicStreamEvent(eventType, data, o.requireMessageStop)
 		if inspection.failure != nil {
 			if !o.applyStreamingTerminal(routeAttemptOutcomeFailed, upstreamProgressTerminalFailure) {
 				return false

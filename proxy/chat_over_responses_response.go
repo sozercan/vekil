@@ -45,8 +45,9 @@ type responsesChatJSONEnvelope struct {
 	IncompleteDetails *struct {
 		Reason string `json:"reason"`
 	} `json:"incomplete_details"`
-	Output []json.RawMessage `json:"output"`
-	Usage  *responsesUsage   `json:"usage"`
+	Output       []json.RawMessage `json:"output"`
+	Usage        *responsesUsage   `json:"usage"`
+	CopilotUsage json.RawMessage   `json:"copilot_usage"`
 }
 
 func translateResponsesJSONToChat(body []byte, options responsesChatResponseOptions) (result responsesChatJSONResult, err error) {
@@ -204,6 +205,7 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 		}},
 	}
 	response.Usage = usage
+	response.CopilotUsage = envelope.CopilotUsage
 	normalizeOpenAIChatCompletionStruct(response, options.PublicModel)
 	encoded, err := json.Marshal(response)
 	if err != nil {

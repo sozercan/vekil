@@ -483,7 +483,7 @@ func (b *copilotTrafficBody) observeStreamEvent(eventType, data string) bool {
 		}
 		// Content-block endings are not message endings: a later native
 		// Messages error can still renew this request's cooldown.
-		failure := inspectAnthropicStreamEvent(eventType, data).failure
+		failure := inspectAnthropicStreamEvent(eventType, data, false).failure
 		if failure == nil {
 			return true
 		}

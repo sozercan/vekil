@@ -396,7 +396,7 @@ func rawJSONHasSemanticValue(raw json.RawMessage) bool {
 	return true
 }
 
-func inspectAnthropicStreamEvent(eventType, data string) explicitRouteStreamInspection {
+func inspectAnthropicStreamEvent(eventType, data string, requireMessageStop bool) explicitRouteStreamInspection {
 	data = strings.TrimSpace(data)
 	if data == "" {
 		return explicitRouteStreamInspection{progress: upstreamProgressAllowedPreamble}
@@ -438,7 +438,12 @@ func inspectAnthropicStreamEvent(eventType, data string) explicitRouteStreamInsp
 		default:
 			return explicitRouteStreamInspection{progress: upstreamProgressUnknown}
 		}
-	case "content_block_stop", "message_delta", "message_stop":
+	case "content_block_stop", "message_delta":
+		if requireMessageStop {
+			return explicitRouteStreamInspection{progress: upstreamProgressSemanticOutput}
+		}
+		fallthrough
+	case "message_stop":
 		return explicitRouteStreamInspection{progress: upstreamProgressTerminalSuccess, terminalSuccess: true}
 	case "error":
 		status, ok := anthropicStreamErrorStatus([]byte(data))
@@ -698,7 +703,7 @@ func runExplicitRouteStreamPeekPump(body io.ReadCloser, pw *io.PipeWriter, proto
 		var result explicitRouteStreamInspection
 		switch protocol {
 		case explicitRouteStreamAnthropic:
-			result = inspectAnthropicStreamEvent(eventType, data)
+			result = inspectAnthropicStreamEvent(eventType, data, false)
 		default:
 			result = inspectOpenAIChatStreamEvent(eventType, data)
 		}

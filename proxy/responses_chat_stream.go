@@ -430,10 +430,15 @@ func (s *responsesChatStreamState) finishChunk(reason string) models.OpenAIStrea
 	return chunk
 }
 
-func (s *responsesChatStreamState) usageChunk(usage *models.OpenAIUsage) models.OpenAIStreamChunk {
+func (s *responsesChatStreamState) usageChunk(usage *models.OpenAIUsage, copilotUsage json.RawMessage) models.OpenAIStreamChunk {
 	chunk := s.baseChunk()
 	chunk.Choices = []models.OpenAIStreamChoice{}
 	chunk.Usage = usage
+	if !rawJSONIsNullOrEmpty(copilotUsage) {
+		payload := map[string]json.RawMessage{"copilot_usage": copilotUsage}
+		rewriteOpenAIChatCompletionModelIdentity(payload, s.config.PublicModel)
+		chunk.CopilotUsage = payload["copilot_usage"]
+	}
 	return chunk
 }
 
@@ -1009,16 +1014,23 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "response.completed arrived before response.created")
 	}
 	var event struct {
-		Response responsesChatJSONEnvelope `json:"response"`
+		Response     responsesChatJSONEnvelope `json:"response"`
+		CopilotUsage json.RawMessage           `json:"copilot_usage"`
 	}
 	if unmarshalErr := json.Unmarshal(data, &event); unmarshalErr != nil {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "terminal Responses event is malformed")
+	}
+	billing := event.CopilotUsage
+	if rawJSONIsNullOrEmpty(billing) {
+		billing = event.Response.CopilotUsage
 	}
 	var terminalUsage *models.OpenAIUsage
 	usageFailureTransition := responsesChatStreamTransition{}
 	if event.Response.Usage != nil {
 		terminalUsage = event.Response.Usage.toOpenAIUsage()
-		usageFailureTransition.chunks = []models.OpenAIStreamChunk{s.usageChunk(terminalUsage)}
+	}
+	if terminalUsage != nil || !rawJSONIsNullOrEmpty(billing) {
+		usageFailureTransition.chunks = []models.OpenAIStreamChunk{s.usageChunk(terminalUsage, billing)}
 	}
 	defer func() {
 		if err == nil {
@@ -1182,12 +1194,9 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 	}
 
 	chunks = append(chunks, s.finishChunk(finishReason))
-	if terminalUsage != nil {
-		// Canonical event streams always carry terminal usage for aggregation and
-		// accounting. The OpenAI public adapter drops this chunk unless the original
-		// client requested stream_options.include_usage; Anthropic/Gemini consume it internally.
-		chunks = append(chunks, s.usageChunk(terminalUsage))
-	}
+	// Canonical streams carry terminal token usage and billing for aggregation and
+	// accounting. Public adapters decide which fields to expose.
+	chunks = append(chunks, usageFailureTransition.chunks...)
 	s.terminalSeen = true
 	transition.chunks = chunks
 	transition.terminal = true
@@ -1252,16 +1261,23 @@ func parseResponsesChatTopLevelError(data []byte) *chatExecutionError {
 
 func (s *responsesChatStreamState) handleFailed(data []byte) (responsesChatStreamTransition, error) {
 	var event struct {
-		Response responsesChatJSONEnvelope `json:"response"`
+		Response     responsesChatJSONEnvelope `json:"response"`
+		CopilotUsage json.RawMessage           `json:"copilot_usage"`
 	}
 	if err := json.Unmarshal(data, &event); err != nil || event.Response.Status != "failed" {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "response.failed is malformed")
+	}
+	billing := event.CopilotUsage
+	if rawJSONIsNullOrEmpty(billing) {
+		billing = event.Response.CopilotUsage
 	}
 	var usage *models.OpenAIUsage
 	transition := responsesChatStreamTransition{}
 	if event.Response.Usage != nil {
 		usage = event.Response.Usage.toOpenAIUsage()
-		transition.chunks = []models.OpenAIStreamChunk{s.usageChunk(usage)}
+	}
+	if usage != nil || !rawJSONIsNullOrEmpty(billing) {
+		transition.chunks = []models.OpenAIStreamChunk{s.usageChunk(usage, billing)}
 	}
 	s.terminalSeen = true
 	return transition, responsesChatFailedExecutionError(event.Response.Error, usage)
