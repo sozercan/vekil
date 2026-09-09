@@ -262,6 +262,7 @@ func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWrite
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
 func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
 	bodyBytes, pooledBody, err := readBodyBorrowedWithLimit(r, maxLargeRequestBodySize)
 	if pooledBody != nil {
 		defer releaseSmallRequestBodyBuffer(pooledBody)
@@ -309,7 +310,6 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), prepared.streaming)
 	defer upstreamCancel()
-	upstreamCtx = withCopilotRequestMetadata(upstreamCtx, r.Header)
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
 	upstreamCtx, routeOperation, _, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), prepared.model, providerEndpointResponses)
 	if err != nil {

@@ -2637,6 +2637,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 					message, _, _ = policyChatUpstreamErrorDetails(status)
 				} else {
 					message = streamErr.Error()
+					mergeHeaderValues(w.Header(), streamErr.headers)
 				}
 			}
 		}
@@ -2783,6 +2784,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 					message, _, _ = policyChatUpstreamErrorDetails(status)
 				} else {
 					message = streamErr.Error()
+					mergeHeaderValues(w.Header(), streamErr.headers)
 				}
 			}
 		}
@@ -3278,6 +3280,10 @@ func policyChatErrorHeaders(err error) http.Header {
 	if errors.As(err, &upstreamErr) {
 		return upstreamErr.headers
 	}
+	var streamErr *openAIStreamError
+	if errors.As(err, &streamErr) {
+		return streamErr.headers
+	}
 	return nil
 }
 
@@ -3555,13 +3561,16 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		if errors.As(err, &streamErr) {
 			status = streamErr.httpStatus()
 			message = streamErr.Error()
+			headers := streamErr.headers
 			if strings.TrimSpace(streamErr.Type) != "" {
 				errType = streamErr.Type
 			}
 			code = streamErr.Code
 			if policyPlan.valid() {
 				message, errType, code = policyChatUpstreamErrorDetails(status)
+				headers = policyChatSafeHeaders(headers, responseModel)
 			}
+			mergeHeaderValues(w.Header(), headers)
 		}
 		writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
 		return
@@ -3700,13 +3709,16 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		if errors.As(err, &streamErr) {
 			status = streamErr.httpStatus()
 			message = streamErr.Error()
+			headers := streamErr.headers
 			if strings.TrimSpace(streamErr.Type) != "" {
 				errType = streamErr.Type
 			}
 			code = streamErr.Code
 			if policyPlan.valid() {
 				message, errType, code = policyChatUpstreamErrorDetails(status)
+				headers = policyChatSafeHeaders(headers, responseModel)
 			}
+			mergeHeaderValues(w.Header(), headers)
 		}
 		writeOpenAIErrorWithDetails(w, status, message, errType, "", code)
 	}

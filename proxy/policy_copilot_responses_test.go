@@ -23,6 +23,7 @@ type copilotResponsesPolicyUpstream struct {
 	terminalModels         []string
 	paths                  []string
 	responsesRequestBodies []string
+	responsesHeaders       []http.Header
 	classifierSignals      policyClassifierSignals
 	toolFailureModel       string
 	toolFailuresLeft       int
@@ -63,6 +64,7 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 			r.Body = io.NopCloser(bytes.NewReader(raw))
 			upstream.mu.Lock()
 			upstream.responsesRequestBodies = append(upstream.responsesRequestBodies, string(raw))
+			upstream.responsesHeaders = append(upstream.responsesHeaders, r.Header.Clone())
 			upstream.mu.Unlock()
 			var request struct {
 				Model  string            `json:"model"`
@@ -396,6 +398,51 @@ func TestPolicyRoutingUsesCopilotResponsesForClassifierAndTerminalText(t *testin
 	stats := h.policyRoutingController.(*chatPolicyRoutingController).PolicyStatsSnapshot()
 	if len(stats.Profiles) != 1 || stats.Profiles[0].Totals.PhysicalClassifierSends != 2 || stats.Profiles[0].Totals.ActualTiers.Powerful != 1 || stats.Profiles[0].Totals.ClassifierUsage.TotalTokens != 28 {
 		t.Fatalf("policy stats = %+v", stats)
+	}
+}
+
+func TestPolicyResponsesIngressPreservesCopilotAttribution(t *testing.T) {
+	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
+		TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh,
+	})
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
+		WithCopilotBaseURL(upstream.server.URL),
+		WithProvidersConfig(directCopilotResponsesPolicyConfig(policyConfigModeEnforce)),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	upstream.mu.Lock()
+	preflightRequests := len(upstream.responsesHeaders)
+	upstream.mu.Unlock()
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.6-semantic","input":"Plan a coordinated multi-file migration.","store":false
+	}`))
+	request.Header.Set("X-Initiator", " agent ")
+	request.Header.Set("X-Interaction-Id", " interaction ")
+	request.Header.Set("X-Client-Session-Id", " session ")
+	request.Header.Set("Authorization", "Bearer caller-token")
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	upstream.mu.Lock()
+	headers := append([]http.Header(nil), upstream.responsesHeaders[preflightRequests:]...)
+	upstream.mu.Unlock()
+	if len(headers) != 2 {
+		t.Fatalf("inference requests = %d, want classifier and terminal", len(headers))
+	}
+	for _, got := range headers {
+		assertResponsesAttribution(t, got, http.Header{
+			"X-Initiator": {"agent"}, "X-Interaction-Id": {"interaction"}, "X-Client-Session-Id": {"session"},
+		})
 	}
 }
 

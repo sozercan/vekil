@@ -154,6 +154,65 @@ func TestPolicyChatPreservesAccountingAndPublicIdentity(t *testing.T) {
 	}
 }
 
+func TestPolicyResponsesPreservesRequestAccounting(t *testing.T) {
+	const usage = `{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}`
+	const billing = `{"total_nano_aiu":27,"compute_units":2,"token_details":[{"model":"physical-terminal"}]}`
+	for _, mode := range []string{"json", "stream", "aggregate"} {
+		t.Run(mode, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request struct {
+					Stream bool `json:"stream"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				if request.Stream != (mode != "json") {
+					t.Errorf("upstream stream = %v for %s", request.Stream, mode)
+				}
+				if request.Stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: "+`{"id":"chat-accounting","object":"chat.completion.chunk","model":"physical-terminal","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`+"\n\n"+
+						"data: "+`{"choices":[],"usage":`+usage+`,"copilot_usage":`+billing+`}`+"\n\ndata: [DONE]\n\n")
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"chat-accounting","object":"chat.completion","created":1,"model":"physical-terminal","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":`+usage+`,"copilot_usage":`+billing+`}`)
+			}))
+			defer upstream.Close()
+			h, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithProvidersConfig(policyIntegrationConfig(upstream.URL, upstream.URL, policyConfigModeOff)),
+				WithPolicyRoutingMode(PolicyRoutingModeOff))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			body := map[string]any{"model": "coding-economy", "input": "hello", "stream": mode == "stream", "store": false}
+			if mode == "aggregate" {
+				body["tools"] = []any{map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}}}
+			}
+			payload, _ := json.Marshal(body)
+			ctx, summary := WithRequestSummary(t.Context())
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(payload))).WithContext(ctx)
+			recorder := httptest.NewRecorder()
+			h.HandleResponses(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+			}
+			summary.mu.Lock()
+			got := summary.copilotUsage
+			summary.mu.Unlock()
+			if want := (copilotUsageTotals{TotalNanoAIU: 27, ComputeUnits: 2}); got != want {
+				t.Errorf("request accounting = %+v, want %+v", got, want)
+			}
+			for _, hidden := range []string{"physical-terminal", "copilot_usage", "token_details"} {
+				if strings.Contains(recorder.Body.String(), hidden) {
+					t.Errorf("policy Responses body leaked %q", hidden)
+				}
+			}
+		})
+	}
+}
+
 func TestPolicySanitizedChatAcceptsAccounting(t *testing.T) {
 	body := newPolicySanitizedOpenAIStream(io.NopCloser(strings.NewReader(nativeChatAccountingStream())))
 	defer func() { _ = body.Close() }()

@@ -114,6 +114,7 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 	observeUpstreamHeaders(r.Context(), upstreamHeaders)
 	completion.Model = publicModel
 	observeOpenAIUsage(r.Context(), completion.Usage)
+	observeCopilotUsage(r.Context(), completion.CopilotUsage)
 	h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), completion, h.toolContexts, toolScope, false)
 	markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 	response, err := buildPolicyResponsesResponse(completion, publicModel, translated.CallableTools, translated.Response)
