@@ -81,13 +81,30 @@ func waitForCopilotTrafficWaiters(t *testing.T, h *ProxyHandler, want int) {
 }
 
 func TestDoWithRetryReturnsLongResetResponseWithoutWaiting(t *testing.T) {
-	for _, reset := range []string{"86400", "604800", "10000000000", "9999999999999999999999999999999", time.Now().Add(7 * 24 * time.Hour).UTC().Format(http.TimeFormat)} {
-		t.Run(reset, func(t *testing.T) {
+	resetDate := time.Now().Add(7 * 24 * time.Hour).UTC().Format(http.TimeFormat)
+	for _, tc := range []struct {
+		name           string
+		headers        http.Header
+		wantRetryAfter string
+	}{
+		{"daily", http.Header{"Retry-After": {"86400"}}, "86400"},
+		{"weekly", http.Header{"Retry-After": {"604800"}}, "604800"},
+		{"long reset", http.Header{"Retry-After": {"10000000000"}}, "10000000000"},
+		{"very long reset", http.Header{"Retry-After": {"9999999999999999999999999999999"}}, "9999999999999999999999999999999"},
+		{"HTTP date", http.Header{"Retry-After": {resetDate}}, resetDate},
+		{"milliseconds fallback", http.Header{"Retry-After": {"invalid"}, "Retry-After-Ms": {"86400000"}}, "86400"},
+		{"token reset fallback", http.Header{"Retry-After": {"invalid"}, "X-Ratelimit-Remaining-Tokens": {"0"}, "X-Ratelimit-Reset-Tokens": {"24h"}}, "86400"},
+		{"request reset fallback", http.Header{"Retry-After": {"invalid"}, "X-Ratelimit-Remaining-Requests": {"0"}, "X-Ratelimit-Reset-Requests": {"86400"}}, "86400"},
+		{"missing retry header", http.Header{"Retry-After-Ms": {"86400000"}}, "86400"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			var sends atomic.Int32
 			body := newRetryBodyReadCloser(`{"error":{"code":"user_weekly_rate_limited","message":"weekly reset"}}`)
 			h := &ProxyHandler{maxRetries: 3, retryBaseDelay: time.Nanosecond, client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 				sends.Add(1)
-				return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": {reset}, "X-Copilot-Service-Request-Id": {"original-attempt"}}, Body: body, Request: req}, nil
+				headers := tc.headers.Clone()
+				headers.Set("X-Copilot-Service-Request-Id", "original-attempt")
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Header: headers, Body: body, Request: req}, nil
 			})}}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
@@ -102,8 +119,8 @@ func TestDoWithRetryReturnsLongResetResponseWithoutWaiting(t *testing.T) {
 			if time.Since(started) > time.Second || sends.Load() != 1 {
 				t.Fatalf("long reset waited or retried: elapsed=%s sends=%d", time.Since(started), sends.Load())
 			}
-			if resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("Retry-After") != reset || resp.Header.Get("X-Copilot-Service-Request-Id") != "original-attempt" {
-				t.Fatalf("response metadata changed: status=%d headers=%v", resp.StatusCode, resp.Header)
+			if resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("Retry-After") != tc.wantRetryAfter || resp.Header.Get("X-Copilot-Service-Request-Id") != "original-attempt" {
+				t.Fatalf("response metadata changed: status=%d headers=%v, want Retry-After=%q", resp.StatusCode, resp.Header, tc.wantRetryAfter)
 			}
 			select {
 			case <-body.closed:

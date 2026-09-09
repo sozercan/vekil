@@ -321,6 +321,9 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 		retryAfterDelay, _ := selectResponsesRetryAfter(resp.Header)
 		if _, valid := retryAfterHeaderSeconds(retryAfterHeader); !valid {
 			retryAfterHeader = retryAfterDelay
+			if retryAfterHeader != "" {
+				resp.Header.Set("Retry-After", retryAfterHeader)
+			}
 		}
 		upstreamErr := &upstreamError{
 			statusCode: resp.StatusCode,
