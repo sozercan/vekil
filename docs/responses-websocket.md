@@ -52,6 +52,11 @@ the first turn, continuations send new input with the last response ID, reducing
 history uploads. Other providers retain the HTTP bridge. This option does not
 enable Azure `/realtime`.
 
+Custom `client_metadata.ws_request_header_<name>` values are forwarded in each
+native turn's `headers`, subject to the header limits above. Credentials,
+provider-managed headers, connection headers, and server-issued continuation
+state are excluded.
+
 The connection stays bound to its source credential, provider, target, and model.
 Refreshing a service token for the same source credential preserves the session;
 changing the source credential closes it and returns a 409 error. New service-token

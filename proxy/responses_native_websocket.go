@@ -375,9 +375,26 @@ func buildResponsesNativeCreate(body []byte, previousID string, headers http.Hea
 func responsesNativeTurnHeaders(headers http.Header) (map[string]string, error) {
 	turnHeaders := make(map[string]string)
 	for name, values := range headers {
-		if len(values) > 0 && responsesWebSocketRequestHeaderAllowed(name) {
-			turnHeaders[name] = values[len(values)-1]
+		if len(values) == 0 {
+			continue
 		}
+		canonical := http.CanonicalHeaderKey(name)
+		if _, hopByHop := hopByHopHeaders[canonical]; hopByHop {
+			continue
+		}
+		// requestHeaders includes custom client metadata accepted by the HTTP
+		// bridge. Preserve it without overriding provider or connection state.
+		switch canonical {
+		case "Authorization", "Api-Key", "X-Api-Key", "Cookie", "Set-Cookie", "Host",
+			"Accept", "Accept-Encoding", "Content-Type", "Content-Length", "Content-Encoding",
+			"Editor-Version", "Editor-Plugin-Version", "User-Agent", "Copilot-Integration-Id",
+			"X-Github-Api-Version", "X-Request-Id", "Openai-Intent", "X-Codex-Turn-State":
+			continue
+		}
+		if strings.HasPrefix(canonical, "Sec-Websocket-") {
+			continue
+		}
+		turnHeaders[name] = values[len(values)-1]
 	}
 	if err := validateResponsesWebSocketHeaders(turnHeaders); err != nil {
 		return nil, err

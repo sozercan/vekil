@@ -70,6 +70,16 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 	request := newResponsesWebSocketCreateRequest([]any{map[string]string{"role": "user", "content": "first"}})
 	for turn := 1; turn <= 2; turn++ {
 		request["headers"] = map[string]string{"X-Initiator": "agent", "X-Interaction-Id": fmt.Sprintf("interaction-%d", turn)}
+		request["client_metadata"] = map[string]string{
+			"ws_request_header_x-custom-test-telemetry": fmt.Sprintf("custom-%d", turn),
+			"ws_request_header_baggage":                 fmt.Sprintf("turn=%d", turn),
+			"ws_request_header_authorization":           "untrusted",
+			"ws_request_header_copilot-integration-id":  "untrusted",
+			"ws_request_header_content-type":            "text/plain",
+			"ws_request_header_connection":              "keep-alive",
+			"ws_request_header_sec-websocket-protocol":  "untrusted",
+			"ws_request_header_x-codex-turn-state":      "untrusted",
+		}
 		if turn > 1 {
 			request["previous_response_id"] = "resp-native-1"
 			request["input"] = []any{map[string]string{"role": "user", "content": "second"}}
@@ -101,12 +111,21 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 		if headers["X-Interaction-Id"] != fmt.Sprintf("interaction-%d", turn) || headers["Authorization"] != "" {
 			t.Fatalf("native per-turn headers = %+v", headers)
 		}
+		if headers["X-Custom-Test-Telemetry"] != fmt.Sprintf("custom-%d", turn) || headers["Baggage"] != fmt.Sprintf("turn=%d", turn) {
+			t.Errorf("turn %d native custom headers = %+v", turn, headers)
+		}
+		for _, name := range []string{"Copilot-Integration-Id", "Content-Type", "Connection", "Sec-Websocket-Protocol", "X-Codex-Turn-State"} {
+			if _, ok := headers[name]; ok {
+				t.Errorf("native per-turn headers contain protected header %q", name)
+			}
+		}
 		if turn == 2 && string(upstream["previous_response_id"]) != `"resp-native-1"` {
 			t.Fatalf("native continuation = %s", upstream["previous_response_id"])
 		}
 	}
 	// Local staging must preserve the actual upstream parent without uploading
 	// completed history or sending a generate:false frame to the provider.
+	delete(request, "client_metadata")
 	request["generate"] = false
 	request["previous_response_id"] = "resp-native-2"
 	request["input"] = "staged"
@@ -129,6 +148,11 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 	_ = json.Unmarshal(staged["input"], &stagedInput)
 	if len(stagedInput) != 2 || string(staged["previous_response_id"]) != `"resp-native-2"` {
 		t.Fatalf("staged native request = %#v", staged)
+	}
+	var stagedHeaders map[string]string
+	_ = json.Unmarshal(staged["headers"], &stagedHeaders)
+	if stagedHeaders["X-Custom-Test-Telemetry"] != "" || stagedHeaders["Baggage"] != "" {
+		t.Fatalf("native custom headers leaked from a previous turn: %+v", stagedHeaders)
 	}
 	if connections.Load() != 1 || frames.Load() != 3 || httpPosts.Load() != 0 {
 		t.Fatalf("transport counts = connections:%d frames:%d HTTP:%d", connections.Load(), frames.Load(), httpPosts.Load())
@@ -645,9 +669,18 @@ func TestResponsesNativeWebSocketBounds(t *testing.T) {
 	if _, err := session.planRequest(&ProxyHandler{}, request); err == nil {
 		t.Fatal("unbounded local warmups before the first native send accepted")
 	}
-	_, _, err = buildResponsesNativeCreate([]byte(`{"model":"gpt-5.4","input":[]}`), "", http.Header{"X-Interaction-Id": {strings.Repeat("x", 9<<10)}})
-	if err == nil {
-		t.Fatal("unbounded native per-turn metadata accepted")
+	for name, headers := range map[string]http.Header{
+		"oversized attribution": {"X-Interaction-Id": {strings.Repeat("x", 9<<10)}},
+		"oversized custom":      {"X-Custom-Test-Telemetry": {strings.Repeat("x", 9<<10)}},
+		"invalid custom name":   {"Bad Header": {"value"}},
+		"invalid custom value":  {"X-Custom-Test-Telemetry": {"one\r\nInjected: value"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := buildResponsesNativeCreate([]byte(`{"model":"gpt-5.4","input":[]}`), "", headers)
+			if err == nil {
+				t.Fatal("invalid native per-turn metadata accepted")
+			}
+		})
 	}
 }
 
