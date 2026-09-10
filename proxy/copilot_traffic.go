@@ -47,7 +47,7 @@ type copilotSourceFingerprintContextKey struct{}
 // origin prevents credentials reused by different providers from sharing a
 // cooldown. Integration limits intentionally cover credentials within that
 // provider only.
-func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, endpoint string, body []byte) *http.Request {
+func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, endpoint string, body []byte, owners ...providerModel) *http.Request {
 	if req == nil || req.URL == nil || provider == nil || provider.kind != providerTypeCopilot {
 		return req
 	}
@@ -55,6 +55,15 @@ func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, e
 	case providerEndpointChatCompletions, providerEndpointMessages, providerEndpointResponses:
 	default:
 		return req
+	}
+	model := ""
+	if len(owners) > 0 {
+		// Inference callers prepare the body for this resolved owner before
+		// constructing the request, including target and fallback rewrites.
+		model = strings.TrimSpace(owners[0].upstreamModel)
+	}
+	if model == "" {
+		model = extractRequestModel(body)
 	}
 	origin := req.URL.Scheme + "://" + strings.ToLower(req.URL.Host)
 	credential := sha256.Sum256([]byte(req.Header.Get("Authorization")))
@@ -65,7 +74,7 @@ func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, e
 	integration := copilotTrafficFingerprint(provider.id, origin, req.Header.Get("Copilot-Integration-ID"))
 	metadata := copilotInferenceRequest{
 		keys: [3]copilotCooldownKey{
-			{scope: copilotThrottleModel, identity: account, model: sha256.Sum256([]byte(extractRequestModel(body)))},
+			{scope: copilotThrottleModel, identity: account, model: sha256.Sum256([]byte(model))},
 			{scope: copilotThrottleAccount, identity: account},
 			{scope: copilotThrottleIntegration, identity: integration},
 		},

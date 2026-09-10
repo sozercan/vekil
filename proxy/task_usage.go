@@ -167,6 +167,7 @@ func (s *taskInferenceSend) finishResponse(resp *http.Response, sendErr error) {
 	}
 	state.observer = newRouteAttemptResponseObserver(nil, nil, routeAttemptTrace{StatusCode: resp.StatusCode}, nil,
 		endpoint, strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream"), nil)
+	state.observer.usageOnly = true
 	state.observer.captureCopilotUsage = true
 	// A finished generation may stop at its output limit without failing the
 	// physical send. Route attempts retain their stricter completion contract.
@@ -186,6 +187,57 @@ func (s *taskInferenceSend) finishResponse(resp *http.Response, sendErr error) {
 	}
 	state.inner = resp.Body
 	resp.Body = state
+}
+
+// The task ledger needs accounting and terminal events, not the semantic
+// progress used for route retries. Inspect field names without decoding ordinary
+// content/tool deltas. Escaped keys and uncertain shapes retain the full parser.
+func taskUsageStreamEventNeedsInspection(endpoint, eventType, data string) bool {
+	if taskUsageTerminalEvent(endpoint, eventType) {
+		return true
+	}
+	// Keep common small deltas off the heap.
+	var scratch [512]byte
+	payload := append(scratch[:0], data...)
+	object, ok := newRawJSONObjectScanner(payload)
+	if !ok {
+		return true
+	}
+	for {
+		key, start, end, done, ok := object.next()
+		if !ok {
+			return true
+		}
+		if done {
+			return false
+		}
+		switch {
+		case rawJSONKeyEqualFold(key, "usage"), rawJSONKeyEqualFold(key, "copilot_usage"), rawJSONKeyEqualFold(key, "error"):
+			return true
+		case endpoint == providerEndpointMessages && rawJSONKeyEqualFold(key, "message"):
+			return true
+		case endpoint == providerEndpointResponses && rawJSONKeyEqualFold(key, "response"):
+			return true
+		case rawJSONKeyEqualFold(key, "type"):
+			from, to, after, escaped, valid := scanRawJSONString(payload, start)
+			if !valid || escaped || after != end || taskUsageTerminalEvent(endpoint, string(payload[from:to])) {
+				return true
+			}
+		}
+	}
+}
+
+func taskUsageTerminalEvent(endpoint, eventType string) bool {
+	switch strings.ToLower(strings.TrimSpace(eventType)) {
+	case "error":
+		return true
+	case "message_stop":
+		return endpoint == providerEndpointMessages
+	case "response.completed", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
+		return endpoint == providerEndpointResponses
+	default:
+		return false
+	}
 }
 
 type taskUsageBody struct {

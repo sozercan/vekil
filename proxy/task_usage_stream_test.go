@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,74 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
+func TestTaskUsageFragmentedStreamAccounting(t *testing.T) {
+	const billing = `"co\u0070ilot_usage":{"total_nano_aiu":31,"compute_units":2}`
+	const failure = "event: error\ndata: " + `{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}`
+	for _, tc := range []struct {
+		name, endpoint, prefix, terminal, escapedTerminal string
+	}{
+		{
+			name: "Chat", endpoint: providerEndpointChatCompletions,
+			prefix: "data: " + `{"u\u0073age":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9},` + "\r\ndata: " + billing + "}\r\r" +
+				"data: " + `{"USAGE":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}` + "\n\n",
+			terminal: "data: [DONE]", escapedTerminal: "data: [DONE]",
+		},
+		{
+			name: "Messages", endpoint: providerEndpointMessages,
+			prefix: "data: " + `{"type":"message_start","mess\u0061ge":{"usage":{"input_tokens":7,"output_tokens":2}},` + "\r\ndata: " + billing + "}\r\r" +
+				"data: " + `{"type":"message_delta","USAGE":{"output_tokens":3}}` + "\n\n",
+			terminal: "event: message_stop\rdata: {}\r\r", escapedTerminal: "data: " + `{"t\u0079pe":"message_st\u006fp"}`,
+		},
+		{
+			name: "Responses", endpoint: providerEndpointResponses,
+			prefix: "data: " + `{"type":"response.in_progress","resp\u006fnse":{"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}},` + "\r\ndata: " + billing + "}\r\r" +
+				"data: " + `{"type":"response.in_progress","RESPONSE":{"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}` + "\n\n",
+			terminal: "event: response.completed\rdata: {}\r\r", escapedTerminal: "data: " + `{"t\u0079pe":"response.compl\u0065ted"}`,
+		},
+	} {
+		for _, ending := range []struct {
+			name, body            string
+			wantErrors, throttles int64
+		}{
+			{name: "terminal", body: tc.terminal},
+			{name: "escaped terminal", body: tc.escapedTerminal},
+			{name: "throttled", body: failure, wantErrors: 1, throttles: 1},
+			{name: "truncated", wantErrors: 1},
+		} {
+			for _, chunkSize := range []int{1, 31, 4096} {
+				t.Run(fmt.Sprintf("%s/%s/chunk%d", tc.name, ending.name, chunkSize), func(t *testing.T) {
+					body := tc.prefix + "data: " + `{"metadata":{"usage":{"prompt_tokens":999999},"copilot_usage":{"total_nano_aiu":999999}}}` + "\n\n" + ending.body
+					var chunks []string
+					for start := 0; start < len(body); start += chunkSize {
+						chunks = append(chunks, body[start:min(start+chunkSize, len(body))])
+					}
+					h := &ProxyHandler{stats: newStatsCollector()}
+					resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: newSplitChunkEOFReadCloser(chunks...)}
+					h.beginTaskInferenceSend(httptest.NewRequest(http.MethodPost, tc.endpoint, nil)).finish(resp, nil)
+					got, err := io.ReadAll(resp.Body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := resp.Body.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if string(got) != body {
+						t.Fatal("accounting changed the forwarded stream")
+					}
+					snapshot := h.stats.taskUsage.snapshot()
+					totals := snapshot.Totals
+					if snapshot.Inflight != 0 || totals.Sends != 1 || totals.Completed != 1 || totals.Errors != ending.wantErrors || totals.Throttled != ending.throttles || totals.ReportedUsageSends != 1 {
+						t.Fatalf("stream accounting = %+v", snapshot)
+					}
+					if totals.Usage.PromptTokens != 7 || totals.Usage.CompletionTokens != 3 || totals.Usage.TotalTokens != 10 || totals.CopilotUsage != (copilotUsageTotals{TotalNanoAIU: 31, ComputeUnits: 2}) {
+						t.Fatalf("stream lost reported usage or counted nested metadata: %+v", totals)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestTaskUsagePublicStreamingBilling(t *testing.T) {
 	const initialBilling = `"copilot_usage":{"total_nano_aiu":7,"compute_units":1}`
 	const finalBilling = `"copilot_usage":{"total_nano_aiu":31,"compute_units":2,"token_details":[{"model":"excluded-accounting-model"}]}`
@@ -20,6 +89,18 @@ func TestTaskUsagePublicStreamingBilling(t *testing.T) {
 		events                  []string
 		wantErrors              int64
 	}{
+		{
+			name: "Chat", endpoint: providerEndpointChatCompletions,
+			request: `{"model":"billing-model","messages":[{"role":"user","content":"hello"}],"stream":true}`,
+			events: []string{
+				`{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13},` + initialBilling + `}`,
+				`{"choices":[{"index":0,"delta":{"content":"literal \"copilot_usage\":{\"total_nano_aiu\":999999}"}}],"metadata":{"copilot_usage":{"total_nano_aiu":999999}}}`,
+				`{"choices":[],"copilot_usage":{"total_nano_aiu":999999,"compute_units":"invalid"}}`,
+				`{"choices":[],"copilot_usage":{"total_nano_aiu":999999,"padding":"` + strings.Repeat("x", 64<<10) + `"}}`,
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18},` + finalBilling + `}`,
+				"[DONE]",
+			},
+		},
 		{
 			name: "Responses", endpoint: providerEndpointResponses,
 			request: `{"model":"billing-model","input":"hello","stream":true}`,
@@ -68,7 +149,7 @@ func TestTaskUsagePublicStreamingBilling(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == providerEndpointModels {
 					w.Header().Set("Content-Type", "application/json")
-					_, _ = io.WriteString(w, `{"data":[{"id":"billing-model","supported_endpoints":["/responses","/v1/messages"]}]}`)
+					_, _ = io.WriteString(w, `{"data":[{"id":"billing-model","supported_endpoints":["/chat/completions","/responses","/v1/messages"]}]}`)
 					return
 				}
 				if r.URL.Path != tc.endpoint {
@@ -89,9 +170,12 @@ func TestTaskUsagePublicStreamingBilling(t *testing.T) {
 				t.Fatal(err)
 			}
 			w := httptest.NewRecorder()
-			if tc.endpoint == providerEndpointResponses {
+			switch tc.endpoint {
+			case providerEndpointChatCompletions:
+				h.HandleOpenAIChatCompletions(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.request)))
+			case providerEndpointResponses:
 				h.HandleResponses(w, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(tc.request)))
-			} else {
+			default:
 				h.HandleAnthropicMessages(w, httptest.NewRequest(http.MethodPost, tc.endpoint, strings.NewReader(tc.request)))
 			}
 			if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), finalBilling) {

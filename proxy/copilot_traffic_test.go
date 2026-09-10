@@ -233,6 +233,75 @@ func TestCopilotCooldownScopeIsolation(t *testing.T) {
 	}
 }
 
+func TestCopilotCooldownResolvedModelIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, endpoint, requestedModel, publicModel, upstreamModel string
+	}{
+		{"rewritten chat", providerEndpointChatCompletions, "public-model", "public-model", "upstream-model"},
+		{"normalized messages alias", providerEndpointMessages, "claude-sonnet-4-5", "claude-sonnet-4.5", "claude-native"},
+		{"unknown responses model", providerEndpointResponses, "unknown-model", "", "unknown-model"},
+		{"missing model", providerEndpointResponses, "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &ProxyHandler{auth: auth.NewTestAuthenticator("credential"), copilotURL: "http://upstream.example"}
+			h.providersState = defaultProviderSetup(h)
+			if tc.publicModel != "" {
+				if err := h.providersState.addProviderModels("copilot", []providerModel{{
+					publicID: tc.publicModel, upstreamModel: tc.upstreamModel, providerID: "copilot",
+				}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			body, _ := json.Marshal(map[string]string{"model": tc.requestedModel})
+			if tc.requestedModel == "" {
+				body = []byte(`{}`)
+			}
+			provider, owner, prepared, err := h.resolveProviderRequest(body, tc.endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := extractRequestModel(prepared); got != tc.upstreamModel {
+				t.Fatalf("prepared model = %q, want %q", got, tc.upstreamModel)
+			}
+			seedBody, _ := json.Marshal(map[string]string{"model": tc.upstreamModel})
+			seed, err := h.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, tc.endpoint, seedBody, nil, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = seed.Body.Close()
+			h.copilotTraffic.observeThrottle(copilotTrafficTestMetadata(t, seed), 429, "86400", []byte(`{"error":{"code":"user_model_rate_limited"}}`))
+			for _, owners := range [][]providerModel{{owner}, nil, {{}}} {
+				req, err := h.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, tc.endpoint, prepared, nil, "", owners...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = req.Body.Close()
+				permit, blocked, err := h.acquireCopilotInference(req)
+				permit.release()
+				if err != nil || blocked == nil {
+					t.Fatalf("owners=%v did not retain upstream-model cooldown: response=%v error=%v", owners, blocked, err)
+				}
+				_ = blocked.Body.Close()
+			}
+			otherBody := []byte(`{"model":"other-model"}`)
+			otherProvider, otherOwner, otherBody, err := h.resolveProviderRequest(otherBody, tc.endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			other, err := h.newProviderJSONInferenceRequest(context.Background(), otherProvider, http.MethodPost, tc.endpoint, otherBody, nil, "", otherOwner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = other.Body.Close()
+			permit, blocked, err := h.acquireCopilotInference(other)
+			permit.release()
+			if err != nil || blocked != nil {
+				t.Fatalf("model cooldown blocked a different model: response=%v error=%v", blocked, err)
+			}
+		})
+	}
+}
+
 func TestCopilotCooldownRequiresBoundedRecognizedEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name, reset, body string
@@ -861,6 +930,59 @@ func TestCopilotCooldownRouteAdmissionPreservesStateAndSendAccounting(t *testing
 			}
 			if task := h.stats.taskUsage.snapshot(); task.Totals.Sends != int64(wantSends) || task.Inflight != 0 {
 				t.Fatalf("task accounting includes local rejection: %+v", task)
+			}
+		})
+	}
+}
+
+func TestCopilotCooldownExplicitFallbackUsesRewrittenModel(t *testing.T) {
+	for _, kind := range []routeAttemptKind{routeAttemptCompatibilityFallback, routeAttemptCompaction} {
+		t.Run(string(kind), func(t *testing.T) {
+			var sends atomic.Int32
+			client := &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				sends.Add(1)
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if model := extractRequestModel(body); model != "fallback-upstream" {
+					t.Fatalf("upstream model = %q, want fallback-upstream", model)
+				}
+				return routeExecutorTestResponse(req, 200, nil, `{"id":"response","status":"completed","output":[]}`), nil
+			})}
+			provider := explicitRouteTestProvider("copilot", "http://upstream.example", "unused")
+			provider.kind = providerTypeCopilot
+			provider.paths = providerEndpointPolicyFor(providerTypeCopilot).defaultEndpointPaths()
+			provider.staticModels["fallback-model"] = providerModel{upstreamModel: "fallback-upstream"}
+			h, route := explicitRouteTestHandler(t, client, routeModePriorityFailover, 1, 1, provider)
+			h.auth = auth.NewTestAuthenticator("credential")
+			t.Cleanup(h.BeginShutdown)
+			seedCooldown := func(model string) {
+				body, _ := json.Marshal(map[string]string{"model": model})
+				req, err := h.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointResponses, body, nil, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = req.Body.Close()
+				h.copilotTraffic.observeThrottle(copilotTrafficTestMetadata(t, req), 429, "86400", []byte(`{"error":{"code":"user_model_rate_limited"}}`))
+			}
+			seedCooldown("deployment-a")
+			for _, wantStatus := range []int{http.StatusOK, http.StatusTooManyRequests} {
+				operation := newRouteOperation(route, context.Background())
+				if err := operation.forcePinnedTarget(route.targets[0].id); err != nil {
+					t.Fatal(err)
+				}
+				ctx := withRouteAttemptKind(withRouteOperation(context.Background(), operation), kind)
+				resp, err := h.postJSONEndpointWithHeadersForModel(ctx, providerEndpointResponses, []byte(`{"model":"fallback-model","input":"hello"}`), nil, "fallback-model")
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != wantStatus || sends.Load() != 1 {
+					t.Fatalf("fallback status=%d sends=%d, want status=%d sends=1", resp.StatusCode, sends.Load(), wantStatus)
+				}
+				seedCooldown("fallback-upstream")
 			}
 		})
 	}

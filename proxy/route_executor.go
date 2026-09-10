@@ -2059,6 +2059,7 @@ type routeAttemptResponseObserver struct {
 	upstreamID                string
 	usage                     statsTokenUsage
 	haveUsage                 bool
+	usageOnly                 bool
 	captureCopilotUsage       bool
 	copilotUsage              copilotUsageTotals
 	acceptIncompleteResponses bool
@@ -2132,41 +2133,45 @@ func (o *routeAttemptResponseObserver) observe(p []byte) {
 		return
 	}
 	o.mu.Lock()
-	o.tail.append(p)
+	// Messages accounting reads parsed events and never uses the diagnostic tail.
+	if !o.usageOnly || !o.streaming || o.endpoint != providerEndpointMessages {
+		o.tail.append(p)
+	}
 	if !o.streaming {
 		o.envelope.observe(p)
 		o.mu.Unlock()
 		return
 	}
 	publish := false
-	for _, b := range p {
+	for len(p) > 0 {
 		if o.linePendingCR {
 			o.linePendingCR = false
-			if b == '\n' {
+			if p[0] == '\n' {
+				p = p[1:]
 				continue
 			}
 		}
-		switch b {
-		case '\r':
-			if o.consumeSSELineLocked() {
-				publish = true
-			}
-			o.linePendingCR = true
-		case '\n':
-			if o.consumeSSELineLocked() {
-				publish = true
-			}
-		default:
-			if o.lineOverflow {
-				continue
-			}
-			if len(o.line) >= routeAttemptObservationMaxLine {
+		end := bytes.IndexAny(p, "\r\n")
+		if end < 0 {
+			end = len(p)
+		}
+		if !o.lineOverflow {
+			if end > routeAttemptObservationMaxLine-len(o.line) {
 				o.line = nil
 				o.lineOverflow = true
-				continue
+			} else {
+				o.line = append(o.line, p[:end]...)
 			}
-			o.line = append(o.line, b)
 		}
+		p = p[end:]
+		if len(p) == 0 {
+			break
+		}
+		if o.consumeSSELineLocked() {
+			publish = true
+		}
+		o.linePendingCR = p[0] == '\r'
+		p = p[1:]
 	}
 	var completion routeAttemptCompletion
 	if publish {
@@ -2191,7 +2196,7 @@ func (o *routeAttemptResponseObserver) consumeSSELineLocked() bool {
 		o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressUnknown)
 		return false
 	}
-	line := string(append(append([]byte(nil), o.line...), '\n'))
+	line := string(o.line)
 	o.line = o.line[:0]
 	publish := false
 	if !o.sse.consumeLine(line, func(eventType, data string) bool {
@@ -2268,6 +2273,9 @@ func (o *routeAttemptResponseObserver) applyStreamingTerminal(outcome routeAttem
 
 func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) bool {
 	data = strings.TrimSpace(data)
+	if o.usageOnly && !taskUsageStreamEventNeedsInspection(o.endpoint, eventType, data) {
+		return false
+	}
 	switch o.endpoint {
 	case providerEndpointResponses:
 		return o.observeResponsesEvent(eventType, data)

@@ -2690,7 +2690,7 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 		if client != nil && client.Jar != nil {
 			req.Header = shallowCloneHeader(req.Header)
 		}
-		req = withCopilotInferenceRequest(req, provider, path, body)
+		req = withCopilotInferenceRequest(req, provider, path, body, owners...)
 		req = withTaskInferenceRequest(req, path)
 	}
 	return req, err
