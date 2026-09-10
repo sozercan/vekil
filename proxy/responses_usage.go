@@ -314,12 +314,14 @@ func observeResponsesUsage(ctx context.Context, usage responsesUsage) {
 // cached-prompt detail; Anthropic does not report a separate reasoning count.
 func observeAnthropicUsageBody(ctx context.Context, body []byte) {
 	var parsed struct {
-		Usage models.AnthropicUsage `json:"usage"`
+		Usage        models.AnthropicUsage `json:"usage"`
+		CopilotUsage json.RawMessage       `json:"copilot_usage"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return
 	}
 	observeAnthropicUsage(ctx, parsed.Usage)
+	observeCopilotUsage(ctx, parsed.CopilotUsage)
 }
 
 func observeAnthropicUsage(ctx context.Context, u models.AnthropicUsage) {

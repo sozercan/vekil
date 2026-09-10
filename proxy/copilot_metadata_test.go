@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -121,5 +122,67 @@ func TestCopilotUsageSummaryIsNumericAndIdempotent(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), "private") || strings.Contains(string(encoded), "token_details") {
 		t.Fatal("summary retained provider metadata")
+	}
+}
+
+func TestDirectAnthropicBillingSummary(t *testing.T) {
+	const billing = `"copilot_usage":{"total_nano_aiu":31,"compute_units":2,"token_details":[{"model":"excluded-accounting-model"}]}`
+	const jsonBody = `{"id":"msg","type":"message","model":"native-billing","content":[],"usage":{"input_tokens":7,"output_tokens":3},` + billing + `}`
+	const streamBody = "data: " + `{"type":"message_start","message":{"model":"native-billing","usage":{"input_tokens":7}},"copilot_usage":{"total_nano_aiu":7,"compute_units":1}}` + "\n\n" +
+		"data: " + `{"type":"message_delta","usage":{"output_tokens":3},` + billing + `}` + "\n\n" +
+		"data: " + `{"type":"message_stop",` + billing + `}` + "\n\n"
+	for _, publicModel := range []string{"native-billing", "alias"} {
+		for _, tc := range []struct {
+			name, body string
+			stream     bool
+			chunked    bool
+		}{
+			{name: "JSON known length", body: jsonBody},
+			{name: "JSON unknown length", body: jsonBody, chunked: true},
+			{name: "SSE", body: streamBody, stream: true},
+		} {
+			t.Run(publicModel+"/"+tc.name, func(t *testing.T) {
+				ctx, summary := WithRequestSummary(t.Context())
+				resp := &http.Response{
+					StatusCode:    http.StatusOK,
+					Header:        make(http.Header),
+					Body:          io.NopCloser(strings.NewReader(tc.body)),
+					ContentLength: int64(len(tc.body)),
+				}
+				if tc.chunked {
+					resp.ContentLength = -1
+				}
+				w := httptest.NewRecorder()
+				if tc.stream {
+					h := &ProxyHandler{}
+					h.writeDirectAnthropicStreamResponse(ctx, t.Context(), w, resp, publicModel, "native-billing")
+				} else if err := writeDirectAnthropicJSONResponse(ctx, t.Context(), w, resp, publicModel, "native-billing"); err != nil {
+					t.Fatal(err)
+				}
+				if summary.copilotUsage != (copilotUsageTotals{TotalNanoAIU: 31, ComputeUnits: 2}) {
+					t.Fatalf("request billing = %+v, want 31 nano-AIU and 2 compute units", summary.copilotUsage)
+				}
+				if summary.totalTokens == nil || *summary.totalTokens != 10 {
+					t.Fatalf("request tokens = %v, want 10", summary.totalTokens)
+				}
+				if !strings.Contains(w.Body.String(), `"model":"`+publicModel+`"`) || !strings.Contains(w.Body.String(), billing) {
+					t.Fatalf("response lost model or billing: %s", w.Body.String())
+				}
+				fields := make(map[string]any)
+				for _, field := range summary.LoggerFields() {
+					fields[field.Key] = field.Value
+				}
+				if fields["total_nano_aiu"] != int64(31) || fields["compute_units"] != int64(2) {
+					t.Fatalf("request log lost billing: %v", fields)
+				}
+				encoded, err := json.Marshal(fields)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(string(encoded), "excluded-accounting-model") || strings.Contains(string(encoded), "token_details") {
+					t.Fatal("request log retained provider billing metadata")
+				}
+			})
+		}
 	}
 }

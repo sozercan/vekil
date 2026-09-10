@@ -1304,7 +1304,10 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 	if len(lifecycleHooks) > 0 {
 		lifecycle = lifecycleHooks[0]
 	}
-	markFailure := func(data []byte) {
+	observeData := func(data []byte) {
+		if raw := usage.observe(data); lifecycle.onCopilotUsage != nil && !rawJSONIsNullOrEmpty(raw) {
+			lifecycle.onCopilotUsage(raw)
+		}
 		if status, ok := anthropicStreamErrorStatus(data); ok {
 			observeResponseFailureStatus(ctx, status)
 		}
@@ -1317,7 +1320,7 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 		// No model rewrite: preserve the original byte-exact, unbounded passthrough
 		// (io.Copy handles SSE lines of any size) while teeing the bytes through a
 		// best-effort usage/error sniffer. The sniffer skips lines it cannot buffer.
-		sniffer := newAnthropicUsageSniffWriter(usage, markFailure)
+		sniffer := newAnthropicUsageSniffWriter(observeData)
 		fw := &flushWriter{w: w, flusher: flusher}
 		handleLifecycleCancellation := func() bool {
 			if lifecycle.transportCanceled == nil || !lifecycle.transportCanceled() {
@@ -1375,8 +1378,7 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 			content, _ := splitSSELineEnding(line)
 			if data, ok := parseSSELine(content); ok {
 				dataBytes := []byte(data)
-				usage.observe(dataBytes)
-				markFailure(dataBytes)
+				observeData(dataBytes)
 				if anthropicStreamDataIsMessageStop(dataBytes) {
 					sawTerminalEvent = true
 				} else if _, ok := anthropicStreamErrorStatus(dataBytes); ok {
@@ -1448,12 +1450,10 @@ func anthropicStreamDataIsMessageStop(data []byte) bool {
 
 // anthropicUsageSniffWriter scans an Anthropic SSE byte stream for usage (and
 // error frames) as it is copied to the client. It buffers a single SSE line at a
-// time and, on each complete data line, feeds the payload to the accumulator and
-// the optional onData callback (used to detect error frames). A line longer than
-// the buffer cap is skipped so the sniffer never affects the client copy or grows
-// unbounded.
+// time and, on each complete data line, feeds the payload to the onData callback.
+// A line longer than the buffer cap is skipped so the sniffer never affects the
+// client copy or grows unbounded.
 type anthropicUsageSniffWriter struct {
-	acc               *anthropicStreamUsageAccumulator
 	onData            func([]byte)
 	line              []byte
 	tail              []byte
@@ -1465,9 +1465,8 @@ type anthropicUsageSniffWriter struct {
 	sawTerminalEvent  bool
 }
 
-func newAnthropicUsageSniffWriter(acc *anthropicStreamUsageAccumulator, onData func([]byte)) *anthropicUsageSniffWriter {
+func newAnthropicUsageSniffWriter(onData func([]byte)) *anthropicUsageSniffWriter {
 	return &anthropicUsageSniffWriter{
-		acc:    acc,
 		onData: onData,
 		line:   make([]byte, 0, 512),
 		tail:   make([]byte, 0, 4),
@@ -1488,7 +1487,6 @@ func (s *anthropicUsageSniffWriter) Write(p []byte) (int, error) {
 			if !s.overflow {
 				if data, ok := parseSSELine(lineContent); ok {
 					dataBytes := []byte(data)
-					s.acc.observe(dataBytes)
 					if s.onData != nil {
 						s.onData(dataBytes)
 					}

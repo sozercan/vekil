@@ -1011,6 +1011,10 @@ func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.R
 			if inspection, ok := inspectAnthropicResponseJSONFast(body); ok {
 				fastUsage = inspection.usage
 				fastUsageParsed = inspection.usageParsed
+				if resp.StatusCode == http.StatusOK && fastUsageParsed {
+					// Observe before an in-place model rewrite can move the billing bytes.
+					observeCopilotUsage(ctx, inspection.copilotUsage)
+				}
 				rewritten, changed, err = rewriteAnthropicResponseModelJSONInPlaceInspected(body, publicModel, upstreamModel, inspection)
 				if err != nil {
 					return newResponseBodyWriteError(resp, err, false, true, false)
@@ -1252,6 +1256,7 @@ type anthropicResponseJSONInspection struct {
 	rewriteModel bool
 	usage        models.AnthropicUsage
 	usageParsed  bool
+	copilotUsage json.RawMessage
 }
 
 func inspectAnthropicResponseJSONFast(body []byte) (anthropicResponseJSONInspection, bool) {
@@ -1313,6 +1318,8 @@ func inspectAnthropicResponseJSONFast(body []byte) (anthropicResponseJSONInspect
 			inspection.usage = usage
 		case rawJSONKeyEqualFold(key, "usage"):
 			inspection.usageParsed = false
+		case rawJSONKeyEqualFold(key, "copilot_usage"):
+			inspection.copilotUsage = body[start:end]
 		}
 	}
 	return inspection, true
