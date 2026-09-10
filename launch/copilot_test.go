@@ -80,6 +80,42 @@ func TestCopilotAdapterPrepareResponses(t *testing.T) {
 	}
 }
 
+func TestCopilotAdapterPromptLimits(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, metadata, want string
+	}{
+		{"prompt precedence", `{"capabilities":{"limits":{"max_prompt_tokens":128000,"max_prompt":96000,"max_input_tokens":64000,"max_context_window_tokens":400000}}}`, "128000"},
+		{"prompt alias", `{"capabilities":{"limits":{"max_prompt":96000,"max_input_tokens":64000,"max_context_window_tokens":400000}}}`, "96000"},
+		{"input alias", `{"capabilities":{"limits":{"max_input_tokens":64000,"max_context_window_tokens":400000}}}`, "64000"},
+		{"public context window", `{"context_window":100000,"capabilities":{"limits":{"max_prompt_tokens":128000}}}`, "100000"},
+		{"context fallback", `{"capabilities":{"limits":{"context_window_tokens":200000}}}`, "200000"},
+		{"ignore invalid limits", `{"capabilities":{"limits":{"max_prompt_tokens":-1,"max_prompt":0,"max_input_tokens":32000}}}`, "32000"},
+		{"unknown limit", `{}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := ModelInfo{ID: "limit-model", SupportedEndpoints: []string{"/responses"}}
+			if err := json.Unmarshal([]byte(tc.metadata), &model); err != nil {
+				t.Fatal(err)
+			}
+			prepared, err := (CopilotAdapter{}).Prepare(PrepareInput{
+				BaseURL: "http://127.0.0.1:43210", Model: model, Binary: binary,
+				LocalToken: "test-token", DryRun: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, set := prepared.EnvSet["COPILOT_PROVIDER_MAX_PROMPT_TOKENS"]
+			if got != tc.want || set != (tc.want != "") {
+				t.Fatalf("prompt limit = %q, set=%v, want %q", got, set, tc.want)
+			}
+		})
+	}
+}
+
 func TestCopilotAdapterSelectsChatCompletions(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {

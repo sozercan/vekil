@@ -88,7 +88,7 @@ func (CopilotAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if wireAPI != "" {
 		envSet["COPILOT_PROVIDER_WIRE_API"] = wireAPI
 	}
-	if value := input.Model.Capabilities.Limits.MaxPromptTokens; value > 0 {
+	if value := modelContextWindow(input.Model); value > 0 {
 		envSet["COPILOT_PROVIDER_MAX_PROMPT_TOKENS"] = strconv.FormatInt(value, 10)
 	}
 	if value := input.Model.Capabilities.Limits.MaxOutputTokens; value > 0 {
