@@ -4599,6 +4599,74 @@ func TestHandleResponses_RewritesSyntheticCompaction(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_RewritesSyntheticCompactionWithUntypedUserMessage(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content string
+	}{
+		{"text", `"Review the new request instead."`},
+		{"content blocks", `[{"type":"input_text","text":"Review the new request instead."}]`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			userMessage := json.RawMessage(`{"role":"user","content":` + tt.content + `}`)
+			upstreamRequests := make(chan []json.RawMessage, 1)
+			handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Input []json.RawMessage `json:"input"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("decode upstream request: %v", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				upstreamRequests <- req.Input
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"resp-synth","object":"response","status":"completed"}`))
+			})
+
+			reqBody, err := json.Marshal(map[string]interface{}{
+				"model": "gpt-5.4",
+				"input": []interface{}{
+					map[string]interface{}{
+						"type":              "compaction",
+						"encrypted_content": encodeSyntheticCompaction("Checkpoint summary"),
+					},
+					userMessage,
+				},
+			})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+			w := httptest.NewRecorder()
+			handler.HandleResponses(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+			}
+			var upstreamInput []json.RawMessage
+			select {
+			case upstreamInput = <-upstreamRequests:
+			default:
+				t.Fatal("expected an upstream request")
+			}
+			if len(upstreamInput) != 2 {
+				t.Fatalf("expected checkpoint and original user message, got %s", upstreamInput)
+			}
+			var got, want interface{}
+			if err := json.Unmarshal(upstreamInput[1], &got); err != nil {
+				t.Fatalf("decode forwarded user message: %v", err)
+			}
+			if err := json.Unmarshal(userMessage, &want); err != nil {
+				t.Fatalf("decode original user message: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("user message changed: got %s, want %s", upstreamInput[1], userMessage)
+			}
+		})
+	}
+}
+
 func TestHandleResponses_RewritesSyntheticCompaction_StripsInlineRenderMarkers(t *testing.T) {
 	summary := "Synthetic compacted summary. citeturn5view1turn9view0"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -6326,30 +6394,46 @@ func TestInjectSyntheticCompactionResumePrompt_IgnoresHistoricalUserMessagesBefo
 	}
 }
 
-func TestInjectSyntheticCompactionResumePrompt_SkipsWhenUserMessageExists(t *testing.T) {
-	reqBody, err := json.Marshal(map[string]interface{}{
-		"model": "gpt-5.4",
-		"input": []interface{}{
-			proxyCompactionContextMessage("Checkpoint summary"),
-			map[string]interface{}{
-				"type": "message",
-				"role": "user",
-				"content": []map[string]string{
-					{"type": "input_text", "text": "continue"},
-				},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("failed to marshal request body: %v", err)
-	}
+func TestInjectSyntheticCompactionResumePrompt_RecognizesUserMessages(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		message     string
+		userMessage bool
+	}{
+		{"explicit type", `{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}`, true},
+		{"omitted type with text", `{"role":"user","content":"continue"}`, true},
+		{"omitted type with content blocks", `{"role":"user","content":[{"type":"input_text","text":"continue"}]}`, true},
+		{"assistant message", `{"role":"assistant","content":"done"}`, false},
+		{"other item type", `{"type":"function_call_output","role":"user","content":"continue"}`, false},
+		{"null type", `{"type":null,"role":"user","content":"continue"}`, false},
+		{"empty type", `{"type":"","role":"user","content":"continue"}`, false},
+		{"non-string type", `{"type":7,"role":"user","content":"continue"}`, false},
+		{"role without content", `{"role":"user"}`, false},
+	} {
+		for _, position := range []string{"after checkpoint", "before checkpoint", "without checkpoint"} {
+			t.Run(tt.name+"/"+position, func(t *testing.T) {
+				input := []interface{}{json.RawMessage(tt.message)}
+				switch position {
+				case "after checkpoint":
+					input = append([]interface{}{proxyCompactionContextMessage("Checkpoint summary")}, input...)
+				case "before checkpoint":
+					input = append(input, proxyCompactionContextMessage("Checkpoint summary"))
+				}
+				reqBody, err := json.Marshal(map[string]interface{}{"model": "gpt-5.4", "input": input})
+				if err != nil {
+					t.Fatalf("marshal request: %v", err)
+				}
 
-	rewritten, injected := injectSyntheticCompactionResumePrompt(reqBody)
-	if injected {
-		t.Fatal("expected resume prompt injection to be skipped")
-	}
-	if !bytes.Equal(rewritten, reqBody) {
-		t.Fatal("expected request body to remain unchanged when user message exists")
+				rewritten, injected := injectSyntheticCompactionResumePrompt(reqBody)
+				wantInjected := !tt.userMessage || position == "before checkpoint"
+				if injected != wantInjected {
+					t.Fatalf("resume prompt injected = %t, want %t", injected, wantInjected)
+				}
+				if !injected && !bytes.Equal(rewritten, reqBody) {
+					t.Fatal("expected request body to remain unchanged when user message exists")
+				}
+			})
+		}
 	}
 }
 
