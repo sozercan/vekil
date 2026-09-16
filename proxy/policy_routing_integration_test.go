@@ -530,6 +530,59 @@ func TestPolicyRoutingAppliesProfileTierReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestPolicyRoutingClassifierReasoningEffortIndependentOfTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		effort string
+		want   string
+	}{
+		{name: "omitted"},
+		{name: "low", effort: "low", want: `"low"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			light := newPolicyIntegrationUpstream(t, policyClassifierSignals{
+				TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh,
+			})
+			powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+			cfg := policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeEnforce)
+			cfg.ModelRoutes[0].ReasoningEffort = []string{"low", "medium"}
+			cfg.ModelRoutes[1].ReasoningEffort = []string{"medium", "max"}
+			cfg.ModelRoutes[2].ReasoningEffort = []string{"low"}
+			cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+			cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
+			cfg.PolicyProfiles[0].Classifier.ReasoningEffort = tc.effort
+			h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeEnforce))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+
+			recorder := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+				"model":"coding-economy","messages":[{"role":"user","content":"Plan a coordinated multi-file migration."}],
+				"reasoning_effort":"medium"
+			}`)))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if _, models := light.snapshot(); strings.Join(models, ",") != "classifier-model,classifier-model" {
+				t.Fatalf("classifier requests = %v, want preflight and runtime classification", models)
+			}
+			for index, effort := range light.reasoningEffortSnapshot() {
+				if string(effort) != tc.want {
+					t.Errorf("classifier request %d reasoning_effort = %q, want %q", index, effort, tc.want)
+				}
+			}
+			if efforts := powerful.reasoningEffortSnapshot(); len(efforts) != 1 || string(efforts[0]) != `"max"` {
+				t.Fatalf("terminal reasoning efforts = %q, want one max request", efforts)
+			}
+		})
+	}
+}
+
 func TestPolicyRoutingWithoutTierReasoningAcceptsOmissionAndRejectsClientEffort(t *testing.T) {
 	tests := []struct {
 		name            string

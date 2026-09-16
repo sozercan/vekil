@@ -401,6 +401,74 @@ func TestPolicyRoutingUsesCopilotResponsesForClassifierAndTerminalText(t *testin
 	}
 }
 
+func TestPolicyRoutingCopilotResponsesClassifierReasoningEffort(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		effort string
+	}{
+		{name: "omitted"},
+		{name: "low", effort: "low"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
+				TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh,
+			})
+			cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+			cfg.ModelRoutes[0].ReasoningEffort = []string{"low", "medium"}
+			cfg.ModelRoutes[1].ReasoningEffort = []string{"medium", "max"}
+			cfg.ModelRoutes[2].ReasoningEffort = []string{"low"}
+			cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+			cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
+			cfg.PolicyProfiles[0].Classifier.ReasoningEffort = tc.effort
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
+				WithCopilotBaseURL(upstream.server.URL), WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+
+			recorder := httptest.NewRecorder()
+			h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+				"model":"gpt-5.6-semantic","input":"Plan a coordinated multi-file migration.",
+				"reasoning":{"effort":"medium"},"store":false
+			}`)))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			_, classifiers, terminals, _ := upstream.snapshot()
+			bodies := upstream.responsesBodies()
+			if classifiers != 2 || len(terminals) != 1 || len(bodies) != 3 {
+				t.Fatalf("upstream requests: classifiers=%d terminals=%v bodies=%d", classifiers, terminals, len(bodies))
+			}
+			for index, want := range []string{tc.effort, tc.effort, "max"} {
+				var request struct {
+					Reasoning *struct {
+						Effort string `json:"effort"`
+					} `json:"reasoning"`
+					ReasoningEffort json.RawMessage `json:"reasoning_effort"`
+				}
+				if err := json.Unmarshal([]byte(bodies[index]), &request); err != nil {
+					t.Fatal(err)
+				}
+				if len(request.ReasoningEffort) != 0 {
+					t.Errorf("Responses request %d contains Chat reasoning_effort", index)
+				}
+				if want == "" {
+					if request.Reasoning != nil {
+						t.Errorf("classifier request %d unexpectedly contains reasoning: %+v", index, request.Reasoning)
+					}
+				} else if request.Reasoning == nil || request.Reasoning.Effort != want {
+					t.Errorf("Responses request %d reasoning = %+v, want effort %q", index, request.Reasoning, want)
+				}
+			}
+		})
+	}
+}
+
 func TestPolicyResponsesIngressPreservesCopilotAttribution(t *testing.T) {
 	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
 		TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh,

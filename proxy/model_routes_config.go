@@ -411,11 +411,11 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 			return validatedProvidersConfig{}, err
 		}
 		if previous, exists := preflightContracts[profile.Classifier.Route]; exists {
-			if previous.TimeoutMS != profile.Classifier.TimeoutMS || previous.MaxCompletionTokens != profile.Classifier.MaxCompletionTokens {
+			if previous.TimeoutMS != profile.Classifier.TimeoutMS || previous.MaxCompletionTokens != profile.Classifier.MaxCompletionTokens || previous.ReasoningEffort != profile.Classifier.ReasoningEffort {
 				owner := preflightOwners[profile.Classifier.Route]
 				return validatedProvidersConfig{}, configPathError(
 					fmt.Sprintf("policy_profiles[%d].classifier", profileIndex),
-					"must use the same timeout_ms and max_completion_tokens as policy_profiles[%d].classifier when sharing classifier route %q",
+					"must use the same timeout_ms, max_completion_tokens, and reasoning_effort as policy_profiles[%d].classifier when sharing classifier route %q",
 					owner,
 					profile.Classifier.Route,
 				)
@@ -1290,7 +1290,7 @@ var policyTierConfigFields = configFieldSet(
 )
 
 var policyClassifierConfigFields = configFieldSet(
-	"route", "profile", "timeout_ms", "max_completion_tokens", "max_request_bytes",
+	"route", "profile", "reasoning_effort", "timeout_ms", "max_completion_tokens", "max_request_bytes",
 	"recent_turns", "max_concurrency", "observe_sample_rate",
 )
 
@@ -1698,6 +1698,7 @@ func markPolicyClassifierFieldPresence(classifier *PolicyClassifierConfig, has f
 	if classifier == nil || has == nil {
 		return
 	}
+	classifier.reasoningEffortSet = has("reasoning_effort")
 	classifier.timeoutMSSet = has("timeout_ms")
 	classifier.maxCompletionTokensSet = has("max_completion_tokens")
 	classifier.maxRequestBytesSet = has("max_request_bytes")
@@ -1707,6 +1708,7 @@ func markPolicyClassifierFieldPresence(classifier *PolicyClassifierConfig, has f
 	if isNull == nil {
 		return
 	}
+	classifier.reasoningEffortNull = isNull("reasoning_effort")
 	classifier.timeoutMSNull = isNull("timeout_ms")
 	classifier.maxCompletionTokensNull = isNull("max_completion_tokens")
 	classifier.maxRequestBytesNull = isNull("max_request_bytes")

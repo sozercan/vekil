@@ -669,6 +669,7 @@ type policyClassifierHTTPResponse struct {
 
 type policyHTTPClassifierOptions struct {
 	Model               string
+	ReasoningEffort     string
 	MaxCompletionTokens int
 	MaxFactsBytes       int
 	MaxResponseBytes    int
@@ -681,6 +682,7 @@ type policyHTTPClassifier struct {
 
 func newPolicyHTTPClassifier(options policyHTTPClassifierOptions, send policyClassifierSendFunc) (*policyHTTPClassifier, error) {
 	options.Model = strings.TrimSpace(options.Model)
+	options.ReasoningEffort = strings.TrimSpace(options.ReasoningEffort)
 	if options.MaxCompletionTokens == 0 {
 		options.MaxCompletionTokens = 256
 	}
@@ -764,6 +766,7 @@ func buildPolicyClassifierHTTPRequest(options policyHTTPClassifierOptions, facts
 	falseValue := false
 	request := struct {
 		Model               string           `json:"model,omitempty"`
+		ReasoningEffort     string           `json:"reasoning_effort,omitempty"`
 		Messages            []map[string]any `json:"messages"`
 		Tools               []map[string]any `json:"tools"`
 		ToolChoice          map[string]any   `json:"tool_choice"`
@@ -774,7 +777,8 @@ func buildPolicyClassifierHTTPRequest(options policyHTTPClassifierOptions, facts
 		MaxCompletionTokens int              `json:"max_completion_tokens"`
 		Store               *bool            `json:"store"`
 	}{
-		Model: options.Model,
+		Model:           options.Model,
+		ReasoningEffort: options.ReasoningEffort,
 		Messages: []map[string]any{
 			{
 				"role":    "system",

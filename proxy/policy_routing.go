@@ -187,7 +187,7 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 			breaker:              breaker,
 			configGeneration:     configGeneration,
 			profileGeneration:    policyProfileGeneration(profileCfg, entry.contract, lightweight, powerful),
-			classifierGeneration: policyClassifierGeneration(classifierRoute),
+			classifierGeneration: policyClassifierGeneration(classifierRoute, profileCfg.Classifier.ReasoningEffort),
 			binaryGeneration:     binaryGeneration,
 		}
 		profile.classifierRuntime = newPolicyClassifierRuntime(classifierAdapter, admission, breaker)
@@ -908,6 +908,7 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 	}
 	options := policyHTTPClassifierOptions{
 		Model:               target.upstreamModel,
+		ReasoningEffort:     profile.Classifier.ReasoningEffort,
 		MaxCompletionTokens: profile.Classifier.MaxCompletionTokens,
 		MaxFactsBytes:       profile.Classifier.MaxRequestBytes,
 		MaxResponseBytes:    policyClassifierResponseLimit,

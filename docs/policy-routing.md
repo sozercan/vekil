@@ -156,6 +156,8 @@ When the pair is configured, it is authoritative policy execution state rather t
 
 When both tier values are omitted, the policy profile does not control or advertise reasoning effort. Requests must omit an explicit non-null effort; Vekil rejects one locally instead of forwarding it or letting it influence tier selection.
 
+Set `classifier.reasoning_effort` to control classification independently of client and terminal tier effort. For example, `reasoning_effort: low` keeps the classifier at low effort even when it selects the powerful tier. The value must appear in the classifier route's `model_routes[].reasoning_effort` allowlist. Vekil sends it as Chat `reasoning_effort` or Responses `reasoning.effort`. When omitted, Vekil sends no classifier effort setting and leaves the choice to the provider.
+
 The v1 defaults are economy-oriented:
 
 - baseline: `lightweight`;
@@ -173,6 +175,7 @@ Unavailable and uncertain fallbacks are not cached in v1.
 | `classifier_unavailable_tier` | `baseline_tier` |
 | `classifier_uncertain_tier` | `powerful` |
 | classifier `profile` | `coding_agent_v1` |
+| classifier `reasoning_effort` | omitted, provider default |
 | `timeout_ms` | `3000` |
 | `max_completion_tokens` | `256` |
 | `max_request_bytes` | `16000` |
@@ -184,6 +187,7 @@ Valid classifier profile ranges are:
 
 | Field | Valid range |
 |---|---|
+| `reasoning_effort` | optional non-empty value from the classifier route's `reasoning_effort` allowlist |
 | `timeout_ms` | `100..10000` |
 | `max_completion_tokens` | `32..1024` |
 | `max_request_bytes` | `1024..65536` |
@@ -199,7 +203,8 @@ Validation also rejects:
 - public metadata on an internal route;
 - recursive policy references;
 - a null or non-object `lightweight`/`powerful` tier object, missing or unknown tier fields, a null/empty/whitespace-only tier `reasoning_effort`, or effort configured on only one tier;
-- a tier reasoning value absent from its referenced terminal route's `reasoning_effort` allowlist;
+- a null/empty/whitespace-only classifier `reasoning_effort`;
+- a tier or classifier reasoning value absent from its referenced route's `reasoning_effort` allowlist;
 - destination routes without `/chat/completions` or `/responses` Chat execution support;
 - unsupported provider families or dynamic providers other than pinned `type: copilot` targets;
 - terminal routes with different preferred Chat backends or other public Chat request semantics;
@@ -352,8 +357,10 @@ When any profile's **effective** mode is `observe` or `enforce`, startup perform
 - authentication and endpoint reachability;
 - forced `emit_policy_signals` selection;
 - strict argument-schema acceptance;
-- acceptance of the configured non-storage behavior; and
+- acceptance of the configured classifier reasoning effort and non-storage behavior; and
 - a maximum of one physical send.
+
+Preflight and runtime classification use the same classifier effort. Profiles sharing one classifier route must agree on `timeout_ms`, `max_completion_tokens`, and `reasoning_effort`, including whether effort is omitted.
 
 Mode-specific behavior:
 
@@ -418,7 +425,7 @@ Each bounded decision record carries IDs/enums/counts, latency/failure categorie
 
 - `configGeneration`: canonical normalized complete providers configuration;
 - `profileGeneration`: normalized profile, including its tier route/effort objects, derived public contract, terminal route IDs, and effective profile-wide request policy;
-- `classifierGeneration`: classifier route/target/model plus fact schema, forced-function schema, classifier-prompt, and mapper versions; and
+- `classifierGeneration`: classifier route/target/model and configured classifier effort, plus fact schema, forced-function schema, classifier-prompt, and mapper versions; and
 - `binaryGeneration`: build version plus Git commit when available.
 
 Generation hashes use normalized values and exclude secret values. Decision records, logs, and aggregate labels never contain prompt text, raw classifier output, tool arguments, credentials, or classifier rationale.

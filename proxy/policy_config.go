@@ -72,6 +72,7 @@ type PolicyTierConfig struct {
 type PolicyClassifierConfig struct {
 	Route               string `json:"route" yaml:"route"`
 	Profile             string `json:"profile,omitempty" yaml:"profile,omitempty"`
+	ReasoningEffort     string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
 	TimeoutMS           int    `json:"timeout_ms,omitempty" yaml:"timeout_ms,omitempty"`
 	MaxCompletionTokens int    `json:"max_completion_tokens,omitempty" yaml:"max_completion_tokens,omitempty"`
 	// MaxRequestBytes caps the serialized canonical facts payload. The fixed
@@ -81,6 +82,7 @@ type PolicyClassifierConfig struct {
 	MaxConcurrency    int     `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty"`
 	ObserveSampleRate float64 `json:"observe_sample_rate,omitempty" yaml:"observe_sample_rate,omitempty"`
 
+	reasoningEffortSet     bool
 	timeoutMSSet           bool
 	maxCompletionTokensSet bool
 	maxRequestBytesSet     bool
@@ -88,6 +90,7 @@ type PolicyClassifierConfig struct {
 	maxConcurrencySet      bool
 	observeSampleRateSet   bool
 
+	reasoningEffortNull     bool
 	timeoutMSNull           bool
 	maxCompletionTokensNull bool
 	maxRequestBytesNull     bool
@@ -204,6 +207,7 @@ func normalizeAndValidatePolicyProfileConfig(profile *PolicyProfileConfig, path 
 		name   string
 		isNull bool
 	}{
+		{"reasoning_effort", profile.Classifier.reasoningEffortNull},
 		{"timeout_ms", profile.Classifier.timeoutMSNull},
 		{"max_completion_tokens", profile.Classifier.maxCompletionTokensNull},
 		{"max_request_bytes", profile.Classifier.maxRequestBytesNull},
@@ -215,6 +219,12 @@ func normalizeAndValidatePolicyProfileConfig(profile *PolicyProfileConfig, path 
 		if field.isNull {
 			return configPathError(classifierPath+"."+field.name, "must not be null")
 		}
+	}
+
+	rawReasoningEffort := profile.Classifier.ReasoningEffort
+	profile.Classifier.ReasoningEffort = strings.TrimSpace(rawReasoningEffort)
+	if profile.Classifier.ReasoningEffort == "" && (profile.Classifier.reasoningEffortSet || rawReasoningEffort != "") {
+		return configPathError(classifierPath+".reasoning_effort", "must not be empty")
 	}
 
 	if !profile.Classifier.timeoutMSSet && profile.Classifier.TimeoutMS == 0 {
@@ -326,10 +336,10 @@ func validatePolicyProfileConfigReferences(
 		return err
 	}
 	if policyProfileControlsReasoning(profile) {
-		if err := validatePolicyTierReasoningEffort(profile.Lightweight.ReasoningEffort, path+".lightweight.reasoning_effort", lightweight, profile.Lightweight.Route); err != nil {
+		if err := validatePolicyReasoningEffort(profile.Lightweight.ReasoningEffort, path+".lightweight.reasoning_effort", lightweight, profile.Lightweight.Route); err != nil {
 			return err
 		}
-		if err := validatePolicyTierReasoningEffort(profile.Powerful.ReasoningEffort, path+".powerful.reasoning_effort", powerful, profile.Powerful.Route); err != nil {
+		if err := validatePolicyReasoningEffort(profile.Powerful.ReasoningEffort, path+".powerful.reasoning_effort", powerful, profile.Powerful.Route); err != nil {
 			return err
 		}
 	}
@@ -343,6 +353,11 @@ func validatePolicyProfileConfigReferences(
 	classifierProvider, err := validatePolicyClassifierRoute(classifier, path+".classifier.route", providers)
 	if err != nil {
 		return err
+	}
+	if profile.Classifier.ReasoningEffort != "" {
+		if err := validatePolicyReasoningEffort(profile.Classifier.ReasoningEffort, path+".classifier.reasoning_effort", classifier, profile.Classifier.Route); err != nil {
+			return err
+		}
 	}
 
 	if !profile.DataPolicy.ContentForwardingAcknowledged {
@@ -372,7 +387,7 @@ func validatePolicyProfileConfigReferences(
 	return nil
 }
 
-func validatePolicyTierReasoningEffort(effort, path string, route *ModelRouteConfig, routeID string) error {
+func validatePolicyReasoningEffort(effort, path string, route *ModelRouteConfig, routeID string) error {
 	if route == nil {
 		return configPathError(path, "cannot be validated because route %q is unavailable", routeID)
 	}
