@@ -56,7 +56,7 @@ When Vekil itself owns a Responses-backed terminal, `call_vekil_*` state records
 
 A downstream Chat-compatible bridge may also return process-local replay IDs; those continuations remain limited to an `off`/`observe` baseline with one target and require a single bridge instance or sticky ingress to the replay-owning process. One configured target proves route determinism, not replica affinity.
 
-Native Chat tool history must be complete and internally consistent before classifier admission. Assistant tool-call IDs must be unique, every tool result must reference one pending prior call exactly once, and all pending calls must receive results before the next non-tool message. Parallel results may arrive in any order. Malformed, missing, unknown, or duplicate tool-call relationships fail locally with no classifier or terminal-model send.
+Policy requests must have complete and internally consistent tool history before classifier admission, including requests entering through Responses compatibility. Assistant tool-call IDs must be unique, every tool result must reference one pending prior call exactly once, and all pending calls must receive results before the next non-tool message. Parallel results may arrive in any order. Malformed, missing, unknown, or duplicate tool-call relationships fail locally with no classifier or terminal-model send.
 
 ## Quick start
 
@@ -264,7 +264,7 @@ If root cancellation or lifecycle shutdown occurs during classification, Vekil r
 Classifier facts are built before tool-output optimization and contain bounded user/system content. Vekil includes:
 
 - system/developer anchors, capped at 2,000 UTF-8 bytes total;
-- `current_user_task`, the latest nonempty user message, capped at 4,000 UTF-8 bytes;
+- `current_user_task`, the latest user message containing non-whitespace text, capped at 4,000 UTF-8 bytes;
 - up to `recent_turns` recent text messages excluding anchors and the current task, each capped at 1,500 UTF-8 bytes;
 - function-tool names only, capped at 128 UTF-8 bytes each and 128 tools total;
 - typed message, tool, and context counts; and

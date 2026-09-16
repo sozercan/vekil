@@ -244,7 +244,7 @@ func buildPolicyClassifierFacts(body []byte, opts policyFactOptions) (policyClas
 			facts.Counts.DeveloperMessages++
 		case policyFactRoleUser:
 			facts.Counts.UserMessages++
-			if message.text != "" {
+			if strings.TrimSpace(message.text) != "" {
 				currentUserIndex = index
 			}
 		case policyFactRoleAssistant:

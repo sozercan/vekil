@@ -162,6 +162,28 @@ func TestBuildPolicyClassifierFactsRecentSelectionIsDeterministic(t *testing.T) 
 	}
 }
 
+func TestBuildPolicyClassifierFactsSkipsBlankUserTasks(t *testing.T) {
+	const task = "  Plan a migration across the authentication and storage modules.  "
+	for _, blank := range []string{"", " \t\r\n ", "\u2003\u00a0"} {
+		t.Run(fmt.Sprintf("trailing=%q", blank), func(t *testing.T) {
+			body := marshalPolicyFactTestBody(t, map[string]any{
+				"messages": []any{
+					map[string]any{"role": "user", "content": "hello"},
+					map[string]any{"role": "user", "content": task},
+					map[string]any{"role": "user", "content": blank},
+				},
+			})
+			facts, err := buildPolicyClassifierFacts(body, policyFactOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if facts.CurrentUserTask == nil || facts.CurrentUserTask.Text != task || facts.CurrentUserTask.OriginalBytes != len(task) {
+				t.Fatalf("current task = %+v, want the preceding substantive request unchanged", facts.CurrentUserTask)
+			}
+		})
+	}
+}
+
 func TestBuildPolicyClassifierFactsRoutesCurrentTaskDespiteClippedSetup(t *testing.T) {
 	for _, tc := range []struct {
 		name string
