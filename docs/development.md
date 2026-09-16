@@ -226,7 +226,7 @@ For that workflow to work, configure these repository settings and variable:
 
 The configured merge method must also be enabled for the repository; otherwise `gh pr merge --auto` cannot enable auto-merge.
 
-The macOS tray app has its own workflow in [`.github/workflows/macos-app.yaml`](../.github/workflows/macos-app.yaml). It runs `scripts/macos-app-smoke.sh` on a macOS runner, which builds `Vekil.app`, validates the bundle contents, launches the app through Launch Services, verifies it stays up, and then quits it cleanly.
+The macOS tray app has its own workflow in [`.github/workflows/macos-app.yaml`](../.github/workflows/macos-app.yaml). It runs `go test -race ./cmd/menubar -count=1`, then `scripts/macos-app-smoke.sh` on a macOS runner. The smoke builds `Vekil.app`, validates the bundle contents, launches the app through Launch Services, verifies it stays up, and then quits it cleanly.
 
 ## Release
 

@@ -25,5 +25,8 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Test macOS menubar app
+        run: go test -race ./cmd/menubar -count=1
+
       - name: Build and smoke test macOS menubar app
         run: scripts/macos-app-smoke.sh
