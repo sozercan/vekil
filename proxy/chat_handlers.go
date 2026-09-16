@@ -1221,16 +1221,21 @@ func isMissingResponsesChatReplayError(err error) bool {
 }
 
 func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOperation, route *modelRoute, chatBody []byte, options chatExecutionOptions, log *logger.Logger) (responsesChatRequestPlan, targetBinding, error) {
+	var completedReplayRoutes []responsesChatReplayRoute
+	if plan, planned := operation.policyPlan(); planned {
+		completedReplayRoutes = plan.completedPolicyReplayRouteSnapshot()
+	}
 	translateForTarget := func(target targetBinding, degrade bool, passLog *logger.Logger) (responsesChatRequestPlan, error) {
 		return translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
-			UpstreamModel:             route.public.id,
-			CarriedReasoning:          options.CarriedReasoning,
-			ReplayStore:               h.responsesChatReplayStore(),
-			ReplayRoute:               explicitResponsesChatReplayRoute(route, target),
-			Log:                       passLog,
-			MinimumOutputTokens:       options.ResponsesMinimumOutputTokens,
-			DropSamplingParams:        options.ResponsesDropSamplingParams,
-			DegradeUnrestorableReplay: degrade,
+			UpstreamModel:               route.public.id,
+			CarriedReasoning:            options.CarriedReasoning,
+			ReplayStore:                 h.responsesChatReplayStore(),
+			ReplayRoute:                 explicitResponsesChatReplayRoute(route, target),
+			CompletedPolicyReplayRoutes: cloneResponsesChatReplayRoutes(completedReplayRoutes),
+			Log:                         passLog,
+			MinimumOutputTokens:         options.ResponsesMinimumOutputTokens,
+			DropSamplingParams:          options.ResponsesDropSamplingParams,
+			DegradeUnrestorableReplay:   degrade,
 		})
 	}
 

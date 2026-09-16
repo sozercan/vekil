@@ -26,13 +26,16 @@ func newChatInvalidRequest(param, message string) *chatExecutionError {
 }
 
 type responsesChatRequestOptions struct {
-	UpstreamModel       string
-	CarriedReasoning    map[string]carriedReplay
-	ReplayStore         *responsesChatReplayStore
-	ReplayRoute         responsesChatReplayRoute
-	Log                 *logger.Logger
-	MinimumOutputTokens int
-	DropSamplingParams  bool
+	UpstreamModel    string
+	CarriedReasoning map[string]carriedReplay
+	ReplayStore      *responsesChatReplayStore
+	ReplayRoute      responsesChatReplayRoute
+	// Sealed policy routes for completed history on the same physical upstream.
+	// Active tool continuations continue to require ReplayRoute exactly.
+	CompletedPolicyReplayRoutes []responsesChatReplayRoute
+	Log                         *logger.Logger
+	MinimumOutputTokens         int
+	DropSamplingParams          bool
 	// Anthropic clients hold their replay state in a transcript they already sent and
 	// cannot repair, so a carrier that cannot answer degrades to the visible turn.
 	// Native Chat owns its history and stays loud. Off while probing candidates: the
@@ -262,6 +265,10 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 	if err != nil {
 		return nil, err
 	}
+	completedPolicyReplayEnd := 0
+	if len(options.CompletedPolicyReplayRoutes) > 0 {
+		completedPolicyReplayEnd = completedResponsesChatPolicyReplayEnd(messages, resultIndices)
+	}
 	// The slice may grow when one Chat message expands to multiple Responses
 	// items. Start with the bounded decoded message count and let append grow it;
 	// avoid arithmetic on an untrusted length in the allocation size.
@@ -359,7 +366,12 @@ func translateChatMessagesToResponses(messages []json.RawMessage, options respon
 				}
 				continue
 			}
-			restored, err := restoreResponsesChatCalls(options, projected, content, &tally)
+			var restored responsesChatRestoredCalls
+			if index < completedPolicyReplayEnd {
+				restored, err = restoreCompletedResponsesChatPolicyCalls(options, projected, content, &tally)
+			} else {
+				restored, err = restoreResponsesChatCalls(options, projected, content, &tally)
+			}
 			if err != nil {
 				return nil, err
 			}

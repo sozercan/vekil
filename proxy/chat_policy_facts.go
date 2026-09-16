@@ -11,14 +11,14 @@ import (
 )
 
 const (
-	policyFactSchemaVersion       = "coding_agent_v1_facts_v1"
+	policyFactSchemaVersion       = "coding_agent_v1_facts_v2"
 	policyFactDefaultRequestBytes = 16_000
 	policyFactMinRequestBytes     = 1_024
 	policyFactMaxRequestBytes     = 65_536
 	policyFactMaxRecentTurns      = 8
 
 	policyFactAnchorBytes        = 2_000
-	policyFactFirstTaskBytes     = 4_000
+	policyFactCurrentTaskBytes   = 4_000
 	policyFactRecentMessageBytes = 1_500
 	policyFactToolNameBytes      = 128
 	policyFactMaxTools           = 128
@@ -109,7 +109,7 @@ type policyFactCounts struct {
 
 type policyFactTruncation struct {
 	Anchors          bool `json:"anchors"`
-	FirstUserTask    bool `json:"first_user_task"`
+	CurrentUserTask  bool `json:"current_user_task"`
 	RecentMessages   bool `json:"recent_messages"`
 	FunctionTools    bool `json:"function_tools"`
 	SerializedBudget bool `json:"serialized_budget"`
@@ -119,17 +119,22 @@ type policyFactTruncation struct {
 // classifier seam. It contains bounded text and function names, never schemas,
 // arguments, IDs, provider state, or routing metadata.
 type policyClassifierFacts struct {
-	SchemaVersion  string               `json:"schema_version"`
-	Anchors        []policyFactMessage  `json:"anchors,omitempty"`
-	FirstUserTask  *policyFactMessage   `json:"first_user_task,omitempty"`
-	RecentMessages []policyFactMessage  `json:"recent_messages,omitempty"`
-	FunctionTools  []policyFactTool     `json:"function_tools,omitempty"`
-	Counts         policyFactCounts     `json:"counts"`
-	Truncation     policyFactTruncation `json:"truncation"`
+	SchemaVersion   string               `json:"schema_version"`
+	Anchors         []policyFactMessage  `json:"anchors,omitempty"`
+	CurrentUserTask *policyFactMessage   `json:"current_user_task,omitempty"`
+	RecentMessages  []policyFactMessage  `json:"recent_messages,omitempty"`
+	FunctionTools   []policyFactTool     `json:"function_tools,omitempty"`
+	Counts          policyFactCounts     `json:"counts"`
+	Truncation      policyFactTruncation `json:"truncation"`
 }
 
-func (f policyClassifierFacts) taskOrContextTruncated() bool {
-	return f.Truncation.Anchors || f.Truncation.FirstUserTask || f.Truncation.RecentMessages
+func (f policyClassifierFacts) taskTruncated() bool {
+	// Setup instructions and older history routinely exceed their context
+	// budgets. Only losing part of the current task forces a powerful route.
+	// Without a user task, retain the conservative rule for the context that
+	// must carry the request instead.
+	return f.Truncation.CurrentUserTask || (f.CurrentUserTask == nil &&
+		(f.Truncation.Anchors || f.Truncation.RecentMessages))
 }
 
 func (f policyClassifierFacts) inputBytes() int {
@@ -137,7 +142,7 @@ func (f policyClassifierFacts) inputBytes() int {
 }
 
 func (f policyClassifierFacts) truncated() bool {
-	return f.Truncation.Anchors || f.Truncation.FirstUserTask || f.Truncation.RecentMessages || f.Truncation.FunctionTools || f.Truncation.SerializedBudget
+	return f.Truncation.Anchors || f.Truncation.CurrentUserTask || f.Truncation.RecentMessages || f.Truncation.FunctionTools || f.Truncation.SerializedBudget
 }
 
 func (f policyClassifierFacts) marshal() ([]byte, error) {
@@ -223,7 +228,7 @@ func buildPolicyClassifierFacts(body []byte, opts policyFactOptions) (policyClas
 	facts := policyClassifierFacts{SchemaVersion: policyFactSchemaVersion}
 	facts.Counts.RequestOriginalBytes = len(body)
 	parsedMessages := make([]parsedPolicyFactMessage, 0, len(messageItems))
-	firstUserIndex := -1
+	currentUserIndex := -1
 	for index, rawMessage := range messageItems {
 		message, toolCalls, err := parsePolicyFactMessage(rawMessage, index)
 		if err != nil {
@@ -239,8 +244,8 @@ func buildPolicyClassifierFacts(body []byte, opts policyFactOptions) (policyClas
 			facts.Counts.DeveloperMessages++
 		case policyFactRoleUser:
 			facts.Counts.UserMessages++
-			if firstUserIndex < 0 && message.text != "" {
-				firstUserIndex = index
+			if message.text != "" {
+				currentUserIndex = index
 			}
 		case policyFactRoleAssistant:
 			facts.Counts.AssistantMessages++
@@ -256,8 +261,8 @@ func buildPolicyClassifierFacts(body []byte, opts policyFactOptions) (policyClas
 	}
 
 	buildPolicyAnchorFacts(&facts, parsedMessages)
-	buildPolicyTaskFact(&facts, parsedMessages, firstUserIndex)
-	buildPolicyRecentFacts(&facts, parsedMessages, firstUserIndex, normalized.RecentTurns)
+	buildPolicyTaskFact(&facts, parsedMessages, currentUserIndex)
+	buildPolicyRecentFacts(&facts, parsedMessages, currentUserIndex, normalized.RecentTurns)
 
 	rawTools, hasTools := root["tools"]
 	if hasTools {
@@ -557,21 +562,21 @@ func buildPolicyAnchorFacts(facts *policyClassifierFacts, messages []parsedPolic
 	}
 }
 
-func buildPolicyTaskFact(facts *policyClassifierFacts, messages []parsedPolicyFactMessage, firstUserIndex int) {
-	if firstUserIndex < 0 || firstUserIndex >= len(messages) {
+func buildPolicyTaskFact(facts *policyClassifierFacts, messages []parsedPolicyFactMessage, currentUserIndex int) {
+	if currentUserIndex < 0 || currentUserIndex >= len(messages) {
 		return
 	}
-	message := messages[firstUserIndex]
-	text, truncated := truncatePolicyUTF8(message.text, policyFactFirstTaskBytes)
-	facts.FirstUserTask = &policyFactMessage{Role: policyFactRoleUser, Text: text, OriginalBytes: message.textBytes, Truncated: truncated}
+	message := messages[currentUserIndex]
+	text, truncated := truncatePolicyUTF8(message.text, policyFactCurrentTaskBytes)
+	facts.CurrentUserTask = &policyFactMessage{Role: policyFactRoleUser, Text: text, OriginalBytes: message.textBytes, Truncated: truncated}
 	facts.Counts.TaskOriginalBytes = message.textBytes
-	facts.Truncation.FirstUserTask = truncated
+	facts.Truncation.CurrentUserTask = truncated
 }
 
-func buildPolicyRecentFacts(facts *policyClassifierFacts, messages []parsedPolicyFactMessage, firstUserIndex, recentTurns int) {
+func buildPolicyRecentFacts(facts *policyClassifierFacts, messages []parsedPolicyFactMessage, currentUserIndex, recentTurns int) {
 	candidates := make([]parsedPolicyFactMessage, 0, len(messages))
 	for index, message := range messages {
-		if index == firstUserIndex || message.role == policyFactRoleSystem || message.role == policyFactRoleDeveloper || message.text == "" {
+		if index == currentUserIndex || message.role == policyFactRoleSystem || message.role == policyFactRoleDeveloper || message.text == "" {
 			continue
 		}
 		candidates = append(candidates, message)
@@ -747,9 +752,8 @@ func fitPolicyFactsToSerializedBudget(facts *policyClassifierFacts, maxBytes int
 		}
 	}
 
-	// Preserve the earliest anchors and newest recent messages. Dropping any
-	// content marks the context as truncated so the mapper can conservatively
-	// choose the powerful tier.
+	// Preserve the earliest anchors and newest recent messages. Keep clipping
+	// visible to the classifier, but retain the current task ahead of context.
 	for len(facts.Anchors) > 0 && len(encoded) > maxBytes {
 		last := len(facts.Anchors) - 1
 		facts.Anchors[last] = policyFactMessage{}
@@ -772,25 +776,25 @@ func fitPolicyFactsToSerializedBudget(facts *policyClassifierFacts, maxBytes int
 		}
 	}
 
-	if len(encoded) > maxBytes && facts.FirstUserTask != nil && facts.FirstUserTask.Text != "" {
-		original := facts.FirstUserTask.Text
+	if len(encoded) > maxBytes && facts.CurrentUserTask != nil && facts.CurrentUserTask.Text != "" {
+		original := facts.CurrentUserTask.Text
 		best, ok, searchErr := largestPolicyUTF8PrefixThatFits(original, func(candidate string) (bool, error) {
-			facts.FirstUserTask.Text = candidate
+			facts.CurrentUserTask.Text = candidate
 			probe, marshalErr := facts.marshal()
 			return len(probe) <= maxBytes, marshalErr
 		})
 		if searchErr != nil {
 			return searchErr
 		}
-		facts.FirstUserTask.Text = best
-		facts.FirstUserTask.Truncated = true
-		facts.Truncation.FirstUserTask = true
+		facts.CurrentUserTask.Text = best
+		facts.CurrentUserTask.Truncated = true
+		facts.Truncation.CurrentUserTask = true
 		encoded, err = facts.marshal()
 		if err != nil {
 			return err
 		}
 		if !ok || len(encoded) > maxBytes {
-			facts.FirstUserTask.Text = ""
+			facts.CurrentUserTask.Text = ""
 			encoded, err = facts.marshal()
 			if err != nil {
 				return err

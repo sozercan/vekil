@@ -27,11 +27,12 @@ type chatOperationPlan struct {
 	publicID string
 	routeID  string
 
-	candidates                []targetBinding
-	routePolicy               routePolicy
-	contract                  publicModelContract
-	terminalParallelToolCalls *bool
-	selectedReasoningEffort   string
+	candidates                  []targetBinding
+	routePolicy                 routePolicy
+	contract                    publicModelContract
+	terminalParallelToolCalls   *bool
+	selectedReasoningEffort     string
+	completedPolicyReplayRoutes []responsesChatReplayRoute
 
 	policyID             string
 	selectedTier         policyTier
@@ -55,6 +56,9 @@ type chatOperationPlanOptions struct {
 	// SelectedReasoningEffort is the policy-owned canonical Chat value sealed
 	// for the selected tier. Empty preserves ordinary non-managed behavior.
 	SelectedReasoningEffort string
+	// CompletedPolicyReplayRoutes allows only completed history to restore under
+	// another tier's exact binding on the same provider and upstream model.
+	CompletedPolicyReplayRoutes []responsesChatReplayRoute
 
 	PolicyID             string
 	SelectedTier         policyTier
@@ -88,21 +92,22 @@ func newChatOperationPlan(options chatOperationPlanOptions) chatOperationPlan {
 	}
 
 	plan := chatOperationPlan{
-		operationID:               strings.TrimSpace(options.OperationID),
-		terminalParallelToolCalls: terminalParallelToolCalls,
-		entryID:                   entryID,
-		publicID:                  publicID,
-		routeID:                   routeID,
-		contract:                  contract,
-		selectedReasoningEffort:   strings.TrimSpace(options.SelectedReasoningEffort),
-		policyID:                  strings.TrimSpace(options.PolicyID),
-		selectedTier:              options.SelectedTier,
-		effectiveMode:             options.EffectiveMode,
-		configGeneration:          strings.TrimSpace(options.ConfigGeneration),
-		profileGeneration:         strings.TrimSpace(options.ProfileGeneration),
-		classifierGeneration:      strings.TrimSpace(options.ClassifierGeneration),
-		binaryGeneration:          strings.TrimSpace(options.BinaryGeneration),
-		decision:                  options.Decision,
+		operationID:                 strings.TrimSpace(options.OperationID),
+		terminalParallelToolCalls:   terminalParallelToolCalls,
+		entryID:                     entryID,
+		publicID:                    publicID,
+		routeID:                     routeID,
+		contract:                    contract,
+		selectedReasoningEffort:     strings.TrimSpace(options.SelectedReasoningEffort),
+		completedPolicyReplayRoutes: cloneResponsesChatReplayRoutes(options.CompletedPolicyReplayRoutes),
+		policyID:                    strings.TrimSpace(options.PolicyID),
+		selectedTier:                options.SelectedTier,
+		effectiveMode:               options.EffectiveMode,
+		configGeneration:            strings.TrimSpace(options.ConfigGeneration),
+		profileGeneration:           strings.TrimSpace(options.ProfileGeneration),
+		classifierGeneration:        strings.TrimSpace(options.ClassifierGeneration),
+		binaryGeneration:            strings.TrimSpace(options.BinaryGeneration),
+		decision:                    options.Decision,
 	}
 	if options.Route != nil {
 		plan.candidates = cloneTargetBindings(options.Route.targets)
@@ -180,4 +185,8 @@ func (p chatOperationPlan) candidateSnapshot() []targetBinding {
 		return cloneTargetBindings(p.operationRoute.targets)
 	}
 	return cloneTargetBindings(p.candidates)
+}
+
+func (p chatOperationPlan) completedPolicyReplayRouteSnapshot() []responsesChatReplayRoute {
+	return cloneResponsesChatReplayRoutes(p.completedPolicyReplayRoutes)
 }

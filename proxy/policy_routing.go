@@ -383,9 +383,9 @@ func (c *chatPolicyRoutingController) Initialize(ctx context.Context) error {
 func policyPreflightFacts() policyClassifierFacts {
 	text := "Inspect one small function and report its behavior."
 	return policyClassifierFacts{
-		SchemaVersion: policyFactSchemaVersion,
-		FirstUserTask: &policyFactMessage{Role: policyFactRoleUser, Text: text, OriginalBytes: len(text)},
-		Counts:        policyFactCounts{Messages: 1, UserMessages: 1, TextMessages: 1, TaskOriginalBytes: len(text)},
+		SchemaVersion:   policyFactSchemaVersion,
+		CurrentUserTask: &policyFactMessage{Role: policyFactRoleUser, Text: text, OriginalBytes: len(text)},
+		Counts:          policyFactCounts{Messages: 1, UserMessages: 1, TextMessages: 1, TaskOriginalBytes: len(text)},
 	}
 }
 
@@ -413,7 +413,8 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	var replayRoute *modelRoute
 	var replayTier policyTier
 	downstreamReplayPassthrough := false
-	if chatRequestContainsResponsesReplayID(input.OriginalBody) {
+	containsReplay := chatRequestContainsResponsesReplayID(input.OriginalBody)
+	if containsReplay {
 		var replayErr error
 		replayRoute, replayTier, replayErr = c.resolvePolicyResponsesReplayRoute(profile, input.OriginalBody, input.CarriedReasoning)
 		if replayErr != nil {
@@ -426,9 +427,18 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 				return chatOperationPlan{}, replayErr
 			}
 		}
+		if replayRoute != nil && len(policyCompletedReplayRoutes(profile)) > 0 && !chatRequestHasActiveResponsesPolicyReplay(input.OriginalBody) {
+			// The replay remains validated history. A new user task chooses its own
+			// effort once every earlier tool call and assistant turn has finished.
+			replayRoute = nil
+			replayTier = policyTierUnknown
+		}
 	}
 	if replayRoute == nil && !downstreamReplayPassthrough {
-		if err := c.validateResponsesBackedPolicyRequest(profile, input.OriginalBody); err != nil {
+		if err := c.validateResponsesBackedPolicyRequest(profile, input.OriginalBody, input.CarriedReasoning); err != nil {
+			if containsReplay {
+				return chatOperationPlan{}, err
+			}
 			return chatOperationPlan{}, &providerRequestError{
 				statusCode: http.StatusBadRequest,
 				err:        fmt.Errorf("policy model %q request is outside its shared terminal contract: %w", entry.id, err),
@@ -465,8 +475,26 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	return c.enforce(ctx, profile, input, facts, bucket)
 }
 
-func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profile *compiledPolicyProfile, body []byte) error {
+func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profile *compiledPolicyProfile, body []byte, carried map[string]carriedReplay) error {
 	if c == nil || c.h == nil || profile == nil {
+		return nil
+	}
+	completedReplayRoutes := policyCompletedReplayRoutes(profile)
+	if len(completedReplayRoutes) > 0 && chatRequestContainsResponsesReplayID(body) {
+		carried = routeSelectingCarriers(carried)
+		for index, route := range []*modelRoute{profile.lightweight, profile.powerful} {
+			replayRoute := completedReplayRoutes[index]
+			if _, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+				UpstreamModel:               replayRoute.UpstreamModel,
+				CarriedReasoning:            carried,
+				ReplayStore:                 c.h.responsesChatReplayStore(),
+				ReplayRoute:                 replayRoute,
+				CompletedPolicyReplayRoutes: cloneResponsesChatReplayRoutes(completedReplayRoutes),
+				DropSamplingParams:          route.public.policy.dropSamplingParams,
+			}); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	seen := make(map[string]struct{}, 2)
@@ -499,6 +527,7 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 		tier  policyTier
 	}
 	carried = routeSelectingCarriers(carried)
+	completedReplayRoutes := policyCompletedReplayRoutes(profile)
 	candidates := []candidate{{route: profile.lightweight, tier: policyTierLightweight}, {route: profile.powerful, tier: policyTierPowerful}}
 	responsesCapable := false
 	var missing error
@@ -526,7 +555,8 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 					RouteID:       candidate.route.public.routeID,
 					PolicyTier:    candidate.tier.String(),
 				},
-				DropSamplingParams: candidate.route.public.policy.dropSamplingParams,
+				CompletedPolicyReplayRoutes: cloneResponsesChatReplayRoutes(completedReplayRoutes),
+				DropSamplingParams:          candidate.route.public.policy.dropSamplingParams,
 			})
 			if err == nil {
 				return candidate.route, candidate.tier, nil
@@ -759,21 +789,22 @@ func (c *chatPolicyRoutingController) sealPlan(profile *compiledPolicyProfile, i
 	decision.InputBytes = len(input.OriginalBody)
 	decision.Truncated = decision.Truncated || facts.truncated()
 	return newChatOperationPlan(chatOperationPlanOptions{
-		OperationID:             input.OperationID,
-		EntryID:                 profile.entry.id,
-		PublicID:                profile.entry.id,
-		RouteID:                 route.public.routeID,
-		Route:                   route,
-		Contract:                contract,
-		SelectedReasoningEffort: profile.reasoningEffortForTier(tier),
-		PolicyID:                profile.config.ID,
-		SelectedTier:            tier,
-		EffectiveMode:           profile.effectiveMode(),
-		ConfigGeneration:        profile.configGeneration,
-		ProfileGeneration:       profile.profileGeneration,
-		ClassifierGeneration:    profile.classifierGeneration,
-		BinaryGeneration:        profile.binaryGeneration,
-		Decision:                decision,
+		OperationID:                 input.OperationID,
+		EntryID:                     profile.entry.id,
+		PublicID:                    profile.entry.id,
+		RouteID:                     route.public.routeID,
+		Route:                       route,
+		Contract:                    contract,
+		SelectedReasoningEffort:     profile.reasoningEffortForTier(tier),
+		CompletedPolicyReplayRoutes: policyCompletedReplayRoutes(profile),
+		PolicyID:                    profile.config.ID,
+		SelectedTier:                tier,
+		EffectiveMode:               profile.effectiveMode(),
+		ConfigGeneration:            profile.configGeneration,
+		ProfileGeneration:           profile.profileGeneration,
+		ClassifierGeneration:        profile.classifierGeneration,
+		BinaryGeneration:            profile.binaryGeneration,
+		Decision:                    decision,
 	})
 }
 
@@ -787,21 +818,22 @@ func (c *chatPolicyRoutingController) sealRoutePlan(profile *compiledPolicyProfi
 	decision.InputBytes = len(input.OriginalBody)
 	decision.Truncated = decision.Truncated || facts.truncated()
 	return newChatOperationPlan(chatOperationPlanOptions{
-		OperationID:             input.OperationID,
-		EntryID:                 profile.entry.id,
-		PublicID:                profile.entry.id,
-		RouteID:                 route.public.routeID,
-		Route:                   route,
-		Contract:                contract,
-		SelectedReasoningEffort: profile.reasoningEffortForTier(tier),
-		PolicyID:                profile.config.ID,
-		SelectedTier:            tier,
-		EffectiveMode:           profile.effectiveMode(),
-		ConfigGeneration:        profile.configGeneration,
-		ProfileGeneration:       profile.profileGeneration,
-		ClassifierGeneration:    profile.classifierGeneration,
-		BinaryGeneration:        profile.binaryGeneration,
-		Decision:                decision,
+		OperationID:                 input.OperationID,
+		EntryID:                     profile.entry.id,
+		PublicID:                    profile.entry.id,
+		RouteID:                     route.public.routeID,
+		Route:                       route,
+		Contract:                    contract,
+		SelectedReasoningEffort:     profile.reasoningEffortForTier(tier),
+		CompletedPolicyReplayRoutes: policyCompletedReplayRoutes(profile),
+		PolicyID:                    profile.config.ID,
+		SelectedTier:                tier,
+		EffectiveMode:               profile.effectiveMode(),
+		ConfigGeneration:            profile.configGeneration,
+		ProfileGeneration:           profile.profileGeneration,
+		ClassifierGeneration:        profile.classifierGeneration,
+		BinaryGeneration:            profile.binaryGeneration,
+		Decision:                    decision,
 	})
 }
 

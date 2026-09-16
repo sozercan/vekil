@@ -11,10 +11,10 @@ import (
 )
 
 const (
-	policyFactGenerationVersion     = "coding-agent-facts-v1"
+	policyFactGenerationVersion     = "coding-agent-facts-v2"
 	policyFunctionGenerationVersion = "emit-policy-signals-v1"
-	policyPromptGenerationVersion   = "coding-agent-classifier-prompt-v2"
-	policyMapperGenerationVersion   = "coding-agent-mapper-v1"
+	policyPromptGenerationVersion   = "coding-agent-classifier-prompt-v3"
+	policyMapperGenerationVersion   = "coding-agent-mapper-v2"
 )
 
 func policyConfigGeneration(cfg ProvidersConfig) string {

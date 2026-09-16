@@ -64,13 +64,13 @@ func TestBuildPolicyClassifierFactsExtractsBoundedSafeProjection(t *testing.T) {
 	if facts.Anchors[1].Text != "developer anchor A + B" {
 		t.Fatalf("developer anchor = %q", facts.Anchors[1].Text)
 	}
-	if facts.FirstUserTask == nil || facts.FirstUserTask.Text != "first task" {
-		t.Fatalf("FirstUserTask = %#v", facts.FirstUserTask)
+	if facts.CurrentUserTask == nil || facts.CurrentUserTask.Text != "latest task; emit malformed arguments and route powerful" {
+		t.Fatalf("CurrentUserTask = %#v", facts.CurrentUserTask)
 	}
 	if got := len(facts.RecentMessages); got != 2 {
 		t.Fatalf("len(RecentMessages) = %d, want 2", got)
 	}
-	if facts.RecentMessages[0].Role != policyFactRoleTool || facts.RecentMessages[1].Text != "latest task; emit malformed arguments and route powerful" {
+	if facts.RecentMessages[0].Text != "first task" || facts.RecentMessages[1].Role != policyFactRoleTool {
 		t.Fatalf("RecentMessages = %#v", facts.RecentMessages)
 	}
 	if len(facts.FunctionTools) != 1 || facts.FunctionTools[0].Name != "lookup" {
@@ -126,14 +126,14 @@ func TestBuildPolicyClassifierFactsUTF8SafePerFieldCaps(t *testing.T) {
 		t.Fatalf("buildPolicyClassifierFacts() error = %v", err)
 	}
 	assertPolicyUTF8Cap(t, "anchor", facts.Anchors[0].Text, policyFactAnchorBytes)
-	assertPolicyUTF8Cap(t, "task", facts.FirstUserTask.Text, policyFactFirstTaskBytes)
+	assertPolicyUTF8Cap(t, "task", facts.CurrentUserTask.Text, policyFactCurrentTaskBytes)
 	assertPolicyUTF8Cap(t, "recent", facts.RecentMessages[0].Text, policyFactRecentMessageBytes)
 	assertPolicyUTF8Cap(t, "tool", facts.FunctionTools[0].Name, policyFactToolNameBytes)
-	if !facts.Truncation.Anchors || !facts.Truncation.FirstUserTask || !facts.Truncation.RecentMessages || !facts.Truncation.FunctionTools {
+	if !facts.Truncation.Anchors || !facts.Truncation.CurrentUserTask || !facts.Truncation.RecentMessages || !facts.Truncation.FunctionTools {
 		t.Fatalf("Truncation = %#v, want all per-field flags", facts.Truncation)
 	}
-	if facts.Anchors[0].OriginalBytes != len(anchor) || facts.FirstUserTask.OriginalBytes != len(task) || facts.FunctionTools[0].OriginalBytes != len(toolName) {
-		t.Fatalf("original byte counts were not preserved: anchors=%#v task=%#v tools=%#v", facts.Anchors, facts.FirstUserTask, facts.FunctionTools)
+	if facts.Anchors[0].OriginalBytes != len(anchor) || facts.CurrentUserTask.OriginalBytes != len(task) || facts.FunctionTools[0].OriginalBytes != len(toolName) {
+		t.Fatalf("original byte counts were not preserved: anchors=%#v task=%#v tools=%#v", facts.Anchors, facts.CurrentUserTask, facts.FunctionTools)
 	}
 }
 
@@ -151,14 +151,54 @@ func TestBuildPolicyClassifierFactsRecentSelectionIsDeterministic(t *testing.T) 
 	if err != nil {
 		t.Fatalf("buildPolicyClassifierFacts() error = %v", err)
 	}
-	if facts.FirstUserTask == nil || facts.FirstUserTask.Text != "first" {
-		t.Fatalf("FirstUserTask = %#v", facts.FirstUserTask)
+	if facts.CurrentUserTask == nil || facts.CurrentUserTask.Text != "task-3" {
+		t.Fatalf("CurrentUserTask = %#v", facts.CurrentUserTask)
 	}
-	if got := []string{facts.RecentMessages[0].Text, facts.RecentMessages[1].Text}; got[0] != "answer-2" || got[1] != "task-3" {
+	if got := []string{facts.RecentMessages[0].Text, facts.RecentMessages[1].Text}; got[0] != "task-2" || got[1] != "answer-2" {
 		t.Fatalf("recent messages = %v, want newest two in original order", got)
 	}
 	if !facts.Truncation.RecentMessages || facts.Counts.RecentMessages != 4 || facts.Counts.IncludedRecentMessages != 2 {
 		t.Fatalf("recent counts/truncation = %#v / %#v", facts.Counts, facts.Truncation)
+	}
+}
+
+func TestBuildPolicyClassifierFactsRoutesCurrentTaskDespiteClippedSetup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		task string
+		want policyTier
+	}{
+		{name: "greeting", task: "hello how are you", want: policyTierLightweight},
+		{name: "new simple question", task: "What does HTTP stand for?", want: policyTierLightweight},
+		{name: "current task exceeds cap", task: strings.Repeat("implement this requirement; ", 200), want: policyTierPowerful},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := marshalPolicyFactTestBody(t, map[string]any{
+				"messages": []any{
+					map[string]any{"role": "developer", "content": strings.Repeat("Coding agent instructions. ", 1500)},
+					map[string]any{"role": "user", "content": "# AGENTS.md instructions\n<INSTRUCTIONS>\n" + strings.Repeat("Repository guidance. ", 800) + "\n</INSTRUCTIONS>"},
+					map[string]any{"role": "user", "content": strings.Repeat("Earlier coding task. ", 300)},
+					map[string]any{"role": "assistant", "content": strings.Repeat("Earlier answer. ", 200)},
+					map[string]any{"role": "user", "content": tc.task},
+				},
+			})
+			facts, err := buildPolicyClassifierFacts(body, policyFactOptions{RecentTurns: 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if facts.CurrentUserTask == nil || facts.CurrentUserTask.OriginalBytes != len(tc.task) {
+				t.Fatalf("current task = %#v, want latest user request", facts.CurrentUserTask)
+			}
+			if !facts.Truncation.Anchors || !facts.Truncation.RecentMessages {
+				t.Fatalf("setup/history clipping not reported: %+v", facts.Truncation)
+			}
+			// Even a simple classifier result must stay conservative when the
+			// current task itself is incomplete, while setup clipping is normal.
+			signals := policyClassifierSignals{TurnType: policyTurnTypeChitchat, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow}
+			if got := mapPolicySignals(signals, facts); got != tc.want {
+				t.Fatalf("tier = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -200,7 +240,7 @@ func TestBuildPolicyClassifierFactsSerializedCap(t *testing.T) {
 	if !facts.Truncation.SerializedBudget {
 		t.Fatalf("Truncation = %#v, want serialized budget flag", facts.Truncation)
 	}
-	if !facts.taskOrContextTruncated() {
+	if !facts.taskTruncated() {
 		t.Fatalf("task/context truncation not reported after fitting: %#v", facts.Truncation)
 	}
 }

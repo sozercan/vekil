@@ -205,8 +205,11 @@ required.
 
 The default policy mode follows the profile's YAML `mode`; an explicit
 `--policy-routing off|observe|enforce` value can still lower the process-wide
-ceiling. Locally owned `call_vekil_*` continuations retain their originating
-route and tier, including in `enforce`. Opaque continuations from a downstream
+ceiling. Active, locally owned `call_vekil_*` continuations retain their originating
+route and tier, including in `enforce`. Completed tool history permits a later
+user task to select a new effort when both tiers use the same single upstream
+target, as described in [Policy routing](policy-routing.md#locked-v1-scope).
+Opaque continuations from a downstream
 Responses-backed bridge are accepted only for a single-target baseline in
 `off` or `observe`, and that bridge must be one process (the normal loopback
 launcher topology) or use sticky ingress to the replay-owning replica.
@@ -271,6 +274,12 @@ configure `reasoning_effort`; the effective selected tier value then replaces
 it. If both tiers omit effort, a valid present value is rejected as unsupported
 and an unset value remains unset. Malformed or blank effort fails locally before
 policy execution.
+
+Semantic routing classifies the latest user task. Long Codex setup instructions
+and completed tool history do not by themselves force `powerful`. With low/max
+tiers on the same single provider/model target, an active tool continuation
+keeps its effort and the next user turn can select a different effort after
+the assistant finishes. See [Policy replay rules](policy-routing.md#locked-v1-scope).
 
 With `--model`, a private temporary one-model Codex catalog is generated from
 the installed CLI's bundled catalog, with Vekil model context, reasoning,
