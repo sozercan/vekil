@@ -1782,13 +1782,13 @@ func yamlTopLevelConfigFields(body []byte) (map[string]bool, error) {
 func rejectDuplicateJSONMappingKeys(body []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
-	if err := scanJSONValueForDuplicateKeys(decoder, ""); err != nil {
+	if err := scanJSONValueForDuplicateKeys(decoder, "", true); err != nil {
 		return err
 	}
 	return nil
 }
 
-func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string) error {
+func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string, reportPaths bool) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
@@ -1810,12 +1810,15 @@ func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string) error {
 			if !ok {
 				return fmt.Errorf("%s: JSON mapping key is not a string", path)
 			}
-			keyPath := appendConfigObjectPath(path, key)
+			keyPath := path
+			if reportPaths {
+				keyPath = appendConfigObjectPath(path, key)
+			}
 			if _, exists := seen[key]; exists {
 				return configPathError(keyPath, "duplicate mapping key %q", key)
 			}
 			seen[key] = struct{}{}
-			if err := scanJSONValueForDuplicateKeys(decoder, keyPath); err != nil {
+			if err := scanJSONValueForDuplicateKeys(decoder, keyPath, reportPaths); err != nil {
 				return err
 			}
 		}
@@ -1824,7 +1827,11 @@ func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string) error {
 	case '[':
 		index := 0
 		for decoder.More() {
-			if err := scanJSONValueForDuplicateKeys(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+			itemPath := path
+			if reportPaths {
+				itemPath = fmt.Sprintf("%s[%d]", path, index)
+			}
+			if err := scanJSONValueForDuplicateKeys(decoder, itemPath, reportPaths); err != nil {
 				return err
 			}
 			index++

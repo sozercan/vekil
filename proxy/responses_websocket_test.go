@@ -7655,7 +7655,10 @@ func TestHandleResponsesWebSocket_EarlyWriteFailureDrainsLateTerminalBeforeCance
 	_ = serverConn.Close()
 	defer func() { _ = clientConn.Close() }()
 	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
-	session.terminalObservationWait = 3 * time.Second
+	// The scanner-limit terminal is expensive under -race. The reader release
+	// controls terminal availability; parsing duration is not the contract
+	// under test.
+	session.terminalObservationWait = 10 * time.Second
 	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
 
 	done := make(chan error, 1)
@@ -7678,7 +7681,7 @@ func TestHandleResponsesWebSocket_EarlyWriteFailureDrainsLateTerminalBeforeCance
 		if !errors.Is(err, errResponsesWebSocketClientWrite) {
 			t.Fatalf("handleCreateRequest error = %v, want client write error", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("handleCreateRequest did not finish after terminal release")
 	}
 	snap := handler.stats.snapshot()
@@ -8019,7 +8022,10 @@ func TestHandleResponsesWebSocket_PreservesUpstreamTimeoutTerminalAndReplayState
 			Request: req,
 		}, nil
 	})
-	WithStreamingUpstreamTimeout(time.Millisecond)(handler)
+	// Give request construction time to reach the fake transport under -race.
+	// The body still waits for the actual upstream deadline and then delays its
+	// terminal, so this cannot turn into a pre-timeout success.
+	WithStreamingUpstreamTimeout(100 * time.Millisecond)(handler)
 	handler.stats = newStatsCollector()
 	serverConn, clientConn := newResponsesWebSocketConnPair(t)
 	defer func() { _ = serverConn.Close() }()

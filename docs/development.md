@@ -67,6 +67,42 @@ Route-specific deterministic tests use local upstream servers plus injected tran
 
 For large request and replay paths, keep the `64 MiB` request boundary in the deterministic matrix and verify that operation/send budgets prevent compaction, recovery, or fallback from creating an unbounded tree.
 
+### Durable provider-state suite
+
+Durable mode is opt-in and Linux-only. These tests use temporary private stores,
+synthetic credentials and controlled loopback providers, never live inference:
+
+```bash
+go test ./proxy ./server -run '^TestDurable' -count=1
+go test . -run '^Test(DurableStateProcessCrashReopen|StatePruneCommand)' -count=1
+go test -race ./... -count=1
+GOMAXPROCS=2 go test ./proxy -run '^$' -bench '^BenchmarkStateBindingExposure$' -benchtime=100x -benchmem -count=10
+GOMAXPROCS=2 go test ./proxy -run '^$' -bench '^BenchmarkDurableStateLookupAndOpen$' -benchtime=10x -benchmem -count=10
+GOMAXPROCS=2 go test ./proxy -run '^$' -bench '^BenchmarkDurableNestedResponseValidation$' -benchtime=5x -benchmem -count=3
+```
+
+Coverage includes real binary/process crash and reopen, kills before/after commit
+but before exposure, exact issuer and credential-source changes, private-file
+validation, logical capacity/tombstones, offline pruning, constructor/drain locks,
+JSON/SSE and HTTP/native-websocket exposure failures, and full-input reconnects.
+On Linux/amd64, dedicated child tests use one-way seccomp restrictions to inject
+real `pwrite64`, `fdatasync` and `close` errors; the parent and shared filesystem are not
+modified. These are process/storage boundary checks, not power-loss simulation.
+
+The exposure benchmark calls the production JSON/SSE writers and synchronous
+binding store with fresh/repeated batches of 1/8 records and initial occupancy
+0/8,192. It reports p50/p95 pre-exposure latency plus database bytes and bytes per
+record; those bytes include bbolt overhead and are not the configured capacity.
+Lookup/reopen are measured separately. Compare ten controlled memory/durable
+samples with fixed CPU settings and an otherwise quiet host. Record raw results,
+filesystem, Go version and exact revision privately; do not copy machine data to
+the repository. These tests exclude provider/network latency. The prepared-stream
+TTFT benchmark alone does not exercise persistence.
+The nested-response benchmark measures the complete JSON/SSE writers at depths
+1,000/2,000/4,000 with already-recorded state. Compare allocated bytes per
+operation to detect diagnostic-path allocation amplification independently of
+first-issuance storage latency.
+
 ### Policy-routing safety suite
 
 Schema-v2 policy routing adds a pre-dispatch planner above native OpenAI Chat. The deterministic merge gate must use in-memory classifier adapters and local `httptest` providers; live credentials and provider availability are supplementary, never substitutes for local tests.

@@ -2136,6 +2136,12 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 		return
 	}
 
+	if err := h.prepareDurableFinalResponseHeaders(resp); err != nil {
+		if !h.handleResponseBodyWriteError(w, r, upstreamCtx, "anthropic", err) {
+			writeAnthropicError(w, http.StatusBadGateway, "api_error", "failed to validate upstream response state")
+		}
+		return
+	}
 	_ = writeUpstreamResponse(w, resp)
 }
 
@@ -2196,7 +2202,10 @@ func (h *ProxyHandler) forwardAnthropicCountTokensDirect(w http.ResponseWriter, 
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		writeErr = writePassthroughSniffingUsage(w, resp, nil)
 	} else {
-		writeErr = writeUpstreamResponse(w, resp)
+		writeErr = h.prepareDurableFinalResponseHeaders(resp)
+		if writeErr == nil {
+			writeErr = writeUpstreamResponse(w, resp)
+		}
 	}
 	if writeErr != nil {
 		if h.handleResponseBodyWriteError(w, r, upstreamCtx, "anthropic_count_tokens", writeErr) {
@@ -2258,6 +2267,9 @@ func (h *ProxyHandler) routeChatCompletionsResponse(w http.ResponseWriter, resp 
 		return handlers.passthrough(resp)
 	}
 
+	if err := h.prepareDurableFinalResponseHeaders(resp); err != nil {
+		return err
+	}
 	return writeUpstreamResponse(w, resp)
 }
 

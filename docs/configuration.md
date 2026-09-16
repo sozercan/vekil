@@ -26,6 +26,8 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 | `--host` | `HOST` | `127.0.0.1` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Local path or HTTP(S) URL to JSON or YAML provider configuration for explicit provider routing |
+| `--state-bindings-file` | `STATE_BINDINGS_FILE` | unset | Opt-in private local ownership store for explicit routes; see [State Recovery](state-recovery.md) |
+| `--state-bindings-max-entries` | `STATE_BINDINGS_MAX_ENTRIES` | `0` (262,144) | Durable logical-record limit including tombstones, not file bytes; requires the file option |
 | `--policy-routing` | `POLICY_ROUTING_MODE` | `config` | Policy-routing ceiling: `config` follows each profile's YAML `mode`; `off`, `observe`, or `enforce` explicitly cap every profile. A profile cannot run above an explicit ceiling. |
 | `--policy-routing-allow-remote-single-tenant` | `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT` | `false` | Acknowledge running policy `observe`/`enforce` on a non-loopback bind for one trusted tenant. This adds no authentication or tenant isolation. |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error` |

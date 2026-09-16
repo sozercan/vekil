@@ -7,7 +7,7 @@ capture if it keeps happening.
 ## `400 provider_state_unavailable`: provider-state ownership is unavailable
 
 On an explicit model route, this code means one or more supplied provider-state
-values have no live ownership binding in this Vekil process. It applies both when
+values have no ownership binding in the active store. It applies both when
 all bindings are missing and when some remain known. The request is rejected
 before any provider send, including when streaming was requested. HTTP responses
 retain `type: invalid_request_error`; WebSocket error frames carry the same code
@@ -16,18 +16,23 @@ state validation encounters a missing binding.
 
 The code does not identify why proof is missing. A binding may never have been
 observed here, or may have been lost through expiry, eviction, restart, or sending
-the request to another process. A proven owner disagreement, conflict tombstone,
+the request to another process in default memory-only mode. With opt-in
+[durable ownership](state-recovery.md), proof survives process restart in the
+same store but may be missing because it was never committed there, was explicitly
+pruned, or the original store was lost or replaced. A proven owner disagreement, conflict tombstone,
 malformed value, or cross-route binding still fails with its existing validation
 error, even when other bindings are missing. A known owner that disagrees with an
 established WebSocket target pin also remains a conflict.
 
-If the original Vekil process still holds the bindings, restore request affinity
-to that process and keep the configured owner stable. Otherwise Vekil cannot
+If the original Vekil process still holds memory bindings, restore request affinity
+to that process and keep the configured owner stable. For durable mode, reopen the
+original intact store with the same owner configuration and authenticated account;
+only one process can use it at a time. Otherwise Vekil cannot
 reconstruct ownership from opaque state. Retrying or compacting the same missing
 state does not recover it. Preserve the transcript; begin a fresh session with
 client-supported context if continuation cannot be restored. Do not strip state
-or switch providers to bypass this check. This diagnostic adds no durable storage,
-cross-target replay, or recovery of already-lost bindings.
+or switch providers to bypass this check. Enabling durable mode after proof has
+already been lost does not reconstruct it or permit cross-target replay.
 
 ## `429`: upstream rate limit
 

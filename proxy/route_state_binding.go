@@ -14,7 +14,13 @@ func (h *ProxyHandler) ensureStateBindingStore() (*stateBindingStore, error) {
 		return nil, fmt.Errorf("proxy handler is required")
 	}
 	h.stateBindingsOnce.Do(func() {
-		h.stateBindings, h.stateBindingsErr = newStateBindingStore(stateBindingStoreConfig{})
+		if h.durableStateConfig.Path != "" {
+			h.stateBindings, h.stateBindingsErr = newDurableStateBindingStore(h.durableStateConfig)
+		} else if h.durableStateConfig.MaxEntries != 0 {
+			h.stateBindingsErr = errDurableStateConfig
+		} else {
+			h.stateBindings, h.stateBindingsErr = newStateBindingStore(stateBindingStoreConfig{})
+		}
 	})
 	return h.stateBindings, h.stateBindingsErr
 }
@@ -37,6 +43,9 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 	result := stateBindingLookupResult{outcome: stateBindingLookupUnknown}
 	bootstrapped := false
 	var evictions uint64
+	if store.durable != nil {
+		return h.applyDurableRequestStateBinding(store, operation, tokens)
+	}
 	if len(tokens) == 1 && tokens[0].stateType == stateBindingTypeConversationID {
 		bootstrapOwner := stateBindingOwner{}
 		if target, ok := explicitConversationBootstrapTarget(operation.route); ok {
@@ -398,8 +407,14 @@ func (h *ProxyHandler) bindExplicitStateTokens(info explicitRouteResponseInfo, t
 	if err != nil {
 		return err
 	}
-	owner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID}
+	owner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID, identity: info.stateIdentity}
 	result, evictions := store.bindAllWithEvictionDelta(tokens, owner)
+	if result.err != nil {
+		if _, _, ok := durableStateFailureDetails(result.err); ok {
+			return &providerRequestError{statusCode: http.StatusServiceUnavailable, err: result.err}
+		}
+		return result.err
+	}
 	if result.outcome == stateBindingLookupConflict {
 		return fmt.Errorf("provider state token collided with another route target")
 	}

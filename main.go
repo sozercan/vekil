@@ -29,6 +29,7 @@ const (
 	cliCommandLogout
 	cliCommandLaunch
 	cliCommandConfig
+	cliCommandState
 )
 
 func main() {
@@ -45,6 +46,11 @@ func main() {
 		return
 	case cliCommandConfig:
 		runConfig(os.Args[2:])
+		return
+	case cliCommandState:
+		if code := runState(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			os.Exit(code)
+		}
 		return
 	}
 
@@ -65,6 +71,8 @@ func commandFromArgs(args []string) cliCommand {
 		return cliCommandLaunch
 	case "config":
 		return cliCommandConfig
+	case "state":
+		return cliCommandState
 	default:
 		return cliCommandServe
 	}
@@ -373,6 +381,8 @@ type serveFlags struct {
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	stateBindingsFile               *string
+	stateBindingsMaxEntries         *int
 	policyRoutingMode               *string
 	policyRoutingAllowRemote        *bool
 	logLevel                        *string
@@ -401,6 +411,8 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             registerProvidersConfigFlag(fs, getEnv("PROVIDERS_CONFIG", "")),
+		stateBindingsFile:               fs.String("state-bindings-file", getEnv("STATE_BINDINGS_FILE", ""), "Opt-in durable Responses ownership file in an existing private local directory"),
+		stateBindingsMaxEntries:         fs.Int("state-bindings-max-entries", getEnvInt("STATE_BINDINGS_MAX_ENTRIES", 0), "Durable logical-record limit including tombstones (0: 262144); not a disk-byte limit"),
 		policyRoutingMode:               fs.String("policy-routing", getPolicyRoutingModeEnv(), "Policy routing mode: config (follow providers YAML), off, observe, or enforce"),
 		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
@@ -668,6 +680,7 @@ func runServe() {
 		server.WithPolicyRoutingAllowRemoteSingleTenant(*serve.policyRoutingAllowRemote),
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
+			proxy.WithDurableStateBindings(proxy.DurableStateBindingsConfig{Path: *serve.stateBindingsFile, MaxEntries: *serve.stateBindingsMaxEntries}),
 			proxy.WithPolicyRoutingMode(policyRoutingMode),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),
 		),

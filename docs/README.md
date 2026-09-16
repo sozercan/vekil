@@ -9,6 +9,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`getting-started.md`](getting-started.md) | install, run, first authentication, deployment entry points | startup flow or distribution changes |
 | [`configuration.md`](configuration.md) | configuration map, generic CLI flags/env vars, policy-routing runtime ceiling, and Copilot header overrides | generic flags, env vars, or Copilot header defaults change |
 | [`provider-routing.md`](provider-routing.md) | provider auth, schema-v2 model routes and policies, ordered priority failover, route exposure, model ownership, native endpoint allowlists | providers, routing behavior, failover safety, auth, or model metadata changes |
+| [`state-recovery.md`](state-recovery.md) | opt-in durable provider-state ownership, local store lifecycle, capacity, pruning and recovery limits | persisted ownership, storage format, supported filesystems, retention or recovery behavior changes |
 | [`policy-routing.md`](policy-routing.md) | schema-v2 semantic policy routing, classifier privacy/trust, modes, fallbacks, metrics, evaluation, and rollout gates | policy schema, classifier behavior, supported surfaces, telemetry, or release gates change |
 | [`provider-api-keys.md`](provider-api-keys.md) | where to get provider API keys and how to map them into providers config | provider signup/key URLs or auth field guidance changes |
 | [`tool-optimizers.md`](tool-optimizers.md) | optional shell command rewrite and tool-output reduction config | optimizer config or behavior changes |

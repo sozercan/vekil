@@ -205,6 +205,8 @@ type routeOperation struct {
 	remainingUpstreamSends  int
 	attemptedTargets        map[string]struct{}
 	pinnedTargetID          string
+	stateOwnerIdentity      [32]byte
+	bootstrapConversation   *stateBindingToken
 	hardPinned              bool
 	sequence                int
 	upstreamSends           int
@@ -3069,11 +3071,24 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
 			break
 		}
+		// Header state can also be emitted by native Chat/Messages targets.
+		// Capture the authenticated request identity on every explicit endpoint.
+		stateIdentity, stateErr := h.validateDurableRequestOwner(req, route, target, operation)
+		if stateErr != nil {
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			failure := routeAttemptFailure{err: stateErr, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedState, cleanupDone: true}
+			failures = append(failures, failure)
+			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
+			break
+		}
 		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), explicitRouteResponseInfo{
-			routeID:    route.public.routeID,
-			publicID:   route.public.id,
-			targetID:   target.id,
-			providerID: target.provider.id,
+			routeID:       route.public.routeID,
+			publicID:      route.public.id,
+			targetID:      target.id,
+			providerID:    target.provider.id,
+			stateIdentity: stateIdentity,
 		}))
 		req.GetBody = nil
 		if rejected := h.maybeRejectNativeResponsesRequest(req); rejected != nil {

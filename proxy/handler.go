@@ -307,6 +307,7 @@ type ProxyHandler struct {
 	stateBindingsOnce                sync.Once
 	stateBindings                    *stateBindingStore
 	stateBindingsErr                 error
+	durableStateConfig               DurableStateBindingsConfig
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
 }
@@ -679,12 +680,13 @@ func (h *ProxyHandler) WaitLifecycleWorkers(ctx context.Context) (err error) {
 	if h == nil {
 		return nil
 	}
-	// Server.stop calls this after http.Server.Shutdown. Clear replay state only
-	// after a successful, non-expired drain; a forced-close timeout can still have
-	// handler goroutines unwinding from lifecycle cancellation.
+	// Server.stop calls this after actual HTTP handler return, even when its
+	// caller timed out. Other callers must likewise establish handler drain;
+	// an expired context alone is not proof that handlers have finished.
 	defer func() {
 		if err == nil && h.ShuttingDown() && (ctx == nil || ctx.Err() == nil) {
 			h.closeResponsesChatReplayStore()
+			err = h.stateBindings.close()
 		}
 	}()
 	h.lifecycleWorkersMu.Lock()
@@ -732,10 +734,27 @@ func (h *ProxyHandler) handleResponseBodyWriteError(w http.ResponseWriter, r *ht
 	if !errors.As(err, &bodyErr) {
 		return false
 	}
+	if message, _, ok := durableStateFailureDetails(err); ok {
+		if r != nil {
+			observeResponseFailureStatus(r.Context(), http.StatusServiceUnavailable)
+		}
+		if !bodyErr.committed {
+			switch endpoint {
+			case "anthropic", "anthropic_count_tokens":
+				writeAnthropicError(w, http.StatusServiceUnavailable, "overloaded_error", message)
+			default:
+				writeDurableStateFailure(w, err)
+			}
+		}
+		return true
+	}
 	if !bodyErr.upstream {
 		return true
 	}
-	if bodyErr.statusCode < http.StatusOK || bodyErr.statusCode >= http.StatusMultipleChoices {
+	durable := h.stateBindings != nil && h.stateBindings.durable != nil
+	if (bodyErr.statusCode < http.StatusOK || bodyErr.statusCode >= http.StatusMultipleChoices) && (bodyErr.committed || !durable) {
+		// Durable final-error writers validate before exposing headers. A local
+		// validation/read failure there still needs a visible terminal error.
 		return true
 	}
 	if bodyErr.cancellationAtFailure && h.ShuttingDown() && upstreamCtx != nil && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown) {
@@ -1071,6 +1090,12 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		stats:                           newStatsCollector(),
 	}
 	h.initializeLifecycle()
+	initialized := false
+	defer func() {
+		if !initialized {
+			_ = h.stateBindings.close()
+		}
+	}()
 	for _, opt := range opts {
 		if opt != nil {
 			opt(h)
@@ -1100,6 +1125,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		h.policyPreflightPending.Store(controller.Active())
 	}
 	h.validateInsightModel()
+	initialized = true
 	return h, nil
 }
 

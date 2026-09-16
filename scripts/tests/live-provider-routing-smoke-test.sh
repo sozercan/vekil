@@ -573,6 +573,36 @@ PY_REDACTION
     fail "workflow diagnostics must fully redact each artifact before truncation"
 }
 
+assert_readiness_collision_interleaving() (
+  # Load only the real readiness/log functions, never the credentialed main.
+  trap - EXIT INT TERM
+  local name scenario expected status
+  for name in proxy_log_has_address_in_use proxy_log_has_fatal wait_for_ready; do
+    source <(sed -n "/^${name}() {$/,/^}$/p" "${SMOKE_SCRIPT}")
+    declare -F "${name}" >/dev/null || fail "missing readiness function: ${name}"
+  done
+  PROXY_LOG="${TMP_ROOT}/interleaved-startup.log"
+  SMOKE_STARTUP_TIMEOUT_SECONDS=5
+  proxy_pid=0
+  for scenario in collision fatal; do
+    : > "${PROXY_LOG}"
+    # The initial collision check sees no log. The fatal line appears while
+    # checking process liveness, before the next real log read.
+    process_is_running() {
+      if [[ "${scenario}" == collision ]]; then
+        printf '%s\n' '{"level":"fatal","error":"listen: bind: address already in use"}' >> "${PROXY_LOG}"
+      else
+        printf '%s\n' '{"level":"fatal","error":"unrelated startup failure"}' >> "${PROXY_LOG}"
+      fi
+      return 0
+    }
+    expected=3
+    [[ "${scenario}" != collision ]] || expected=2
+    if wait_for_ready; then status=0; else status=$?; fi
+    [[ "${status}" == "${expected}" ]] || fail "interleaved ${scenario} returned ${status}, expected ${expected}"
+  done
+)
+
 main() {
   require_cmd curl
   require_cmd diff
@@ -585,6 +615,7 @@ main() {
   [[ -f "${EXAMPLE_CONFIG}" ]] || fail "provider-routing example config is missing: ${EXAMPLE_CONFIG}"
   [[ -f "${WORKFLOW_FILE}" ]] || fail "live provider-routing workflow is missing: ${WORKFLOW_FILE}"
   assert_redaction_before_truncation
+  assert_readiness_collision_interleaving
 
   log "Building a real Vekil binary for the process-level smoke"
   (cd "${REPO_ROOT}" && go build -o "${TEST_PROXY_BIN}" .)
