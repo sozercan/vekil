@@ -228,7 +228,7 @@ func TestExplicitRouteAzureRetryUsesSendBudgetAndLatestError(t *testing.T) {
 	if result.err != nil || result.blocked == nil {
 		t.Fatalf("exhausted request = %+v", result)
 	}
-	defer result.blocked.Body.Close()
+	defer func() { _ = result.blocked.Body.Close() }()
 	body, err := io.ReadAll(result.blocked.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +270,7 @@ func TestExplicitRouteAzureRetryCancellationPreservesRejection(t *testing.T) {
 			if result.err != nil || result.blocked == nil || result.blocked.StatusCode != 429 || calls.Load() != 1 {
 				t.Fatalf("canceled recovery: sends=%d result=%+v", calls.Load(), result)
 			}
-			result.blocked.Body.Close()
+			_ = result.blocked.Body.Close()
 			waitForAzureTrafficWaiters(t, h, 0)
 			want := routeRetrySuppressedAdmission
 			if shutdown {
@@ -389,7 +389,7 @@ func TestExplicitRouteAzurePinnedWebSocketTurnRetries(t *testing.T) {
 	advance := azureTrafficTestClock(h)
 	server := startResponsesWebSocketProxyServer(t, h)
 	conn := mustDialResponsesWebSocket(t, server, nil)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	request := newResponsesWebSocketCreateRequest([]interface{}{})
 	request["model"] = "public-model"
 	if err := conn.WriteJSON(request); err != nil {
@@ -412,17 +412,21 @@ func TestExplicitRouteAzurePinnedWebSocketTurnRetries(t *testing.T) {
 	if second["type"] != "response.completed" || websocketResponseID(t, second) != "resp_3" {
 		t.Fatalf("recovered turn = %+v", second)
 	}
-	if primaryCalls.Load() != 3 || secondaryCalls.Load() != 0 || <-bodies != <-bodies {
-		t.Fatal("websocket retry changed the request or target")
+	if primaryCalls.Load() != 3 || secondaryCalls.Load() != 0 {
+		t.Fatal("websocket retry changed the target or send count")
+	}
+	firstBody, secondBody := <-bodies, <-bodies
+	if firstBody != secondBody {
+		t.Fatal("websocket retry changed the request")
 	}
 }
 
 func TestExplicitRouteAzureProbeLateThrottleDelaysQueuedRequest(t *testing.T) {
 	reader, writer := io.Pipe()
-	defer reader.Close()
-	defer writer.Close()
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
 	go func() {
-		defer writer.Close()
+		defer func() { _ = writer.Close() }()
 		_, _ = io.WriteString(writer, "data: "+`{"type":"response.output_text.delta","delta":"partial"}`+"\n\n")
 		_, _ = io.WriteString(writer, "data: "+`{"type":"error","code":"rate_limit_exceeded","headers":{"retry-after-ms":5000}}`+"\n\n")
 	}()
@@ -448,7 +452,7 @@ func TestExplicitRouteAzureProbeLateThrottleDelaysQueuedRequest(t *testing.T) {
 	if first.err != nil || first.blocked == nil {
 		t.Fatalf("probe = %+v", first)
 	}
-	defer first.blocked.Body.Close()
+	defer func() { _ = first.blocked.Body.Close() }()
 	second := make(chan azureTrafficTestResult, 1)
 	go func() { second <- execute() }()
 	waitForAzureTrafficWaiters(t, h, 1)
@@ -464,7 +468,7 @@ func TestExplicitRouteAzureProbeLateThrottleDelaysQueuedRequest(t *testing.T) {
 	if result.err != nil || result.blocked == nil || calls.Load() != 2 {
 		t.Fatalf("queued request = %+v, calls=%d", result, calls.Load())
 	}
-	defer result.blocked.Body.Close()
+	defer func() { _ = result.blocked.Body.Close() }()
 	if _, err := io.Copy(io.Discard, result.blocked.Body); err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +516,7 @@ func TestExplicitRouteAzureRenewedResetPreservesUpstreamRejection(t *testing.T) 
 				if result.err != nil || result.blocked == nil {
 					t.Fatalf("original HTTP rejection lost: %+v", result)
 				}
-				defer result.blocked.Body.Close()
+				defer func() { _ = result.blocked.Body.Close() }()
 				body, _ := io.ReadAll(result.blocked.Body)
 				if result.blocked.StatusCode != 429 || result.blocked.Header.Get("Retry-After") != "60" || !strings.Contains(string(body), "original error") {
 					t.Fatalf("original HTTP rejection changed: %d %v %s", result.blocked.StatusCode, result.blocked.Header, body)

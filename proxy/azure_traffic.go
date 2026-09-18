@@ -102,7 +102,7 @@ func (a azureRouteTraffic) observe(status int, headers http.Header) bool {
 			reset = value
 		}
 	}
-	if status != http.StatusTooManyRequests && !(status >= 200 && status < 300 && exhausted) {
+	if status != http.StatusTooManyRequests && (status < 200 || status >= 300 || !exhausted) {
 		return false
 	}
 	retryAfter, _ := selectResponsesRetryAfter(headers)
@@ -269,7 +269,7 @@ func (h *ProxyHandler) acquireAzureRouteInference(req *http.Request, canSwitch b
 			if len(entry.queue) >= maxAzureDeploymentWaiters || weight > maxAzureDeploymentWaitingBytes-entry.waitingBytes ||
 				c.waiters >= maxAzureTrafficWaiters || weight > maxAzureTrafficWaitingBytes-c.waitingBytes {
 				c.mu.Unlock()
-				return nil, nil, &providerRequestError{statusCode: http.StatusServiceUnavailable, code: "rate_limit_queue_full", err: fmt.Errorf("Azure rate-limit recovery queue is full")}
+				return nil, nil, &providerRequestError{statusCode: http.StatusServiceUnavailable, code: "rate_limit_queue_full", err: fmt.Errorf("azure rate-limit recovery queue is full")}
 			}
 			waiter = &azureTrafficWaiter{}
 			queued = entry

@@ -52,7 +52,7 @@ func TestExplicitRouteHTTPRejectionWithProgressNeverReplays(t *testing.T) {
 				if err != nil || resp == nil {
 					t.Fatalf("request failed: %v", err)
 				}
-				defer resp.Body.Close()
+				defer func() { _ = resp.Body.Close() }()
 				_, _ = io.Copy(io.Discard, resp.Body)
 				sends, switches, _ := op.snapshot()
 				if calls.Load() != 1 || sends != 1 || switches != 0 || resp.StatusCode != 429 {

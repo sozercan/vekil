@@ -102,7 +102,7 @@ func TestAzureTrafficCooldownScopeAndExpiredProbe(t *testing.T) {
 				t.Fatalf("admission: blocked=%v error=%v", blocked != nil, err)
 			}
 			if blocked != nil {
-				defer blocked.Body.Close()
+				defer func() { _ = blocked.Body.Close() }()
 				if blocked.StatusCode != 429 || blocked.Header.Get("Retry-After") != "5" {
 					t.Fatalf("cooldown response = %d, %v", blocked.StatusCode, blocked.Header)
 				}
@@ -223,7 +223,7 @@ func TestAzureTrafficLongResetPreservesDelayWithoutWaiting(t *testing.T) {
 	if err != nil || blocked == nil || blocked.Header.Get("Retry-After") != "86400" {
 		t.Fatalf("long reset = %v, %v", blocked, err)
 	}
-	defer blocked.Body.Close()
+	defer func() { _ = blocked.Body.Close() }()
 	if h.azureTraffic.waiters != 0 {
 		t.Fatal("long reset entered the recovery queue")
 	}
@@ -303,7 +303,7 @@ func TestAzureTrafficSuccessfulExhaustionStartsCooldown(t *testing.T) {
 				t.Fatalf("admission: blocked=%v err=%v", blocked != nil, err)
 			}
 			if blocked != nil {
-				defer blocked.Body.Close()
+				defer func() { _ = blocked.Body.Close() }()
 				if blocked.Header.Get("Retry-After") != tc.wantReset {
 					t.Fatalf("reset=%s want=%s", blocked.Header.Get("Retry-After"), tc.wantReset)
 				}

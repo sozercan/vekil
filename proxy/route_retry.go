@@ -53,7 +53,7 @@ func (o *routeOperation) sameTargetRetryDecision(ctx context.Context, kind route
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.commitment != downstreamCommitmentNone && !(o.hardPinned && o.commitment == downstreamCommitmentProtocolFrame) {
+	if o.commitment != downstreamCommitmentNone && (!o.hardPinned || o.commitment != downstreamCommitmentProtocolFrame) {
 		return routeRetrySuppressedCommitment
 	}
 	if kind != routeAttemptNormal {
