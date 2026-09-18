@@ -13,7 +13,6 @@
 #   LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE
 #   LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL
 #   LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL
-#   LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT
 #   LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY
 #   LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE
 #   LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL
@@ -23,7 +22,6 @@
 #   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL
 #   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL
 #   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY
-#   LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT
 #   LIVE_POLICY_ROUTING_CLASSIFIER_MODEL
 #   LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED=true|false
 #
@@ -43,6 +41,9 @@
 #   LIVE_POLICY_ROUTING_ALLOW_INSECURE_HTTP=1   local development only
 #   LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=0        delete artifacts after success
 #   LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=false
+#   LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT
+#   LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT
+#     Set both tier efforts or omit both for models without effort support.
 #   SMOKE_*                                     bounded timeout overrides
 
 set -euo pipefail
@@ -336,7 +337,6 @@ validate_inputs() {
     LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE
 	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL
 	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL
-	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT
 	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY
     LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE
     LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL
@@ -346,7 +346,6 @@ validate_inputs() {
     LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL
 	    LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL
 	    LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY
-	    LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT
 	    LIVE_POLICY_ROUTING_CLASSIFIER_MODEL
     LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED
   )
@@ -399,17 +398,19 @@ PY_VALIDATE_URL
 
 	"$(python_command)" - \
 	  "${PUBLIC_MODEL}" \
-	  "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT}" \
-	  "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT}" <<'PY_PUBLIC_ID'
+	  "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT:-}" \
+	  "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT:-}" <<'PY_PUBLIC_ID'
 import sys
 public_model, lightweight_effort, powerful_effort = sys.argv[1:]
 if not public_model.strip() or len(public_model.encode()) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in public_model):
     raise SystemExit("LIVE_POLICY_ROUTING_PUBLIC_MODEL must be non-empty, control-free, and at most 128 bytes")
+if bool(lightweight_effort) != bool(powerful_effort):
+    raise SystemExit("tier reasoning efforts must be configured for both lightweight and powerful or omitted from both")
 for name, value in (
     ("LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT", lightweight_effort),
     ("LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT", powerful_effort),
 ):
-    if not value.strip() or len(value.encode()) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+    if value and (not value.strip() or len(value.encode()) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)):
         raise SystemExit(f"{name} must be non-empty, control-free, and at most 128 bytes")
 PY_PUBLIC_ID
 
@@ -952,6 +953,14 @@ def target(target_id, provider_id, model):
     }
 
 
+def tier(name):
+    value = {"route": "live-semantic-" + name}
+    effort = os.environ.get("LIVE_POLICY_ROUTING_" + name.upper() + "_REASONING_EFFORT")
+    if effort:
+        value["reasoning_effort"] = effort
+    return value
+
+
 config = {
     "schema_version": 2,
     "providers": [
@@ -980,7 +989,7 @@ config = {
             "live-semantic-lightweight",
             "Live semantic lightweight",
 	            [target("live-lightweight-primary", "live-lightweight-provider", os.environ["LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL"])],
-	            reasoning_effort=os.environ["LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT"],
+	            reasoning_effort=os.environ.get("LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT"),
 	        ),
         route(
             "live-semantic-powerful",
@@ -990,7 +999,7 @@ config = {
                 target("live-powerful-secondary", "live-powerful-secondary-provider", os.environ["LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL"]),
 	            ],
 	            failover=True,
-	            reasoning_effort=os.environ["LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT"],
+	            reasoning_effort=os.environ.get("LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT"),
 	        ),
         route(
             "live-semantic-classifier",
@@ -1007,14 +1016,8 @@ config = {
             "mode": "enforce",
             "model_picker_enabled": True,
             "model_picker_category": "versatile",
-            "lightweight": {
-                "route": "live-semantic-lightweight",
-                "reasoning_effort": os.environ["LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT"],
-            },
-            "powerful": {
-                "route": "live-semantic-powerful",
-                "reasoning_effort": os.environ["LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT"],
-            },
+            "lightweight": tier("lightweight"),
+            "powerful": tier("powerful"),
             "baseline_tier": "lightweight",
             "classifier_unavailable_tier": "lightweight",
             "classifier_uncertain_tier": "powerful",
@@ -1051,29 +1054,23 @@ text = path.read_text(encoding="utf-8")
 config = __import__("json").loads(text)
 expected_no_store = os.environ["LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED"] == "true"
 expected_retention = os.environ.get("LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION", "false") == "true"
-expected_lightweight_effort = os.environ["LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT"]
-expected_powerful_effort = os.environ["LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT"]
 classifier_provider = next(provider for provider in config["providers"] if provider["id"] == "live-powerful-primary-provider")
 profile = config["policy_profiles"][0]
 if classifier_provider.get("classifier_no_store_supported") is not expected_no_store:
     raise SystemExit("generated config has the wrong classifier_no_store_supported value")
 if profile["data_policy"].get("allow_provider_retention") is not expected_retention:
     raise SystemExit("generated config has the wrong allow_provider_retention value")
-if profile.get("lightweight") != {
-    "route": "live-semantic-lightweight",
-    "reasoning_effort": expected_lightweight_effort,
-}:
-    raise SystemExit("generated config has the wrong lightweight tier")
-if profile.get("powerful") != {
-    "route": "live-semantic-powerful",
-    "reasoning_effort": expected_powerful_effort,
-}:
-    raise SystemExit("generated config has the wrong powerful tier")
 routes = {route["id"]: route for route in config["model_routes"]}
-if routes["live-semantic-lightweight"].get("reasoning_effort") != [expected_lightweight_effort]:
-    raise SystemExit("generated config has the wrong lightweight reasoning_effort allowlist")
-if routes["live-semantic-powerful"].get("reasoning_effort") != [expected_powerful_effort]:
-    raise SystemExit("generated config has the wrong powerful reasoning_effort allowlist")
+for name in ("lightweight", "powerful"):
+    effort = os.environ.get("LIVE_POLICY_ROUTING_" + name.upper() + "_REASONING_EFFORT")
+    route_id = "live-semantic-" + name
+    expected_tier = {"route": route_id}
+    if effort:
+        expected_tier["reasoning_effort"] = effort
+    if profile.get(name) != expected_tier:
+        raise SystemExit(f"generated config has the wrong {name} tier")
+    if routes[route_id].get("reasoning_effort") != ([effort] if effort else None):
+        raise SystemExit(f"generated config has the wrong {name} reasoning_effort allowlist")
 for name in (
     "LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY",
     "LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY",
@@ -2010,7 +2007,7 @@ run_enforce_mode() {
 
 	run_enforce_text_case enforce-lightweight \
 	  "In one sentence, explain what path/filepath.Join does. This is a bounded read-only single-function lookup; do not plan or inspect a codebase." \
-	  1024 lightweight "${SMOKE_CURL_MAX_TIME_SECONDS}" "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT}"
+	  1024 lightweight "${SMOKE_CURL_MAX_TIME_SECONDS}" "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT:-}"
   printf 'PASS enforce-lightweight-selection\n' >> "${SUMMARY_FILE}"
 
   run_enforce_text_case enforce-powerful \

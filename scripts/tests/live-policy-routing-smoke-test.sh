@@ -207,6 +207,7 @@ parser.add_argument("--state-file", required=True)
 parser.add_argument("--role", choices=("lightweight", "primary", "secondary"), required=True)
 parser.add_argument("--terminal-model", required=True)
 parser.add_argument("--classifier-model", default="")
+parser.add_argument("--reasoning-effort", required=True)
 parser.add_argument("--secret", required=True)
 args = parser.parse_args()
 
@@ -458,9 +459,10 @@ class Handler(BaseHTTPRequestHandler):
                 errors.append("classifier_choice_invalid")
         else:
             signals = None
-            expected_effort = "low" if args.role == "lightweight" else "max"
-            if body.get("reasoning_effort") != expected_effort:
+            if args.reasoning_effort and body.get("reasoning_effort") != args.reasoning_effort:
                 errors.append("terminal_reasoning_effort_invalid")
+            if not args.reasoning_effort and "reasoning_effort" in body:
+                errors.append("terminal_reasoning_effort_present")
 
         entry = {
             "kind": "classifier" if is_classifier else "terminal",
@@ -538,6 +540,8 @@ start_mock_server() {
   local terminal_model="$2"
   local classifier_model="$3"
   local secret="$4"
+  local effort="${POWERFUL_REASONING_EFFORT}"
+  [[ "${role}" != lightweight ]] || effort="${LIGHTWEIGHT_REASONING_EFFORT}"
   local case_dir="${TMP_ROOT}/${role}"
   local port_file="${case_dir}/port"
   local state_file="${case_dir}/state.json"
@@ -551,6 +555,7 @@ start_mock_server() {
     --role "${role}" \
     --terminal-model "${terminal_model}" \
     --classifier-model "${classifier_model}" \
+    --reasoning-effort "${effort}" \
     --secret "${secret}" \
     >"${case_dir}/server.log" 2>&1 &
   pid=$!
@@ -645,6 +650,12 @@ assert_generated_config() {
     --arg classifier_model "${CLASSIFIER_MODEL}" \
     --arg lightweight_effort "${LIGHTWEIGHT_REASONING_EFFORT}" \
     --arg powerful_effort "${POWERFUL_REASONING_EFFORT}" '
+      def tier($name; $effort):
+        {route: ("live-semantic-" + $name)}
+        + (if $effort == "" then {} else {reasoning_effort: $effort} end);
+      def route_effort($effort):
+        if $effort == "" then has("reasoning_effort") | not
+        else .reasoning_effort == [$effort] end;
       .schema_version == 2
       and (.providers | length) == 3
       and ([.providers[].type] | all(. == "openai-compatible"))
@@ -659,12 +670,12 @@ assert_generated_config() {
       and (.model_routes[] | select(.id == "live-semantic-lightweight").targets[0].upstream_model) == $lightweight_model
       and (.model_routes[] | select(.id == "live-semantic-powerful").targets | map(.upstream_model)) == [$primary_model,$secondary_model]
       and (.model_routes[] | select(.id == "live-semantic-classifier").targets[0].upstream_model) == $classifier_model
-      and (.model_routes[] | select(.id == "live-semantic-lightweight").reasoning_effort) == [$lightweight_effort]
-      and (.model_routes[] | select(.id == "live-semantic-powerful").reasoning_effort) == [$powerful_effort]
+      and (.model_routes[] | select(.id == "live-semantic-lightweight") | route_effort($lightweight_effort))
+      and (.model_routes[] | select(.id == "live-semantic-powerful") | route_effort($powerful_effort))
       and ([.model_routes[] | select(has("default_reasoning_effort"))] | length) == 0
       and .policy_profiles[0].public_id == $public_model
-      and .policy_profiles[0].lightweight == {route:"live-semantic-lightweight",reasoning_effort:$lightweight_effort}
-      and .policy_profiles[0].powerful == {route:"live-semantic-powerful",reasoning_effort:$powerful_effort}
+      and .policy_profiles[0].lightweight == tier("lightweight"; $lightweight_effort)
+      and .policy_profiles[0].powerful == tier("powerful"; $powerful_effort)
       and .policy_profiles[0].baseline_tier == "lightweight"
       and .policy_profiles[0].classifier_unavailable_tier == "lightweight"
       and .policy_profiles[0].classifier_uncertain_tier == "powerful"
@@ -723,6 +734,14 @@ assert_wrapper_ports() {
 }
 
 main() {
+  case "${1:-configured}" in
+    configured) ;;
+    omitted)
+      LIGHTWEIGHT_REASONING_EFFORT=""
+      POWERFUL_REASONING_EFFORT=""
+      ;;
+    *) fail "reasoning-effort test mode must be configured or omitted" ;;
+  esac
   require_cmd bash
   require_cmd curl
   require_cmd go
@@ -743,7 +762,7 @@ main() {
   primary_port="$(start_mock_server primary "${PRIMARY_MODEL}" "${CLASSIFIER_MODEL}" "${PRIMARY_SECRET}")"
   secondary_port="$(start_mock_server secondary "${SECONDARY_MODEL}" "" "${SECONDARY_SECRET}")"
 
-  log "Running live policy-routing harness against deterministic local providers"
+  log "Running live policy-routing harness with ${1:-configured} tier effort against deterministic local providers"
   env \
     PROXY_BIN="${TEST_PROXY_WRAPPER}" \
     REAL_PROXY_BIN="${TEST_PROXY_BIN}" \

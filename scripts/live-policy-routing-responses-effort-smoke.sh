@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 
-# Focused live semantic-policy smoke for Responses-native GPT-5.6 Sol.
+# Focused live semantic-policy smoke for Responses effort overrides.
 #
 # The caller supplies an already-authenticated loopback Vekil bridge. This
 # harness inserts a metadata-only capture shim, runs one policy proxy whose two
-# terminal tiers both target gpt-5.6-sol, and proves prompt-selected low/max
-# effort overrides conflicting public Responses values. Request content is never
-# logged.
+# terminal tiers both target GPT-5-mini, and proves prompt-selected low/high
+# effort overrides conflicting public Responses values. Haiku classifies each
+# prompt through native Chat without reasoning effort or a no-store guarantee.
+# Request content is never logged.
 #
 # Required environment:
-#   LIVE_POLICY_ROUTING_SOL_BRIDGE_BASE_URL   loopback bridge root, e.g. http://127.0.0.1:12345
+#   LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL   loopback bridge root, e.g. http://127.0.0.1:12345
 #
 # Optional environment:
 #   PROXY_BIN                                 default: ./vekil
-#   LIVE_POLICY_ROUTING_SOL_MODEL             default: gpt-5.6-sol
-#   LIVE_POLICY_ROUTING_SOL_PUBLIC_MODEL      default: gpt-5.6-semantic
-#   LIVE_POLICY_ROUTING_SOL_SMOKE_DIR         explicit artifact directory
-#   LIVE_POLICY_ROUTING_SOL_KEEP_ARTIFACTS=0  delete artifacts after success
+#   LIVE_POLICY_ROUTING_RESPONSES_MODEL             default: gpt-5-mini
+#   LIVE_POLICY_ROUTING_RESPONSES_CLASSIFIER_MODEL  default: claude-haiku-4.5
+#   LIVE_POLICY_ROUTING_RESPONSES_PUBLIC_MODEL      default: vekil-live-semantic-effort
+#   LIVE_POLICY_ROUTING_RESPONSES_SMOKE_DIR         explicit artifact directory
+#   LIVE_POLICY_ROUTING_RESPONSES_KEEP_ARTIFACTS=0  delete artifacts after success
 #   SMOKE_*                                    bounded timeout overrides
 
 set -euo pipefail
@@ -42,9 +44,10 @@ require_env() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
-BRIDGE_BASE_URL="${LIVE_POLICY_ROUTING_SOL_BRIDGE_BASE_URL:-}"
-SOL_MODEL="${LIVE_POLICY_ROUTING_SOL_MODEL:-gpt-5.6-sol}"
-PUBLIC_MODEL="${LIVE_POLICY_ROUTING_SOL_PUBLIC_MODEL:-gpt-5.6-semantic}"
+BRIDGE_BASE_URL="${LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL:-}"
+TERMINAL_MODEL="${LIVE_POLICY_ROUTING_RESPONSES_MODEL:-gpt-5-mini}"
+CLASSIFIER_MODEL="${LIVE_POLICY_ROUTING_RESPONSES_CLASSIFIER_MODEL:-claude-haiku-4.5}"
+PUBLIC_MODEL="${LIVE_POLICY_ROUTING_RESPONSES_PUBLIC_MODEL:-vekil-live-semantic-effort}"
 SMOKE_STARTUP_TIMEOUT_SECONDS="${SMOKE_STARTUP_TIMEOUT_SECONDS:-120}"
 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS="${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS:-5}"
 SMOKE_CURL_MAX_TIME_SECONDS="${SMOKE_CURL_MAX_TIME_SECONDS:-300}"
@@ -53,7 +56,7 @@ SMOKE_PORT_RELEASE_TIMEOUT_SECONDS="${SMOKE_PORT_RELEASE_TIMEOUT_SECONDS:-8}"
 SMOKE_DIAGNOSTIC_MAX_BYTES="${SMOKE_DIAGNOSTIC_MAX_BYTES:-32768}"
 
 TMP_PARENT="${LIVE_POLICY_ROUTING_TMP_PARENT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
-SMOKE_DIR="${LIVE_POLICY_ROUTING_SOL_SMOKE_DIR:-$(mktemp -d "${TMP_PARENT%/}/live-policy-routing-sol-effort.XXXXXX")}"
+SMOKE_DIR="${LIVE_POLICY_ROUTING_RESPONSES_SMOKE_DIR:-$(mktemp -d "${TMP_PARENT%/}/live-policy-routing-responses-effort.XXXXXX")}"
 if [[ "${SMOKE_DIR}" != /* ]]; then
   SMOKE_DIR="${PWD}/${SMOKE_DIR}"
 fi
@@ -176,7 +179,7 @@ cleanup() {
     print_diagnostic_file "capture-events.jsonl" "${CAPTURE_LOG}"
     print_diagnostic_file "capture-shim.log" "${CAPTURE_STDERR}"
     print_diagnostic_file "proxy.log" "${PROXY_LOG}"
-  elif [[ "${LIVE_POLICY_ROUTING_SOL_KEEP_ARTIFACTS:-0}" == "0" ]]; then
+  elif [[ "${LIVE_POLICY_ROUTING_RESPONSES_KEEP_ARTIFACTS:-0}" == "0" ]]; then
     rm -rf "${SMOKE_DIR}"
   fi
   exit "${rc}"
@@ -187,43 +190,50 @@ validate_inputs() {
   require_cmd curl
   require_cmd jq
   require_cmd ps
-  require_env LIVE_POLICY_ROUTING_SOL_BRIDGE_BASE_URL
+  require_env LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL
   python_command >/dev/null
   validate_positive_integer SMOKE_STARTUP_TIMEOUT_SECONDS "${SMOKE_STARTUP_TIMEOUT_SECONDS}"
   validate_positive_integer SMOKE_CURL_MAX_TIME_SECONDS "${SMOKE_CURL_MAX_TIME_SECONDS}"
   [[ -x "${PROXY_BIN}" ]] || die "proxy binary not found or not executable: ${PROXY_BIN} (run: make build)"
-  [[ "${SOL_MODEL}" != "${PUBLIC_MODEL}" ]] || die "Sol upstream model must differ from public semantic model"
+  [[ "${TERMINAL_MODEL}" != "${PUBLIC_MODEL}" ]] || die "terminal upstream model must differ from public semantic model"
+  [[ "${CLASSIFIER_MODEL}" != "${PUBLIC_MODEL}" ]] || die "classifier model must differ from public semantic model"
 
-  "$(python_command)" - "${BRIDGE_BASE_URL}" "${PUBLIC_MODEL}" "${SOL_MODEL}" <<'PY'
+  "$(python_command)" - "${BRIDGE_BASE_URL}" "${PUBLIC_MODEL}" "${TERMINAL_MODEL}" "${CLASSIFIER_MODEL}" <<'PY'
 import sys
 import urllib.parse
-bridge, public_model, sol_model = sys.argv[1:]
+bridge, public_model, terminal_model, classifier_model = sys.argv[1:]
 parsed = urllib.parse.urlsplit(bridge.rstrip("/"))
 if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"} or not parsed.port:
-    raise SystemExit("LIVE_POLICY_ROUTING_SOL_BRIDGE_BASE_URL must be an absolute loopback HTTP URL with an explicit port")
+    raise SystemExit("LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL must be an absolute loopback HTTP URL with an explicit port")
 if parsed.username or parsed.password or parsed.query or parsed.fragment:
-    raise SystemExit("LIVE_POLICY_ROUTING_SOL_BRIDGE_BASE_URL must not contain credentials, query, or fragment")
-for name, value in (("public model", public_model), ("Sol model", sol_model)):
+    raise SystemExit("LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL must not contain credentials, query, or fragment")
+for name, value in (("public model", public_model), ("terminal model", terminal_model), ("classifier model", classifier_model)):
     if not value.strip() or len(value.encode()) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
         raise SystemExit(f"{name} must be non-empty, control-free, and at most 128 bytes")
 PY
 }
 
-fetch_and_validate_bridge_model() {
+fetch_and_validate_bridge_models() {
   curl --fail --silent --show-error \
     --connect-timeout "${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS}" \
     --max-time "${SMOKE_CURL_MAX_TIME_SECONDS}" \
     "${BRIDGE_BASE_URL%/}/v1/models" > "${MODELS_JSON}" \
     || die "GET ${BRIDGE_BASE_URL%/}/v1/models failed"
   chmod 600 "${MODELS_JSON}"
-  jq -e --arg model "${SOL_MODEL}" '
+  jq -e --arg model "${TERMINAL_MODEL}" '
     [.data[]?
       | select(.id == $model)
       | select(((.supported_endpoints // []) | index("/responses")) != null)
       | select(((.capabilities.supports.reasoning_effort // []) | index("low")) != null)
-      | select(((.capabilities.supports.reasoning_effort // []) | index("max")) != null)
+      | select(((.capabilities.supports.reasoning_effort // []) | index("high")) != null)
     ] | length == 1
-  ' "${MODELS_JSON}" >/dev/null || die "bridge must advertise ${SOL_MODEL} with /responses plus low and max reasoning effort"
+  ' "${MODELS_JSON}" >/dev/null || die "bridge must advertise ${TERMINAL_MODEL} with /responses plus low and high reasoning effort"
+  jq -e --arg model "${CLASSIFIER_MODEL}" '
+    [.data[]?
+      | select(.id == $model)
+      | select(((.supported_endpoints // []) | index("/chat/completions")) != null)
+    ] | length == 1
+  ' "${MODELS_JSON}" >/dev/null || die "bridge must advertise ${CLASSIFIER_MODEL} with native /chat/completions"
 }
 
 write_capture_shim() {
@@ -274,7 +284,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             body = {}
         reasoning = body.get("reasoning") if isinstance(body, dict) else None
-        effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else body.get("reasoning_effort")
         label_path = pathlib.Path(args.label)
         label = label_path.read_text(encoding="utf-8").strip() if label_path.exists() else ""
         event = {
@@ -283,14 +293,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "path": self.path,
             "model": body.get("model"),
             "effort": effort,
+            "reasoning_present": "reasoning" in body or "reasoning_effort" in body,
             "store": body.get("store"),
+            "store_present": "store" in body,
             "stream": body.get("stream"),
         }
+        if self.path not in {"/v1/responses", "/v1/chat/completions"}:
+            event["status"] = 404
+            write_event(event)
+            self.send_error(404, "unexpected upstream path")
+            return
         try:
             connection = http.client.HTTPConnection(bridge.hostname, bridge.port, timeout=300)
             connection.request(
                 "POST",
-                (bridge.path.rstrip("/") + "/v1/responses") or "/v1/responses",
+                bridge.path.rstrip("/") + self.path,
                 body=raw,
                 headers={"content-type": self.headers.get("content-type", "application/json")},
             )
@@ -343,20 +360,20 @@ start_capture_shim() {
 }
 
 write_policy_config() {
-  "$(python_command)" - "${CONFIG_JSON}" "${capture_port}" "${PUBLIC_MODEL}" "${SOL_MODEL}" <<'PY'
+  "$(python_command)" - "${CONFIG_JSON}" "${capture_port}" "${PUBLIC_MODEL}" "${TERMINAL_MODEL}" "${CLASSIFIER_MODEL}" <<'PY'
 import json
 import os
 import pathlib
 import sys
-path, capture_port, public_model, sol_model = sys.argv[1:]
+path, capture_port, public_model, terminal_model, classifier_model = sys.argv[1:]
 
 def route(route_id, effort=None, classifier=False):
     value = {
         "id": route_id,
         "exposure": "internal",
-        "endpoints": ["/responses"],
+        "endpoints": ["/chat/completions"] if classifier else ["/responses"],
         "drop_sampling_params": True,
-        "targets": [{"id": route_id + "-target", "provider": "bridge", "upstream_model": sol_model}],
+        "targets": [{"id": route_id + "-target", "provider": "bridge", "upstream_model": classifier_model if classifier else terminal_model}],
         "routing": {"mode": "primary_only", "max_target_attempts": 1, "max_upstream_sends": 1},
     }
     if classifier:
@@ -375,24 +392,24 @@ config = {
         "auth_type": "none",
         "model_discovery": "static",
         "trust_domain": "github-copilot-loopback",
-        "classifier_no_store_supported": True,
+        "classifier_no_store_supported": False,
     }],
     "model_routes": [
-        route("semantic-sol-low", "low"),
-        route("semantic-sol-max", "max"),
-        route("semantic-sol-classifier", classifier=True),
+        route("semantic-responses-low", "low"),
+        route("semantic-responses-high", "high"),
+        route("semantic-responses-classifier", classifier=True),
     ],
     "policy_profiles": [{
-        "id": "gpt-5-6-semantic-sol-policy",
+        "id": "responses-effort-policy",
         "public_id": public_model,
-        "name": "GPT-5.6 Semantic Sol Effort Smoke",
+        "name": "Responses Effort Smoke",
         "mode": "enforce",
-        "lightweight": {"route": "semantic-sol-low", "reasoning_effort": "low"},
-        "powerful": {"route": "semantic-sol-max", "reasoning_effort": "max"},
+        "lightweight": {"route": "semantic-responses-low", "reasoning_effort": "low"},
+        "powerful": {"route": "semantic-responses-high", "reasoning_effort": "high"},
         "baseline_tier": "lightweight",
         "classifier_unavailable_tier": "lightweight",
         "classifier_uncertain_tier": "powerful",
-        "classifier": {"route": "semantic-sol-classifier", "timeout_ms": 10000},
+        "classifier": {"route": "semantic-responses-classifier", "timeout_ms": 10000},
         "data_policy": {"content_forwarding_acknowledged": True, "allow_provider_retention": True},
     }],
 }
@@ -507,21 +524,21 @@ post_request() {
 }
 
 validate_capture_events() {
-  "$(python_command)" - "${CAPTURE_LOG}" "${SOL_MODEL}" <<'PY'
+  "$(python_command)" - "${CAPTURE_LOG}" "${TERMINAL_MODEL}" "${CLASSIFIER_MODEL}" <<'PY'
 import json
 import sys
-events_path, sol_model = sys.argv[1:]
+events_path, terminal_model, classifier_model = sys.argv[1:]
 events = [json.loads(line) for line in open(events_path, encoding="utf-8") if line.strip()]
 classifiers = [event for event in events if event.get("kind") == "classifier"]
 if not classifiers:
     raise SystemExit("no classifier request was captured")
-if any(event.get("effort") is not None for event in classifiers):
+if any(event.get("reasoning_present") for event in classifiers):
     raise SystemExit(f"classifier request received terminal effort: {classifiers}")
-if any(event.get("store") is not False for event in classifiers):
-    raise SystemExit(f"classifier request did not retain store=false: {classifiers}")
-if any(event.get("path") != "/v1/responses" for event in events):
-    raise SystemExit(f"non-Responses upstream path captured: {events}")
-for label, expected in (("simple", "low"), ("complex", "max")):
+if any(event.get("store_present") for event in classifiers):
+    raise SystemExit(f"classifier request received unsupported store field: {classifiers}")
+if any(event.get("path") != "/v1/chat/completions" or event.get("model") != classifier_model for event in classifiers):
+    raise SystemExit(f"classifier did not use the configured native-Chat model: {classifiers}")
+for label, expected in (("simple", "low"), ("complex", "high")):
     selected = [event for event in events if event.get("label") == label]
     label_classifiers = [event for event in selected if event.get("kind") == "classifier"]
     terminals = [event for event in selected if event.get("kind") == "terminal"]
@@ -532,10 +549,14 @@ for label, expected in (("simple", "low"), ("complex", "max")):
     if len(terminals) != 1:
         raise SystemExit(f"{label}: terminal requests={len(terminals)}, want 1")
     terminal = terminals[0]
-    if terminal.get("model") != sol_model:
-        raise SystemExit(f"{label}: terminal model={terminal.get('model')!r}, want {sol_model!r}")
+    if terminal.get("path") != "/v1/responses":
+        raise SystemExit(f"{label}: terminal did not use /v1/responses: {terminal}")
+    if terminal.get("model") != terminal_model:
+        raise SystemExit(f"{label}: terminal model={terminal.get('model')!r}, want {terminal_model!r}")
     if terminal.get("effort") != expected:
         raise SystemExit(f"{label}: terminal effort={terminal.get('effort')!r}, want {expected!r}")
+    if terminal.get("store") is not False:
+        raise SystemExit(f"{label}: terminal did not preserve store=false")
     if terminal.get("status") != 200:
         raise SystemExit(f"{label}: terminal upstream status={terminal.get('status')!r}, want 200")
     if terminal.get("stream") is not False:
@@ -556,8 +577,8 @@ run_requests() {
 
   fetch_stats "${before}"
   write_request "${simple_request}" \
-    "SOL_LOW_TASK_SENTINEL: In one sentence, explain what path/filepath.Join does. This is a bounded read-only single-function lookup; do not inspect files or plan changes." \
-    max 256
+    "RESPONSES_LOW_TASK_SENTINEL: In one sentence, explain what path/filepath.Join does. This is a bounded read-only single-function lookup; do not inspect files or plan changes." \
+    high 256
   post_request simple "${simple_request}" "${simple_response}" "${simple_status}"
   fetch_stats "${after_simple}"
   assert_delta "simple classifier sends" \
@@ -569,10 +590,10 @@ run_requests() {
   assert_delta "simple lightweight tier" \
     "$(profile_metric "${before}" '.totals.actual_tiers.lightweight')" \
     "$(profile_metric "${after_simple}" '.totals.actual_tiers.lightweight')" 1
-  printf 'PASS sol-simple-conflicting-max-routed-low\n' >> "${SUMMARY_FILE}"
+  printf 'PASS responses-simple-conflicting-high-routed-low\n' >> "${SUMMARY_FILE}"
 
   write_request "${complex_request}" \
-    "SOL_MAX_TASK_SENTINEL: produce a coordinated cross-module remediation plan covering authentication, durable storage, streaming cancellation, schema migration, rollback safety, and multi-file race tests." \
+    "RESPONSES_HIGH_TASK_SENTINEL: produce a coordinated cross-module remediation plan covering authentication, durable storage, streaming cancellation, schema migration, rollback safety, and multi-file race tests." \
     low 1024
   post_request complex "${complex_request}" "${complex_response}" "${complex_status}"
   fetch_stats "${after_complex}"
@@ -585,24 +606,24 @@ run_requests() {
   assert_delta "complex powerful tier" \
     "$(profile_metric "${after_simple}" '.totals.actual_tiers.powerful')" \
     "$(profile_metric "${after_complex}" '.totals.actual_tiers.powerful')" 1
-  printf 'PASS sol-complex-conflicting-low-routed-max\n' >> "${SUMMARY_FILE}"
+  printf 'PASS responses-complex-conflicting-low-routed-high\n' >> "${SUMMARY_FILE}"
 
   validate_capture_events
-  printf 'PASS sol-classifier-has-no-terminal-effort\n' >> "${SUMMARY_FILE}"
+  printf 'PASS responses-classifier-has-no-terminal-effort\n' >> "${SUMMARY_FILE}"
 }
 
 main() {
   validate_inputs
   : > "${SUMMARY_FILE}"
   chmod 600 "${SUMMARY_FILE}"
-  fetch_and_validate_bridge_model
-  printf 'PASS sol-responses-low-max-capability\n' >> "${SUMMARY_FILE}"
+  fetch_and_validate_bridge_models
+  printf 'PASS responses-low-high-capability\n' >> "${SUMMARY_FILE}"
   write_capture_shim
   start_capture_shim
   write_policy_config
   start_policy_proxy
   run_requests
-  log "Live GPT-5.6 Sol semantic low/max effort smoke passed."
+  log "Live GPT-5-mini semantic low/high effort smoke passed."
 }
 
 main "$@"

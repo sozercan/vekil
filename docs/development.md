@@ -26,7 +26,8 @@ scripts/tests/live-smoke-reliability-test.sh  # deterministic mock-server/fake-C
 scripts/tests/live-chat-over-responses-smoke-test.sh  # deterministic Chat-over-Responses live-harness gates
 scripts/tests/live-policy-routing-smoke-test.sh  # deterministic semantic-policy process/cleanup gates
 scripts/tests/live-policy-routing-copilot-smoke-test.sh  # deterministic Copilot bridge/model-selection wrapper gate
-scripts/tests/live-policy-routing-sol-effort-smoke-test.sh  # deterministic Responses-native Sol low/max routing gate
+scripts/tests/live-policy-routing-smoke-test.sh omitted  # repeat the policy matrix without tier effort
+scripts/tests/live-policy-routing-responses-effort-smoke-test.sh  # deterministic Responses low/high routing gate
 ```
 
 `cmd/compaction-lab` starts an in-process proxy and fake `/responses` upstream, then exercises the compact-response shape, opaque compaction replay, remote compaction v2 trigger handling, and websocket `response.processed` control frames. It is intended as a quick deterministic check for compaction regressions before running live Copilot smoke tests.
@@ -208,7 +209,7 @@ make lint
 
 ## CI
 
-GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs on pushes to `main` and pull requests targeting `main`. Its jobs cover lint, tests, the full race detector, the `windows-launch` and `darwin-launch` launcher lifecycle checks, build, vet, a Kubernetes/kind operational smoke, and e2e validation. Every job has a job-level deadline. The test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers; [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims; [`scripts/tests/live-policy-routing-copilot-smoke-test.sh`](../scripts/tests/live-policy-routing-copilot-smoke-test.sh) verifies Copilot bridge catalog selection, secret isolation, non-default ports, and descendant cleanup without contacting Copilot; and [`scripts/tests/live-policy-routing-sol-effort-smoke-test.sh`](../scripts/tests/live-policy-routing-sol-effort-smoke-test.sh) proves conflicting public Responses effort is replaced with prompt-selected Sol `low`/`max` effort while classifier requests remain effort-free.
+GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs on pushes to `main` and pull requests targeting `main`. Its jobs cover lint, tests, the full race detector, the `windows-launch` and `darwin-launch` launcher lifecycle checks, build, vet, a Kubernetes/kind operational smoke, and e2e validation. Every job has a job-level deadline. The test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers; [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes with and without tier effort, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims; [`scripts/tests/live-policy-routing-copilot-smoke-test.sh`](../scripts/tests/live-policy-routing-copilot-smoke-test.sh) verifies Copilot bridge catalog selection, secret isolation, non-default ports, and descendant cleanup without contacting Copilot; and [`scripts/tests/live-policy-routing-responses-effort-smoke-test.sh`](../scripts/tests/live-policy-routing-responses-effort-smoke-test.sh) proves conflicting public Responses effort is replaced with prompt-selected GPT-5-mini `low`/`high` effort while Haiku classifier requests remain effort-free.
 
 The kind smoke builds the PR image and renders the checked-in [`k8s/vekil.yaml`](../k8s/vekil.yaml), patching only the test namespace, local image/pull policy, and the deterministic provider config used in its second phase. It verifies that the `/healthz` startup probe has a coherent 60–90 second failure budget before liveness/readiness begin. It then deploys without Copilot credentials and verifies that `/healthz` remains live, the liveness probe causes zero restarts, `/readyz` stays gated, the Pod is not Ready, and the Service has no ready endpoint. Finally it rolls out a static configured provider and verifies that the same readiness probe admits the Pod and Service endpoint. The script uses an isolated kubeconfig, bounds cluster/API/port-forward work, and requires the live `kubectl port-forward` PID plus its exact listener log before accepting HTTP responses.
 
@@ -251,7 +252,7 @@ To publish Sparkle updates, configure both `SPARKLE_PUBLIC_ED_KEY` and `SPARKLE_
 
 Live validation runs on pull-request updates with explicit inexpensive model allowlists and usage reporting. The Copilot protocol/CLI and semantic-policy workflows run on same-repository pull requests targeting `main`, weekly, and on manual dispatch. The provider-routing workflow runs on pull requests when its repository configuration is available and can also be dispatched manually. Fork and Dependabot pull requests skip credentialed checks before checkout. Core CI and the credential-free Zen workflow remain automated for all pull requests. Direct-bearer validation remains restricted to the weekly schedule on `main`, and paid checks do not run again on the post-merge push.
 
-The generic Copilot scripts use explicit inexpensive model allowlists. A missing required model or capability fails before inference instead of selecting an arbitrary catalog model. Optional Gemini CLI coverage skips when no approved native-Chat Flash model is listed. The policy workflow explicitly reserves `claude-opus-4.7` for its distinct high-effort secondary and keeps the exact Sol `low`/`max` regression test. Repository model overrides are deliberate wider-coverage choices and must still satisfy endpoint and effort constraints. See [GitHub's current model pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing) before changing them.
+The Copilot scripts use explicit inexpensive model allowlists. A missing required model or capability fails before inference instead of selecting an arbitrary catalog model. Optional Gemini CLI coverage skips when no approved native-Chat Flash model is listed. The policy workflow uses GPT mini terminal routes and Haiku for classification and failover. A separate GPT-5-mini Responses check verifies `low`/`high` effort overrides. Repository model overrides are deliberate wider-coverage choices and must still satisfy endpoint and effort constraints. See [GitHub's current model pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing) before changing them.
 
 Copilot proxy smoke scripts capture `task_usage` before shutdown and publish numeric usage to the Actions step summary, stderr, and an owner-only `usage.json` artifact in the smoke directory. This includes classifier/preflight, compaction, tool continuation, and retry sends. The policy wrapper counts its credentialed bridge once, rather than also adding the delegated proxies' overlapping counters. The carrier restart smoke adds one snapshot from each proxy lifetime. Missing snapshots and unfinished sends are marked partial; missing usage is not estimated, and zero reported billing units do not establish that requests were free. Cached and reasoning tokens are subsets of the input/output totals. Summaries contain no provider topology, request content, or credentials.
 
@@ -292,20 +293,22 @@ Fork and Dependabot pull requests skip before checkout. Other pull requests skip
 
 ## Live Semantic Policy Routing Smoke Workflows
 
-The [`Live Copilot Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-copilot-smoke.yaml) workflow has the uniquely named job `semantic-policy-e2e`. It runs on pull requests targeting `main`, weekly on Monday at 09:47 UTC, and on manual dispatch. It reuses the repository's existing `COPILOT_GITHUB_TOKEN`. [`scripts/live-policy-routing-copilot-smoke.sh`](../scripts/live-policy-routing-copilot-smoke.sh) starts a private zero-config Vekil bridge backed by Copilot, reads its `/v1/models` catalog, selects native-Chat models, and delegates to the common [`scripts/live-policy-routing-smoke.sh`](../scripts/live-policy-routing-smoke.sh) acceptance harness. It then runs [`scripts/live-policy-routing-sol-effort-smoke.sh`](../scripts/live-policy-routing-sol-effort-smoke.sh) against the same bridge with both policy tiers pinned to Responses-native `gpt-5.6-sol`: a simple prompt carries conflicting client `max` but must execute with tier `low`, while a complex prompt carries conflicting client `low` but must execute with tier `max`. The capture shim records only endpoint/model/effort/store metadata and verifies classifier requests never receive terminal reasoning effort and retain `store: false`.
+The [`Live Copilot Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-copilot-smoke.yaml) workflow has the uniquely named job `semantic-policy-e2e`. It runs on pull requests targeting `main`, weekly on Monday at 09:47 UTC, and on manual dispatch. It reuses the repository's existing `COPILOT_GITHUB_TOKEN`. [`scripts/live-policy-routing-copilot-smoke.sh`](../scripts/live-policy-routing-copilot-smoke.sh) starts a private zero-config Vekil bridge backed by Copilot, reads its `/v1/models` catalog, selects native-Chat models, and delegates to the common [`scripts/live-policy-routing-smoke.sh`](../scripts/live-policy-routing-smoke.sh) acceptance harness.
+
+It then runs [`scripts/live-policy-routing-responses-effort-smoke.sh`](../scripts/live-policy-routing-responses-effort-smoke.sh) against the same bridge with both terminal tiers pinned to `gpt-5-mini` over `/responses`. A simple prompt carries conflicting client `high` but must execute with tier `low`; a complex prompt carries conflicting client `low` but must execute with tier `high`. Haiku classifies both prompts through native Chat. The capture shim records only endpoint/model/effort/store metadata and verifies terminal requests preserve `store: false` while classifier requests omit unsupported effort and store fields.
 
 The bridge is intentional even though production schema-v2 policy profiles can target pinned models on a dynamic `type: copilot` provider directly, including Responses-backed Chat models. It gives the common smoke harness independently controllable static targets and fault injection, keeps the real Copilot token in one private bridge process, and permits metadata-only capture of the exact terminal `/responses` request without exposing credentials or request content. The wrapper removes `COPILOT_GITHUB_TOKEN` from delegated harness environments, gives the bridge a private token directory, auto-selects a non-default loopback port, and verifies bridge/process-group cleanup.
 
 The common harness keeps the observe-mode baseline at a 512-token ceiling. Every padded synthetic routing task ends with a fixed-response instruction outside the bounded classifier projection, so truncation still forces conservative powerful routing without asking terminal models to spend their budgets solving meaningless padding.
 
-For the broad matrix, the wrapper requires native `/chat/completions` support and the required tier effort. Default selection is limited to:
+For the broad matrix, the wrapper requires native `/chat/completions` support. Default selection is limited to:
 
-- lightweight: `gpt-5-mini`, then `gpt-5.4-mini`, advertising `low`;
+- lightweight: `gpt-5-mini`, then `gpt-5.4-mini`;
 - classifier: `claude-haiku-4.5`, which emits the required function call within the 256-token classifier budget. GPT-5-mini exhausted that budget in reasoning during live validation;
-- powerful primary: `gpt-5-mini`, then `gpt-5.4-mini`, advertising `high`; and
-- powerful secondary: a distinct model advertising `high`. The workflow explicitly pins `claude-opus-4.7` unless its repository override is set. The standalone wrapper only tries the two approved GPT mini models unless given an explicit override.
+- powerful primary: `gpt-5-mini`, then `gpt-5.4-mini`; and
+- powerful secondary: `claude-haiku-4.5`, distinct from the primary.
 
-The focused Sol matrix does not fall back: `gpt-5.6-sol` must advertise `/responses` plus both `low` and `max`, or the check fails.
+Haiku does not support reasoning effort, so the broad matrix omits it from both tiers. The common script accepts optional `LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT` and `LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT` values only as a pair. The focused Responses check requires `gpt-5-mini` to advertise `/responses` plus both `low` and `high`, and the classifier to advertise native Chat, before sending requests.
 
 Optional repository variables pin a model instead of using dynamic selection:
 
@@ -314,7 +317,7 @@ Optional repository variables pin a model instead of using dynamic selection:
 - `LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL`
 - `LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL`
 
-Because Vekil cannot independently attest Copilot's retention behavior, the broad native-Chat wrapper declares `classifier_no_store_supported: false`, strips the classifier `store` field, and sets the synthetic test profile's explicit `allow_provider_retention: true` acknowledgement. The focused Sol Responses harness declares the observed provider capability instead and verifies every classifier request retains `store: false`; it keeps the same conservative retention acknowledgement. Both tests send only fixed synthetic content. Neither the acknowledgement nor acceptance of `store: false` proves an external retention guarantee.
+Both policy tests declare `classifier_no_store_supported: false` and set the synthetic profile's `allow_provider_retention: true` acknowledgement. Vekil removes the classifier `store` field before forwarding to Haiku. The capture shim forwards the body unchanged, so its assertions verify the actual request sent to the bridge. Both tests send only fixed synthetic content; they do not establish an external retention guarantee.
 
 The common native-Chat live matrix covers:
 
@@ -330,7 +333,7 @@ The common native-Chat live matrix covers:
 
 In the Copilot matrix, the powerful targets are distinct models but share one Copilot service and loopback bridge. That proves sealed tier selection, retry accounting, target switching, and public-identity behavior; it does **not** prove independent cross-provider availability.
 
-The focused Sol matrix adds exact provider-wire coverage for `gpt-5.6-semantic` over public `/v1/responses` and Responses-backed terminal execution. Both tiers use the same physical `gpt-5.6-sol` model with different profile-owned effort, so the check specifically proves that prompt classification—not the client harness's incoming effort—selects `low` versus `max`.
+The focused Responses matrix uses public model `vekil-live-semantic-effort`. Both tiers use the same physical `gpt-5-mini` model with different profile-owned effort. Captured requests prove that prompt classification selects `low` versus `high` even when the client requests the opposite effort.
 
 True cross-provider coverage remains available through the manual [`Live Multi-Provider Semantic Policy Routing Smoke`](../.github/workflows/live-policy-routing-smoke.yaml) workflow and its `semantic-policy-multiprovider-e2e` job. Configure these repository variables for that workflow:
 
@@ -363,12 +366,10 @@ If the private Copilot bridge records HTTP 402 while either delegated Copilot po
 
 These smokes incur real provider cost and are bounded acceptance coverage, not the 75-task pilot/holdout or 5,000-observation production-enforcement evaluation described in the policy-routing release gate. Failure diagnostics are allowlisted, redacted, and truncated; raw generated provider configs are not uploaded.
 
-Run the Copilot-backed matrix locally after `make build`, explicitly choosing its second high-effort model:
+Run the Copilot-backed matrix locally after `make build`:
 
 ```bash
-COPILOT_GITHUB_TOKEN=... \
-  LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL=claude-opus-4.7 \
-  scripts/live-policy-routing-copilot-smoke.sh
+COPILOT_GITHUB_TOKEN=... scripts/live-policy-routing-copilot-smoke.sh
 ```
 
 Run the true multi-provider harness locally by exporting its variables and secrets:
