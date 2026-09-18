@@ -803,6 +803,7 @@ type routeAttemptTransportBody struct {
 	inner       io.ReadCloser
 	owner       *routeAttemptTransportOwner
 	observation *routeSendObservation
+	azurePermit *azureTrafficPermit
 	closeOnce   sync.Once
 	closeErr    error
 }
@@ -811,6 +812,10 @@ func (b *routeAttemptTransportBody) Read(p []byte) (int, error) {
 	if b == nil || b.inner == nil {
 		return 0, io.EOF
 	}
+	if !b.azurePermit.beginBodyRead() {
+		return 0, http.ErrBodyReadAfterClose
+	}
+	defer b.azurePermit.endBodyRead()
 	n, err := b.inner.Read(p)
 	if n > 0 {
 		b.observation.observeBodyBytes(n)
@@ -823,10 +828,12 @@ func (b *routeAttemptTransportBody) Close() error {
 		return nil
 	}
 	b.closeOnce.Do(func() {
+		b.azurePermit.beginBodyClose()
 		b.owner.cancelRequest()
 		if b.inner != nil {
 			b.closeErr = b.inner.Close()
 		}
+		b.azurePermit.completeResponseBody()
 	})
 	return b.closeErr
 }
@@ -2662,7 +2669,7 @@ func (o *routeAttemptResponseObserver) inspectNonStreamingLocked() {
 						if status, _, ok := classifyResponsesFailure(event, failureHeaders); ok {
 							o.statusCode = status
 							o.retryAfter = sanitizedRouteAttemptRetryAfter(failureHeaders, "")
-							o.azureTraffic.observe(status, failureHeaders)
+							o.azureTraffic.observeJSONFailure(status, failureHeaders)
 						}
 					}
 				}
@@ -2831,6 +2838,11 @@ func (b *routeAttemptObservedBody) Read(p []byte) (int, error) {
 			b.eof.Store(true)
 		}
 		b.observer.finish(errors.Is(err, io.EOF), err)
+		if errors.Is(err, io.EOF) && b.observer.trace.Decision == routeRetryAccepted {
+			// Accepted EOF proves completion after final throttle accounting.
+			// Abandoned attempts retain ownership until transport cleanup ends.
+			b.observer.azureTraffic.permit.completeResponseBody()
+		}
 		b.observer.azureTraffic.permit.release()
 	}
 	return n, err
@@ -3514,7 +3526,9 @@ func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *route
 	}
 	maybeAutoDecompressProviderResponse(resp, autoDecompressGzip)
 	receipt.finish(resp, err)
-	resp.Body = &routeAttemptTransportBody{inner: resp.Body, owner: owner, observation: observation}
+	azurePermit := azureRouteTrafficFromRequest(req).permit
+	azurePermit.holdResponseBody()
+	resp.Body = &routeAttemptTransportBody{inner: resp.Body, owner: owner, observation: observation, azurePermit: azurePermit}
 	return resp, err
 }
 

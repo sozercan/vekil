@@ -1175,6 +1175,14 @@ run_failover_case() {
   printf '%s\n' "${after}"
 }
 
+expected_pinned_primary_sends() {
+  if [[ "${LIVE_PROVIDER_ROUTING_PRIMARY_TYPE}" == "azure-openai" ]]; then
+    jq -r '.model_routes[0].routing.max_upstream_sends' "${CONFIG_JSON}"
+  else
+    printf '1\n'
+  fi
+}
+
 run_pinned_primary_case() {
   local before="$1"
   local response_id
@@ -1182,7 +1190,9 @@ run_pinned_primary_case() {
   local response="${SMOKE_DIR}/pinned-primary.response.json"
   local headers="${SMOKE_DIR}/pinned-primary.headers.txt"
   local status_file="${SMOKE_DIR}/pinned-primary.status"
-  local status after
+  local status after expected_sends
+
+  expected_sends="$(expected_pinned_primary_sends)"
 
   response_id="$(cat "${SMOKE_DIR}/healthy-primary.response-id.txt")"
   [[ -n "${response_id}" && "${response_id}" != "null" ]] || die "healthy primary response did not provide a bindable response id"
@@ -1196,10 +1206,10 @@ run_pinned_primary_case() {
   after="$(fetch_stats after-pinned-primary)"
   assert_delta "pinned primary upstream attempts" \
     "$(stats_counter "${before}" upstream_attempts)" \
-    "$(stats_counter "${after}" upstream_attempts)" 1
+    "$(stats_counter "${after}" upstream_attempts)" "${expected_sends}"
   assert_delta "pinned primary target attempts" \
     "$(stats_target_attempts "${before}" "${PRIMARY_TARGET_ID}")" \
-    "$(stats_target_attempts "${after}" "${PRIMARY_TARGET_ID}")" 1
+    "$(stats_target_attempts "${after}" "${PRIMARY_TARGET_ID}")" "${expected_sends}"
   assert_delta "pinned secondary target attempts" \
     "$(stats_target_attempts "${before}" "${SECONDARY_TARGET_ID}")" \
     "$(stats_target_attempts "${after}" "${SECONDARY_TARGET_ID}")" 0
@@ -1251,7 +1261,7 @@ control_proxy_counts_match() {
   if [[ "${LIVE_PROVIDER_ROUTING_PRIMARY_TYPE}" == "azure-openai" ]]; then
     responses_path="/openai/v1/responses"
   fi
-  jq -s -e --arg responses_path "${responses_path}" '
+  jq -s -e --arg responses_path "${responses_path}" --argjson pinned_sends "$(expected_pinned_primary_sends)" '
     [.[]
       | select(
           .event == "request"
@@ -1283,7 +1293,7 @@ control_proxy_counts_match() {
               and .expected_previous_response_id_present == true
               and .previous_response_id_present == true
             )]
-        | length) == 1
+        | length) == $pinned_sends
     and ([.[]
           | select(
               .event == "request"
@@ -1310,7 +1320,7 @@ assert_control_proxy_counts() {
     fi
     sleep 0.1
   done
-  die "primary control proxy did not observe one valid healthy Responses POST and two valid injected Responses rejections"
+  die "primary control proxy did not observe the expected healthy, failover, and pinned recovery attempts"
 }
 
 main() {
@@ -1329,7 +1339,8 @@ main() {
   start_proxy
   assert_catalog_identity
 
-  local initial after_healthy after_failover after_pinned final_stats
+  local initial after_healthy after_failover after_pinned final_stats pinned_sends
+  pinned_sends="$(expected_pinned_primary_sends)"
   initial="$(fetch_stats initial)"
   after_healthy="$(run_healthy_primary_case "${initial}")"
   after_failover="$(run_failover_case "${after_healthy}")"
@@ -1339,10 +1350,10 @@ main() {
 
   assert_delta "total upstream attempts" \
     "$(stats_counter "${initial}" upstream_attempts)" \
-    "$(stats_counter "${final_stats}" upstream_attempts)" 4
+    "$(stats_counter "${final_stats}" upstream_attempts)" "$((3 + pinned_sends))"
   assert_delta "total primary target attempts" \
     "$(stats_target_attempts "${initial}" "${PRIMARY_TARGET_ID}")" \
-    "$(stats_target_attempts "${final_stats}" "${PRIMARY_TARGET_ID}")" 3
+    "$(stats_target_attempts "${final_stats}" "${PRIMARY_TARGET_ID}")" "$((2 + pinned_sends))"
   assert_delta "total secondary target attempts" \
     "$(stats_target_attempts "${initial}" "${SECONDARY_TARGET_ID}")" \
     "$(stats_target_attempts "${final_stats}" "${SECONDARY_TARGET_ID}")" 1

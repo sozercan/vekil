@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -60,9 +62,10 @@ func (c *azureTrafficController) timeNow() time.Time {
 }
 
 type azureRouteTraffic struct {
-	controller *azureTrafficController
-	key        azureDeploymentKey
-	permit     *azureTrafficPermit
+	controller          *azureTrafficController
+	key                 azureDeploymentKey
+	permit              *azureTrafficPermit
+	jsonFailureObserved *atomic.Bool
 }
 
 type azureRouteTrafficContextKey struct{}
@@ -71,10 +74,22 @@ func (h *ProxyHandler) withAzureRouteTraffic(req *http.Request, target targetBin
 	if h == nil || req == nil || req.URL == nil || target.provider == nil || target.provider.kind != providerTypeAzureOpenAI {
 		return req
 	}
-	origin := strings.ToLower(req.URL.Scheme + "://" + req.URL.Host)
+	scheme := strings.ToLower(req.URL.Scheme)
+	host := strings.ToLower(req.URL.Hostname())
+	port := req.URL.Port()
+	if scheme == "https" && port == "443" || scheme == "http" && port == "80" {
+		port = ""
+	}
+	if port != "" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	origin := scheme + "://" + host
 	metadata := azureRouteTraffic{
-		controller: &h.azureTraffic,
-		key:        sha256.Sum256([]byte(origin + "\x00" + target.upstreamModel)),
+		controller:          &h.azureTraffic,
+		key:                 sha256.Sum256([]byte(origin + "\x00" + target.upstreamModel)),
+		jsonFailureObserved: new(atomic.Bool),
 	}
 	return req.WithContext(context.WithValue(req.Context(), azureRouteTrafficContextKey{}, metadata))
 }
@@ -85,6 +100,16 @@ func azureRouteTrafficFromRequest(req *http.Request) azureRouteTraffic {
 	}
 	metadata, _ := req.Context().Value(azureRouteTrafficContextKey{}).(azureRouteTraffic)
 	return metadata
+}
+
+// Preparation and body accounting may inspect the same JSON failure. Share
+// one observation across request copies so later reads cannot restart its reset.
+// New physical sends and streamed failure events retain independent resets.
+func (a azureRouteTraffic) observeJSONFailure(status int, headers http.Header) {
+	if a.jsonFailureObserved != nil && !a.jsonFailureObserved.CompareAndSwap(false, true) {
+		return
+	}
+	a.observe(status, headers)
 }
 
 func (a azureRouteTraffic) observe(status int, headers http.Header) bool {
@@ -148,26 +173,90 @@ type azureTrafficPermit struct {
 	controller *azureTrafficController
 	key        azureDeploymentKey
 	entry      *azureCooldown
-	once       sync.Once
+	// Protected by controller.mu. Requesting release does not end ownership
+	// while an abandoned transport body is still being read or closed.
+	bodyPending      bool
+	activeReads      int
+	closing          bool
+	releaseRequested bool
+	released         bool
+}
+
+func (p *azureTrafficPermit) holdResponseBody() {
+	if p == nil || p.controller == nil {
+		return
+	}
+	p.controller.mu.Lock()
+	defer p.controller.mu.Unlock()
+	p.bodyPending = true
+}
+
+func (p *azureTrafficPermit) beginBodyRead() bool {
+	if p == nil || p.controller == nil {
+		return true
+	}
+	p.controller.mu.Lock()
+	defer p.controller.mu.Unlock()
+	if p.closing {
+		return false
+	}
+	p.activeReads++
+	return true
+}
+
+func (p *azureTrafficPermit) endBodyRead() {
+	if p == nil || p.controller == nil {
+		return
+	}
+	p.controller.mu.Lock()
+	defer p.controller.mu.Unlock()
+	p.activeReads--
+	p.releaseIfCompleteLocked()
+}
+
+func (p *azureTrafficPermit) beginBodyClose() {
+	if p == nil || p.controller == nil {
+		return
+	}
+	p.controller.mu.Lock()
+	defer p.controller.mu.Unlock()
+	p.closing = true
+}
+
+func (p *azureTrafficPermit) completeResponseBody() {
+	if p == nil || p.controller == nil {
+		return
+	}
+	p.controller.mu.Lock()
+	defer p.controller.mu.Unlock()
+	p.bodyPending = false
+	p.releaseIfCompleteLocked()
 }
 
 func (p *azureTrafficPermit) release() {
 	if p == nil || p.controller == nil {
 		return
 	}
-	p.once.Do(func() {
-		c := p.controller
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		p.entry.probe = false
-		// While a recovery queue exists, release one caller per completed
-		// attempt. Deleting the entry and waking everyone would recreate the
-		// burst that exhausted the token quota.
-		if len(p.entry.queue) == 0 && !p.entry.until.After(c.timeNow()) && c.cooldowns[p.key] == p.entry {
-			delete(c.cooldowns, p.key)
-		}
-		p.entry.notify()
-	})
+	p.controller.mu.Lock()
+	defer p.controller.mu.Unlock()
+	p.releaseRequested = true
+	p.releaseIfCompleteLocked()
+}
+
+func (p *azureTrafficPermit) releaseIfCompleteLocked() {
+	if p.released || !p.releaseRequested || p.bodyPending || p.activeReads != 0 {
+		return
+	}
+	p.released = true
+	c := p.controller
+	p.entry.probe = false
+	// While a recovery queue exists, release one caller per completed
+	// attempt. Deleting the entry and waking everyone would recreate the
+	// burst that exhausted the token quota.
+	if len(p.entry.queue) == 0 && !p.entry.until.After(c.timeNow()) && c.cooldowns[p.key] == p.entry {
+		delete(c.cooldowns, p.key)
+	}
+	p.entry.notify()
 }
 
 func azureCooldownResponse(req *http.Request, delay time.Duration) *http.Response {

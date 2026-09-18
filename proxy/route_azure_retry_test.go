@@ -479,6 +479,117 @@ func TestExplicitRouteAzureProbeLateThrottleDelaysQueuedRequest(t *testing.T) {
 	}
 }
 
+func TestExplicitRouteAzureProbeWaitsForResponseCleanup(t *testing.T) {
+	for _, scenario := range []struct {
+		name          string
+		stream        bool
+		headerFailure bool
+	}{
+		{name: "HTTP rejection"},
+		{name: "stream rejection", stream: true},
+		{name: "Chat header rejection", headerFailure: true},
+		{name: "stream header rejection", stream: true, headerFailure: true},
+	} {
+		for _, blockClose := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/block-close=%t", scenario.name, blockClose), func(t *testing.T) {
+				readRelease := make(chan struct{})
+				closeRelease := make(chan struct{})
+				var readOnce, closeOnce sync.Once
+				releaseRead := func() { readOnce.Do(func() { close(readRelease) }) }
+				releaseClose := func() { closeOnce.Do(func() { close(closeRelease) }) }
+				t.Cleanup(func() { releaseRead(); releaseClose() })
+				if blockClose {
+					releaseRead()
+				} else {
+					releaseClose()
+				}
+				payload := `{"error":{"code":"rate_limit_exceeded"}}`
+				status := http.StatusTooManyRequests
+				endpoint := providerEndpointResponses
+				headers := http.Header{"Retry-After": {"1"}, "Content-Type": {"application/json"}}
+				if scenario.stream {
+					payload = "data: " + `{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}` + "\n\n"
+					status = http.StatusOK
+					headers.Set("Content-Type", "text/event-stream")
+				}
+				if scenario.headerFailure {
+					status = http.StatusOK
+					headers.Add("X-Codex-Turn-State", "state-one")
+					headers.Add("X-Codex-Turn-State", "state-two")
+					if scenario.stream {
+						payload = azureRetryCompletedSSE
+					} else {
+						endpoint = providerEndpointChatCompletions
+						payload = `{"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`
+					}
+				}
+				body := &routeAttemptUsageThenBlockingCleanupBody{
+					data: []byte(payload), readBlocked: make(chan struct{}), readRelease: readRelease,
+					closeStarted: make(chan struct{}), closeRelease: closeRelease,
+				}
+				var calls atomic.Int32
+				h, route := explicitRouteTestHandler(t, &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if calls.Add(1) == 1 {
+						resp := routeExecutorTestResponse(req, status, headers, payload)
+						resp.Body = body
+						return resp, nil
+					}
+					if scenario.stream {
+						return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, azureRetryCompletedSSE), nil
+					}
+					return routeExecutorTestResponse(req, 200, nil, `{"status":"completed","output":[]}`), nil
+				})}, routeModePrimaryOnly, 1, 1, explicitRouteTestProvider("primary", "http://primary.example", "key"))
+				t.Cleanup(h.BeginShutdown)
+				advance := azureTrafficTestClock(h)
+				seed := azureTrafficTestRequest(t, h, t.Context(), "primary", "http://primary.example", "deployment-a")
+				azureRouteTrafficFromRequest(seed).observe(429, http.Header{"Retry-After": {"1"}})
+				advance(time.Second)
+				execute := func() <-chan azureTrafficTestResult {
+					done := make(chan azureTrafficTestResult, 1)
+					go func() {
+						ctx := withRouteOperation(t.Context(), newRouteOperation(route, t.Context()))
+						resp, err := h.executeExplicitRouteRequest(ctx, route, endpoint, []byte(`{"model":"public-model"}`), nil, "public-model", scenario.stream)
+						done <- azureTrafficTestResult{blocked: resp, err: err}
+					}()
+					return done
+				}
+				first := execute()
+				waiting := body.readBlocked
+				if blockClose {
+					waiting = body.closeStarted
+				}
+				select {
+				case <-waiting:
+				case <-time.After(3 * time.Second):
+					t.Fatal("probe never entered blocked cleanup")
+				}
+				result := receiveAzureTrafficResult(t, first)
+				if scenario.headerFailure && (result.err == nil || !strings.Contains(result.err.Error(), "conflicting X-Codex-Turn-State")) {
+					t.Fatalf("expected header binding failure: %+v", result)
+				}
+				if result.blocked != nil {
+					_ = result.blocked.Body.Close()
+				}
+				advance(2 * time.Second)
+				second := execute()
+				waitForAzureTrafficWaiters(t, h, 1)
+				if calls.Load() != 1 {
+					t.Fatalf("queued request overlapped cleanup: calls=%d", calls.Load())
+				}
+				releaseRead()
+				releaseClose()
+				result = receiveAzureTrafficResult(t, second)
+				if result.err != nil || result.blocked == nil || result.blocked.StatusCode != 200 || calls.Load() != 2 {
+					t.Fatalf("queue did not recover after cleanup: calls=%d result=%+v", calls.Load(), result)
+				}
+				_, _ = io.Copy(io.Discard, result.blocked.Body)
+				_ = result.blocked.Body.Close()
+				waitForAzureTrafficWaiters(t, h, 0)
+			})
+		}
+	}
+}
+
 func TestExplicitRouteAzureRenewedResetPreservesUpstreamRejection(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {

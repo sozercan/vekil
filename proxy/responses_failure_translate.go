@@ -1501,6 +1501,11 @@ func writePrefixAndDrainResponsesStream(pw *io.PipeWriter, prefix []byte, chunkC
 }
 
 func classifyResponsesPeekMessage(msg responsesSSEMessage, headers http.Header) peekResult {
+	// Decoding can overwrite earlier usage or output under duplicate keys.
+	// Preserve ambiguous raw events and prevent them from authorizing replay.
+	if rejectDuplicateJSONMappingKeys([]byte(msg.data)) != nil {
+		return peekResult{decision: responsesPeekDecisionPassthrough}
+	}
 	event, err := parseResponsesStreamEvent(msg.data)
 	if err != nil {
 		return peekResult{decision: responsesPeekDecisionPassthrough}

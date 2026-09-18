@@ -91,6 +91,8 @@ func TestAzureTrafficCooldownScopeAndExpiredProbe(t *testing.T) {
 	}{
 		{"same deployment", "east", "https://east.example", "deployment", true},
 		{"provider alias", "east-alias", "https://east.example", "deployment", true},
+		{"default HTTPS port", "east-alias", "https://EAST.example:443", "deployment", true},
+		{"non-default HTTPS port", "east-alias", "https://east.example:8443", "deployment", false},
 		{"different resource", "west", "https://west.example", "deployment", false},
 		{"different deployment", "east", "https://east.example", "classifier", false},
 	} {
@@ -119,6 +121,32 @@ func TestAzureTrafficCooldownScopeAndExpiredProbe(t *testing.T) {
 	defer permit.release()
 	if err != nil || blocked != nil || permit != nil {
 		t.Fatalf("successful probe did not restore ordinary admission: %v, %v", blocked, err)
+	}
+}
+
+func TestAzureTrafficCooldownDefaultPortAliases(t *testing.T) {
+	for _, origins := range [][2]string{
+		{"http://east.example:80", "http://east.example"},
+		{"https://east.example:443", "https://east.example"},
+		{"http://[::1]:80", "http://[::1]"},
+		{"https://[::1]", "https://[::1]:443"},
+	} {
+		t.Run(origins[0], func(t *testing.T) {
+			h := &ProxyHandler{}
+			t.Cleanup(h.BeginShutdown)
+			azureTrafficTestClock(h)
+			first := azureTrafficTestRequest(t, h, t.Context(), "first", origins[0], "deployment")
+			azureRouteTrafficFromRequest(first).observe(429, http.Header{"Retry-After": {"60"}})
+			alias := azureTrafficTestRequest(t, h, t.Context(), "alias", origins[1], "deployment")
+			permit, blocked, err := h.acquireAzureRouteInference(alias, true)
+			defer permit.release()
+			if blocked != nil {
+				defer func() { _ = blocked.Body.Close() }()
+			}
+			if err != nil || blocked == nil || blocked.StatusCode != 429 {
+				t.Fatalf("default-port alias bypassed cooldown: response=%v err=%v", blocked, err)
+			}
+		})
 	}
 }
 

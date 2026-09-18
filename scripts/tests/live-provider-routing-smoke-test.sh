@@ -504,9 +504,9 @@ assert_control_proxy_log() {
   jq -s -e '
     [.[] | select(.event == "request" and .request_kind == "responses" and .valid_responses_post == true)] as $posts
     | ([$posts[] | select(.mode == "forward" and .status == 200)] | length) == 1
-    and ([$posts[] | select(.mode == "reject" and .status == 429)] | length) == 2
+    and ([$posts[] | select(.mode == "reject" and .status == 429)] | length) == 3
     and ([$posts[] | select(.mode == "reject" and .expected_previous_response_id_present == false and .previous_response_id_present == false)] | length) == 1
-    and ([$posts[] | select(.mode == "reject" and .expected_previous_response_id_present == true and .previous_response_id_present == true)] | length) == 1
+    and ([$posts[] | select(.mode == "reject" and .expected_previous_response_id_present == true and .previous_response_id_present == true)] | length) == 2
     and ($posts | all(
       .method == "POST"
       and .path == "/openai/v1/responses"

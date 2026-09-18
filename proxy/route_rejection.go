@@ -42,7 +42,7 @@ func routeResponseBodyAllowsReplay(body []byte) bool {
 	for name, raw := range envelope {
 		switch strings.ToLower(name) {
 		case "usage":
-			var usage any
+			var usage map[string]any
 			decoder := json.NewDecoder(bytes.NewReader(raw))
 			decoder.UseNumber()
 			if decoder.Decode(&usage) != nil || !routeRejectionUsageIsZero(usage) {
@@ -138,10 +138,14 @@ func prepareAzureRouteJSONRejection(resp *http.Response, target targetBinding, t
 	event.Type = "response.failed"
 	event.Response.Error = envelope.Error
 	headers := responsesFailureHeaders(event, resp.Header)
-	if status, _, ok := classifyResponsesFailure(event, headers); ok {
-		traffic.observe(status, headers)
+	status, certified := routeAdapterCertifiesStreamFailure(target, event)
+	if classifiedStatus, _, ok := classifyResponsesFailure(event, headers); ok {
+		traffic.observeJSONFailure(classifiedStatus, headers)
+		if classifiedStatus == http.StatusTooManyRequests {
+			status, certified = classifiedStatus, true
+		}
 	}
-	if status, certified := routeAdapterCertifiesStreamFailure(target, event); certified && routeResponseBodyAllowsReplay(prefix) {
+	if certified && routeResponseBodyAllowsReplay(prefix) {
 		cloned.StatusCode = status
 		cloned.Status = strconv.Itoa(status) + " " + http.StatusText(status)
 		cloned.Header = headers.Clone()

@@ -24,6 +24,8 @@ func TestExplicitRouteHTTPRejectionWithProgressNeverReplays(t *testing.T) {
 		`{"error":{"code":"rate_limit_exceeded"},"usage":{"input_tokens":1},"usage":null}`,
 		`{"error":{"code":"rate_limit_exceeded"},"usage":{"input_tokens":"unknown"}}`,
 		`{"error":{"code":"rate_limit_exceeded"},"usage":{"input_tokens":1e-400}}`,
+		`{"error":{"code":"rate_limit_exceeded"},"usage":0}`,
+		`{"error":{"code":"rate_limit_exceeded"},"response":{"usage":0}}`,
 		`{"error":{"code":"rate_limit_exceeded"},"status":"completed","output":[]}`,
 		`{"error":{"code":"rate_limit_exceeded"},"output":{}}`,
 		`{"error":{"code":"rate_limit_exceeded"},"usage":`,
@@ -60,6 +62,76 @@ func TestExplicitRouteHTTPRejectionWithProgressNeverReplays(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestExplicitRouteStreamDuplicateKeysNeverReplay(t *testing.T) {
+	for _, event := range []string{
+		`{"type":"response.failed","response":{"usage":{"input_tokens":5}},"response":{"usage":{"input_tokens":0},"error":{"code":"rate_limit_exceeded"}}}`,
+		`{"type":"response.failed","response":{"usage":{"input_tokens":5},"usage":{"input_tokens":0},"error":{"code":"rate_limit_exceeded"}}}`,
+		`{"type":"response.failed","response":{"usage":{"input_tokens":5,"input_tokens":0},"error":{"code":"rate_limit_exceeded"}}}`,
+		`{"type":"response.failed","response":{"output":[{"type":"message"}],"output":[],"error":{"code":"rate_limit_exceeded"}}}`,
+		`{"type":"response.created","response":{"usage":{"input_tokens":5},"usage":{"input_tokens":0}}}` + "\n\ndata: " + `{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}`,
+	} {
+		for _, pinned := range []bool{false, true} {
+			t.Run(event+map[bool]string{false: "/failover", true: "/pinned"}[pinned], func(t *testing.T) {
+				var calls atomic.Int32
+				h, route := explicitRouteTestHandler(t, &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls.Add(1)
+					return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}, "Retry-After": {"1"}}, "data: "+event+"\n\n"), nil
+				})}, routeModePriorityFailover, 2, 2,
+					explicitRouteTestProvider("primary", "http://primary.example", "key"),
+					explicitRouteTestProvider("secondary", "http://secondary.example", "key"))
+				t.Cleanup(h.BeginShutdown)
+				ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+				defer cancel()
+				op := newRouteOperation(route, ctx)
+				if pinned {
+					if err := op.forcePinnedTarget(route.targets[0].id); err != nil {
+						t.Fatal(err)
+					}
+				}
+				resp, err := h.executeExplicitRouteRequest(withRouteOperation(ctx, op), route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+				if resp != nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+				}
+				sends, switches, _ := op.snapshot()
+				if calls.Load() != 1 || sends != 1 || switches != 0 {
+					t.Fatalf("replayed ambiguous stream: calls=%d sends=%d switches=%d err=%v", calls.Load(), sends, switches, err)
+				}
+			})
+		}
+	}
+}
+
+func TestExplicitRouteAzureJSONRateLimitAliases(t *testing.T) {
+	for _, code := range []string{"quota_exceeded", "429", "rate_limit_error", "rate_limit_exceeded"} {
+		t.Run(code, func(t *testing.T) {
+			var primaryCalls, secondaryCalls atomic.Int32
+			h, route := explicitRouteTestHandler(t, &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Hostname() == "primary.example" {
+					primaryCalls.Add(1)
+					return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}}, `{"status":"failed","output":[],"usage":{"input_tokens":0},"error":{"code":"`+code+`"}}`), nil
+				}
+				secondaryCalls.Add(1)
+				return routeExecutorTestResponse(req, 200, nil, `{"id":"resp_done","status":"completed","output":[]}`), nil
+			})}, routeModePriorityFailover, 2, 2,
+				explicitRouteTestProvider("primary", "http://primary.example", "key"),
+				explicitRouteTestProvider("secondary", "http://secondary.example", "key"))
+			t.Cleanup(h.BeginShutdown)
+			op := newRouteOperation(route, t.Context())
+			resp, err := h.executeExplicitRouteRequest(withRouteOperation(t.Context(), op), route, providerEndpointResponses, []byte(`{"model":"public-model"}`), nil, "public-model", false)
+			if err != nil || resp == nil {
+				t.Fatalf("response unavailable: %v", err)
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			sends, switches, _ := op.snapshot()
+			if readErr != nil || resp.StatusCode != 200 || !strings.Contains(string(body), "resp_done") || primaryCalls.Load() != 1 || secondaryCalls.Load() != 1 || sends != 2 || switches != 1 {
+				t.Fatalf("rate limit did not recover: primary=%d secondary=%d sends=%d switches=%d status=%d body=%s err=%v", primaryCalls.Load(), secondaryCalls.Load(), sends, switches, resp.StatusCode, body, readErr)
+			}
+		})
 	}
 }
 
@@ -225,5 +297,82 @@ func TestExplicitRouteAzureJSONInspectionPreservesBodyAndReadError(t *testing.T)
 				t.Fatalf("body or error changed: calls=%d status=%d body bytes=%d error=%v", calls.Load(), resp.StatusCode, len(got), err)
 			}
 		})
+	}
+}
+
+func TestExplicitRouteAzureJSONCooldownIsObservedOnce(t *testing.T) {
+	for _, size := range []string{"small", "large-known-length", "large-unknown-length"} {
+		for _, suppressed := range []bool{false, true} {
+			t.Run(size+map[bool]string{false: "/stats", true: "/stats-suppressed"}[suppressed], func(t *testing.T) {
+				body := `{"status":"failed","usage":{"input_tokens":1},"output":[],"error":{"code":"rate_limit_exceeded"},"padding":"`
+				if size != "small" {
+					body += strings.Repeat("x", upstreamErrorDetailMaxBodyBytes)
+				}
+				body += `"}`
+				var calls atomic.Int32
+				h, route := explicitRouteTestHandler(t, &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls.Add(1)
+					resp := routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}}, body)
+					resp.ContentLength = int64(len(body))
+					if size == "large-unknown-length" {
+						resp.ContentLength = -1
+					}
+					return resp, nil
+				})}, routeModePrimaryOnly, 1, 3, explicitRouteTestProvider("primary", "http://primary.example", "key"))
+				t.Cleanup(h.BeginShutdown)
+				h.stats = newStatsCollector()
+				advance := azureTrafficTestClock(h)
+				ctx := t.Context()
+				if suppressed {
+					ctx = suppressRouteAttemptStats(ctx)
+				}
+				op := newRouteOperation(route, ctx)
+				resp, err := h.executeExplicitRouteRequest(withRouteOperation(ctx, op), route, providerEndpointResponses, []byte(`{"model":"public-model"}`), nil, "public-model", false)
+				if err != nil || resp == nil {
+					t.Fatalf("response unavailable: %v", err)
+				}
+				defer func() { _ = resp.Body.Close() }()
+				advance(50 * time.Second)
+				got, err := io.ReadAll(resp.Body)
+				if err != nil || string(got) != body || resp.StatusCode != 200 || calls.Load() != 1 {
+					t.Fatalf("failed response changed: status=%d calls=%d error=%v", resp.StatusCode, calls.Load(), err)
+				}
+				assertReset := func(want string) {
+					t.Helper()
+					req := azureTrafficTestRequest(t, h, t.Context(), "primary", "http://primary.example", "deployment-a")
+					permit, blocked, err := h.acquireAzureRouteInference(req, true)
+					defer permit.release()
+					if err != nil || blocked == nil {
+						t.Fatalf("cooldown unavailable: response=%v error=%v", blocked, err)
+					}
+					defer func() { _ = blocked.Body.Close() }()
+					if got := blocked.Header.Get("Retry-After"); got != want {
+						t.Fatalf("remaining reset=%s want=%s", got, want)
+					}
+				}
+				if size == "small" {
+					assertReset("10")
+				} else {
+					assertReset("60")
+				}
+				advance(5 * time.Second)
+				if _, err := resp.Body.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+					t.Fatalf("second terminal read=%v want EOF", err)
+				}
+				_ = resp.Body.Close()
+				if size == "small" {
+					assertReset("5")
+				} else {
+					assertReset("55")
+				}
+				wantAttempts := 1
+				if suppressed {
+					wantAttempts = 0
+				}
+				if got := len(h.stats.snapshot().RecentAttempts); got != wantAttempts {
+					t.Fatalf("recorded attempts=%d want=%d", got, wantAttempts)
+				}
+			})
+		}
 	}
 }
