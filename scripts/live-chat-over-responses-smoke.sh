@@ -202,6 +202,15 @@ dump_proxy_log() {
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
+  if [[ "${proxy_listen_confirmed}" == "1" && -s "${MODELS_JSON}" ]]; then
+    local usage_url=""
+    if [[ -n "${proxy_pid}" ]] && process_is_running "${proxy_pid}"; then
+      usage_url="${PROXY_BASE_URL}"
+    fi
+    "$(python_command)" "${SCRIPT_DIR}/live-smoke-usage.py" \
+      --url "${usage_url}" --label "Chat over Responses" --output "${SMOKE_DIR}/usage.json" \
+      || log "Unable to publish smoke usage"
+  fi
   if [[ -n "${proxy_pgid}" ]]; then
     terminate_process_group "${proxy_pid}" "${proxy_pgid}"
     proxy_pid=""
@@ -307,21 +316,16 @@ fetch_models() {
 }
 
 pick_responses_only_model() {
-  local selected
-  selected="$(jq -r '
-    def responses_only:
-      ((.supported_endpoints // []) | index("/responses")) != null
-      and ((.supported_endpoints // []) | index("/chat/completions")) == null;
-    ([.data[]? | select((.id | type) == "string") | select(responses_only) | .id] as $models
-      | if ($models | index("gpt-5.6-sol")) != null then "gpt-5.6-sol"
-        elif ($models | length) > 0 then $models[0]
-        else ""
-        end)
-  ' "${MODELS_JSON}")"
-  if [[ -z "${selected}" ]]; then
-    die "no model advertises /responses while excluding /chat/completions"
-  fi
-  printf '%s\n' "${selected}"
+  # Luna must satisfy the same native endpoint and tool contract as the old
+  # Sol preference. Never fall back to an unpriced catalog entry.
+  jq -e '
+    .data[]?
+    | select(.id == "gpt-5.6-luna")
+    | ((.supported_endpoints // []) | index("/responses")) != null
+      and ((.supported_endpoints // []) | index("/chat/completions")) == null
+      and (.capabilities.supports.tool_calls // false) == true
+  ' "${MODELS_JSON}" >/dev/null || die "approved model gpt-5.6-luna must advertise /responses only and tool_calls"
+  printf '%s\n' gpt-5.6-luna
 }
 
 post_chat() {

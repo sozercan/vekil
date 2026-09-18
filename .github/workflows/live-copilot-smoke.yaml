@@ -2,8 +2,8 @@ name: Live Copilot Smoke
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+  schedule:
+    - cron: "31 9 * * 1"
 
 permissions:
   contents: read

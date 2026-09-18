@@ -227,6 +227,15 @@ cleanup() {
   local rc=$?
   trap - EXIT INT TERM
 
+  if [[ "${bridge_listen_confirmed}" == "1" && -s "${BRIDGE_MODELS}" ]]; then
+    local usage_url=""
+    if process_is_running "${bridge_pid}"; then
+      usage_url="${bridge_base_url}"
+    fi
+    "$(python_command)" "${SCRIPT_DIR}/live-smoke-usage.py" \
+      --url "${usage_url}" --label "Copilot policy and Sol effort" --output "${SMOKE_DIR}/usage.json" \
+      || log "Unable to publish smoke usage"
+  fi
   if [[ -n "${bridge_pgid}" ]]; then
     terminate_process_group "${bridge_pid}" "${bridge_pgid}"
     if [[ "${bridge_listen_confirmed}" == "1" && -n "${bridge_port}" ]] && ! wait_for_port_release "${bridge_port}"; then
@@ -359,43 +368,26 @@ pick_copilot_model() {
     fi
   done
 
-  candidate="$(jq -r --arg excluded "${excluded}" --arg effort "${required_effort}" '
-    [.data[]?
-      | select((.id | type) == "string")
-      | select(.id != $excluded)
-      | select(((.supported_endpoints // []) | index("/chat/completions")) != null)
-      | select($effort == "" or (((.capabilities.supports.reasoning_effort // []) | index($effort)) != null))
-      | .id][0] // ""
-  ' "${BRIDGE_MODELS}")"
-  [[ -n "${candidate}" ]] || die "unable to select ${label} from Copilot native-Chat models supporting reasoning effort ${required_effort:-<any>}"
-  printf '%s\n' "${candidate}"
+  die "no approved ${label} model supports native Chat and reasoning effort ${required_effort:-<any>}; set an explicit LIVE_POLICY_ROUTING_COPILOT model override for wider coverage"
 }
 
 select_copilot_models() {
   selected_lightweight="$(pick_copilot_model \
     lightweight \
     "${LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL:-}" \
-    "" \
-    low \
-    gpt-5.4-mini claude-haiku-4.5 gpt-5-mini gpt-4.1 gpt-4o)"
+    "" low gpt-5-mini gpt-5.4-mini)"
   selected_classifier="$(pick_copilot_model \
     classifier \
     "${LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL:-}" \
-    "" \
-    "" \
-    gpt-4.1 claude-sonnet-4.6 claude-haiku-4.5 gpt-5.4-mini gpt-5-mini gpt-5.4)"
-	selected_primary="$(pick_copilot_model \
+    "" "" gpt-5-mini claude-haiku-4.5)"
+  selected_primary="$(pick_copilot_model \
     powerful-primary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL:-}" \
-    "" \
-    high \
-	    gemini-3.1-pro-preview gemini-3.5-flash claude-sonnet-4.6 gpt-5.4 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1)"
+    "" high gpt-5-mini gpt-5.4-mini)"
   selected_secondary="$(pick_copilot_model \
     powerful-secondary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL:-}" \
-    "${selected_primary}" \
-    high \
-    gemini-3.5-flash claude-sonnet-4.6 gemini-3.1-pro-preview gpt-5.4 gpt-5.3-codex claude-sonnet-4.5 gpt-5.2-codex gpt-4.1 gpt-5-mini)"
+    "${selected_primary}" high gpt-5-mini gpt-5.4-mini)"
 
   jq -n \
     --arg lightweight "${selected_lightweight}" \

@@ -106,9 +106,11 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": "mimo-v2.5-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "hy3-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
+                {"id": "gpt-5-mini", "supported_endpoints": ["/responses"]},
                 {"id": "muse-spark-1.2-contributor-free", "supported_endpoints": ["/responses"]},
                 {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
                 {"id": "claude-sonnet-5", "supported_endpoints": ["/chat/completions"]},
+                {"id": "claude-haiku-4.5", "supported_endpoints": ["/chat/completions"]},
             ]})
             return
         self.send_json(404, {"error": {"message": "not found"}})
@@ -881,10 +883,10 @@ if expect_success "Claude subprocess defaults and model preference" 8 \
   fi
 
   captured_claude_model="$(cat "${claude_capture_dir}/model" 2>/dev/null || true)"
-  if [[ "${captured_claude_model}" == "claude-sonnet-5" ]]; then
-    record_success "Claude model selection prefers Sonnet 5 over catalogued Sonnet 4"
+  if [[ "${captured_claude_model}" == "claude-haiku-4.5" ]]; then
+    record_success "Claude model selection uses Haiku despite catalogued Sonnet models"
   else
-    record_failure "Claude model selection prefers Sonnet 5 over catalogued Sonnet 4" \
+    record_failure "Claude model selection uses Haiku despite catalogued Sonnet models" \
       "captured model=${captured_claude_model:-<missing>}"
   fi
 fi

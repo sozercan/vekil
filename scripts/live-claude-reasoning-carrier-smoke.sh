@@ -308,6 +308,18 @@ cleanup() {
     claude_pid=""
     claude_pgid=""
   fi
+  if [[ "${proxy_listen_confirmed}" == "1" && -s "${MODELS_JSON}" ]]; then
+    local usage_url=""
+    if [[ -n "${proxy_pid}" ]] && process_is_running "${proxy_pid}" && proxy_log_has_expected_listener; then
+      usage_url="${PROXY_BASE_URL}"
+    fi
+    local usage_args=(--url "${usage_url}" --label "Claude carrier restart" --output "${SMOKE_DIR}/usage.json")
+    if [[ "${proxy_pid}" != "${stopped_proxy_pid}" && -f "${SMOKE_DIR}/usage-initial.json" ]]; then
+      usage_args+=(--previous "${SMOKE_DIR}/usage-initial.json")
+    fi
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/live-smoke-usage.py" "${usage_args[@]}" \
+      || log "Unable to publish smoke usage"
+  fi
   if [[ -n "${proxy_pgid}" ]]; then
     terminate_process_group "${proxy_pid}" "${proxy_pgid}"
     proxy_pid=""
@@ -430,6 +442,9 @@ wait_for_ready() {
 }
 
 stop_proxy_for_restart() {
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/live-smoke-usage.py" \
+    --url "${PROXY_BASE_URL}" --label "Claude carrier initial process" \
+    --output "${SMOKE_DIR}/usage-initial.json" --quiet || log "Unable to capture initial smoke usage"
   stopped_proxy_pid="${proxy_pid}"
   terminate_process_group "${proxy_pid}" "${proxy_pgid}"
   proxy_pid=""
@@ -447,22 +462,16 @@ fetch_models() {
 }
 
 pick_responses_only_gpt_model() {
-  local selected
-  selected="$(jq -r '
-    def responses_only_gpt:
-      (.id | type) == "string"
-      and (.id | startswith("gpt-"))
-      and ((.supported_endpoints // []) | index("/responses")) != null
+  # Luna must satisfy the same native endpoint and tool contract as the old
+  # Sol preference. Never fall back to an unpriced catalog entry.
+  jq -e '
+    .data[]?
+    | select(.id == "gpt-5.6-luna")
+    | ((.supported_endpoints // []) | index("/responses")) != null
       and ((.supported_endpoints // []) | index("/chat/completions")) == null
-      and (.capabilities.supports.tool_calls // false) == true;
-    ([.data[]? | select(responses_only_gpt) | .id] as $models
-      | if ($models | index("gpt-5.6-sol")) != null then "gpt-5.6-sol"
-        elif ($models | length) > 0 then $models[0]
-        else ""
-        end)
-  ' "${MODELS_JSON}")"
-  [[ -n "${selected}" ]] || die "no tool-capable GPT model advertises /responses while excluding /chat/completions"
-  printf '%s\n' "${selected}"
+      and (.capabilities.supports.tool_calls // false) == true
+  ' "${MODELS_JSON}" >/dev/null || die "approved model gpt-5.6-luna must advertise /responses only and tool_calls"
+  printf '%s\n' gpt-5.6-luna
 }
 
 validate_claude_stream() {

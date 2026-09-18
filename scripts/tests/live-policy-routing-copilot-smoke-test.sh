@@ -106,12 +106,13 @@ child = subprocess.Popen(["sleep", "300"])
 pathlib.Path(os.environ["FAKE_BRIDGE_CHILD_PID_FILE"]).write_text(str(child.pid), encoding="utf-8")
 
 models = [
+    {"id": "gpt-5-mini", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
     {"id": "gpt-5.4-mini", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low"]}}},
     {"id": "gpt-5.4", "supported_endpoints": ["/chat/completions", "/responses"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
     {"id": "gemini-3.1-pro-preview", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}}},
     {"id": "gpt-4.1", "supported_endpoints": ["/chat/completions"]},
     {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
-    {"id": "claude-opus-4.6", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
+    {"id": "claude-opus-4.7", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
     {"id": "responses-only", "supported_endpoints": ["/responses"]},
 ]
 
@@ -174,10 +175,10 @@ set -euo pipefail
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL}" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL}" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == http://127.0.0.1:*/v1 ]]
-[[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" == "gpt-5.4-mini" ]]
-[[ "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" == "gpt-4.1" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "gemini-3.1-pro-preview" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "claude-sonnet-4.6" ]]
+[[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" == "gpt-5-mini" ]]
+[[ "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" == "gpt-5-mini" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "gpt-5-mini" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "claude-opus-4.7" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT}" == "low" ]]
 [[ "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT}" == "high" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" == "false" ]]
@@ -254,6 +255,7 @@ main() {
   log "Running Copilot semantic-policy wrapper against a deterministic bridge catalog"
   env \
     COPILOT_GITHUB_TOKEN="${TOKEN}" \
+    LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL=claude-opus-4.7 \
     PROXY_BIN=/usr/bin/true \
     LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN="${BRIDGE_BIN}" \
     LIVE_POLICY_ROUTING_HARNESS="${HARNESS}" \
@@ -268,10 +270,10 @@ main() {
   [[ -s "${RECORD}" ]] || fail "fake harness did not record selected Copilot topology"
   [[ -s "${SOL_RECORD}" ]] || fail "fake Sol effort harness did not record its bridge topology"
   jq -e '
-    .lightweight == "gpt-5.4-mini"
-    and .classifier == "gpt-4.1"
-    and .primary == "gemini-3.1-pro-preview"
-    and .secondary == "claude-sonnet-4.6"
+    .lightweight == "gpt-5-mini"
+    and .classifier == "gpt-5-mini"
+    and .primary == "gpt-5-mini"
+    and .secondary == "claude-opus-4.7"
   ' "${RECORD}" >/dev/null || fail "wrapper selected unexpected Copilot models"
 
   local base port child_pid
@@ -305,11 +307,31 @@ PY
   grep -Fq 'Copilot-backed semantic policy-routing and Sol low/max effort smokes passed.' "${STDERR_FILE}" || \
     fail "wrapper did not emit success marker"
 
+  log "Rejecting an unapproved expensive secondary before inference"
+  local denied_rc=0
+  env -u LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL \
+    COPILOT_GITHUB_TOKEN="${TOKEN}" PROXY_BIN=/usr/bin/true \
+    LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN="${BRIDGE_BIN}" \
+    LIVE_POLICY_ROUTING_HARNESS="${HARNESS}" \
+    LIVE_POLICY_ROUTING_SOL_EFFORT_HARNESS="${SOL_HARNESS}" \
+    LIVE_POLICY_ROUTING_SMOKE_DIR="${TMP_ROOT}/unapproved-secondary" \
+    LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=1 \
+    FAKE_BRIDGE_CHILD_PID_FILE="${CHILD_PID_FILE}" \
+    FAKE_HARNESS_RECORD="${TMP_ROOT}/unapproved-harness.json" \
+    FAKE_SOL_HARNESS_RECORD="${TMP_ROOT}/unapproved-sol.json" \
+    "${WRAPPER}" >"${TMP_ROOT}/unapproved.stdout" 2>"${TMP_ROOT}/unapproved.stderr" || denied_rc=$?
+  [[ "${denied_rc}" -eq 1 ]] || fail "unapproved secondary exit=${denied_rc}, want 1"
+  grep -Fq 'no approved powerful-secondary model' "${TMP_ROOT}/unapproved.stderr" || \
+    fail "wrapper did not explain the missing approved secondary"
+  [[ ! -e "${TMP_ROOT}/unapproved-harness.json" && ! -e "${TMP_ROOT}/unapproved-sol.json" ]] || \
+    fail "an inference harness ran after model approval failed"
+
   log "Running deterministic Copilot quota-unavailable classification"
   local quota_rc=0 quota_port
   set +e
   env \
     COPILOT_GITHUB_TOKEN="${TOKEN}" \
+    LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL=claude-opus-4.7 \
     PROXY_BIN=/usr/bin/true \
     LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN="${BRIDGE_BIN}" \
     LIVE_POLICY_ROUTING_HARNESS="${HARNESS}" \
