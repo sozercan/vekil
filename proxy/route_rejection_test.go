@@ -21,6 +21,10 @@ func TestExplicitRouteHTTPRejectionWithProgressNeverReplays(t *testing.T) {
 		`{"error":{"code":"rate_limit_exceeded"},"choices":[{"message":{"tool_calls":[{"id":"call_1"}]}}]}`,
 		`{"error":{"code":"rate_limit_exceeded"},"response":{"usage":{"input_tokens":1}}}`,
 		`{"error":{"code":"rate_limit_exceeded","usage":{"input_tokens":1}}}`,
+		`{"error":{"code":"rate_limit_exceeded","details":{"usage":{"input_tokens":1}}}}`,
+		`{"error":{"code":"rate_limit_exceeded","details":[{"usage":{"input_tokens":1}}]}}`,
+		`{"error":{"code":"rate_limit_exceeded","innererror":{"details":[{"output":[{"type":"message"}]}]}}}`,
+		`{"error":{"code":"rate_limit_exceeded"},"details":[[{"usage":0}]]}`,
 		`{"error":{"code":"rate_limit_exceeded"},"usage":{"input_tokens":1},"usage":null}`,
 		`{"error":{"code":"rate_limit_exceeded"},"usage":{"input_tokens":"unknown"}}`,
 		`{"error":{"code":"rate_limit_exceeded"},"usage":{"input_tokens":1e-400}}`,
@@ -65,13 +69,16 @@ func TestExplicitRouteHTTPRejectionWithProgressNeverReplays(t *testing.T) {
 	}
 }
 
-func TestExplicitRouteStreamDuplicateKeysNeverReplay(t *testing.T) {
+func TestExplicitRouteStreamAmbiguousRejectionNeverReplays(t *testing.T) {
 	for _, event := range []string{
 		`{"type":"response.failed","response":{"usage":{"input_tokens":5}},"response":{"usage":{"input_tokens":0},"error":{"code":"rate_limit_exceeded"}}}`,
 		`{"type":"response.failed","response":{"usage":{"input_tokens":5},"usage":{"input_tokens":0},"error":{"code":"rate_limit_exceeded"}}}`,
 		`{"type":"response.failed","response":{"usage":{"input_tokens":5,"input_tokens":0},"error":{"code":"rate_limit_exceeded"}}}`,
 		`{"type":"response.failed","response":{"output":[{"type":"message"}],"output":[],"error":{"code":"rate_limit_exceeded"}}}`,
 		`{"type":"response.created","response":{"usage":{"input_tokens":5},"usage":{"input_tokens":0}}}` + "\n\ndata: " + `{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}`,
+		`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","details":[{"usage":{"input_tokens":1}}]}}}`,
+		`{"type":"error","error":{"code":"rate_limit_exceeded","details":{"usage":{"input_tokens":1}}}}`,
+		`{"type":"response.failed","response":{"usage":{"input_tokens_details":{"cached_tokens":1}},"error":{"code":"rate_limit_exceeded"}}}`,
 	} {
 		for _, pinned := range []bool{false, true} {
 			t.Run(event+map[bool]string{false: "/failover", true: "/pinned"}[pinned], func(t *testing.T) {
@@ -112,7 +119,7 @@ func TestExplicitRouteAzureJSONRateLimitAliases(t *testing.T) {
 			h, route := explicitRouteTestHandler(t, &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 				if req.URL.Hostname() == "primary.example" {
 					primaryCalls.Add(1)
-					return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}}, `{"status":"failed","output":[],"usage":{"input_tokens":0},"error":{"code":"`+code+`"}}`), nil
+					return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"application/json"}, "Retry-After": {"60"}}, `{"status":"failed","output":[],"usage":{"input_tokens":0},"error":{"code":"`+code+`","details":[{"usage":{"input_tokens":0},"headers":{"Retry-After":["60"]}}]}}`), nil
 				}
 				secondaryCalls.Add(1)
 				return routeExecutorTestResponse(req, 200, nil, `{"id":"resp_done","status":"completed","output":[]}`), nil
@@ -374,5 +381,45 @@ func TestExplicitRouteAzureJSONCooldownIsObservedOnce(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestRouteAttemptAzureObserverWithoutStatsRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		stream     bool
+	}{
+		{name: "bodyless"},
+		{name: "JSON", body: `{"status":"completed","output":[],"usage":{"input_tokens":1}}`},
+		{name: "terminal SSE", stream: true, body: azureRetryCompletedSSE},
+		{name: "failed SSE", stream: true, body: "data: " + `{"type":"response.failed","response":{"usage":{"input_tokens":1},"error":{"code":"rate_limit_exceeded"}}}` + "\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &ProxyHandler{stats: newStatsCollector()}
+			t.Cleanup(h.BeginShutdown)
+			req := azureTrafficTestRequest(t, h, suppressRouteAttemptStats(t.Context()), "primary", "https://primary.example", "deployment")
+			resp := &http.Response{StatusCode: 200, Request: req, Header: http.Header{"Retry-After": {"60"}}}
+			if tc.body != "" {
+				resp.Body = io.NopCloser(strings.NewReader(tc.body))
+			}
+			resp = observeRouteAttemptResponse(resp, nil, nil, routeAttemptTrace{StatusCode: 200, Decision: routeRetryAccepted}, nil, providerEndpointResponses, tc.stream)
+			if resp.Body != nil {
+				if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+					t.Fatal(err)
+				}
+				_ = resp.Body.Close()
+			}
+			if got := len(h.stats.snapshot().RecentAttempts); got != 0 {
+				t.Fatalf("recorded %d attempts with no stats record", got)
+			}
+			if tc.name == "failed SSE" {
+				permit, blocked, err := h.acquireAzureRouteInference(req, true)
+				defer permit.release()
+				if err != nil || blocked == nil {
+					t.Fatalf("throttle observation was lost without a record: response=%v err=%v", blocked, err)
+				}
+				_ = blocked.Body.Close()
+			}
+		})
 	}
 }

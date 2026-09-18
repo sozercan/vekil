@@ -35,53 +35,82 @@ func routeResponseBodyAllowsReplay(body []byte) bool {
 	if !json.Valid(body) || rejectDuplicateJSONMappingKeys(body) != nil {
 		return false
 	}
-	var envelope map[string]json.RawMessage
-	if json.Unmarshal(body, &envelope) != nil || envelope == nil {
+	var envelope map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if decoder.Decode(&envelope) != nil || envelope == nil {
 		return false
 	}
-	for name, raw := range envelope {
-		switch strings.ToLower(name) {
-		case "usage":
-			var usage map[string]any
-			decoder := json.NewDecoder(bytes.NewReader(raw))
-			decoder.UseNumber()
-			if decoder.Decode(&usage) != nil || !routeRejectionUsageIsZero(usage) {
+	return routeRejectionValueAllowsReplay(envelope)
+}
+
+// Error details and provider-specific wrappers can nest execution evidence in
+// objects or arrays. Decode once, then inspect every reserved progress key.
+func routeRejectionValueAllowsReplay(value any) bool {
+	switch value := value.(type) {
+	case []any:
+		for _, child := range value {
+			if !routeRejectionValueAllowsReplay(child) {
 				return false
 			}
-		case "output", "choices", "tool_calls":
-			if responsesOutputHasProgress(raw) {
-				return false
-			}
-		case "content":
-			if !bytes.Equal(bytes.TrimSpace(raw), []byte(`""`)) && responsesOutputHasProgress(raw) {
-				return false
-			}
-		case "function_call", "item", "delta":
-			if !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-				return false
-			}
-		case "status":
-			var status string
-			if json.Unmarshal(raw, &status) != nil {
-				return false
-			}
-			switch strings.ToLower(strings.TrimSpace(status)) {
-			case "", "failed", "error":
+		}
+	case map[string]any:
+		for name, child := range value {
+			switch strings.ToLower(name) {
+			case "usage":
+				if _, ok := child.(map[string]any); child != nil && !ok {
+					return false
+				}
+				if !routeRejectionUsageIsZero(child) {
+					return false
+				}
+			case "output", "choices", "tool_calls":
+				if !routeRejectionOutputIsEmpty(child) {
+					return false
+				}
+			case "content":
+				if text, ok := child.(string); !ok || text != "" {
+					if !routeRejectionOutputIsEmpty(child) {
+						return false
+					}
+				}
+			case "function_call", "item", "delta":
+				if child != nil {
+					return false
+				}
+			case "status":
+				status, ok := child.(string)
+				if child != nil && !ok {
+					return false
+				}
+				switch strings.ToLower(strings.TrimSpace(status)) {
+				case "", "failed", "error":
+				default:
+					return false
+				}
+			case "response":
+				if _, ok := child.(map[string]any); child != nil && !ok {
+					return false
+				}
+				if !routeRejectionValueAllowsReplay(child) {
+					return false
+				}
 			default:
-				return false
-			}
-		case "response":
-			if !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) && !routeResponseBodyAllowsReplay(raw) {
-				return false
-			}
-		case "error":
-			// Some compatible endpoints attach usage to the error itself.
-			if bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) && !routeResponseBodyAllowsReplay(raw) {
-				return false
+				if !routeRejectionValueAllowsReplay(child) {
+					return false
+				}
 			}
 		}
 	}
 	return true
+}
+
+func routeRejectionOutputIsEmpty(value any) bool {
+	if value == nil {
+		return true
+	}
+	items, ok := value.([]any)
+	return ok && len(items) == 0
 }
 
 func routeRejectionUsageIsZero(value any) bool {

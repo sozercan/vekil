@@ -1372,7 +1372,7 @@ func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Heade
 		classified := classifyResponsesPeekMessage(msg, headers)
 		unsafeBeforeMessage := parser.sawUnsafeProgress
 		if classified.failure != nil && !unsafeBeforeMessage && !classified.eventOutputProgress && !classified.eventUsageProgress {
-			classified.precommitReplaySafe = true
+			classified.precommitReplaySafe = routeResponseBodyAllowsReplay([]byte(msg.data))
 		}
 		if classified.eventOutputProgress || classified.eventUsageProgress {
 			// Output and usage on any parsed event, including a nominal preamble,
