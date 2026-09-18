@@ -18,6 +18,9 @@ const (
 	maxAzureTrafficWaiters      = 64
 	maxAzureTrafficWaitingBytes = 64 << 20
 	maxAzureTrafficWait         = 5 * time.Minute
+	// Keep one deployment from consuming all shared recovery capacity.
+	maxAzureDeploymentWaiters      = 16
+	maxAzureDeploymentWaitingBytes = 16 << 20
 )
 
 type azureDeploymentKey [sha256.Size]byte
@@ -26,10 +29,11 @@ type azureDeploymentKey [sha256.Size]byte
 type azureTrafficWaiter struct{ _ byte }
 
 type azureCooldown struct {
-	until   time.Time
-	changed chan struct{}
-	probe   bool
-	queue   []*azureTrafficWaiter
+	until        time.Time
+	changed      chan struct{}
+	probe        bool
+	queue        []*azureTrafficWaiter
+	waitingBytes int64
 }
 
 func (e *azureCooldown) notify() {
@@ -84,10 +88,29 @@ func azureRouteTrafficFromRequest(req *http.Request) azureRouteTraffic {
 }
 
 func (a azureRouteTraffic) observe(status int, headers http.Header) bool {
-	if a.controller == nil || status != http.StatusTooManyRequests {
+	if a.controller == nil {
+		return false
+	}
+	exhausted := false
+	reset := ""
+	for _, dimension := range []string{"tokens", "requests"} {
+		if _, empty := responsesQuotaRemaining(headers, dimension); !empty {
+			continue
+		}
+		exhausted = true
+		if value, valid := responsesQuotaResetRetryAfter(headers, dimension); valid && (reset == "" || positiveDecimalGreater(value, reset)) {
+			reset = value
+		}
+	}
+	if status != http.StatusTooManyRequests && !(status >= 200 && status < 300 && exhausted) {
 		return false
 	}
 	retryAfter, _ := selectResponsesRetryAfter(headers)
+	if retryAfter == "" {
+		// Retain resets for Azure balances of -1 too. The shared parser
+		// reserves that value for other providers' unlimited-quota sentinel.
+		retryAfter = reset
+	}
 	delay, valid := parseRetryAfter(retryAfter)
 	if !valid {
 		return false
@@ -205,6 +228,7 @@ func (h *ProxyHandler) acquireAzureRouteInference(req *http.Request, canSwitch b
 				queued.queue = append(queued.queue[:i], queued.queue[i+1:]...)
 				c.waiters--
 				c.waitingBytes -= weight
+				queued.waitingBytes -= weight
 				queued.notify()
 				break
 			}
@@ -234,6 +258,7 @@ func (h *ProxyHandler) acquireAzureRouteInference(req *http.Request, canSwitch b
 				entry.queue = entry.queue[1:]
 				c.waiters--
 				c.waitingBytes -= weight
+				entry.waitingBytes -= weight
 				waiter = nil
 			}
 			entry.probe = true
@@ -241,7 +266,8 @@ func (h *ProxyHandler) acquireAzureRouteInference(req *http.Request, canSwitch b
 			return &azureTrafficPermit{controller: c, key: metadata.key, entry: entry}, nil, nil
 		}
 		if waiter == nil {
-			if c.waiters >= maxAzureTrafficWaiters || weight > maxAzureTrafficWaitingBytes-c.waitingBytes {
+			if len(entry.queue) >= maxAzureDeploymentWaiters || weight > maxAzureDeploymentWaitingBytes-entry.waitingBytes ||
+				c.waiters >= maxAzureTrafficWaiters || weight > maxAzureTrafficWaitingBytes-c.waitingBytes {
 				c.mu.Unlock()
 				return nil, nil, &providerRequestError{statusCode: http.StatusServiceUnavailable, code: "rate_limit_queue_full", err: fmt.Errorf("Azure rate-limit recovery queue is full")}
 			}
@@ -250,6 +276,7 @@ func (h *ProxyHandler) acquireAzureRouteInference(req *http.Request, canSwitch b
 			entry.queue = append(entry.queue, waiter)
 			c.waiters++
 			c.waitingBytes += weight
+			entry.waitingBytes += weight
 		}
 		changed := entry.changed
 		c.mu.Unlock()

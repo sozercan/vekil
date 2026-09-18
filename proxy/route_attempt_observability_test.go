@@ -90,7 +90,7 @@ func TestPhysicalAttemptLedgerPrimaryFailureSecondarySuccess(t *testing.T) {
 		w.Header().Set("Retry-After", "999999999999")
 		w.Header().Set("X-Request-Id", "req-primary")
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"quota"},"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}`)
+		_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"quota"}}`)
 	}))
 	defer primary.Close()
 	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -129,8 +129,8 @@ func TestPhysicalAttemptLedgerPrimaryFailureSecondarySuccess(t *testing.T) {
 	if snap.Totals.Requests != 1 || snap.Totals.TotalTokens != 15 {
 		t.Fatalf("client ledger = requests:%d tokens:%d, want 1/15", snap.Totals.Requests, snap.Totals.TotalTokens)
 	}
-	if snap.PhysicalUsage.TotalTokens != 20 || snap.WastedUsage.TotalTokens != 5 {
-		t.Fatalf("physical/wasted usage = %+v / %+v, want 20 / 5", snap.PhysicalUsage, snap.WastedUsage)
+	if snap.PhysicalUsage.TotalTokens != 15 || snap.WastedUsage.TotalTokens != 0 {
+		t.Fatalf("physical/wasted usage = %+v / %+v, want 15 / 0", snap.PhysicalUsage, snap.WastedUsage)
 	}
 	if len(snap.RecentAttempts) != 2 {
 		t.Fatalf("recent attempts len = %d, want 2: %+v", len(snap.RecentAttempts), snap.RecentAttempts)
@@ -150,8 +150,8 @@ func TestPhysicalAttemptLedgerPrimaryFailureSecondarySuccess(t *testing.T) {
 	if *first.RetryAfterSeconds != 9223372037 {
 		t.Fatalf("primary retry-after = %d, want 9223372037", *first.RetryAfterSeconds)
 	}
-	if first.ReportedUsage == nil || first.ReportedUsage.TotalTokens != 5 {
-		t.Fatalf("primary reported usage = %+v, want 5", first.ReportedUsage)
+	if first.ReportedUsage != nil {
+		t.Fatalf("pre-execution rejection reported usage = %+v", first.ReportedUsage)
 	}
 	if first.UpstreamRequestID != "req-primary" || !first.CleanupComplete {
 		t.Fatalf("primary diagnostics = %+v", first)
@@ -175,11 +175,11 @@ func TestPhysicalAttemptLedgerPrimaryFailureSecondarySuccess(t *testing.T) {
 	for _, row := range snap.ByTarget {
 		byTarget[row.Target] = row
 	}
-	if got := byTarget["target-primary"].PhysicalUsage.TotalTokens; got != 5 {
-		t.Fatalf("primary physical tokens = %d, want 5", got)
+	if got := byTarget["target-primary"].PhysicalUsage.TotalTokens; got != 0 {
+		t.Fatalf("primary physical tokens = %d, want 0", got)
 	}
-	if got := byTarget["target-primary"].WastedUsage.TotalTokens; got != 5 {
-		t.Fatalf("primary wasted tokens = %d, want 5", got)
+	if got := byTarget["target-primary"].WastedUsage.TotalTokens; got != 0 {
+		t.Fatalf("primary wasted tokens = %d, want 0", got)
 	}
 	if got := byTarget["target-secondary"].PhysicalUsage.TotalTokens; got != 15 {
 		t.Fatalf("secondary physical tokens = %d, want 15", got)

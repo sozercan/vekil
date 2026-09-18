@@ -173,11 +173,11 @@ func TestAzureTrafficWaitCancellationAndBounds(t *testing.T) {
 			defer cancel()
 			req := azureTrafficTestRequest(t, h, ctx, "east", "https://east.example", "deployment")
 			azureRouteTrafficFromRequest(req).observe(429, http.Header{"Retry-After": {"60"}})
-			results := make([]<-chan azureTrafficTestResult, maxAzureTrafficWaiters)
+			results := make([]<-chan azureTrafficTestResult, maxAzureDeploymentWaiters)
 			for i := range results {
 				results[i] = acquireAzureTrafficAsync(h, req)
 			}
-			waitForAzureTrafficWaiters(t, h, maxAzureTrafficWaiters)
+			waitForAzureTrafficWaiters(t, h, maxAzureDeploymentWaiters)
 			_, blocked, err := h.acquireAzureRouteInference(req, false)
 			var queueErr *providerRequestError
 			if blocked != nil || !errors.As(err, &queueErr) || queueErr.statusCode != 503 || queueErr.code != "rate_limit_queue_full" {
@@ -242,20 +242,26 @@ func TestAzureTrafficBoundsAcrossDeployments(t *testing.T) {
 			t.Fatalf("cooldown capacity: entry=%d tracked=%v", i, tracked)
 		}
 	}
-	first := azureTrafficTestRequest(t, h, ctx, "east", "https://east.example", "deployment-0")
-	first.ContentLength = maxAzureTrafficWaitingBytes / 2
-	second := azureTrafficTestRequest(t, h, ctx, "east", "https://east.example", "deployment-1")
-	second.ContentLength = maxAzureTrafficWaitingBytes/2 + 1
-	waiting := acquireAzureTrafficAsync(h, first)
-	waitForAzureTrafficWaiters(t, h, 1)
-	_, _, err := h.acquireAzureRouteInference(second, false)
+	var waiting []<-chan azureTrafficTestResult
+	for i := range maxAzureTrafficWaitingBytes / maxAzureDeploymentWaitingBytes {
+		req := azureTrafficTestRequest(t, h, ctx, "east", "https://east.example", fmt.Sprintf("deployment-%d", i))
+		req.ContentLength = maxAzureDeploymentWaitingBytes
+		waiting = append(waiting, acquireAzureTrafficAsync(h, req))
+	}
+	waitForAzureTrafficWaiters(t, h, len(waiting))
+	// Reuse an existing tracked deployment because the entry table is full.
+	overflow := azureTrafficTestRequest(t, h, ctx, "east", "https://east.example", "deployment-10")
+	overflow.ContentLength = 1
+	_, _, err := h.acquireAzureRouteInference(overflow, false)
 	var queueErr *providerRequestError
 	if !errors.As(err, &queueErr) || queueErr.code != "rate_limit_queue_full" {
 		t.Fatalf("aggregate waiting byte bound was not enforced: %v", err)
 	}
 	cancel()
-	if result := receiveAzureTrafficResult(t, waiting); !errors.Is(result.err, context.Canceled) {
-		t.Fatalf("canceled admission = %+v", result)
+	for _, result := range waiting {
+		if result := receiveAzureTrafficResult(t, result); !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("canceled admission = %+v", result)
+		}
 	}
 	advance(time.Minute)
 	next := azureTrafficTestRequest(t, h, t.Context(), "east", "https://east.example", "new-deployment")
@@ -266,5 +272,93 @@ func TestAzureTrafficBoundsAcrossDeployments(t *testing.T) {
 	defer h.azureTraffic.mu.Unlock()
 	if len(h.azureTraffic.cooldowns) != 1 || h.azureTraffic.waitingBytes != 0 || h.azureTraffic.waiters != 0 {
 		t.Fatal("expired records or canceled waiters were retained")
+	}
+}
+
+func TestAzureTrafficSuccessfulExhaustionStartsCooldown(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		headers   http.Header
+		wantReset string
+	}{
+		{"negative tokens", 200, http.Header{"X-Ratelimit-Remaining-Tokens": {"-65538"}, "X-Ratelimit-Reset-Tokens": {"71"}}, "71"},
+		{"minus one tokens with reset", 200, http.Header{"X-Ratelimit-Remaining-Tokens": {"-1"}, "X-Ratelimit-Reset-Tokens": {"2"}}, "2"},
+		{"zero requests", 200, http.Header{"X-Ratelimit-Remaining-Requests": {"0"}, "X-Ratelimit-Reset-Requests": {"4s"}}, "4"},
+		{"both dimensions", 200, http.Header{"X-Ratelimit-Remaining-Tokens": {"0"}, "X-Ratelimit-Reset-Tokens": {"4s"}, "X-Ratelimit-Remaining-Requests": {"0"}, "X-Ratelimit-Reset-Requests": {"10s"}}, "10"},
+		{"capacity remains", 200, http.Header{"X-Ratelimit-Remaining-Tokens": {"100"}, "X-Ratelimit-Reset-Tokens": {"60"}, "Retry-After": {"30"}}, ""},
+		{"missing reset", 200, http.Header{"X-Ratelimit-Remaining-Tokens": {"0"}}, ""},
+		{"invalid remaining", 200, http.Header{"X-Ratelimit-Remaining-Tokens": {"unknown"}, "X-Ratelimit-Reset-Tokens": {"60"}}, ""},
+		{"unrelated error", 400, http.Header{"X-Ratelimit-Remaining-Tokens": {"0"}, "X-Ratelimit-Reset-Tokens": {"60"}}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &ProxyHandler{}
+			t.Cleanup(h.BeginShutdown)
+			azureTrafficTestClock(h)
+			req := azureTrafficTestRequest(t, h, t.Context(), "east", "https://east.example", "deployment")
+			azureRouteTrafficFromRequest(req).observe(tc.status, tc.headers)
+			permit, blocked, err := h.acquireAzureRouteInference(req, true)
+			defer permit.release()
+			if err != nil || (blocked != nil) != (tc.wantReset != "") {
+				t.Fatalf("admission: blocked=%v err=%v", blocked != nil, err)
+			}
+			if blocked != nil {
+				defer blocked.Body.Close()
+				if blocked.Header.Get("Retry-After") != tc.wantReset {
+					t.Fatalf("reset=%s want=%s", blocked.Header.Get("Retry-After"), tc.wantReset)
+				}
+			}
+		})
+	}
+}
+
+func TestAzureTrafficQueueCapacityIsReservedAcrossDeployments(t *testing.T) {
+	for _, byteBound := range []bool{false, true} {
+		t.Run(map[bool]string{false: "waiters", true: "bytes"}[byteBound], func(t *testing.T) {
+			h := &ProxyHandler{}
+			t.Cleanup(h.BeginShutdown)
+			azureTrafficTestClock(h)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			east := azureTrafficTestRequest(t, h, ctx, "east", "https://east.example", "deployment")
+			west := azureTrafficTestRequest(t, h, ctx, "west", "https://west.example", "deployment")
+			azureRouteTrafficFromRequest(east).observe(429, http.Header{"Retry-After": {"30"}})
+			azureRouteTrafficFromRequest(west).observe(429, http.Header{"Retry-After": {"30"}})
+			count := maxAzureDeploymentWaiters
+			if byteBound {
+				count = 1
+				east.ContentLength = maxAzureDeploymentWaitingBytes
+				west.ContentLength = maxAzureDeploymentWaitingBytes
+			}
+			var results []<-chan azureTrafficTestResult
+			for range count {
+				results = append(results, acquireAzureTrafficAsync(h, east))
+			}
+			waitForAzureTrafficWaiters(t, h, count)
+			_, _, err := h.acquireAzureRouteInference(east, false)
+			var full *providerRequestError
+			if !errors.As(err, &full) || full.code != "rate_limit_queue_full" {
+				t.Fatalf("hot deployment exceeded its queue share: %v", err)
+			}
+			results = append(results, acquireAzureTrafficAsync(h, west))
+			waitForAzureTrafficWaiters(t, h, count+1)
+			cancel()
+			for _, result := range results {
+				if result := receiveAzureTrafficResult(t, result); !errors.Is(result.err, context.Canceled) {
+					t.Fatalf("queued result=%+v", result)
+				}
+			}
+			waitForAzureTrafficWaiters(t, h, 0)
+			h.azureTraffic.mu.Lock()
+			defer h.azureTraffic.mu.Unlock()
+			if h.azureTraffic.waitingBytes != 0 {
+				t.Fatal("global queued bytes leaked")
+			}
+			for _, entry := range h.azureTraffic.cooldowns {
+				if entry.waitingBytes != 0 {
+					t.Fatal("deployment queued bytes leaked")
+				}
+			}
+		})
 	}
 }

@@ -44,20 +44,40 @@ provider-bound continuations keep their owner and wait before retrying the same
 request. Each retry consumes `max_upstream_sends`, so allow more than one send to
 enable this recovery. Azure TPM remains unchanged.
 
-Recovery also handles certified pre-output Responses stream rejections after
-HTTP `200`, including reset headers embedded in the error event. It never replays
-a request after text/tool progress, reported usage, or ambiguous delivery. A late
-streamed throttle updates the cooldown for other requests while preserving the
-current stream's failure.
+Recovery also handles certified pre-output Responses stream rejections and
+complete non-streaming `status: "failed"` JSON envelopes up to 4 KiB after
+HTTP `200`, including reset headers embedded in the error. Rejection bodies
+with output, nonzero or malformed usage, duplicate keys, truncation, or read
+errors cannot authorize replay. Plain-text HTTP `429` admission errors remain
+retryable. Larger JSON failures retain their original
+response and can update the cooldown when consumed. A late streamed throttle
+updates the cooldown for other requests while preserving the current stream's
+failure.
 
-Azure recovery admits one request at a time until the waiting queue drains.
-Each permit lasts through response completion or close. The process keeps at most
+A successful response with zero or negative remaining tokens or requests and a
+valid reset starts the same cooldown. Vekil preserves the successful response and
+applies the delay to subsequent requests without waiting for another `429`.
+See [Azure's rate-limit guidance](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/how-to/quota)
+for the remaining-capacity and reset headers.
+
+Azure recovery admits one request at a time per deployment until its waiting
+queue drains. Each permit lasts through response completion or close, so a long
+generation can delay other requests to that deployment. Each deployment may
+queue at most 16 requests and 16 MiB of request bodies. The process keeps at most
 256 deployment cooldowns, 64 waiting requests, and 64 MiB of queued request bodies.
+Requests larger than 16 MiB can run immediately but cannot enter a recovery queue.
 Each wait is capped at five minutes and by the request deadline; disconnects and
 shutdown cancel it. Queue overflow returns `503 rate_limit_queue_full` for a new
 admission. A retry that cannot wait returns its last upstream rejection, retaining
 the reset and request correlation. These limits apply to explicit Azure inference
 routes; classifier admission and version-1 retries retain their existing behavior.
+
+Client retries start new operation send budgets, but share these deployment
+cooldowns within the process. Vekil does not deduplicate identical requests,
+because they may be intentional independent calls. Bound client retry time as
+well as proxy send counts. Cooldowns do not reserve Azure capacity or coordinate
+other Vekil processes and external clients; already-dispatched requests can still
+consume quota after a failover target is selected.
 
 In attempt diagnostics, `retry_same_target` records the recovery decision and
 `rate_limit_retry` identifies the subsequent physical send. A wait canceled before

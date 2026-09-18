@@ -49,7 +49,7 @@ func azureRetryTestHandler(t *testing.T, primaryURL, secondaryURL string, sends 
 const azureRetryCompletedSSE = "data: " + `{"type":"response.completed","response":{"id":"resp_done","model":"physical-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}` + "\n\n"
 
 func TestExplicitRouteAzurePinnedResponsesRetryPreservesState(t *testing.T) {
-	for _, failure := range []string{"HTTP", "preamble failure", "embedded reset"} {
+	for _, failure := range []string{"HTTP", "preamble failure", "embedded reset", "JSON failure", "JSON embedded reset"} {
 		t.Run(failure, func(t *testing.T) {
 			var primaryCalls, secondaryCalls atomic.Int32
 			var mu sync.Mutex
@@ -75,10 +75,17 @@ func TestExplicitRouteAzurePinnedResponsesRetryPreservesState(t *testing.T) {
 					t.Error("retry changed provider credentials or turn state")
 				}
 				if call == 2 {
-					if failure != "embedded reset" {
+					if failure != "embedded reset" && failure != "JSON embedded reset" {
 						w.Header().Set("Retry-After", "1")
 					}
-					if failure == "HTTP" {
+					if strings.HasPrefix(failure, "JSON") {
+						w.Header().Set("Content-Type", "application/json")
+						if failure == "JSON embedded reset" {
+							_, _ = io.WriteString(w, `{"id":"resp_rejected","status":"failed","output":[],"error":{"code":"rate_limit_exceeded","headers":{"retry-after-ms":1}}}`)
+						} else {
+							_, _ = io.WriteString(w, `{"id":"resp_rejected","status":"failed","output":[],"error":{"code":"rate_limit_exceeded"}}`)
+						}
+					} else if failure == "HTTP" {
 						w.WriteHeader(429)
 						_, _ = io.WriteString(w, `{"error":{"code":"rate_limit_exceeded","message":"wait"}}`)
 					} else {
@@ -92,8 +99,13 @@ func TestExplicitRouteAzurePinnedResponsesRetryPreservesState(t *testing.T) {
 					}
 					return
 				}
-				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = io.WriteString(w, azureRetryCompletedSSE)
+				if strings.HasPrefix(failure, "JSON") {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"resp_done","model":"physical-model","status":"completed","output":[]}`)
+				} else {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, azureRetryCompletedSSE)
+				}
 			}))
 			defer primary.Close()
 			secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -109,7 +121,7 @@ func TestExplicitRouteAzurePinnedResponsesRetryPreservesState(t *testing.T) {
 			if first.Code != 200 {
 				t.Fatalf("bootstrap: %d %s", first.Code, first.Body.String())
 			}
-			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"public-model","stream":true,"previous_response_id":"resp_seed","input":[{"type":"reasoning","encrypted_content":"opaque_seed"},{"role":"user","content":"next"}]}`))
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(fmt.Sprintf(`{"model":"public-model","stream":%t,"previous_response_id":"resp_seed","input":[{"type":"reasoning","encrypted_content":"opaque_seed"},{"role":"user","content":"next"}]}`, !strings.HasPrefix(failure, "JSON"))))
 			request.Header.Set("X-Codex-Turn-State", "turn_seed")
 			response := httptest.NewRecorder()
 			done := make(chan struct{})
@@ -511,5 +523,116 @@ func TestExplicitRouteAzureRenewedResetPreservesUpstreamRejection(t *testing.T) 
 				t.Fatalf("renewed cooldown retry: calls=%d sends=%d trace=%+v", calls.Load(), sends, trace)
 			}
 		})
+	}
+}
+
+func TestExplicitRouteAzureConcurrentFailoverExhaustionAndClientRetries(t *testing.T) {
+	// A has already reached West when B consumes its remaining capacity.
+	// East and the final fallback are unavailable throughout the scenario.
+	var eastCalls, westCalls, fallbackCalls atomic.Int32
+	westSelected := make(chan struct{})
+	westConsumed := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseWest := func() { releaseOnce.Do(func() { close(westConsumed) }) }
+	t.Cleanup(releaseWest)
+	transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Hostname() {
+		case "east.example":
+			eastCalls.Add(1)
+			return routeExecutorTestResponse(req, 429, http.Header{"Retry-After": {"60"}, "X-Request-Id": {"east-rejection"}}, `{"error":{"code":"rate_limit_exceeded","message":"east quota"}}`), nil
+		case "west.example":
+			westCalls.Add(1)
+			body, _ := io.ReadAll(req.Body)
+			if strings.Contains(string(body), `"input":"A"`) {
+				close(westSelected)
+				select {
+				case <-westConsumed:
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
+				return routeExecutorTestResponse(req, 429, http.Header{"Retry-After": {"30"}}, `{"error":{"code":"rate_limit_exceeded","message":"west quota"}}`), nil
+			}
+			return routeExecutorTestResponse(req, 200, http.Header{
+				"X-Ratelimit-Remaining-Tokens": {"-100"}, "X-Ratelimit-Reset-Tokens": {"30"},
+			}, `{"id":"resp_b","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":1}}`), nil
+		case "fallback.example":
+			fallbackCalls.Add(1)
+			return routeExecutorTestResponse(req, 503, nil, `{"error":{"code":"model_overloaded","message":"fallback unavailable"}}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected upstream %s", req.URL.Hostname())
+		}
+	})
+	fallback := explicitRouteTestProvider("fallback", "http://fallback.example", "key")
+	fallback.kind = providerTypeOpenAICompatible
+	h, route := explicitRouteTestHandler(t, &http.Client{Transport: transport}, routeModePriorityFailover, 3, 3,
+		explicitRouteTestProvider("east", "http://east.example", "key"),
+		explicitRouteTestProvider("west", "http://west.example", "key"),
+		fallback)
+	t.Cleanup(h.BeginShutdown)
+	azureTrafficTestClock(h)
+	type result struct {
+		response  *http.Response
+		operation *routeOperation
+		err       error
+	}
+	execute := func(ctx context.Context, input string, pinned bool) result {
+		op := newRouteOperation(route, ctx)
+		if pinned {
+			if err := op.forcePinnedTarget("target-west"); err != nil {
+				return result{operation: op, err: err}
+			}
+		}
+		response, err := h.executeExplicitRouteRequest(withRouteOperation(ctx, op), route, providerEndpointResponses,
+			[]byte(fmt.Sprintf(`{"model":"public-model","input":%q}`, input)), nil, "public-model", false)
+		return result{response, op, err}
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	pending := make(chan result, 1)
+	go func() { pending <- execute(ctx, "A", false) }()
+	select {
+	case <-westSelected:
+	case <-ctx.Done():
+		t.Fatal("A did not reach West")
+	}
+	b := execute(ctx, "B", true)
+	if b.err != nil || b.response == nil || b.response.StatusCode != 200 {
+		t.Fatalf("B failed: %+v", b)
+	}
+	_, _ = io.Copy(io.Discard, b.response.Body)
+	_ = b.response.Body.Close()
+	if sends, switches, _ := b.operation.snapshot(); sends != 1 || switches != 0 {
+		t.Fatalf("B was replayed or migrated: sends=%d switches=%d", sends, switches)
+	}
+	releaseWest()
+	var a result
+	select {
+	case a = <-pending:
+	case <-ctx.Done():
+		t.Fatal("A did not finish after West rejected it")
+	}
+	if a.err != nil || a.response == nil || a.response.StatusCode != 429 {
+		t.Fatalf("A lost its upstream rejection: %+v", a)
+	}
+	_, _ = io.Copy(io.Discard, a.response.Body)
+	_ = a.response.Body.Close()
+	if sends, switches, trace := a.operation.snapshot(); sends != 3 || switches != 2 || len(trace) != 3 ||
+		trace[0].StatusCode != 429 || trace[1].StatusCode != 429 || trace[2].StatusCode != 503 {
+		t.Fatalf("unbounded or incorrect failover: sends=%d switches=%d trace=%+v", sends, switches, trace)
+	}
+	// Client retries are distinct operations. They still share deployment
+	// cooldowns, so fresh budgets cannot produce more Azure sends.
+	for range 8 {
+		retried := execute(ctx, "client retry", false)
+		if retried.err != nil || retried.response == nil || retried.response.StatusCode != 503 {
+			t.Fatalf("client retry lost the actual fallback failure: %+v", retried)
+		}
+		_ = retried.response.Body.Close()
+		if sends, _, _ := retried.operation.snapshot(); sends != 1 {
+			t.Fatalf("client retry sent to a cooled-down deployment: sends=%d", sends)
+		}
+	}
+	if eastCalls.Load() != 1 || westCalls.Load() != 2 || fallbackCalls.Load() != 9 {
+		t.Fatalf("unexpected sends: east=%d west=%d fallback=%d", eastCalls.Load(), westCalls.Load(), fallbackCalls.Load())
 	}
 }

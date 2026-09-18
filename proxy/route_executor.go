@@ -978,9 +978,13 @@ type capturedRouteResponse struct {
 	statusCode int
 	header     http.Header
 	body       []byte
-	request    *http.Request
-	upstreamID string
+	// An incomplete capture cannot establish that no work was performed.
+	bodyIncomplete bool
+	request        *http.Request
+	upstreamID     string
 }
+
+type incompleteRouteCaptureContextKey struct{}
 
 func captureRouteResponse(resp *http.Response) (*capturedRouteResponse, bool) {
 	if resp == nil {
@@ -1010,24 +1014,29 @@ func captureRouteResponse(resp *http.Response) (*capturedRouteResponse, bool) {
 		request:    resp.Request,
 		upstreamID: upstreamID,
 	}
+	if resp.Request != nil {
+		captured.bodyIncomplete, _ = resp.Request.Context().Value(incompleteRouteCaptureContextKey{}).(bool)
+	}
 	if resp.Body == nil {
 		return captured, true
 	}
 
 	type readResult struct {
 		body []byte
+		err  error
 	}
 	timer := time.NewTimer(upstreamErrorDetailDrainTimeout)
 	defer timer.Stop()
 	resultCh := make(chan readResult, 1)
 	go func() {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorDetailMaxBodyBytes+upstreamErrorDetailDrainBytes+1))
+		data, err := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorDetailMaxBodyBytes+upstreamErrorDetailDrainBytes+1))
 		_ = resp.Body.Close()
-		resultCh <- readResult{body: data}
+		resultCh <- readResult{body: data, err: err}
 	}()
 
 	select {
 	case result := <-resultCh:
+		captured.bodyIncomplete = captured.bodyIncomplete || result.err != nil || len(result.body) > upstreamErrorDetailMaxBodyBytes
 		if len(result.body) > upstreamErrorDetailMaxBodyBytes {
 			captured.body = append([]byte(nil), result.body[:upstreamErrorDetailMaxBodyBytes]...)
 		} else {
@@ -1035,6 +1044,7 @@ func captureRouteResponse(resp *http.Response) (*capturedRouteResponse, bool) {
 		}
 		return captured, true
 	case <-timer.C:
+		captured.bodyIncomplete = true
 		// The read goroutine remains the sole response-body owner. Canceling the
 		// dedicated request context unblocks a conforming net/http response body;
 		// that same owner then performs the only Close.
@@ -1049,12 +1059,18 @@ func (c *capturedRouteResponse) response() *http.Response {
 	}
 	header := c.header.Clone()
 	header.Del("Content-Length")
+	request := c.request
+	if c.bodyIncomplete && request != nil {
+		// Chat's outer adapter may capture this response again. Truncation or
+		// a failed read must not become a certified rejection on that pass.
+		request = request.WithContext(context.WithValue(request.Context(), incompleteRouteCaptureContextKey{}, true))
+	}
 	return &http.Response{
 		StatusCode: c.statusCode,
 		Status:     fmt.Sprintf("%d %s", c.statusCode, http.StatusText(c.statusCode)),
 		Header:     header,
 		Body:       io.NopCloser(bytes.NewReader(c.body)),
-		Request:    c.request,
+		Request:    request,
 	}
 }
 
@@ -1657,7 +1673,7 @@ func newRouteAttemptEnvelopeExtractor(endpoint string) *routeAttemptEnvelopeExtr
 	var names []string
 	switch endpoint {
 	case providerEndpointResponses:
-		names = []string{"status", "usage"}
+		names = []string{"status", "error", "usage"}
 	case providerEndpointMessages:
 		names = []string{"type", "error", "usage"}
 	case providerEndpointChatCompletions:
@@ -2638,6 +2654,18 @@ func (o *routeAttemptResponseObserver) inspectNonStreamingLocked() {
 					o.outcome = routeAttemptOutcomeFailed
 				}
 				o.terminal = true
+				if o.azureTraffic.controller != nil && strings.EqualFold(strings.TrimSpace(status), "failed") {
+					var event responsesWebSocketStreamEvent
+					event.Type = "response.failed"
+					if raw, ok := o.envelope.field("error"); ok && json.Unmarshal(raw, &event.Response.Error) == nil {
+						failureHeaders := responsesFailureHeaders(event, o.headers)
+						if status, _, ok := classifyResponsesFailure(event, failureHeaders); ok {
+							o.statusCode = status
+							o.retryAfter = sanitizedRouteAttemptRetryAfter(failureHeaders, "")
+							o.azureTraffic.observe(status, failureHeaders)
+						}
+					}
+				}
 			case "cancelled", "canceled":
 				o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressTerminalFailure)
 				o.outcome = routeAttemptOutcomeCanceled
@@ -3257,6 +3285,11 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			break
 		}
 
+		traffic.observe(resp.StatusCode, resp.Header)
+		if !stream && endpoint == providerEndpointResponses && target.provider.kind == providerTypeAzureOpenAI {
+			resp = prepareAzureRouteJSONRejection(resp, target, traffic)
+		}
+
 		if stream && resp.StatusCode == http.StatusOK {
 			accepted, streamFailure := h.prepareExplicitResponsesStream(ctx, operation, route, target, resp)
 			if streamFailure != nil {
@@ -3339,6 +3372,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 
 		responseUpstreamID := responsesUpstreamRequestID(resp.Header)
 		var capturedObservation *capturedRouteResponse
+		unsafeRejection := false
 		if routeAdapterMayExplicitlyReject(target, endpoint, resp.StatusCode) {
 			captured, cleanupDone := captureRouteResponse(resp)
 			traffic.observe(resp.StatusCode, captured.header)
@@ -3378,6 +3412,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			// pre-execution rejection. Return it as an ambiguous terminal response.
 			captured.recordFinalUpstreamID(operation.inbound)
 			capturedObservation = captured
+			unsafeRejection = captured.bodyIncomplete || !routeHTTPRejectionBodyAllowsReplay(captured)
 			resp = captured.response()
 		}
 
@@ -3413,6 +3448,10 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		}
 		operation.pinTarget(target.id)
 		trace := routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: resp.StatusCode, Delivery: requestDeliveredOrAmbiguous, Progress: upstreamProgressNone, Commitment: downstreamCommitmentNone, Decision: routeRetryAccepted, UpstreamID: responseUpstreamID, CleanupDone: capturedObservation != nil}
+		if unsafeRejection {
+			trace.Progress = upstreamProgressUnknown
+			trace.Decision = routeRetrySuppressedProgress
+		}
 		operation.appendTrace(trace)
 		if capturedObservation != nil {
 			outcome := routeAttemptOutcomeSucceeded
@@ -3553,7 +3592,7 @@ func routeAdapterMayExplicitlyReject(target targetBinding, endpoint string, stat
 }
 
 func routeAdapterCertifiesHTTPRejection(target targetBinding, endpoint string, response *capturedRouteResponse) bool {
-	if response == nil || target.provider == nil {
+	if response == nil || target.provider == nil || response.bodyIncomplete || !routeHTTPRejectionBodyAllowsReplay(response) {
 		return false
 	}
 	if response.statusCode == http.StatusTooManyRequests {
