@@ -195,11 +195,15 @@ vekil config validate --live --providers-config /path/to/providers.yaml
 - `priority_failover` considers unattempted targets in configuration order, but only while the replay-safety gate remains open. It does not balance healthy requests across targets.
 - Changing only `mode` does not increase the budgets: with omitted budget fields, `priority_failover` still has one target attempt and one send. Configure larger values explicitly to permit a secondary.
 - `max_target_attempts` defaults to `1` when omitted, includes the first target, and cannot exceed the configured target count. An explicitly configured `0` is invalid, and `primary_only` requires this value to remain `1`.
-- `max_upstream_sends` defaults to `1` when omitted, must be at least `max_target_attempts`, and caps physical inference POSTs for one logical operation. An explicitly configured `0` is invalid. A named same-target protocol recovery, compact/replay child call, or compatibility-model call also consumes a send when that path is integrated with explicit routes; it is not a free retry or another target attempt.
+- `max_upstream_sends` defaults to `1` when omitted, must be at least `max_target_attempts`, and caps physical inference POSTs for one logical operation. An explicitly configured `0` is invalid. Azure rate-limit recovery, a named same-target protocol recovery, a compact/replay child call, or a compatibility-model call also consumes a send when that path is integrated with explicit routes; it is not a free retry or another target attempt.
 - Explicit routes do not nest the broad legacy same-target transport retry loop inside each target. Version-1 and compiled legacy routes retain their existing retry behavior, and the existing `retries` metric continues to describe those same-target retries.
 - Size `max_upstream_sends` for every reachable child send, not just normal targets. Responses compaction/replay, encrypted-content cleanup, stream-options recovery, and compatibility-model recovery all draw from the same route operation; the route cap can stop them before their own local fanout/recovery limit.
 
 One total inference deadline is shared across all attempts. It is not restarted per target, and the initial behavior does not allocate a smaller timeout to a hanging primary. Redirects and implicit transport body replay are disabled for inference sends so the send budget matches actual dispatches and credentials cannot follow redirects.
+
+Explicit Azure routes can retry an authoritative, fully cleaned-up `429` on the same target after a valid provider reset. This includes a certified Responses stream admission failure before semantic output or usage. The request body and provider-owned state remain intact. An eligible configured failover target takes priority; a pinned operation, `primary_only` route, or last eligible Azure target can instead use remaining sends on its current target. This recovery applies to normal inference attempts, including later pinned websocket turns; it does not add retry loops inside compaction or protocol-recovery child calls. Missing reset data, ambiguous delivery, semantic/tool progress, and an exhausted deadline or send budget prevent another send.
+
+Azure cooldowns are shared by resource origin and physical deployment across public model aliases, reasoning tiers, provider aliases, and credentials. During a cooldown, fresh requests can fail over without sending to the throttled deployment. Operations that must keep the target wait in a bounded, cancellable FIFO queue. One recovery request holds the deployment permit until its response body finishes or closes; queued requests then proceed one at a time. Limits and diagnostics are in [429 troubleshooting](troubleshooting.md#429-upstream-rate-limit).
 
 Automatic target switching is intentionally narrow:
 
@@ -217,7 +221,7 @@ Automatic target switching is intentionally narrow:
 
 Attempts never overlap. Before switching, the failed response body and local readers/pumps must terminate. If delivery, semantic progress, commitment, state ownership, or cleanup is uncertain, Vekil returns an error instead of risking a duplicate generation, duplicate billing, duplicate server-side tool activity, or corrupted continuation.
 
-When several attempts fail, error selection is deterministic: ambiguous delivery wins over local state/configuration/authentication errors, which win over authoritative retryable rejections, which win over no-eligible-target exhaustion. If every attempt was an authoritative retryable rejection, the first attempted target's canonical protocol error is preserved; failed-attempt headers are not merged into a later response.
+When several attempts fail, error selection is deterministic: ambiguous delivery wins over local state/configuration/authentication errors, which win over authoritative retryable rejections, which win over no-eligible-target exhaustion. Equal-precedence failures preserve the first attempted target's canonical protocol error, using its latest result when that target was retried. A recovery wait stopped before dispatch preserves the upstream rejection and any longer shared reset. Failed-attempt headers are not merged into a later successful response.
 
 ### Supported route surfaces
 
@@ -258,8 +262,8 @@ The binding index is bounded to 262,144 entries with a 24-hour absolute TTL and 
 Schema version 2 does not include weighted routing, active health probes,
 user-defined quota domains, generic terminal-target circuit breakers, or
 cross-route fallback. Temporary target errors do not change `/readyz`.
-Recognized Copilot throttles with authoritative reset data use the separate
-[shared cooldown controller](troubleshooting.md). Priority failover may select
+Azure deployment throttles and recognized Copilot throttles with authoritative
+reset data use [shared cooldowns](troubleshooting.md). Priority failover may select
 an unaffected target when the request has no binding that prevents a switch.
 
 Schema-v2 policy routing adds a separate infrastructure-only breaker for the **classifier route**, not for terminal target selection. Only pre-inference transport failures, `429`, and upstream `5xx` affect it. Timeouts, malformed classifier output, missing forced calls, abstention, content-dependent latency, and user validation errors do not change shared health. A selected terminal route still follows only its own configured `primary_only` or replay-safe `priority_failover` behavior; classifier failure selects the profile's configured unavailable tier and never creates cross-tier failover.

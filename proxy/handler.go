@@ -253,6 +253,7 @@ type ProxyHandler struct {
 	copilotURL                       string
 	copilotHeaders                   CopilotHeaderConfig
 	copilotTraffic                   copilotTrafficController
+	azureTraffic                     azureTrafficController
 	providersConfig                  ProvidersConfig
 	allowedModels                    map[string]struct{}
 	providersState                   *providerSetup

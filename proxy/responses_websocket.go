@@ -1252,8 +1252,8 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 		return routedCtx, operation, route, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 	// Prior websocket frames commit the session to this exact target. Mark the
-	// per-turn operation committed before dispatch so the shared executor cannot
-	// admit an automatic target switch (or same-target loop) on a later turn.
+	// per-turn operation committed before dispatch to prohibit target switching.
+	// A clean Azure admission rejection may still retry this turn on its owner.
 	operation.setCommitment(downstreamCommitmentProtocolFrame)
 	return routedCtx, operation, route, nil
 }

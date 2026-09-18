@@ -36,6 +36,37 @@ the upstream response immediately when another attempt cannot fit within the
 request timeout. It also honors `retry-after-ms` and exhausted quota reset
 headers. Increasing the timeout does not increase the upstream quota.
 
+For schema-v2 explicit Azure routes, an authoritative `429` with a valid reset
+starts a cooldown shared by the Azure resource origin and physical deployment.
+Public aliases, reasoning tiers, and different credentials for that deployment
+share the cooldown. Fresh requests can use a configured failover target;
+provider-bound continuations keep their owner and wait before retrying the same
+request. Each retry consumes `max_upstream_sends`, so allow more than one send to
+enable this recovery. Azure TPM remains unchanged.
+
+Recovery also handles certified pre-output Responses stream rejections after
+HTTP `200`, including reset headers embedded in the error event. It never replays
+a request after text/tool progress, reported usage, or ambiguous delivery. A late
+streamed throttle updates the cooldown for other requests while preserving the
+current stream's failure.
+
+Azure recovery admits one request at a time until the waiting queue drains.
+Each permit lasts through response completion or close. The process keeps at most
+256 deployment cooldowns, 64 waiting requests, and 64 MiB of queued request bodies.
+Each wait is capped at five minutes and by the request deadline; disconnects and
+shutdown cancel it. Queue overflow returns `503 rate_limit_queue_full` for a new
+admission. A retry that cannot wait returns its last upstream rejection, retaining
+the reset and request correlation. These limits apply to explicit Azure inference
+routes; classifier admission and version-1 retries retain their existing behavior.
+
+In attempt diagnostics, `retry_same_target` records the recovery decision and
+`rate_limit_retry` identifies the subsequent physical send. A wait canceled before
+dispatch reports `suppressed_retry_admission` or `suppressed_lifecycle` without
+adding a send. Capture the Vekil request ID, upstream request ID from the attempt
+trace, reset headers, and remaining-token headers when investigating repeated
+Azure throttling. A retry budget cannot guarantee recovery while demand continues
+to exceed the deployment's quota.
+
 For recognized Copilot limits with a valid reset, Vekil shares a process-local
 cooldown across affected requests. Model limits apply to that model and
 credential, account and weekly limits apply across models for that credential,

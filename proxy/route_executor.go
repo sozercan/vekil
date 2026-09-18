@@ -54,6 +54,7 @@ const (
 	routeAttemptNormal                routeAttemptKind = "normal"
 	routeAttemptProtocolRecovery      routeAttemptKind = "protocol_recovery"
 	routeAttemptFailover              routeAttemptKind = "route_failover"
+	routeAttemptRateLimitRetry        routeAttemptKind = "rate_limit_retry"
 	routeAttemptCompaction            routeAttemptKind = "compaction"
 	routeAttemptCompatibilityFallback routeAttemptKind = "compatibility_fallback"
 )
@@ -63,6 +64,7 @@ type routeRetryDecision string
 const (
 	routeRetryAccepted               routeRetryDecision = "accepted"
 	routeRetrySwitchTarget           routeRetryDecision = "switch_target"
+	routeRetrySameTarget             routeRetryDecision = "retry_same_target"
 	routeRetrySuppressedMode         routeRetryDecision = "suppressed_mode"
 	routeRetrySuppressedDelivery     routeRetryDecision = "suppressed_delivery"
 	routeRetrySuppressedProgress     routeRetryDecision = "suppressed_progress"
@@ -2052,6 +2054,7 @@ type routeAttemptResponseObserver struct {
 	endpoint                  string
 	streaming                 bool
 	headers                   http.Header
+	azureTraffic              azureRouteTraffic
 	statusCode                int
 	outcome                   routeAttemptOutcome
 	progress                  upstreamSemanticProgress
@@ -2380,6 +2383,7 @@ func (o *routeAttemptResponseObserver) observeResponsesEvent(eventType, data str
 		}
 		o.statusCode = status
 		o.retryAfter = sanitizedRouteAttemptRetryAfter(failureHeaders, "")
+		o.azureTraffic.observe(status, failureHeaders)
 		if requestID := responsesUpstreamRequestID(failureHeaders); requestID != "" {
 			o.upstreamID = boundOperationalStatLabel(requestID)
 		}
@@ -2799,6 +2803,7 @@ func (b *routeAttemptObservedBody) Read(p []byte) (int, error) {
 			b.eof.Store(true)
 		}
 		b.observer.finish(errors.Is(err, io.EOF), err)
+		b.observer.azureTraffic.permit.release()
 	}
 	return n, err
 }
@@ -2821,6 +2826,9 @@ func (b *routeAttemptObservedBody) Close() error {
 			finishErr = contextErr
 		}
 		b.observer.finish(true, finishErr)
+	}
+	if b.observer != nil {
+		b.observer.azureTraffic.permit.release()
 	}
 	return err
 }
@@ -2856,10 +2864,15 @@ func (b *routeAttemptObservedBody) canceledAtFailure() bool {
 }
 
 func observeRouteAttemptResponse(resp *http.Response, record *routeAttemptRecord, operation *routeOperation, trace routeAttemptTrace, send *routeSendObservation, endpoint string, streaming bool) *http.Response {
-	if resp == nil || record == nil {
+	if resp == nil {
+		return resp
+	}
+	traffic := azureRouteTrafficFromRequest(resp.Request)
+	if record == nil && traffic.controller == nil {
 		return resp
 	}
 	if resp.Body == nil {
+		traffic.permit.release()
 		completedTrace := trace
 		completedTrace.CleanupDone = true
 		outcome := routeAttemptOutcomeFromTrace(completedTrace)
@@ -2886,6 +2899,7 @@ func observeRouteAttemptResponse(resp *http.Response, record *routeAttemptRecord
 	}
 	streaming = streaming || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
 	observer := newRouteAttemptResponseObserver(record, operation, trace, send, endpoint, streaming, resp.Header)
+	observer.azureTraffic = traffic
 	if resp.Request != nil {
 		observer.attemptCtx = resp.Request.Context()
 	}
@@ -2999,7 +3013,8 @@ func selectFinalRouteFailure(failures []routeAttemptFailure) routeAttemptFailure
 	}
 	selected := failures[0]
 	for _, failure := range failures[1:] {
-		if failure.precedence() > selected.precedence() {
+		if failure.precedence() > selected.precedence() ||
+			failure.precedence() == selected.precedence() && failure.attribution.targetID != "" && failure.attribution.targetID == selected.attribution.targetID {
 			selected = failure
 		}
 	}
@@ -3028,8 +3043,16 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 	}
 	kind := routeAttemptKindFromContext(ctx)
 	failures := make([]routeAttemptFailure, 0, route.policy.maxTargetAttempts)
+	retryTargetID := ""
 	for {
 		targets := orderedRouteTargets(route, operation, endpoint)
+		sameTargetRetry := retryTargetID != ""
+		if sameTargetRetry {
+			if retryTarget, ok := route.targetByID(retryTargetID); ok {
+				targets = []targetBinding{retryTarget}
+			}
+			retryTargetID = ""
+		}
 		if len(targets) == 0 {
 			break
 		}
@@ -3044,6 +3067,9 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			break
 		}
 		attemptKind := kind
+		if sameTargetRetry {
+			attemptKind = routeAttemptRateLimitRetry
+		}
 		if switchedTarget {
 			if !routeAttemptStatsSuppressed(operation.inbound) {
 				h.RecordTargetSwitch(operation.inbound)
@@ -3076,6 +3102,8 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			providerID: target.provider.id,
 		}))
 		req.GetBody = nil
+		req = h.withAzureRouteTraffic(req, target)
+		traffic := azureRouteTrafficFromRequest(req)
 		if rejected := h.maybeRejectNativeResponsesRequest(req); rejected != nil {
 			if req.Body != nil {
 				_ = req.Body.Close()
@@ -3087,11 +3115,24 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			break
 		}
 		permit, blocked, admissionErr := h.acquireCopilotInference(req)
+		var azurePermit *azureTrafficPermit
+		if blocked == nil && admissionErr == nil {
+			azurePermit, blocked, admissionErr = h.acquireAzureRouteInference(req, routeCanSwitchAfterAttempt(ctx, operation, endpoint, kind, h.ShuttingDown()))
+		}
 		if blocked != nil || admissionErr != nil {
+			permit.release()
+			azurePermit.release()
 			if req.Body != nil {
 				_ = req.Body.Close()
 			}
 			decision := routeRetrySuppressedAdmission
+			if ctx.Err() != nil || h.ShuttingDown() {
+				decision = routeRetrySuppressedLifecycle
+			}
+			if sameTargetRetry {
+				suppressPendingRouteRetry(operation, failures, decision, blocked)
+				break
+			}
 			failure := routeAttemptFailure{err: admissionErr, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, cleanupDone: true}
 			if blocked != nil {
 				failure.response, _ = captureRouteResponse(blocked)
@@ -3114,11 +3155,20 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			}
 			break
 		}
+		if traffic.controller != nil {
+			traffic.permit = azurePermit
+			req = req.WithContext(context.WithValue(req.Context(), azureRouteTrafficContextKey{}, traffic))
+		}
 
 		if reserved, decision := operation.reserveSendAtDispatch(ctx, h.ShuttingDown()); !reserved {
 			permit.release()
+			azurePermit.release()
 			if req.Body != nil {
 				_ = req.Body.Close()
+			}
+			if sameTargetRetry {
+				suppressPendingRouteRetry(operation, failures, decision, nil)
+				break
 			}
 			message := "route upstream-send budget exhausted"
 			switch decision {
@@ -3180,6 +3230,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 					upstreamID = captured.upstreamID
 				}
 			}
+			azurePermit.release()
 			failure := routeAttemptFailure{err: sendErr, attribution: attribution, delivery: delivery, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: decision, statusCode: statusCode, upstreamID: upstreamID, cleanupDone: cleanupDone, outcome: outcome}
 			failures = append(failures, failure)
 			trace := routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: statusCode, Delivery: delivery, Progress: upstreamProgressNone, Commitment: downstreamCommitmentNone, Decision: decision, UpstreamID: upstreamID, CleanupDone: cleanupDone}
@@ -3213,8 +3264,15 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				if streamFailure.decision == "" {
 					streamFailure.decision = routeRetrySuppressedProgress
 				}
-				if streamFailure.delivery == requestExplicitlyRejected && operation.allowsAutomaticTargetSwitch(kind) && operation.retryAdmissionOpen(ctx, h.ShuttingDown()) && route.policy.mode == routeModePriorityFailover {
-					streamFailure.decision = routeRetrySwitchTarget
+				failureHeaders := resp.Header
+				var upstreamErr *upstreamError
+				if errors.As(streamFailure.err, &upstreamErr) {
+					failureHeaders = upstreamErr.headers
+				}
+				traffic.observe(streamFailure.statusCode, failureHeaders)
+				azurePermit.release()
+				if streamFailure.delivery == requestExplicitlyRejected {
+					streamFailure.decision = h.explicitRouteRejectionDecision(ctx, operation, target, endpoint, kind, *streamFailure, traffic)
 				}
 				failures = append(failures, *streamFailure)
 				upstreamID := streamFailure.upstreamID
@@ -3243,7 +3301,10 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 					}
 					attemptRecord.complete(completion)
 				}
-				if streamFailure.decision == routeRetrySwitchTarget {
+				if streamFailure.decision == routeRetrySameTarget {
+					retryTargetID = target.id
+				}
+				if streamFailure.decision == routeRetrySwitchTarget || streamFailure.decision == routeRetrySameTarget {
 					continue
 				}
 				break
@@ -3258,6 +3319,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				// spend is retained without exposing any prepared bytes downstream.
 				accepted = observeRouteAttemptResponse(accepted, attemptRecord, operation, trace, observation, endpoint, true)
 				cleanupDone := drainRouteAttemptBodyWithTimeout(accepted.Body, upstreamErrorDetailDrainTimeout)
+				azurePermit.release()
 				failure.cleanupDone = cleanupDone
 				trace.CleanupDone = cleanupDone
 				failures = append(failures, failure)
@@ -3279,6 +3341,8 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		var capturedObservation *capturedRouteResponse
 		if routeAdapterMayExplicitlyReject(target, endpoint, resp.StatusCode) {
 			captured, cleanupDone := captureRouteResponse(resp)
+			traffic.observe(resp.StatusCode, captured.header)
+			azurePermit.release()
 			responseUpstreamID = captured.upstreamID
 			if !cleanupDone {
 				failure := routeAttemptFailure{err: fmt.Errorf("route attempt cleanup did not complete"), attribution: attribution, delivery: requestDeliveredOrAmbiguous, progress: upstreamProgressUnknown, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedLifecycle, statusCode: resp.StatusCode, upstreamID: captured.upstreamID, cleanupDone: false, outcome: routeAttemptOutcomeFailed}
@@ -3289,16 +3353,23 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				break
 			}
 			if routeAdapterCertifiesHTTPRejection(target, endpoint, captured) {
-				decision := routeRetrySuppressedMode
-				if route.policy.mode == routeModePriorityFailover && operation.allowsAutomaticTargetSwitch(kind) && operation.retryAdmissionOpen(ctx, h.ShuttingDown()) {
-					decision = routeRetrySwitchTarget
+				retryAfter, _ := selectResponsesRetryAfter(captured.header)
+				if retryAfter != "" {
+					if _, valid := retryAfterHeaderSeconds(headerGetCI(captured.header, "Retry-After")); !valid {
+						captured.header.Set("Retry-After", retryAfter)
+					}
 				}
-				failure := routeAttemptFailure{response: captured, attribution: attribution, delivery: requestExplicitlyRejected, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: decision, statusCode: captured.statusCode, retryAfter: headerGetCI(captured.header, "Retry-After"), upstreamID: captured.upstreamID, cleanupDone: true, outcome: routeAttemptOutcomeRejected}
+				failure := routeAttemptFailure{response: captured, attribution: attribution, delivery: requestExplicitlyRejected, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, statusCode: captured.statusCode, retryAfter: retryAfter, upstreamID: captured.upstreamID, cleanupDone: true, outcome: routeAttemptOutcomeRejected}
+				decision := h.explicitRouteRejectionDecision(ctx, operation, target, endpoint, kind, failure, traffic)
+				failure.decision = decision
 				failures = append(failures, failure)
 				trace := routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: captured.statusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: decision, UpstreamID: captured.upstreamID, CleanupDone: true}
 				operation.appendTrace(trace)
 				completeCapturedRouteAttempt(attemptRecord, operation, trace, observation, endpoint, captured, true, routeAttemptOutcomeRejected)
-				if decision == routeRetrySwitchTarget {
+				if decision == routeRetrySameTarget {
+					retryTargetID = target.id
+				}
+				if decision == routeRetrySwitchTarget || decision == routeRetrySameTarget {
 					continue
 				}
 				break
@@ -3327,6 +3398,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 					resp = observeRouteAttemptResponse(resp, attemptRecord, operation, trace, observation, endpoint, stream)
 					cleanupDone = drainRouteAttemptBodyWithTimeout(resp.Body, upstreamErrorDetailDrainTimeout)
 				}
+				azurePermit.release()
 				failure.cleanupDone = cleanupDone
 				trace.CleanupDone = cleanupDone
 				failures = append(failures, failure)
