@@ -569,15 +569,18 @@ run_claude_command() {
   cd "${case_dir}"
   # This baseline compatibility smoke does not exercise Claude's experimental
   # Advisor Tool, whose beta header is not accepted by the Copilot endpoint.
+  # Use Anthropic's version spelling so Claude recognizes Haiku's capabilities;
+  # Vekil normalizes it back to the Copilot catalog ID. File reads need no thinking.
   HOME="${home_dir}" \
   ANTHROPIC_BASE_URL="${PROXY_BASE_URL}" \
   ANTHROPIC_API_KEY=dummy \
   CLAUDE_CODE_DISABLE_ADVISOR_TOOL="${CLAUDE_CODE_DISABLE_ADVISOR_TOOL:-1}" \
+  MAX_THINKING_TOKENS=0 \
   claude \
     --dangerously-skip-permissions \
     --print \
     --output-format text \
-    --model "${model}" \
+    --model "${model//./-}" \
     "${PROMPT}" \
     > "${output_file}" < /dev/null
 }

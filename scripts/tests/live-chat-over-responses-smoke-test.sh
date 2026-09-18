@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Mock upstream usage must not appear as real live usage in the CI summary.
+unset GITHUB_STEP_SUMMARY
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SMOKE_SCRIPT="${REPO_ROOT}/scripts/live-chat-over-responses-smoke.sh"

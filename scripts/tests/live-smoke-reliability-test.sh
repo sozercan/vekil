@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Mock upstream usage must not appear as real live usage in the CI summary.
+unset GITHUB_STEP_SUMMARY
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vekil-smoke-reliability.XXXXXX")"
@@ -420,6 +423,7 @@ set -euo pipefail
 capture_dir="${FAKE_CLAUDE_CAPTURE_DIR:?}"
 mkdir -p "${capture_dir}"
 printf '%s' "${CLAUDE_CODE_DISABLE_ADVISOR_TOOL-}" > "${capture_dir}/disable-advisor-tool"
+printf '%s' "${MAX_THINKING_TOKENS-}" > "${capture_dir}/max-thinking-tokens"
 model=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -883,11 +887,19 @@ if expect_success "Claude subprocess defaults and model preference" 8 \
   fi
 
   captured_claude_model="$(cat "${claude_capture_dir}/model" 2>/dev/null || true)"
-  if [[ "${captured_claude_model}" == "claude-haiku-4.5" ]]; then
-    record_success "Claude model selection uses Haiku despite catalogued Sonnet models"
+  if [[ "${captured_claude_model}" == "claude-haiku-4-5" ]]; then
+    record_success "Claude model selection uses its recognized Haiku alias despite catalogued Sonnet models"
   else
-    record_failure "Claude model selection uses Haiku despite catalogued Sonnet models" \
+    record_failure "Claude model selection uses its recognized Haiku alias despite catalogued Sonnet models" \
       "captured model=${captured_claude_model:-<missing>}"
+  fi
+
+  captured_thinking_tokens="$(cat "${claude_capture_dir}/max-thinking-tokens" 2>/dev/null || true)"
+  if [[ "${captured_thinking_tokens}" == "0" ]]; then
+    record_success "Claude file-reading smoke disables thinking"
+  else
+    record_failure "Claude file-reading smoke disables thinking" \
+      "captured MAX_THINKING_TOKENS=${captured_thinking_tokens:-<missing>}"
   fi
 fi
 

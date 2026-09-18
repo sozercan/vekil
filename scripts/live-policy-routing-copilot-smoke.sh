@@ -376,10 +376,12 @@ select_copilot_models() {
     lightweight \
     "${LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL:-}" \
     "" low gpt-5-mini gpt-5.4-mini)"
+  # The bounded classifier must emit its function call within 256 tokens.
+  # GPT-5-mini consumed that budget in reasoning during live validation.
   selected_classifier="$(pick_copilot_model \
     classifier \
     "${LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL:-}" \
-    "" "" gpt-5-mini claude-haiku-4.5)"
+    "" "" claude-haiku-4.5)"
   selected_primary="$(pick_copilot_model \
     powerful-primary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL:-}" \
