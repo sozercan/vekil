@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,8 +76,14 @@ func (h *ProxyHandler) withAzureRouteTraffic(req *http.Request, target targetBin
 		return req
 	}
 	scheme := strings.ToLower(req.URL.Scheme)
-	host := strings.ToLower(req.URL.Hostname())
+	host := strings.TrimSuffix(strings.ToLower(req.URL.Hostname()), ".")
+	if address, err := netip.ParseAddr(host); err == nil {
+		host = address.Unmap().String()
+	}
 	port := req.URL.Port()
+	if number, err := strconv.ParseUint(port, 10, 16); err == nil {
+		port = strconv.FormatUint(number, 10)
+	}
 	if scheme == "https" && port == "443" || scheme == "http" && port == "80" {
 		port = ""
 	}
@@ -112,31 +119,39 @@ func (a azureRouteTraffic) observeJSONFailure(status int, headers http.Header) {
 	a.observe(status, headers)
 }
 
+func azureRetryAfter(headers http.Header) string {
+	retryAfter, source := selectResponsesRetryAfter(headers)
+	if source == "Retry-After" || source == "retry-after-ms" {
+		return retryAfter
+	}
+	// Azure negative balances are exhausted, including -1. Other providers
+	// may use -1 for unlimited quota, so keep this policy out of the shared parser.
+	for _, dimension := range []string{"tokens", "requests"} {
+		if _, exhausted := responsesQuotaRemaining(headers, dimension); !exhausted {
+			continue
+		}
+		if reset, valid := responsesQuotaResetRetryAfter(headers, dimension); valid && (retryAfter == "" || positiveDecimalGreater(reset, retryAfter)) {
+			retryAfter = reset
+		}
+	}
+	return retryAfter
+}
+
 func (a azureRouteTraffic) observe(status int, headers http.Header) bool {
 	if a.controller == nil {
 		return false
 	}
 	exhausted := false
-	reset := ""
 	for _, dimension := range []string{"tokens", "requests"} {
 		if _, empty := responsesQuotaRemaining(headers, dimension); !empty {
 			continue
 		}
 		exhausted = true
-		if value, valid := responsesQuotaResetRetryAfter(headers, dimension); valid && (reset == "" || positiveDecimalGreater(value, reset)) {
-			reset = value
-		}
 	}
 	if status != http.StatusTooManyRequests && (status < 200 || status >= 300 || !exhausted) {
 		return false
 	}
-	retryAfter, _ := selectResponsesRetryAfter(headers)
-	if retryAfter == "" {
-		// Retain resets for Azure balances of -1 too. The shared parser
-		// reserves that value for other providers' unlimited-quota sentinel.
-		retryAfter = reset
-	}
-	delay, valid := parseRetryAfter(retryAfter)
+	delay, valid := parseRetryAfter(azureRetryAfter(headers))
 	if !valid {
 		return false
 	}

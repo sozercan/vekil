@@ -3103,6 +3103,10 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		}
 		sequence, switchedTarget, ok := operation.reserveTarget(target.id)
 		if !ok {
+			if sameTargetRetry {
+				suppressPendingRouteRetry(operation, failures, routeRetrySuppressedBudget, nil)
+				break
+			}
 			failures = append(failures, routeAttemptFailure{err: fmt.Errorf("route target-attempt budget exhausted"), decision: routeRetrySuppressedBudget})
 			break
 		}
@@ -3122,6 +3126,10 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		owner := providerModelFromRouteTarget(route, target)
 		preparedBody, err := prepareRouteTargetBody(body, requestedModel, endpoint, route, target, owner)
 		if err != nil {
+			if sameTargetRetry {
+				suppressPendingRouteRetry(operation, failures, routeRetrySuppressedNonretryable, nil)
+				break
+			}
 			failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedNonretryable}
 			failures = append(failures, failure)
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
@@ -3130,6 +3138,10 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 
 		req, err := h.newProviderJSONInferenceRequest(ctx, target.provider, http.MethodPost, dispatchPath, preparedBody, cloneSanitizedRouteHeaders(extraHeaders), "", owner)
 		if err != nil {
+			if sameTargetRetry {
+				suppressPendingRouteRetry(operation, failures, routeRetrySuppressedNonretryable, nil)
+				break
+			}
 			failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedNonretryable}
 			failures = append(failures, failure)
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
@@ -3149,6 +3161,10 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				_ = req.Body.Close()
 			}
 			captured, _ := captureRouteResponse(rejected)
+			if sameTargetRetry {
+				suppressPendingRouteRetry(operation, failures, routeRetrySuppressedNonretryable, nil)
+				break
+			}
 			failure := routeAttemptFailure{response: captured, statusCode: rejected.StatusCode, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, outcome: routeAttemptOutcomeRejected, decision: routeRetrySuppressedNonretryable, cleanupDone: true}
 			failures = append(failures, failure)
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: failure.statusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
@@ -3158,6 +3174,13 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		var azurePermit *azureTrafficPermit
 		if blocked == nil && admissionErr == nil {
 			azurePermit, blocked, admissionErr = h.acquireAzureRouteInference(req, routeCanSwitchAfterAttempt(ctx, operation, endpoint, kind, h.ShuttingDown()))
+			if blocked == nil && admissionErr == nil && azurePermit != nil && target.provider.azureAuthMode() == providerAuthModeAzureIdentity {
+				// A recovery queue can outlive the token attached during request
+				// construction. Refresh before reserving a physical send.
+				refreshCtx, cancelRefresh := copilotInferenceAdmissionContext(req)
+				admissionErr = h.applyProviderHeaders(req.WithContext(refreshCtx), target.provider, dispatchPath)
+				cancelRefresh()
+			}
 		}
 		if blocked != nil || admissionErr != nil {
 			permit.release()
@@ -3400,6 +3423,9 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			}
 			if routeAdapterCertifiesHTTPRejection(target, endpoint, captured) {
 				retryAfter, _ := selectResponsesRetryAfter(captured.header)
+				if target.provider.kind == providerTypeAzureOpenAI {
+					retryAfter = azureRetryAfter(captured.header)
+				}
 				if retryAfter != "" {
 					if _, valid := retryAfterHeaderSeconds(headerGetCI(captured.header, "Retry-After")); !valid {
 						captured.header.Set("Retry-After", retryAfter)
@@ -3651,9 +3677,14 @@ func routeAdapterCertifiesHTTPRejection(target targetBinding, endpoint string, r
 	return errType == "overloaded_error"
 }
 
-func routeAdapterCertifiesStreamFailure(target targetBinding, event responsesWebSocketStreamEvent) (int, bool) {
+func routeAdapterCertifiesStreamFailure(target targetBinding, event responsesWebSocketStreamEvent, headers http.Header) (int, bool) {
 	if target.provider == nil {
 		return 0, false
+	}
+	if target.provider.kind == providerTypeAzureOpenAI {
+		if status, _, ok := classifyResponsesFailure(event, headers); ok && status == http.StatusTooManyRequests {
+			return status, true
+		}
 	}
 	streamErr := responsesStreamEventError(event)
 	code := strings.ToLower(strings.TrimSpace(streamErr.Code))
@@ -3741,7 +3772,13 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 	if hasResult && result.failure != nil {
 		failureHeaders := responsesFailureHeaders(*result.failure, resp.Header)
 		streamErr := responsesStreamEventError(*result.failure)
-		if status, safe := routeAdapterCertifiesStreamFailure(target, *result.failure); safe && result.precommitReplaySafe {
+		if target.provider.kind == providerTypeAzureOpenAI {
+			result.retryAfter = azureRetryAfter(failureHeaders)
+			if result.retryAfter != "" {
+				failureHeaders.Set("Retry-After", result.retryAfter)
+			}
+		}
+		if status, safe := routeAdapterCertifiesStreamFailure(target, *result.failure, failureHeaders); safe && result.precommitReplaySafe {
 			if !prepared.abortAndWait(upstreamErrorDetailDrainTimeout) {
 				return nil, &routeAttemptFailure{
 					err:         fmt.Errorf("responses attempt cleanup did not complete before failover"),

@@ -167,12 +167,9 @@ func prepareAzureRouteJSONRejection(resp *http.Response, target targetBinding, t
 	event.Type = "response.failed"
 	event.Response.Error = envelope.Error
 	headers := responsesFailureHeaders(event, resp.Header)
-	status, certified := routeAdapterCertifiesStreamFailure(target, event)
+	status, certified := routeAdapterCertifiesStreamFailure(target, event, headers)
 	if classifiedStatus, _, ok := classifyResponsesFailure(event, headers); ok {
 		traffic.observeJSONFailure(classifiedStatus, headers)
-		if classifiedStatus == http.StatusTooManyRequests {
-			status, certified = classifiedStatus, true
-		}
 	}
 	if certified && routeResponseBodyAllowsReplay(prefix) {
 		cloned.StatusCode = status

@@ -826,7 +826,7 @@ func explicitRouteTargetCertifiesStreamFailure(target targetBinding, failure *ex
 	event.Response.Error.Code = strings.TrimSpace(failure.code)
 	event.Response.Error.Type = strings.TrimSpace(failure.errType)
 	event.Response.Error.Message = strings.TrimSpace(failure.message)
-	return routeAdapterCertifiesStreamFailure(target, event)
+	return routeAdapterCertifiesStreamFailure(target, event, nil)
 }
 
 func (h *ProxyHandler) explicitRouteRetryDecision(ctx context.Context, operation *routeOperation, endpoint string) (routeRetryDecision, bool) {

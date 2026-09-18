@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 )
@@ -47,6 +49,194 @@ func azureRetryTestHandler(t *testing.T, primaryURL, secondaryURL string, sends 
 }
 
 const azureRetryCompletedSSE = "data: " + `{"type":"response.completed","response":{"id":"resp_done","model":"physical-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}` + "\n\n"
+
+func TestExplicitRouteAzureNegativeBalanceResetRecovers(t *testing.T) {
+	for _, tc := range [][2]string{{"HTTP", "-1"}, {"HTTP", "0"}, {"JSON", "-1"}, {"JSON", "0"}, {"SSE", "-1"}, {"SSE", "0"}} {
+		protocol := tc[0]
+		t.Run(protocol+"/requests="+tc[1], func(t *testing.T) {
+			var calls atomic.Int32
+			h, route := explicitRouteTestHandler(t, &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if calls.Add(1) == 1 {
+					headers := http.Header{"X-Ratelimit-Remaining-Tokens": {"-1"}, "X-Ratelimit-Reset-Tokens": {"2s"}, "X-Ratelimit-Remaining-Requests": {tc[1]}, "X-Ratelimit-Reset-Requests": {"1s"}}
+					if protocol == "JSON" {
+						return routeExecutorTestResponse(req, 200, headers, `{"status":"failed","output":[],"error":{"code":"rate_limit_exceeded"}}`), nil
+					}
+					if protocol == "SSE" {
+						headers.Set("Content-Type", "text/event-stream")
+						return routeExecutorTestResponse(req, 200, headers, "data: "+`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}`+"\n\n"), nil
+					}
+					return routeExecutorTestResponse(req, 429, headers, `{"error":{"code":"rate_limit_exceeded"}}`), nil
+				}
+				if protocol == "SSE" {
+					return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, azureRetryCompletedSSE), nil
+				}
+				return routeExecutorTestResponse(req, 200, nil, `{"status":"completed","output":[]}`), nil
+			})}, routeModePrimaryOnly, 1, 2, explicitRouteTestProvider("primary", "http://primary.example", "key"))
+			t.Cleanup(h.BeginShutdown)
+			advance := azureTrafficTestClock(h)
+			op := newRouteOperation(route, t.Context())
+			done := make(chan azureTrafficTestResult, 1)
+			go func() {
+				resp, err := h.executeExplicitRouteRequest(withRouteOperation(t.Context(), op), route, providerEndpointResponses, []byte(`{"model":"public-model"}`), nil, "public-model", protocol == "SSE")
+				done <- azureTrafficTestResult{blocked: resp, err: err}
+			}()
+			waitForAzureTrafficWaiters(t, h, 1)
+			h.azureTraffic.mu.Lock()
+			if len(h.azureTraffic.cooldowns) != 1 {
+				t.Error("recovery lost its deployment cooldown")
+			}
+			for _, cooldown := range h.azureTraffic.cooldowns {
+				if cooldown.until.Sub(h.azureTraffic.timeNow()) != 2*time.Second {
+					t.Error("negative token balance lost its longer reset")
+				}
+			}
+			h.azureTraffic.mu.Unlock()
+			advance(2 * time.Second)
+			result := receiveAzureTrafficResult(t, done)
+			if result.err != nil || result.blocked == nil || result.blocked.StatusCode != 200 || calls.Load() != 2 {
+				t.Fatalf("negative-balance recovery failed: calls=%d result=%+v", calls.Load(), result)
+			}
+			_, _ = io.Copy(io.Discard, result.blocked.Body)
+			_ = result.blocked.Body.Close()
+		})
+	}
+}
+
+func TestExplicitRouteAzureStreamRateLimitAliases(t *testing.T) {
+	for _, eventType := range []string{"response.failed", "error"} {
+		for _, code := range []string{"quota_exceeded", "429", "rate_limit_error"} {
+			t.Run(eventType+"/"+code, func(t *testing.T) {
+				var calls atomic.Int32
+				h, route := explicitRouteTestHandler(t, &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if calls.Add(1) == 1 {
+						payload := `{"type":"error","error":{"code":"` + code + `"}}`
+						if eventType == "response.failed" {
+							payload = `{"type":"response.failed","response":{"error":{"code":"` + code + `"}}}`
+						}
+						return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}, "Retry-After": {"1"}}, "data: "+payload+"\n\n"), nil
+					}
+					return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, azureRetryCompletedSSE), nil
+				})}, routeModePriorityFailover, 2, 2,
+					explicitRouteTestProvider("primary", "http://primary.example", "key"),
+					explicitRouteTestProvider("secondary", "http://secondary.example", "key"))
+				t.Cleanup(h.BeginShutdown)
+				op := newRouteOperation(route, t.Context())
+				resp, err := h.executeExplicitRouteRequest(withRouteOperation(t.Context(), op), route, providerEndpointResponses, []byte(`{"model":"public-model"}`), nil, "public-model", true)
+				if err != nil || resp == nil {
+					t.Fatalf("stream alias did not recover: %v", err)
+				}
+				body, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				sends, switches, _ := op.snapshot()
+				if err != nil || !strings.Contains(string(body), "resp_done") || sends != 2 || switches != 1 {
+					t.Fatalf("stream alias recovery: sends=%d switches=%d body=%s err=%v", sends, switches, body, err)
+				}
+			})
+		}
+	}
+}
+
+func TestExplicitRouteAzureRefreshesIdentityAfterQueue(t *testing.T) {
+	credential := &fakeAzureCredential{tokens: []azcore.AccessToken{{Token: "fresh-token", ExpiresOn: time.Now().Add(time.Hour)}}}
+	source := newAzureSDKTokenSource(credential, "scope")
+	source.cached = azcore.AccessToken{Token: "queued-token", ExpiresOn: time.Now().Add(time.Hour)}
+	provider := explicitRouteTestProvider("primary", "http://primary.example", "")
+	provider.authMode, provider.azureToken = providerAuthModeAzureIdentity, source
+	var calls atomic.Int32
+	h, route := explicitRouteTestHandler(t, &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		if req.Header.Get("Authorization") != "Bearer fresh-token" {
+			t.Error("queued request dispatched with its stale identity token")
+		}
+		return routeExecutorTestResponse(req, 200, nil, `{"status":"completed","output":[]}`), nil
+	})}, routeModePrimaryOnly, 1, 1, provider)
+	t.Cleanup(h.BeginShutdown)
+	advance := azureTrafficTestClock(h)
+	seed := azureTrafficTestRequest(t, h, t.Context(), "primary", "http://primary.example", "deployment-a")
+	azureRouteTrafficFromRequest(seed).observe(429, http.Header{"Retry-After": {"2"}})
+	done := make(chan azureTrafficTestResult, 1)
+	go func() {
+		resp, err := h.executeExplicitRouteRequest(t.Context(), route, providerEndpointResponses, []byte(`{"model":"public-model"}`), nil, "public-model", false)
+		done <- azureTrafficTestResult{blocked: resp, err: err}
+	}()
+	waitForAzureTrafficWaiters(t, h, 1)
+	// Simulate token expiry while the request is held without sleeping through
+	// a production-length cooldown or changing the credential cache policy.
+	source.mu.Lock()
+	source.cached.ExpiresOn = time.Now().Add(-time.Second)
+	source.mu.Unlock()
+	advance(2 * time.Second)
+	result := receiveAzureTrafficResult(t, done)
+	if result.err != nil || result.blocked == nil || calls.Load() != 1 {
+		t.Fatalf("identity refresh recovery: calls=%d result=%+v", calls.Load(), result)
+	}
+	_, _ = io.Copy(io.Discard, result.blocked.Body)
+	_ = result.blocked.Body.Close()
+}
+
+type azureRetryTokenSourceFunc func(context.Context) (string, error)
+
+func (f azureRetryTokenSourceFunc) AccessToken(ctx context.Context) (string, error) { return f(ctx) }
+
+func TestExplicitRouteAzureRetryAuthFailurePreservesRejection(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, afterQueue := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/after-queue=%t", stream, afterQueue), func(t *testing.T) {
+				var unavailable atomic.Bool
+				provider := explicitRouteTestProvider("primary", "http://primary.example", "")
+				provider.authMode = providerAuthModeAzureIdentity
+				provider.azureToken = azureRetryTokenSourceFunc(func(context.Context) (string, error) {
+					if unavailable.Load() {
+						return "", errors.New("identity refresh unavailable")
+					}
+					return "token", nil
+				})
+				var calls atomic.Int32
+				h, route := explicitRouteTestHandler(t, &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls.Add(1)
+					if !afterQueue {
+						unavailable.Store(true)
+					}
+					headers := http.Header{"Retry-After": {"1"}, "X-Request-Id": {"original-rejection"}}
+					if stream {
+						headers.Set("Content-Type", "text/event-stream")
+						return routeExecutorTestResponse(req, 200, headers, "data: "+`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}`+"\n\n"), nil
+					}
+					return routeExecutorTestResponse(req, 429, headers, `{"error":{"code":"rate_limit_exceeded"}}`), nil
+				})}, routeModePrimaryOnly, 1, 2, provider)
+				t.Cleanup(h.BeginShutdown)
+				advance := azureTrafficTestClock(h)
+				op := newRouteOperation(route, t.Context())
+				done := make(chan azureTrafficTestResult, 1)
+				go func() {
+					resp, err := h.executeExplicitRouteRequest(withRouteOperation(t.Context(), op), route, providerEndpointResponses, []byte(`{"model":"public-model"}`), nil, "public-model", stream)
+					done <- azureTrafficTestResult{blocked: resp, err: err}
+				}()
+				if afterQueue {
+					waitForAzureTrafficWaiters(t, h, 1)
+					unavailable.Store(true)
+					advance(time.Second)
+				}
+				result := receiveAzureTrafficResult(t, done)
+				if stream {
+					var upstreamErr *upstreamError
+					if !errors.As(result.err, &upstreamErr) || upstreamErr.statusCode != 429 {
+						t.Fatalf("lost original stream rejection: %v", result.err)
+					}
+				} else {
+					if result.err != nil || result.blocked == nil || result.blocked.StatusCode != 429 {
+						t.Fatalf("lost original HTTP rejection: %+v", result)
+					}
+					_ = result.blocked.Body.Close()
+				}
+				sends, switches, trace := op.snapshot()
+				if calls.Load() != 1 || sends != 1 || switches != 0 || len(trace) != 1 || trace[0].UpstreamID != "original-rejection" {
+					t.Fatalf("auth failure changed dispatch or correlation: calls=%d sends=%d switches=%d trace=%+v", calls.Load(), sends, switches, trace)
+				}
+			})
+		}
+	}
+}
 
 func TestExplicitRouteAzurePinnedResponsesRetryPreservesState(t *testing.T) {
 	for _, failure := range []string{"HTTP", "preamble failure", "embedded reset", "JSON failure", "JSON embedded reset"} {

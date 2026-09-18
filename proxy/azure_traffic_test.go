@@ -124,12 +124,16 @@ func TestAzureTrafficCooldownScopeAndExpiredProbe(t *testing.T) {
 	}
 }
 
-func TestAzureTrafficCooldownDefaultPortAliases(t *testing.T) {
+func TestAzureTrafficCooldownOriginAliases(t *testing.T) {
 	for _, origins := range [][2]string{
 		{"http://east.example:80", "http://east.example"},
 		{"https://east.example:443", "https://east.example"},
 		{"http://[::1]:80", "http://[::1]"},
 		{"https://[::1]", "https://[::1]:443"},
+		{"https://east.example.", "https://east.example"},
+		{"https://[2001:db8::1]", "https://[2001:0db8:0:0:0:0:0:1]"},
+		{"https://[::ffff:127.0.0.1]", "https://127.0.0.1"},
+		{"https://east.example:0443", "https://east.example"},
 	} {
 		t.Run(origins[0], func(t *testing.T) {
 			h := &ProxyHandler{}
@@ -144,7 +148,7 @@ func TestAzureTrafficCooldownDefaultPortAliases(t *testing.T) {
 				defer func() { _ = blocked.Body.Close() }()
 			}
 			if err != nil || blocked == nil || blocked.StatusCode != 429 {
-				t.Fatalf("default-port alias bypassed cooldown: response=%v err=%v", blocked, err)
+				t.Fatalf("equivalent origin bypassed cooldown: response=%v err=%v", blocked, err)
 			}
 		})
 	}
