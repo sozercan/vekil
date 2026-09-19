@@ -31,6 +31,11 @@ func providerEndpointPolicyFor(kind providerType) providerEndpointPolicy {
 	}
 
 	switch kind {
+	case providerTypeTypeSafeCompatible:
+		return providerEndpointPolicy{
+			defaultPaths:           providerEndpointPaths{systemOne: providerEndpointSystemOne},
+			routedRequestEndpoints: []string{providerEndpointSystemOne},
+		}
 	case providerTypeOpenAICodex:
 		paths.chatCompletions = ""
 		paths.messages = ""

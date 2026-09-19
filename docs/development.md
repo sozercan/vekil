@@ -81,6 +81,7 @@ Coverage should include:
 - bounded canonical facts, UTF-8 truncation, non-text rejection, tool-name-only forwarding, total request cap, and exclusion of credentials, auth headers, provider state, replay IDs, physical routing metadata, parameter schemas, and tool arguments;
 - mandatory content-forwarding, trust-domain, cross-domain, non-storage, and retention acknowledgements;
 - strict forced `emit_policy_signals` parsing, duplicate-key/extra-field/enum/integer/trailing-content rejection, abstention, and exhaustive deterministic mapper precedence;
+- TypeSafe-compatible classifier request/choice parsing, custom endpoint/auth configuration, internal-only exposure, retention validation, one-send fallbacks, and shared usage accounting;
 - non-blocking per-profile plus global admission, no queue/backlog, partial-admission release, per-profile fairness, cancellation before terminal dispatch, and shutdown cleanup;
 - unavailable versus uncertain fallback separation, no fallback caching, infrastructure-only breaker transitions, timeout/content-output immunity, `Retry-After`, cooldown, and one half-open probe;
 - sealed operation-plan immutability, classifier/terminal budget separation, exact selected-route sends, selected-tier reasoning override for omitted and explicit client values, function-tool compatibility, identical failover values, translated Anthropic/Responses policy ingress and direct-route non-injection coverage, no cross-tier fallback, and preservation of forced-stream/aggregation behavior for both tiers;
@@ -97,7 +98,7 @@ make build
 go test -race ./... -count=1
 ```
 
-`vekil config validate` must remain offline with respect to provider discovery and inference endpoints. When `--providers-config` is an HTTP(S) URL, fetching that config source is the only permitted network request. `vekil config validate --live` is an explicit operator smoke that uses a fixed non-user fixture to verify classifier auth/reachability, forced strict function output, non-storage request acceptance, and one physical send. Tests for both paths should use controlled local servers so CI remains deterministic.
+`vekil config validate` must remain offline with respect to provider discovery and inference endpoints. When `--providers-config` is an HTTP(S) URL, fetching that config source is the only permitted network request. `vekil config validate --live` is an explicit operator smoke that uses a fixed non-user fixture to verify classifier auth/reachability, the configured classifier protocol, non-storage request acceptance where supported, and one physical send. Tests for both paths should use controlled local servers so CI remains deterministic.
 
 ### Chat-over-Responses suite
 
@@ -475,5 +476,5 @@ You can also run the same smoke scripts locally after building `vekil`; the CLI 
 - Keep Chat backend selection and Responses conversion inside the deep execution seam (`chat_execution.go`, `chat_route*.go`, and `chat_over_responses_*.go`); Anthropic and Gemini handlers should consume canonical Chat results rather than Responses events directly.
 - Responses-backed Chat must reject unsupported fields instead of silently dropping them, preserve replay IDs unchanged along with their state bounds, and use the typed internal Chat event transport for streams.
 - Preserve startup failure on public-model-ID collisions. For schema version 2, add new provider/native-endpoint/surface/mode support to the compiled route feature matrix and reject unsupported combinations rather than accepting degraded routes.
-- If the provider participates in policy routing, define and validate its `trust_domain`, classifier non-storage capability, forced function-tool support, and live-preflight behavior. Policy destinations may use native Chat or the bounded Chat-over-Responses adapter. Copilot is the only catalog-driven explicit-route exception; pinned targets must be validated against discovery and suppressed from the provider's legacy catalog. Do not silently admit other dynamic providers, Anthropic, Gemini, multimodal, or multi-tenant policy behavior.
+- If the provider participates in policy routing, define and validate its `trust_domain`, classifier non-storage capability, classifier protocol support, and live-preflight behavior. Policy destinations may use native Chat or the bounded Chat-over-Responses adapter. Copilot is the only catalog-driven explicit-route exception; pinned targets must be validated against discovery and suppressed from the provider's legacy catalog. Do not silently admit other dynamic providers, Anthropic, Gemini, multimodal, or multi-tenant policy behavior.
 - Cross-link config examples in [`provider-routing.md`](provider-routing.md) instead of duplicating YAML here.

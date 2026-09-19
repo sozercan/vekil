@@ -450,6 +450,9 @@ func validateSchemaV2FeatureFields(cfg ProvidersConfig, schemaVersion int) error
 		return configPathError("policy_profiles", "requires schema_version: 2")
 	}
 	for providerIndex, provider := range cfg.Providers {
+		if providerType(strings.TrimSpace(provider.Type)) == providerTypeTypeSafeCompatible {
+			return configPathError(fmt.Sprintf("providers[%d].type", providerIndex), "typesafe-compatible requires schema_version: 2")
+		}
 		if provider.trustDomainSet || strings.TrimSpace(provider.TrustDomain) != "" {
 			return configPathError(fmt.Sprintf("providers[%d].trust_domain", providerIndex), "requires schema_version: 2")
 		}
@@ -558,7 +561,7 @@ func validateProviderConfigDescriptors(configured []ProviderConfig, allowRouteOn
 
 		kind := providerType(strings.TrimSpace(provider.Type))
 		switch kind {
-		case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		default:
 			return nil, nil, false, configPathError(path+".type", "unsupported provider type %q", provider.Type)
 		}
@@ -636,6 +639,17 @@ func validateProviderRuntimeEnvironment(cfg ProviderConfig, providerIndex int) e
 }
 
 func validateProviderShellWithoutSecrets(cfg ProviderConfig, kind providerType, path string) error {
+	if kind == providerTypeTypeSafeCompatible {
+		if cfg.Default {
+			return configPathError(path+".default", "typesafe-compatible providers are internal classifiers and cannot be the default provider")
+		}
+		if len(cfg.Models) > 0 {
+			return configPathError(path+".models", "typesafe-compatible models must be pinned in internal policy_classifier routes")
+		}
+		if boolConfigValue(cfg.ClassifierNoStoreSupported) {
+			return configPathError(path+".classifier_no_store_supported", "the TypeSafe protocol has no request-level non-storage option")
+		}
+	}
 	switch kind {
 	case providerTypeAzureOpenAI:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
@@ -682,7 +696,7 @@ func validateProviderShellWithoutSecrets(cfg ProviderConfig, kind providerType, 
 				return configPathError(path+".base_url", "%v", err)
 			}
 		}
-	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 		if baseURL == "" {
 			return configPathError(path+".base_url", "is required")
@@ -790,7 +804,7 @@ func validateGenericProviderAuthWithoutEnvironment(cfg ProviderConfig) *provider
 
 func providerPathValidationField(err error) string {
 	message := err.Error()
-	for _, field := range []string{"chat_completions_path", "responses_path", "messages_path", "models_path"} {
+	for _, field := range []string{"chat_completions_path", "responses_path", "messages_path", "models_path", "systemone_path"} {
 		if strings.HasPrefix(message, field+" ") || strings.HasPrefix(message, field+" must") {
 			return field
 		}
@@ -863,7 +877,7 @@ func providerConfigRequiresStaticModels(provider providerConfigDescriptor) bool 
 	switch provider.kind {
 	case providerTypeAzureOpenAI:
 		return true
-	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		return provider.modelDiscovery == providerModelDiscoveryStatic
 	default:
 		return false
@@ -945,7 +959,14 @@ func normalizeAndValidateModelRouteForSchema(route *ModelRouteConfig, path strin
 		if endpoint == "" {
 			return configPathError(endpointPath, "must not be empty")
 		}
-		if !knownProviderEndpoint(endpoint) {
+		if endpoint == providerEndpointSystemOne {
+			if isPublic || route.InternalPurpose != modelRouteInternalPurposePolicyClassifier || len(route.Endpoints) != 1 {
+				return configPathError(endpointPath, "systemone is only supported as the sole endpoint of an internal policy_classifier route")
+			}
+			if len(route.ReasoningEffort) > 0 {
+				return configPathError(path+".reasoning_effort", "is not supported by the TypeSafe protocol")
+			}
+		} else if !knownProviderEndpoint(endpoint) {
 			return configPathError(endpointPath, "unsupported canonical endpoint %q", rawEndpoint)
 		}
 		if prior, exists := seenEndpoints[endpoint]; exists {
@@ -1134,7 +1155,7 @@ func configuredPublicModelAliases(publicID string) []string {
 
 func providerKindSupportsExplicitRoutes(kind providerType) bool {
 	switch kind {
-	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		return true
 	default:
 		return false
@@ -1143,6 +1164,8 @@ func providerKindSupportsExplicitRoutes(kind providerType) bool {
 
 func explicitRouteProviderFamily(kind providerType) string {
 	switch kind {
+	case providerTypeTypeSafeCompatible:
+		return "typesafe"
 	case providerTypeAnthropicCompatible:
 		return "anthropic"
 	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible:
@@ -1154,6 +1177,8 @@ func explicitRouteProviderFamily(kind providerType) string {
 
 func providerKindSupportsExplicitEndpoint(kind providerType, endpoint string) bool {
 	switch kind {
+	case providerTypeTypeSafeCompatible:
+		return endpoint == providerEndpointSystemOne
 	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible:
 		return endpoint == providerEndpointResponses || endpoint == providerEndpointChatCompletions
 	case providerTypeAnthropicCompatible:
@@ -1256,7 +1281,7 @@ var providerConfigFields = configFieldSet(
 	"id", "type", "default", "include_models", "exclude_models", "base_url", "auth_mode",
 	"api_key", "api_key_env", "api_version", "token_scope", "auth_type", "auth_header",
 	"auth_prefix", "extra_headers", "chat_completions_path", "responses_path", "messages_path",
-	"models_path", "model_discovery", "trust_domain", "classifier_no_store_supported", "headers", "models",
+	"models_path", "systemone_path", "model_discovery", "trust_domain", "classifier_no_store_supported", "headers", "models",
 )
 
 var providerModelConfigFields = configFieldSet(
