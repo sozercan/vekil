@@ -13,7 +13,6 @@
 #   LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE
 #   LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL
 #   LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL
-#   LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT
 #   LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY
 #   LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE
 #   LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL
@@ -23,7 +22,6 @@
 #   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL
 #   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL
 #   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY
-#   LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT
 #   LIVE_POLICY_ROUTING_CLASSIFIER_MODEL
 #   LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED=true|false
 #
@@ -43,6 +41,11 @@
 #   LIVE_POLICY_ROUTING_ALLOW_INSECURE_HTTP=1   local development only
 #   LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=0        delete artifacts after success
 #   LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=false
+#   LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS=true
+#     Set false to preserve the classifier's temperature=0 when supported.
+#   LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT
+#   LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT
+#     Set both tier efforts or omit both for models without effort support.
 #   SMOKE_*                                     bounded timeout overrides
 
 set -euo pipefail
@@ -336,7 +339,6 @@ validate_inputs() {
     LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE
 	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL
 	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL
-	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT
 	    LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY
     LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE
     LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL
@@ -346,7 +348,6 @@ validate_inputs() {
     LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL
 	    LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL
 	    LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY
-	    LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT
 	    LIVE_POLICY_ROUTING_CLASSIFIER_MODEL
     LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED
   )
@@ -359,6 +360,10 @@ validate_inputs() {
   case "${classifier_no_store_supported}" in
     true|false) ;;
     *) die "LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED must be true or false" ;;
+  esac
+  case "${LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS:-true}" in
+    true|false) ;;
+    *) die "LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS must be true or false" ;;
   esac
   case "${allow_provider_retention}" in
     true|false) ;;
@@ -399,17 +404,19 @@ PY_VALIDATE_URL
 
 	"$(python_command)" - \
 	  "${PUBLIC_MODEL}" \
-	  "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT}" \
-	  "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT}" <<'PY_PUBLIC_ID'
+	  "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT:-}" \
+	  "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT:-}" <<'PY_PUBLIC_ID'
 import sys
 public_model, lightweight_effort, powerful_effort = sys.argv[1:]
 if not public_model.strip() or len(public_model.encode()) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in public_model):
     raise SystemExit("LIVE_POLICY_ROUTING_PUBLIC_MODEL must be non-empty, control-free, and at most 128 bytes")
+if bool(lightweight_effort) != bool(powerful_effort):
+    raise SystemExit("tier reasoning efforts must be configured for both lightweight and powerful or omitted from both")
 for name, value in (
     ("LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT", lightweight_effort),
     ("LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT", powerful_effort),
 ):
-    if not value.strip() or len(value.encode()) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+    if value and (not value.strip() or len(value.encode()) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)):
         raise SystemExit(f"{name} must be non-empty, control-free, and at most 128 bytes")
 PY_PUBLIC_ID
 
@@ -595,6 +602,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         messages_valid = body_object and isinstance(body.get("messages"), list) and bool(body["messages"])
         no_sampling = body_object and "temperature" not in body and "top_p" not in body
         classifier_shape = body_object and self._has_classifier_tool(body)
+        sampling_valid = no_sampling
+        if classifier_shape and not self.server.classifier_drop_sampling_params:
+            sampling_valid = type(body.get("temperature")) in (int, float) and body["temperature"] == 0 and "top_p" not in body
         kind = "classifier" if classifier_shape else "terminal"
         model_expected = self.server.classifier_model if kind == "classifier" else self.server.primary_model
         model_valid = body_object and body.get("model") == model_expected
@@ -612,8 +622,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 errors.append("model_invalid")
             if not messages_valid:
                 errors.append("messages_invalid")
-            if not no_sampling:
-                errors.append("sampling_fields_not_dropped")
+            if not sampling_valid:
+                errors.append("sampling_fields_invalid")
             if kind == "classifier":
                 if self.server.classifier_no_store_supported:
                     if body.get("store") is not False:
@@ -637,7 +647,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "content_type_valid": content_type_valid,
             "model_valid": model_valid,
             "messages_valid": messages_valid,
-            "no_sampling": no_sampling,
+            "sampling_valid": sampling_valid,
             "path": incoming.path,
             "stream": body.get("stream") if body_object else None,
         }
@@ -656,7 +666,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "content_type_valid": inspection["content_type_valid"],
             "model_valid": inspection["model_valid"],
             "messages_valid": inspection["messages_valid"],
-            "sampling_fields_absent": inspection["no_sampling"],
+            "sampling_fields_valid": inspection["sampling_valid"],
             "stream": inspection["stream"],
             "status": status,
         }
@@ -779,6 +789,7 @@ def main():
     parser.add_argument("--classifier-model", required=True)
     parser.add_argument("--classifier-max-tokens", type=int, required=True)
     parser.add_argument("--classifier-no-store-supported", choices=("true", "false"), required=True)
+    parser.add_argument("--classifier-drop-sampling-params", choices=("true", "false"), required=True)
     parser.add_argument("--expected-auth-header", choices=("api-key", "authorization"), required=True)
     parser.add_argument("--expected-auth-sha256", required=True)
     parser.add_argument("--injected-request-id", required=True)
@@ -793,6 +804,7 @@ def main():
     server.classifier_model = args.classifier_model
     server.classifier_max_tokens = args.classifier_max_tokens
     server.classifier_no_store_supported = args.classifier_no_store_supported == "true"
+    server.classifier_drop_sampling_params = args.classifier_drop_sampling_params == "true"
     server.expected_auth_header = args.expected_auth_header
     server.expected_auth_sha256 = args.expected_auth_sha256
     server.injected_request_id = args.injected_request_id
@@ -854,6 +866,7 @@ start_powerful_primary_shim() {
         --classifier-model "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" \
         --classifier-max-tokens 256 \
         --classifier-no-store-supported "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" \
+        --classifier-drop-sampling-params "${LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS:-true}" \
         --expected-auth-header "${expected_auth_header}" \
         --expected-auth-sha256 "${expected_auth_sha256}" \
         --injected-request-id "${INJECTED_REQUEST_ID}" \
@@ -938,6 +951,7 @@ def route(route_id, name, targets, *, purpose=None, failover=False, reasoning_ef
         value["reasoning_effort"] = [reasoning_effort]
     if purpose:
         value["internal_purpose"] = purpose
+        value["drop_sampling_params"] = os.environ.get("LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS", "true") == "true"
         value.pop("parallel_tool_calls", None)
         value.pop("vision", None)
     return value
@@ -950,6 +964,14 @@ def target(target_id, provider_id, model):
         "upstream_model": model,
         "use_max_completion_tokens": True,
     }
+
+
+def tier(name):
+    value = {"route": "live-semantic-" + name}
+    effort = os.environ.get("LIVE_POLICY_ROUTING_" + name.upper() + "_REASONING_EFFORT")
+    if effort:
+        value["reasoning_effort"] = effort
+    return value
 
 
 config = {
@@ -980,7 +1002,7 @@ config = {
             "live-semantic-lightweight",
             "Live semantic lightweight",
 	            [target("live-lightweight-primary", "live-lightweight-provider", os.environ["LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL"])],
-	            reasoning_effort=os.environ["LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT"],
+	            reasoning_effort=os.environ.get("LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT"),
 	        ),
         route(
             "live-semantic-powerful",
@@ -990,7 +1012,7 @@ config = {
                 target("live-powerful-secondary", "live-powerful-secondary-provider", os.environ["LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL"]),
 	            ],
 	            failover=True,
-	            reasoning_effort=os.environ["LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT"],
+	            reasoning_effort=os.environ.get("LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT"),
 	        ),
         route(
             "live-semantic-classifier",
@@ -1007,14 +1029,8 @@ config = {
             "mode": "enforce",
             "model_picker_enabled": True,
             "model_picker_category": "versatile",
-            "lightweight": {
-                "route": "live-semantic-lightweight",
-                "reasoning_effort": os.environ["LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT"],
-            },
-            "powerful": {
-                "route": "live-semantic-powerful",
-                "reasoning_effort": os.environ["LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT"],
-            },
+            "lightweight": tier("lightweight"),
+            "powerful": tier("powerful"),
             "baseline_tier": "lightweight",
             "classifier_unavailable_tier": "lightweight",
             "classifier_uncertain_tier": "powerful",
@@ -1051,29 +1067,25 @@ text = path.read_text(encoding="utf-8")
 config = __import__("json").loads(text)
 expected_no_store = os.environ["LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED"] == "true"
 expected_retention = os.environ.get("LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION", "false") == "true"
-expected_lightweight_effort = os.environ["LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT"]
-expected_powerful_effort = os.environ["LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT"]
 classifier_provider = next(provider for provider in config["providers"] if provider["id"] == "live-powerful-primary-provider")
 profile = config["policy_profiles"][0]
 if classifier_provider.get("classifier_no_store_supported") is not expected_no_store:
     raise SystemExit("generated config has the wrong classifier_no_store_supported value")
 if profile["data_policy"].get("allow_provider_retention") is not expected_retention:
     raise SystemExit("generated config has the wrong allow_provider_retention value")
-if profile.get("lightweight") != {
-    "route": "live-semantic-lightweight",
-    "reasoning_effort": expected_lightweight_effort,
-}:
-    raise SystemExit("generated config has the wrong lightweight tier")
-if profile.get("powerful") != {
-    "route": "live-semantic-powerful",
-    "reasoning_effort": expected_powerful_effort,
-}:
-    raise SystemExit("generated config has the wrong powerful tier")
 routes = {route["id"]: route for route in config["model_routes"]}
-if routes["live-semantic-lightweight"].get("reasoning_effort") != [expected_lightweight_effort]:
-    raise SystemExit("generated config has the wrong lightweight reasoning_effort allowlist")
-if routes["live-semantic-powerful"].get("reasoning_effort") != [expected_powerful_effort]:
-    raise SystemExit("generated config has the wrong powerful reasoning_effort allowlist")
+if routes["live-semantic-classifier"]["drop_sampling_params"] != (os.environ.get("LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS", "true") == "true"):
+    raise SystemExit("generated config has the wrong classifier sampling policy")
+for name in ("lightweight", "powerful"):
+    effort = os.environ.get("LIVE_POLICY_ROUTING_" + name.upper() + "_REASONING_EFFORT")
+    route_id = "live-semantic-" + name
+    expected_tier = {"route": route_id}
+    if effort:
+        expected_tier["reasoning_effort"] = effort
+    if profile.get(name) != expected_tier:
+        raise SystemExit(f"generated config has the wrong {name} tier")
+    if routes[route_id].get("reasoning_effort") != ([effort] if effort else None):
+        raise SystemExit(f"generated config has the wrong {name} reasoning_effort allowlist")
 for name in (
     "LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY",
     "LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY",
@@ -2010,7 +2022,7 @@ run_enforce_mode() {
 
 	run_enforce_text_case enforce-lightweight \
 	  "In one sentence, explain what path/filepath.Join does. This is a bounded read-only single-function lookup; do not plan or inspect a codebase." \
-	  1024 lightweight "${SMOKE_CURL_MAX_TIME_SECONDS}" "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT}"
+	  1024 lightweight "${SMOKE_CURL_MAX_TIME_SECONDS}" "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT:-}"
   printf 'PASS enforce-lightweight-selection\n' >> "${SUMMARY_FILE}"
 
   run_enforce_text_case enforce-powerful \

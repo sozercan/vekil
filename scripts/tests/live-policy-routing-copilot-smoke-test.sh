@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Mock upstream usage must not appear as real live usage in the CI summary.
+unset GITHUB_STEP_SUMMARY
+
 log() {
   printf '==> %s\n' "$*" >&2
 }
@@ -53,15 +56,15 @@ TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vekil-policy-copilot-wrapper-test.XXXXXX"
 SMOKE_DIR="${TMP_ROOT}/smoke"
 BRIDGE_BIN="${TMP_ROOT}/fake-copilot-bridge.py"
 HARNESS="${TMP_ROOT}/fake-policy-harness.sh"
-SOL_HARNESS="${TMP_ROOT}/fake-sol-effort-harness.sh"
+RESPONSES_HARNESS="${TMP_ROOT}/fake-responses-effort-harness.sh"
 RECORD="${TMP_ROOT}/harness-env.json"
-SOL_RECORD="${TMP_ROOT}/sol-harness-env.json"
+RESPONSES_RECORD="${TMP_ROOT}/responses-harness-env.json"
 CHILD_PID_FILE="${TMP_ROOT}/bridge-child.pid"
 STDOUT_FILE="${TMP_ROOT}/wrapper.stdout"
 STDERR_FILE="${TMP_ROOT}/wrapper.stderr"
 QUOTA_SMOKE_DIR="${TMP_ROOT}/quota-smoke"
 QUOTA_RECORD="${TMP_ROOT}/quota-harness-env.json"
-QUOTA_SOL_RECORD="${TMP_ROOT}/quota-sol-harness-env.json"
+QUOTA_RESPONSES_RECORD="${TMP_ROOT}/quota-responses-harness-env.json"
 QUOTA_STDOUT_FILE="${TMP_ROOT}/quota-wrapper.stdout"
 QUOTA_STDERR_FILE="${TMP_ROOT}/quota-wrapper.stderr"
 TOKEN="synthetic-copilot-token-must-not-leak"
@@ -106,14 +109,25 @@ child = subprocess.Popen(["sleep", "300"])
 pathlib.Path(os.environ["FAKE_BRIDGE_CHILD_PID_FILE"]).write_text(str(child.pid), encoding="utf-8")
 
 models = [
+    {"id": "claude-haiku-4.5", "supported_endpoints": ["/chat/completions"]},
+    {"id": "gpt-5-mini", "supported_endpoints": ["/chat/completions", "/responses"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
     {"id": "gpt-5.4-mini", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low"]}}},
     {"id": "gpt-5.4", "supported_endpoints": ["/chat/completions", "/responses"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
     {"id": "gemini-3.1-pro-preview", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}}},
     {"id": "gpt-4.1", "supported_endpoints": ["/chat/completions"]},
     {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
-    {"id": "claude-opus-4.6", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
+    {"id": "claude-opus-4.7", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
     {"id": "responses-only", "supported_endpoints": ["/responses"]},
 ]
+catalog_case = os.environ.get("FAKE_BRIDGE_CATALOG_CASE", "")
+if catalog_case == "missing-mini":
+    models = [model for model in models if model["id"] != "gpt-5-mini"]
+elif catalog_case == "missing-haiku":
+    models = [model for model in models if model["id"] != "claude-haiku-4.5"]
+elif catalog_case == "missing-responses":
+    models[1]["supported_endpoints"] = ["/chat/completions"]
+elif catalog_case == "missing-high-effort":
+    models[1]["capabilities"]["supports"]["reasoning_effort"] = ["low"]
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
@@ -174,13 +188,14 @@ set -euo pipefail
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL}" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL}" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == http://127.0.0.1:*/v1 ]]
-[[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" == "gpt-5.4-mini" ]]
-[[ "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" == "gpt-4.1" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "gemini-3.1-pro-preview" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "claude-sonnet-4.6" ]]
-[[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT}" == "low" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT}" == "high" ]]
+[[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" == "gpt-5-mini" ]]
+[[ "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" == "claude-haiku-4.5" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "gpt-5-mini" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "claude-haiku-4.5" ]]
+[[ -z "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT+x}" ]]
+[[ -z "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT+x}" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" == "false" ]]
+[[ "${LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS}" == "false" ]]
 [[ "${LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION}" == "true" ]]
 [[ -n "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY}" ]]
 [[ -n "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY}" ]]
@@ -211,30 +226,32 @@ SH
   chmod 700 "${HARNESS}"
 }
 
-write_fake_sol_harness() {
-  cat > "${SOL_HARNESS}" <<'SH'
+write_fake_responses_harness() {
+  cat > "${RESPONSES_HARNESS}" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 [[ -z "${COPILOT_GITHUB_TOKEN:-}" ]] || {
-  echo "COPILOT_GITHUB_TOKEN leaked into Sol effort harness" >&2
+  echo "COPILOT_GITHUB_TOKEN leaked into Responses effort harness" >&2
   exit 1
 }
 [[ "${PROXY_BIN}" == "/usr/bin/true" ]]
-[[ "${LIVE_POLICY_ROUTING_SOL_BRIDGE_BASE_URL}" == http://127.0.0.1:* ]]
-[[ "${LIVE_POLICY_ROUTING_SOL_MODEL}" == "gpt-5.6-sol" ]]
-[[ "${LIVE_POLICY_ROUTING_SOL_PUBLIC_MODEL}" == "gpt-5.6-semantic" ]]
-[[ "${LIVE_POLICY_ROUTING_SOL_SMOKE_DIR}" == */sol-effort ]]
-[[ "${LIVE_POLICY_ROUTING_SOL_KEEP_ARTIFACTS}" == "1" ]]
+[[ "${LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL}" == http://127.0.0.1:* ]]
+[[ "${LIVE_POLICY_ROUTING_RESPONSES_MODEL}" == "gpt-5-mini" ]]
+[[ "${LIVE_POLICY_ROUTING_RESPONSES_CLASSIFIER_MODEL}" == "claude-haiku-4.5" ]]
+[[ "${LIVE_POLICY_ROUTING_RESPONSES_PUBLIC_MODEL}" == "vekil-live-semantic-effort" ]]
+[[ "${LIVE_POLICY_ROUTING_RESPONSES_SMOKE_DIR}" == */responses-effort ]]
+[[ "${LIVE_POLICY_ROUTING_RESPONSES_KEEP_ARTIFACTS}" == "1" ]]
 
 jq -n \
-  --arg base "${LIVE_POLICY_ROUTING_SOL_BRIDGE_BASE_URL}" \
-  --arg model "${LIVE_POLICY_ROUTING_SOL_MODEL}" \
-  --arg public_model "${LIVE_POLICY_ROUTING_SOL_PUBLIC_MODEL}" \
-  '{base:$base,model:$model,public_model:$public_model}' \
-  > "${FAKE_SOL_HARNESS_RECORD}"
+  --arg base "${LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL}" \
+  --arg model "${LIVE_POLICY_ROUTING_RESPONSES_MODEL}" \
+  --arg classifier "${LIVE_POLICY_ROUTING_RESPONSES_CLASSIFIER_MODEL}" \
+  --arg public_model "${LIVE_POLICY_ROUTING_RESPONSES_PUBLIC_MODEL}" \
+  '{base:$base,model:$model,classifier:$classifier,public_model:$public_model}' \
+  > "${FAKE_RESPONSES_HARNESS_RECORD}"
 SH
-  chmod 700 "${SOL_HARNESS}"
+  chmod 700 "${RESPONSES_HARNESS}"
 }
 
 main() {
@@ -248,39 +265,42 @@ main() {
 
   write_fake_bridge
   write_fake_harness
-  write_fake_sol_harness
+  write_fake_responses_harness
   mkdir -p "${SMOKE_DIR}"
 
   log "Running Copilot semantic-policy wrapper against a deterministic bridge catalog"
   env \
     COPILOT_GITHUB_TOKEN="${TOKEN}" \
+    LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT=low \
+    LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT=high \
     PROXY_BIN=/usr/bin/true \
     LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN="${BRIDGE_BIN}" \
     LIVE_POLICY_ROUTING_HARNESS="${HARNESS}" \
-    LIVE_POLICY_ROUTING_SOL_EFFORT_HARNESS="${SOL_HARNESS}" \
+    LIVE_POLICY_ROUTING_RESPONSES_EFFORT_HARNESS="${RESPONSES_HARNESS}" \
     LIVE_POLICY_ROUTING_SMOKE_DIR="${SMOKE_DIR}" \
     LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=1 \
     FAKE_BRIDGE_CHILD_PID_FILE="${CHILD_PID_FILE}" \
     FAKE_HARNESS_RECORD="${RECORD}" \
-    FAKE_SOL_HARNESS_RECORD="${SOL_RECORD}" \
+    FAKE_RESPONSES_HARNESS_RECORD="${RESPONSES_RECORD}" \
     "${WRAPPER}" >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
 
   [[ -s "${RECORD}" ]] || fail "fake harness did not record selected Copilot topology"
-  [[ -s "${SOL_RECORD}" ]] || fail "fake Sol effort harness did not record its bridge topology"
+  [[ -s "${RESPONSES_RECORD}" ]] || fail "fake Responses effort harness did not record its bridge topology"
   jq -e '
-    .lightweight == "gpt-5.4-mini"
-    and .classifier == "gpt-4.1"
-    and .primary == "gemini-3.1-pro-preview"
-    and .secondary == "claude-sonnet-4.6"
+    .lightweight == "gpt-5-mini"
+    and .classifier == "claude-haiku-4.5"
+    and .primary == "gpt-5-mini"
+    and .secondary == "claude-haiku-4.5"
   ' "${RECORD}" >/dev/null || fail "wrapper selected unexpected Copilot models"
 
   local base port child_pid
   base="$(jq -r '.base' "${RECORD}")"
   jq -e --arg base "${base%/v1}" '
     .base == $base
-    and .model == "gpt-5.6-sol"
-    and .public_model == "gpt-5.6-semantic"
-  ' "${SOL_RECORD}" >/dev/null || fail "wrapper supplied unexpected Sol effort harness configuration"
+    and .model == "gpt-5-mini"
+    and .classifier == "claude-haiku-4.5"
+    and .public_model == "vekil-live-semantic-effort"
+  ' "${RESPONSES_RECORD}" >/dev/null || fail "wrapper supplied unexpected Responses effort harness configuration"
   port="$(python3 - "${base}" <<'PY'
 import sys
 import urllib.parse
@@ -302,8 +322,37 @@ PY
     fi
   done
 
-  grep -Fq 'Copilot-backed semantic policy-routing and Sol low/max effort smokes passed.' "${STDERR_FILE}" || \
+  grep -Fq 'Copilot-backed semantic policy-routing and Responses low/high effort smokes passed.' "${STDERR_FILE}" || \
     fail "wrapper did not emit success marker"
+
+  log "Rejecting missing required models or capabilities before either inference harness runs"
+  local denied_rc catalog_case expected_error case_dir
+  for catalog_case in missing-mini missing-responses missing-high-effort missing-haiku; do
+    case_dir="${TMP_ROOT}/${catalog_case}"
+    mkdir -p "${case_dir}"
+    denied_rc=0
+    expected_error='must advertise gpt-5-mini with /responses plus low and high reasoning effort before inference'
+    if [[ "${catalog_case}" == missing-haiku ]]; then
+      expected_error='no approved classifier model'
+    fi
+    env -u LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL \
+      COPILOT_GITHUB_TOKEN="${TOKEN}" PROXY_BIN=/usr/bin/true \
+      FAKE_BRIDGE_CATALOG_CASE="${catalog_case}" \
+      LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN="${BRIDGE_BIN}" \
+      LIVE_POLICY_ROUTING_HARNESS="${HARNESS}" \
+      LIVE_POLICY_ROUTING_RESPONSES_EFFORT_HARNESS="${RESPONSES_HARNESS}" \
+      LIVE_POLICY_ROUTING_SMOKE_DIR="${case_dir}/smoke" \
+      LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=1 \
+      FAKE_BRIDGE_CHILD_PID_FILE="${CHILD_PID_FILE}" \
+      FAKE_HARNESS_RECORD="${case_dir}/harness.json" \
+      FAKE_RESPONSES_HARNESS_RECORD="${case_dir}/responses.json" \
+      "${WRAPPER}" >"${case_dir}/stdout" 2>"${case_dir}/stderr" || denied_rc=$?
+    [[ "${denied_rc}" -eq 1 ]] || fail "${catalog_case} exit=${denied_rc}, want 1"
+    grep -Fq "${expected_error}" "${case_dir}/stderr" || \
+      fail "wrapper did not explain ${catalog_case}"
+    [[ ! -e "${case_dir}/harness.json" && ! -e "${case_dir}/responses.json" ]] || \
+      fail "an inference harness ran after ${catalog_case} failed validation"
+  done
 
   log "Running deterministic Copilot quota-unavailable classification"
   local quota_rc=0 quota_port
@@ -313,19 +362,19 @@ PY
     PROXY_BIN=/usr/bin/true \
     LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN="${BRIDGE_BIN}" \
     LIVE_POLICY_ROUTING_HARNESS="${HARNESS}" \
-    LIVE_POLICY_ROUTING_SOL_EFFORT_HARNESS="${SOL_HARNESS}" \
+    LIVE_POLICY_ROUTING_RESPONSES_EFFORT_HARNESS="${RESPONSES_HARNESS}" \
     LIVE_POLICY_ROUTING_SMOKE_DIR="${QUOTA_SMOKE_DIR}" \
     LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=1 \
     FAKE_POLICY_HARNESS_MODE=quota \
     FAKE_BRIDGE_CHILD_PID_FILE="${CHILD_PID_FILE}" \
     FAKE_HARNESS_RECORD="${QUOTA_RECORD}" \
-    FAKE_SOL_HARNESS_RECORD="${QUOTA_SOL_RECORD}" \
+    FAKE_RESPONSES_HARNESS_RECORD="${QUOTA_RESPONSES_RECORD}" \
     "${WRAPPER}" >"${QUOTA_STDOUT_FILE}" 2>"${QUOTA_STDERR_FILE}"
   quota_rc=$?
   set -e
 
   [[ "${quota_rc}" -eq 75 ]] || fail "quota-unavailable wrapper exit=${quota_rc}, want 75"
-  [[ ! -e "${QUOTA_SOL_RECORD}" ]] || fail "Sol harness ran after Copilot billing became unavailable"
+  [[ ! -e "${QUOTA_RESPONSES_RECORD}" ]] || fail "Responses harness ran after Copilot billing became unavailable"
   grep -Fq 'Copilot returned HTTP 402; live policy-routing coverage is temporarily unavailable.' \
     "${QUOTA_STDERR_FILE}" || fail "wrapper did not emit quota-unavailable marker"
   quota_port="$(sed -nE 's/.*Starting Copilot bridge at http:\/\/127\.0\.0\.1:([0-9]+).*/\1/p' "${QUOTA_STDERR_FILE}" | head -1)"

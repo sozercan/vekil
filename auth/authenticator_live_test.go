@@ -147,7 +147,7 @@ func TestLiveEnvAccessTokenDirectBearer(t *testing.T) {
 	}
 	model := selectLiveCopilotResponsesModel(modelsResponse.Data)
 	if model == "" {
-		t.Fatal("live Copilot catalog did not advertise a /responses model")
+		t.Fatal("live Copilot catalog did not advertise an approved lightweight /responses model")
 	}
 
 	responsesToken, err := a.GetResponsesToken(ctx)
@@ -241,20 +241,19 @@ func TestSelectLiveCopilotResponsesModel(t *testing.T) {
 			want: "gpt-5.6-luna",
 		},
 		{
-			name: "falls back to advertised model",
+			name: "rejects unapproved fallback",
 			models: []liveCopilotModel{
 				{ID: "gpt-5.6-luna", SupportedEndpoints: []string{"/responses"}, ModelPickerEnabled: &disabled},
 				{ID: "future-responses-model", SupportedEndpoints: []string{"/responses"}},
 			},
-			want: "future-responses-model",
 		},
 		{
 			name: "skips policy-disabled model",
 			models: []liveCopilotModel{
 				liveCopilotModelWithPolicyState("gpt-5.6-luna", "disabled"),
-				{ID: "future-responses-model", SupportedEndpoints: []string{"/responses"}},
+				{ID: "gpt-5-mini", SupportedEndpoints: []string{"/responses"}},
 			},
-			want: "future-responses-model",
+			want: "gpt-5-mini",
 		},
 		{
 			name: "rejects missing responses support",
@@ -309,9 +308,8 @@ func decodeLiveCopilotJSONResponse(resp *http.Response, target any) error {
 
 func selectLiveCopilotResponsesModel(models []liveCopilotModel) string {
 	const responsesEndpoint = "/responses"
-	preferred := []string{"gpt-5.6-luna", "gpt-5.4-mini", "gpt-5-mini"}
+	preferred := []string{"gpt-5.6-luna", "gpt-5-mini", "gpt-5.4-mini"}
 	available := make(map[string]struct{}, len(models))
-	fallback := ""
 	for _, model := range models {
 		id := strings.TrimSpace(model.ID)
 		if id == "" || (model.ModelPickerEnabled != nil && !*model.ModelPickerEnabled) ||
@@ -320,16 +318,13 @@ func selectLiveCopilotResponsesModel(models []liveCopilotModel) string {
 			continue
 		}
 		available[id] = struct{}{}
-		if fallback == "" {
-			fallback = id
-		}
 	}
 	for _, model := range preferred {
 		if _, ok := available[model]; ok {
 			return model
 		}
 	}
-	return fallback
+	return ""
 }
 
 func liveCopilotModelWithPolicyState(id, state string) liveCopilotModel {

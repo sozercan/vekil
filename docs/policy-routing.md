@@ -375,11 +375,11 @@ Mode-specific behavior:
 The required `semantic-policy-e2e` pull-request check runs two complementary credentialed matrices against GitHub Copilot:
 
 - a broad native-Chat matrix covering modes, tools, streaming, within-tier failover, identity, telemetry, privacy, and cleanup; and
-- an exact Responses-native Sol matrix in which both tiers target `gpt-5.6-sol` through public `POST /v1/responses`.
+- a Responses effort matrix in which both terminal tiers target `gpt-5-mini` through public `POST /v1/responses`, with Haiku handling classification through native Chat.
 
-The focused Sol matrix sends deliberately conflicting client effort values. A simple prompt supplies client `max` but must produce a successful classifier decision and a terminal `/v1/responses` request with `reasoning.effort: low`. A complex cross-module prompt supplies client `low` but must produce a successful classifier decision and terminal `reasoning.effort: max`. The capture shim records only request kind, path, model, effort, stream mode, and status; it also verifies every classifier request omits terminal effort and every public response retains `gpt-5.6-semantic` identity.
+The focused Responses matrix sends deliberately conflicting client effort values. A simple prompt supplies client `high` but must produce a successful classifier decision and a terminal `/v1/responses` request with `reasoning.effort: low`. A complex cross-module prompt supplies client `low` but must produce a successful classifier decision and terminal `reasoning.effort: high`. The capture shim records only request metadata. It verifies that Haiku classifier requests preserve `temperature: 0` and omit unsupported effort and store fields, GPT-5-mini terminal requests preserve `store: false`, and every public response retains `vekil-live-semantic-effort` identity.
 
-[`scripts/live-policy-routing-sol-effort-smoke.sh`](../scripts/live-policy-routing-sol-effort-smoke.sh) implements the credentialed check. [`scripts/tests/live-policy-routing-sol-effort-smoke-test.sh`](../scripts/tests/live-policy-routing-sol-effort-smoke-test.sh) runs the same policy topology against a deterministic local Responses server and the real Vekil binary. Detailed local commands and CI wiring are documented in [Development](development.md).
+[`scripts/live-policy-routing-responses-effort-smoke.sh`](../scripts/live-policy-routing-responses-effort-smoke.sh) implements the credentialed check. [`scripts/tests/live-policy-routing-responses-effort-smoke-test.sh`](../scripts/tests/live-policy-routing-responses-effort-smoke-test.sh) runs the same policy topology against a deterministic local Chat/Responses server and the real Vekil binary. Detailed local commands and CI wiring are documented in [Development](development.md).
 
 ## Catalog and output identity
 

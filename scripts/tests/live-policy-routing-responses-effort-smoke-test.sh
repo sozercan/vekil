@@ -8,8 +8,8 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || fail "missing required comman
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-SMOKE_SCRIPT="${REPO_ROOT}/scripts/live-policy-routing-sol-effort-smoke.sh"
-TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vekil-sol-effort-smoke-test.XXXXXX")"
+SMOKE_SCRIPT="${REPO_ROOT}/scripts/live-policy-routing-responses-effort-smoke.sh"
+TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vekil-responses-effort-smoke-test.XXXXXX")"
 PROXY_BIN="${TMP_ROOT}/vekil"
 BRIDGE_SCRIPT="${TMP_ROOT}/fake-bridge.py"
 BRIDGE_STATE="${TMP_ROOT}/bridge-state.json"
@@ -103,17 +103,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             self.send_json(200, {
                 "object": "list",
-                "data": [{
-                    "id": "gpt-5.6-sol",
-                    "supported_endpoints": ["/responses"],
-                    "capabilities": {"supports": {"reasoning_effort": ["none", "low", "medium", "high", "xhigh", "max"]}},
-                }],
+                "data": [
+                    {
+                        "id": "gpt-5-mini",
+                        "supported_endpoints": ["/responses"],
+                        "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}},
+                    },
+                    {"id": "claude-haiku-4.5", "supported_endpoints": ["/chat/completions"]},
+                ],
             })
             return
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/v1/responses":
+        if self.path not in {"/v1/responses", "/v1/chat/completions"}:
             with lock:
                 state["errors"].append("path_invalid")
                 state["requests"].append({"kind": "invalid", "path": self.path})
@@ -128,15 +131,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         is_classifier = classifier_tool(body.get("tools", []))
         reasoning = body.get("reasoning") if isinstance(body, dict) else None
-        effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else body.get("reasoning_effort")
         errors = []
-        if body.get("model") != "gpt-5.6-sol":
+        expected_model = "claude-haiku-4.5" if is_classifier else "gpt-5-mini"
+        expected_path = "/v1/chat/completions" if is_classifier else "/v1/responses"
+        if body.get("model") != expected_model:
             errors.append("model_invalid")
-        if is_classifier and effort is not None:
+        if self.path != expected_path:
+            errors.append("path_invalid")
+        if is_classifier and ("reasoning" in body or "reasoning_effort" in body):
             errors.append("classifier_effort_present")
-        if is_classifier and body.get("store") is not False:
-            errors.append("classifier_store_not_false")
-        if not is_classifier and effort not in {"low", "max"}:
+        if is_classifier and "store" in body:
+            errors.append("classifier_store_present")
+        if is_classifier and (type(body.get("temperature")) not in (int, float) or body["temperature"] != 0):
+            errors.append("classifier_temperature_not_zero")
+        if not is_classifier and effort not in {"low", "high"}:
             errors.append("terminal_effort_invalid")
         with lock:
             state["errors"].extend(errors)
@@ -148,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if is_classifier:
             text = json.dumps(body, separators=(",", ":"))
-            complex_task = "SOL_MAX_TASK_SENTINEL" in text
+            complex_task = "RESPONSES_HIGH_TASK_SENTINEL" in text
             signals = {
                 "abstain": False,
                 "turn_type": "planning" if complex_task else "lookup",
@@ -159,19 +168,25 @@ class Handler(BaseHTTPRequestHandler):
                 "risk_level": "high" if complex_task else "low",
             }
             self.send_json(200, {
-                "id": "resp-classifier",
-                "object": "response",
-                "status": "completed",
-                "model": "gpt-5.6-sol",
-                "output": [{
-                    "type": "function_call",
-                    "id": "fc-classifier",
-                    "call_id": "call-classifier",
-                    "name": "emit_policy_signals",
-                    "arguments": json.dumps(signals, separators=(",", ":")),
-                    "status": "completed",
+                "id": "chatcmpl-classifier",
+                "object": "chat.completion",
+                "model": "claude-haiku-4.5",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-classifier",
+                            "type": "function",
+                            "function": {
+                                "name": "emit_policy_signals",
+                                "arguments": json.dumps(signals, separators=(",", ":")),
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
                 }],
-                "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
             })
             return
 
@@ -179,13 +194,13 @@ class Handler(BaseHTTPRequestHandler):
             "id": "resp-terminal",
             "object": "response",
             "status": "completed",
-            "model": "gpt-5.6-sol",
+            "model": "gpt-5-mini",
             "output": [{
                 "type": "message",
                 "id": "msg-terminal",
                 "status": "completed",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "SOL_FAKE_OK"}],
+                "content": [{"type": "output_text", "text": "RESPONSES_FAKE_OK"}],
             }],
             "usage": {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
         })
@@ -208,7 +223,7 @@ main() {
   require_cmd go
   require_cmd jq
   require_cmd python3
-  [[ -x "${SMOKE_SCRIPT}" ]] || fail "missing Sol effort smoke: ${SMOKE_SCRIPT}"
+  [[ -x "${SMOKE_SCRIPT}" ]] || fail "missing Responses effort smoke: ${SMOKE_SCRIPT}"
   bash -n "${SMOKE_SCRIPT}"
 
   log "Building isolated Vekil binary"
@@ -224,28 +239,33 @@ main() {
   done
   port_is_open "${bridge_port}" || fail "fake bridge did not start"
 
-  log "Running exact Sol low/max semantic effort smoke against deterministic bridge"
+  log "Running Responses low/high semantic effort smoke against deterministic bridge"
   PROXY_BIN="${PROXY_BIN}" \
-  LIVE_POLICY_ROUTING_SOL_BRIDGE_BASE_URL="http://127.0.0.1:${bridge_port}" \
-  LIVE_POLICY_ROUTING_SOL_SMOKE_DIR="${SMOKE_DIR}" \
-  LIVE_POLICY_ROUTING_SOL_KEEP_ARTIFACTS=1 \
+  LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL="http://127.0.0.1:${bridge_port}" \
+  LIVE_POLICY_ROUTING_RESPONSES_SMOKE_DIR="${SMOKE_DIR}" \
+  LIVE_POLICY_ROUTING_RESPONSES_KEEP_ARTIFACTS=1 \
   SMOKE_STARTUP_TIMEOUT_SECONDS=20 \
   SMOKE_CURL_MAX_TIME_SECONDS=20 \
   "${SMOKE_SCRIPT}" > "${STDOUT_FILE}" 2> "${STDERR_FILE}"
 
+  # Startup preflight plus one classifier request for each terminal request.
   jq -e '
     (.errors | length) == 0
     and ([.requests[] | select(.kind == "classifier" and .effort != null)] | length) == 0
-    and ([.requests[] | select(.kind == "classifier" and .store != false)] | length) == 0
-    and ([.requests[] | select(.kind == "terminal") | .effort] | sort) == ["low", "max"]
-    and ([.requests[] | select(.path != "/v1/responses")] | length) == 0
-    and ([.requests[] | select(.model != "gpt-5.6-sol")] | length) == 0
-  ' "${BRIDGE_STATE}" >/dev/null || fail "fake bridge observed invalid classifier or terminal requests"
+    and ([.requests[] | select(.kind == "classifier" and .store != null)] | length) == 0
+    and ([.requests[] | select(.kind == "classifier")] | length) == 3
+    and ([.requests[] | select(.kind == "classifier" and (.path != "/v1/chat/completions" or .model != "claude-haiku-4.5"))] | length) == 0
+    and ([.requests[] | select(.kind == "terminal") | .effort] | sort) == ["high", "low"]
+    and ([.requests[] | select(.kind == "terminal" and (.path != "/v1/responses" or .model != "gpt-5-mini" or .store != false))] | length) == 0
+  ' "${BRIDGE_STATE}" >/dev/null || {
+    cat "${BRIDGE_STATE}" >&2
+    fail "fake bridge observed invalid classifier or terminal requests"
+  }
 
-  grep -Fq 'PASS sol-simple-conflicting-max-routed-low' "${SMOKE_DIR}/summary.txt" || fail "missing lightweight override marker"
-  grep -Fq 'PASS sol-complex-conflicting-low-routed-max' "${SMOKE_DIR}/summary.txt" || fail "missing powerful override marker"
-  grep -Fq 'Live GPT-5.6 Sol semantic low/max effort smoke passed.' "${STDERR_FILE}" || fail "missing success marker"
-  log "Deterministic Sol semantic effort smoke passed"
+  grep -Fq 'PASS responses-simple-conflicting-high-routed-low' "${SMOKE_DIR}/summary.txt" || fail "missing lightweight override marker"
+  grep -Fq 'PASS responses-complex-conflicting-low-routed-high' "${SMOKE_DIR}/summary.txt" || fail "missing powerful override marker"
+  grep -Fq 'Live GPT-5-mini semantic low/high effort smoke passed.' "${STDERR_FILE}" || fail "missing success marker"
+  log "Deterministic Responses semantic effort smoke passed"
 }
 
 main "$@"

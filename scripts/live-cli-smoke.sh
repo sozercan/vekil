@@ -249,6 +249,15 @@ cleanup() {
     active_pid=""
     active_pgid=""
   fi
+  if [[ "${proxy_listen_confirmed}" == "1" && -s "${MODELS_JSON}" ]]; then
+    local usage_url=""
+    if [[ -n "${proxy_pid}" ]] && process_is_running "${proxy_pid}"; then
+      usage_url="${PROXY_BASE_URL}"
+    fi
+    "$(python_command)" "${SCRIPT_DIR}/live-smoke-usage.py" \
+      --url "${usage_url}" --label "CLI smoke" --output "${SMOKE_DIR}/usage.json" \
+      || log "Unable to publish smoke usage"
+  fi
   if [[ -n "${proxy_pgid}" ]]; then
     terminate_process_group "${proxy_pid}" "${proxy_pgid}"
     proxy_pid=""
@@ -292,11 +301,12 @@ model_supports_endpoint() {
 
 pick_model() {
   local family="$1"
-  shift
+  local endpoint="$2"
+  shift 2
 
   local candidate
   for candidate in "$@"; do
-    if model_exists "${candidate}"; then
+    if model_supports_endpoint "${candidate}" "${endpoint}"; then
       printf '%s\n' "${candidate}"
       return 0
     fi
@@ -304,7 +314,7 @@ pick_model() {
 
   log "Available models from ${PROXY_BASE_URL}/v1/models:"
   jq -r '.data[].id' "${MODELS_JSON}" >&2
-  die "unable to find a ${family} model from preferred list: $*"
+  die "no approved ${family} model supports ${endpoint}; allowed models: $*"
 }
 
 pick_optional_gemini_model() {
@@ -317,24 +327,7 @@ pick_optional_gemini_model() {
     fi
   done
 
-  # The Gemini CLI hits Gemini-native proxy routes, but Vekil translates
-  # those requests to upstream OpenAI chat completions internally, so the
-  # selected model must advertise /chat/completions support.
-  candidate="$(jq -r '
-    [
-      .data[]?
-      | select((.id | type) == "string")
-      | select(.id | startswith("gemini-"))
-      | select((.supported_endpoints // []) | index("/chat/completions"))
-      | .id
-    ][0] // ""
-  ' "${MODELS_JSON}")"
-  if [[ -n "${candidate}" ]]; then
-    printf '%s\n' "${candidate}"
-    return 0
-  fi
-
-  log "Skipping Gemini smoke: no Gemini model with /chat/completions support is listed by ${PROXY_BASE_URL}/v1/models."
+  log "Skipping Gemini smoke: no approved Flash model with /chat/completions support is listed by ${PROXY_BASE_URL}/v1/models."
   return 0
 }
 
@@ -576,15 +569,18 @@ run_claude_command() {
   cd "${case_dir}"
   # This baseline compatibility smoke does not exercise Claude's experimental
   # Advisor Tool, whose beta header is not accepted by the Copilot endpoint.
+  # Use Anthropic's version spelling so Claude recognizes Haiku's capabilities;
+  # Vekil normalizes it back to the Copilot catalog ID. File reads need no thinking.
   HOME="${home_dir}" \
   ANTHROPIC_BASE_URL="${PROXY_BASE_URL}" \
   ANTHROPIC_API_KEY=dummy \
   CLAUDE_CODE_DISABLE_ADVISOR_TOOL="${CLAUDE_CODE_DISABLE_ADVISOR_TOOL:-1}" \
+  MAX_THINKING_TOKENS=0 \
   claude \
     --dangerously-skip-permissions \
     --print \
     --output-format text \
-    --model "${model}" \
+    --model "${model//./-}" \
     "${PROMPT}" \
     > "${output_file}" < /dev/null
 }
@@ -1179,9 +1175,10 @@ main() {
 
   fetch_models
 
-  CODEX_MODEL="$(pick_model "Codex/OpenAI" gpt-5.4 gpt-5.3-codex gpt-5.2-codex gpt-5.1-codex gpt-5.1 gpt-5-mini gpt-4.1 gpt-4o)"
-  CLAUDE_MODEL="$(pick_model "Claude" claude-sonnet-5 claude-opus-4.8 claude-opus-4.7 claude-opus-4.6 claude-sonnet-4.6 claude-sonnet-4.5 claude-haiku-4.5 claude-sonnet-4)"
-  GEMINI_MODEL="$(pick_optional_gemini_model gemini-3.1-pro-preview gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview)"
+  # Deliberate allowlists: catalog changes must not silently increase spend.
+  CODEX_MODEL="$(pick_model "Codex/OpenAI" /responses gpt-5-mini)"
+  CLAUDE_MODEL="$(pick_model "Claude" /chat/completions claude-haiku-4.5)"
+  GEMINI_MODEL="$(pick_optional_gemini_model gemini-3.8-flash gemini-3.7-flash gemini-3.6-flash)"
 
   if [[ -n "${GEMINI_MODEL}" ]]; then
     require_cmd gemini

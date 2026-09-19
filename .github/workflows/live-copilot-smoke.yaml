@@ -2,14 +2,16 @@ name: Live Copilot Smoke
 
 on:
   workflow_dispatch:
-  push:
+  pull_request:
     branches: [main]
+  schedule:
+    - cron: "31 9 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  group: live-copilot-smoke-${{ github.ref }}
+  group: live-copilot-smoke-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -19,15 +21,34 @@ jobs:
     env:
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
     steps:
-      - name: Require live smoke credential
+      - name: Decide whether live Copilot smoke can run
         id: gate
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork || false }}
+          ACTOR: ${{ github.actor }}
         run: |
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK}" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping Copilot live smoke for fork pull requests because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${ACTOR}" = "dependabot[bot]" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Skipping Copilot live smoke for Dependabot because repository secrets are not exposed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
             echo "COPILOT_GITHUB_TOKEN repository secret is required for live smoke checks." >&2
             exit 1
           fi
 
           echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Explain skipped Copilot live smoke
+        if: steps.gate.outputs.run != 'true'
+        run: echo "${{ steps.gate.outputs.reason }}"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.gate.outputs.run == 'true'

@@ -177,6 +177,15 @@ dump_proxy_log() {
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
+  if [[ "${proxy_listen_confirmed}" == "1" && -s "${MODELS_JSON}" ]]; then
+    local usage_url=""
+    if [[ -n "${proxy_pid}" ]] && process_is_running "${proxy_pid}"; then
+      usage_url="${PROXY_BASE_URL}"
+    fi
+    "$(python_command)" "${SCRIPT_DIR}/live-smoke-usage.py" \
+      --url "${usage_url}" --label "Compaction" --output "${SMOKE_DIR}/usage.json" \
+      || log "Unable to publish smoke usage"
+  fi
   if [[ -n "${proxy_pgid}" ]]; then
     terminate_process_group "${proxy_pid}" "${proxy_pgid}"
     proxy_pid=""
@@ -202,17 +211,14 @@ seed_access_token() {
   chmod 600 "${PROXY_TOKEN_DIR}/access-token"
 }
 
-model_exists() {
-  jq -e --arg model "$1" '.data[]? | select(.id == $model)' "${MODELS_JSON}" >/dev/null
-}
-
 pick_model() {
   local family="$1"
   shift
 
   local candidate
   for candidate in "$@"; do
-    if model_exists "${candidate}"; then
+    if jq -e --arg model "${candidate}" '.data[]? | select(.id == $model)
+        | (.supported_endpoints // []) | index("/responses")' "${MODELS_JSON}" >/dev/null; then
       printf '%s\n' "${candidate}"
       return 0
     fi
@@ -220,7 +226,7 @@ pick_model() {
 
   log "Available models from ${PROXY_BASE_URL}/v1/models:"
   jq -r '.data[].id' "${MODELS_JSON}" >&2
-  die "unable to find a ${family} model from preferred list: $*"
+  die "no approved ${family} Responses model is available; allowed models: $*"
 }
 
 start_proxy() {
@@ -446,7 +452,7 @@ main() {
 
   fetch_models
 
-  COMPACT_MODEL="$(pick_model "Codex/OpenAI" gpt-5.4 gpt-5.3-codex gpt-5.2-codex gpt-5.1-codex gpt-5.1 gpt-5-mini gpt-4.1 gpt-4o)"
+  COMPACT_MODEL="$(pick_model "Codex/OpenAI" gpt-5-mini)"
   log "Selected compact model: ${COMPACT_MODEL}"
 
   log "Posting live compact request"
