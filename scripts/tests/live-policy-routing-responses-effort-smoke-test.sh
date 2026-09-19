@@ -143,6 +143,8 @@ class Handler(BaseHTTPRequestHandler):
             errors.append("classifier_effort_present")
         if is_classifier and "store" in body:
             errors.append("classifier_store_present")
+        if is_classifier and (type(body.get("temperature")) not in (int, float) or body["temperature"] != 0):
+            errors.append("classifier_temperature_not_zero")
         if not is_classifier and effort not in {"low", "high"}:
             errors.append("terminal_effort_invalid")
         with lock:

@@ -296,6 +296,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "reasoning_present": "reasoning" in body or "reasoning_effort" in body,
             "store": body.get("store"),
             "store_present": "store" in body,
+            "temperature_zero": type(body.get("temperature")) in (int, float) and body["temperature"] == 0,
             "stream": body.get("stream"),
         }
         if self.path not in {"/v1/responses", "/v1/chat/completions"}:
@@ -372,7 +373,7 @@ def route(route_id, effort=None, classifier=False):
         "id": route_id,
         "exposure": "internal",
         "endpoints": ["/chat/completions"] if classifier else ["/responses"],
-        "drop_sampling_params": True,
+        "drop_sampling_params": not classifier,
         "targets": [{"id": route_id + "-target", "provider": "bridge", "upstream_model": classifier_model if classifier else terminal_model}],
         "routing": {"mode": "primary_only", "max_target_attempts": 1, "max_upstream_sends": 1},
     }
@@ -534,6 +535,8 @@ if not classifiers:
     raise SystemExit("no classifier request was captured")
 if any(event.get("reasoning_present") for event in classifiers):
     raise SystemExit(f"classifier request received terminal effort: {classifiers}")
+if any(not event.get("temperature_zero") for event in classifiers):
+    raise SystemExit(f"classifier request did not preserve temperature=0: {classifiers}")
 if any(event.get("store_present") for event in classifiers):
     raise SystemExit(f"classifier request received unsupported store field: {classifiers}")
 if any(event.get("path") != "/v1/chat/completions" or event.get("model") != classifier_model for event in classifiers):

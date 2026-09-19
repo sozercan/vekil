@@ -41,6 +41,8 @@
 #   LIVE_POLICY_ROUTING_ALLOW_INSECURE_HTTP=1   local development only
 #   LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=0        delete artifacts after success
 #   LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=false
+#   LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS=true
+#     Set false to preserve the classifier's temperature=0 when supported.
 #   LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT
 #   LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT
 #     Set both tier efforts or omit both for models without effort support.
@@ -359,6 +361,10 @@ validate_inputs() {
     true|false) ;;
     *) die "LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED must be true or false" ;;
   esac
+  case "${LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS:-true}" in
+    true|false) ;;
+    *) die "LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS must be true or false" ;;
+  esac
   case "${allow_provider_retention}" in
     true|false) ;;
     *) die "LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION must be true or false" ;;
@@ -596,6 +602,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         messages_valid = body_object and isinstance(body.get("messages"), list) and bool(body["messages"])
         no_sampling = body_object and "temperature" not in body and "top_p" not in body
         classifier_shape = body_object and self._has_classifier_tool(body)
+        sampling_valid = no_sampling
+        if classifier_shape and not self.server.classifier_drop_sampling_params:
+            sampling_valid = type(body.get("temperature")) in (int, float) and body["temperature"] == 0 and "top_p" not in body
         kind = "classifier" if classifier_shape else "terminal"
         model_expected = self.server.classifier_model if kind == "classifier" else self.server.primary_model
         model_valid = body_object and body.get("model") == model_expected
@@ -613,8 +622,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 errors.append("model_invalid")
             if not messages_valid:
                 errors.append("messages_invalid")
-            if not no_sampling:
-                errors.append("sampling_fields_not_dropped")
+            if not sampling_valid:
+                errors.append("sampling_fields_invalid")
             if kind == "classifier":
                 if self.server.classifier_no_store_supported:
                     if body.get("store") is not False:
@@ -638,7 +647,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "content_type_valid": content_type_valid,
             "model_valid": model_valid,
             "messages_valid": messages_valid,
-            "no_sampling": no_sampling,
+            "sampling_valid": sampling_valid,
             "path": incoming.path,
             "stream": body.get("stream") if body_object else None,
         }
@@ -657,7 +666,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "content_type_valid": inspection["content_type_valid"],
             "model_valid": inspection["model_valid"],
             "messages_valid": inspection["messages_valid"],
-            "sampling_fields_absent": inspection["no_sampling"],
+            "sampling_fields_valid": inspection["sampling_valid"],
             "stream": inspection["stream"],
             "status": status,
         }
@@ -780,6 +789,7 @@ def main():
     parser.add_argument("--classifier-model", required=True)
     parser.add_argument("--classifier-max-tokens", type=int, required=True)
     parser.add_argument("--classifier-no-store-supported", choices=("true", "false"), required=True)
+    parser.add_argument("--classifier-drop-sampling-params", choices=("true", "false"), required=True)
     parser.add_argument("--expected-auth-header", choices=("api-key", "authorization"), required=True)
     parser.add_argument("--expected-auth-sha256", required=True)
     parser.add_argument("--injected-request-id", required=True)
@@ -794,6 +804,7 @@ def main():
     server.classifier_model = args.classifier_model
     server.classifier_max_tokens = args.classifier_max_tokens
     server.classifier_no_store_supported = args.classifier_no_store_supported == "true"
+    server.classifier_drop_sampling_params = args.classifier_drop_sampling_params == "true"
     server.expected_auth_header = args.expected_auth_header
     server.expected_auth_sha256 = args.expected_auth_sha256
     server.injected_request_id = args.injected_request_id
@@ -855,6 +866,7 @@ start_powerful_primary_shim() {
         --classifier-model "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" \
         --classifier-max-tokens 256 \
         --classifier-no-store-supported "${LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED}" \
+        --classifier-drop-sampling-params "${LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS:-true}" \
         --expected-auth-header "${expected_auth_header}" \
         --expected-auth-sha256 "${expected_auth_sha256}" \
         --injected-request-id "${INJECTED_REQUEST_ID}" \
@@ -939,6 +951,7 @@ def route(route_id, name, targets, *, purpose=None, failover=False, reasoning_ef
         value["reasoning_effort"] = [reasoning_effort]
     if purpose:
         value["internal_purpose"] = purpose
+        value["drop_sampling_params"] = os.environ.get("LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS", "true") == "true"
         value.pop("parallel_tool_calls", None)
         value.pop("vision", None)
     return value
@@ -1061,6 +1074,8 @@ if classifier_provider.get("classifier_no_store_supported") is not expected_no_s
 if profile["data_policy"].get("allow_provider_retention") is not expected_retention:
     raise SystemExit("generated config has the wrong allow_provider_retention value")
 routes = {route["id"]: route for route in config["model_routes"]}
+if routes["live-semantic-classifier"]["drop_sampling_params"] != (os.environ.get("LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS", "true") == "true"):
+    raise SystemExit("generated config has the wrong classifier sampling policy")
 for name in ("lightweight", "powerful"):
     effort = os.environ.get("LIVE_POLICY_ROUTING_" + name.upper() + "_REASONING_EFFORT")
     route_id = "live-semantic-" + name

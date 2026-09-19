@@ -27,6 +27,7 @@ CLASSIFIER_MODEL="local-classifier-model"
 PUBLIC_MODEL="vekil-local-policy-smoke"
 LIGHTWEIGHT_REASONING_EFFORT="low"
 POWERFUL_REASONING_EFFORT="max"
+CLASSIFIER_DROP_SAMPLING_PARAMS="true"
 
 log() {
   printf '==> %s\n' "$*" >&2
@@ -208,6 +209,7 @@ parser.add_argument("--role", choices=("lightweight", "primary", "secondary"), r
 parser.add_argument("--terminal-model", required=True)
 parser.add_argument("--classifier-model", default="")
 parser.add_argument("--reasoning-effort", required=True)
+parser.add_argument("--classifier-drop-sampling-params", choices=("true", "false"), required=True)
 parser.add_argument("--secret", required=True)
 args = parser.parse_args()
 
@@ -429,8 +431,11 @@ class Handler(BaseHTTPRequestHandler):
             errors.append("model_invalid")
         if not isinstance(body.get("messages"), list) or not body.get("messages"):
             errors.append("messages_invalid")
-        if "temperature" in body or "top_p" in body:
-            errors.append("sampling_fields_not_dropped")
+        sampling_valid = "temperature" not in body and "top_p" not in body
+        if is_classifier and args.classifier_drop_sampling_params == "false":
+            sampling_valid = type(body.get("temperature")) in (int, float) and body["temperature"] == 0 and "top_p" not in body
+        if not sampling_valid:
+            errors.append("sampling_fields_invalid")
         if "max_tokens" in body:
             errors.append("max_tokens_not_rewritten")
         if not isinstance(body.get("max_completion_tokens"), int):
@@ -471,7 +476,7 @@ class Handler(BaseHTTPRequestHandler):
             "tool_names": tool_names,
             "tool_choice_kind": "object" if isinstance(body.get("tool_choice"), dict) else body.get("tool_choice"),
             "selected_powerful": selected_powerful,
-            "sampling_fields_absent": "temperature" not in body and "top_p" not in body,
+            "sampling_fields_valid": sampling_valid,
             "max_completion_tokens": body.get("max_completion_tokens"),
             "reasoning_effort": body.get("reasoning_effort"),
             "valid": not errors,
@@ -556,6 +561,7 @@ start_mock_server() {
     --terminal-model "${terminal_model}" \
     --classifier-model "${classifier_model}" \
     --reasoning-effort "${effort}" \
+    --classifier-drop-sampling-params "${CLASSIFIER_DROP_SAMPLING_PARAMS}" \
     --secret "${secret}" \
     >"${case_dir}/server.log" 2>&1 &
   pid=$!
@@ -649,7 +655,8 @@ assert_generated_config() {
     --arg secondary_model "${SECONDARY_MODEL}" \
     --arg classifier_model "${CLASSIFIER_MODEL}" \
     --arg lightweight_effort "${LIGHTWEIGHT_REASONING_EFFORT}" \
-    --arg powerful_effort "${POWERFUL_REASONING_EFFORT}" '
+    --arg powerful_effort "${POWERFUL_REASONING_EFFORT}" \
+    --argjson classifier_drop_sampling "${CLASSIFIER_DROP_SAMPLING_PARAMS}" '
       def tier($name; $effort):
         {route: ("live-semantic-" + $name)}
         + (if $effort == "" then {} else {reasoning_effort: $effort} end);
@@ -670,6 +677,7 @@ assert_generated_config() {
       and (.model_routes[] | select(.id == "live-semantic-lightweight").targets[0].upstream_model) == $lightweight_model
       and (.model_routes[] | select(.id == "live-semantic-powerful").targets | map(.upstream_model)) == [$primary_model,$secondary_model]
       and (.model_routes[] | select(.id == "live-semantic-classifier").targets[0].upstream_model) == $classifier_model
+      and (.model_routes[] | select(.id == "live-semantic-classifier").drop_sampling_params) == $classifier_drop_sampling
       and (.model_routes[] | select(.id == "live-semantic-lightweight") | route_effort($lightweight_effort))
       and (.model_routes[] | select(.id == "live-semantic-powerful") | route_effort($powerful_effort))
       and ([.model_routes[] | select(has("default_reasoning_effort"))] | length) == 0
@@ -699,7 +707,7 @@ assert_mock_state() {
     and ([.requests[] | select(.valid != true)] | length) == 0
     and ([.requests[] | select(.kind == "classifier")] | length) == $classifiers
     and ([.requests[] | select(.kind == "terminal")] | length) == $terminals
-    and ([.requests[] | select(.sampling_fields_absent != true)] | length) == 0
+    and ([.requests[] | select(.sampling_fields_valid != true)] | length) == 0
     and ([.requests[] | select(.model_valid != true)] | length) == 0
   ' "${state}" >/dev/null || fail "${role} mock observed unexpected request shape or count"
 }
@@ -739,6 +747,7 @@ main() {
     omitted)
       LIGHTWEIGHT_REASONING_EFFORT=""
       POWERFUL_REASONING_EFFORT=""
+      CLASSIFIER_DROP_SAMPLING_PARAMS="false"
       ;;
     *) fail "reasoning-effort test mode must be configured or omitted" ;;
   esac
@@ -787,6 +796,7 @@ main() {
     LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT="${POWERFUL_REASONING_EFFORT}" \
     LIVE_POLICY_ROUTING_CLASSIFIER_MODEL="${CLASSIFIER_MODEL}" \
     LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED=true \
+    LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS="${CLASSIFIER_DROP_SAMPLING_PARAMS}" \
     SMOKE_STARTUP_TIMEOUT_SECONDS=20 \
     SMOKE_VALIDATE_TIMEOUT_SECONDS=20 \
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
