@@ -55,6 +55,7 @@ POLICY_PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 COPILOT_BRIDGE_BIN="${LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN:-${POLICY_PROXY_BIN}}"
 POLICY_HARNESS="${LIVE_POLICY_ROUTING_HARNESS:-${SCRIPT_DIR}/live-policy-routing-smoke.sh}"
 RESPONSES_EFFORT_HARNESS="${LIVE_POLICY_ROUTING_RESPONSES_EFFORT_HARNESS:-${SCRIPT_DIR}/live-policy-routing-responses-effort-smoke.sh}"
+RESPONSES_MODEL="gpt-5-mini"
 SMOKE_STARTUP_TIMEOUT_SECONDS="${SMOKE_STARTUP_TIMEOUT_SECONDS:-90}"
 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS="${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS:-5}"
 SMOKE_CURL_MAX_TIME_SECONDS="${SMOKE_CURL_MAX_TIME_SECONDS:-180}"
@@ -330,6 +331,15 @@ fetch_copilot_models() {
     [.data[]? | select(((.supported_endpoints // []) | index("/chat/completions")) != null)]
     | length >= 2
   ' "${BRIDGE_MODELS}" >/dev/null || die "Copilot bridge must advertise two native-Chat models for failover"
+  # Validate the focused check before the broad matrix sends paid requests.
+  jq -e --arg model "${RESPONSES_MODEL}" '
+    [.data[]?
+      | select(.id == $model)
+      | select(((.supported_endpoints // []) | index("/responses")) != null)
+      | select(((.capabilities.supports.reasoning_effort // []) | index("low")) != null)
+      | select(((.capabilities.supports.reasoning_effort // []) | index("high")) != null)
+    ] | length == 1
+  ' "${BRIDGE_MODELS}" >/dev/null || die "Copilot bridge must advertise ${RESPONSES_MODEL} with /responses plus low and high reasoning effort before inference"
 }
 
 model_supports_chat() {
@@ -448,7 +458,7 @@ run_responses_effort_harness() {
   env -u COPILOT_GITHUB_TOKEN \
     PROXY_BIN="${POLICY_PROXY_BIN}" \
     LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL="${bridge_base_url}" \
-    LIVE_POLICY_ROUTING_RESPONSES_MODEL=gpt-5-mini \
+    LIVE_POLICY_ROUTING_RESPONSES_MODEL="${RESPONSES_MODEL}" \
     LIVE_POLICY_ROUTING_RESPONSES_CLASSIFIER_MODEL="${selected_classifier}" \
     LIVE_POLICY_ROUTING_RESPONSES_PUBLIC_MODEL=vekil-live-semantic-effort \
     LIVE_POLICY_ROUTING_RESPONSES_SMOKE_DIR="${SMOKE_DIR}/responses-effort" \

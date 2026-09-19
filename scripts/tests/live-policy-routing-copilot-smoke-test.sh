@@ -110,7 +110,7 @@ pathlib.Path(os.environ["FAKE_BRIDGE_CHILD_PID_FILE"]).write_text(str(child.pid)
 
 models = [
     {"id": "claude-haiku-4.5", "supported_endpoints": ["/chat/completions"]},
-    {"id": "gpt-5-mini", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
+    {"id": "gpt-5-mini", "supported_endpoints": ["/chat/completions", "/responses"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
     {"id": "gpt-5.4-mini", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low"]}}},
     {"id": "gpt-5.4", "supported_endpoints": ["/chat/completions", "/responses"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
     {"id": "gemini-3.1-pro-preview", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}}},
@@ -119,8 +119,15 @@ models = [
     {"id": "claude-opus-4.7", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high", "max"]}}},
     {"id": "responses-only", "supported_endpoints": ["/responses"]},
 ]
-if os.environ.get("FAKE_BRIDGE_HIDE_MINI") == "1":
-    models = [model for model in models if model["id"] not in {"gpt-5-mini", "gpt-5.4-mini"}]
+catalog_case = os.environ.get("FAKE_BRIDGE_CATALOG_CASE", "")
+if catalog_case == "missing-mini":
+    models = [model for model in models if model["id"] != "gpt-5-mini"]
+elif catalog_case == "missing-haiku":
+    models = [model for model in models if model["id"] != "claude-haiku-4.5"]
+elif catalog_case == "missing-responses":
+    models[1]["supported_endpoints"] = ["/chat/completions"]
+elif catalog_case == "missing-high-effort":
+    models[1]["capabilities"]["supports"]["reasoning_effort"] = ["low"]
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
@@ -318,25 +325,34 @@ PY
   grep -Fq 'Copilot-backed semantic policy-routing and Responses low/high effort smokes passed.' "${STDERR_FILE}" || \
     fail "wrapper did not emit success marker"
 
-  log "Rejecting expensive catalog fallback when approved mini models are missing"
-  local denied_rc=0
-  env -u LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL \
-    COPILOT_GITHUB_TOKEN="${TOKEN}" PROXY_BIN=/usr/bin/true \
-    FAKE_BRIDGE_HIDE_MINI=1 \
-    LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN="${BRIDGE_BIN}" \
-    LIVE_POLICY_ROUTING_HARNESS="${HARNESS}" \
-    LIVE_POLICY_ROUTING_RESPONSES_EFFORT_HARNESS="${RESPONSES_HARNESS}" \
-    LIVE_POLICY_ROUTING_SMOKE_DIR="${TMP_ROOT}/unapproved-model" \
-    LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=1 \
-    FAKE_BRIDGE_CHILD_PID_FILE="${CHILD_PID_FILE}" \
-    FAKE_HARNESS_RECORD="${TMP_ROOT}/unapproved-harness.json" \
-    FAKE_RESPONSES_HARNESS_RECORD="${TMP_ROOT}/unapproved-responses.json" \
-    "${WRAPPER}" >"${TMP_ROOT}/unapproved.stdout" 2>"${TMP_ROOT}/unapproved.stderr" || denied_rc=$?
-  [[ "${denied_rc}" -eq 1 ]] || fail "missing approved model exit=${denied_rc}, want 1"
-  grep -Fq 'no approved lightweight model' "${TMP_ROOT}/unapproved.stderr" || \
-    fail "wrapper did not explain the missing approved lightweight model"
-  [[ ! -e "${TMP_ROOT}/unapproved-harness.json" && ! -e "${TMP_ROOT}/unapproved-responses.json" ]] || \
-    fail "an inference harness ran after model approval failed"
+  log "Rejecting missing required models or capabilities before either inference harness runs"
+  local denied_rc catalog_case expected_error case_dir
+  for catalog_case in missing-mini missing-responses missing-high-effort missing-haiku; do
+    case_dir="${TMP_ROOT}/${catalog_case}"
+    mkdir -p "${case_dir}"
+    denied_rc=0
+    expected_error='must advertise gpt-5-mini with /responses plus low and high reasoning effort before inference'
+    if [[ "${catalog_case}" == missing-haiku ]]; then
+      expected_error='no approved classifier model'
+    fi
+    env -u LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL \
+      COPILOT_GITHUB_TOKEN="${TOKEN}" PROXY_BIN=/usr/bin/true \
+      FAKE_BRIDGE_CATALOG_CASE="${catalog_case}" \
+      LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN="${BRIDGE_BIN}" \
+      LIVE_POLICY_ROUTING_HARNESS="${HARNESS}" \
+      LIVE_POLICY_ROUTING_RESPONSES_EFFORT_HARNESS="${RESPONSES_HARNESS}" \
+      LIVE_POLICY_ROUTING_SMOKE_DIR="${case_dir}/smoke" \
+      LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=1 \
+      FAKE_BRIDGE_CHILD_PID_FILE="${CHILD_PID_FILE}" \
+      FAKE_HARNESS_RECORD="${case_dir}/harness.json" \
+      FAKE_RESPONSES_HARNESS_RECORD="${case_dir}/responses.json" \
+      "${WRAPPER}" >"${case_dir}/stdout" 2>"${case_dir}/stderr" || denied_rc=$?
+    [[ "${denied_rc}" -eq 1 ]] || fail "${catalog_case} exit=${denied_rc}, want 1"
+    grep -Fq "${expected_error}" "${case_dir}/stderr" || \
+      fail "wrapper did not explain ${catalog_case}"
+    [[ ! -e "${case_dir}/harness.json" && ! -e "${case_dir}/responses.json" ]] || \
+      fail "an inference harness ran after ${catalog_case} failed validation"
+  done
 
   log "Running deterministic Copilot quota-unavailable classification"
   local quota_rc=0 quota_port

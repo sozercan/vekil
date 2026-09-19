@@ -308,7 +308,7 @@ For the broad matrix, the wrapper requires native `/chat/completions` support. D
 - powerful primary: `gpt-5-mini`, then `gpt-5.4-mini`; and
 - powerful secondary: `claude-haiku-4.5`, distinct from the primary.
 
-Haiku does not support reasoning effort, so the broad matrix omits it from both tiers. The common script accepts optional `LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT` and `LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT` values only as a pair. The focused Responses check requires `gpt-5-mini` to advertise `/responses` plus both `low` and `high`, and the classifier to advertise native Chat, before sending requests.
+Haiku does not support reasoning effort, so the broad matrix omits it from both tiers. The common script accepts optional `LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT` and `LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT` values only as a pair. Before either matrix sends requests, the wrapper verifies the broad models and requires `gpt-5-mini` to advertise `/responses` plus both `low` and `high`. The standalone Responses check also validates its terminal and classifier models before inference.
 
 Both Copilot policy checks preserve the classifier's `temperature: 0`; terminal routes still drop sampling parameters. The wrapper sets `LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS=false` for this. Standalone common-script callers can set the same option when their classifier supports temperature; it defaults to `true`.
 
