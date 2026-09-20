@@ -253,6 +253,75 @@ func TestConversationHistoryStorageFailureBarriers(t *testing.T) {
 	}
 }
 
+func TestConversationHistoryStorageCountsFollowCommittedRecords(t *testing.T) {
+	for _, operation := range []string{"begin", "save", "clear"} {
+		t.Run(operation, func(t *testing.T) {
+			bindings, history, file := newConversationHistoryStorageFixture(t, ConversationMigrationConfig{MaxSnapshots: 2})
+			first := conversationHistoryStorageSnapshot(history, "count-first", "count-root", time.Now())
+			saveConversationHistoryStorageSnapshot(t, history, first)
+			second := conversationHistoryStorageSnapshot(history, "count-second", first.Root, time.Now())
+			if operation != "begin" {
+				if err := history.beginAttempt(first.Root, "count-operation"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := history.counts
+			bindings.durable.beforeCommit = func() error {
+				if history.counts != before {
+					t.Error("quota counts were published before commit")
+				}
+				return errConversationHistoryCapacity // abort without poisoning the store
+			}
+			mutate := func() error {
+				switch operation {
+				case "begin":
+					return history.beginAttempt(first.Root, "count-operation")
+				case "save":
+					return history.save(second)
+				default:
+					return history.clearAttempt(first.Root)
+				}
+			}
+			if err := mutate(); !errors.Is(err, errConversationHistoryCapacity) || history.counts != before {
+				t.Fatalf("aborted transaction changed counts: before=%+v after=%+v err=%v", before, history.counts, err)
+			}
+			bindings.durable.beforeCommit = nil
+			if err := mutate(); err != nil {
+				t.Fatal(err)
+			}
+			if operation == "clear" {
+				if err := history.clearAttempt(first.Root); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var committed conversationHistoryCounts
+			if err := bindings.durable.db.View(func(tx *bolt.Tx) error {
+				committed.snapshots = tx.Bucket(conversationSnapshotsBucket).Stats().KeyN
+				committed.pending = tx.Bucket(conversationPendingBucket).Stats().KeyN
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if history.counts != committed {
+				t.Fatalf("counts differ from committed records: cache=%+v records=%+v", history.counts, committed)
+			}
+			closeDurableStoreFixture(t, bindings)
+			_, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
+			if retained.counts != committed {
+				t.Fatalf("reopen lost quota counts: got=%+v want=%+v", retained.counts, committed)
+			}
+			for i := committed.snapshots + committed.pending; i < retained.config.MaxSnapshots; i++ {
+				if err := retained.beginAttempt(fmt.Sprintf("fill-%d", i), "fill-operation"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := retained.beginAttempt("overflow", "overflow-operation"); !errors.Is(err, errConversationHistoryCapacity) {
+				t.Fatalf("reopened counts did not enforce capacity: %v", err)
+			}
+		})
+	}
+}
+
 func TestConversationHistoryStorageCorruptionIsPreserved(t *testing.T) {
 	for _, corruption := range []string{"MAC", "payload", "count", "index", "missing index", "pending", "pending timestamp", "pending key", "missing index bucket", "missing pending bucket"} {
 		t.Run(corruption, func(t *testing.T) {
@@ -432,6 +501,16 @@ func TestConversationHistoryStoragePrunePreservesOwnership(t *testing.T) {
 	retained.release(retired.Root)
 	if err := retained.acquire(kept.Root); !errors.Is(err, errConversationHistoryUncertain) {
 		t.Fatalf("prune removed an intent at the cutoff: %v", err)
+	}
+	retained.config.MaxSnapshots = 2 // one retained snapshot and one pending turn
+	if err := retained.beginAttempt("after-prune", "after-prune-operation"); !errors.Is(err, errConversationHistoryCapacity) {
+		t.Fatalf("pruned counts did not retain pending capacity: %v", err)
+	}
+	if err := retained.clearAttempt(kept.Root); err != nil {
+		t.Fatal(err)
+	}
+	if err := retained.beginAttempt("after-prune", "after-prune-operation"); err != nil {
+		t.Fatalf("pruned counts did not release cleared capacity: %v", err)
 	}
 	missing := filepath.Join(filepath.Dir(file.Path), "missing-history.db")
 	if _, err := PruneConversationHistory(missing, cutoff); err == nil {

@@ -133,6 +133,7 @@ Run the same suite on macOS APFS and Linux to execute process-kill/reopen tests:
 ```bash
 go test ./proxy -run '^Test(Conversation|LoadProvidersConfigFileConversationMigration)' -count=1
 go test -race ./proxy -run '^TestConversation' -count=1
+go test ./proxy -run '^$' -bench '^BenchmarkConversationHistoryAdmission$' -benchtime=20x -count=1 -benchmem
 ```
 
 Coverage includes HTTP JSON/SSE, local tool history, full-input and response-ID
@@ -143,6 +144,13 @@ the Darwin durable-storage job runs them on macOS. Complete the production gate
 before live Azure validation. A live check must use a separate providers file,
 database and client workspace, a confirmed prewrite outage, and record the
 answering resource, retained context, local side-effect count and next turn.
+
+The admission benchmark reserves and clears a pending turn with 0, 4,096, and
+32,768 saved snapshots. Quota counts are rebuilt during startup validation and
+published under the durable-store mutex after successful commits. The measured
+path includes normal disk synchronization; fixture creation and validation are
+outside the timer. Keep raw benchmark results private, as with the ownership
+benchmarks above.
 
 ### Policy-routing safety suite
 

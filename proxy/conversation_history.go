@@ -59,6 +59,14 @@ type conversationHistoryStore struct {
 	config ConversationMigrationConfig
 	mu     sync.Mutex
 	active map[string]bool
+	// The single writer rebuilds counts while validating records at startup.
+	// d.mu guards them, and updates publish only after the transaction commits.
+	counts conversationHistoryCounts
+}
+
+type conversationHistoryCounts struct {
+	snapshots int
+	pending   int
 }
 
 func newConversationHistoryStore(d *durableStateBindings, config ConversationMigrationConfig) (*conversationHistoryStore, error) {
@@ -86,7 +94,7 @@ func newConversationHistoryStore(d *durableStateBindings, config ConversationMig
 		if present != 3 {
 			return errConversationHistoryStorage
 		}
-		return s.validate(tx)
+		return s.validate(tx, &s.counts)
 	})
 	if err == nil && created {
 		err = d.db.Update(func(tx *bolt.Tx) error {
@@ -108,10 +116,11 @@ func newConversationHistoryStore(d *durableStateBindings, config ConversationMig
 	return s, nil
 }
 
-func (s *conversationHistoryStore) validate(tx *bolt.Tx) error {
+func (s *conversationHistoryStore) validate(tx *bolt.Tx, counts *conversationHistoryCounts) error {
 	snapshots := tx.Bucket(conversationSnapshotsBucket)
 	index := tx.Bucket(conversationIndexBucket)
 	pending := tx.Bucket(conversationPendingBucket)
+	*counts = conversationHistoryCounts{}
 	var total uint64
 	err := snapshots.ForEach(func(key, value []byte) error {
 		snapshot, err := s.decode(key, value)
@@ -132,6 +141,7 @@ func (s *conversationHistoryStore) validate(tx *bolt.Tx) error {
 			return errConversationHistoryStorage
 		}
 		total += cost
+		counts.snapshots++
 		return nil
 	})
 	if err != nil {
@@ -156,12 +166,15 @@ func (s *conversationHistoryStore) validate(tx *bolt.Tx) error {
 	}
 	if err := pending.ForEach(func(key, value []byte) error {
 		_, err := s.pendingCreated(key, value)
+		if err == nil {
+			counts.pending++
+		}
 		return err
 	}); err != nil {
 		return err
 	}
-	if snapshots.Stats().KeyN+pending.Stats().KeyN > s.config.MaxSnapshots ||
-		total+uint64(pending.Stats().KeyN*conversationPendingBytes) > uint64(s.config.MaxTotalBytes) {
+	if counts.snapshots+counts.pending > s.config.MaxSnapshots ||
+		total+uint64(counts.pending*conversationPendingBytes) > uint64(s.config.MaxTotalBytes) {
 		return errConversationHistoryCapacity
 	}
 	return nil
@@ -324,15 +337,16 @@ func (s *conversationHistoryStore) release(root string) {
 	s.mu.Unlock()
 }
 
-func (s *conversationHistoryStore) update(fn func(*bolt.Tx) error) error {
+func (s *conversationHistoryStore) update(fn func(*bolt.Tx, *conversationHistoryCounts) error) error {
 	d := s.d
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.failed != nil || d.db == nil {
 		return errConversationHistoryStorage
 	}
+	counts := s.counts
 	err := d.db.Update(func(tx *bolt.Tx) error {
-		if err := fn(tx); err != nil {
+		if err := fn(tx, &counts); err != nil {
 			return err
 		}
 		if d.beforeCommit != nil {
@@ -340,6 +354,9 @@ func (s *conversationHistoryStore) update(fn func(*bolt.Tx) error) error {
 		}
 		return nil
 	})
+	if err == nil {
+		s.counts = counts
+	}
 	if err == nil && d.afterCommit != nil {
 		err = d.afterCommit()
 	}
@@ -354,14 +371,14 @@ func (s *conversationHistoryStore) update(fn func(*bolt.Tx) error) error {
 }
 
 func (s *conversationHistoryStore) beginAttempt(root, operationID string) error {
-	return s.update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx, counts *conversationHistoryCounts) error {
 		pending, snapshots := tx.Bucket(conversationPendingBucket), tx.Bucket(conversationSnapshotsBucket)
 		key := s.rootKey(root)
 		if pending.Get(key) != nil {
 			return errConversationHistoryUncertain
 		}
-		if snapshots.Stats().KeyN+pending.Stats().KeyN >= s.config.MaxSnapshots ||
-			snapshots.Sequence()+uint64((pending.Stats().KeyN+1)*conversationPendingBytes) > uint64(s.config.MaxTotalBytes) {
+		if counts.snapshots+counts.pending >= s.config.MaxSnapshots ||
+			snapshots.Sequence()+uint64((counts.pending+1)*conversationPendingBytes) > uint64(s.config.MaxTotalBytes) {
 			return errConversationHistoryCapacity
 		}
 		value := make([]byte, 40)
@@ -369,13 +386,25 @@ func (s *conversationHistoryStore) beginAttempt(root, operationID string) error 
 		digest := s.d.digest("conversation-attempt-v1", operationID)
 		copy(value[8:], digest[:])
 		mac := s.d.digest("conversation-pending-record-v1", string(key), string(value))
-		return pending.Put(key, append(mac[:], value...))
+		if err := pending.Put(key, append(mac[:], value...)); err != nil {
+			return err
+		}
+		counts.pending++
+		return nil
 	})
 }
 
 func (s *conversationHistoryStore) clearAttempt(root string) error {
-	return s.update(func(tx *bolt.Tx) error {
-		return tx.Bucket(conversationPendingBucket).Delete(s.rootKey(root))
+	return s.update(func(tx *bolt.Tx, counts *conversationHistoryCounts) error {
+		pending, key := tx.Bucket(conversationPendingBucket), s.rootKey(root)
+		if pending.Get(key) == nil {
+			return nil
+		}
+		if err := pending.Delete(key); err != nil {
+			return err
+		}
+		counts.pending--
+		return nil
 	})
 }
 
@@ -389,17 +418,17 @@ func (s *conversationHistoryStore) save(snapshot *conversationSnapshot) error {
 	if len(value) > s.config.MaxHistoryBytes {
 		return errConversationHistoryCapacity
 	}
-	return s.update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx, counts *conversationHistoryCounts) error {
 		snapshots, index, pending := tx.Bucket(conversationSnapshotsBucket), tx.Bucket(conversationIndexBucket), tx.Bucket(conversationPendingBucket)
 		if snapshots.Get(key) != nil {
 			// Reusing an ID for a different turn must never overwrite history.
 			return errConversationHistoryStorage
 		}
-		pendingCount := pending.Stats().KeyN
+		pendingCount := counts.pending
 		if pending.Get(s.rootKey(snapshot.Root)) != nil {
 			pendingCount--
 		}
-		if snapshots.Stats().KeyN+pendingCount+1 > s.config.MaxSnapshots ||
+		if counts.snapshots+pendingCount+1 > s.config.MaxSnapshots ||
 			cost > uint64(s.config.MaxTotalBytes) ||
 			snapshots.Sequence()+cost+uint64(pendingCount*conversationPendingBytes) > uint64(s.config.MaxTotalBytes) {
 			return errConversationHistoryCapacity
@@ -419,7 +448,12 @@ func (s *conversationHistoryStore) save(snapshot *conversationSnapshot) error {
 		if err := snapshots.SetSequence(snapshots.Sequence() + cost); err != nil {
 			return err
 		}
-		return pending.Delete(s.rootKey(snapshot.Root))
+		if err := pending.Delete(s.rootKey(snapshot.Root)); err != nil {
+			return err
+		}
+		counts.snapshots++
+		counts.pending = pendingCount
+		return nil
 	})
 }
 
@@ -438,7 +472,7 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 	s := &conversationHistoryStore{d: bindings.durable, config: ConversationMigrationConfig{
 		MaxHistoryBytes: math.MaxInt, MaxTotalBytes: math.MaxInt64, MaxSnapshots: math.MaxInt,
 	}}
-	err = s.update(func(tx *bolt.Tx) error {
+	err = s.update(func(tx *bolt.Tx, counts *conversationHistoryCounts) error {
 		snapshots := tx.Bucket(conversationSnapshotsBucket)
 		if snapshots == nil {
 			return nil
@@ -447,7 +481,7 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 		if index == nil || pending == nil {
 			return errConversationHistoryStorage
 		}
-		if err := s.validate(tx); err != nil {
+		if err := s.validate(tx, counts); err != nil {
 			return err
 		}
 		cursor := snapshots.Cursor()
@@ -461,6 +495,7 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 				if err := cursor.Delete(); err != nil {
 					return err
 				}
+				counts.snapshots--
 				removed++
 			} else {
 				total += conversationSnapshotCost(snapshot, value)
@@ -480,6 +515,7 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 				if err := cursor.Delete(); err != nil {
 					return err
 				}
+				counts.pending--
 			}
 		}
 		cursor = snapshots.Cursor()
@@ -493,6 +529,7 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 				if err := cursor.Delete(); err != nil {
 					return err
 				}
+				counts.snapshots--
 				removed++
 			}
 		}
