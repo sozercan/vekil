@@ -233,6 +233,7 @@ func directCopilotResponsesPolicyConfig(profileMode string) ProvidersConfig {
 	parallel := true
 	return ProvidersConfig{
 		SchemaVersion: ProvidersConfigSchemaVersion2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{{
 			ID:            "copilot",
 			Type:          string(providerTypeCopilot),
@@ -677,6 +678,7 @@ func TestPublicCopilotExplicitRouteValidatesPinnedModelWithoutLegacyExposure(t *
 	defer upstream.Close()
 	cfg := ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{{
 			ID: "copilot", Type: "copilot", Default: true, TrustDomain: "github-copilot", IncludeModels: []string{"gpt-5.6-sol"},
 		}},
@@ -1066,6 +1068,7 @@ func TestPolicyCopilotDynamicValidationSkipsInactiveTierRoutes(t *testing.T) {
 	classifierNoStore := true
 	cfg := ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{ID: "copilot", Type: "copilot", Default: true, TrustDomain: "org", IncludeModels: []string{"classifier", "power"}},
 			{ID: "local", Type: "openai-compatible", BaseURL: "https://local.example.test/v1", AuthType: "none", ModelDiscovery: "static", TrustDomain: "org", ClassifierNoStoreSupported: &classifierNoStore},
@@ -1307,6 +1310,7 @@ func TestPolicyCopilotSynchronousValidationSkipsInactiveTierRoutes(t *testing.T)
 	classifierNoStore := true
 	cfg := ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{ID: "copilot", Type: "copilot", Default: true, TrustDomain: "org", IncludeModels: []string{"classifier", "power"}},
 			{ID: "local", Type: "openai-compatible", BaseURL: "https://local.example.test/v1", AuthType: "none", ModelDiscovery: "static", TrustDomain: "org", ClassifierNoStoreSupported: &classifierNoStore},

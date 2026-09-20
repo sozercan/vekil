@@ -528,6 +528,7 @@ func newDeclaredRouteTestHandler(t *testing.T, baseURL string) *ProxyHandler {
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: 2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{{
 				ID: "test-provider", Type: string(providerTypeOpenAICompatible), Default: true,
 				BaseURL: baseURL, AuthType: string(providerAuthTypeNone),

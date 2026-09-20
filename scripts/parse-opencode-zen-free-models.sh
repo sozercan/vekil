@@ -122,12 +122,7 @@ END {
 
     endpoint = endpoint_url_by_label[label]
     sub(/^https:\/\/opencode\.ai\/zen\/v1/, "", endpoint)
-    # System One models are internal classifiers, outside the public inference
-    # catalog consumed by the Zen example updater and CLI smoke.
-    if (endpoint == "/systemone") {
-      continue
-    }
-    if (endpoint != "/chat/completions" && endpoint != "/responses" && endpoint != "/messages") {
+    if (endpoint != "/chat/completions" && endpoint != "/responses" && endpoint != "/messages" && endpoint != "/systemone") {
       fail("unsupported endpoint for " label ": " endpoint_url_by_label[label])
       continue
     }

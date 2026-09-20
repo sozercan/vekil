@@ -60,6 +60,14 @@ The proxy and its local credential are ephemeral. Agent-owned conversation
 history can persist across launches, and a resumed conversation uses the new
 launch's provider routing and optional model pin.
 
+Schema-v2 explicit routes retain durable provider-state ownership across launches
+using the same `state_bindings` block and default file as the normal CLI and tray
+app. Each file has one writer. Separate simultaneous launches need distinct
+files, or `--state-bindings-mode memory` for intentionally temporary ownership.
+Multiple clients sharing one running proxy remain supported. Websocket history
+and Responses-backed Chat replay remain process-local; see
+[State Recovery](state-recovery.md) for reconnect and retention limits.
+
 ## Model selection modes
 
 Claude Code and Codex CLI support two launch modes:
@@ -114,6 +122,9 @@ normal global policy-controller startup behavior.
 |------|---------|
 | `--model ID` | Public Vekil model ID to validate, scope, and pin. Optional for Claude Code and Codex CLI; required for GitHub Copilot CLI. |
 | `--providers-config SOURCE` | Local path or HTTP(S) URL to JSON or YAML provider configuration. |
+| `--state-bindings-mode config\|durable\|memory` | Optional override of the shared providers-file state mode. |
+| `--state-bindings-file PATH` | Optional distinct durable file in an existing private directory. |
+| `--state-bindings-max-entries COUNT` | Optional logical-record capacity override; zero follows the providers file. |
 | `--token-dir PATH` | Copilot token storage directory used by Vekil. |
 | `--port PORT` | Local proxy port. Default `0` lets the OS allocate one. |
 | `--binary PATH` | Agent executable override. |

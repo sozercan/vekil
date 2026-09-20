@@ -69,6 +69,89 @@ Route-specific deterministic tests use local upstream servers plus injected tran
 
 For large request and replay paths, keep the `64 MiB` request boundary in the deterministic matrix and verify that operation/send budgets prevent compaction, recovery, or fallback from creating an unbounded tree.
 
+### Durable provider-state suite
+
+Durable mode is the default for schema-v2 explicit routes on supported Linux
+filesystems and macOS APFS. Run the storage and process suites on both platforms.
+Tests use temporary private stores, synthetic credentials, and controlled
+loopback providers, never live inference. General route fixtures explicitly use
+memory mode so tests cannot open the user's default database:
+
+```bash
+go test ./proxy ./server -run '^Test(Durable|StateBindings|StateBindingStats|LoadProvidersConfigFileStateBindings)' -count=1
+go test . -run '^Test(DurableStateProcessCrashReopen|StatePruneCommand)' -count=1
+go test -race ./... -count=1
+GOMAXPROCS=2 go test ./proxy -run '^$' -bench '^BenchmarkStateBindingExposure$' -benchtime=100x -benchmem -count=10
+GOMAXPROCS=2 go test ./proxy -run '^$' -bench '^BenchmarkDurableStateLookupAndOpen$' -benchtime=10x -benchmem -count=10
+GOMAXPROCS=2 go test ./proxy -run '^$' -bench '^BenchmarkDurableNestedResponseValidation$' -benchtime=5x -benchmem -count=3
+```
+
+Coverage includes providers-file-only startup, configuration precedence, private
+default-path creation, real binary/process crash and reopen, kills before/after
+commit but before exposure, exact issuer and credential-source changes,
+private-file validation, logical capacity/tombstones without full preallocation,
+dashboard warnings, and offline pruning. Concurrent clients, second-writer
+refusal, constructor/drain locks, JSON/SSE and HTTP/native-websocket exposure
+failures, and full-input reconnects run on both supported platforms. macOS also
+checks descriptor-based ACL refusal and real APFS `F_FULLFSYNC` directory
+barriers. JSON tests cover case-variant state fields, competing spellings, and
+nesting limits with the default or legacy Go decoder. Raw HTTP, compact, and
+WebSocket requests also verify rejection of noncanonical state fields before
+dispatch, including after a store reopen, while canonical continuations and
+vendor metadata remain supported.
+
+On Linux/amd64, dedicated child tests use one-way seccomp restrictions to inject
+real `pwrite64`, `fdatasync`, and `close` errors; the parent and shared filesystem
+are not modified. Process kills and syscall failures exercise recovery
+boundaries; they do not simulate a host or drive power loss. Cross-compiling
+these tests alone does not execute the platform's crash or fault coverage.
+
+The `darwin-launch` CI job also runs the durable proxy/server and menubar tests,
+including a legacy JSON backend depth/alias regression check. Temporary provider
+and policy smoke proxies explicitly choose memory mode so they do not open a
+user's persistent store.
+
+The exposure benchmark calls the production JSON/SSE writers and synchronous
+binding store with fresh/repeated batches of 1/8 records and initial occupancy
+0/8,192. It reports p50/p95 pre-exposure latency plus database bytes and bytes per
+record; those bytes include bbolt overhead and are not the configured capacity.
+Lookup/reopen are measured separately. Compare ten controlled memory/durable
+samples with fixed CPU settings and an otherwise quiet host. Record raw results,
+filesystem, Go version and exact revision privately; do not copy machine data to
+the repository. These tests exclude provider/network latency. The prepared-stream
+TTFT benchmark alone does not exercise persistence.
+The nested-response benchmark measures the complete JSON/SSE writers at depths
+1,000/2,000/4,000 with already-recorded state. Compare allocated bytes per
+operation to detect diagnostic-path allocation amplification independently of
+first-issuance storage latency.
+
+### Conversation migration suite
+
+Opt-in Azure/Copilot migration uses synthetic providers and private temporary
+stores. Run the same suite on macOS APFS and Linux to execute process-kill/reopen tests:
+
+```bash
+go test ./proxy -run '^Test(Conversation|LoadProvidersConfigFileConversationMigration)' -count=1
+go test -race ./proxy -run '^TestConversation' -count=1
+go test ./proxy -run '^$' -bench '^BenchmarkConversationHistoryAdmission$' -benchtime=20x -count=1 -benchmem
+```
+
+Coverage includes HTTP JSON/SSE, local tool history, full-input and response-ID
+recovery, immutable older branches, WebSocket reconnect, uncertain execution,
+storage faults/capacity/corruption, concurrent admission, offline deletion and
+process kills around history commits. Core CI runs these tests on Linux and
+the Darwin durable-storage job runs them on macOS. Complete the production gate
+before live Azure/Copilot validation. A live check must use a separate providers
+file, database and client workspace, a confirmed prewrite outage, and record the
+answering resource, retained context, local side-effect count and next turn.
+
+The admission benchmark reserves and clears a pending turn with 0, 4,096, and
+32,768 saved snapshots. Quota counts are rebuilt during startup validation and
+published under the durable-store mutex after successful commits. The measured
+path includes normal disk synchronization; fixture creation and validation are
+outside the timer. Keep raw benchmark results private, as with the ownership
+benchmarks above.
+
 ### Policy-routing safety suite
 
 Schema-v2 policy routing adds a pre-dispatch planner above native OpenAI Chat. The deterministic merge gate must use in-memory classifier adapters and local `httptest` providers; live credentials and provider availability are supplementary, never substitutes for local tests.
@@ -387,14 +470,14 @@ For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../s
 
 The [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow runs the **same** `scripts/live-cli-smoke.sh` harness as the Copilot smoke, but in `SMOKE_PROVIDER=zen` mode: it starts vekil with `examples/opencode-zen-free.yaml` (no credentials) and drives real coding-agent CLIs against the OpenCode Zen free tier. Because it needs no secrets, it runs on **every** pull request, **including external-contributor forks**. Paid Copilot checks run separately on same-repository pull requests, weekly schedules, and manual dispatch. It is the only live end-to-end coverage of vekil's generic `openai-compatible` provider routing (config loading, bearer auth, static model catalog, and the per-model endpoint allowlist), which zero-config Copilot startup never exercises.
 
-Before starting Vekil, the workflow fetches OpenCode's published Zen documentation and uses [`scripts/parse-opencode-zen-free-models.sh`](../scripts/parse-opencode-zen-free-models.sh) to join the endpoint and pricing tables by display label. Only rows whose input and output prices are both labeled `Free` are eligible for the smoke. The parser excludes `/systemone` evaluation models from the public inference catalog and smoke candidates. The harness intersects that parsed set with the checked-in static example, so aliases such as Ox Alpha's `x-preview-f-free` do not depend on an ID suffix and models that lose their free label are not exercised anonymously.
+Before starting Vekil, the workflow fetches OpenCode's published Zen documentation and uses [`scripts/parse-opencode-zen-free-models.sh`](../scripts/parse-opencode-zen-free-models.sh) to join the endpoint and pricing tables by display label. Only rows whose input and output prices are both labeled `Free` are eligible for the smoke. The harness intersects that parsed set with the checked-in static example, so aliases such as Ox Alpha's `x-preview-f-free` do not depend on an ID suffix and models that lose their free label are not exercised anonymously.
 
 CI copies the single-provider example into a temporary config and adds
 `User-Agent: vekil-live-smoke/1` plus one UUID in `x-opencode-session` for the
 smoke run. The stable session header lets the upstream retain routing and cache
 affinity. The generated config is validated offline before the proxy starts.
 
-The separate [`Update OpenCode Zen Free Models`](../.github/workflows/update-opencode-zen-free.yaml) workflow runs daily on trusted `main` code. It resolves OpenCode's mutable `dev` branch to an exact commit, downloads only that revision's `zen.mdx`, and runs [`scripts/update-opencode-zen-free-config.sh`](../scripts/update-opencode-zen-free-config.sh) to replace the marked model block in the example. The renderer sorts IDs, preserves the rest of the file, rejects duplicates, bounds the catalog, and accepts only `/chat/completions` and `/responses`; a free `/messages` model requires an explicit provider-design change instead of being silently emitted under `openai-compatible`. Changed output is validated offline and proposed in a signed PR rather than written directly to `main`.
+The separate [`Update OpenCode Zen Free Models`](../.github/workflows/update-opencode-zen-free.yaml) workflow runs daily on trusted `main` code. It resolves OpenCode's mutable `dev` branch to an exact commit, downloads only that revision's `zen.mdx`, and runs [`scripts/update-opencode-zen-free-config.sh`](../scripts/update-opencode-zen-free-config.sh) to replace the marked model block in the example. The renderer sorts IDs, preserves the rest of the file, rejects duplicates, bounds the catalog, and accepts only `/chat/completions` and `/responses`; free `/messages` and `/systemone` models cannot be emitted under `openai-compatible`. Changed output is validated offline and proposed in a signed PR rather than written directly to `main`.
 
 To reproduce an update locally:
 

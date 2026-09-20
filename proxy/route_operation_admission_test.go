@@ -20,6 +20,7 @@ func newOperationAdmissionTestHandler(t testing.TB, providerKind providerType, e
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{{
 				ID:       "upstream",
 				Type:     string(providerKind),
@@ -281,6 +282,7 @@ func TestExplicitRoutesRespectAllowedModelScopeAcrossHTTPHandlers(t *testing.T) 
 				WithAllowedModels("selected-model"),
 				WithProvidersConfig(ProvidersConfig{
 					SchemaVersion: ProvidersConfigSchemaVersion2,
+					StateBindings: &StateBindingsConfig{Mode: "memory"},
 					Providers: []ProviderConfig{{
 						ID: "upstream", Type: string(tt.providerKind), Default: true,
 						BaseURL: upstream.URL, AuthType: "none",

@@ -25,6 +25,7 @@ func newRouteAttemptStatsTestHandler(t *testing.T, kind providerType, endpoint, 
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{{
 				ID:       "upstream",
 				Type:     string(kind),
@@ -193,6 +194,7 @@ func TestStandaloneNonInferenceSuppressionIncludesSwitchAndExhaustion(t *testing
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{
 				{ID: "primary", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: primary.URL, AuthType: "none"},
 				{ID: "secondary", Type: string(providerTypeOpenAICompatible), BaseURL: secondary.URL, AuthType: "none"},

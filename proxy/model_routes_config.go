@@ -216,6 +216,9 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 	if cfg.schemaVersionSet && cfg.SchemaVersion == 0 {
 		return validatedProvidersConfig{}, configPathError("schema_version", "unsupported schema version 0; supported versions are 1 and 2")
 	}
+	if err := validateProviderStateBindings(cfg); err != nil {
+		return validatedProvidersConfig{}, err
+	}
 
 	switch validated.schemaVersion {
 	case ProvidersConfigSchemaVersion1:
@@ -439,6 +442,9 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 		}
 	}
 
+	if err := normalizeAndValidateConversationMigrationConfig(&validated.config, routeConfigs, providers); err != nil {
+		return validatedProvidersConfig{}, err
+	}
 	return validated, nil
 }
 
@@ -448,6 +454,9 @@ func validateSchemaV2FeatureFields(cfg ProvidersConfig, schemaVersion int) error
 	}
 	if cfg.policyProfilesSet || cfg.PolicyProfiles != nil {
 		return configPathError("policy_profiles", "requires schema_version: 2")
+	}
+	if cfg.conversationMigrationSet || cfg.ConversationMigration != nil {
+		return configPathError("conversation_migration", "requires schema_version: 2")
 	}
 	for providerIndex, provider := range cfg.Providers {
 		if providerType(strings.TrimSpace(provider.Type)) == providerTypeTypeSafeCompatible {
@@ -473,6 +482,15 @@ func validateSchemaV2FeatureFields(cfg ProvidersConfig, schemaVersion int) error
 
 func cloneProvidersConfigForValidation(cfg ProvidersConfig) ProvidersConfig {
 	cloned := cfg
+	if cfg.StateBindings != nil {
+		stateBindings := *cfg.StateBindings
+		cloned.StateBindings = &stateBindings
+	}
+	if cfg.ConversationMigration != nil {
+		migration := *cfg.ConversationMigration
+		migration.Routes = append([]string(nil), cfg.ConversationMigration.Routes...)
+		cloned.ConversationMigration = &migration
+	}
 	if cfg.Providers != nil {
 		cloned.Providers = make([]ProviderConfig, len(cfg.Providers))
 		for index := range cfg.Providers {
@@ -1277,8 +1295,13 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 }
 
 var topLevelProviderConfigFields = configFieldSet(
-	"schema_version", "providers", "model_routes", "policy_profiles", "tool_optimizers", "insight_model",
+	"schema_version", "providers", "model_routes", "policy_profiles", "tool_optimizers", "insight_model", "state_bindings",
+	"conversation_migration",
 )
+
+var stateBindingsConfigFields = configFieldSet("mode", "max_entries", "file")
+
+var conversationMigrationConfigFields = configFieldSet("routes", "max_history_bytes", "max_total_bytes", "max_snapshots")
 
 var providerConfigFields = configFieldSet(
 	"id", "type", "default", "include_models", "exclude_models", "base_url", "auth_mode",
@@ -1347,6 +1370,16 @@ func validateJSONConfigFieldPaths(body []byte) error {
 	}
 	if err := validateJSONKnownFields(root, topLevelProviderConfigFields, ""); err != nil {
 		return err
+	}
+	if bindings, ok := root["state_bindings"].(map[string]interface{}); ok {
+		if err := validateJSONKnownFields(bindings, stateBindingsConfigFields, "state_bindings"); err != nil {
+			return err
+		}
+	}
+	if migration, ok := root["conversation_migration"].(map[string]interface{}); ok {
+		if err := validateJSONKnownFields(migration, conversationMigrationConfigFields, "conversation_migration"); err != nil {
+			return err
+		}
 	}
 	if providers, ok := root["providers"].([]interface{}); ok {
 		for index, rawProvider := range providers {
@@ -1462,6 +1495,19 @@ func validateYAMLConfigFieldPaths(body []byte) error {
 	if err := validateYAMLKnownFields(root, topLevelProviderConfigFields, ""); err != nil {
 		return err
 	}
+	if bindings := yamlMappingValue(root, "state_bindings"); bindings != nil && bindings.Kind == yaml.MappingNode {
+		if err := validateYAMLKnownFields(bindings, stateBindingsConfigFields, "state_bindings"); err != nil {
+			return err
+		}
+	}
+	if migration := yamlDereferenceAlias(yamlMappingValue(root, "conversation_migration")); migration != nil && migration.Kind == yaml.MappingNode {
+		if err := validateYAMLKnownFields(migration, conversationMigrationConfigFields, "conversation_migration"); err != nil {
+			return err
+		}
+		if err := validateYAMLConversationMigrationFieldTypes(migration); err != nil {
+			return err
+		}
+	}
 	if providers := yamlMappingValue(root, "providers"); providers != nil && providers.Kind == yaml.SequenceNode {
 		for index, provider := range providers.Content {
 			if provider.Kind != yaml.MappingNode {
@@ -1571,6 +1617,20 @@ func markJSONProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 	if json.Unmarshal(body, &root) != nil {
 		return
 	}
+	if cfg.StateBindings != nil {
+		var bindings map[string]json.RawMessage
+		if json.Unmarshal(root["state_bindings"], &bindings) == nil {
+			_, cfg.StateBindings.maxEntriesSet = bindings["max_entries"]
+		}
+	}
+	if cfg.ConversationMigration != nil {
+		var migration map[string]json.RawMessage
+		if json.Unmarshal(root["conversation_migration"], &migration) == nil {
+			_, cfg.ConversationMigration.maxHistoryBytesSet = migration["max_history_bytes"]
+			_, cfg.ConversationMigration.maxTotalBytesSet = migration["max_total_bytes"]
+			_, cfg.ConversationMigration.maxSnapshotsSet = migration["max_snapshots"]
+		}
+	}
 
 	var providers []map[string]json.RawMessage
 	if json.Unmarshal(root["providers"], &providers) == nil {
@@ -1649,6 +1709,20 @@ func markYAMLProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 	root := document.Content[0]
 	if root.Kind != yaml.MappingNode {
 		return
+	}
+	if cfg.StateBindings != nil {
+		bindings := yamlDereferenceAlias(yamlMappingValue(root, "state_bindings"))
+		if bindings != nil && bindings.Kind == yaml.MappingNode {
+			cfg.StateBindings.maxEntriesSet = yamlMappingHasField(bindings, "max_entries")
+		}
+	}
+	if cfg.ConversationMigration != nil {
+		migration := yamlDereferenceAlias(yamlMappingValue(root, "conversation_migration"))
+		if migration != nil && migration.Kind == yaml.MappingNode {
+			cfg.ConversationMigration.maxHistoryBytesSet = yamlMappingHasField(migration, "max_history_bytes")
+			cfg.ConversationMigration.maxTotalBytesSet = yamlMappingHasField(migration, "max_total_bytes")
+			cfg.ConversationMigration.maxSnapshotsSet = yamlMappingHasField(migration, "max_snapshots")
+		}
 	}
 
 	if providers := yamlMappingValue(root, "providers"); providers != nil && providers.Kind == yaml.SequenceNode {
@@ -1810,13 +1884,13 @@ func yamlTopLevelConfigFields(body []byte) (map[string]bool, error) {
 func rejectDuplicateJSONMappingKeys(body []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
-	if err := scanJSONValueForDuplicateKeys(decoder, ""); err != nil {
+	if err := scanJSONValueForDuplicateKeys(decoder, "", true); err != nil {
 		return err
 	}
 	return nil
 }
 
-func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string) error {
+func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string, reportPaths bool) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
@@ -1838,12 +1912,15 @@ func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string) error {
 			if !ok {
 				return fmt.Errorf("%s: JSON mapping key is not a string", path)
 			}
-			keyPath := appendConfigObjectPath(path, key)
+			keyPath := path
+			if reportPaths {
+				keyPath = appendConfigObjectPath(path, key)
+			}
 			if _, exists := seen[key]; exists {
 				return configPathError(keyPath, "duplicate mapping key %q", key)
 			}
 			seen[key] = struct{}{}
-			if err := scanJSONValueForDuplicateKeys(decoder, keyPath); err != nil {
+			if err := scanJSONValueForDuplicateKeys(decoder, keyPath, reportPaths); err != nil {
 				return err
 			}
 		}
@@ -1852,7 +1929,11 @@ func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string) error {
 	case '[':
 		index := 0
 		for decoder.More() {
-			if err := scanJSONValueForDuplicateKeys(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+			itemPath := path
+			if reportPaths {
+				itemPath = fmt.Sprintf("%s[%d]", path, index)
+			}
+			if err := scanJSONValueForDuplicateKeys(decoder, itemPath, reportPaths); err != nil {
 				return err
 			}
 			index++

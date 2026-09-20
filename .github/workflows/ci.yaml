@@ -102,6 +102,14 @@ jobs:
       - name: Test Darwin launcher lifecycle
         run: go test . ./launch -count=1
 
+      - name: Test Darwin durable storage and shared configuration
+        run: go test ./proxy ./server ./cmd/menubar -run '^Test(Durable|StateBindings|StateBindingStats|Conversation|LoadProvidersConfigFile(StateBindings|ConversationMigration))' -count=1
+
+      - name: Test legacy JSON response validation
+        env:
+          GOEXPERIMENT: nojsonv2
+        run: go test ./proxy -run '^TestDurableResponses(JSONDepthLimit|StateFieldAliases|IDAliasesExposureAndContinuation|RequestStateAliases)' -count=1
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 15

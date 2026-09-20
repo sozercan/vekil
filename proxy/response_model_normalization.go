@@ -15,10 +15,12 @@ import (
 )
 
 type explicitRouteResponseInfo struct {
-	routeID    string
-	publicID   string
-	targetID   string
-	providerID string
+	routeID       string
+	publicID      string
+	targetID      string
+	providerID    string
+	stateIdentity [32]byte
+	conversation  *conversationTurn
 }
 
 type explicitRouteResponseContextKey struct{}
@@ -102,11 +104,36 @@ func responsesLifecycleEventHasResponse(eventType string) bool {
 	}
 }
 
+func validateUnambiguousResponsesJSON(data []byte) error {
+	// Token does not enforce the nesting limit in the legacy JSON decoder.
+	// Validate first so the recursive duplicate-key scan has the same bound as
+	// Unmarshal, including when built with GOEXPERIMENT=nojsonv2.
+	if !json.Valid(data) {
+		return errors.New("expected one complete JSON response within the nesting limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	// Unlike configuration diagnostics, this path must not build an ever-longer
+	// path at each nesting level. Those discarded strings cost quadratic space.
+	if err := scanJSONValueForDuplicateKeys(decoder, "", false); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return errors.New("expected one complete JSON response")
+	}
+	return nil
+}
+
 func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http.ResponseWriter, resp *http.Response, info explicitRouteResponseInfo, store *ToolExecutionContextStore, scope string) error {
-	if resp == nil || resp.Body == nil {
+	durable := h != nil && h.stateBindings != nil && h.stateBindings.durable != nil
+	if resp == nil || (resp.Body == nil && !durable) {
 		return writeUpstreamResponse(w, resp)
 	}
-	body := newLifecycleAwareReadCloser(resp.Body, responseRequestContext(resp))
+	source := resp.Body
+	if source == nil {
+		source = http.NoBody
+	}
+	body := newLifecycleAwareReadCloser(source, responseRequestContext(resp))
 	defer func() { _ = body.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(body, maxLargeRequestBodySize+1))
@@ -119,17 +146,36 @@ func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http
 	if len(data) > maxLargeRequestBodySize {
 		return newResponseBodyWriteError(resp, errors.New("explicit route response exceeds normalization limit"), false, true, false)
 	}
-
 	success := resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
 	if success {
 		observeResponsesUsage(ctx, sniffResponsesUsageBody(data))
-		bodyTokens, tokenErr := extractExplicitResponsesOutputState(data)
+	}
+	if success || durable {
+		// A final error is still an exposure boundary. Bind its structured state
+		// and headers atomically too; abandoned attempts never reach this writer.
+		var bodyTokens []stateBindingToken
+		var tokenErr error
+		emptyAllowed := durable && (!success || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusResetContent)
+		if len(data) != 0 || !emptyAllowed {
+			if durable {
+				bodyTokens, tokenErr = extractDurableResponsesOutputState(data)
+			} else {
+				bodyTokens, tokenErr = extractExplicitResponsesOutputState(data)
+			}
+		}
 		headerTokens, headerErr := explicitResponseHeaderStateTokens(resp.Header)
 		if headerErr != nil {
 			return newResponseBodyWriteError(resp, headerErr, false, true, false)
 		}
 		if tokenErr != nil {
 			return newResponseBodyWriteError(resp, fmt.Errorf("malformed explicit route responses response: %w", tokenErr), false, true, false)
+		}
+		if durable && len(data) != 0 {
+			errorTokens, err := durableResponsesErrorHeaderState(data)
+			if err != nil {
+				return newResponseBodyWriteError(resp, fmt.Errorf("malformed explicit route responses error headers: %w", err), false, true, false)
+			}
+			bodyTokens = append(bodyTokens, errorTokens...)
 		}
 		allTokens := append(headerTokens, bodyTokens...)
 		if bindErr := h.bindExplicitStateTokens(info, allTokens); bindErr != nil {
@@ -147,6 +193,15 @@ func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http
 	if normalized, normalizedChanged := rewriteResponsesResponseModelJSON(out, info.publicID); normalizedChanged {
 		out = normalized
 		changed = true
+	}
+	if success && info.conversation != nil {
+		var err error
+		out, err = info.conversation.saveResponse(out, info)
+		if err != nil {
+			return newResponseBodyWriteError(resp, err, false, true, false)
+		}
+		changed = true
+		resp.Header.Set("X-Vekil-Conversation-Recovery", "saved")
 	}
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
@@ -179,14 +234,14 @@ func (b *normalizedResponsesStreamBody) Close() error {
 	return err
 }
 
-func normalizeResponsesStreamBody(source io.ReadCloser, publicModel string, onEvent func([]byte) error) io.ReadCloser {
+func normalizeResponsesStreamBody(source io.ReadCloser, publicModel string, onEvent func([]byte) error, transforms ...func([]byte) ([]byte, error)) io.ReadCloser {
 	if source == nil || strings.TrimSpace(publicModel) == "" {
 		return source
 	}
 	pr, pw := io.Pipe()
 	wrapped := &normalizedResponsesStreamBody{reader: pr, source: source}
 	go func() {
-		err := copyNormalizedResponsesSSE(pw, source, publicModel, onEvent)
+		err := copyNormalizedResponsesSSE(pw, source, publicModel, onEvent, transforms...)
 		_ = source.Close()
 		if err != nil {
 			_ = pw.CloseWithError(err)
@@ -197,7 +252,7 @@ func normalizeResponsesStreamBody(source io.ReadCloser, publicModel string, onEv
 	return wrapped
 }
 
-func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string, onEvent func([]byte) error) error {
+func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string, onEvent func([]byte) error, transforms ...func([]byte) ([]byte, error)) error {
 	reader := bufio.NewReaderSize(src, openAIStreamScannerInitialBuffer)
 	var event bytes.Buffer
 	flush := func() error {
@@ -206,7 +261,7 @@ func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string
 		}
 		raw := append([]byte(nil), event.Bytes()...)
 		event.Reset()
-		rewritten, changed, eventErr := rewriteResponsesSSEEventModel(raw, publicModel, onEvent)
+		rewritten, changed, eventErr := rewriteResponsesSSEEventModel(raw, publicModel, onEvent, transforms...)
 		if eventErr != nil {
 			return eventErr
 		}
@@ -244,15 +299,19 @@ func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string
 	}
 }
 
-func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func([]byte) error) ([]byte, bool, error) {
+func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func([]byte) error, transforms ...func([]byte) ([]byte, error)) ([]byte, bool, error) {
 	lines := splitSSEEventLines(raw)
 	if len(lines) == 0 {
 		return raw, false, nil
 	}
 	dataParts := make([]string, 0, 1)
 	firstData := -1
+	eventName := ""
 	for i, line := range lines {
 		content, _ := splitSSELineEnding(line)
+		if strings.HasPrefix(content, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(content, "event:"))
+		}
 		if data, ok := parseSSELine(content); ok {
 			if firstData < 0 {
 				firstData = i
@@ -265,6 +324,11 @@ func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func(
 	}
 	data := strings.Join(dataParts, "\n")
 	if strings.TrimSpace(data) == "[DONE]" {
+		for _, transform := range transforms {
+			if _, err := transform([]byte(data)); err != nil {
+				return nil, false, err
+			}
+		}
 		return raw, false, nil
 	}
 	if onEvent != nil {
@@ -272,7 +336,23 @@ func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func(
 			return nil, false, err
 		}
 	}
-	rewritten, changed := rewriteResponsesResponseModelJSON([]byte(data), publicModel)
+	transformed := []byte(data)
+	if len(transforms) > 0 && eventName != "" {
+		var envelope map[string]json.RawMessage
+		if json.Unmarshal(transformed, &envelope) == nil && envelope != nil && rawJSONString(envelope["type"]) == "" {
+			envelope["type"], _ = json.Marshal(eventName)
+			transformed, _ = json.Marshal(envelope)
+		}
+	}
+	for _, transform := range transforms {
+		var err error
+		transformed, err = transform(transformed)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	rewritten, changed := rewriteResponsesResponseModelJSON(transformed, publicModel)
+	changed = changed || !bytes.Equal(transformed, []byte(data))
 	if !changed {
 		return raw, false, nil
 	}
@@ -302,16 +382,45 @@ func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func(
 }
 
 func normalizeResponsesStreamBodyWithBinding(h *ProxyHandler, source io.ReadCloser, info explicitRouteResponseInfo) io.ReadCloser {
-	return normalizeResponsesStreamBody(source, info.publicID, func(data []byte) error {
-		tokens, err := extractExplicitResponsesOutputState(data)
+	var transforms []func([]byte) ([]byte, error)
+	if info.conversation != nil {
+		transforms = append(transforms, func(data []byte) ([]byte, error) {
+			return info.conversation.saveResponse(data, info)
+		})
+	}
+	body := normalizeResponsesStreamBody(source, info.publicID, func(data []byte) error {
+		durable := h != nil && h.stateBindings != nil && h.stateBindings.durable != nil
+		var tokens []stateBindingToken
+		var err error
+		if durable {
+			tokens, err = extractDurableResponsesOutputState(data)
+		} else {
+			tokens, err = extractExplicitResponsesOutputState(data)
+		}
 		if err != nil {
+			if durable {
+				// A malformed state-bearing event cannot establish durable proof.
+				// Keep memory-only compatibility, but never expose it in this mode.
+				return fmt.Errorf("malformed explicit route responses state")
+			}
 			// Streaming headers are already committed. Vendor extensions and
 			// malformed events must remain transparent instead of terminating the
 			// downstream pipe; only successfully extracted state is bindable.
 			return nil
 		}
+		if durable {
+			errorTokens, err := durableResponsesErrorHeaderState(data)
+			if err != nil {
+				return fmt.Errorf("malformed explicit route responses error headers")
+			}
+			tokens = append(tokens, errorTokens...)
+		}
 		return h.bindExplicitStateTokens(info, tokens)
-	})
+	}, transforms...)
+	if info.conversation != nil {
+		return &conversationCompletionBody{ReadCloser: body, turn: info.conversation}
+	}
+	return body
 }
 
 func splitSSEEventLines(raw []byte) []string {

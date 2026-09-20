@@ -26,6 +26,9 @@ func formatUpstreamErrorMessage(statusCode int, body []byte) string {
 }
 
 func formatUpstreamRequestFailure(err error, fallback string) string {
+	if message, _, ok := durableStateFailureDetails(err); ok {
+		return message
+	}
 	var upstreamErr *upstreamError
 	if errors.As(err, &upstreamErr) {
 		return upstreamErr.Error()
@@ -48,6 +51,9 @@ func upstreamErrorRetryMetadata(err error) (string, http.Header) {
 }
 
 func writeOpenAIUpstreamRequestFailure(w http.ResponseWriter, statusCode int, err error) {
+	if writeDurableStateFailure(w, err) {
+		return
+	}
 	retryAfter, upstreamHeaders := upstreamErrorRetryMetadata(err)
 	writeOpenAIErrorWithRetryAfter(
 		w,

@@ -105,6 +105,7 @@ func newExplicitRouteSurfaceHandlerWithRouting(t *testing.T, providerKind provid
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{
 				provider("primary", primaryURL, "primary-key", true),
 				provider("secondary", secondaryURL, "secondary-key", false),
@@ -1186,6 +1187,7 @@ func TestAnthropicDuplicateModelSelectionPreservesLegacyForwarding(t *testing.T)
 
 			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 				SchemaVersion: ProvidersConfigSchemaVersion2,
+				StateBindings: &StateBindingsConfig{Mode: "memory"},
 				Providers: []ProviderConfig{
 					{
 						ID:       "legacy",
@@ -1274,6 +1276,7 @@ func TestMixedRouteConfigScopesAmbiguousJSONValidationToExplicitRoutes(t *testin
 
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: ProvidersConfigSchemaVersion2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{
 				ID:       "legacy",
@@ -1395,6 +1398,7 @@ func TestMixedRouteConfigOpenAIChatDuplicateModelValidationUsesForwardingSemanti
 
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: ProvidersConfigSchemaVersion2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{
 				ID:       "legacy",
@@ -1525,6 +1529,7 @@ func TestExplicitRouteGeminiCompressionAliasUsesCanonicalRouteOperation(t *testi
 
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{ID: "primary", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: primary.URL, AuthType: "none"},
 			{ID: "secondary", Type: string(providerTypeOpenAICompatible), BaseURL: secondary.URL, AuthType: "none"},
@@ -1601,6 +1606,7 @@ func TestExplicitRouteDoesNotInjectPolicyTierReasoningIntoTranslatedChatSurfaces
 
 			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 				SchemaVersion: 2,
+				StateBindings: &StateBindingsConfig{Mode: "memory"},
 				Providers: []ProviderConfig{{
 					ID: "openai", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.URL, AuthType: "none",
 				}},
@@ -1642,6 +1648,7 @@ func TestExplicitNativeAnthropicRouteAcceptsNormalizedAlias(t *testing.T) {
 	defer upstream.Close()
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers:     []ProviderConfig{{ID: "anthropic", Type: string(providerTypeAnthropicCompatible), Default: true, BaseURL: upstream.URL, AuthType: "none"}},
 		ModelRoutes: []ModelRouteConfig{{
 			ID: "claude-route", PublicID: "claude-sonnet-4.5", Endpoints: []string{providerEndpointMessages},
@@ -1724,6 +1731,7 @@ func TestExplicitRouteOpenAISurfacesAcceptDatedNormalizedAlias(t *testing.T) {
 
 			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 				SchemaVersion: ProvidersConfigSchemaVersion2,
+				StateBindings: &StateBindingsConfig{Mode: "memory"},
 				Providers: []ProviderConfig{
 					{
 						ID:       "fallback",
@@ -1778,6 +1786,7 @@ func TestExplicitRouteCountTokenRecoveryRespectsOneSendBudget(t *testing.T) {
 		defer upstream.Close()
 		h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: 2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers:     []ProviderConfig{{ID: "openai", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.URL, AuthType: "none"}},
 			ModelRoutes: []ModelRouteConfig{{
 				ID: "route", PublicID: "gemini-3-pro-preview", Endpoints: []string{providerEndpointChatCompletions},
@@ -1806,6 +1815,7 @@ func TestExplicitRouteCountTokenRecoveryRespectsOneSendBudget(t *testing.T) {
 		defer upstream.Close()
 		h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: 2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers:     []ProviderConfig{{ID: "openai", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.URL, AuthType: "none"}},
 			ModelRoutes: []ModelRouteConfig{{
 				ID: "route", PublicID: "claude-route", Endpoints: []string{providerEndpointChatCompletions},

@@ -56,6 +56,45 @@ func TestStart_ReturnsErrorWhenPortInUse(t *testing.T) {
 	if !strings.Contains(err.Error(), "address already in use") {
 		t.Fatalf("expected address-in-use error, got %v", err)
 	}
+	if !srv.proxyHandler.ShuttingDown() {
+		t.Fatal("listen failure did not shut down the failed generation")
+	}
+}
+
+func TestStartRejectsRunningOrFinalizedGeneration(t *testing.T) {
+	srv, err := New(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), "127.0.0.1", "0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Stop(context.Background()) })
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	boundAddr := srv.Addr()
+	if err := srv.Start(); err == nil {
+		t.Fatal("second Start admitted another listener")
+	}
+	if !srv.IsRunning() || srv.proxyHandler.ShuttingDown() || srv.Addr() != boundAddr {
+		t.Fatal("second Start changed the running generation")
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + boundAddr + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("running health = %d", resp.StatusCode)
+	}
+	if err := srv.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Start(); err == nil {
+		t.Fatal("Start reused a finalized generation")
+	}
+	if srv.IsRunning() {
+		t.Fatal("finalized generation marked running")
+	}
 }
 
 func TestStart_PortZeroPublishesAndLogsBoundAddress(t *testing.T) {

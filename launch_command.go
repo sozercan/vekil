@@ -29,6 +29,7 @@ type launchAgentOptions struct {
 	port                     string
 	tokenDir                 string
 	providersConfigPath      string
+	stateBindings            proxy.StateBindingsConfig
 	logLevel                 string
 	proxyLogPath             string
 	startupTimeout           time.Duration
@@ -145,6 +146,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	port := fs.String("port", "0", "Ephemeral proxy listen port (0 lets the OS choose)")
 	tokenDir := fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)")
 	providersConfig := registerProvidersConfigFlag(fs, getEnv("PROVIDERS_CONFIG", ""))
+	stateBindingsFlags := registerStateBindingsFlags(fs)
 	logLevel := fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Proxy log level")
 	proxyLog := fs.String("proxy-log", "", fmt.Sprintf("Proxy JSON log path (default: ~/.config/vekil/logs/launch-%s-*.jsonl)", target.name))
 	startupTimeout := fs.Duration("startup-timeout", getEnvDuration("LAUNCH_STARTUP_TIMEOUT", 2*time.Minute), "Maximum time to authenticate and become ready")
@@ -176,6 +178,10 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	if err != nil {
 		return opts, fmt.Errorf("--policy-routing: %w", err)
 	}
+	stateBindings, err := stateBindingsFlags.parsedStateBindingsConfig()
+	if err != nil {
+		return opts, err
+	}
 
 	return launchAgentOptions{
 		model:                    strings.TrimSpace(*model),
@@ -183,6 +189,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 		port:                     strconv.Itoa(portNumber),
 		tokenDir:                 strings.TrimSpace(*tokenDir),
 		providersConfigPath:      strings.TrimSpace(*providersConfig),
+		stateBindings:            stateBindings,
 		logLevel:                 strings.TrimSpace(*logLevel),
 		proxyLogPath:             strings.TrimSpace(*proxyLog),
 		startupTimeout:           *startupTimeout,
@@ -293,6 +300,7 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		server.WithCopilotHeaderConfig(copilotHeaderConfigFromEnv()),
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
+			proxy.WithStateBindingsConfig(opts.stateBindings),
 			proxy.WithAllowedModels(opts.model),
 			proxy.WithPolicyRoutingMode(opts.policyRoutingMode),
 			proxy.WithDeferredDynamicProviderModelValidation(true),

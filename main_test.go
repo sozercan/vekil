@@ -1378,6 +1378,7 @@ func TestLaunchUsesCopilotForDirectPolicyModel(t *testing.T) {
 	classifierNoStore := false
 	cfg := proxy.ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &proxy.StateBindingsConfig{Mode: "memory"},
 		Providers: []proxy.ProviderConfig{{
 			ID:                         "copilot",
 			Type:                       "copilot",
@@ -2037,6 +2038,7 @@ func TestRunLaunchAgentInitializesConfiguredPolicyRouting(t *testing.T) {
 			tmp := t.TempDir()
 			providersPath := filepath.Join(tmp, "providers.yaml")
 			providersBody := fmt.Sprintf(`schema_version: 2
+state_bindings: {mode: memory}
 providers:
   - id: policy-provider
     type: openai-compatible
@@ -2107,6 +2109,7 @@ func writeStaticPolicyLaunchProvidersConfig(t *testing.T) string {
 	t.Helper()
 	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
 	providersBody := `schema_version: 2
+state_bindings: {mode: memory}
 providers:
   - id: policy-provider
     type: openai-compatible
@@ -2150,6 +2153,7 @@ func writeCopilotPolicyLaunchProvidersConfig(t *testing.T) string {
 	t.Helper()
 	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
 	providersBody := `schema_version: 2
+state_bindings: {mode: memory}
 providers:
   - id: copilot
     type: copilot

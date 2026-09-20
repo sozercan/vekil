@@ -198,15 +198,18 @@ func (m *routeOperationMutex) Unlock() {
 type routeOperation struct {
 	mu routeOperationMutex
 
-	id       string
-	route    *modelRoute
-	inbound  context.Context
-	chatPlan *chatOperationPlan
+	id           string
+	route        *modelRoute
+	inbound      context.Context
+	chatPlan     *chatOperationPlan
+	conversation *conversationTurn
 
 	remainingTargetAttempts int
 	remainingUpstreamSends  int
 	attemptedTargets        map[string]struct{}
 	pinnedTargetID          string
+	stateOwnerIdentity      [32]byte
+	bootstrapConversation   *stateBindingToken
 	hardPinned              bool
 	sequence                int
 	upstreamSends           int
@@ -3149,6 +3152,9 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 
 		owner := providerModelFromRouteTarget(route, target)
 		preparedBody, err := prepareRouteTargetBody(body, requestedModel, endpoint, route, target, owner)
+		if err == nil {
+			preparedBody, err = operation.conversation.prepareTargetBody(preparedBody, target)
+		}
 		if err != nil {
 			if sameTargetRetry {
 				suppressPendingRouteRetry(operation, failures, routeRetrySuppressedNonretryable, nil)
@@ -3171,12 +3177,14 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
 			break
 		}
-		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), explicitRouteResponseInfo{
-			routeID:    route.public.routeID,
-			publicID:   route.public.id,
-			targetID:   target.id,
-			providerID: target.provider.id,
-		}))
+		responseInfo := explicitRouteResponseInfo{
+			routeID:      route.public.routeID,
+			publicID:     route.public.id,
+			targetID:     target.id,
+			providerID:   target.provider.id,
+			conversation: operation.conversation,
+		}
+		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), responseInfo))
 		req.GetBody = nil
 		req = h.withAzureRouteTraffic(req, target)
 		traffic := azureRouteTrafficFromRequest(req)
@@ -3194,10 +3202,21 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: failure.statusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
 			break
 		}
-		permit, blocked, admissionErr := h.acquireCopilotInference(req)
+		_, migrationReady := h.conversationMigrationTarget(ctx, operation, endpoint, kind)
+		var permit *copilotInferencePermit
+		var blocked *http.Response
+		var admissionErr error
+		// Either provider's local cooldown can reject before dispatch. Verify
+		// the original authenticated owner before that rejection can migrate.
+		if migrationReady {
+			_, admissionErr = h.validateDurableRequestOwner(req, route, target, operation)
+		}
+		if admissionErr == nil {
+			permit, blocked, admissionErr = h.acquireCopilotInference(req)
+		}
 		var azurePermit *azureTrafficPermit
 		if blocked == nil && admissionErr == nil {
-			azurePermit, blocked, admissionErr = h.acquireAzureRouteInference(req, routeCanSwitchAfterAttempt(ctx, operation, endpoint, kind, h.ShuttingDown()))
+			azurePermit, blocked, admissionErr = h.acquireAzureRouteInference(req, routeCanSwitchAfterAttempt(ctx, operation, endpoint, kind, h.ShuttingDown()) || migrationReady)
 			if blocked == nil && admissionErr == nil && azurePermit != nil && target.provider.azureAuthMode() == providerAuthModeAzureIdentity {
 				// A recovery queue can outlive the token attached during request
 				// construction. Refresh before reserving a physical send.
@@ -3242,9 +3261,33 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			}
 			break
 		}
+		// Admission may refresh Azure credentials. Capture the final authenticated
+		// request before any ownership claim or physical send on every endpoint.
+		stateIdentity, stateErr := h.validateDurableRequestOwner(req, route, target, operation)
+		if stateErr != nil {
+			permit.release()
+			azurePermit.release()
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			failure := routeAttemptFailure{err: stateErr, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedState, cleanupDone: true}
+			failures = append(failures, failure)
+			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
+			break
+		}
+		responseInfo.stateIdentity = stateIdentity
+		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), responseInfo))
 		if traffic.controller != nil {
 			traffic.permit = azurePermit
 			req = req.WithContext(context.WithValue(req.Context(), azureRouteTrafficContextKey{}, traffic))
+		}
+		if err := operation.conversation.persistIntent(); err != nil {
+			permit.release()
+			azurePermit.release()
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			return nil, err
 		}
 
 		if reserved, decision := operation.reserveSendAtDispatch(ctx, h.ShuttingDown()); !reserved {
@@ -3288,6 +3331,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			})
 		}
 
+		operation.conversation.dispatching()
 		resp, sendErr := h.singleInferenceSend(req, observation)
 		h.finishCopilotInference(req, resp, sendErr, permit)
 		if resp != nil {
@@ -3295,6 +3339,9 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		}
 		if sendErr == nil && resp != nil {
 			normalizeExplicitModelHeaders(resp.Header, route.public.id)
+			if operation.conversation != nil {
+				resp.Header.Set("X-Vekil-Conversation-Recovery", "recording")
+			}
 		}
 		if sendErr != nil {
 			delivery := observation.deliveryForError()
@@ -3525,11 +3572,25 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			resp = observeRouteAttemptResponse(resp, attemptRecord, operation, trace, observation, endpoint, stream)
 		}
 		attribution.recordFinal(operation.inbound)
+		if operation.conversation != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
+			// A non-success response without the adapter's non-execution proof
+			// cannot be replayed. This includes redirects: clients must not follow
+			// Location and repeat a protected turn outside this route.
+			_ = drainRouteAttemptBodyWithTimeout(resp.Body, upstreamErrorDetailDrainTimeout)
+			h.logConversationRecovery(operation, "blocked", target.id, "execution_uncertain")
+			operation.conversation.mu.Lock()
+			operation.conversation.blocked = true
+			operation.conversation.mu.Unlock()
+			return nil, conversationRequestError(errConversationHistoryUncertain)
+		}
 		return resp, nil
 	}
 
-	h.recordExplicitRouteExhaustion(operation, endpoint)
 	failure := selectFinalRouteFailure(failures)
+	if resp, handled, err := h.tryConversationMigration(ctx, operation, endpoint, dispatchPath, extraHeaders, requestedModel, stream, failure); handled {
+		return resp, err
+	}
+	h.recordExplicitRouteExhaustion(operation, endpoint)
 	failure.attribution.recordFinal(operation.inbound)
 	if failure.response != nil {
 		failure.response.recordFinalUpstreamID(operation.inbound)

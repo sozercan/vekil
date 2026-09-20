@@ -7,6 +7,13 @@ Vekil supports two runtime patterns:
 
 Schema version 2 is the complete explicit-routing format: it supports public and internal routes, ordered failover, and optional [semantic policy profiles](policy-routing.md) that select one Chat-capable terminal route per request. Existing route-only version-2 files remain valid. By default, each profile's YAML `mode` is authoritative; an explicit process mode can still lower the effective mode as an operational override.
 
+Schema-v2 explicit routes also use durable provider-state ownership by default on
+macOS and Linux. Configure the top-level `state_bindings` block in this same
+JSON/YAML file; no additional flags or tray settings are required. Set
+`state_bindings.mode: memory` to opt out. Legacy and zero-config routing keep
+their existing memory behavior. See [State Recovery](state-recovery.md) for the
+configuration block, default application-data paths, retention, and pruning.
+
 ## Topic Map
 
 | Need | Doc |
@@ -26,12 +33,23 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 | `--host` | `HOST` | `127.0.0.1` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Local path or HTTP(S) URL to JSON or YAML provider configuration for explicit provider routing |
+| `--state-bindings-mode` | `STATE_BINDINGS_MODE` | `config` | Optional process override: `config`, `durable`, or `memory` |
+| `--state-bindings-file` | `STATE_BINDINGS_FILE` | providers config | Optional absolute file override in an existing private local directory |
+| `--state-bindings-max-entries` | `STATE_BINDINGS_MAX_ENTRIES` | `0`, follows providers config | Logical-record capacity including tombstones; durable default 8,388,608, without preallocation |
 | `--policy-routing` | `POLICY_ROUTING_MODE` | `config` | Policy-routing ceiling: `config` follows each profile's YAML `mode`; `off`, `observe`, or `enforce` explicitly cap every profile. A profile cannot run above an explicit ceiling. |
 | `--policy-routing-allow-remote-single-tenant` | `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT` | `false` | Acknowledge running policy `observe`/`enforce` on a non-loopback bind for one trusted tenant. This adds no authentication or tenant isolation. |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error` |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
 Native CLI and tray-app runs default to `127.0.0.1`. Container deployments that publish the proxy port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path.
+
+State overrides follow flag, environment, providers-file, then schema-default
+precedence. An empty file override or zero capacity follows the providers file.
+A nonempty file override enables durable mode unless `memory` is explicitly
+selected; memory mode never opens that file. The CLI and agent launchers accept
+these flags, and the menubar uses the same environment parsing and shared store
+initialization. Storage or lock failures stop startup and never select memory
+automatically.
 
 Serve mode defaults Go's garbage-collection target to `GOGC=200` to favor
 throughput while retaining a bounded memory footprint. Whitespace-only `GOGC`

@@ -66,10 +66,15 @@ You can run Azure-only or Codex-only configs, or mix those providers with Copilo
 
 A provider file with no `schema_version` is version 1. Explicitly setting `schema_version: 0` is invalid. Only schema versions 1 and 2 are supported. Version-1 files keep the existing provider-owned `models[]`, dynamic discovery, default-provider, unknown-model, catalog, and retry behavior. A new binary does not rewrite those files.
 
-Schema version 2 is the complete explicit-routing schema. It adds public and internal `model_routes`, ordered target failover, provider trust metadata, internal classifier routes, and optional semantic `policy_profiles`. A route-only version-2 file remains valid without policy fields. A sole provider other than a TypeSafe-compatible classifier is the implicit default. In a multi-provider configuration, a single Copilot provider is the implicit default. Multiple non-Copilot providers may omit `default: true` only when none exposes a legacy static or dynamic model catalog and client-visible models are owned by public routes or policies. If any such provider exposes legacy/catalog models, configure exactly one explicit default provider. A complete route-only environment-variable example is checked in at [`examples/provider-routing-failover.yaml`](../examples/provider-routing-failover.yaml).
+Schema version 2 is the complete explicit-routing schema. It adds public and internal `model_routes`, ordered target failover, provider trust metadata, internal classifier routes, and optional semantic `policy_profiles`. Explicit routes use durable provider-state ownership by default, configured through the top-level `state_bindings` block. A route-only version-2 file remains valid without policy fields. A sole provider other than a TypeSafe-compatible classifier is the implicit default. In a multi-provider configuration, a single Copilot provider is the implicit default. Multiple non-Copilot providers may omit `default: true` only when none exposes a legacy static or dynamic model catalog and client-visible models are owned by public routes or policies. If any such provider exposes legacy/catalog models, configure exactly one explicit default provider. A complete route-only environment-variable example is checked in at [`examples/provider-routing-failover.yaml`](../examples/provider-routing-failover.yaml).
 
 ```yaml
 schema_version: 2
+
+state_bindings:
+  mode: durable
+  max_entries: 8388608
+  # file: /absolute/path/to/bindings.db
 
 providers:
   - id: azure-primary
@@ -113,6 +118,13 @@ model_routes:
       max_upstream_sends: 1
 ```
 
+The `state_bindings` block above shows the defaults for explicit routes. Omit
+`file` to use the private OS application-data path, or set `mode: memory` to
+retain process-local ownership with expiry and eviction. The providers file
+alone controls this behavior for the CLI, managed launchers, and menubar app.
+See [durable state recovery](state-recovery.md) for macOS/Linux storage support,
+capacity, multiple-instance isolation, and pruning.
+
 After the route has been validated in `primary_only`, enable ordered failover explicitly:
 
 ```yaml
@@ -131,7 +143,7 @@ The same schema-version-2 contract also includes:
 - provider `trust_domain` and classifier non-storage capability metadata; and
 - top-level `policy_profiles` that publish one Chat model ID and select a `lightweight` or `powerful` canonical-Chat terminal route backed by native Chat or bounded Chat-over-Responses.
 
-These fields are additive: existing route-only version-2 configurations remain valid, while version-1 files reject explicit-route and policy-routing fields. Internal routes have no public ID, aliases, picker metadata, `/v1/models` entry, dashboard insight-model eligibility, or direct client resolution. Policy destinations may be public or internal; exposed public destinations are deliberate policy bypasses. The recommended policy configuration keeps both destinations and the classifier internal. See [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml), the single-process [`examples/policy-routing-copilot.yaml`](../examples/policy-routing-copilot.yaml), and [Semantic Policy Routing](policy-routing.md).
+These fields are additive: existing route-only version-2 configurations remain valid, while version-1 files reject explicit-route, policy-routing, and `state_bindings` fields. Internal routes have no public ID, aliases, picker metadata, `/v1/models` entry, dashboard insight-model eligibility, or direct client resolution. Policy destinations may be public or internal; exposed public destinations are deliberate policy bypasses. The recommended policy configuration keeps both destinations and the classifier internal. See [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml), the single-process [`examples/policy-routing-copilot.yaml`](../examples/policy-routing-copilot.yaml), and [Semantic Policy Routing](policy-routing.md).
 
 ### Route schema and validation
 
@@ -207,6 +219,12 @@ Azure cooldowns are shared by resource origin and physical deployment across pub
 
 Automatic target switching is intentionally narrow:
 
+These are the default ownership rules. Opt-in
+[Responses conversation migration](conversation-migration.md) can reconstruct a
+saved complete conversation on another Azure resource or Copilot at the same
+safe boundaries. It never forwards an old resource's opaque state to the new
+resource.
+
 | Observed outcome | Switch to the next target |
 |------------------|---------------------------|
 | DNS, dial, or TLS failure before request bytes could be written | Yes, if admission, deadline, cleanup, and budgets still allow it |
@@ -246,18 +264,41 @@ Schema-v2 policy selection is narrower than this general explicit-route matrix. 
 
 The optional websocket bridge uses upstream HTTP `/responses` by default. Its
 first provider-backed `response.create` may use the same safe precommit route
-failover; after a successful target is exposed, the session is pinned to that
-exact route/target. Experimental native Copilot connections additionally
+failover; by default, after a successful target is exposed, the session is pinned
+to that exact route/target. Migration-enabled Azure routes select subsequent
+owners from immutable saved responses, including after reconnect. Experimental native Copilot connections additionally
 prohibit retry or migration after sending a create. See
 [Responses WebSocket Bridge](responses-websocket.md).
 
 ### Exact state binding and process-local limits
 
-Provider-issued state is bound to one exact `{route_id, target_id}`. This includes adapter-marked response IDs, trusted `X-Codex-Turn-State`, non-proxy opaque `encrypted_content`, and other opaque reasoning/session handles. Known state pins the owning target and disables failover. All supplied state values must agree; malformed, conflicting, cross-route, or mixed known/unknown state on an explicit `/responses` operation fails locally without an upstream call. A token observed from different owners becomes a conflict tombstone and remains fail-closed until that record expires or is evicted.
+Provider-issued state is bound to one exact `{route_id, target_id}`. This includes adapter-marked response IDs, trusted `X-Codex-Turn-State`, non-proxy opaque `encrypted_content`, and other opaque reasoning/session handles. By default, known state pins the owning target and disables failover. All supplied state values must agree; malformed, conflicting, cross-route, or mixed known/unknown state on an explicit `/responses` operation fails locally without an upstream call. A token observed from different owners becomes a conflict tombstone. Memory-only tombstones can expire or evict; durable tombstones remain until explicit pruning. Opt-in migration verifies complete visible history before reconstructing without old provider state; it never relabels an old token's owner.
 
 There is one narrow first-use exception for a client-supplied Responses `conversation` ID. When that conversation is the request's only explicit state and the route can select exactly one eligible Responses target, Vekil atomically binds the ID to that target before dispatch and hard-pins the operation. This covers a one-target route and a multi-target `primary_only` route whose configured primary is eligible. An unknown conversation on a multi-target `priority_failover` route remains fail-closed because ownership is ambiguous; other unknown provider state also remains fail-closed. `previous_response_id` cannot be combined with `conversation`. Vekil exposes no public conversation-registration endpoint and accepts no client target hint.
 
-The binding index is bounded to 262,144 entries with a 24-hour absolute TTL and is process-local. Capacity eviction, expiry, restart, or sending the next request to another Vekil process makes a prior binding unknown. For ordinary provider state that fails closed. A conversation-only request on a currently deterministic route can instead take the bootstrap path, which cannot distinguish genuine first use from a lost prior binding; keep the process affinity and deterministic target stable for the lifetime of active conversations. Lookups update recency for eviction but do not extend the absolute TTL; observing the same token again from the same owner refreshes it. **Every explicit Responses route that accepts provider-issued state requires one Vekil process or sticky ingress to the process that owns the binding**, including one-target and `primary_only` routes. Responses-backed Chat tool continuations use a separate process-local replay store and have the same affinity/restart constraint. Vekil does not migrate Responses state, replay a WebSocket session onto another target, or infer portability from user-provided strings. Durable/shared bindings and proxy-signed target hints are future work.
+[Durable state recovery](state-recovery.md) is the default for schema-v2 explicit
+routes. It binds the actual authenticated endpoint, deployment, and account
+identity and retains ownership across restart. The default capacity is 8,388,608
+logical records including tombstones; it does not preallocate that many records.
+New records fail at capacity without automatic expiry or eviction. The dashboard
+shows occupancy and file size and warns before the limit is reached.
+
+`state_bindings.mode: memory` opts out. Its default capacity is 262,144 entries
+with a 24-hour absolute TTL and LRU eviction. Lookups update eviction recency but
+not TTL; observing the same token from its owner refreshes it. Expiry, eviction,
+restart, or another process makes proof unknown. Ordinary opaque state then
+fails closed; conversation-only IDs retain the narrow bootstrap exception.
+Enabling durability later cannot reconstruct lost proof.
+
+Concurrent clients share the proxy's store safely. Every explicit stateful route,
+including one-target and `primary_only`, still needs one writer per file and
+ingress affinity when several proxies run independently. Responses-backed Chat
+replay remains a separate process-local store. Shared binding storage,
+client-supplied ownership hints and generic cross-provider session migration
+remain unsupported. Selected Azure routes can enable the narrower
+[`conversation_migration`](conversation-migration.md) contract through the
+providers file. It requires durable storage and saves conversation text with
+separate limits and deletion rules.
 
 ### No terminal-route balancing or generic circuit breaker
 
@@ -276,7 +317,21 @@ A conservative rollout is: validate the version-2 file, run a one-target route i
 
 Policy profiles have a separate operator gate: keep the global ceiling `off`, complete the powered end-to-end evaluation, graduate profiles independently through `observe`, require at least 5,000 completed observations and 95% admission in every declared traffic bucket, then enforce one profile at a time. See [Policy evaluation gates](policy-routing.md#evaluation-gates-before-enforcement) and [Policy rollout and rollback](policy-routing.md#rollout-and-rollback).
 
-To stop automatic switching, restore `mode: primary_only` and restart the same schema-version-2 binary. This is availability-safe but **not continuity-preserving**: restart clears process-local state bindings, Responses-backed Chat replay state, and WebSocket sessions, so drain stateful traffic first or accept deterministic continuation failures. The new process still interprets newly issued state with the same version-2 fail-closed rules. Do **not** restore a version-1 file or downgrade to an older binary while state issued by a secondary may still be presented. First fence new stateful continuations, drain WebSocket sessions, wait at least the 24-hour binding TTL plus any longer provider replay window, and perform an atomic no-mixed-version cutover. If that fence cannot be guaranteed, keep the running version-2 process in `primary_only` until the fence is complete. There is no automatic configuration migration in either direction.
+To stop automatic switching, restore `routing.mode: primary_only` and restart
+the same schema-v2 binary against the complete same store and exact owner
+configuration. Durable proof still pins state to its issuing target, including
+a secondary. Websocket connections and Responses-backed Chat replay remain
+process-local and need draining. In memory mode, the restart also clears
+ownership proof.
+
+Fence new stateful continuations before explicit pruning, changing to memory
+mode, restoring an older backup, using a version-1 configuration, or downgrading.
+Drain WebSocket sessions and prevent clients from presenting retired state to a
+different version or owner. Durable records have no TTL; the memory-only
+24-hour limit does not retire them. If that fence cannot be guaranteed, keep
+the version-2 configuration and complete store. There is no automatic
+configuration migration in either direction. See
+[recovery and rollback](state-recovery.md#failures-and-rollback).
 
 ### Native endpoints and Chat compatibility
 

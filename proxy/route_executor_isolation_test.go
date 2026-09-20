@@ -375,6 +375,7 @@ func newRouteIsolationHandler(
 
 	options := []Option{WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: ProvidersConfigSchemaVersion2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers:     []ProviderConfig{primary, backup},
 		ModelRoutes: []ModelRouteConfig{{
 			ID:        "release-matrix-route",

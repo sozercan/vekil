@@ -202,6 +202,8 @@ type statsSnapshot struct {
 	StateBindingHits      int64 `json:"state_binding_hits"`
 	StateBindingMisses    int64 `json:"state_binding_misses"`
 	StateBindingEvictions int64 `json:"state_binding_evictions"`
+	// Storage gauges include recovered records and do not reset with traffic.
+	StateBindings stateBindingStatsSnapshot `json:"state_bindings"`
 	// Retries is the total upstream retry attempts and the breakdown by the
 	// status that triggered them (surfaces flakiness the proxy absorbed).
 	Retries       int64           `json:"retries"`
@@ -1895,7 +1897,9 @@ func (h *ProxyHandler) HandleStatsJSON(w http.ResponseWriter, r *http.Request) {
 		snap.AuxiliaryInflight = auxiliaryInflight
 	}
 	snap.PolicyRouting = emptyPolicyStatsSnapshot()
+	snap.StateBindings = (*stateBindingStore)(nil).dashboardStats()
 	if h != nil {
+		snap.StateBindings = h.stateBindings.dashboardStats()
 		snap.InsightsEnabled = strings.TrimSpace(h.providersConfig.InsightModel) != ""
 		if controller, ok := h.policyRoutingController.(*chatPolicyRoutingController); ok {
 			snap.PolicyRouting = controller.PolicyStatsSnapshot()
