@@ -42,6 +42,11 @@ func (s *responsesWebSocketSession) postConversationCreateRequest(h *ProxyHandle
 		return nil, err
 	}
 	headers := s.requestHeaders(request, false)
+	if plan.conversationComplete && headerGetCI(headers, "X-Vekil-History-Complete") == "" {
+		// A staged independent import keeps its assertion until generation.
+		// The request planner clears it when the client starts a new chain.
+		headers.Set("X-Vekil-History-Complete", "true")
+	}
 	body, headers, err = h.prepareConversationTurn(operation, body, headers)
 	if err != nil {
 		return nil, err

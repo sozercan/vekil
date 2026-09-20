@@ -258,3 +258,71 @@ func TestConversationMigrationWebSocketIndependentImport(t *testing.T) {
 		t.Fatalf("import sends = %d", sends.Load())
 	}
 }
+
+func TestConversationMigrationWebSocketStagedIndependentImport(t *testing.T) {
+	for _, reset := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reset=%t", reset), func(t *testing.T) {
+			var sends atomic.Int32
+			h, _ := newConversationAPIHandler(t, routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if strings.HasSuffix(req.URL.Path, "/models") {
+					return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+				}
+				body, _ := io.ReadAll(req.Body)
+				req.Body = io.NopCloser(bytes.NewReader(body))
+				for _, text := range []string{"Earlier question.", "Earlier answer.", "finished once", "Staged request.", "Generate now."} {
+					if bytes.Count(body, []byte(text)) != 1 {
+						t.Errorf("staged import lost or duplicated %q: %s", text, body)
+					}
+				}
+				if req.Header.Get("X-Vekil-History-Complete") != "" || bytes.Contains(body, []byte("previous_response_id")) {
+					t.Error("staged import forwarded its assertion or foreign lineage")
+				}
+				return conversationResponse(t, req, fmt.Sprintf("imported-%d", sends.Add(1)), conversationText("Generated answer.")), nil
+			}), nil)
+			conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
+			defer func() { _ = conn.Close() }()
+			stage := func(previousID string, input any, headers map[string]string) string {
+				t.Helper()
+				request := map[string]any{"type": "response.create", "model": "coding", "store": false, "generate": false, "input": input, "headers": headers}
+				if previousID != "" {
+					request["previous_response_id"] = previousID
+				}
+				if err := conn.WriteJSON(request); err != nil {
+					t.Fatal(err)
+				}
+				if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "response.created" {
+					t.Fatalf("staging did not start: %v", frame)
+				}
+				frame := mustReadWebSocketJSONSkipMetadata(t, conn)
+				if frame["type"] != "response.completed" || sends.Load() != 0 {
+					t.Fatalf("staging failed or dispatched inference: %v, sends=%d", frame, sends.Load())
+				}
+				return websocketResponseID(t, frame)
+			}
+			history := []any{
+				map[string]any{"role": "user", "content": "Earlier question."}, conversationText("Earlier answer."),
+				map[string]any{"type": "function_call", "call_id": "imported-call", "name": "local_tool", "arguments": "{}"},
+				map[string]any{"type": "function_call_output", "call_id": "imported-call", "output": "finished once"},
+			}
+			stagedID := stage("foreign-response", history, map[string]string{"X-Vekil-History-Complete": "true"})
+			stagedID = stage(stagedID, "Staged request.", nil)
+			if reset {
+				stagedID = stage("", history, nil)
+				if err := conn.WriteJSON(map[string]any{"type": "response.create", "model": "coding", "store": false, "previous_response_id": stagedID, "input": "Generate now."}); err != nil {
+					t.Fatal(err)
+				}
+				frame := mustReadWebSocketJSONSkipMetadata(t, conn)
+				encoded, _ := json.Marshal(frame)
+				if frame["type"] != "error" || !bytes.Contains(encoded, []byte("conversation_history_unavailable")) || sends.Load() != 0 {
+					t.Fatalf("reset inherited an unrelated completeness assertion: %s, sends=%d", encoded, sends.Load())
+				}
+				return
+			}
+			response := conversationWebSocketTurn(t, conn, map[string]any{"previous_response_id": stagedID, "input": "Generate now."})
+			conversationWebSocketTurn(t, conn, map[string]any{"previous_response_id": response["id"], "input": "Continue."})
+			if sends.Load() != 2 {
+				t.Fatalf("import generation and continuation sends = %d", sends.Load())
+			}
+		})
+	}
+}

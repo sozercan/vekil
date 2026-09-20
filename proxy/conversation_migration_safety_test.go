@@ -220,6 +220,58 @@ func TestConversationMigrationCancellationClosesAdmission(t *testing.T) {
 	}
 }
 
+func TestConversationMigrationRejectsRedirects(t *testing.T) {
+	for _, status := range []int{300, 301, 302, 303, 304, 307, 308} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("status=%d/stream=%t", status, stream), func(t *testing.T) {
+				var redirected, sends, west atomic.Int32
+				redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					redirected.Add(1)
+					w.WriteHeader(http.StatusOK)
+				}))
+				defer redirect.Close()
+				transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if strings.HasSuffix(req.URL.Path, "/models") {
+						return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+					}
+					if strings.HasPrefix(req.URL.Host, "west.") {
+						west.Add(1)
+					}
+					if sends.Add(1) == 1 {
+						return conversationResponse(t, req, "redirect-seed", conversationText("Saved answer.")), nil
+					}
+					return routeExecutorTestResponse(req, status, http.Header{"Location": {redirect.URL}}, "redirected response"), nil
+				})
+				h, cfg := newConversationAPIHandler(t, transport, nil)
+				conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
+				server := httptest.NewServer(http.HandlerFunc(h.HandleResponses))
+				defer server.Close()
+				body := fmt.Sprintf(`{"model":"coding","previous_response_id":"redirect-seed","input":"Continue.","stream":%t}`, stream)
+				// Use a redirect-following client to prove the proxy cannot expose a
+				// Location that replays the protected turn outside its route.
+				response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := io.ReadAll(response.Body)
+				_ = response.Body.Close()
+				if err != nil || response.StatusCode != http.StatusConflict || response.Header.Get("Location") != "" || !bytes.Contains(data, []byte("conversation_execution_uncertain")) {
+					t.Fatalf("redirect was not withheld: status=%d body=%s err=%v", response.StatusCode, data, err)
+				}
+				if sends.Load() != 2 || redirected.Load() != 0 || west.Load() != 0 {
+					t.Fatalf("redirect replayed: sends=%d redirected=%d west=%d", sends.Load(), redirected.Load(), west.Load())
+				}
+				stopConversationAPIHandler(t, h)
+				h, _ = newConversationAPIHandler(t, transport, &cfg)
+				retry := conversationPOST(t, h, map[string]any{"previous_response_id": "redirect-seed", "input": "Retry."}, nil)
+				if retry.Code != http.StatusConflict || !strings.Contains(retry.Body.String(), "conversation_execution_uncertain") || sends.Load() != 2 {
+					t.Fatalf("redirect uncertainty was lost on restart: %d %s, sends=%d", retry.Code, retry.Body.String(), sends.Load())
+				}
+			})
+		}
+	}
+}
+
 func TestConversationMigrationHasOneTransitionAndSharedBudget(t *testing.T) {
 	var outage atomic.Bool
 	var east, west, third atomic.Int32

@@ -3542,9 +3542,10 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			resp = observeRouteAttemptResponse(resp, attemptRecord, operation, trace, observation, endpoint, stream)
 		}
 		attribution.recordFinal(operation.inbound)
-		if operation.conversation != nil && resp.StatusCode >= http.StatusBadRequest {
-			// An error without the adapter's non-execution proof cannot be
-			// replayed. Explain that uncertainty on the protected route itself.
+		if operation.conversation != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
+			// A non-success response without the adapter's non-execution proof
+			// cannot be replayed. This includes redirects: clients must not follow
+			// Location and repeat a protected turn outside this route.
 			_ = drainRouteAttemptBodyWithTimeout(resp.Body, upstreamErrorDetailDrainTimeout)
 			h.logConversationRecovery(operation, "blocked", target.id, "execution_uncertain")
 			operation.conversation.mu.Lock()

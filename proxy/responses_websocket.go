@@ -231,6 +231,7 @@ type responsesWebSocketSession struct {
 	lastResponseID             string
 	lastSignature              string
 	stagedConversationSourceID string
+	stagedConversationComplete bool
 	historyItems               []json.RawMessage
 	historyBytes               int
 	nativeUpstream             *responsesNativeUpstream
@@ -263,6 +264,7 @@ type responsesWebSocketRequestPlan struct {
 	compactionChecked    bool
 	compactionTrigger    bool
 	conversationSourceID string
+	conversationComplete bool
 }
 
 type responsesWebSocketRequestMetrics struct {
@@ -1926,7 +1928,14 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	}
 	route, known := h.resolveModelRouteForRequest(request.Model, providerEndpointResponses)
 	migration := known && h.conversationMigrationEnabled(route)
-	if request.PreviousResponseID == "" || (migration && headerGetCI(s.requestHeaders(request, false), "X-Vekil-History-Complete") == "true") {
+	if migration {
+		assertion := headerGetCI(s.requestHeaders(request, false), "X-Vekil-History-Complete")
+		if assertion != "" && assertion != "true" {
+			return responsesWebSocketRequestPlan{}, conversationRequestError(errConversationHistoryPartial)
+		}
+		plan.conversationComplete = assertion == "true"
+	}
+	if request.PreviousResponseID == "" || plan.conversationComplete {
 		plan.resetHistory = true
 		plan.fullReplaySegments = [][]json.RawMessage{request.Input}
 		return plan, nil
@@ -1952,6 +1961,7 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	plan.fullReplaySegments = [][]json.RawMessage{s.historyItems, request.Input}
 	if migration {
 		plan.conversationSourceID = s.stagedConversationSourceID
+		plan.conversationComplete = s.stagedConversationComplete
 		catalogs, history := partitionResponsesAdditionalToolsInputItems(s.historyItems)
 		if current, _ := partitionResponsesAdditionalToolsInputItems(request.Input); len(current) > 0 {
 			catalogs = nil
@@ -2236,8 +2246,10 @@ func (s *responsesWebSocketSession) rememberResponse(resetHistory bool, response
 
 func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSocketRequestPlan, responseID string, outputItems []json.RawMessage) {
 	s.stagedConversationSourceID = ""
+	s.stagedConversationComplete = false
 	if strings.HasPrefix(responseID, "vekil-ws-") {
 		s.stagedConversationSourceID = plan.conversationSourceID
+		s.stagedConversationComplete = plan.conversationComplete
 	}
 	if plan.hasCompactionTrigger() {
 		s.turnState = ""
