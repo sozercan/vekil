@@ -728,6 +728,7 @@ cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
 | Big Pickle | big-pickle | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
 | Ox Alpha Free | x-preview-f-free | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
 | Muse Spark Free | muse-spark-free | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
+| Jev Free | jev-free | `https://opencode.ai/zen/v1/systemone` | - |
 
 ## Pricing
 
@@ -737,6 +738,7 @@ cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
 | Big Pickle | Free | Free | Free | - |
 | Ox Alpha Free | Free | Free | Free | - |
 | Muse Spark Free | Free | Free | Free | - |
+| Jev Free | Free | Free | - | - |
 
 ### Retirement dates
 
@@ -748,6 +750,7 @@ cat > "${zen_parser_dir}/expected.tsv" <<'EOF_ZEN_EXPECTED'
 big-pickle	Big Pickle	/chat/completions
 x-preview-f-free	Ox Alpha Free	/chat/completions
 muse-spark-free	Muse Spark Free	/responses
+jev-free	Jev Free	/systemone
 EOF_ZEN_EXPECTED
 if "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
   "${zen_parser_dir}/zen.mdx" > "${zen_parser_dir}/actual.tsv" \
@@ -830,9 +833,9 @@ if GITHUB_OUTPUT="${zen_render_outputs}" \
   "${zen_parser_dir}/zen.mdx" "${zen_parser_dir}/render-config.yaml" \
   && cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" \
   && grep -Fxq 'changed=true' "${zen_render_outputs}"; then
-  record_success "Zen config updater replaces only the generated block with sorted endpoints"
+  record_success "Zen config updater skips classifiers and sorts public endpoints"
 else
-  record_failure "Zen config updater replaces only the generated block with sorted endpoints" \
+  record_failure "Zen config updater skips classifiers and sorts public endpoints" \
     "$(diff -u "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" 2>&1 || true)"
 fi
 
@@ -887,10 +890,22 @@ else
   record_failure "Zen free-label parser retains SystemOne catalog metadata" \
     "$(diff -u "${zen_parser_dir}/systemone-expected.tsv" "${zen_parser_dir}/systemone-actual.tsv" 2>&1 || true)"
 fi
-expect_hard_failure_with_stderr "Zen config updater rejects SystemOne routing" 4 \
-  'unsupported endpoint for openai-compatible Zen example: jev-1.13-free -> /systemone' \
+expect_hard_failure_with_stderr "Zen config updater rejects a classifier-only catalog" 4 \
+  'no OpenCode Zen free Chat or Responses models were parsed' \
   "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
   "${zen_parser_dir}/systemone-free.mdx" "${zen_parser_dir}/render-config.yaml"
+if cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml"; then
+  record_success "Zen classifier-only catalog preserves the existing config"
+else
+  record_failure "Zen classifier-only catalog preserves the existing config" "config changed after rejected update"
+fi
+
+sed 's@/systemone@/unknown-evaluation@g' "${zen_parser_dir}/systemone-free.mdx" \
+  > "${zen_parser_dir}/unknown-endpoint.mdx"
+expect_hard_failure_with_stderr "Zen free-label parser rejects unknown evaluation endpoints" 4 \
+  'unsupported endpoint for Jev 1.13 Free: https://opencode.ai/zen/v1/unknown-evaluation' \
+  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/unknown-endpoint.mdx"
 
 claude_contract_dir="${TMP_ROOT}/setup/claude-defaults-and-model-preference"
 start_mock_server "${claude_contract_dir}/server" 200

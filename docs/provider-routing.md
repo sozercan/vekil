@@ -43,7 +43,7 @@ Entra token refreshes are shared across concurrent requests; waiters can time ou
 
 ### Generic Providers
 
-`openai-compatible` and `anthropic-compatible` providers use the generic auth fields:
+`openai-compatible`, `anthropic-compatible`, and `typesafe-compatible` providers use the generic auth fields:
 
 - `auth_type: bearer` sends `Authorization: Bearer <key>` by default.
 - `auth_type: api-key-header` sends the key through `auth_header`, with optional `auth_prefix`.
@@ -66,7 +66,7 @@ You can run Azure-only or Codex-only configs, or mix those providers with Copilo
 
 A provider file with no `schema_version` is version 1. Explicitly setting `schema_version: 0` is invalid. Only schema versions 1 and 2 are supported. Version-1 files keep the existing provider-owned `models[]`, dynamic discovery, default-provider, unknown-model, catalog, and retry behavior. A new binary does not rewrite those files.
 
-Schema version 2 is the complete explicit-routing schema. It adds public and internal `model_routes`, ordered target failover, provider trust metadata, internal classifier routes, and optional semantic `policy_profiles`. Explicit routes use durable provider-state ownership by default, configured through the top-level `state_bindings` block. A route-only version-2 file remains valid without policy fields. A sole provider is the implicit default, and in a multi-provider configuration a single Copilot provider is the implicit default. Multiple non-Copilot providers may omit `default: true` only when none exposes a legacy static or dynamic model catalog and client-visible models are owned by public routes or policies. If any such provider exposes legacy/catalog models, configure exactly one explicit default provider. A complete route-only environment-variable example is checked in at [`examples/provider-routing-failover.yaml`](../examples/provider-routing-failover.yaml).
+Schema version 2 is the complete explicit-routing schema. It adds public and internal `model_routes`, ordered target failover, provider trust metadata, internal classifier routes, and optional semantic `policy_profiles`. Explicit routes use durable provider-state ownership by default, configured through the top-level `state_bindings` block. A route-only version-2 file remains valid without policy fields. A sole provider other than a TypeSafe-compatible classifier is the implicit default. In a multi-provider configuration, a single Copilot provider is the implicit default. Multiple non-Copilot providers may omit `default: true` only when none exposes a legacy static or dynamic model catalog and client-visible models are owned by public routes or policies. If any such provider exposes legacy/catalog models, configure exactly one explicit default provider. A complete route-only environment-variable example is checked in at [`examples/provider-routing-failover.yaml`](../examples/provider-routing-failover.yaml).
 
 ```yaml
 schema_version: 2
@@ -199,7 +199,7 @@ For schema-v2 policies, explicitly request classifier protocol preflight with:
 vekil config validate --live --providers-config /path/to/providers.yaml
 ```
 
-`--live` sends one fixed non-user fixture per distinct classifier route selected by the policy config to verify authentication/reachability, forced strict function output, configured non-storage behavior, and the one-send contract. It does not prove the provider's retention policy. Configuration reload is not part of schema version 2; apply changes by restarting Vekil.
+`--live` sends one fixed non-user fixture per distinct classifier route selected by the policy config to verify authentication/reachability, the configured classifier protocol, configured non-storage behavior, and the one-send contract. It does not prove the provider's retention policy. Configuration reload is not part of schema version 2; apply changes by restarting Vekil.
 
 ### Routing modes and budgets
 
@@ -252,6 +252,7 @@ Copilot targets:
 | `/responses` | `copilot`; `azure-openai`; static `openai-compatible` | Direct `POST /v1/responses`; route-aware compact/memory/replay helpers; optional proxy-owned `GET /v1/responses` websocket bridge; OpenAI Chat, translated Anthropic/Gemini, token probes, and dashboard insights through Chat-over-Responses when the request subset permits | Prewrite or adapter-certified pre-execution rejection; direct Responses and Responses-backed Chat streams may also switch after a held Responses preamble and a certified non-executing terminal admission failure, but never after semantic/tool progress or downstream commitment |
 | `/chat/completions` | `copilot`; `azure-openai`; static `openai-compatible` | OpenAI Chat Completions; translated Anthropic Messages; Gemini `generateContent` / `streamGenerateContent`; Chat-based token probes and dashboard insights | Prewrite or adapter-certified `429`/overload rejection; client streams can switch only while the held prefix is nonsemantic, and forced-stream aggregation only before text/reasoning/tool progress |
 | `/v1/messages` | static `anthropic-compatible` | Direct native Anthropic Messages | Prewrite or adapter-certified `429`/overload rejection while only a nonsemantic Anthropic preamble is held; no mixing with OpenAI-translated targets |
+| `/systemone` | static `typesafe-compatible` | Internal policy classification only | One target, one attempt, one send; no classifier failover |
 
 Native Anthropic `POST /v1/messages/count_tokens` is a bounded compatibility operation in the selected public route. In `priority_failover` mode it may switch targets only under the same replay-safe, precommit, adapter-certified rejection rules and shared target/send budgets as other route operations; protocol-recovery child sends remain pinned to their selected target. Chat-based Anthropic/Gemini token probes use canonical Chat execution and therefore the native `/chat/completions` or `/responses` endpoint selected from the route allowlist.
 
@@ -259,7 +260,7 @@ For explicit client streams, Vekil bounds precommit inspection with the existing
 
 An OpenAI-family route may use Copilot, Azure, or static OpenAI-compatible targets when all targets implement every advertised endpoint with equivalent semantics. Copilot targets use the configured `upstream_model` directly and authenticate through the process's normal Copilot authenticator; they do not require a second loopback Vekil bridge. An Anthropic-family route contains only static Anthropic-compatible targets. OpenAI Codex, dynamically discovered generic providers, native `/realtime`, and heterogeneous OpenAI/native-Anthropic target sets are rejected as explicit route targets. Provider-only version-1 routing for those providers remains available.
 
-Schema-v2 policy selection is narrower than this general explicit-route matrix. Both terminal routes and the classifier route must support canonical Chat execution through either native `/chat/completions` or Vekil's bounded Chat-over-Responses adapter. Copilot-backed Responses routes authenticate and adapt in process, so `vekil launch` remains a single command. The policy public ID still advertises `/chat/completions` and accepts text/function-tool OpenAI Chat, translated Anthropic Messages/counting, and bounded stateless Responses compatibility. It is rejected on the Responses websocket, compact/memory routes, hosted/custom tools, Gemini, multimodal input, and stateful `previous_response_id`. Active process-local `call_vekil_*` continuations remain bound to their originating terminal route/tier. Completed tool history can survive a later effort decision when both tiers configure effort and use the same single Responses provider/model target; see [Policy replay rules](policy-routing.md#locked-v1-scope). Opaque downstream-bridge replay still requires the documented single-target `off`/`observe` baseline and sticky ingress. Direct public routes keep the general matrix above.
+Schema-v2 policy selection is narrower than this general explicit-route matrix. Both terminal routes must support canonical Chat execution through either native `/chat/completions` or Vekil's bounded Chat-over-Responses adapter. Classifier routes may also use a [TypeSafe-compatible `/systemone` endpoint](policy-routing.md#typesafe-compatible-classifiers). Copilot-backed Responses routes authenticate and adapt in process, so `vekil launch` remains a single command. The policy public ID still advertises `/chat/completions` and accepts text/function-tool OpenAI Chat, translated Anthropic Messages/counting, and bounded stateless Responses compatibility. It is rejected on the Responses websocket, compact/memory routes, hosted/custom tools, Gemini, multimodal input, and stateful `previous_response_id`. Active process-local `call_vekil_*` continuations remain bound to their originating terminal route/tier. Completed tool history can survive a later effort decision when both tiers configure effort and use the same single Responses provider/model target; see [Policy replay rules](policy-routing.md#locked-v1-scope). Opaque downstream-bridge replay still requires the documented single-target `off`/`observe` baseline and sticky ingress. Direct public routes keep the general matrix above.
 
 The optional websocket bridge uses upstream HTTP `/responses` by default. Its
 first provider-backed `response.create` may use the same safe precommit route
@@ -431,7 +432,7 @@ Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decodi
 
 | Field | Applies To | Purpose |
 |-------|------------|---------|
-| `type` | all providers | Use `openai-compatible` or `anthropic-compatible` for generic providers. |
+| `type` | all providers | Use `openai-compatible`, `anthropic-compatible`, or `typesafe-compatible` for generic providers. TypeSafe is limited to internal policy classification. |
 | `base_url` | generic providers | Upstream origin and any fixed API prefix. The proxy appends only the configured path field. |
 | `api_key`, `api_key_env` | generic providers | Static credential value or the name of any environment variable you choose. |
 | `auth_type` | generic providers | `bearer`, `api-key-header`, or `none`. Defaults to `bearer` when a key is present, otherwise `none`. |
@@ -440,8 +441,9 @@ Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decodi
 | `chat_completions_path` | `openai-compatible` | Upstream native Chat path, used when the selected model allows `/chat/completions`. Defaults to `/chat/completions`. |
 | `responses_path` | `openai-compatible` | Upstream native Responses path for direct Responses and Responses-backed Chat. Defaults to `/responses`; models must still opt in with `/responses`. |
 | `messages_path` | `anthropic-compatible` | Upstream path for public `POST /v1/messages`. Defaults to `/v1/messages`. |
-| `models_path` | generic providers | Upstream path for dynamic model discovery and readiness probes. Defaults to `/models`. |
-| `model_discovery` | generic providers | `static`, `openai`, `ollama`, or `openrouter-tools`. |
+| `systemone_path` | `typesafe-compatible` | Upstream evaluation path for internal classifiers. Defaults to `/systemone`, appended to `base_url`. |
+| `models_path` | OpenAI/Anthropic-compatible providers | Upstream path for dynamic model discovery and readiness probes. Defaults to `/models`. |
+| `model_discovery` | generic providers | `static`, `openai`, `ollama`, or `openrouter-tools`. TypeSafe-compatible providers require `static`. |
 | `trust_domain` | providers used by schema-v2 policy destinations/classifiers | Operator-defined data-governance domain. Required for every provider referenced by a policy; matching is enforced unless the profile acknowledges cross-domain forwarding. |
 | `classifier_no_store_supported` | provider used by a schema-v2 classifier route | Declares that Vekil can send the provider's supported non-storage option for classifier requests. This is a capability declaration, not proof of retention behavior. |
 | `models[].endpoints` | all static models | Verified native upstream endpoint allowlist. It controls rendered capability metadata and native backend selection; Vekil does not add served compatibility routes. |
@@ -592,7 +594,7 @@ Routing rules:
 - Azure `auth_mode` is optional and defaults to `api_key`. Supported values are `api_key` and `azure_identity`.
 - `openai-compatible` models default to `/chat/completions` when `models[].endpoints` is omitted. Add `/responses` only for models you have validated on `responses_path`.
 - `anthropic-compatible` models default to `/v1/messages` when `models[].endpoints` is omitted. OpenAI Chat Completions and Responses requests for those models fail fast.
-- Generic path fields are `chat_completions_path`, `responses_path`, `messages_path`, and `models_path`. They are paths relative to `base_url`, with no query string or fragment.
+- Generic path fields are `chat_completions_path`, `responses_path`, `messages_path`, `models_path`, and `systemone_path`. They are paths relative to `base_url`, with no query string or fragment.
 - Azure `base_url` must be an absolute URL whose path ends with either the OpenAI-compatible `/openai/v1` path or the legacy `/openai` path, with no query string or fragment.
 - Microsoft Foundry inference URLs ending in `/models` are not supported in `type: "azure-openai"` configs. Use the corresponding OpenAI-compatible `.../openai/v1` endpoint instead.
 - For `/openai/v1` base URLs, omit `api_version`; the proxy calls `/chat/completions`, `/responses`, and `/models` directly with no `api-version` query string.

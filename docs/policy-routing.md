@@ -177,7 +177,7 @@ Unavailable and uncertain fallbacks are not cached in v1.
 | classifier `profile` | `coding_agent_v1` |
 | classifier `reasoning_effort` | omitted, provider default |
 | `timeout_ms` | `3000` |
-| `max_completion_tokens` | `256` |
+| `max_completion_tokens` | `256`, Chat classifiers only |
 | `max_request_bytes` | `16000` |
 | `recent_turns` | `4` |
 | `max_concurrency` | `4` |
@@ -189,7 +189,7 @@ Valid classifier profile ranges are:
 |---|---|
 | `reasoning_effort` | optional non-empty value from the classifier route's `reasoning_effort` allowlist |
 | `timeout_ms` | `100..10000` |
-| `max_completion_tokens` | `32..1024` |
+| `max_completion_tokens` | `32..1024`, Chat classifiers only |
 | `max_request_bytes` | `1024..65536` |
 | `recent_turns` | `0..8` |
 | `max_concurrency` | `1..32` |
@@ -209,7 +209,7 @@ Validation also rejects:
 - unsupported provider families or dynamic providers other than pinned `type: copilot` targets;
 - terminal routes with different preferred Chat backends or other public Chat request semantics;
 - classifier routes that are public, have the wrong internal purpose, or can send more than once;
-- classifiers that cannot perform the forced function-tool protocol;
+- classifiers that cannot perform their configured Chat or TypeSafe protocol;
 - missing trust-domain or data-policy acknowledgements; and
 - unsupported custom classifier prompts, custom classifier output schemas, arbitrary routing languages, or config hot reload.
 
@@ -292,7 +292,7 @@ Use `allow_cross_trust_domain` and `allow_provider_retention` only after an oper
 
 ## Classifier protocol and deterministic mapping
 
-The `coding_agent_v1` adapter forces exactly one strict function call named `emit_policy_signals`. It sends no other classifier tools and rejects duplicate JSON keys, missing or extra fields, invalid enums/integers, and trailing content. The signals are:
+The `coding_agent_v1` profile uses the classifier provider's protocol. Copilot, Azure OpenAI, and OpenAI-compatible classifiers force exactly one strict function call named `emit_policy_signals`. TypeSafe-compatible classifiers request typed choices. Both adapters reject duplicate signal keys, missing or extra signals, invalid enums/integers, and trailing content. The signals are:
 
 - `abstain`: boolean;
 - `turn_type`: `chitchat`, `lookup`, `execution`, `exploration`, `edit`, `planning`, `debug`, `review`, or `other`;
@@ -316,6 +316,18 @@ After fallback precedence, the mapper selects `powerful` when any of these is tr
 Otherwise it selects `lightweight`. The built-in classifier calibration treats an explicit low- or medium-risk edit bounded to one file or one function as `edit` with `file`/`function` scope and no broad codebase-context requirement unless the request actually depends on cross-file or cross-module information. Inspecting the named target and nearby lines does not by itself make the request codebase-wide.
 
 Classifier output is advisory data, not a trusted control plane. Malformed or adversarial content can affect only the current request's uncertain fallback; it cannot authorize actions, change another request's route, consume unbounded capacity, or open an infrastructure breaker.
+
+### TypeSafe-compatible classifiers
+
+Use `type: typesafe-compatible` for Jev or another endpoint implementing the [TypeSafe System One protocol](https://docs.typesafe.ai/api). Configure `base_url`, credentials, and a pinned `upstream_model` through the ordinary provider and route fields. The provider appends `/systemone` to `base_url`; `systemone_path` can override that path. Bearer, custom-header, and anonymous auth work as for other generic providers.
+
+The classifier route must use `exposure: internal`, `internal_purpose: policy_classifier`, and only `endpoints: [/systemone]`. It retains the one-target, one-attempt, one-send limits. TypeSafe providers require schema v2 and static routing; they cannot be default providers, publish `models[]`, or serve a terminal tier.
+
+Vekil sends bounded canonical facts as `state` and asks seven independent `choice` questions in one request. Booleans use explicit `true`/`false` choices and tool estimates use integer choices `0..128`. The adapter converts selected choices into the same policy signals used by Chat classifiers. Provider probabilities and confidence do not affect routing. Admission, deadlines, observe mode, fallbacks, and usage accounting remain shared.
+
+The TypeSafe protocol has no documented request-level non-storage option. Omit `classifier_no_store_supported` or set it to `false`, and explicitly set `data_policy.allow_provider_retention: true`. The usual content-forwarding and trust-domain checks still apply. Omit classifier `reasoning_effort` and `max_completion_tokens`; TypeSafe does not support either field, and validation rejects them when configured.
+
+For direct Jev, use `base_url: https://api.typesafe.ai/v1` and `upstream_model: jev-latest`. See [the TypeSafe policy example](../examples/policy-routing-typesafe.yaml), which uses Jev to classify requests for Copilot terminal models. A compatible gateway can use the same adapter by changing the base URL, credentials, and model ID.
 
 ## Admission, breaker, and fallback safety
 
@@ -350,13 +362,13 @@ After selection, all terminal failure behavior remains inside the chosen route. 
 
 ## Live preflight and readiness
 
-Endpoint metadata alone does not prove that a classifier accepts forced strict function output or non-storage request options.
+Endpoint metadata alone does not prove that a classifier accepts its configured protocol or non-storage request options.
 
 When any profile's **effective** mode is `observe` or `enforce`, startup performs one live preflight per distinct classifier route using fixed non-user content. With the default process mode `config`, effective mode comes directly from each profile's YAML `mode`; explicit `off` or `observe` process ceilings remain available for rollback. It verifies:
 
 - authentication and endpoint reachability;
-- forced `emit_policy_signals` selection;
-- strict argument-schema acceptance;
+- forced `emit_policy_signals` selection or TypeSafe choice answers, depending on the provider;
+- strict policy-signal validation;
 - acceptance of the configured classifier reasoning effort and non-storage behavior; and
 - a maximum of one physical send.
 

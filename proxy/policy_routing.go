@@ -906,6 +906,11 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 	if !route.supportsEndpoint(endpoint) && route.supportsEndpoint(providerEndpointResponses) {
 		endpoint = providerEndpointResponses
 	}
+	newClassifier := newPolicyHTTPClassifier
+	if target.provider.kind == providerTypeTypeSafeCompatible {
+		endpoint = providerEndpointSystemOne
+		newClassifier = newPolicyTypeSafeClassifier
+	}
 	options := policyHTTPClassifierOptions{
 		Model:               target.upstreamModel,
 		ReasoningEffort:     profile.Classifier.ReasoningEffort,
@@ -913,29 +918,36 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 		MaxFactsBytes:       profile.Classifier.MaxRequestBytes,
 		MaxResponseBytes:    policyClassifierResponseLimit,
 	}
-	return newPolicyHTTPClassifier(options, func(ctx context.Context, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
+	return newClassifier(options, func(ctx context.Context, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
 		ctx = withTaskInferenceKind(ctx, taskClassifier)
-		prepared, err := preparePolicyClassifierBody(body, target)
-		if err != nil {
-			return policyClassifierHTTPResponse{}, err
-		}
 		owner := providerModelFromRouteTarget(route, target)
-		prepared = applyProviderModelRequestPolicy(prepared, providerEndpointChatCompletions, owner)
-		if err := validatePolicyClassifierNoStore(prepared, target.provider); err != nil {
-			return policyClassifierHTTPResponse{}, err
+		prepared := body
+		var err error
+		if endpoint != providerEndpointSystemOne {
+			prepared, err = preparePolicyClassifierBody(body, target)
+			if err != nil {
+				return policyClassifierHTTPResponse{}, err
+			}
+			prepared = applyProviderModelRequestPolicy(prepared, providerEndpointChatCompletions, owner)
+			if err := validatePolicyClassifierNoStore(prepared, target.provider); err != nil {
+				return policyClassifierHTTPResponse{}, err
+			}
 		}
 
 		var response policyClassifierHTTPResponse
 		if endpoint == providerEndpointResponses {
 			response, err = h.sendPolicyClassifierOverResponses(ctx, route, target, owner, prepared, headers)
 		} else {
-			response, err = h.sendPolicyClassifierNativeChat(ctx, target, owner, prepared, headers)
+			response, err = h.sendPolicyClassifierJSON(ctx, target, owner, endpoint, prepared, headers)
 		}
 		if err != nil {
 			return policyClassifierHTTPResponse{}, err
 		}
 		if stats != nil {
 			usage := response.Usage
+			if endpoint == providerEndpointSystemOne {
+				usage = readPolicyTypeSafeUsage(response.Body)
+			}
 			if usage.isZero() {
 				usage = readPolicyClassifierUsage(response.Body)
 			}
@@ -947,8 +959,8 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 	})
 }
 
-func (h *ProxyHandler) sendPolicyClassifierNativeChat(ctx context.Context, target targetBinding, owner providerModel, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
-	req, err := h.newProviderJSONInferenceRequest(ctx, target.provider, http.MethodPost, providerEndpointChatCompletions, body, headers, "", owner)
+func (h *ProxyHandler) sendPolicyClassifierJSON(ctx context.Context, target targetBinding, owner providerModel, endpoint string, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
+	req, err := h.newProviderJSONInferenceRequest(ctx, target.provider, http.MethodPost, endpoint, body, headers, "", owner)
 	if err != nil {
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, true)
 	}

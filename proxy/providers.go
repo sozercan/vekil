@@ -27,6 +27,7 @@ const (
 	providerTypeOpenAICodex         providerType = "openai-codex"
 	providerTypeOpenAICompatible    providerType = "openai-compatible"
 	providerTypeAnthropicCompatible providerType = "anthropic-compatible"
+	providerTypeTypeSafeCompatible  providerType = "typesafe-compatible"
 
 	providerAuthModeAPIKey        providerAuthMode = "api_key"
 	providerAuthModeAzureIdentity providerAuthMode = "azure_identity"
@@ -55,6 +56,7 @@ const (
 	providerEndpointMessages        = "/v1/messages"
 	providerEndpointMessagesCount   = "/v1/messages/count_tokens"
 	providerEndpointModels          = "/models"
+	providerEndpointSystemOne       = "/systemone"
 )
 
 var openAICodexProviderEndpoints = []string{providerEndpointResponses}
@@ -103,6 +105,7 @@ type ProviderConfig struct {
 	ResponsesPath              string                      `json:"responses_path,omitempty" yaml:"responses_path,omitempty"`
 	MessagesPath               string                      `json:"messages_path,omitempty" yaml:"messages_path,omitempty"`
 	ModelsPath                 string                      `json:"models_path,omitempty" yaml:"models_path,omitempty"`
+	SystemOnePath              string                      `json:"systemone_path,omitempty" yaml:"systemone_path,omitempty"`
 	ModelDiscovery             string                      `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
 	TrustDomain                string                      `json:"trust_domain,omitempty" yaml:"trust_domain,omitempty"`
 	ClassifierNoStoreSupported *bool                       `json:"classifier_no_store_supported,omitempty" yaml:"classifier_no_store_supported,omitempty"`
@@ -167,6 +170,7 @@ type providerEndpointPaths struct {
 	responses       string
 	messages        string
 	models          string
+	systemOne       string
 }
 
 type providerModel struct {
@@ -364,6 +368,9 @@ func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderMo
 				// discovered catalog, so dry-run cannot resolve them statically.
 				continue
 			}
+		case providerTypeTypeSafeCompatible:
+			// Evaluation providers have no public model catalog.
+			continue
 		case providerTypeCopilot, providerTypeOpenAICodex:
 			// These providers are catalog-driven; their Models fields are not
 			// part of the configured static model table.
@@ -1164,8 +1171,10 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 	if defaultProviderID == "" {
 		switch {
 		case len(providers) == 1:
-			for id := range providers {
-				defaultProviderID = id
+			for id, provider := range providers {
+				if provider.kind != providerTypeTypeSafeCompatible {
+					defaultProviderID = id
+				}
 			}
 		case copilotProviders == 1:
 			for _, provider := range providers {
@@ -1200,9 +1209,13 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 
 	kind := providerType(strings.TrimSpace(cfg.Type))
 	switch kind {
-	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 	default:
 		return nil, fmt.Errorf("provider %q has unsupported type %q", id, cfg.Type)
+	}
+
+	if kind != providerTypeTypeSafeCompatible && strings.TrimSpace(cfg.SystemOnePath) != "" {
+		return nil, fmt.Errorf("provider %q: systemone_path is only supported for typesafe-compatible providers", id)
 	}
 
 	runtime := &providerRuntime{
@@ -1315,7 +1328,7 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		}
 		runtime.baseURL = baseURL
 		runtime.codexAuth = codexAuth
-	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 		if baseURL == "" {
 			return nil, fmt.Errorf("provider %q must set base_url", id)
@@ -1390,6 +1403,22 @@ func configuredProviderEndpointPaths(kind providerType, cfg ProviderConfig) (pro
 	paths := providerEndpointPolicyFor(kind).defaultEndpointPaths()
 
 	var err error
+	if kind == providerTypeTypeSafeCompatible {
+		for _, field := range []struct{ name, value string }{
+			{"chat_completions_path", cfg.ChatCompletionsPath},
+			{"responses_path", cfg.ResponsesPath},
+			{"messages_path", cfg.MessagesPath},
+			{"models_path", cfg.ModelsPath},
+		} {
+			if strings.TrimSpace(field.value) != "" {
+				return providerEndpointPaths{}, fmt.Errorf("%s is not supported for typesafe-compatible providers", field.name)
+			}
+		}
+		if paths.systemOne, err = normalizeProviderPath(cfg.SystemOnePath, paths.systemOne, "systemone_path"); err != nil {
+			return providerEndpointPaths{}, err
+		}
+		return paths, nil
+	}
 	if paths.chatCompletions, err = normalizeProviderPath(cfg.ChatCompletionsPath, paths.chatCompletions, "chat_completions_path"); err != nil {
 		return providerEndpointPaths{}, err
 	}
@@ -1514,6 +1543,9 @@ func configuredProviderModelDiscovery(kind providerType, configured string) (pro
 	discovery := providerModelDiscovery(strings.TrimSpace(configured))
 	if discovery == "" {
 		return providerModelDiscoveryStatic, nil
+	}
+	if kind == providerTypeTypeSafeCompatible && discovery != providerModelDiscoveryStatic {
+		return "", fmt.Errorf("typesafe-compatible providers require static model_discovery")
 	}
 	switch discovery {
 	case providerModelDiscoveryStatic, providerModelDiscoveryOpenAI, providerModelDiscoveryOllama, providerModelDiscoveryOpenRouterTools:
@@ -2446,6 +2478,8 @@ func (p *providerRuntime) upstreamPath(endpoint string) string {
 		if p.paths.models != "" {
 			return p.paths.models
 		}
+	case providerEndpointSystemOne:
+		return p.paths.systemOne
 	}
 	return endpoint
 }
@@ -2575,7 +2609,7 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 			req.Header.Set("X-OpenAI-Fedramp", "true")
 		}
 		req.Header.Set("Content-Type", "application/json")
-	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		clearCopilotHeaders(req.Header)
 		mergeHeaderValues(req.Header, provider.extraHeaders)
 		if err := applyGenericProviderAuth(req, provider); err != nil {
@@ -2915,6 +2949,8 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		}
 		result.models = models
 		return result, nil
+	case providerTypeTypeSafeCompatible:
+		return providerModelsFetchResult{}, nil
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		if provider.modelDiscovery == providerModelDiscoveryStatic {
 			return providerModelsFetchResult{models: orderedStaticProviderModels(provider)}, nil

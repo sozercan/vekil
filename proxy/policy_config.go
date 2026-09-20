@@ -75,8 +75,8 @@ type PolicyClassifierConfig struct {
 	ReasoningEffort     string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
 	TimeoutMS           int    `json:"timeout_ms,omitempty" yaml:"timeout_ms,omitempty"`
 	MaxCompletionTokens int    `json:"max_completion_tokens,omitempty" yaml:"max_completion_tokens,omitempty"`
-	// MaxRequestBytes caps the serialized canonical facts payload. The fixed
-	// forced-tool Chat envelope has a separate implementation bound.
+	// MaxRequestBytes caps the serialized canonical facts payload. Each
+	// classifier protocol bounds its envelope separately.
 	MaxRequestBytes   int     `json:"max_request_bytes,omitempty" yaml:"max_request_bytes,omitempty"`
 	RecentTurns       int     `json:"recent_turns,omitempty" yaml:"recent_turns,omitempty"`
 	MaxConcurrency    int     `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty"`
@@ -233,12 +233,6 @@ func normalizeAndValidatePolicyProfileConfig(profile *PolicyProfileConfig, path 
 	if profile.Classifier.TimeoutMS < 100 || profile.Classifier.TimeoutMS > 10000 {
 		return configPathError(classifierPath+".timeout_ms", "must be between 100 and 10000")
 	}
-	if !profile.Classifier.maxCompletionTokensSet && profile.Classifier.MaxCompletionTokens == 0 {
-		profile.Classifier.MaxCompletionTokens = defaultPolicyClassifierMaxCompletionTokens
-	}
-	if profile.Classifier.MaxCompletionTokens < 32 || profile.Classifier.MaxCompletionTokens > 1024 {
-		return configPathError(classifierPath+".max_completion_tokens", "must be between 32 and 1024")
-	}
 	if !profile.Classifier.maxRequestBytesSet && profile.Classifier.MaxRequestBytes == 0 {
 		profile.Classifier.MaxRequestBytes = defaultPolicyClassifierMaxRequestBytes
 	}
@@ -306,7 +300,7 @@ func policyProfileControlsReasoning(profile PolicyProfileConfig) bool {
 }
 
 func validatePolicyProfileConfigReferences(
-	profile PolicyProfileConfig,
+	profile *PolicyProfileConfig,
 	profileIndex int,
 	routes map[string]*ModelRouteConfig,
 	providers map[string]providerConfigDescriptor,
@@ -335,7 +329,7 @@ func validatePolicyProfileConfigReferences(
 	if err != nil {
 		return err
 	}
-	if policyProfileControlsReasoning(profile) {
+	if policyProfileControlsReasoning(*profile) {
 		if err := validatePolicyReasoningEffort(profile.Lightweight.ReasoningEffort, path+".lightweight.reasoning_effort", lightweight, profile.Lightweight.Route); err != nil {
 			return err
 		}
@@ -354,7 +348,22 @@ func validatePolicyProfileConfigReferences(
 	if err != nil {
 		return err
 	}
+	if classifierProvider.kind == providerTypeTypeSafeCompatible {
+		if profile.Classifier.maxCompletionTokensSet || profile.Classifier.MaxCompletionTokens != 0 {
+			return configPathError(path+".classifier.max_completion_tokens", "is not supported by the TypeSafe protocol")
+		}
+	} else {
+		if !profile.Classifier.maxCompletionTokensSet && profile.Classifier.MaxCompletionTokens == 0 {
+			profile.Classifier.MaxCompletionTokens = defaultPolicyClassifierMaxCompletionTokens
+		}
+		if profile.Classifier.MaxCompletionTokens < 32 || profile.Classifier.MaxCompletionTokens > 1024 {
+			return configPathError(path+".classifier.max_completion_tokens", "must be between 32 and 1024")
+		}
+	}
 	if profile.Classifier.ReasoningEffort != "" {
+		if classifierProvider.kind == providerTypeTypeSafeCompatible {
+			return configPathError(path+".classifier.reasoning_effort", "is not supported by the TypeSafe protocol")
+		}
 		if err := validatePolicyReasoningEffort(profile.Classifier.ReasoningEffort, path+".classifier.reasoning_effort", classifier, profile.Classifier.Route); err != nil {
 			return err
 		}
@@ -450,8 +459,8 @@ func validatePolicyClassifierRoute(route *ModelRouteConfig, path string, provide
 	if route.InternalPurpose != modelRouteInternalPurposePolicyClassifier {
 		return providerConfigDescriptor{}, configPathError(path, "route %q must set internal_purpose: %s", route.ID, modelRouteInternalPurposePolicyClassifier)
 	}
-	if !configRouteSupportsPolicyChatExecution(route) {
-		return providerConfigDescriptor{}, configPathError(path, "route %q must expose %s or %s for policy classifier execution", route.ID, providerEndpointChatCompletions, providerEndpointResponses)
+	if !configRouteSupportsPolicyChatExecution(route) && !configRouteSupportsEndpoint(route, providerEndpointSystemOne) {
+		return providerConfigDescriptor{}, configPathError(path, "route %q must expose %s, %s, or %s for policy classifier execution", route.ID, providerEndpointChatCompletions, providerEndpointResponses, providerEndpointSystemOne)
 	}
 	if len(route.Targets) != 1 {
 		return providerConfigDescriptor{}, configPathError(path, "route %q must contain exactly one target", route.ID)
@@ -467,8 +476,8 @@ func validatePolicyClassifierRoute(route *ModelRouteConfig, path string, provide
 	if !ok {
 		return providerConfigDescriptor{}, configPathError(path, "route %q references unknown provider %q", route.ID, route.Targets[0].Provider)
 	}
-	if descriptor.kind != providerTypeCopilot && descriptor.kind != providerTypeAzureOpenAI && descriptor.kind != providerTypeOpenAICompatible {
-		return providerConfigDescriptor{}, configPathError(path, "classifier provider %q does not support forced function-tool classification", descriptor.id)
+	if descriptor.kind != providerTypeCopilot && descriptor.kind != providerTypeAzureOpenAI && descriptor.kind != providerTypeOpenAICompatible && descriptor.kind != providerTypeTypeSafeCompatible {
+		return providerConfigDescriptor{}, configPathError(path, "classifier provider %q does not support policy classification", descriptor.id)
 	}
 	if descriptor.kind != providerTypeCopilot && descriptor.modelDiscovery != providerModelDiscoveryStatic {
 		return providerConfigDescriptor{}, configPathError(path, "classifier provider %q uses unsupported dynamic model_discovery %q", descriptor.id, descriptor.modelDiscovery)

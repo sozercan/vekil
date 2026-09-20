@@ -76,15 +76,17 @@ for line_number, raw_line in enumerate(models_path.read_text(encoding="utf-8").s
         raise SystemExit(f"invalid model ID in parsed row {line_number}: {model_id}")
     if model_id in seen:
         raise SystemExit(f"duplicate free model ID: {model_id}")
+    seen.add(model_id)
+    if endpoint == "/systemone":
+        continue
     if endpoint not in allowed_endpoints:
         raise SystemExit(
             f"unsupported endpoint for openai-compatible Zen example: {model_id} -> {endpoint}"
         )
-    seen.add(model_id)
     models.append((model_id, endpoint))
 
 if not models:
-    raise SystemExit("no OpenCode Zen free models were parsed")
+    raise SystemExit("no OpenCode Zen free Chat or Responses models were parsed")
 if len(models) > max_models:
     raise SystemExit(f"parsed {len(models)} free models; maximum automatic update size is {max_models}")
 

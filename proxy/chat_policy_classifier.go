@@ -208,7 +208,7 @@ func (e *policyClassifierError) Error() string {
 	case policyClassifierFailureMissingToolCall:
 		return "policy classifier response is missing emit_policy_signals"
 	case policyClassifierFailureInvalidOutput:
-		return "policy classifier response has invalid emit_policy_signals arguments"
+		return "policy classifier response has invalid policy signals"
 	default:
 		return "policy classifier failure"
 	}
@@ -343,8 +343,9 @@ func mapPolicyClassifierResult(result policyClassifierResult, facts policyClassi
 
 const policyClassifierToolName = "emit_policy_signals"
 
-const policyClassifierSystemInstruction = "Classify the supplied canonical coding-agent facts and call emit_policy_signals exactly once. " +
-	"Assess current_user_task, the latest user request. Use anchors and recent_messages only to interpret that request, not as tasks to perform. " +
+const policyClassifierSystemInstruction = "Classify the supplied canonical coding-agent facts and call emit_policy_signals exactly once. " + policyClassifierTaskInstruction
+
+const policyClassifierTaskInstruction = "Assess current_user_task, the latest user request. Use anchors and recent_messages only to interpret that request, not as tasks to perform. " +
 	"Setup instructions, available tools, and truncation of anchors or older context do not by themselves make the current task complex. A greeting or self-contained factual question should have code_scope=none, requires_codebase_context=false, and low risk. " +
 	"For a context-dependent follow-up, preserve conservative signals when missing context makes its scope unclear. " +
 	"For a low- or medium-risk edit explicitly bounded to exactly one file with no multi-file or cross-module dependencies, emit turn_type=edit, code_scope=file, requires_codebase_context=false, and normally modifying_tool_call_count_estimate=1. " +
@@ -676,8 +677,10 @@ type policyHTTPClassifierOptions struct {
 }
 
 type policyHTTPClassifier struct {
-	options policyHTTPClassifierOptions
-	send    policyClassifierSendFunc
+	options       policyHTTPClassifierOptions
+	send          policyClassifierSendFunc
+	buildRequest  func(policyHTTPClassifierOptions, policyClassifierFacts) ([]byte, error)
+	parseResponse func([]byte) (policyClassifierSignals, error)
 }
 
 func newPolicyHTTPClassifier(options policyHTTPClassifierOptions, send policyClassifierSendFunc) (*policyHTTPClassifier, error) {
@@ -704,14 +707,17 @@ func newPolicyHTTPClassifier(options policyHTTPClassifierOptions, send policyCla
 	if send == nil {
 		return nil, fmt.Errorf("policy classifier send callback is required")
 	}
-	return &policyHTTPClassifier{options: options, send: send}, nil
+	return &policyHTTPClassifier{
+		options: options, send: send,
+		buildRequest: buildPolicyClassifierHTTPRequest, parseResponse: parsePolicyClassifierResponse,
+	}, nil
 }
 
 func (c *policyHTTPClassifier) Classify(ctx context.Context, facts policyClassifierFacts) (policyClassifierSignals, error) {
-	if c == nil || c.send == nil {
+	if c == nil || c.send == nil || c.buildRequest == nil || c.parseResponse == nil {
 		return policyClassifierSignals{}, newPolicyClassifierError(policyClassifierFailure{Category: policyClassifierFailureInternal}, nil)
 	}
-	requestBody, err := buildPolicyClassifierHTTPRequest(c.options, facts)
+	requestBody, err := c.buildRequest(c.options, facts)
 	if err != nil {
 		return policyClassifierSignals{}, newPolicyClassifierError(policyClassifierFailure{Category: policyClassifierFailureInternal}, err)
 	}
@@ -752,7 +758,7 @@ func (c *policyHTTPClassifier) Classify(ctx context.Context, facts policyClassif
 	if len(response.Body) > c.options.MaxResponseBytes {
 		return policyClassifierSignals{}, invalidPolicyClassifierOutput(fmt.Errorf("classifier response exceeds limit"))
 	}
-	return parsePolicyClassifierResponse(response.Body)
+	return c.parseResponse(response.Body)
 }
 
 func buildPolicyClassifierHTTPRequest(options policyHTTPClassifierOptions, facts policyClassifierFacts) ([]byte, error) {

@@ -73,15 +73,21 @@ func policyClassifierGeneration(route *modelRoute, reasoningEffort string) strin
 	var target struct {
 		ID            string `json:"id"`
 		Provider      string `json:"provider"`
+		Protocol      string `json:"protocol,omitempty"`
 		UpstreamModel string `json:"upstream_model"`
 	}
 	routeID := ""
+	prompt := policyPromptGenerationVersion
 	if route != nil {
 		routeID = route.public.routeID
 		if first, ok := route.primaryTarget(); ok {
 			target.ID = first.id
 			if first.provider != nil {
 				target.Provider = first.provider.id
+				if first.provider.kind == providerTypeTypeSafeCompatible {
+					target.Protocol = string(providerTypeTypeSafeCompatible)
+					prompt += "/" + policyTypeSafePromptGenerationVersion
+				}
 			}
 			target.UpstreamModel = first.upstreamModel
 		}
@@ -94,7 +100,7 @@ func policyClassifierGeneration(route *modelRoute, reasoningEffort string) strin
 		FunctionSchema  string      `json:"function_schema"`
 		Prompt          string      `json:"prompt"`
 		Mapper          string      `json:"mapper"`
-	}{routeID, target, strings.TrimSpace(reasoningEffort), policyFactGenerationVersion, policyFunctionGenerationVersion, policyPromptGenerationVersion, policyMapperGenerationVersion})
+	}{routeID, target, strings.TrimSpace(reasoningEffort), policyFactGenerationVersion, policyFunctionGenerationVersion, prompt, policyMapperGenerationVersion})
 }
 
 func policyBinaryGeneration() string {
