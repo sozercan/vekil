@@ -1563,6 +1563,9 @@ func providerSkipsReadyzProbe(provider *providerRuntime) bool {
 	switch provider.kind {
 	case providerTypeAzureOpenAI:
 		return true
+	case providerTypeTypeSafeCompatible:
+		// Policy preflight gates readiness; classifiers have no model catalog.
+		return true
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		return provider.modelDiscovery == providerModelDiscoveryStatic
 	default:

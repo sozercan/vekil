@@ -1683,7 +1683,7 @@ func newRouteAttemptEnvelopeExtractor(endpoint string) *routeAttemptEnvelopeExtr
 		names = []string{"status", "error", "usage"}
 	case providerEndpointMessages:
 		names = []string{"type", "error", "usage"}
-	case providerEndpointChatCompletions:
+	case providerEndpointChatCompletions, providerEndpointSystemOne:
 		names = []string{"usage"}
 	default:
 		return nil
@@ -2737,6 +2737,28 @@ func (o *routeAttemptResponseObserver) inspectNonStreamingLocked() {
 			}
 		} else if o.statusCode >= http.StatusOK && o.statusCode < http.StatusBadRequest {
 			o.classifyInvalidNonStreamingEnvelopeLocked()
+		}
+	case providerEndpointSystemOne:
+		if raw, ok := o.envelope.field("usage"); ok {
+			var usage struct {
+				InputTokens  int64 `json:"input_tokens"`
+				OutputTokens int64 `json:"output_tokens"`
+			}
+			if json.Unmarshal(raw, &usage) == nil {
+				o.usage = statsTokenUsage{
+					PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens,
+				}.normalized()
+				o.haveUsage = !o.usage.isZero()
+			}
+		}
+		if o.statusCode >= http.StatusOK && o.statusCode < http.StatusMultipleChoices {
+			if o.envelope.complete() {
+				o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressTerminalSuccess)
+				o.outcome = routeAttemptOutcomeSucceeded
+				o.terminal = true
+			} else {
+				o.classifyInvalidNonStreamingEnvelopeLocked()
+			}
 		}
 	default:
 		var usage *models.OpenAIUsage

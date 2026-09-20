@@ -1206,6 +1206,10 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		return nil, fmt.Errorf("provider %q has unsupported type %q", id, cfg.Type)
 	}
 
+	if kind != providerTypeTypeSafeCompatible && strings.TrimSpace(cfg.SystemOnePath) != "" {
+		return nil, fmt.Errorf("provider %q: systemone_path is only supported for typesafe-compatible providers", id)
+	}
+
 	runtime := &providerRuntime{
 		id:                         id,
 		kind:                       kind,
@@ -1396,9 +1400,6 @@ func configuredProviderEndpointPaths(kind providerType, cfg ProviderConfig) (pro
 			return providerEndpointPaths{}, err
 		}
 		return paths, nil
-	}
-	if strings.TrimSpace(cfg.SystemOnePath) != "" {
-		return providerEndpointPaths{}, fmt.Errorf("systemone_path is only supported for typesafe-compatible providers")
 	}
 	if paths.chatCompletions, err = normalizeProviderPath(cfg.ChatCompletionsPath, paths.chatCompletions, "chat_completions_path"); err != nil {
 		return providerEndpointPaths{}, err

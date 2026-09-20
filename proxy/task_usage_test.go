@@ -142,6 +142,43 @@ func TestTaskUsageResponsesTerminalAccounting(t *testing.T) {
 	}
 }
 
+func TestTaskUsageTypeSafeAccounting(t *testing.T) {
+	const usage = `"usage":{"input_tokens":10,"output_tokens":4}`
+	const response = `{` + usage + `,"answers":{"risk_level":{"type":"choice","choice":"low"}}}`
+	for _, tc := range []struct {
+		name, body                string
+		statusCode                int
+		wantErrors, wantThrottles int64
+	}{
+		{name: "success", body: response, statusCode: http.StatusOK},
+		{name: "large response", body: `{` + usage + `,"padding":"` + strings.Repeat("x", routeAttemptObservationTail+1024) + `"}`, statusCode: http.StatusOK},
+		{name: "truncated", body: strings.TrimSuffix(response, "}"), statusCode: http.StatusOK, wantErrors: 1},
+		{name: "invalid JSON", body: response + `!`, statusCode: http.StatusOK, wantErrors: 1},
+		{name: "HTTP failure", body: response, statusCode: http.StatusUnprocessableEntity, wantErrors: 1},
+		{name: "throttled", body: response, statusCode: http.StatusTooManyRequests, wantErrors: 1, wantThrottles: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &ProxyHandler{stats: newStatsCollector()}
+			req := httptest.NewRequest(http.MethodPost, "/custom/evaluate", nil)
+			req = req.WithContext(withTaskInferenceKind(req.Context(), taskClassifier))
+			req = withTaskInferenceRequest(req, providerEndpointSystemOne)
+			resp := &http.Response{StatusCode: tc.statusCode, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(tc.body))}
+			h.beginTaskInferenceSend(req).finish(resp, nil)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			snapshot := h.stats.snapshot().TaskUsage
+			totals := snapshot.Totals
+			if snapshot.Inflight != 0 || totals.Sends != 1 || totals.Completed != 1 || totals.Errors != tc.wantErrors || totals.Throttled != tc.wantThrottles || totals.ReportedUsageSends != 1 ||
+				totals.Usage != (statsTokenUsage{PromptTokens: 10, CompletionTokens: 4, TotalTokens: 14}) {
+				t.Fatalf("TypeSafe ledger = %+v", snapshot)
+			}
+			if len(snapshot.ByKind) != 1 || snapshot.ByKind[0].Kind != "classifier" || snapshot.ByKind[0].taskUsageTotals != totals {
+				t.Fatalf("TypeSafe classifier usage = %+v", snapshot.ByKind)
+			}
+		})
+	}
+}
+
 func TestTaskUsageAnthropicRequiresMessageStop(t *testing.T) {
 	start := "event: message_start\ndata: " + `{"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":1}}}` + "\n\n"
 	blockStop := "event: content_block_stop\ndata: " + `{"type":"content_block_stop","index":0}` + "\n\n"

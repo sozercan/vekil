@@ -639,6 +639,9 @@ func validateProviderRuntimeEnvironment(cfg ProviderConfig, providerIndex int) e
 }
 
 func validateProviderShellWithoutSecrets(cfg ProviderConfig, kind providerType, path string) error {
+	if kind != providerTypeTypeSafeCompatible && strings.TrimSpace(cfg.SystemOnePath) != "" {
+		return configPathError(path+".systemone_path", "is only supported for typesafe-compatible providers")
+	}
 	if kind == providerTypeTypeSafeCompatible {
 		if cfg.Default {
 			return configPathError(path+".default", "typesafe-compatible providers are internal classifiers and cannot be the default provider")

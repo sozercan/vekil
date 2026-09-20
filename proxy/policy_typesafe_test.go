@@ -155,6 +155,76 @@ func TestPolicyTypeSafeConfigDecodesOffline(t *testing.T) {
 	}
 }
 
+func TestPolicyTypeSafeSystemOnePathRejectsOtherProviders(t *testing.T) {
+	for _, kind := range []providerType{providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible} {
+		t.Run(string(kind), func(t *testing.T) {
+			provider := ProviderConfig{
+				ID: "other", Type: string(kind), BaseURL: "https://provider.example/openai/v1", APIKey: "test-key",
+				SystemOnePath: "/evaluate", Models: []ProviderModelConfig{{PublicID: "test-model"}},
+			}
+			cfg := ProvidersConfig{SchemaVersion: ProvidersConfigSchemaVersion2, Providers: []ProviderConfig{provider}}
+			if err := ValidateProvidersConfig(cfg); err == nil || !strings.Contains(err.Error(), "providers[0].systemone_path") {
+				t.Fatalf("config validation = %v, want systemone_path rejection", err)
+			}
+			if _, err := buildProviderRuntime(provider, "https://copilot.example", nil); err == nil || !strings.Contains(err.Error(), "systemone_path") {
+				t.Fatalf("runtime validation = %v, want systemone_path rejection", err)
+			}
+		})
+	}
+}
+
+func TestPolicyTypeSafeReadiness(t *testing.T) {
+	response := policyTypeSafeTestResponse(t, policyClassifierSignals{
+		TurnType: policyTurnTypeEdit, CodeScope: policyCodeScopeFile, RiskLevel: policyRiskLevelLow,
+	})
+	for _, test := range []struct {
+		name, mode string
+		failure    bool
+		wantStatus int
+		wantCalls  int32
+	}{
+		{name: "enforce", mode: "enforce", wantStatus: http.StatusOK, wantCalls: 1},
+		{name: "observe", mode: "observe", wantStatus: http.StatusOK, wantCalls: 1},
+		{name: "off", mode: "off", failure: true, wantStatus: http.StatusOK},
+		{name: "failed preflight", mode: "observe", failure: true, wantStatus: http.StatusServiceUnavailable, wantCalls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			evaluator := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method != http.MethodPost || r.URL.Path != "/systemone" {
+					t.Errorf("unexpected readiness request: %s %s", r.Method, r.URL.Path)
+				}
+				if test.failure {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				_, _ = w.Write(response)
+			}))
+			t.Cleanup(evaluator.Close)
+			cfg := policyTypeSafeTestConfig(evaluator.URL, evaluator.URL, evaluator.URL, test.mode)
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), nil, WithProvidersConfig(cfg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				ready := httptest.NewRecorder()
+				h.HandleReadyz(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+				if ready.Code != test.wantStatus {
+					t.Fatalf("readiness = %d %s", ready.Code, ready.Body.String())
+				}
+			}
+			if calls.Load() != test.wantCalls {
+				t.Fatalf("readiness made extra classifier requests: calls=%d, want %d", calls.Load(), test.wantCalls)
+			}
+		})
+	}
+}
+
 func TestPolicyTypeSafeExample(t *testing.T) {
 	t.Setenv("TYPESAFE_API_KEY", "test-key")
 	if err := ValidateProvidersConfigFile(filepath.Join("..", "examples", "policy-routing-typesafe.yaml")); err != nil {
@@ -322,8 +392,20 @@ func TestPolicyTypeSafeRouting(t *testing.T) {
 			if stats.PhysicalClassifierSends != int64(wantCalls) {
 				t.Fatalf("reported classifier sends = %d", stats.PhysicalClassifierSends)
 			}
-			if test.status == 0 && !test.timeout && !test.malformed && test.mode != "off" && stats.ClassifierUsage.TotalTokens != 28 {
-				t.Fatalf("classifier usage = %+v", stats.ClassifierUsage)
+			if test.status == 0 && !test.timeout && !test.malformed && test.mode != "off" {
+				if stats.ClassifierUsage.TotalTokens != 28 {
+					t.Fatalf("classifier usage = %+v", stats.ClassifierUsage)
+				}
+				var classifierUsage taskUsageTotals
+				for _, row := range h.stats.snapshot().TaskUsage.ByKind {
+					if row.Kind == "classifier" {
+						classifierUsage = row.taskUsageTotals
+					}
+				}
+				if classifierUsage.Sends != 2 || classifierUsage.Completed != 2 || classifierUsage.Errors != 0 || classifierUsage.ReportedUsageSends != 2 ||
+					classifierUsage.Usage != (statsTokenUsage{PromptTokens: 20, CompletionTokens: 8, TotalTokens: 28}) {
+					t.Fatalf("classifier task usage = %+v", classifierUsage)
+				}
 			}
 			catalog := httptest.NewRecorder()
 			h.HandleModels(catalog, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
