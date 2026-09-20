@@ -451,7 +451,9 @@ func TestConversationHistoryStoragePrunePreservesOwnership(t *testing.T) {
 	old := conversationHistoryStorageSnapshot(history, "prune-old", "old-root", cutoff.Add(-time.Second))
 	retired := conversationHistoryStorageSnapshot(history, "prune-uncertain", "uncertain-root", cutoff.Add(time.Second))
 	kept := conversationHistoryStorageSnapshot(history, "prune-kept", "kept-root", cutoff)
-	for _, snapshot := range []*conversationSnapshot{old, retired, kept} {
+	keptOlder := conversationHistoryStorageSnapshot(history, "prune-kept-old", kept.Root, cutoff.Add(-time.Second))
+	snapshots := []*conversationSnapshot{old, retired, keptOlder, kept}
+	for _, snapshot := range snapshots {
 		saveConversationHistoryStorageSnapshot(t, history, snapshot)
 		if result := bindings.bindAll([]stateBindingToken{{stateBindingTypeResponseID, snapshot.ResponseID}}, durableFixtureOwner()); result.err != nil {
 			t.Fatal(result.err)
@@ -480,12 +482,15 @@ func TestConversationHistoryStoragePrunePreservesOwnership(t *testing.T) {
 		t.Fatalf("offline prune = %d, %v", removed, err)
 	}
 	reopened, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
-	for _, snapshot := range []*conversationSnapshot{old, retired, kept} {
+	for _, snapshot := range snapshots {
 		if result := reopened.lookup(stateBindingTypeResponseID, snapshot.ResponseID); result.err != nil || result.outcome != stateBindingLookupKnown || result.owner != reopened.durable.encodeOwner(durableFixtureOwner()) {
 			t.Fatalf("history pruning changed ownership: %+v", result)
 		}
-		if snapshot == kept {
+		if snapshot.Root == kept.Root {
 			requireConversationHistoryStorageSnapshot(t, retained, snapshot)
+			if got, err := retained.lookupIndexes(snapshot.Indexes); err != nil || !reflect.DeepEqual(got, snapshot) {
+				t.Fatalf("prune lost an index for a pending conversation: %+v, %v", got, err)
+			}
 			continue
 		}
 		if _, err := retained.lookupResponse(snapshot.RouteID, snapshot.ResponseID); !errors.Is(err, errConversationHistoryMissing) {
@@ -502,7 +507,7 @@ func TestConversationHistoryStoragePrunePreservesOwnership(t *testing.T) {
 	if err := retained.acquire(kept.Root); !errors.Is(err, errConversationHistoryUncertain) {
 		t.Fatalf("prune removed an intent at the cutoff: %v", err)
 	}
-	retained.config.MaxSnapshots = 2 // one retained snapshot and one pending turn
+	retained.config.MaxSnapshots = 3 // two retained snapshots and one pending turn
 	if err := retained.beginAttempt("after-prune", "after-prune-operation"); !errors.Is(err, errConversationHistoryCapacity) {
 		t.Fatalf("pruned counts did not retain pending capacity: %v", err)
 	}

@@ -421,8 +421,9 @@ func (s *conversationHistoryStore) save(snapshot *conversationSnapshot) error {
 	return s.update(func(tx *bolt.Tx, counts *conversationHistoryCounts) error {
 		snapshots, index, pending := tx.Bucket(conversationSnapshotsBucket), tx.Bucket(conversationIndexBucket), tx.Bucket(conversationPendingBucket)
 		if snapshots.Get(key) != nil {
-			// Reusing an ID for a different turn must never overwrite history.
-			return errConversationHistoryStorage
+			// Keep the pending turn and original history. An upstream ID collision
+			// does not make the shared database unusable.
+			return errConversationHistoryUncertain
 		}
 		pendingCount := counts.pending
 		if pending.Get(s.rootKey(snapshot.Root)) != nil {
@@ -484,27 +485,10 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 		if err := s.validate(tx, counts); err != nil {
 			return err
 		}
-		cursor := snapshots.Cursor()
-		var total uint64
-		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
-			snapshot, err := s.decode(key, value)
-			if err != nil {
-				return err
-			}
-			if snapshot.Created < before.Unix() {
-				if err := cursor.Delete(); err != nil {
-					return err
-				}
-				counts.snapshots--
-				removed++
-			} else {
-				total += conversationSnapshotCost(snapshot, value)
-			}
-		}
 		// An unresolved attempt and its source history must be retired together.
-		// Otherwise deletion could silently authorize a duplicate attempt.
+		// Process attempts first so newer pending roots retain all their history.
 		retiredRoots := make(map[string]bool)
-		cursor = pending.Cursor()
+		cursor := pending.Cursor()
 		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
 			created, err := s.pendingCreated(key, value)
 			if err != nil {
@@ -518,19 +502,22 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 				counts.pending--
 			}
 		}
+		var total uint64
 		cursor = snapshots.Cursor()
 		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
 			snapshot, err := s.decode(key, value)
 			if err != nil {
 				return err
 			}
-			if retiredRoots[string(s.rootKey(snapshot.Root))] {
-				total -= conversationSnapshotCost(snapshot, value)
+			rootKey := s.rootKey(snapshot.Root)
+			if retiredRoots[string(rootKey)] || snapshot.Created < before.Unix() && pending.Get(rootKey) == nil {
 				if err := cursor.Delete(); err != nil {
 					return err
 				}
 				counts.snapshots--
 				removed++
+			} else {
+				total += conversationSnapshotCost(snapshot, value)
 			}
 		}
 		if err := tx.DeleteBucket(conversationIndexBucket); err != nil {

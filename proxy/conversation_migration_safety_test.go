@@ -368,6 +368,75 @@ func TestConversationMigrationStorageFailureWithholdsCompletion(t *testing.T) {
 	}
 }
 
+func TestConversationMigrationDuplicateResponseIDIsContained(t *testing.T) {
+	for _, duplicateID := range []string{"affected-seed", "healthy-seed"} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", duplicateID, stream), func(t *testing.T) {
+				var sends atomic.Int32
+				transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if strings.HasSuffix(req.URL.Path, "/models") {
+						return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+					}
+					if strings.HasPrefix(req.URL.Host, "west.") {
+						t.Error("response ID collision triggered migration")
+					}
+					number := sends.Add(1)
+					id := fmt.Sprintf("healthy-%d", number)
+					switch number {
+					case 1:
+						id = "affected-seed"
+					case 2:
+						id = "healthy-seed"
+					case 3:
+						id = duplicateID
+					}
+					return conversationResponse(t, req, id, conversationText(fmt.Sprintf("Answer %d.", number))), nil
+				})
+				h, cfg := newConversationAPIHandler(t, transport, nil)
+				var snapshots []*conversationSnapshot
+				for _, id := range []string{"affected-seed", "healthy-seed"} {
+					conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": id}, nil), false)
+					snapshot, err := h.conversationHistory.lookupResponse("azure", id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					snapshots = append(snapshots, snapshot)
+				}
+				response := conversationPOST(t, h, map[string]any{"previous_response_id": "affected-seed", "input": "Continue.", "stream": stream}, nil)
+				body := response.Body.String()
+				if !strings.Contains(body, "conversation_execution_uncertain") || !stream && response.Code != http.StatusConflict {
+					t.Fatalf("collision did not report execution uncertainty: %d %s", response.Code, body)
+				}
+				if strings.Contains(body, `"history":"saved"`) || strings.Contains(body, `"status":"completed"`) || sends.Load() != 3 {
+					t.Fatalf("colliding completion was exposed or retried: %d %s, sends=%d", response.Code, body, sends.Load())
+				}
+				healthyID := "healthy-seed"
+				for _, reopen := range []bool{false, true} {
+					if reopen {
+						stopConversationAPIHandler(t, h)
+						h, _ = newConversationAPIHandler(t, transport, &cfg)
+					}
+					for _, snapshot := range snapshots {
+						requireConversationHistoryStorageSnapshot(t, h.conversationHistory, snapshot)
+					}
+					before := sends.Load()
+					retry := conversationPOST(t, h, map[string]any{"previous_response_id": "affected-seed", "input": "Retry."}, nil)
+					if retry.Code != http.StatusConflict || !strings.Contains(retry.Body.String(), "conversation_execution_uncertain") || sends.Load() != before {
+						t.Fatalf("collision lost its pending marker after reopen=%t: %d %s, sends=%d", reopen, retry.Code, retry.Body.String(), sends.Load())
+					}
+					healthy := conversationCompleted(t, conversationPOST(t, h, map[string]any{
+						"previous_response_id": healthyID, "input": "Continue the healthy conversation.", "stream": stream,
+					}, nil), stream)
+					healthyID = rawJSONString(healthy["id"])
+					if sends.Load() != before+1 {
+						t.Fatalf("healthy continuation sends=%d, want %d", sends.Load(), before+1)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestConversationMigrationSaveFailureAccounting(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		for _, boundary := range []string{"storage", "capacity"} {

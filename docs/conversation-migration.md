@@ -138,6 +138,8 @@ incomplete stream leaves execution uncertain, later continuation is blocked to
 avoid duplicate work. A saved completion survives restart. A lost client
 connection before receiving the completion can still require inspection of the
 client's local work; Vekil does not repeat the request automatically.
+If an upstream reuses a saved response ID, Vekil withholds the new completion
+and leaves that turn uncertain. The collision does not disable the shared store.
 
 HTTP responses report `X-Vekil-Conversation-Recovery: recording` during streaming
 and `saved` for a completed JSON response. The authoritative completion contains
@@ -164,10 +166,11 @@ vekil state prune-history --file /path/to/private-state/bindings.db \
   --before 2026-01-01T00:00:00Z --confirm
 ```
 
-This deletes snapshots older than the cutoff and retires eligible uncertain
-attempts together with every snapshot of their affected conversation. Snapshots
-at the cutoff remain. Ownership records are unchanged. Ordinary `state prune`
-deletes ownership proof separately and does not erase conversation text.
+This deletes snapshots older than the cutoff unless their conversation has an
+unresolved attempt at or after the cutoff. Older unresolved attempts are retired
+together with every snapshot of their conversation. Ownership records are
+unchanged. Ordinary `state prune` deletes ownership proof separately and does
+not erase conversation text.
 Pruning breaks affected recovery. Freed pages are reusable, not securely erased,
 and backups can retain the deleted contents. Back up only a stopped store; an
 older backup loses later completions and uncertainty markers.
