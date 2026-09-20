@@ -30,6 +30,8 @@ type conversationTurn struct {
 	instructions    json.RawMessage
 	tools           json.RawMessage
 	additionalTools []json.RawMessage
+	toolContexts    *ToolExecutionContextStore
+	toolScope       string
 	pending         bool
 	dispatched      bool
 	saved           bool
@@ -453,6 +455,7 @@ func (h *ProxyHandler) tryConversationMigration(ctx context.Context, operation *
 	if err != nil {
 		return nil, true, conversationRequestError(err)
 	}
+	body = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, body, requestedModel, "responses/migration", true, t.toolContexts, t.toolScope)
 	t.mu.Lock()
 	t.attempted, t.migrated = true, true
 	t.mu.Unlock()
