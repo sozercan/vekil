@@ -173,6 +173,12 @@ func (h *ProxyHandler) writeDurableShimPassthrough(w http.ResponseWriter, r *htt
 // Classify only local durable-store faults. Missing or mismatched ownership
 // evidence remains a separate request rejection, never a safety verdict.
 func durableStateFailureDetails(err error) (message, code string, ok bool) {
+	if errors.Is(err, errConversationHistoryCapacity) {
+		return errConversationHistoryCapacity.Error(), "conversation_history_capacity_exceeded", true
+	}
+	if errors.Is(err, errConversationHistoryStorage) {
+		return errConversationHistoryStorage.Error(), "conversation_history_storage_unavailable", true
+	}
 	if errors.Is(err, errDurableStateCapacity) {
 		return errDurableStateCapacity.Error(), "state_binding_capacity_exceeded", true
 	}

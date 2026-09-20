@@ -557,6 +557,9 @@ func (h *ProxyHandler) postResponsesWithHeadersForModelValidation(ctx context.Co
 	if err != nil {
 		return nil, err
 	}
+	if conversationTurnFromContext(ctx) != nil {
+		return resp, nil
+	}
 	return h.maybeRetryResponsesWithoutUnverifiableEncryptedContent(ctx, body, extraHeaders, resp)
 }
 

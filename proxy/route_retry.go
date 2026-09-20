@@ -90,6 +90,10 @@ func (h *ProxyHandler) explicitRouteRejectionDecision(ctx context.Context, opera
 		failure.commitment != downstreamCommitmentNone || !upstreamProgressAllowsTargetSwitch(failure.progress) {
 		return decision
 	}
+	if _, ready := h.conversationMigrationTarget(ctx, operation, endpoint, kind); ready && safeConversationMigrationFailure(failure) {
+		// The executor reconstructs on the backup using the remaining budget.
+		return routeRetrySuppressedState
+	}
 	if next := operation.sameTargetRetryDecision(ctx, kind, h.ShuttingDown()); next != routeRetrySameTarget {
 		return next
 	}

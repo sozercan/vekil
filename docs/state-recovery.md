@@ -10,6 +10,11 @@ Durable storage cannot reconstruct bindings already lost through restart,
 expiry, or eviction in memory mode. Vekil validates and opens the store before
 listening; configuration changes require a restart.
 
+Opt-in [Azure conversation migration](conversation-migration.md) adds saved
+visible history to this store so a conversation can continue on another resource.
+The ownership-only defaults described here do not store that history or migrate
+conversations.
+
 ## Configure one local writer
 
 The optional top-level block belongs in the existing schema-v2 providers file.
@@ -160,19 +165,23 @@ provider routes retain their existing behavior.
 
 The file contains a versioned key, typed keyed token digests, keyed owner
 fingerprints, issuance timestamps, and conflict tombstones. Raw continuation
-tokens, conversations, account IDs, and credentials are not stored. It is not an
-encrypted conversation backup. Keep the file private: its integrity key is in
+tokens, conversations, account IDs, and credentials are not stored by the
+ownership index. Enabling conversation migration additionally stores plaintext
+messages, instructions and tool output in separate buckets in the same file.
+Neither mode is an encrypted backup. Keep the file private: its integrity key is in
 the same file and does not defend against a malicious writer with the service user's
 filesystem access. Preserve the complete file for an offline backup, including
 its key and tombstones. Restoring an older backup loses proof issued afterward.
 
-Websocket connection history and upstream connections are **not** recovered.
+Without conversation migration, websocket connection history and upstream connections are **not** recovered.
 After reconnect, resend full client-held input without an old connection-local
 `previous_response_id`; retained encrypted input is still checked against its
 durable owner. HTTP `previous_response_id` retains its usual provider contract.
 Provider-side expiry/deletion may still reject state whose local ownership is
 known. Responses-backed Chat tool replay remains a separate process-local
-store; this feature does not persist it or migrate state across targets.
+store; durable ownership does not persist it or migrate state across targets.
+Migration-enabled Azure routes can instead reconnect using a locally saved
+response ID and new input, including when the upstream response used `store: false`.
 
 ## Retention, capacity and explicit pruning
 
@@ -180,6 +189,10 @@ Durable records never expire or evict automatically. The configured limit counts
 logical fixed-size records, **including tombstones**, not physical file bytes.
 The default 8,388,608-entry limit does not preallocate the full capacity. The
 database grows as new records are committed.
+Conversation snapshots have separate byte and count limits; ownership occupancy
+does not measure history capacity. `state prune` below leaves conversation text
+intact. Use [history pruning](conversation-migration.md#storage-diagnostics-and-deletion)
+to delete that text explicitly.
 At capacity, existing proof remains usable and existing tokens can still be
 marked conflicting. A batch requiring new records fails without partial
 insertion or exposure. Increase the limit on restart or deliberately retire old

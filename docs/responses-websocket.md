@@ -9,8 +9,8 @@ Important:
 - This websocket bridge is proxy-owned and forwards upstream over HTTP `/responses` by default.
 - It is separate from Azure OpenAI's native `/realtime` websocket and WebRTC APIs.
 - For a schema-version-2 route, the first provider-backed `response.create` may try the next ordered target only after a definitely replay-safe rejection and before websocket metadata, a Responses event, semantic output, or provider-bound state is exposed.
-- Once a target is committed, the session is pinned to that exact `{route_id, target_id}`. Every later turn, delta replay, full-replay fallback, automatic compaction call, and protocol recovery stays on that target. Cross-target session migration is not implemented.
-- If a pinned Azure target returns an authoritative pre-execution `429` with a valid reset, the bridge can wait and retry the same turn on that target within its send budget and deadline. Prior turns' frames retain the session pin; progress on the current turn prevents retry. Other unavailable-target failures remain closed to migration, even with `priority_failover`. See [Azure recovery and route budgets](provider-routing.md#routing-modes-and-budgets).
+- By default, once a target is committed, the session is pinned to that exact `{route_id, target_id}`. Every later turn, delta replay, full-replay fallback, automatic compaction call, and protocol recovery stays on that target. Selected Azure routes can opt into [conversation migration](conversation-migration.md), which reconstructs complete saved history before changing targets.
+- If a pinned Azure target returns an authoritative pre-execution `429` with a valid reset, the bridge can wait and retry the same turn on that target within its send budget and deadline. An eligible migration takes priority when enabled. Progress on the current turn prevents retry. Other unavailable-target failures remain closed to migration unless the route is opted in and the failure proves non-execution. See [Azure recovery and route budgets](provider-routing.md#routing-modes-and-budgets).
 - Each websocket session is serialized: one active turn is processed at a time, with at most one additional request queued. Vekil does not multiplex turns or implement Copilot-style request superseding; clients that try to queue more than one request receive a WebSocket policy-violation close.
 - A dedicated session reader continues handling close and pong control frames while inference or automatic compaction is in progress. Client close/read failure, missed pong deadlines, the shared turn deadline, and server shutdown cancel the active upstream inference or compaction promptly, close retry admission, and prevent a secondary target or other new turn work from starting.
 - Each provider-backed `response.create` is one logical operation with one target-attempt budget and one physical upstream-send budget. Initial selection, any safe first-turn failover, Azure rate-limit retries, replay/compaction child calls, and same-target protocol recovery share those bounds; attempts remain serialized.
@@ -25,13 +25,21 @@ default. The providers file controls storage, with a default capacity of
 `state_bindings.mode: memory` opts out and retains the process-local index with
 a default 262,144-entry limit and 24-hour absolute TTL.
 
-Durable ownership does not recover websocket history or upstream connections.
+Durable ownership alone does not recover websocket history or upstream connections.
 Reconnect with full client-held input without the old connection-local
 `previous_response_id`; retained encrypted input must still match its owner.
 Concurrent clients can share one proxy, but each database has one writer.
 Separate proxies need ingress affinity. Drain sessions before rollback or
-downgrade. Shared bindings, signed target hints, and cross-target replay are
-not implemented.
+downgrade. Shared bindings and signed target hints are not implemented.
+
+On a migration-enabled Azure route, reconnect with a saved `previous_response_id`
+and only new input, including after a Vekil restart. Matching full input is also
+supported. Per-turn `headers: {"X-Vekil-History-Complete": "true"}` imports an
+independent complete history. Successful completions carry `vekil.history: saved`
+and the answering target; `vekil.migration: completed` identifies the switch.
+Incomplete turns remain blocked. Automatic compaction is disabled on these
+routes so saved original history remains available. Local `generate: false`
+staging is still connection-local and is not recoverable after reconnect.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|

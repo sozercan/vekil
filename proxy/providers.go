@@ -62,22 +62,24 @@ var openAICodexProviderEndpoints = []string{providerEndpointResponses}
 // ProvidersConfig configures optional non-Copilot upstream providers.
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
 type ProvidersConfig struct {
-	SchemaVersion  int                   `json:"schema_version,omitempty" yaml:"schema_version,omitempty"`
-	Providers      []ProviderConfig      `json:"providers" yaml:"providers"`
-	ModelRoutes    []ModelRouteConfig    `json:"model_routes,omitempty" yaml:"model_routes,omitempty"`
-	PolicyProfiles []PolicyProfileConfig `json:"policy_profiles,omitempty" yaml:"policy_profiles,omitempty"`
-	ToolOptimizers ToolOptimizersConfig  `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
-	StateBindings  *StateBindingsConfig  `json:"state_bindings,omitempty" yaml:"state_bindings,omitempty"`
+	SchemaVersion         int                          `json:"schema_version,omitempty" yaml:"schema_version,omitempty"`
+	Providers             []ProviderConfig             `json:"providers" yaml:"providers"`
+	ModelRoutes           []ModelRouteConfig           `json:"model_routes,omitempty" yaml:"model_routes,omitempty"`
+	PolicyProfiles        []PolicyProfileConfig        `json:"policy_profiles,omitempty" yaml:"policy_profiles,omitempty"`
+	ToolOptimizers        ToolOptimizersConfig         `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+	StateBindings         *StateBindingsConfig         `json:"state_bindings,omitempty" yaml:"state_bindings,omitempty"`
+	ConversationMigration *ConversationMigrationConfig `json:"conversation_migration,omitempty" yaml:"conversation_migration,omitempty"`
 	// InsightModel is the public model ID the dashboard uses to generate
 	// natural-language traffic insights on demand. Empty disables the feature
 	// (the dashboard's "Generate insights" button is hidden). The model must be
 	// one served by the configured providers.
 	InsightModel string `json:"insight_model,omitempty" yaml:"insight_model,omitempty"`
 
-	schemaVersionSet  bool
-	modelRoutesSet    bool
-	policyProfilesSet bool
-	stateBindingsSet  bool
+	schemaVersionSet         bool
+	modelRoutesSet           bool
+	policyProfilesSet        bool
+	stateBindingsSet         bool
+	conversationMigrationSet bool
 }
 
 // ProviderConfig configures one upstream provider instance.
@@ -470,6 +472,7 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		cfg.modelRoutesSet = present["model_routes"]
 		cfg.policyProfilesSet = present["policy_profiles"]
 		cfg.stateBindingsSet = present["state_bindings"]
+		cfg.conversationMigrationSet = present["conversation_migration"]
 		markYAMLProvidersConfigFieldPresence(body, cfg)
 	default:
 		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
@@ -498,6 +501,7 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		cfg.modelRoutesSet = present["model_routes"]
 		cfg.policyProfilesSet = present["policy_profiles"]
 		cfg.stateBindingsSet = present["state_bindings"]
+		cfg.conversationMigrationSet = present["conversation_migration"]
 		markJSONProvidersConfigFieldPresence(body, cfg)
 	}
 	return nil

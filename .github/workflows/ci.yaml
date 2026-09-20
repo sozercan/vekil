@@ -103,7 +103,7 @@ jobs:
         run: go test . ./launch -count=1
 
       - name: Test Darwin durable storage and shared configuration
-        run: go test ./proxy ./server ./cmd/menubar -run '^Test(Durable|StateBindings|StateBindingStats|LoadProvidersConfigFileStateBindings)' -count=1
+        run: go test ./proxy ./server ./cmd/menubar -run '^Test(Durable|StateBindings|StateBindingStats|Conversation|LoadProvidersConfigFile(StateBindings|ConversationMigration))' -count=1
 
       - name: Test legacy JSON response validation
         env:

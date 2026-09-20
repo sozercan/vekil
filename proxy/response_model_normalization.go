@@ -20,6 +20,7 @@ type explicitRouteResponseInfo struct {
 	targetID      string
 	providerID    string
 	stateIdentity [32]byte
+	conversation  *conversationTurn
 }
 
 type explicitRouteResponseContextKey struct{}
@@ -193,6 +194,15 @@ func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http
 		out = normalized
 		changed = true
 	}
+	if success && info.conversation != nil {
+		var err error
+		out, err = info.conversation.saveResponse(out, info)
+		if err != nil {
+			return newResponseBodyWriteError(resp, err, false, true, false)
+		}
+		changed = true
+		resp.Header.Set("X-Vekil-Conversation-Recovery", "saved")
+	}
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	if changed || len(out) != len(data) {
@@ -224,14 +234,14 @@ func (b *normalizedResponsesStreamBody) Close() error {
 	return err
 }
 
-func normalizeResponsesStreamBody(source io.ReadCloser, publicModel string, onEvent func([]byte) error) io.ReadCloser {
+func normalizeResponsesStreamBody(source io.ReadCloser, publicModel string, onEvent func([]byte) error, transforms ...func([]byte) ([]byte, error)) io.ReadCloser {
 	if source == nil || strings.TrimSpace(publicModel) == "" {
 		return source
 	}
 	pr, pw := io.Pipe()
 	wrapped := &normalizedResponsesStreamBody{reader: pr, source: source}
 	go func() {
-		err := copyNormalizedResponsesSSE(pw, source, publicModel, onEvent)
+		err := copyNormalizedResponsesSSE(pw, source, publicModel, onEvent, transforms...)
 		_ = source.Close()
 		if err != nil {
 			_ = pw.CloseWithError(err)
@@ -242,7 +252,7 @@ func normalizeResponsesStreamBody(source io.ReadCloser, publicModel string, onEv
 	return wrapped
 }
 
-func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string, onEvent func([]byte) error) error {
+func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string, onEvent func([]byte) error, transforms ...func([]byte) ([]byte, error)) error {
 	reader := bufio.NewReaderSize(src, openAIStreamScannerInitialBuffer)
 	var event bytes.Buffer
 	flush := func() error {
@@ -251,7 +261,7 @@ func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string
 		}
 		raw := append([]byte(nil), event.Bytes()...)
 		event.Reset()
-		rewritten, changed, eventErr := rewriteResponsesSSEEventModel(raw, publicModel, onEvent)
+		rewritten, changed, eventErr := rewriteResponsesSSEEventModel(raw, publicModel, onEvent, transforms...)
 		if eventErr != nil {
 			return eventErr
 		}
@@ -289,15 +299,19 @@ func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string
 	}
 }
 
-func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func([]byte) error) ([]byte, bool, error) {
+func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func([]byte) error, transforms ...func([]byte) ([]byte, error)) ([]byte, bool, error) {
 	lines := splitSSEEventLines(raw)
 	if len(lines) == 0 {
 		return raw, false, nil
 	}
 	dataParts := make([]string, 0, 1)
 	firstData := -1
+	eventName := ""
 	for i, line := range lines {
 		content, _ := splitSSELineEnding(line)
+		if strings.HasPrefix(content, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(content, "event:"))
+		}
 		if data, ok := parseSSELine(content); ok {
 			if firstData < 0 {
 				firstData = i
@@ -310,6 +324,11 @@ func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func(
 	}
 	data := strings.Join(dataParts, "\n")
 	if strings.TrimSpace(data) == "[DONE]" {
+		for _, transform := range transforms {
+			if _, err := transform([]byte(data)); err != nil {
+				return nil, false, err
+			}
+		}
 		return raw, false, nil
 	}
 	if onEvent != nil {
@@ -317,7 +336,23 @@ func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func(
 			return nil, false, err
 		}
 	}
-	rewritten, changed := rewriteResponsesResponseModelJSON([]byte(data), publicModel)
+	transformed := []byte(data)
+	if len(transforms) > 0 && eventName != "" {
+		var envelope map[string]json.RawMessage
+		if json.Unmarshal(transformed, &envelope) == nil && envelope != nil && rawJSONString(envelope["type"]) == "" {
+			envelope["type"], _ = json.Marshal(eventName)
+			transformed, _ = json.Marshal(envelope)
+		}
+	}
+	for _, transform := range transforms {
+		var err error
+		transformed, err = transform(transformed)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	rewritten, changed := rewriteResponsesResponseModelJSON(transformed, publicModel)
+	changed = changed || !bytes.Equal(transformed, []byte(data))
 	if !changed {
 		return raw, false, nil
 	}
@@ -347,7 +382,13 @@ func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func(
 }
 
 func normalizeResponsesStreamBodyWithBinding(h *ProxyHandler, source io.ReadCloser, info explicitRouteResponseInfo) io.ReadCloser {
-	return normalizeResponsesStreamBody(source, info.publicID, func(data []byte) error {
+	var transforms []func([]byte) ([]byte, error)
+	if info.conversation != nil {
+		transforms = append(transforms, func(data []byte) ([]byte, error) {
+			return info.conversation.saveResponse(data, info)
+		})
+	}
+	body := normalizeResponsesStreamBody(source, info.publicID, func(data []byte) error {
 		durable := h != nil && h.stateBindings != nil && h.stateBindings.durable != nil
 		var tokens []stateBindingToken
 		var err error
@@ -375,7 +416,11 @@ func normalizeResponsesStreamBodyWithBinding(h *ProxyHandler, source io.ReadClos
 			tokens = append(tokens, errorTokens...)
 		}
 		return h.bindExplicitStateTokens(info, tokens)
-	})
+	}, transforms...)
+	if info.conversation != nil {
+		return &conversationCompletionBody{ReadCloser: body, turn: info.conversation}
+	}
+	return body
 }
 
 func splitSSEEventLines(raw []byte) []string {

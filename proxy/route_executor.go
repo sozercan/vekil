@@ -198,10 +198,11 @@ func (m *routeOperationMutex) Unlock() {
 type routeOperation struct {
 	mu routeOperationMutex
 
-	id       string
-	route    *modelRoute
-	inbound  context.Context
-	chatPlan *chatOperationPlan
+	id           string
+	route        *modelRoute
+	inbound      context.Context
+	chatPlan     *chatOperationPlan
+	conversation *conversationTurn
 
 	remainingTargetAttempts int
 	remainingUpstreamSends  int
@@ -3150,10 +3151,11 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			break
 		}
 		responseInfo := explicitRouteResponseInfo{
-			routeID:    route.public.routeID,
-			publicID:   route.public.id,
-			targetID:   target.id,
-			providerID: target.provider.id,
+			routeID:      route.public.routeID,
+			publicID:     route.public.id,
+			targetID:     target.id,
+			providerID:   target.provider.id,
+			conversation: operation.conversation,
 		}
 		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), responseInfo))
 		req.GetBody = nil
@@ -3176,7 +3178,15 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		permit, blocked, admissionErr := h.acquireCopilotInference(req)
 		var azurePermit *azureTrafficPermit
 		if blocked == nil && admissionErr == nil {
-			azurePermit, blocked, admissionErr = h.acquireAzureRouteInference(req, routeCanSwitchAfterAttempt(ctx, operation, endpoint, kind, h.ShuttingDown()))
+			_, migrationReady := h.conversationMigrationTarget(ctx, operation, endpoint, kind)
+			// A local cooldown can reject before the normal post-admission owner
+			// check. Validate the saved owner before that rejection can migrate.
+			if migrationReady {
+				_, admissionErr = h.validateDurableRequestOwner(req, route, target, operation)
+			}
+			if admissionErr == nil {
+				azurePermit, blocked, admissionErr = h.acquireAzureRouteInference(req, routeCanSwitchAfterAttempt(ctx, operation, endpoint, kind, h.ShuttingDown()) || migrationReady)
+			}
 			if blocked == nil && admissionErr == nil && azurePermit != nil && target.provider.azureAuthMode() == providerAuthModeAzureIdentity {
 				// A recovery queue can outlive the token attached during request
 				// construction. Refresh before reserving a physical send.
@@ -3241,6 +3251,14 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			traffic.permit = azurePermit
 			req = req.WithContext(context.WithValue(req.Context(), azureRouteTrafficContextKey{}, traffic))
 		}
+		if err := operation.conversation.persistIntent(); err != nil {
+			permit.release()
+			azurePermit.release()
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			return nil, err
+		}
 
 		if reserved, decision := operation.reserveSendAtDispatch(ctx, h.ShuttingDown()); !reserved {
 			permit.release()
@@ -3283,6 +3301,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			})
 		}
 
+		operation.conversation.dispatching()
 		resp, sendErr := h.singleInferenceSend(req, observation)
 		h.finishCopilotInference(req, resp, sendErr, permit)
 		if resp != nil {
@@ -3290,6 +3309,9 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		}
 		if sendErr == nil && resp != nil {
 			normalizeExplicitModelHeaders(resp.Header, route.public.id)
+			if operation.conversation != nil {
+				resp.Header.Set("X-Vekil-Conversation-Recovery", "recording")
+			}
 		}
 		if sendErr != nil {
 			delivery := observation.deliveryForError()
@@ -3520,11 +3542,24 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			resp = observeRouteAttemptResponse(resp, attemptRecord, operation, trace, observation, endpoint, stream)
 		}
 		attribution.recordFinal(operation.inbound)
+		if operation.conversation != nil && resp.StatusCode >= http.StatusBadRequest {
+			// An error without the adapter's non-execution proof cannot be
+			// replayed. Explain that uncertainty on the protected route itself.
+			_ = drainRouteAttemptBodyWithTimeout(resp.Body, upstreamErrorDetailDrainTimeout)
+			h.logConversationRecovery(operation, "blocked", target.id, "execution_uncertain")
+			operation.conversation.mu.Lock()
+			operation.conversation.blocked = true
+			operation.conversation.mu.Unlock()
+			return nil, conversationRequestError(errConversationHistoryUncertain)
+		}
 		return resp, nil
 	}
 
-	h.recordExplicitRouteExhaustion(operation, endpoint)
 	failure := selectFinalRouteFailure(failures)
+	if resp, handled, err := h.tryConversationMigration(ctx, operation, endpoint, dispatchPath, extraHeaders, requestedModel, stream, failure); handled {
+		return resp, err
+	}
+	h.recordExplicitRouteExhaustion(operation, endpoint)
 	failure.attribution.recordFinal(operation.inbound)
 	if failure.response != nil {
 		failure.response.recordFinalUpstreamID(operation.inbound)
