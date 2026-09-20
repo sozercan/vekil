@@ -2714,6 +2714,12 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 }
 
 func (h *ProxyHandler) newProviderJSONRequestWithTemplateHeaders(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, reuseSealedHeaders bool, owners ...providerModel) (*http.Request, error) {
+	// The history assertion belongs to local request validation, including on
+	// routes where migration is disabled. Never forward it to a provider.
+	if _, present := extraHeaders["X-Vekil-History-Complete"]; present {
+		extraHeaders = extraHeaders.Clone()
+		extraHeaders.Del("X-Vekil-History-Complete")
+	}
 	route := providerRouteInfo{id: provider.id, kind: string(provider.kind)}
 	// Route selection has already happened before URL construction or provider
 	// authentication. Publish it now so failures in either step retain the actual

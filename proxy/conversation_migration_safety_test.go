@@ -14,7 +14,55 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 )
+
+func TestConversationMigrationAssertionHeaderStaysLocal(t *testing.T) {
+	for _, mode := range []string{"zero-config", "legacy", "explicit-disabled"} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", mode, stream), func(t *testing.T) {
+				cfg := ProvidersConfig{}
+				if mode != "zero-config" {
+					cfg.Providers = []ProviderConfig{{ID: "configured", Type: "openai-compatible", Default: true, BaseURL: "https://provider.example.test/v1", APIKey: "test-key",
+						Models: []ProviderModelConfig{{PublicID: "coding", Endpoints: []string{providerEndpointResponses}}}}}
+				}
+				if mode == "explicit-disabled" {
+					cfg.SchemaVersion = 2
+					cfg.StateBindings = &StateBindingsConfig{Mode: "memory"}
+					cfg.Providers[0].Models = nil
+					cfg.ModelRoutes = []ModelRouteConfig{{ID: "configured", PublicID: "coding", Endpoints: []string{providerEndpointResponses},
+						Targets: []ModelRouteTargetConfig{{ID: "only", Provider: "configured", UpstreamModel: "physical-model"}}}}
+				}
+				var sends atomic.Int32
+				h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(cfg), func(h *ProxyHandler) {
+					h.client = &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						if strings.HasSuffix(req.URL.Path, "/models") {
+							return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+						}
+						sends.Add(1)
+						if req.Header.Get("X-Vekil-History-Complete") != "" || req.Header.Get("X-Client-Request-Id") != "client-request" {
+							t.Error("upstream headers leaked the history assertion or lost client attribution")
+						}
+						return conversationResponse(t, req, "header-response", conversationText("Answer.")), nil
+					})}
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { stopConversationAPIHandler(t, h) })
+				disableColdChatRouteDiscoveryForLegacyTest(h)
+				response := conversationPOST(t, h, map[string]any{"input": "Question.", "stream": stream}, http.Header{
+					"X-Vekil-History-Complete": {"true"}, "X-Client-Request-Id": {"client-request"},
+				})
+				if response.Code != http.StatusOK || sends.Load() != 1 {
+					t.Fatalf("response = %d %s, sends=%d", response.Code, response.Body.String(), sends.Load())
+				}
+			})
+		}
+	}
+}
 
 func TestConversationMigrationRetainsNewOwnerReasoning(t *testing.T) {
 	var outage atomic.Bool
@@ -262,6 +310,57 @@ func TestConversationMigrationStorageFailureWithholdsCompletion(t *testing.T) {
 				}
 				if (boundary == "intent" || boundary == "capacity") && sends.Load() != 0 || sends.Load() > 1 {
 					t.Fatalf("storage failure dispatched/retried: %d", sends.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestConversationMigrationSaveFailureAccounting(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, boundary := range []string{"storage", "capacity"} {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, boundary), func(t *testing.T) {
+				var h *ProxyHandler
+				var sends atomic.Int32
+				transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if strings.HasSuffix(req.URL.Path, "/models") {
+						return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+					}
+					sends.Add(1)
+					if boundary == "storage" {
+						// Commit the response's ownership proof, then fail its history save.
+						commits := 0
+						h.stateBindings.durable.mu.Lock()
+						h.stateBindings.durable.beforeCommit = func() error {
+							commits++
+							if commits > 1 {
+								return syscall.ENOSPC
+							}
+							return nil
+						}
+						h.stateBindings.durable.mu.Unlock()
+					}
+					response := conversationResponse(t, req, "unsaved-history", conversationText(strings.Repeat("answer ", 1024)))
+					response.Header.Del("X-Codex-Turn-State")
+					return response, nil
+				})
+				h, _ = newConversationAPIHandler(t, transport, nil)
+				if boundary == "capacity" {
+					h.conversationHistory.config.MaxHistoryBytes = 2048
+				}
+				ctx, summary := WithRequestSummary(t.Context())
+				req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(fmt.Sprintf(`{"model":"coding","input":"Seed.","stream":%t}`, stream))).WithContext(ctx)
+				response := httptest.NewRecorder()
+				h.HandleResponses(response, req)
+				code := "conversation_history_storage_unavailable"
+				if boundary == "capacity" {
+					code = "conversation_history_capacity_exceeded"
+				}
+				if !strings.Contains(response.Body.String(), code) || strings.Contains(response.Body.String(), `"history":"saved"`) || sends.Load() != 1 {
+					t.Fatalf("history save failure = %d %s, sends=%d", response.Code, response.Body.String(), sends.Load())
+				}
+				if summary.FailureStatus() != http.StatusServiceUnavailable || !stream && response.Code != http.StatusServiceUnavailable {
+					t.Fatalf("history save failure accounting: HTTP=%d summary=%d", response.Code, summary.FailureStatus())
 				}
 			})
 		}

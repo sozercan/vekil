@@ -14,6 +14,7 @@ func (s *responsesWebSocketSession) postConversationCreateRequest(h *ProxyHandle
 	if strings.HasPrefix(request.PreviousResponseID, "vekil-ws-") {
 		// generate:false staging remains connection-local and does not claim a
 		// saved generation. Its full input is available on this connection.
+		previousID = ""
 		input = plan.fullReplaySegments
 		if plan.conversationSourceID != "" {
 			source, err := h.conversationHistory.lookupResponse(operation.route.public.routeID, plan.conversationSourceID)

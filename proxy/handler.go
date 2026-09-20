@@ -737,8 +737,11 @@ func (h *ProxyHandler) handleResponseBodyWriteError(w http.ResponseWriter, r *ht
 		return false
 	}
 	if code := providerRequestErrorCode(err); strings.HasPrefix(code, "conversation_") {
+		status := upstreamStatusCode(err, http.StatusBadGateway)
+		if r != nil {
+			observeResponseFailureStatus(r.Context(), status)
+		}
 		if !bodyErr.committed {
-			status := upstreamStatusCode(err, http.StatusBadGateway)
 			writeOpenAIErrorWithDetails(w, status, err.Error(), "server_error", "", code)
 		}
 		return true

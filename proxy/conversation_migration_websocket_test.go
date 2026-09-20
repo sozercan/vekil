@@ -185,6 +185,54 @@ func TestConversationMigrationWebSocketStagingPreservesSavedSource(t *testing.T)
 	}
 }
 
+func TestConversationMigrationWebSocketFreshStaging(t *testing.T) {
+	var sends atomic.Int32
+	h, _ := newConversationAPIHandler(t, routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/models") {
+			return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+		}
+		body, _ := io.ReadAll(req.Body)
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		for _, text := range []string{"First staged input.", "Second staged input.", "Generate now."} {
+			if bytes.Count(body, []byte(text)) != 1 {
+				t.Errorf("generated request lost or duplicated %q: %s", text, body)
+			}
+		}
+		if bytes.Contains(body, []byte("vekil-ws-")) {
+			t.Error("synthetic staging ID reached the provider")
+		}
+		return conversationResponse(t, req, fmt.Sprintf("fresh-%d", sends.Add(1)), conversationText("Generated answer.")), nil
+	}), nil)
+	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
+	defer func() { _ = conn.Close() }()
+	var stagedID string
+	for _, input := range []string{"First staged input.", "Second staged input."} {
+		request := map[string]any{"type": "response.create", "model": "coding", "store": false, "generate": false, "input": input}
+		if stagedID != "" {
+			request["previous_response_id"] = stagedID
+		}
+		if err := conn.WriteJSON(request); err != nil {
+			t.Fatal(err)
+		}
+		if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "response.created" {
+			t.Fatalf("staging did not start: %v", frame)
+		}
+		frame := mustReadWebSocketJSONSkipMetadata(t, conn)
+		if frame["type"] != "response.completed" {
+			t.Fatalf("staging did not complete: %v", frame)
+		}
+		stagedID = websocketResponseID(t, frame)
+		if !strings.HasPrefix(stagedID, "vekil-ws-") || sends.Load() != 0 {
+			t.Fatalf("staging dispatched inference: id=%q sends=%d", stagedID, sends.Load())
+		}
+	}
+	response := conversationWebSocketTurn(t, conn, map[string]any{"previous_response_id": stagedID, "input": "Generate now."})
+	conversationWebSocketTurn(t, conn, map[string]any{"previous_response_id": response["id"], "input": "Continue."})
+	if sends.Load() != 2 {
+		t.Fatalf("generation and continuation sends = %d", sends.Load())
+	}
+}
+
 func TestConversationMigrationWebSocketIndependentImport(t *testing.T) {
 	var sends atomic.Int32
 	h, _ := newConversationAPIHandler(t, routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {

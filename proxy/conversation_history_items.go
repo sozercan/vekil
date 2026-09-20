@@ -185,6 +185,17 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 	for _, part := range parts {
 		switch rawJSONString(part["type"]) {
 		case "input_text", "output_text", "text":
+			if err := conversationItemFields(part, "type", "text", "annotations", "logprobs"); err != nil {
+				return nil, err
+			}
+			// Azure emits empty annotations and token logprobs on ordinary text.
+			// References are visible content that this history format cannot replay.
+			if raw, present := part["annotations"]; present {
+				var annotations []json.RawMessage
+				if json.Unmarshal(raw, &annotations) != nil || len(annotations) != 0 {
+					return nil, errConversationHostedState
+				}
+			}
 			if err := json.Unmarshal(part["text"], &text); err != nil {
 				return nil, errConversationHostedState
 			}
@@ -194,6 +205,9 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 			}
 			normalized = append(normalized, map[string]any{"type": kind, "text": text})
 		case "refusal":
+			if err := conversationItemFields(part, "type", "refusal"); err != nil {
+				return nil, err
+			}
 			if role != "assistant" || json.Unmarshal(part["refusal"], &text) != nil {
 				return nil, errConversationHostedState
 			}

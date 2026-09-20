@@ -35,6 +35,7 @@ func TestResponsesWebSocketPerTurnHeadersAndStringInput(t *testing.T) {
 		create["headers"] = map[string]string{
 			"X-Initiator": "agent", "X-Interaction-Id": interaction,
 			"Authorization": "untrusted", "X-Codex-Turn-State": "untrusted-state",
+			"X-Vekil-History-Complete": "true",
 		}
 		if err := conn.WriteJSON(create); err != nil {
 			t.Fatal(err)
@@ -48,6 +49,9 @@ func TestResponsesWebSocketPerTurnHeadersAndStringInput(t *testing.T) {
 		}
 		if r.Header.Get("Authorization") != "Bearer test-token" || r.Header.Get("X-Codex-Turn-State") != "" {
 			t.Fatal("per-turn headers replaced provider credentials or trusted state")
+		}
+		if r.Header.Get("X-Vekil-History-Complete") != "" {
+			t.Fatal("proxy-only history assertion reached the upstream")
 		}
 		body := <-bodies
 		if _, ok := body["headers"]; ok {

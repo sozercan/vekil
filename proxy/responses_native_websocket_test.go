@@ -31,6 +31,9 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer test-token" || r.Header.Get("X-Initiator") != "agent" {
 			t.Error("native handshake did not retain provider authentication and request attribution")
 		}
+		if r.Header.Get("X-Vekil-History-Complete") != "" {
+			t.Error("proxy-only history assertion reached the native handshake")
+		}
 		conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
 		if err != nil {
 			t.Error(err)
@@ -68,7 +71,7 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 	request := newResponsesWebSocketCreateRequest([]any{map[string]string{"role": "user", "content": "first"}})
 	for turn := 1; turn <= 2; turn++ {
-		request["headers"] = map[string]string{"X-Initiator": "agent", "X-Interaction-Id": fmt.Sprintf("interaction-%d", turn)}
+		request["headers"] = map[string]string{"X-Initiator": "agent", "X-Interaction-Id": fmt.Sprintf("interaction-%d", turn), "X-Vekil-History-Complete": "true"}
 		request["client_metadata"] = map[string]string{
 			"ws_request_header_x-custom-test-telemetry": fmt.Sprintf("custom-%d", turn),
 			"ws_request_header_baggage":                 fmt.Sprintf("turn=%d", turn),
@@ -113,7 +116,7 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 		if headers["X-Custom-Test-Telemetry"] != fmt.Sprintf("custom-%d", turn) || headers["Baggage"] != fmt.Sprintf("turn=%d", turn) {
 			t.Errorf("turn %d native custom headers = %+v", turn, headers)
 		}
-		for _, name := range []string{"Copilot-Integration-Id", "Content-Type", "Connection", "Sec-Websocket-Protocol", "X-Codex-Turn-State"} {
+		for _, name := range []string{"Copilot-Integration-Id", "Content-Type", "Connection", "Sec-Websocket-Protocol", "X-Codex-Turn-State", "X-Vekil-History-Complete"} {
 			if _, ok := headers[name]; ok {
 				t.Errorf("native per-turn headers contain protected header %q", name)
 			}
