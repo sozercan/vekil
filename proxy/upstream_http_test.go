@@ -402,6 +402,7 @@ func TestPostJSONEndpointWithHeadersForModel_ExplicitRouteRewritesNormalizedAlia
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{{
 				ID:       "explicit",
 				Type:     string(providerTypeOpenAICompatible),
@@ -482,6 +483,7 @@ func TestPostJSONEndpointWithHeadersForModel_ExplicitFallbackKeepsBodyModelAsRew
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{{
 				ID:       "explicit",
 				Type:     string(providerTypeOpenAICompatible),
@@ -583,6 +585,7 @@ func TestPostAnthropicMessagesCountTokens_ExplicitOperationRewritesNormalizedAli
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{{
 				ID:       "explicit",
 				Type:     string(providerTypeAnthropicCompatible),

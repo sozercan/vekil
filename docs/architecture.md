@@ -112,7 +112,30 @@ Provider-issued continuation state is an exact ownership constraint, not a routi
 
 All state inputs on a request must resolve together to the same route and target. Known state pins the exact target and disables failover. Conflicting, malformed, cross-route, mixed known/unknown, or unknown state on an explicit route fails locally without an upstream call. If the same token is ever observed with different owners, the store records a conflict tombstone and continues to fail it closed rather than choosing one owner. An unavailable bound target also fails closed; Vekil does not guess another owner or migrate provider state.
 
-Bindings use keyed digests and live in a process-local index capped at 262,144 entries with a 24-hour absolute TTL. Raw state is not used as a log field or metrics label. Expiry, eviction, process restart, or routing a continuation to another Vekil process turns the binding into unknown state. Stateful multi-target routes therefore require a single Vekil process or sticky ingress to the process that owns the binding map. Durable/shared bindings and cross-target replay or session migration are not implemented.
+Bindings use keyed digests. Schema-v2 explicit routes use durable storage by
+default, with an 8,388,608-record logical capacity and no full-capacity
+preallocation. `state_binding_config.go` resolves the providers file's
+`state_bindings` block and optional process overrides. The CLI, managed
+launchers, and menubar use that shared initialization. `mode: memory` retains
+the process-local index with its default 262,144-entry capacity, 24-hour absolute
+TTL, and LRU eviction; legacy and zero-config defaults are unchanged.
+
+`state_binding_durable*` uses synchronous bbolt transactions, a persistent digest
+key, and a single-writer file lock. Linux and macOS share descriptor-based file
+validation and recovery; macOS requires local APFS, rejects extended ACLs, and
+uses `F_FULLFSYNC` barriers. The default application-data directory is created
+privately and its creation is synced. `route_state_durable_identity.go`
+fingerprints the authenticated request before dispatch; exposure hooks commit
+records before publishing state. Durable records do not expire or evict, and
+I/O uncertainty freezes the store until reopen. Concurrent clients share one
+proxy's writer; another process cannot acquire the same file until shutdown
+has drained handlers and workers.
+
+The dashboard reads committed count and file-size gauges without scanning all
+records. Raw state is not a log field or metric label. See
+[state recovery](state-recovery.md) for capacity, pruning, lifecycle, and
+supported-platform limits. Shared storage and cross-target replay/session
+migration remain unsupported.
 
 ## Key Decisions
 

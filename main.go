@@ -29,6 +29,7 @@ const (
 	cliCommandLogout
 	cliCommandLaunch
 	cliCommandConfig
+	cliCommandState
 )
 
 func main() {
@@ -45,6 +46,11 @@ func main() {
 		return
 	case cliCommandConfig:
 		runConfig(os.Args[2:])
+		return
+	case cliCommandState:
+		if code := runState(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			os.Exit(code)
+		}
 		return
 	}
 
@@ -65,6 +71,8 @@ func commandFromArgs(args []string) cliCommand {
 		return cliCommandLaunch
 	case "config":
 		return cliCommandConfig
+	case "state":
+		return cliCommandState
 	default:
 		return cliCommandServe
 	}
@@ -369,6 +377,7 @@ func writeConfigValidateUsage(w io.Writer) {
 }
 
 type serveFlags struct {
+	stateBindingsFlags
 	port                            *string
 	host                            *string
 	tokenDir                        *string
@@ -397,6 +406,7 @@ type serveFlags struct {
 
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
 	return serveFlags{
+		stateBindingsFlags:              registerStateBindingsFlags(fs),
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
@@ -429,6 +439,24 @@ func (f serveFlags) parsedPolicyRoutingMode() (proxy.PolicyRoutingMode, error) {
 		return proxy.PolicyRoutingModeConfig, nil
 	}
 	return proxy.ParsePolicyRoutingMode(*f.policyRoutingMode)
+}
+
+type stateBindingsFlags struct {
+	stateBindingsMode       *string
+	stateBindingsFile       *string
+	stateBindingsMaxEntries *string
+}
+
+func registerStateBindingsFlags(fs *flag.FlagSet) stateBindingsFlags {
+	return stateBindingsFlags{
+		stateBindingsMode:       fs.String("state-bindings-mode", getEnv("STATE_BINDINGS_MODE", "config"), "Provider state mode override: config, durable, or memory"),
+		stateBindingsFile:       fs.String("state-bindings-file", getEnv("STATE_BINDINGS_FILE", ""), "Override the provider-state file with an absolute path in a private local directory"),
+		stateBindingsMaxEntries: fs.String("state-bindings-max-entries", getEnv("STATE_BINDINGS_MAX_ENTRIES", "0"), "Override logical-record capacity including tombstones (0 follows providers config; durable default: 8388608)"),
+	}
+}
+
+func (f stateBindingsFlags) parsedStateBindingsConfig() (proxy.StateBindingsConfig, error) {
+	return proxy.ParseStateBindingsOverrides(*f.stateBindingsMode, *f.stateBindingsFile, *f.stateBindingsMaxEntries)
 }
 
 func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
@@ -643,6 +671,10 @@ func runServe() {
 	if err != nil {
 		log.Fatal("invalid policy routing mode", logger.Err(err))
 	}
+	stateBindings, err := serve.parsedStateBindingsConfig()
+	if err != nil {
+		log.Fatal("invalid state bindings configuration", logger.Err(err))
+	}
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
@@ -668,6 +700,7 @@ func runServe() {
 		server.WithPolicyRoutingAllowRemoteSingleTenant(*serve.policyRoutingAllowRemote),
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
+			proxy.WithStateBindingsConfig(stateBindings),
 			proxy.WithPolicyRoutingMode(policyRoutingMode),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),
 		),

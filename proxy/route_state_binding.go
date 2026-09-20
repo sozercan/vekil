@@ -14,7 +14,26 @@ func (h *ProxyHandler) ensureStateBindingStore() (*stateBindingStore, error) {
 		return nil, fmt.Errorf("proxy handler is required")
 	}
 	h.stateBindingsOnce.Do(func() {
-		h.stateBindings, h.stateBindingsErr = newStateBindingStore(stateBindingStoreConfig{})
+		config, err := resolveStateBindingsConfig(h.providersConfig, h.stateBindingsOverride)
+		if err != nil {
+			h.stateBindingsErr = err
+			return
+		}
+		if config.Mode == "memory" {
+			h.stateBindings, h.stateBindingsErr = newStateBindingStore(stateBindingStoreConfig{maxEntries: config.MaxEntries})
+			return
+		}
+		if config.File == "" {
+			config.File, err = defaultStateBindingsPath()
+			if err == nil {
+				err = createPrivateStateDirectory(config.File)
+			}
+			if err != nil {
+				h.stateBindingsErr = err
+				return
+			}
+		}
+		h.stateBindings, h.stateBindingsErr = newDurableStateBindingStore(DurableStateBindingsConfig{Path: config.File, MaxEntries: config.MaxEntries})
 	})
 	return h.stateBindings, h.stateBindingsErr
 }
@@ -23,20 +42,28 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 	if operation == nil || operation.route == nil || operation.route.legacy {
 		return nil
 	}
-	tokens, err := extractExplicitResponsesRequestState(body, headers)
+	store, err := h.ensureStateBindingStore()
+	if err != nil {
+		return err
+	}
+	var tokens []stateBindingToken
+	if store.durable != nil {
+		tokens, err = extractResponsesRequestState(body, headers, true)
+	} else {
+		tokens, err = extractExplicitResponsesRequestState(body, headers)
+	}
 	if err != nil {
 		return &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 	if len(tokens) == 0 {
 		return nil
 	}
-	store, err := h.ensureStateBindingStore()
-	if err != nil {
-		return err
-	}
 	result := stateBindingLookupResult{outcome: stateBindingLookupUnknown}
 	bootstrapped := false
 	var evictions uint64
+	if store.durable != nil {
+		return h.applyDurableRequestStateBinding(store, operation, tokens)
+	}
 	if len(tokens) == 1 && tokens[0].stateType == stateBindingTypeConversationID {
 		bootstrapOwner := stateBindingOwner{}
 		if target, ok := explicitConversationBootstrapTarget(operation.route); ok {
@@ -151,6 +178,10 @@ func explicitConversationBootstrapTarget(route *modelRoute) (targetBinding, bool
 }
 
 func extractExplicitResponsesRequestState(body []byte, headers http.Header) ([]stateBindingToken, error) {
+	return extractResponsesRequestState(body, headers, false)
+}
+
+func extractResponsesRequestState(body []byte, headers http.Header, durable bool) ([]stateBindingToken, error) {
 	if err := rejectDuplicateJSONMappingKeys(body); err != nil {
 		return nil, fmt.Errorf("invalid ambiguous JSON request: %w", err)
 	}
@@ -175,6 +206,35 @@ func extractExplicitResponsesRequestState(body []byte, headers http.Header) ([]s
 	}
 
 	if object, ok := payload.(map[string]any); ok {
+		if durable {
+			// Reject aliases rather than normalizing only this inspection copy:
+			// compatibility rewrites and upstream decoders must see the same
+			// state fields that ownership validation inspects.
+			if err := rejectResponsesStateFieldAliases(object, "previous_response_id", "conversation", "input"); err != nil {
+				return nil, err
+			}
+			if conversation, ok := object["conversation"].(map[string]any); ok {
+				if err := rejectResponsesStateFieldAliases(conversation, "id"); err != nil {
+					return nil, err
+				}
+			}
+			if input, ok := object["input"].([]any); ok {
+				for _, value := range input {
+					item, ok := value.(map[string]any)
+					if !ok {
+						continue
+					}
+					if err := rejectResponsesStateFieldAliases(item, "type"); err != nil {
+						return nil, err
+					}
+					if explicitResponsesItemOwnsEncryptedContent(item) {
+						if err := rejectResponsesStateFieldAliases(item, "encrypted_content"); err != nil {
+							return nil, err
+						}
+					}
+				}
+			}
+		}
 		var hasPreviousResponseID bool
 		if raw, exists := object["previous_response_id"]; exists {
 			if raw != nil {
@@ -223,6 +283,17 @@ func extractExplicitResponsesRequestState(body []byte, headers http.Header) ([]s
 		add(stateBindingTypeTurnState, turnState)
 	}
 	return tokens, nil
+}
+
+func rejectResponsesStateFieldAliases(object map[string]any, fields ...string) error {
+	for _, field := range fields {
+		for name := range object {
+			if name != field && strings.EqualFold(name, field) {
+				return fmt.Errorf("non-canonical responses state field; use %q", field)
+			}
+		}
+	}
+	return nil
 }
 
 func explicitResponsesRequestConversationID(value any) (string, bool, error) {
@@ -331,6 +402,19 @@ func isProxyOwnedEncryptedContent(value string) bool {
 }
 
 func extractExplicitResponsesOutputState(body []byte) ([]stateBindingToken, error) {
+	return extractResponsesOutputState(body, false)
+}
+
+func extractDurableResponsesOutputState(body []byte) ([]stateBindingToken, error) {
+	// Validate the original bytes before map decoding or model rewriting can
+	// collapse duplicate values that remain visible in a raw representation.
+	if err := validateUnambiguousResponsesJSON(body); err != nil {
+		return nil, fmt.Errorf("ambiguous explicit route responses JSON")
+	}
+	return extractResponsesOutputState(body, true)
+}
+
+func extractResponsesOutputState(body []byte, foldedAliases bool) ([]stateBindingToken, error) {
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
@@ -354,10 +438,38 @@ func extractExplicitResponsesOutputState(body []byte) ([]stateBindingToken, erro
 	if !ok {
 		return nil, fmt.Errorf("responses output root must be a JSON object")
 	}
+	if foldedAliases {
+		if err := normalizeResponsesStateObjectFields(object, "type", "response", "item"); err != nil {
+			return nil, err
+		}
+	}
 	visitItem := func(stateType stateBindingType, value string) {
 		add(stateType, value)
 	}
+	visitOutputItem := func(value any) error {
+		if item, ok := value.(map[string]any); ok && foldedAliases {
+			if err := normalizeResponsesStateObjectFields(item, "type"); err != nil {
+				return err
+			}
+			if explicitResponsesItemOwnsEncryptedContent(item) {
+				if err := normalizeResponsesStateObjectFields(item, "encrypted_content"); err != nil {
+					return err
+				}
+			}
+		}
+		return visitExplicitResponsesItem(value, false, visitItem)
+	}
 	visitResponse := func(response map[string]any) error {
+		if foldedAliases {
+			if err := normalizeResponsesStateObjectFields(response, "id", "conversation", "output"); err != nil {
+				return err
+			}
+			if conversation, ok := response["conversation"].(map[string]any); ok {
+				if err := normalizeResponsesStateObjectFields(conversation, "id"); err != nil {
+					return err
+				}
+			}
+		}
 		if token, ok := response["id"].(string); ok {
 			add(stateBindingTypeResponseID, token)
 		}
@@ -365,7 +477,14 @@ func extractExplicitResponsesOutputState(body []byte) ([]stateBindingToken, erro
 		if hasConversation {
 			add(stateBindingTypeConversationID, conversationID)
 		}
-		return visitExplicitResponsesItems(response["output"], false, visitItem)
+		if output, ok := response["output"].([]any); ok {
+			for _, item := range output {
+				if err := visitOutputItem(item); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	}
 
 	// A non-streaming response is the root object. Streaming lifecycle events
@@ -383,11 +502,36 @@ func extractExplicitResponsesOutputState(body []byte) ([]stateBindingToken, erro
 		}
 	}
 	if item, exists := object["item"]; exists {
-		if err := visitExplicitResponsesItem(item, false, visitItem); err != nil {
+		if err := visitOutputItem(item); err != nil {
 			return nil, err
 		}
 	}
 	return tokens, nil
+}
+
+// Struct decoders used by websocket clients accept folded JSON field names.
+// Inspect those same names for durable proof, rejecting competing spellings
+// that decoding or model rewriting might merge differently. Normalize only the
+// parsed inspection copy, and only schema-owned state paths. Vendor metadata,
+// message text, and the original bytes forwarded to clients remain untouched.
+func normalizeResponsesStateObjectFields(object map[string]any, fields ...string) error {
+	for _, field := range fields {
+		matched := ""
+		for name := range object {
+			if !strings.EqualFold(name, field) {
+				continue
+			}
+			if matched != "" {
+				return fmt.Errorf("ambiguous responses %s aliases", field)
+			}
+			matched = name
+		}
+		if matched != "" && matched != field {
+			object[field] = object[matched]
+			delete(object, matched)
+		}
+	}
+	return nil
 }
 
 func (h *ProxyHandler) bindExplicitStateTokens(info explicitRouteResponseInfo, tokens []stateBindingToken) error {
@@ -398,8 +542,14 @@ func (h *ProxyHandler) bindExplicitStateTokens(info explicitRouteResponseInfo, t
 	if err != nil {
 		return err
 	}
-	owner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID}
+	owner := stateBindingOwner{routeID: info.routeID, targetID: info.targetID, identity: info.stateIdentity}
 	result, evictions := store.bindAllWithEvictionDelta(tokens, owner)
+	if result.err != nil {
+		if _, _, ok := durableStateFailureDetails(result.err); ok {
+			return &providerRequestError{statusCode: http.StatusServiceUnavailable, err: result.err}
+		}
+		return result.err
+	}
 	if result.outcome == stateBindingLookupConflict {
 		return fmt.Errorf("provider state token collided with another route target")
 	}

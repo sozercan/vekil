@@ -865,6 +865,33 @@ expect_hard_failure_with_stderr "Zen config updater rejects endpoints outside op
   "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
   "${zen_parser_dir}/messages-free.mdx" "${zen_parser_dir}/render-config.yaml"
 
+cat > "${zen_parser_dir}/systemone-free.mdx" <<'EOF_ZEN_SYSTEMONE'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Jev 1.13 Free | jev-1.13-free | `https://opencode.ai/zen/v1/systemone` | - |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Jev 1.13 Free | Free | Free | - | - |
+EOF_ZEN_SYSTEMONE
+printf '%s\n' $'jev-1.13-free\tJev 1.13 Free\t/systemone' > "${zen_parser_dir}/systemone-expected.tsv"
+if "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/systemone-free.mdx" > "${zen_parser_dir}/systemone-actual.tsv" \
+  && cmp -s "${zen_parser_dir}/systemone-expected.tsv" "${zen_parser_dir}/systemone-actual.tsv"; then
+  record_success "Zen free-label parser retains SystemOne catalog metadata"
+else
+  record_failure "Zen free-label parser retains SystemOne catalog metadata" \
+    "$(diff -u "${zen_parser_dir}/systemone-expected.tsv" "${zen_parser_dir}/systemone-actual.tsv" 2>&1 || true)"
+fi
+expect_hard_failure_with_stderr "Zen config updater rejects SystemOne routing" 4 \
+  'unsupported endpoint for openai-compatible Zen example: jev-1.13-free -> /systemone' \
+  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
+  "${zen_parser_dir}/systemone-free.mdx" "${zen_parser_dir}/render-config.yaml"
+
 claude_contract_dir="${TMP_ROOT}/setup/claude-defaults-and-model-preference"
 start_mock_server "${claude_contract_dir}/server" 200
 claude_contract_port="${MOCK_SERVER_PORT}"
@@ -1080,6 +1107,7 @@ write_fake_clients "${free_filter_dir}/bin" pass pass pass
 printf '%s\n' \
   $'mimo-v2.5-free\tMiMo V2.5 Free\t/chat/completions' \
   $'muse-spark-1.2-contributor-free\tMuse Spark Free\t/responses' \
+  $'jev-1.13-free\tJev 1.13 Free\t/systemone' \
   > "${free_filter_dir}/free-models.tsv"
 free_filter_name="Zen candidates honor parsed free labels"
 if expect_success "${free_filter_name}" 8 \

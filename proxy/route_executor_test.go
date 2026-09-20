@@ -1040,6 +1040,7 @@ func TestConfiguredExplicitRouteHandleResponsesAndCatalog(t *testing.T) {
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.New(logger.LevelError),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: 2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{
 				{ID: "primary", Type: string(providerTypeAzureOpenAI), Default: true, BaseURL: primary.URL + "/openai/v1", APIKey: "primary-key"},
 				{ID: "secondary", Type: string(providerTypeAzureOpenAI), BaseURL: secondary.URL + "/openai/v1", APIKey: "secondary-key"},
@@ -1202,6 +1203,7 @@ func TestConfiguredExplicitResponsesRoutePreparesEachTargetFromLogicalRequest(t 
 			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
 				WithProvidersConfig(ProvidersConfig{
 					SchemaVersion: 2,
+					StateBindings: &StateBindingsConfig{Mode: "memory"},
 					Providers:     providers,
 					ModelRoutes: []ModelRouteConfig{{
 						ID:        "route-public",
@@ -1307,6 +1309,7 @@ func TestConfiguredExplicitRouteBindsResponseStateToExactTarget(t *testing.T) {
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.New(logger.LevelError),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: 2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{
 				{ID: "primary", Type: string(providerTypeAzureOpenAI), Default: true, BaseURL: primary.URL + "/openai/v1", APIKey: "primary-key"},
 				{ID: "secondary", Type: string(providerTypeAzureOpenAI), BaseURL: secondary.URL + "/openai/v1", APIKey: "secondary-key"},
@@ -1394,6 +1397,7 @@ func TestVersion2ConfigRejectsAmbiguousDuplicateRequestKeysBeforeDispatch(t *tes
 	defer upstream.Close()
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.New(logger.LevelError), WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers:     []ProviderConfig{{ID: "azure", Type: string(providerTypeAzureOpenAI), Default: true, BaseURL: upstream.URL + "/openai/v1", APIKey: "key"}},
 		ModelRoutes: []ModelRouteConfig{{
 			ID: "route", PublicID: "public-model", Endpoints: []string{providerEndpointResponses},

@@ -672,6 +672,9 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) error {
 // responses that fit in usageSniffMaxBuffer; errors, invalid JSON, and oversized
 // responses fail open to passthrough behavior.
 func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string) error {
+	if err := h.prepareDurableFinalResponseHeaders(resp); err != nil {
+		return err
+	}
 	return writePassthroughSniffingUsage(w, resp, func(body []byte) ([]byte, bool) {
 		observeChatCopilotUsage(ctx, body)
 		if usage, canonical := inspectCanonicalOpenAIChatCompletionResponse(body, requestedModel); canonical {

@@ -443,6 +443,7 @@ start_policy_proxy() {
     --host 127.0.0.1 \
     --port "${proxy_port}" \
     --providers-config "${CONFIG_JSON}" \
+    --state-bindings-mode memory \
     --policy-routing enforce \
     --log-level info \
     > "${PROXY_LOG}" 2>&1 &

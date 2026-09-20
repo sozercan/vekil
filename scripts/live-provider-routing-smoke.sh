@@ -829,6 +829,7 @@ launch_proxy() {
     --log-level info \
     --token-dir "${PROXY_TOKEN_DIR}" \
     --providers-config "${CONFIG_JSON}" \
+    --state-bindings-mode memory \
     >"${PROXY_LOG}" 2>&1 &
   proxy_pid="$!"
   proxy_pgid="${proxy_pid}"
@@ -857,6 +858,11 @@ wait_for_ready() {
       return 3
     fi
     if proxy_log_has_fatal; then
+      # The fatal line can arrive after the first collision check above.
+      # Reclassify the now-observed failure before deciding not to retry.
+      if proxy_log_has_address_in_use; then
+        return 2
+      fi
       return 3
     fi
 

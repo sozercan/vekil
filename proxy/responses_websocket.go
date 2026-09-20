@@ -1595,6 +1595,21 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	var lifecycleBody *lifecycleAwareReadCloser
 	var preparedPeek *peekResult
 	var translatedHeaders http.Header
+	var responseInfo explicitRouteResponseInfo
+	// The preparation layer can reduce the final response to translated error
+	// details. Keep its actual request identity, not a reconstructed target.
+	sendResponseError := func(status int, message, errType, code, param string, headers http.Header, usage responsesUsage) error {
+		if routeOperation != nil {
+			if stateErr := h.bindDurableFinalWebSocketHeaders(responseInfo, headers); stateErr != nil {
+				status, message, errType, code, param, headers = http.StatusBadGateway, "failed to validate upstream response state", "server_error", "", "", nil
+				if storageMessage, storageCode, ok := durableStateFailureDetails(stateErr); ok {
+					status, message, code = http.StatusServiceUnavailable, storageMessage, storageCode
+				}
+			}
+		}
+		recordTurn(status, usage)
+		return s.sendExplicitRouteErrorDetails(routeOperation, status, message, errType, code, param, headers)
+	}
 	resp, preparedPeek, translatedHeaders, err = h.prepareResponsesStream(s.ctx, upstreamCtx, request.Model, func() (*http.Response, error) {
 		attemptPlan, err := s.planRequest(h, request)
 		if err != nil {
@@ -1605,6 +1620,9 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		metrics.captureProvider(attemptResp)
 		metrics.deltaAttempted = metrics.deltaAttempted || attemptDeltaAttempted
 		metrics.deltaFallback = metrics.deltaFallback || attemptDeltaFallback
+		if info, ok := explicitRouteResponseInfoFromResponse(attemptResp); ok {
+			responseInfo = info
+		}
 		if err == nil && attemptResp != nil && attemptResp.Body != nil {
 			lifecycleBody = newLifecycleAwareReadCloser(attemptResp.Body, upstreamCtx)
 			attemptResp.Body = lifecycleBody
@@ -1624,6 +1642,16 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		}
 		if clientDisconnected {
 			recordDisconnected(0, responsesUsage{}, s.clientClosePrecedesShutdown(h))
+			return err
+		}
+		if message, code, ok := durableStateFailureDetails(err); ok {
+			recordTurn(http.StatusServiceUnavailable, responsesUsage{})
+			if s.isClosing() || h.upstreamShutdownStarted() {
+				return err
+			}
+			if writeErr := s.sendExplicitRouteErrorDetails(routeOperation, http.StatusServiceUnavailable, message, "server_error", code, "", nil); writeErr != nil {
+				return writeErr
+			}
 			return err
 		}
 		status := upstreamStatusCode(err, http.StatusBadGateway)
@@ -1659,11 +1687,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if peek.failure != nil {
 			usage = peek.failure.Response.Usage
 		}
-		recordTurn(peek.status, usage)
 		if s.isClosing() || h.upstreamShutdownStarted() {
+			recordTurn(peek.status, usage)
 			return context.Canceled
 		}
-		if writeErr := s.sendExplicitRouteErrorDetails(routeOperation, peek.status, peek.message, peek.errType, code, param, translatedHeaders); writeErr != nil {
+		if writeErr := sendResponseError(peek.status, peek.message, peek.errType, code, param, translatedHeaders, usage); writeErr != nil {
 			return writeErr
 		}
 		return nil
@@ -1677,7 +1705,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			if s.isClosing() || h.upstreamShutdownStarted() {
 				return context.Canceled
 			}
-			if writeErr := s.sendExplicitRouteError(routeOperation, http.StatusBadGateway, "upstream stream canceled before terminal delivery", "server_error", translatedHeaders); writeErr != nil {
+			if writeErr := sendResponseError(http.StatusBadGateway, "upstream stream canceled before terminal delivery", "", "server_error", "", translatedHeaders, terminalUsage); writeErr != nil {
 				return writeErr
 			}
 			return fmt.Errorf("upstream stream canceled before terminal delivery")
@@ -1702,11 +1730,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if s.nativeUpstream.started() {
 			s.nativeUpstream.close()
 		}
-		recordTurn(http.StatusBadGateway, responsesUsage{})
 		if s.isClosing() || h.upstreamShutdownStarted() {
+			recordTurn(http.StatusBadGateway, responsesUsage{})
 			return err
 		}
-		if writeErr := s.sendExplicitRouteError(routeOperation, http.StatusBadGateway, err.Error(), "server_error", resp.Header); writeErr != nil {
+		if writeErr := sendResponseError(http.StatusBadGateway, err.Error(), "", "server_error", "", resp.Header, responsesUsage{}); writeErr != nil {
 			return writeErr
 		}
 		return err
@@ -1726,11 +1754,16 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			respBody = nil
 		}
 		message, code := extractResponsesWebSocketError(resp.StatusCode, respBody)
-		recordTurn(resp.StatusCode, responsesUsage{})
+		if routeOperation != nil && h.stateBindings != nil && h.stateBindings.durable != nil {
+			// Errors expose only structured message/code and bound headers. Never
+			// embed an unvalidated raw body (possibly opaque state) as a message.
+			message, code = extractDurableResponsesWebSocketError(resp.StatusCode, respBody)
+		}
 		if s.isClosing() || h.upstreamShutdownStarted() {
+			recordTurn(resp.StatusCode, responsesUsage{})
 			return context.Canceled
 		}
-		if writeErr := s.sendExplicitRouteError(routeOperation, resp.StatusCode, message, code, resp.Header); writeErr != nil {
+		if writeErr := sendResponseError(resp.StatusCode, message, "", code, "", resp.Header, responsesUsage{}); writeErr != nil {
 			return writeErr
 		}
 		return fmt.Errorf("upstream websocket bridge status %d", resp.StatusCode)
@@ -1756,6 +1789,16 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			// Parsed response.failed and top-level error events account themselves before
 			// client delivery, so the outer handler must not record them again.
 			return nil
+		}
+		if message, code, ok := durableStateFailureDetails(err); ok {
+			recordTurn(http.StatusServiceUnavailable, streamResult.usage)
+			if s.isClosing() || h.upstreamShutdownStarted() {
+				return err
+			}
+			if writeErr := s.sendExplicitRouteErrorDetails(routeOperation, http.StatusServiceUnavailable, message, "server_error", code, "", nil); writeErr != nil {
+				return writeErr
+			}
+			return err
 		}
 		if lifecycleBody != nil && lifecycleBody.canceledAtFailure() && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown) {
 			return err
@@ -2499,6 +2542,13 @@ func (s *responsesWebSocketSession) streamUpstreamResponseWithRequest(h *ProxyHa
 		}
 		failureStatus := 0
 		if parsedEvent && (event.Type == "response.failed" || event.Type == "error") {
+			if h != nil && h.stateBindings != nil && h.stateBindings.durable != nil && upstreamRequest != nil && routeOperationFromContext(upstreamRequest.Context()) != nil {
+				// The event body has already passed durable validation, but its
+				// projected error can also inherit raw HTTP response headers.
+				if err := validateResponsesWebSocketTurnStateHeaders(responsesFailureHeaders(event, headers)); err != nil {
+					return err
+				}
+			}
 			if upstreamRequest != nil {
 				h.observeCopilotResponseFailure(upstreamRequest, event, responsesFailureHeaders(event, headers))
 			}
@@ -2824,6 +2874,19 @@ func extractResponsesWebSocketError(status int, body []byte) (string, string) {
 		return trimmed, ""
 	}
 
+	return http.StatusText(status), ""
+}
+
+func extractDurableResponsesWebSocketError(status int, body []byte) (string, string) {
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) == nil && strings.TrimSpace(envelope.Error.Message) != "" {
+		return envelope.Error.Message, envelope.Error.Code
+	}
 	return http.StatusText(status), ""
 }
 

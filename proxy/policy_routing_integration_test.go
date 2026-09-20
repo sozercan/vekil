@@ -181,6 +181,7 @@ func policyIntegrationConfig(lightURL, powerfulURL, profileMode string) Provider
 	parallel := true
 	return ProvidersConfig{
 		SchemaVersion: ProvidersConfigSchemaVersion2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{ID: "light-provider", Type: string(providerTypeOpenAICompatible), BaseURL: lightURL, AuthType: string(providerAuthTypeNone), TrustDomain: "org-ai", ClassifierNoStoreSupported: &trueValue},
 			{ID: "power-provider", Type: string(providerTypeOpenAICompatible), BaseURL: powerfulURL, AuthType: string(providerAuthTypeNone), TrustDomain: "org-ai"},

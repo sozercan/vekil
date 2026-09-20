@@ -15,6 +15,7 @@ For a default local run that is <http://localhost:1337/dashboard>. In the tray a
 The dashboard polls `GET /stats.json` once per second and renders:
 
 - **Cards** — in-flight requests, requests/sec, tokens/sec, error rate, latency p50/p95, upstream retries, and cumulative tokens.
+- **Provider state** shows storage mode, entry count, configured capacity, and database size, with capacity and storage-failure warnings.
 - **Time series** — requests/sec (with an errors/sec overlay) and tokens/sec (prompt vs. completion) over a rolling window, drawn with [uPlot](https://github.com/leeoniya/uPlot).
 - **Total usage** — cumulative requests, total/prompt/completion tokens, cached-prompt %, reasoning tokens, average tokens per request, and errors.
 - **Breakdowns** — top models, providers, and agents, each with request count, token volume, error count, and average latency. A controls bar lets you **sort by** requests / tokens / errors / latency and **filter** by name (e.g. `gpt-5.4-pro` to inspect one model). Sorting by errors or latency hides rows with none. The JSON snapshot additionally includes `by_route` client-request rows and `by_target` physical-attempt rows for external tooling.
@@ -27,6 +28,39 @@ The dashboard polls `GET /stats.json` once per second and renders:
 **Upstream retries** retain their existing meaning: same-target retries performed by legacy provider routes on transient upstream failures. A version-2 route target switch is counted separately in `target_switches`; it does not redefine or inflate `retries`.
 
 Route/failover metrics are additive in `GET /stats.json`: `upstream_attempts`, `target_switches`, `requests_with_failover`, `successful_failovers`, `route_exhaustions`, `state_binding_hits`, `state_binding_misses`, and `state_binding_evictions`. `by_route` adds client-request aggregates plus failover counters; `by_target` reports physical send counts. The websocket bridge still records each provider-backed `response.create` once in client totals, but its route-level client row/recent-row enrichment is limited: websocket physical sends and switches appear in `upstream_attempts`, `target_switches`, and `by_target`, while `requests_with_failover`, `successful_failovers`, and `by_route` are populated from HTTP request summaries.
+
+### Provider-state storage
+
+The provider-state panel uses the `state_bindings` object in `GET /stats.json`:
+
+| Field | Meaning |
+|-------|---------|
+| `mode` | Active `durable` or `memory` storage |
+| `status` | `ready`, `frozen` after a storage failure, `closed` after shutdown, or `unavailable` when metrics cannot be read |
+| `entries` | Current retained logical records, including conflict tombstones |
+| `max_entries` | Configured logical record limit |
+| `database_bytes` | Actual database file length, including free pages; zero in memory mode |
+| `capacity_usage_percent` | `entries / max_entries * 100` |
+| `capacity_status` | `ok` below 80%, `warning` at 80%, `critical` at 95%, or `exhausted` at 100%; `unknown` when the count is unavailable |
+
+Unavailable counts and sizes are `null`, so shutdown and failed reads do not
+look like an empty database. A frozen store can still report its committed
+count and file size when those reads succeed. Polling reads a stored count and
+the file size without scanning all records or changing retention. Memory-mode
+counts include expired entries until normal store activity removes them.
+
+Durable entries remain until explicit offline pruning. At capacity, new state
+is withheld and existing records stay in place. Increase `max_entries` in the
+providers config and restart, or stop the proxy and explicitly prune entries
+whose continuity can be retired. Pruning breaks continuations that need those
+records and does not shrink the database file. The capacity limit does not
+preallocate disk space. See [State recovery](state-recovery.md) for storage,
+shutdown and pruning procedures.
+
+The panel shows a separate warning for frozen storage. Preserve the database,
+resolve the storage failure, and restart. Storage failures never select memory
+mode. Database paths, state tokens, provider-owner identifiers, and credentials
+are excluded from these metrics.
 
 ### Policy-routing telemetry (`GET /stats.json`)
 
@@ -114,7 +148,7 @@ The existing routing ledgers keep their meanings alongside the task ledger:
 
 A successful failover still increments client request totals once. Existing token totals remain client-request/accepted-turn accounting rather than physical-send totals; failed-attempt usage is kept in the physical ledger instead of being attributed to the final provider. The recent-request row exposes only the final/canonical upstream request ID.
 
-Metrics are aggregated in memory in the proxy and reset when the process restarts; nothing is persisted. Only inference and compatibility endpoints that produce model completions are counted. The dashboard's own requests (`/dashboard`, its assets, `/stats.json`, `/dashboard/insight`) and the `/healthz` and `/readyz` probes are excluded so the dashboard does not measure itself. Also excluded are non-generating or metadata routes whose traffic would otherwise dilute completion-oriented metrics: model-catalog reads (`GET /v1/models`), token-counting probes (`POST /v1/messages/count_tokens` and Gemini `:countTokens`, which may still call an upstream model and incur latency or cost), and the proxy-owned compatibility shims (`POST /v1/responses/compact`, `POST /v1/memories/trace_summarize`). These standalone exclusions apply to both the client-request and physical-attempt ledgers. Internal compaction, replay, and protocol-recovery sends spawned under a counted inference request remain attributed to that owning operation and stay in the physical-attempt ledger.
+Traffic metrics are aggregated in memory in the proxy and reset when the process restarts. Provider-state storage gauges describe the current store, including records recovered after a durable-mode restart. Only inference and compatibility endpoints that produce model completions are counted in traffic totals. The dashboard's own requests (`/dashboard`, its assets, `/stats.json`, `/dashboard/insight`) and the `/healthz` and `/readyz` probes are excluded so the dashboard does not measure itself. Also excluded are non-generating or metadata routes whose traffic would otherwise dilute completion-oriented metrics: model-catalog reads (`GET /v1/models`), token-counting probes (`POST /v1/messages/count_tokens` and Gemini `:countTokens`, which may still call an upstream model and incur latency or cost), and the proxy-owned compatibility shims (`POST /v1/responses/compact`, `POST /v1/memories/trace_summarize`). These standalone exclusions apply to both the client-request and physical-attempt ledgers. Internal compaction, replay, and protocol-recovery sends spawned under a counted inference request remain attributed to that owning operation and stay in the physical-attempt ledger.
 
 Policy classifier telemetry is maintained alongside, not inside, the ordinary client-request ledger. This preserves one client request and one selected terminal operation while still accounting for classifier admission, latency, usage/cost, decisions, and failures.
 
@@ -156,6 +190,10 @@ Token usage is captured across all inference surfaces: OpenAI chat completions (
   "state_binding_hits": 120,
   "state_binding_misses": 3,
   "state_binding_evictions": 1,
+  "state_bindings": {
+    "mode": "durable", "status": "ready", "entries": 2048, "max_entries": 8388608,
+    "database_bytes": 1048576, "capacity_usage_percent": 0.0244140625, "capacity_status": "ok"
+  },
   "recent": [ { "t": 1718900000, "endpoint": "openai_chat", "model": "gpt-5.4",
                "operation_id": "5dc6cb8d-3e12-43a5-a822-5e89c68c7a40", "route_id": "gpt-5-4-route", "final_target": "secondary",
                "provider": "azure-east", "agent": "Codex CLI", "status": 200, "dur_ms": 1234,

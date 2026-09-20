@@ -250,6 +250,11 @@ func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWrite
 	if h.handleShutdownError(w, r, upstreamCtx, err) {
 		return
 	}
+	if _, code, ok := durableStateFailureDetails(err); ok {
+		h.log.Error("local provider-state storage failed", logger.F("endpoint", endpoint), logger.F("error_code", code))
+		writeDurableStateFailure(w, err)
+		return
+	}
 	statusCode := upstreamStatusCode(err, http.StatusBadGateway)
 	h.log.Error("upstream request failed", logger.F("endpoint", endpoint), logger.Err(err))
 	if statusCode == http.StatusBadRequest {
@@ -338,11 +343,16 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 			return
 		}
-		// The compaction-trigger turn spends upstream /responses tokens across its
-		// internal compaction calls, but returns a synthetic response that bypasses
-		// the usage-observing passthrough below. Record the aggregate usage onto the
-		// inbound request summary so the dashboard does not count it as zero tokens.
+		if compactionResp != nil && compactionResp.Body != nil {
+			defer func() { _ = compactionResp.Body.Close() }()
+		}
+		// Record aggregate usage from internal compaction calls, including work
+		// preceding a terminal error. Success is synthetic, but a passthrough
+		// failure can expose provider state and needs the same durable guard.
 		observeResponsesUsage(r.Context(), compactionUsage)
+		if h.writeDurableShimPassthrough(w, r, upstreamCtx, compactionResp) {
+			return
+		}
 		if err := writeUpstreamResponse(w, compactionResp); err != nil {
 			h.log.Debug("failed to write compaction trigger response", logger.Err(err))
 		}
@@ -732,6 +742,9 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	if routeOperation != nil {
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
 		if err := h.applyExplicitRequestStateBinding(routeOperation, stateBindingBody, extraHeaders); err != nil {
+			if writeDurableStateFailure(w, err) {
+				return
+			}
 			statusCode := upstreamStatusCode(err, http.StatusBadRequest)
 			writeOpenAIErrorWithDetails(w, statusCode, err.Error(), "invalid_request_error", "", providerRequestErrorCode(err))
 			return
@@ -754,6 +767,9 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	if resp != nil {
 		defer func() { _ = resp.Body.Close() }()
+		if h.writeDurableShimPassthrough(w, r, upstreamCtx, resp) {
+			return
+		}
 		if contentType := resp.Header.Get("Content-Type"); contentType != "" {
 			w.Header().Set("Content-Type", contentType)
 		}
@@ -860,6 +876,9 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	if routeOperation != nil {
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
 		if err := h.applyExplicitRequestStateBinding(routeOperation, reqBody, extraHeaders); err != nil {
+			if writeDurableStateFailure(w, err) {
+				return
+			}
 			statusCode := upstreamStatusCode(err, http.StatusBadRequest)
 			writeOpenAIErrorWithDetails(w, statusCode, err.Error(), "invalid_request_error", "", providerRequestErrorCode(err))
 			return
@@ -883,6 +902,9 @@ func (h *ProxyHandler) HandleMemorySummarize(w http.ResponseWriter, r *http.Requ
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
+		if h.writeDurableShimPassthrough(w, r, upstreamCtx, resp) {
+			return
+		}
 		if contentType := resp.Header.Get("Content-Type"); contentType != "" {
 			w.Header().Set("Content-Type", contentType)
 		}

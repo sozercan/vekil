@@ -15,10 +15,11 @@ import (
 )
 
 type explicitRouteResponseInfo struct {
-	routeID    string
-	publicID   string
-	targetID   string
-	providerID string
+	routeID       string
+	publicID      string
+	targetID      string
+	providerID    string
+	stateIdentity [32]byte
 }
 
 type explicitRouteResponseContextKey struct{}
@@ -102,11 +103,36 @@ func responsesLifecycleEventHasResponse(eventType string) bool {
 	}
 }
 
+func validateUnambiguousResponsesJSON(data []byte) error {
+	// Token does not enforce the nesting limit in the legacy JSON decoder.
+	// Validate first so the recursive duplicate-key scan has the same bound as
+	// Unmarshal, including when built with GOEXPERIMENT=nojsonv2.
+	if !json.Valid(data) {
+		return errors.New("expected one complete JSON response within the nesting limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	// Unlike configuration diagnostics, this path must not build an ever-longer
+	// path at each nesting level. Those discarded strings cost quadratic space.
+	if err := scanJSONValueForDuplicateKeys(decoder, "", false); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return errors.New("expected one complete JSON response")
+	}
+	return nil
+}
+
 func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http.ResponseWriter, resp *http.Response, info explicitRouteResponseInfo, store *ToolExecutionContextStore, scope string) error {
-	if resp == nil || resp.Body == nil {
+	durable := h != nil && h.stateBindings != nil && h.stateBindings.durable != nil
+	if resp == nil || (resp.Body == nil && !durable) {
 		return writeUpstreamResponse(w, resp)
 	}
-	body := newLifecycleAwareReadCloser(resp.Body, responseRequestContext(resp))
+	source := resp.Body
+	if source == nil {
+		source = http.NoBody
+	}
+	body := newLifecycleAwareReadCloser(source, responseRequestContext(resp))
 	defer func() { _ = body.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(body, maxLargeRequestBodySize+1))
@@ -119,17 +145,36 @@ func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http
 	if len(data) > maxLargeRequestBodySize {
 		return newResponseBodyWriteError(resp, errors.New("explicit route response exceeds normalization limit"), false, true, false)
 	}
-
 	success := resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
 	if success {
 		observeResponsesUsage(ctx, sniffResponsesUsageBody(data))
-		bodyTokens, tokenErr := extractExplicitResponsesOutputState(data)
+	}
+	if success || durable {
+		// A final error is still an exposure boundary. Bind its structured state
+		// and headers atomically too; abandoned attempts never reach this writer.
+		var bodyTokens []stateBindingToken
+		var tokenErr error
+		emptyAllowed := durable && (!success || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusResetContent)
+		if len(data) != 0 || !emptyAllowed {
+			if durable {
+				bodyTokens, tokenErr = extractDurableResponsesOutputState(data)
+			} else {
+				bodyTokens, tokenErr = extractExplicitResponsesOutputState(data)
+			}
+		}
 		headerTokens, headerErr := explicitResponseHeaderStateTokens(resp.Header)
 		if headerErr != nil {
 			return newResponseBodyWriteError(resp, headerErr, false, true, false)
 		}
 		if tokenErr != nil {
 			return newResponseBodyWriteError(resp, fmt.Errorf("malformed explicit route responses response: %w", tokenErr), false, true, false)
+		}
+		if durable && len(data) != 0 {
+			errorTokens, err := durableResponsesErrorHeaderState(data)
+			if err != nil {
+				return newResponseBodyWriteError(resp, fmt.Errorf("malformed explicit route responses error headers: %w", err), false, true, false)
+			}
+			bodyTokens = append(bodyTokens, errorTokens...)
 		}
 		allTokens := append(headerTokens, bodyTokens...)
 		if bindErr := h.bindExplicitStateTokens(info, allTokens); bindErr != nil {
@@ -303,12 +348,31 @@ func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func(
 
 func normalizeResponsesStreamBodyWithBinding(h *ProxyHandler, source io.ReadCloser, info explicitRouteResponseInfo) io.ReadCloser {
 	return normalizeResponsesStreamBody(source, info.publicID, func(data []byte) error {
-		tokens, err := extractExplicitResponsesOutputState(data)
+		durable := h != nil && h.stateBindings != nil && h.stateBindings.durable != nil
+		var tokens []stateBindingToken
+		var err error
+		if durable {
+			tokens, err = extractDurableResponsesOutputState(data)
+		} else {
+			tokens, err = extractExplicitResponsesOutputState(data)
+		}
 		if err != nil {
+			if durable {
+				// A malformed state-bearing event cannot establish durable proof.
+				// Keep memory-only compatibility, but never expose it in this mode.
+				return fmt.Errorf("malformed explicit route responses state")
+			}
 			// Streaming headers are already committed. Vendor extensions and
 			// malformed events must remain transparent instead of terminating the
 			// downstream pipe; only successfully extracted state is bindable.
 			return nil
+		}
+		if durable {
+			errorTokens, err := durableResponsesErrorHeaderState(data)
+			if err != nil {
+				return fmt.Errorf("malformed explicit route responses error headers")
+			}
+			tokens = append(tokens, errorTokens...)
 		}
 		return h.bindExplicitStateTokens(info, tokens)
 	})

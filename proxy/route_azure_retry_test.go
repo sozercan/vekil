@@ -25,6 +25,7 @@ func azureRetryTestHandler(t *testing.T, primaryURL, secondaryURL string, sends 
 	t.Helper()
 	config := ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{ID: "east", Type: string(providerTypeAzureOpenAI), Default: true, BaseURL: primaryURL + "/openai/v1", APIKey: "east-key"},
 			{ID: "west", Type: string(providerTypeAzureOpenAI), BaseURL: secondaryURL + "/openai/v1", APIKey: "west-key"},

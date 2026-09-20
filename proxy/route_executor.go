@@ -207,6 +207,8 @@ type routeOperation struct {
 	remainingUpstreamSends  int
 	attemptedTargets        map[string]struct{}
 	pinnedTargetID          string
+	stateOwnerIdentity      [32]byte
+	bootstrapConversation   *stateBindingToken
 	hardPinned              bool
 	sequence                int
 	upstreamSends           int
@@ -3147,12 +3149,13 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
 			break
 		}
-		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), explicitRouteResponseInfo{
+		responseInfo := explicitRouteResponseInfo{
 			routeID:    route.public.routeID,
 			publicID:   route.public.id,
 			targetID:   target.id,
 			providerID: target.provider.id,
-		}))
+		}
+		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), responseInfo))
 		req.GetBody = nil
 		req = h.withAzureRouteTraffic(req, target)
 		traffic := azureRouteTrafficFromRequest(req)
@@ -3218,6 +3221,22 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			}
 			break
 		}
+		// Admission may refresh Azure credentials. Capture the final authenticated
+		// request before any ownership claim or physical send on every endpoint.
+		stateIdentity, stateErr := h.validateDurableRequestOwner(req, route, target, operation)
+		if stateErr != nil {
+			permit.release()
+			azurePermit.release()
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			failure := routeAttemptFailure{err: stateErr, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedState, cleanupDone: true}
+			failures = append(failures, failure)
+			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
+			break
+		}
+		responseInfo.stateIdentity = stateIdentity
+		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), responseInfo))
 		if traffic.controller != nil {
 			traffic.permit = azurePermit
 			req = req.WithContext(context.WithValue(req.Context(), azureRouteTrafficContextKey{}, traffic))

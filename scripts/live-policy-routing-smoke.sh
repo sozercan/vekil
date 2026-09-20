@@ -1170,6 +1170,7 @@ launch_proxy() {
     --log-level info \
     --token-dir "${token_dir}" \
     --providers-config "${CONFIG_JSON}" \
+    --state-bindings-mode memory \
     --policy-routing "${proxy_mode}" \
     >"${proxy_log}" 2>&1 &
   proxy_pid="$!"

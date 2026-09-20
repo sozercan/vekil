@@ -1879,6 +1879,13 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 
 	tap := newResponsesFailureTap(ctx, h, upstreamHeaders, store, scope)
 	if _, err := io.Copy(fw, io.TeeReader(r, tap)); err != nil {
+		if _, _, ok := durableStateFailureDetails(err); ok {
+			observeResponseFailureStatus(ctx, http.StatusServiceUnavailable)
+			if ctx.Err() == nil && !isClientWriteError(fw, err) {
+				writeDurableStateStreamFailure(fw, err)
+			}
+			return
+		}
 		if tap.completedCleanly() {
 			return
 		}

@@ -69,6 +69,62 @@ Route-specific deterministic tests use local upstream servers plus injected tran
 
 For large request and replay paths, keep the `64 MiB` request boundary in the deterministic matrix and verify that operation/send budgets prevent compaction, recovery, or fallback from creating an unbounded tree.
 
+### Durable provider-state suite
+
+Durable mode is the default for schema-v2 explicit routes on supported Linux
+filesystems and macOS APFS. Run the storage and process suites on both platforms.
+Tests use temporary private stores, synthetic credentials, and controlled
+loopback providers, never live inference. General route fixtures explicitly use
+memory mode so tests cannot open the user's default database:
+
+```bash
+go test ./proxy ./server -run '^Test(Durable|StateBindings|StateBindingStats|LoadProvidersConfigFileStateBindings)' -count=1
+go test . -run '^Test(DurableStateProcessCrashReopen|StatePruneCommand)' -count=1
+go test -race ./... -count=1
+GOMAXPROCS=2 go test ./proxy -run '^$' -bench '^BenchmarkStateBindingExposure$' -benchtime=100x -benchmem -count=10
+GOMAXPROCS=2 go test ./proxy -run '^$' -bench '^BenchmarkDurableStateLookupAndOpen$' -benchtime=10x -benchmem -count=10
+GOMAXPROCS=2 go test ./proxy -run '^$' -bench '^BenchmarkDurableNestedResponseValidation$' -benchtime=5x -benchmem -count=3
+```
+
+Coverage includes providers-file-only startup, configuration precedence, private
+default-path creation, real binary/process crash and reopen, kills before/after
+commit but before exposure, exact issuer and credential-source changes,
+private-file validation, logical capacity/tombstones without full preallocation,
+dashboard warnings, and offline pruning. Concurrent clients, second-writer
+refusal, constructor/drain locks, JSON/SSE and HTTP/native-websocket exposure
+failures, and full-input reconnects run on both supported platforms. macOS also
+checks descriptor-based ACL refusal and real APFS `F_FULLFSYNC` directory
+barriers. JSON tests cover case-variant state fields, competing spellings, and
+nesting limits with the default or legacy Go decoder. Raw HTTP, compact, and
+WebSocket requests also verify rejection of noncanonical state fields before
+dispatch, including after a store reopen, while canonical continuations and
+vendor metadata remain supported.
+
+On Linux/amd64, dedicated child tests use one-way seccomp restrictions to inject
+real `pwrite64`, `fdatasync`, and `close` errors; the parent and shared filesystem
+are not modified. Process kills and syscall failures exercise recovery
+boundaries; they do not simulate a host or drive power loss. Cross-compiling
+these tests alone does not execute the platform's crash or fault coverage.
+
+The `darwin-launch` CI job also runs the durable proxy/server and menubar tests,
+including a legacy JSON backend depth/alias regression check. Temporary provider
+and policy smoke proxies explicitly choose memory mode so they do not open a
+user's persistent store.
+
+The exposure benchmark calls the production JSON/SSE writers and synchronous
+binding store with fresh/repeated batches of 1/8 records and initial occupancy
+0/8,192. It reports p50/p95 pre-exposure latency plus database bytes and bytes per
+record; those bytes include bbolt overhead and are not the configured capacity.
+Lookup/reopen are measured separately. Compare ten controlled memory/durable
+samples with fixed CPU settings and an otherwise quiet host. Record raw results,
+filesystem, Go version and exact revision privately; do not copy machine data to
+the repository. These tests exclude provider/network latency. The prepared-stream
+TTFT benchmark alone does not exercise persistence.
+The nested-response benchmark measures the complete JSON/SSE writers at depths
+1,000/2,000/4,000 with already-recorded state. Compare allocated bytes per
+operation to detect diagnostic-path allocation amplification independently of
+first-issuance storage latency.
+
 ### Policy-routing safety suite
 
 Schema-v2 policy routing adds a pre-dispatch planner above native OpenAI Chat. The deterministic merge gate must use in-memory classifier adapters and local `httptest` providers; live credentials and provider availability are supplementary, never substitutes for local tests.
@@ -393,7 +449,7 @@ CI copies the single-provider example into a temporary config and adds
 smoke run. The stable session header lets the upstream retain routing and cache
 affinity. The generated config is validated offline before the proxy starts.
 
-The separate [`Update OpenCode Zen Free Models`](../.github/workflows/update-opencode-zen-free.yaml) workflow runs daily on trusted `main` code. It resolves OpenCode's mutable `dev` branch to an exact commit, downloads only that revision's `zen.mdx`, and runs [`scripts/update-opencode-zen-free-config.sh`](../scripts/update-opencode-zen-free-config.sh) to replace the marked model block in the example. The renderer sorts IDs, preserves the rest of the file, rejects duplicates, bounds the catalog, and accepts only `/chat/completions` and `/responses`; a free `/messages` model requires an explicit provider-design change instead of being silently emitted under `openai-compatible`. Changed output is validated offline and proposed in a signed PR rather than written directly to `main`.
+The separate [`Update OpenCode Zen Free Models`](../.github/workflows/update-opencode-zen-free.yaml) workflow runs daily on trusted `main` code. It resolves OpenCode's mutable `dev` branch to an exact commit, downloads only that revision's `zen.mdx`, and runs [`scripts/update-opencode-zen-free-config.sh`](../scripts/update-opencode-zen-free-config.sh) to replace the marked model block in the example. The renderer sorts IDs, preserves the rest of the file, rejects duplicates, bounds the catalog, and accepts only `/chat/completions` and `/responses`; free `/messages` and `/systemone` models cannot be emitted under `openai-compatible`. Changed output is validated offline and proposed in a signed PR rather than written directly to `main`.
 
 To reproduce an update locally:
 

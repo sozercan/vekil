@@ -708,7 +708,7 @@ validate_zen_free_models_file() {
     length($1) > 128 ||
     $1 !~ /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/ ||
     $2 == "" ||
-    ($3 != "/chat/completions" && $3 != "/responses" && $3 != "/messages") ||
+    ($3 != "/chat/completions" && $3 != "/responses" && $3 != "/messages" && $3 != "/systemone") ||
     seen[$1]++ {
       exit 1
     }

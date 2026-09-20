@@ -221,6 +221,10 @@ func runProxyStartup(
 	cfg proxy.ProvidersConfig,
 	configErr error,
 ) proxyStartResult {
+	return runProxyStartupAt(ctx, authn, cfg, configErr, proxyHost, proxyPort)
+}
+
+func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy.ProvidersConfig, configErr error, host, port string) proxyStartResult {
 	if configErr != nil {
 		title, message := providersConfigStartDialog(configErr)
 		return proxyStartFailure(
@@ -244,13 +248,18 @@ func runProxyStartup(
 			err,
 		)
 	}
+	stateBindings, err := proxy.StateBindingsEnvironmentOverrides()
+	if err != nil {
+		return proxyStartFailure("invalid state bindings configuration", "Vekil Start Failed", fmt.Sprintf("Invalid state bindings override.\n\n%v", err), err)
+	}
 	nextSrv, err := server.New(
 		authn,
 		log,
-		proxyHost,
-		proxyPort,
+		host,
+		port,
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(cfg),
+			proxy.WithStateBindingsConfig(stateBindings),
 			proxy.WithPolicyRoutingMode(policyMode),
 			proxy.WithDeferredDynamicProviderModelValidation(cfg.UsesCopilot()),
 		),
@@ -299,7 +308,7 @@ func runProxyStartup(
 		return proxyStartFailure(
 			"server start failed",
 			"Vekil Start Failed",
-			fmt.Sprintf("Could not start Vekil on port 1337.\n\n%v", err),
+			fmt.Sprintf("Could not start Vekil on port %s.\n\n%v", port, err),
 			err,
 		)
 	}

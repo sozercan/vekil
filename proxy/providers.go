@@ -67,6 +67,7 @@ type ProvidersConfig struct {
 	ModelRoutes    []ModelRouteConfig    `json:"model_routes,omitempty" yaml:"model_routes,omitempty"`
 	PolicyProfiles []PolicyProfileConfig `json:"policy_profiles,omitempty" yaml:"policy_profiles,omitempty"`
 	ToolOptimizers ToolOptimizersConfig  `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+	StateBindings  *StateBindingsConfig  `json:"state_bindings,omitempty" yaml:"state_bindings,omitempty"`
 	// InsightModel is the public model ID the dashboard uses to generate
 	// natural-language traffic insights on demand. Empty disables the feature
 	// (the dashboard's "Generate insights" button is hidden). The model must be
@@ -76,6 +77,7 @@ type ProvidersConfig struct {
 	schemaVersionSet  bool
 	modelRoutesSet    bool
 	policyProfilesSet bool
+	stateBindingsSet  bool
 }
 
 // ProviderConfig configures one upstream provider instance.
@@ -467,6 +469,7 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		cfg.schemaVersionSet = present["schema_version"]
 		cfg.modelRoutesSet = present["model_routes"]
 		cfg.policyProfilesSet = present["policy_profiles"]
+		cfg.stateBindingsSet = present["state_bindings"]
 		markYAMLProvidersConfigFieldPresence(body, cfg)
 	default:
 		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
@@ -494,6 +497,7 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		cfg.schemaVersionSet = present["schema_version"]
 		cfg.modelRoutesSet = present["model_routes"]
 		cfg.policyProfilesSet = present["policy_profiles"]
+		cfg.stateBindingsSet = present["state_bindings"]
 		markJSONProvidersConfigFieldPresence(body, cfg)
 	}
 	return nil

@@ -2559,6 +2559,7 @@ func TestModelUsesCopilotHonorsProviderFiltersDuringDeferredDiscovery(t *testing
 	t.Run("explicit route scopes readiness to its target", func(t *testing.T) {
 		cfg := ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{
 				{
 					ID:      "azure",
@@ -2626,6 +2627,7 @@ func TestPolicyCopilotProviderScopeFollowsEffectiveMode(t *testing.T) {
 		}
 		return ProvidersConfig{
 			SchemaVersion: 2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{
 				{ID: "copilot", Type: "copilot", Default: true, TrustDomain: "org", IncludeModels: includeModels},
 				{ID: "local", Type: "openai-compatible", BaseURL: "https://local.example.test/v1", AuthType: "none", ModelDiscovery: "static", TrustDomain: "org", ClassifierNoStoreSupported: &classifierNoStore},

@@ -9969,6 +9969,7 @@ func TestHandleModelsFiltersExplicitRoutesByAllowedModels(t *testing.T) {
 		WithAllowedModels("selected-model"),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{{
 				ID:             "local",
 				Type:           string(providerTypeOpenAICompatible),
@@ -10066,6 +10067,7 @@ func TestHandleModels_QueryVariantRejectsExplicitRouteAliasCollisions(t *testing
 				WithDeferredDynamicProviderModelValidation(true),
 				WithProvidersConfig(ProvidersConfig{
 					SchemaVersion: ProvidersConfigSchemaVersion2,
+					StateBindings: &StateBindingsConfig{Mode: "memory"},
 					Providers: []ProviderConfig{
 						{ID: "dynamic", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: dynamic.URL, AuthType: "none", ModelDiscovery: string(providerModelDiscoveryOpenAI)},
 						{ID: "explicit", Type: string(providerTypeOpenAICompatible), BaseURL: explicit.URL, AuthType: "none"},

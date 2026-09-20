@@ -2448,6 +2448,7 @@ func TestHandleGeminiModelsCountTokensRejectsIneligibleExplicitRoute(t *testing.
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{{
 				ID:      "azure",
 				Type:    string(providerTypeAzureOpenAI),
@@ -2512,6 +2513,7 @@ func newGeminiCountTokensRouteTestHandler(t testing.TB, providers []ProviderConf
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers:     providers,
 			ModelRoutes: []ModelRouteConfig{{
 				ID:        "gemini-count-route",

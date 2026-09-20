@@ -19,7 +19,19 @@ Important:
 - `response.completed` and `response.incomplete` are terminal for the current upstream SSE response. After forwarding and recording the response ID, output, and usage, Vekil closes the upstream body immediately; trailing bytes, a held-open body, or a later transport reset do not delay the turn. Terminal output is the authoritative ordered replay snapshot, including an explicitly empty output array. Incomplete responses preserve partial output and may be continued with their response ID. Both `response.cancelled` and `response.canceled` terminate the turn and preserve reported usage without publishing replay history. `response.failed`, top-level Responses `error` events, and streams that end without a terminal response remain errors. A classified `response.failed` or top-level `error` that is the first semantic event is replaced by the bridge's wrapped error frame. An unclassified first `response.failed`, or any failure after another semantic event has already been relayed (including `response.created`, `response.in_progress`, or output), keeps the upstream event and is then followed by the wrapped frame.
 - Dashboard client accounting is per provider-backed client `response.create`: a structurally valid terminal provider outcome is recorded immediately and exactly once; a client-first abort without a terminal outcome is recorded once as 499, while shutdown-first lifecycle cancellation is excluded. Physical sends and target switches are recorded separately. Tokens spent by proxy-internal auto-compaction or replay `413` compaction are added to that create's usage rather than recorded as synthetic client requests, including usage collected before a later compaction parse/merge failure. Post-terminal auto-compaction amends the existing record without delaying its request/status visibility. Failed provider turns keep terminal partial usage and remain attributed to the public model, final provider, and original agent; target-level public stats expose attempt counts rather than per-attempt token usage.
 
-Target/state bindings are process-local, capped at 262,144 entries, and use a 24-hour absolute TTL. Websocket session history also lives in the process that owns the connection. Use one Vekil process or sticky ingress, and drain sessions before rollback or downgrade. A process restart or another replica cannot recover the live session or its binding map. Durable/shared bindings, signed target hints, and cross-target full replay are not implemented.
+Schema-v2 explicit routes use [durable state recovery](state-recovery.md) by
+default. The providers file controls storage, with a default capacity of
+8,388,608 retained records and no automatic expiry or eviction.
+`state_bindings.mode: memory` opts out and retains the process-local index with
+a default 262,144-entry limit and 24-hour absolute TTL.
+
+Durable ownership does not recover websocket history or upstream connections.
+Reconnect with full client-held input without the old connection-local
+`previous_response_id`; retained encrypted input must still match its owner.
+Concurrent clients can share one proxy, but each database has one writer.
+Separate proxies need ingress affinity. Drain sessions before rollback or
+downgrade. Shared bindings, signed target hints, and cross-target replay are
+not implemented.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
