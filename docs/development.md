@@ -125,6 +125,33 @@ The nested-response benchmark measures the complete JSON/SSE writers at depths
 operation to detect diagnostic-path allocation amplification independently of
 first-issuance storage latency.
 
+### Conversation migration suite
+
+Opt-in Azure/Copilot migration uses synthetic providers and private temporary
+stores. Run the same suite on macOS APFS and Linux to execute process-kill/reopen tests:
+
+```bash
+go test ./proxy -run '^Test(Conversation|LoadProvidersConfigFileConversationMigration)' -count=1
+go test -race ./proxy -run '^TestConversation' -count=1
+go test ./proxy -run '^$' -bench '^BenchmarkConversationHistoryAdmission$' -benchtime=20x -count=1 -benchmem
+```
+
+Coverage includes HTTP JSON/SSE, local tool history, full-input and response-ID
+recovery, immutable older branches, WebSocket reconnect, uncertain execution,
+storage faults/capacity/corruption, concurrent admission, offline deletion and
+process kills around history commits. Core CI runs these tests on Linux and
+the Darwin durable-storage job runs them on macOS. Complete the production gate
+before live Azure/Copilot validation. A live check must use a separate providers
+file, database and client workspace, a confirmed prewrite outage, and record the
+answering resource, retained context, local side-effect count and next turn.
+
+The admission benchmark reserves and clears a pending turn with 0, 4,096, and
+32,768 saved snapshots. Quota counts are rebuilt during startup validation and
+published under the durable-store mutex after successful commits. The measured
+path includes normal disk synchronization; fixture creation and validation are
+outside the timer. Keep raw benchmark results private, as with the ownership
+benchmarks above.
+
 ### Policy-routing safety suite
 
 Schema-v2 policy routing adds a pre-dispatch planner above native OpenAI Chat. The deterministic merge gate must use in-memory classifier adapters and local `httptest` providers; live credentials and provider availability are supplementary, never substitutes for local tests.

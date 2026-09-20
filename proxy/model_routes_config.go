@@ -442,6 +442,9 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 		}
 	}
 
+	if err := normalizeAndValidateConversationMigrationConfig(&validated.config, routeConfigs, providers); err != nil {
+		return validatedProvidersConfig{}, err
+	}
 	return validated, nil
 }
 
@@ -451,6 +454,9 @@ func validateSchemaV2FeatureFields(cfg ProvidersConfig, schemaVersion int) error
 	}
 	if cfg.policyProfilesSet || cfg.PolicyProfiles != nil {
 		return configPathError("policy_profiles", "requires schema_version: 2")
+	}
+	if cfg.conversationMigrationSet || cfg.ConversationMigration != nil {
+		return configPathError("conversation_migration", "requires schema_version: 2")
 	}
 	for providerIndex, provider := range cfg.Providers {
 		if provider.trustDomainSet || strings.TrimSpace(provider.TrustDomain) != "" {
@@ -476,6 +482,11 @@ func cloneProvidersConfigForValidation(cfg ProvidersConfig) ProvidersConfig {
 	if cfg.StateBindings != nil {
 		stateBindings := *cfg.StateBindings
 		cloned.StateBindings = &stateBindings
+	}
+	if cfg.ConversationMigration != nil {
+		migration := *cfg.ConversationMigration
+		migration.Routes = append([]string(nil), cfg.ConversationMigration.Routes...)
+		cloned.ConversationMigration = &migration
 	}
 	if cfg.Providers != nil {
 		cloned.Providers = make([]ProviderConfig, len(cfg.Providers))
@@ -1257,9 +1268,12 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 
 var topLevelProviderConfigFields = configFieldSet(
 	"schema_version", "providers", "model_routes", "policy_profiles", "tool_optimizers", "insight_model", "state_bindings",
+	"conversation_migration",
 )
 
 var stateBindingsConfigFields = configFieldSet("mode", "max_entries", "file")
+
+var conversationMigrationConfigFields = configFieldSet("routes", "max_history_bytes", "max_total_bytes", "max_snapshots")
 
 var providerConfigFields = configFieldSet(
 	"id", "type", "default", "include_models", "exclude_models", "base_url", "auth_mode",
@@ -1331,6 +1345,11 @@ func validateJSONConfigFieldPaths(body []byte) error {
 	}
 	if bindings, ok := root["state_bindings"].(map[string]interface{}); ok {
 		if err := validateJSONKnownFields(bindings, stateBindingsConfigFields, "state_bindings"); err != nil {
+			return err
+		}
+	}
+	if migration, ok := root["conversation_migration"].(map[string]interface{}); ok {
+		if err := validateJSONKnownFields(migration, conversationMigrationConfigFields, "conversation_migration"); err != nil {
 			return err
 		}
 	}
@@ -1453,6 +1472,14 @@ func validateYAMLConfigFieldPaths(body []byte) error {
 			return err
 		}
 	}
+	if migration := yamlDereferenceAlias(yamlMappingValue(root, "conversation_migration")); migration != nil && migration.Kind == yaml.MappingNode {
+		if err := validateYAMLKnownFields(migration, conversationMigrationConfigFields, "conversation_migration"); err != nil {
+			return err
+		}
+		if err := validateYAMLConversationMigrationFieldTypes(migration); err != nil {
+			return err
+		}
+	}
 	if providers := yamlMappingValue(root, "providers"); providers != nil && providers.Kind == yaml.SequenceNode {
 		for index, provider := range providers.Content {
 			if provider.Kind != yaml.MappingNode {
@@ -1568,6 +1595,14 @@ func markJSONProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			_, cfg.StateBindings.maxEntriesSet = bindings["max_entries"]
 		}
 	}
+	if cfg.ConversationMigration != nil {
+		var migration map[string]json.RawMessage
+		if json.Unmarshal(root["conversation_migration"], &migration) == nil {
+			_, cfg.ConversationMigration.maxHistoryBytesSet = migration["max_history_bytes"]
+			_, cfg.ConversationMigration.maxTotalBytesSet = migration["max_total_bytes"]
+			_, cfg.ConversationMigration.maxSnapshotsSet = migration["max_snapshots"]
+		}
+	}
 
 	var providers []map[string]json.RawMessage
 	if json.Unmarshal(root["providers"], &providers) == nil {
@@ -1651,6 +1686,14 @@ func markYAMLProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 		bindings := yamlDereferenceAlias(yamlMappingValue(root, "state_bindings"))
 		if bindings != nil && bindings.Kind == yaml.MappingNode {
 			cfg.StateBindings.maxEntriesSet = yamlMappingHasField(bindings, "max_entries")
+		}
+	}
+	if cfg.ConversationMigration != nil {
+		migration := yamlDereferenceAlias(yamlMappingValue(root, "conversation_migration"))
+		if migration != nil && migration.Kind == yaml.MappingNode {
+			cfg.ConversationMigration.maxHistoryBytesSet = yamlMappingHasField(migration, "max_history_bytes")
+			cfg.ConversationMigration.maxTotalBytesSet = yamlMappingHasField(migration, "max_total_bytes")
+			cfg.ConversationMigration.maxSnapshotsSet = yamlMappingHasField(migration, "max_snapshots")
 		}
 	}
 

@@ -1879,6 +1879,14 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 
 	tap := newResponsesFailureTap(ctx, h, upstreamHeaders, store, scope)
 	if _, err := io.Copy(fw, io.TeeReader(r, tap)); err != nil {
+		if code := providerRequestErrorCode(err); strings.HasPrefix(code, "conversation_") {
+			observeResponseFailureStatus(ctx, upstreamStatusCode(err, http.StatusBadGateway))
+			if ctx.Err() == nil && !isClientWriteError(fw, err) {
+				data, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]string{"type": "server_error", "code": code, "message": err.Error()}})
+				_, _ = io.WriteString(fw, "event: error\ndata: "+string(data)+"\n\n")
+			}
+			return
+		}
 		if _, _, ok := durableStateFailureDetails(err); ok {
 			observeResponseFailureStatus(ctx, http.StatusServiceUnavailable)
 			if ctx.Err() == nil && !isClientWriteError(fw, err) {

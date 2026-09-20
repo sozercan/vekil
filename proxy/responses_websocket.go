@@ -216,51 +216,55 @@ func (b *responsesWebSocketCloseBarrier) released() bool {
 }
 
 type responsesWebSocketSession struct {
-	conn                    *websocket.Conn
-	shutdownConn            responsesWebSocketShutdownConn
-	ctx                     context.Context
-	cancel                  context.CancelFunc
-	baseHeaders             http.Header
-	userAgent               string
-	explicitRouteID         string
-	explicitTargetID        string
-	operationConnectionID   string
-	operationSequence       uint64
-	turnState               string
-	turnMetadata            string
-	lastResponseID          string
-	lastSignature           string
-	historyItems            []json.RawMessage
-	historyBytes            int
-	nativeUpstream          *responsesNativeUpstream
-	nativeResetPending      bool
-	toolContexts            *ToolExecutionContextStore
-	toolScope               string
-	handlerDone             chan struct{}
-	handlerDoneOnce         sync.Once
-	writeWait               time.Duration
-	pingPeriod              time.Duration
-	pongWait                time.Duration
-	terminalObservationWait time.Duration
-	inflightMu              sync.Mutex
-	inflightCancel          context.CancelFunc
-	inflightGen             uint64
-	inflightCancelHolds     int
-	closing                 bool
-	closeCause              responsesWebSocketCloseCause
-	closeSequence           uint64
-	closeBarrier            *responsesWebSocketCloseBarrier
-	socketClosed            bool
+	conn                       *websocket.Conn
+	shutdownConn               responsesWebSocketShutdownConn
+	ctx                        context.Context
+	cancel                     context.CancelFunc
+	baseHeaders                http.Header
+	userAgent                  string
+	explicitRouteID            string
+	explicitTargetID           string
+	operationConnectionID      string
+	operationSequence          uint64
+	turnState                  string
+	turnMetadata               string
+	lastResponseID             string
+	lastSignature              string
+	stagedConversationSourceID string
+	stagedConversationComplete bool
+	historyItems               []json.RawMessage
+	historyBytes               int
+	nativeUpstream             *responsesNativeUpstream
+	nativeResetPending         bool
+	toolContexts               *ToolExecutionContextStore
+	toolScope                  string
+	handlerDone                chan struct{}
+	handlerDoneOnce            sync.Once
+	writeWait                  time.Duration
+	pingPeriod                 time.Duration
+	pongWait                   time.Duration
+	terminalObservationWait    time.Duration
+	inflightMu                 sync.Mutex
+	inflightCancel             context.CancelFunc
+	inflightGen                uint64
+	inflightCancelHolds        int
+	closing                    bool
+	closeCause                 responsesWebSocketCloseCause
+	closeSequence              uint64
+	closeBarrier               *responsesWebSocketCloseBarrier
+	socketClosed               bool
 }
 
 type responsesWebSocketRequestPlan struct {
-	signature          string
-	resetHistory       bool
-	currentInput       []json.RawMessage
-	fullReplaySegments [][]json.RawMessage
-	useTurnStateDelta  bool
-	compactionChecked  bool
-	compactionTrigger  bool
+	signature            string
+	resetHistory         bool
+	currentInput         []json.RawMessage
+	fullReplaySegments   [][]json.RawMessage
+	useTurnStateDelta    bool
+	compactionChecked    bool
+	compactionTrigger    bool
+	conversationSourceID string
+	conversationComplete bool
 }
 
 type responsesWebSocketRequestMetrics struct {
@@ -1232,6 +1236,11 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 		summary.SetOperationID(operationID)
 		summary.SetRouteID(route.public.routeID)
 	}
+	if h.conversationMigrationEnabled(route) {
+		// Saved per-response history chooses the owner, including after a
+		// reconnect or when a client explicitly resumes an older branch.
+		return routedCtx, operation, route, nil
+	}
 
 	if s.explicitTargetID == "" {
 		return routedCtx, operation, route, nil
@@ -1276,7 +1285,13 @@ func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, op
 		return fmt.Errorf("responses websocket session route changed after target pinning")
 	}
 	if s.explicitTargetID != "" && s.explicitTargetID != targetID {
-		return fmt.Errorf("responses websocket session target changed from %q to %q", s.explicitTargetID, targetID)
+		if operation.conversation == nil {
+			return fmt.Errorf("responses websocket session target changed from %q to %q", s.explicitTargetID, targetID)
+		}
+	}
+	if operation.conversation != nil {
+		// Publish the new session owner only after the completed turn is saved.
+		return nil
 	}
 	operation.pinTarget(targetID)
 	s.explicitRouteID = route.public.routeID
@@ -1451,7 +1466,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 
 	plan, err := s.planRequest(h, request)
 	if err != nil {
-		if writeErr := s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil); writeErr != nil {
+		status, code := http.StatusBadRequest, "invalid_request_error"
+		if requestCode := providerRequestErrorCode(err); requestCode != "" {
+			status, code = upstreamStatusCode(err, status), requestCode
+		}
+		if writeErr := s.sendWrappedError(status, err.Error(), code, nil); writeErr != nil {
 			return writeErr
 		}
 		return err
@@ -1565,6 +1584,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	upstreamCtx = markRetryStatsTracked(upstreamCtx)
 	upstreamCtx, routeObserver := withProviderRouteObserver(upstreamCtx)
 	upstreamCtx, routeOperation, explicitRoute, err = s.prepareExplicitRouteOperation(h, upstreamCtx, request.Model)
+	defer func() {
+		if routeOperation != nil {
+			routeOperation.conversation.finish()
+		}
+	}()
 	if err != nil {
 		upstreamCancel()
 		status := upstreamStatusCode(err, http.StatusBadGateway)
@@ -1815,7 +1839,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		if s.isClosing() || h.upstreamShutdownStarted() {
 			return err
 		}
-		if writeErr := s.sendExplicitRouteError(routeOperation, http.StatusBadGateway, err.Error(), "server_error", nil); writeErr != nil {
+		status, code := http.StatusBadGateway, "server_error"
+		if requestCode := providerRequestErrorCode(err); strings.HasPrefix(requestCode, "conversation_") {
+			status, code = upstreamStatusCode(err, status), requestCode
+		}
+		if writeErr := s.sendExplicitRouteError(routeOperation, status, err.Error(), code, nil); writeErr != nil {
 			return writeErr
 		}
 		return err
@@ -1849,6 +1877,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 	if pendingExplicitTurnState != "" {
 		s.turnState = pendingExplicitTurnState
+	}
+	if routeOperation != nil && routeOperation.conversation != nil {
+		s.explicitRouteID = explicitRoute.public.routeID
+		s.explicitTargetID = routeOperation.pinnedTarget()
+		s.turnState = ""
 	}
 	s.rememberPlannedResponse(plan, streamResult.responseID, streamResult.outputItems)
 	var autoCompactionUsage responsesUsage
@@ -1893,9 +1926,29 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	if nativeInputLimits && len(request.Input) > responsesNativeMaxPendingItems {
 		return responsesWebSocketRequestPlan{}, fmt.Errorf("websocket input exceeds session item limit")
 	}
-	if request.PreviousResponseID == "" {
+	route, known := h.resolveModelRouteForRequest(request.Model, providerEndpointResponses)
+	migration := known && h.conversationMigrationEnabled(route)
+	if migration {
+		assertion := headerGetCI(s.requestHeaders(request, false), "X-Vekil-History-Complete")
+		if assertion != "" && assertion != "true" {
+			return responsesWebSocketRequestPlan{}, conversationRequestError(errConversationHistoryPartial)
+		}
+		plan.conversationComplete = assertion == "true"
+	}
+	if request.PreviousResponseID == "" || plan.conversationComplete {
 		plan.resetHistory = true
 		plan.fullReplaySegments = [][]json.RawMessage{request.Input}
+		return plan, nil
+	}
+	if migration && !strings.HasPrefix(request.PreviousResponseID, "vekil-ws-") {
+		snapshot, err := h.conversationHistory.lookupResponse(route.public.routeID, request.PreviousResponseID)
+		if err != nil {
+			return responsesWebSocketRequestPlan{}, conversationRequestError(err)
+		}
+		plan.resetHistory = true
+		plan.conversationSourceID = snapshot.ResponseID
+		plan.currentInput = append(cloneRawMessages(snapshot.Input), request.Input...)
+		plan.fullReplaySegments = [][]json.RawMessage{plan.currentInput}
 		return plan, nil
 	}
 	if request.PreviousResponseID != s.lastResponseID {
@@ -1906,6 +1959,20 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	}
 
 	plan.fullReplaySegments = [][]json.RawMessage{s.historyItems, request.Input}
+	if migration {
+		plan.conversationSourceID = s.stagedConversationSourceID
+		plan.conversationComplete = s.stagedConversationComplete
+		catalogs, history := partitionResponsesAdditionalToolsInputItems(s.historyItems)
+		if current, _ := partitionResponsesAdditionalToolsInputItems(request.Input); len(current) > 0 {
+			catalogs = nil
+		}
+		// Staging retains only the latest request-scoped catalogs. Repeated
+		// generate:false frames must not accumulate obsolete definitions.
+		plan.resetHistory = true
+		plan.currentInput = append(cloneRawMessages(catalogs), history...)
+		plan.currentInput = append(plan.currentInput, request.Input...)
+		plan.fullReplaySegments = [][]json.RawMessage{plan.currentInput}
+	}
 	if nativeInputLimits {
 		if len(s.historyItems)+len(request.Input) > responsesNativeMaxPendingItems || rawMessageSegmentsSize(plan.fullReplaySegments...) > maxRequestBodySize {
 			return responsesWebSocketRequestPlan{}, fmt.Errorf("staged websocket input exceeds session limits")
@@ -1927,6 +1994,11 @@ func (s *responsesWebSocketSession) nativeInputLimitsApply(h *ProxyHandler, mode
 		return true
 	}
 	if route, known := h.resolveModelRouteForRequest(model, providerEndpointResponses); known && route != nil {
+		if h.conversationMigrationEnabled(route) {
+			// Protected turns always use the HTTP bridge, including after a
+			// switch to Copilot with NativeUpstream enabled for other routes.
+			return false
+		}
 		if s.explicitTargetID != "" {
 			target, ok := route.targetByID(s.explicitTargetID)
 			return ok && target.provider != nil && target.provider.kind == providerTypeCopilot
@@ -1949,6 +2021,10 @@ func (s *responsesWebSocketSession) nativeInputLimitsApply(h *ProxyHandler, mode
 }
 
 func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan, metrics *responsesWebSocketRequestMetrics) (*http.Response, bool, bool, error) {
+	if operation := routeOperationFromContext(ctx); operation != nil && h.conversationMigrationEnabled(operation.route) {
+		resp, err := s.postConversationCreateRequest(h, ctx, request, plan)
+		return resp, false, false, err
+	}
 	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta)
 	if s.nativeUpstream.started() {
 		return resp, request.PreviousResponseID != "" && !s.nativeResetPending, false, err
@@ -2174,6 +2250,12 @@ func (s *responsesWebSocketSession) rememberResponse(resetHistory bool, response
 }
 
 func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSocketRequestPlan, responseID string, outputItems []json.RawMessage) {
+	s.stagedConversationSourceID = ""
+	s.stagedConversationComplete = false
+	if strings.HasPrefix(responseID, "vekil-ws-") {
+		s.stagedConversationSourceID = plan.conversationSourceID
+		s.stagedConversationComplete = plan.conversationComplete
+	}
 	if plan.hasCompactionTrigger() {
 		s.turnState = ""
 	}
@@ -2182,6 +2264,9 @@ func (s *responsesWebSocketSession) rememberPlannedResponse(plan responsesWebSoc
 }
 
 func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, request *responsesWebSocketCreateRequest, metrics responsesWebSocketRequestMetrics, operation *routeOperation) (responsesWebSocketRequestMetrics, responsesUsage) {
+	if operation != nil && operation.conversation != nil {
+		return metrics, responsesUsage{}
+	}
 	if s == nil || s.isClosing() || (s.ctx != nil && s.ctx.Err() != nil) {
 		return metrics, responsesUsage{}
 	}
@@ -3006,6 +3091,9 @@ func responsesWebSocketMetadataHeaders(headers http.Header) map[string]interface
 	}
 	if value := headers.Get(responsesWebSocketOperationHeader); value != "" {
 		result["x-vekil-request-id"] = value
+	}
+	if value := headers.Get("X-Vekil-Conversation-Recovery"); value != "" {
+		result["x-vekil-conversation-recovery"] = value
 	}
 
 	if len(result) == 0 {

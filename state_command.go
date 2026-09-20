@@ -11,11 +11,12 @@ import (
 )
 
 func runState(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] != "prune" {
-		_, _ = fmt.Fprintln(stderr, "Usage: vekil state prune --file PATH --before RFC3339 --confirm")
+	if len(args) == 0 || (args[0] != "prune" && args[0] != "prune-history") {
+		_, _ = fmt.Fprintln(stderr, "Usage: vekil state {prune|prune-history} --file PATH --before RFC3339 --confirm")
 		return 2
 	}
-	fs := flag.NewFlagSet("state prune", flag.ContinueOnError)
+	history := args[0] == "prune-history"
+	fs := flag.NewFlagSet("state "+args[0], flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	path := fs.String("file", "", "Existing private durable state file; serving must be stopped")
 	cutoff := fs.String("before", "", "Retire records issued before this whole-second RFC3339 timestamp")
@@ -33,11 +34,19 @@ func runState(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, "pruning requires --file, a past whole-second --before RFC3339 timestamp, and --confirm; affected continuation state will become unknown")
 		return 2
 	}
-	removed, err := proxy.PruneDurableStateBindings(*path, before)
+	prune := proxy.PruneDurableStateBindings
+	if history {
+		prune = proxy.PruneConversationHistory
+	}
+	removed, err := prune(*path, before)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
-	_, _ = fmt.Fprintf(stdout, "Pruned %d ownership records; affected continuations can no longer be verified. Database pages are retained for reuse.\n", removed)
+	if history {
+		_, _ = fmt.Fprintf(stdout, "Pruned %d conversation snapshots and retired eligible unresolved attempts; affected history cannot migrate. Ownership records remain. Freed pages are reusable, not securely erased.\n", removed)
+	} else {
+		_, _ = fmt.Fprintf(stdout, "Pruned %d ownership records; affected continuations can no longer be verified. Database pages are retained for reuse.\n", removed)
+	}
 	return 0
 }

@@ -40,6 +40,7 @@ var responsesExtraHeaderNames = func() map[string]struct{} {
 		"X-Codex-Window-Id",
 		"X-OAI-Attestation",
 		"X-ResponsesAPI-Include-Timing-Metrics",
+		"X-Vekil-History-Complete",
 		"Traceparent",
 		"Tracestate",
 	}
@@ -221,7 +222,10 @@ func (h *ProxyHandler) prepareResponsesRequestWithMetadata(ctx context.Context, 
 	headerToolScope := toolExecutionScopeFromHeaders(extraHeaders)
 	requestToolScope := responsesRequestToolExecutionScope(headerToolScope, metadata.PreviousResponseID)
 
-	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, metadata.Model, "responses", true, h.toolContexts, requestToolScope)
+	route, _ := h.resolveModelRouteForRequest(metadata.Model, providerEndpointResponses)
+	if !h.conversationMigrationEnabled(route) {
+		bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, metadata.Model, "responses", true, h.toolContexts, requestToolScope)
+	}
 
 	return preparedResponsesRequest{
 		body:             bodyBytes,
@@ -243,6 +247,9 @@ func (h *ProxyHandler) postPreparedResponsesRequestWithValidation(ctx context.Co
 	if err != nil {
 		return nil, err
 	}
+	if conversationTurnFromContext(ctx) != nil {
+		return resp, nil
+	}
 	return h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
 }
 
@@ -256,6 +263,10 @@ func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWrite
 		return
 	}
 	statusCode := upstreamStatusCode(err, http.StatusBadGateway)
+	if code := providerRequestErrorCode(err); strings.HasPrefix(code, "conversation_") {
+		writeOpenAIErrorWithDetails(w, statusCode, err.Error(), "invalid_request_error", "", code)
+		return
+	}
 	h.log.Error("upstream request failed", logger.F("endpoint", endpoint), logger.Err(err))
 	if statusCode == http.StatusBadRequest {
 		writeOpenAIErrorWithDetails(w, statusCode, err.Error(), "invalid_request_error", "", providerRequestErrorCode(err))
@@ -323,6 +334,27 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	if routeOperation != nil {
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+		if h.conversationMigrationEnabled(routeOperation.route) {
+			stopCancellation := context.AfterFunc(r.Context(), upstreamCancel)
+			defer stopCancellation()
+			if r.Context().Err() != nil {
+				upstreamCancel()
+			}
+		}
+		body, headers, prepareErr := h.prepareConversationTurn(routeOperation, prepared.stateBindingBody, prepared.extraHeaders)
+		defer func() { routeOperation.conversation.finish() }()
+		if prepareErr != nil {
+			h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses_history", prepareErr)
+			return
+		}
+		if turn := routeOperation.conversation; turn != nil {
+			prepared.body, prepared.stateBindingBody = body, body
+			prepared.extraHeaders = headers
+			prepared.upstreamHeaders = responsesUpstreamHeaders(headers, prepared.streaming)
+			scope := responsesRequestToolExecutionScope(prepared.headerToolScope, metadata.PreviousResponseID)
+			turn.toolContexts, turn.toolScope = h.toolContexts, scope
+			prepared.body = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(upstreamCtx, body, prepared.model, "responses", true, turn.toolContexts, turn.toolScope)
+		}
 		if err := h.applyExplicitRequestStateBinding(routeOperation, prepared.stateBindingBody, prepared.extraHeaders); err != nil {
 			h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses_state_binding", err)
 			return

@@ -219,6 +219,12 @@ Azure cooldowns are shared by resource origin and physical deployment across pub
 
 Automatic target switching is intentionally narrow:
 
+These are the default ownership rules. Opt-in
+[Responses conversation migration](conversation-migration.md) can reconstruct a
+saved complete conversation on another Azure resource or Copilot at the same
+safe boundaries. It never forwards an old resource's opaque state to the new
+resource.
+
 | Observed outcome | Switch to the next target |
 |------------------|---------------------------|
 | DNS, dial, or TLS failure before request bytes could be written | Yes, if admission, deadline, cleanup, and budgets still allow it |
@@ -257,14 +263,15 @@ Schema-v2 policy selection is narrower than this general explicit-route matrix. 
 
 The optional websocket bridge uses upstream HTTP `/responses` by default. Its
 first provider-backed `response.create` may use the same safe precommit route
-failover; after a successful target is exposed, the session is pinned to that
-exact route/target. Experimental native Copilot connections additionally
+failover; by default, after a successful target is exposed, the session is pinned
+to that exact route/target. Migration-enabled Azure routes select subsequent
+owners from immutable saved responses, including after reconnect. Experimental native Copilot connections additionally
 prohibit retry or migration after sending a create. See
 [Responses WebSocket Bridge](responses-websocket.md).
 
 ### Exact state binding and process-local limits
 
-Provider-issued state is bound to one exact `{route_id, target_id}`. This includes adapter-marked response IDs, trusted `X-Codex-Turn-State`, non-proxy opaque `encrypted_content`, and other opaque reasoning/session handles. Known state pins the owning target and disables failover. All supplied state values must agree; malformed, conflicting, cross-route, or mixed known/unknown state on an explicit `/responses` operation fails locally without an upstream call. A token observed from different owners becomes a conflict tombstone. Memory-only tombstones can expire or evict; durable tombstones remain until explicit pruning.
+Provider-issued state is bound to one exact `{route_id, target_id}`. This includes adapter-marked response IDs, trusted `X-Codex-Turn-State`, non-proxy opaque `encrypted_content`, and other opaque reasoning/session handles. By default, known state pins the owning target and disables failover. All supplied state values must agree; malformed, conflicting, cross-route, or mixed known/unknown state on an explicit `/responses` operation fails locally without an upstream call. A token observed from different owners becomes a conflict tombstone. Memory-only tombstones can expire or evict; durable tombstones remain until explicit pruning. Opt-in migration verifies complete visible history before reconstructing without old provider state; it never relabels an old token's owner.
 
 There is one narrow first-use exception for a client-supplied Responses `conversation` ID. When that conversation is the request's only explicit state and the route can select exactly one eligible Responses target, Vekil atomically binds the ID to that target before dispatch and hard-pins the operation. This covers a one-target route and a multi-target `primary_only` route whose configured primary is eligible. An unknown conversation on a multi-target `priority_failover` route remains fail-closed because ownership is ambiguous; other unknown provider state also remains fail-closed. `previous_response_id` cannot be combined with `conversation`. Vekil exposes no public conversation-registration endpoint and accepts no client target hint.
 
@@ -286,8 +293,11 @@ Concurrent clients share the proxy's store safely. Every explicit stateful route
 including one-target and `primary_only`, still needs one writer per file and
 ingress affinity when several proxies run independently. Responses-backed Chat
 replay remains a separate process-local store. Shared binding storage,
-cross-target replay/session migration, and client-supplied ownership hints remain
-unsupported.
+client-supplied ownership hints and generic cross-provider session migration
+remain unsupported. Selected Azure routes can enable the narrower
+[`conversation_migration`](conversation-migration.md) contract through the
+providers file. It requires durable storage and saves conversation text with
+separate limits and deletion rules.
 
 ### No terminal-route balancing or generic circuit breaker
 

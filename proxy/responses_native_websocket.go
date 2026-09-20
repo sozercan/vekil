@@ -388,7 +388,7 @@ func responsesNativeTurnHeaders(headers http.Header) (map[string]string, error) 
 		case "Authorization", "Api-Key", "X-Api-Key", "Cookie", "Set-Cookie", "Host",
 			"Accept", "Accept-Encoding", "Content-Type", "Content-Length", "Content-Encoding",
 			"Editor-Version", "Editor-Plugin-Version", "User-Agent", "Copilot-Integration-Id",
-			"X-Github-Api-Version", "X-Request-Id", "Openai-Intent", "X-Codex-Turn-State":
+			"X-Github-Api-Version", "X-Request-Id", "Openai-Intent", "X-Codex-Turn-State", "X-Vekil-History-Complete":
 			continue
 		}
 		if strings.HasPrefix(canonical, "Sec-Websocket-") {

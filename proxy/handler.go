@@ -309,6 +309,7 @@ type ProxyHandler struct {
 	stateBindings                    *stateBindingStore
 	stateBindingsErr                 error
 	stateBindingsOverride            StateBindingsConfig
+	conversationHistory              *conversationHistoryStore
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
 }
@@ -735,6 +736,16 @@ func (h *ProxyHandler) handleResponseBodyWriteError(w http.ResponseWriter, r *ht
 	if !errors.As(err, &bodyErr) {
 		return false
 	}
+	if code := providerRequestErrorCode(err); strings.HasPrefix(code, "conversation_") {
+		status := upstreamStatusCode(err, http.StatusBadGateway)
+		if r != nil {
+			observeResponseFailureStatus(r.Context(), status)
+		}
+		if !bodyErr.committed {
+			writeOpenAIErrorWithDetails(w, status, err.Error(), "server_error", "", code)
+		}
+		return true
+	}
 	if message, _, ok := durableStateFailureDetails(err); ok {
 		if r != nil {
 			observeResponseFailureStatus(r.Context(), http.StatusServiceUnavailable)
@@ -1112,6 +1123,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	}
 	h.initializeToolOptimizers()
 	if err := h.initializeProviders(); err != nil {
+		h.BeginShutdown()
+		return nil, err
+	}
+	if err := h.initializeConversationHistory(); err != nil {
 		h.BeginShutdown()
 		return nil, err
 	}
