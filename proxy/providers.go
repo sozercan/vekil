@@ -1396,6 +1396,16 @@ func configuredProviderEndpointPaths(kind providerType, cfg ProviderConfig) (pro
 
 	var err error
 	if kind == providerTypeTypeSafeCompatible {
+		for _, field := range []struct{ name, value string }{
+			{"chat_completions_path", cfg.ChatCompletionsPath},
+			{"responses_path", cfg.ResponsesPath},
+			{"messages_path", cfg.MessagesPath},
+			{"models_path", cfg.ModelsPath},
+		} {
+			if strings.TrimSpace(field.value) != "" {
+				return providerEndpointPaths{}, fmt.Errorf("%s is not supported for typesafe-compatible providers", field.name)
+			}
+		}
 		if paths.systemOne, err = normalizeProviderPath(cfg.SystemOnePath, paths.systemOne, "systemone_path"); err != nil {
 			return providerEndpointPaths{}, err
 		}

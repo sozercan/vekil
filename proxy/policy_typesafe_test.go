@@ -96,6 +96,11 @@ func TestPolicyTypeSafeConfig(t *testing.T) {
 		{"no reasoning metadata", func(c *ProvidersConfig) { c.ModelRoutes[2].ReasoningEffort = []string{"low"} }, "reasoning_effort"},
 		{"relative path", func(c *ProvidersConfig) { c.Providers[2].SystemOnePath = "evaluate" }, "systemone_path"},
 		{"path query", func(c *ProvidersConfig) { c.Providers[2].SystemOnePath = "/evaluate?key=secret" }, "systemone_path"},
+		{"no chat path", func(c *ProvidersConfig) { c.Providers[2].ChatCompletionsPath = "/custom-chat" }, "chat_completions_path"},
+		{"no responses path", func(c *ProvidersConfig) { c.Providers[2].ResponsesPath = "/custom-responses" }, "responses_path"},
+		{"no messages path", func(c *ProvidersConfig) { c.Providers[2].MessagesPath = "/custom-messages" }, "messages_path"},
+		{"no models path", func(c *ProvidersConfig) { c.Providers[2].ModelsPath = "/custom-models" }, "models_path"},
+		{"invalid other protocol path", func(c *ProvidersConfig) { c.Providers[2].ResponsesPath = "responses?key=secret" }, "responses_path"},
 		{"protocol mismatch", func(c *ProvidersConfig) { c.Providers[2].Type = "openai-compatible" }, "not supported"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -108,6 +113,11 @@ func TestPolicyTypeSafeConfig(t *testing.T) {
 				}
 			} else if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+			if strings.HasSuffix(test.want, "_path") {
+				if _, err := buildProviderRuntimeForProvidersConfig(cfg.Providers[2], "", nil, true); err == nil || !strings.Contains(err.Error(), test.want) {
+					t.Fatalf("runtime validation = %v, want %q", err, test.want)
+				}
 			}
 		})
 	}
