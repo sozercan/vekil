@@ -392,15 +392,21 @@ func TestPolicyTypeSafeRouting(t *testing.T) {
 			if stats.PhysicalClassifierSends != int64(wantCalls) {
 				t.Fatalf("reported classifier sends = %d", stats.PhysicalClassifierSends)
 			}
+			var classifierUsage taskUsageTotals
+			for _, row := range h.stats.snapshot().TaskUsage.ByKind {
+				if row.Kind == "classifier" {
+					classifierUsage = row.taskUsageTotals
+				}
+			}
+			if test.status != 0 || test.timeout {
+				if classifierUsage.Sends != 2 || classifierUsage.Completed != 2 || classifierUsage.Errors != 1 || classifierUsage.ReportedUsageSends != 1 ||
+					classifierUsage.Usage != (statsTokenUsage{PromptTokens: 10, CompletionTokens: 4, TotalTokens: 14}) {
+					t.Fatalf("failed classifier task usage = %+v", classifierUsage)
+				}
+			}
 			if test.status == 0 && !test.timeout && !test.malformed && test.mode != "off" {
 				if stats.ClassifierUsage.TotalTokens != 28 {
 					t.Fatalf("classifier usage = %+v", stats.ClassifierUsage)
-				}
-				var classifierUsage taskUsageTotals
-				for _, row := range h.stats.snapshot().TaskUsage.ByKind {
-					if row.Kind == "classifier" {
-						classifierUsage = row.taskUsageTotals
-					}
 				}
 				if classifierUsage.Sends != 2 || classifierUsage.Completed != 2 || classifierUsage.Errors != 0 || classifierUsage.ReportedUsageSends != 2 ||
 					classifierUsage.Usage != (statsTokenUsage{PromptTokens: 20, CompletionTokens: 8, TotalTokens: 28}) {

@@ -2759,6 +2759,8 @@ func (o *routeAttemptResponseObserver) inspectNonStreamingLocked() {
 			} else {
 				o.classifyInvalidNonStreamingEnvelopeLocked()
 			}
+		} else {
+			o.outcome = routeAttemptOutcomeFailed
 		}
 	default:
 		var usage *models.OpenAIUsage

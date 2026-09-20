@@ -154,6 +154,7 @@ func TestTaskUsageTypeSafeAccounting(t *testing.T) {
 		{name: "large response", body: `{` + usage + `,"padding":"` + strings.Repeat("x", routeAttemptObservationTail+1024) + `"}`, statusCode: http.StatusOK},
 		{name: "truncated", body: strings.TrimSuffix(response, "}"), statusCode: http.StatusOK, wantErrors: 1},
 		{name: "invalid JSON", body: response + `!`, statusCode: http.StatusOK, wantErrors: 1},
+		{name: "redirect", body: response, statusCode: http.StatusTemporaryRedirect, wantErrors: 1},
 		{name: "HTTP failure", body: response, statusCode: http.StatusUnprocessableEntity, wantErrors: 1},
 		{name: "throttled", body: response, statusCode: http.StatusTooManyRequests, wantErrors: 1, wantThrottles: 1},
 	} {
