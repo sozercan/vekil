@@ -3128,6 +3128,9 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 
 		owner := providerModelFromRouteTarget(route, target)
 		preparedBody, err := prepareRouteTargetBody(body, requestedModel, endpoint, route, target, owner)
+		if err == nil {
+			preparedBody, err = operation.conversation.prepareTargetBody(preparedBody, target)
+		}
 		if err != nil {
 			if sameTargetRetry {
 				suppressPendingRouteRetry(operation, failures, routeRetrySuppressedNonretryable, nil)
@@ -3175,18 +3178,21 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: failure.statusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
 			break
 		}
-		permit, blocked, admissionErr := h.acquireCopilotInference(req)
+		_, migrationReady := h.conversationMigrationTarget(ctx, operation, endpoint, kind)
+		var permit *copilotInferencePermit
+		var blocked *http.Response
+		var admissionErr error
+		// Either provider's local cooldown can reject before dispatch. Verify
+		// the original authenticated owner before that rejection can migrate.
+		if migrationReady {
+			_, admissionErr = h.validateDurableRequestOwner(req, route, target, operation)
+		}
+		if admissionErr == nil {
+			permit, blocked, admissionErr = h.acquireCopilotInference(req)
+		}
 		var azurePermit *azureTrafficPermit
 		if blocked == nil && admissionErr == nil {
-			_, migrationReady := h.conversationMigrationTarget(ctx, operation, endpoint, kind)
-			// A local cooldown can reject before the normal post-admission owner
-			// check. Validate the saved owner before that rejection can migrate.
-			if migrationReady {
-				_, admissionErr = h.validateDurableRequestOwner(req, route, target, operation)
-			}
-			if admissionErr == nil {
-				azurePermit, blocked, admissionErr = h.acquireAzureRouteInference(req, routeCanSwitchAfterAttempt(ctx, operation, endpoint, kind, h.ShuttingDown()) || migrationReady)
-			}
+			azurePermit, blocked, admissionErr = h.acquireAzureRouteInference(req, routeCanSwitchAfterAttempt(ctx, operation, endpoint, kind, h.ShuttingDown()) || migrationReady)
 			if blocked == nil && admissionErr == nil && azurePermit != nil && target.provider.azureAuthMode() == providerAuthModeAzureIdentity {
 				// A recovery queue can outlive the token attached during request
 				// construction. Refresh before reserving a physical send.

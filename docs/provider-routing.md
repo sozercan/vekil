@@ -220,9 +220,10 @@ Azure cooldowns are shared by resource origin and physical deployment across pub
 Automatic target switching is intentionally narrow:
 
 These are the default ownership rules. Opt-in
-[Azure conversation migration](conversation-migration.md) can reconstruct a
-saved complete conversation on another resource at the same safe boundaries.
-It never forwards an old resource's opaque state to the new resource.
+[Responses conversation migration](conversation-migration.md) can reconstruct a
+saved complete conversation on another Azure resource or Copilot at the same
+safe boundaries. It never forwards an old resource's opaque state to the new
+resource.
 
 | Observed outcome | Switch to the next target |
 |------------------|---------------------------|

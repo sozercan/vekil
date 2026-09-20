@@ -131,6 +131,14 @@ func TestConversationMigrationConfigRouteValidation(t *testing.T) {
 		wantError string
 	}{
 		{name: "different Azure deployments", change: func(*ProvidersConfig) {}},
+		{name: "Copilot backup", change: func(cfg *ProvidersConfig) {
+			cfg.Providers[1] = ProviderConfig{ID: "copilot", Type: "copilot"}
+			cfg.ModelRoutes[0].Targets[1].Provider = "copilot"
+		}},
+		{name: "Copilot source", change: func(cfg *ProvidersConfig) {
+			cfg.Providers[0] = ProviderConfig{ID: "copilot", Type: "copilot"}
+			cfg.ModelRoutes[0].Targets[0].Provider = "copilot"
+		}},
 		{name: "same provider different deployments", change: func(cfg *ProvidersConfig) {
 			cfg.ModelRoutes[0].Targets[1].Provider = cfg.Providers[0].ID
 			cfg.Providers = cfg.Providers[:1]
@@ -169,9 +177,9 @@ func TestConversationMigrationConfigRouteValidation(t *testing.T) {
 		{name: "insufficient send budget", change: func(cfg *ProvidersConfig) {
 			cfg.ModelRoutes[0].Routing.MaxUpstreamSends = 1
 		}, wantError: "model_routes[0].routing.max_upstream_sends"},
-		{name: "non Azure target", change: func(cfg *ProvidersConfig) {
+		{name: "unsupported target provider", change: func(cfg *ProvidersConfig) {
 			cfg.Providers[1].Type = string(providerTypeOpenAICompatible)
-		}, wantError: "conversation_migration.routes[0]: route \"gpt-route\" target \"secondary\" must use an azure-openai provider"},
+		}, wantError: "conversation_migration.routes[0]: route \"gpt-route\" target \"secondary\" must use an azure-openai or copilot provider"},
 		{name: "excessive route list", change: func(cfg *ProvidersConfig) {
 			cfg.ConversationMigration.Routes = make([]string, maxExplicitModelRoutes+1)
 		}, wantError: "conversation_migration.routes: contains 257 routes; maximum is 256"},

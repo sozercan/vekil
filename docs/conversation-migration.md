@@ -1,10 +1,10 @@
-# Azure conversation migration
+# Responses conversation migration
 
 Conversation migration lets a Codex Responses conversation continue on another
-Azure resource after a confirmed failure before execution. It preserves visible
-instructions, messages, local tool calls and their recorded results. The client
-process and local files stay in place. A completed file edit is context for the
-next generation; Vekil does not execute it again.
+Azure resource or GitHub Copilot after a confirmed failure before execution. It
+preserves visible instructions, messages, local tool calls and their recorded
+results. The client process and local files stay in place. A completed file edit
+is context for the next generation; Vekil does not execute it again.
 
 [Durable ownership](state-recovery.md) remembers which resource issued a token
 after Vekil restarts. Migration additionally saves the readable conversation
@@ -26,15 +26,42 @@ conversation_migration:
 ```
 
 `routes` contains operational `model_routes[].id` values. Each route must be
-public, advertise native `/responses`, contain at least two `azure-openai`
-targets, use `routing.mode: priority_failover`, and allow at least two target
-attempts and upstream sends. Configure the same model and compatible capabilities
-on both resources. Deployment names may differ. Existing
-[provider configuration](provider-routing.md) supplies endpoints and API-key or
-Microsoft Entra authentication.
+public, advertise native `/responses`, contain at least two targets using
+`azure-openai` or `copilot`, use `routing.mode: priority_failover`, and allow at
+least two target attempts and upstream sends. Configure the same underlying model
+and compatible tools and reasoning settings on all targets. Azure deployment
+names may differ from the Copilot model ID. Existing
+[provider configuration](provider-routing.md) supplies endpoints and provider
+authentication. Copilot uses the existing GitHub credential, and startup validates
+that the configured Copilot model advertises `/responses`.
 
-The limits shown are defaults. All are positive integers. Upper limits are
-64 MiB per snapshot, 16 GiB total logical bytes, and 1,000,000 snapshots.
+For east, west, then Copilot, register a `type: copilot` provider and append it to
+the existing route's targets. Allow three target attempts and upstream sends:
+
+```yaml
+targets:
+  - id: east
+    provider: azure-eastus2
+    upstream_model: gpt-6-astra
+  - id: west
+    provider: azure-westus3
+    upstream_model: gpt-6-astra
+  - id: copilot
+    provider: copilot
+    upstream_model: gpt-6-astra
+routing:
+  mode: priority_failover
+  max_target_attempts: 3
+  max_upstream_sends: 3
+```
+
+The saved history must fit the destination's context and request-size limits.
+A history within Vekil's storage quota can still exceed Copilot's input limits.
+Migration does not truncate or summarize it to make it fit.
+
+The `conversation_migration` limits shown above are defaults. All are positive
+integers. Upper limits are 64 MiB per snapshot, 16 GiB total logical bytes, and
+1,000,000 snapshots.
 `max_total_bytes` must be at least `max_history_bytes`. Durable `state_bindings`
 is required; a memory-mode process override also prevents startup. Removing the
 migration block restores ordinary ownership pinning and leaves saved history on
@@ -92,17 +119,26 @@ permit migration. Partial output, ambiguous delivery, cancellation, shutdown,
 an exhausted deadline or a storage failure cannot. Generic error statuses alone
 are insufficient proof that a request did not execute.
 
-Vekil reconstructs one request on the next eligible target using the same
-operation deadline and attempt/send budgets. There is at most one migration
-transition per request. It removes the old response ID, turn-state header and
-private reasoning before dispatch. Long histories consume more input tokens and
-can increase latency and cost; no automatic summarization reduces that history.
+Vekil reconstructs a request on the next eligible target using the same operation
+deadline and attempt/send budgets. A confirmed failure before execution on that
+backup can advance to another untried target. Migration never returns to an
+already attempted target. It removes the old response ID, turn-state header and
+private reasoning before dispatch. Each target uses its own authentication.
+Long histories consume more input tokens and can increase latency and cost;
+no automatic summarization reduces that history.
 
 Successful west output belongs to west. Response-ID continuations use the new
 ID when the response was stored upstream. For `store: false`, Vekil reconstructs
 from its local snapshot. Full-history clients can retain west-issued reasoning
 whose ownership is verified while earlier east reasoning is removed. This does
 not transfer east's private reasoning or promise identical future answers.
+
+Copilot rejects `store: true`. Migration-enabled routes send `store: false` to
+Copilot when the client requested storage, and always reconstruct Copilot
+response-ID continuations from Vekil's local snapshots. This also works after
+restart. The original Azure response IDs
+keep their Azure ownership. Refreshing a Copilot bearer preserves ownership;
+changing the source GitHub credential does not.
 
 Older east IDs keep their original ownership and immutable history. Branching
 from one cannot acquire later west messages. Different conversations proceed
@@ -114,7 +150,9 @@ The proxy-owned WebSocket bridge follows the same rules. Reconnect by sending
 send matching full history. This also works after a Vekil restart. An independent
 import uses per-turn `headers: {"X-Vekil-History-Complete": "true"}`. A
 `generate: false` staging ID remains connection-local and is not a saved
-generation. Experimental direct Copilot connections are outside this feature.
+generation. Migration-enabled routes always use upstream HTTP, including when
+the native Copilot WebSocket option is enabled for other routes. Experimental
+direct Copilot connections are outside this feature.
 
 ## Storage, diagnostics and deletion
 

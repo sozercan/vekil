@@ -23,7 +23,7 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-func newConversationAPIHandler(t *testing.T, transport http.RoundTripper, saved *ProvidersConfig) (*ProxyHandler, ProvidersConfig) {
+func newConversationAPIHandler(t *testing.T, transport http.RoundTripper, saved *ProvidersConfig, options ...Option) (*ProxyHandler, ProvidersConfig) {
 	t.Helper()
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("conversation migration requires Linux or macOS durable storage")
@@ -51,12 +51,14 @@ func newConversationAPIHandler(t *testing.T, transport http.RoundTripper, saved 
 			}},
 		}
 	}
-	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
+	options = append([]Option{
 		WithProvidersConfig(cfg), WithResponsesWebSocketConfig(ResponsesWebSocketConfig{Enabled: true}),
 		func(h *ProxyHandler) {
 			h.client = &http.Client{Transport: transport}
 			h.streamingUpstreamTimeout = 3 * time.Second
-		})
+		},
+	}, options...)
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), options...)
 	if err != nil {
 		t.Fatal(err)
 	}

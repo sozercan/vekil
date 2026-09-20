@@ -1994,6 +1994,11 @@ func (s *responsesWebSocketSession) nativeInputLimitsApply(h *ProxyHandler, mode
 		return true
 	}
 	if route, known := h.resolveModelRouteForRequest(model, providerEndpointResponses); known && route != nil {
+		if h.conversationMigrationEnabled(route) {
+			// Protected turns always use the HTTP bridge, including after a
+			// switch to Copilot with NativeUpstream enabled for other routes.
+			return false
+		}
 		if s.explicitTargetID != "" {
 			target, ok := route.targetByID(s.explicitTargetID)
 			return ok && target.provider != nil && target.provider.kind == providerTypeCopilot

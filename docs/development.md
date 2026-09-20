@@ -127,8 +127,8 @@ first-issuance storage latency.
 
 ### Conversation migration suite
 
-Opt-in Azure migration uses synthetic providers and private temporary stores.
-Run the same suite on macOS APFS and Linux to execute process-kill/reopen tests:
+Opt-in Azure/Copilot migration uses synthetic providers and private temporary
+stores. Run the same suite on macOS APFS and Linux to execute process-kill/reopen tests:
 
 ```bash
 go test ./proxy -run '^Test(Conversation|LoadProvidersConfigFileConversationMigration)' -count=1
@@ -141,8 +141,8 @@ recovery, immutable older branches, WebSocket reconnect, uncertain execution,
 storage faults/capacity/corruption, concurrent admission, offline deletion and
 process kills around history commits. Core CI runs these tests on Linux and
 the Darwin durable-storage job runs them on macOS. Complete the production gate
-before live Azure validation. A live check must use a separate providers file,
-database and client workspace, a confirmed prewrite outage, and record the
+before live Azure/Copilot validation. A live check must use a separate providers
+file, database and client workspace, a confirmed prewrite outage, and record the
 answering resource, retained context, local side-effect count and next turn.
 
 The admission benchmark reserves and clears a pending turn with 0, 4,096, and

@@ -272,7 +272,7 @@ func TestConversationMigrationRejectsRedirects(t *testing.T) {
 	}
 }
 
-func TestConversationMigrationHasOneTransitionAndSharedBudget(t *testing.T) {
+func TestConversationMigrationUsesEachTargetOnceWithSharedBudget(t *testing.T) {
 	var outage atomic.Bool
 	var east, west, third atomic.Int32
 	var eastOperation *routeOperation
@@ -302,6 +302,12 @@ func TestConversationMigrationHasOneTransitionAndSharedBudget(t *testing.T) {
 			}
 		default:
 			third.Add(1)
+			operation := routeOperationFromContext(req.Context())
+			deadline, _ := req.Context().Deadline()
+			sends, switches, _ := operation.snapshot()
+			if operation != eastOperation || deadline != eastDeadline || sends != 3 || switches != 2 {
+				t.Errorf("third target replaced the operation, extended the deadline, or reset budgets: sends=%d switches=%d", sends, switches)
+			}
 		}
 		return nil, errors.New("connection failed before write")
 	})
@@ -315,10 +321,10 @@ func TestConversationMigrationHasOneTransitionAndSharedBudget(t *testing.T) {
 	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
 	outage.Store(true)
 	failed := conversationPOST(t, h, map[string]any{"previous_response_id": "budget-east-1", "input": "Continue."}, nil)
-	if failed.Code < 400 || east.Load() != 2 || west.Load() != 1 || third.Load() != 0 || strings.Contains(failed.Body.String(), `"migration":"completed"`) {
-		t.Fatalf("more than one transition or false completion: %d %s east=%d west=%d third=%d", failed.Code, failed.Body.String(), east.Load(), west.Load(), third.Load())
+	if failed.Code < 400 || east.Load() != 2 || west.Load() != 1 || third.Load() != 1 || strings.Contains(failed.Body.String(), `"migration":"completed"`) {
+		t.Fatalf("target repeated or false completion: %d %s east=%d west=%d third=%d", failed.Code, failed.Body.String(), east.Load(), west.Load(), third.Load())
 	}
-	// Both sends provably failed before execution. The original branch remains
+	// All sends provably failed before execution. The original branch remains
 	// usable, and a failed switch must not redirect it or retain an uncertainty.
 	outage.Store(false)
 	response := conversationCompleted(t, conversationPOST(t, h, map[string]any{"previous_response_id": "budget-east-1", "input": "Retry after recovery."}, nil), false)

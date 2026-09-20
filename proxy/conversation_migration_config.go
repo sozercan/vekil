@@ -18,8 +18,8 @@ const (
 )
 
 // ConversationMigrationConfig opts selected operational routes into durable
-// Responses conversation migration. Limits bound complete saved snapshots,
-// their total stored bytes, and their count without reserving storage.
+// Responses conversation migration between Azure and Copilot targets. Limits
+// bound complete snapshots, total stored bytes, and count without reserving storage.
 type ConversationMigrationConfig struct {
 	Routes          []string `json:"routes" yaml:"routes"`
 	MaxHistoryBytes int      `json:"max_history_bytes,omitempty" yaml:"max_history_bytes,omitempty"`
@@ -131,10 +131,14 @@ func normalizeAndValidateConversationMigrationConfig(cfg *ProvidersConfig, route
 			return configPathError(path, "route %q must allow at least two target attempts and upstream sends", routeID)
 		}
 		for _, target := range route.Targets {
-			if providers[target.Provider].kind != providerTypeAzureOpenAI {
-				return configPathError(path, "route %q target %q must use an azure-openai provider", routeID, target.ID)
+			if !conversationMigrationProviderSupported(providers[target.Provider].kind) {
+				return configPathError(path, "route %q target %q must use an azure-openai or copilot provider", routeID, target.ID)
 			}
 		}
 	}
 	return nil
+}
+
+func conversationMigrationProviderSupported(kind providerType) bool {
+	return kind == providerTypeAzureOpenAI || kind == providerTypeCopilot
 }

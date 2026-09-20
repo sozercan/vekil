@@ -10,10 +10,10 @@ Durable storage cannot reconstruct bindings already lost through restart,
 expiry, or eviction in memory mode. Vekil validates and opens the store before
 listening; configuration changes require a restart.
 
-Opt-in [Azure conversation migration](conversation-migration.md) adds saved
-visible history to this store so a conversation can continue on another resource.
-The ownership-only defaults described here do not store that history or migrate
-conversations.
+Opt-in [Responses conversation migration](conversation-migration.md) adds saved
+visible history to this store so a conversation can continue on another Azure
+resource or Copilot. The ownership-only defaults described here do not store
+that history or migrate conversations.
 
 ## Configure one local writer
 

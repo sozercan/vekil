@@ -120,11 +120,16 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		if err != nil {
 			return fail(err)
 		}
-		if source == nil {
-			source, err = store.lookupIndexes(store.prefixIndexes(routeID, store.clientScope(routeID, headers), input.items))
-			if err != nil {
-				return fail(err)
-			}
+		prefix, err := store.lookupIndexes(store.prefixIndexes(routeID, store.clientScope(routeID, headers), input.items))
+		if err != nil {
+			return fail(err)
+		}
+		// A client may replay streamed item IDs absent from the terminal
+		// response. An older anchor must not hide a newer complete snapshot,
+		// but a matching prefix cannot override a different anchored lineage.
+		if prefix != nil && (source == nil || (prefix.Root == source.Root &&
+			len(prefix.Input) > len(source.Input) && conversationHasPrefix(prefix.Input, source.Input))) {
+			source = prefix
 		}
 	}
 	fullInput := input.items
@@ -326,6 +331,20 @@ func (t *conversationTurn) historyRequest(input []json.RawMessage, headers http.
 	return body, headers, nil
 }
 
+func (t *conversationTurn) prepareTargetBody(body []byte, target targetBinding) ([]byte, error) {
+	if t == nil || target.provider == nil || target.provider.kind != providerTypeCopilot ||
+		!bytes.Equal(bytes.TrimSpace(t.fields["store"]), []byte("true")) {
+		return body, nil
+	}
+	// Copilot rejects store:true. Protected turns already save their complete
+	// history locally, so response-ID continuations can reconstruct it instead.
+	rewritten, ok := replaceSingleTopLevelRawJSONField(body, "store", json.RawMessage("false"))
+	if !ok {
+		return nil, conversationRequestError(errConversationHistoryPartial)
+	}
+	return rewritten, nil
+}
+
 func (t *conversationTurn) persistIntent() error {
 	if t == nil {
 		return nil
@@ -403,18 +422,20 @@ func (h *ProxyHandler) conversationMigrationTarget(ctx context.Context, operatio
 	t.mu.Lock()
 	attempted, closed := t.attempted, t.closed
 	t.mu.Unlock()
-	if attempted || closed || operation.pinnedTarget() == "" {
+	if closed || operation.pinnedTarget() == "" {
 		return targetBinding{}, false
 	}
 	operation.mu.Lock()
 	defer operation.mu.Unlock()
-	if operation.stateOwnerIdentity == [32]byte{} || operation.route.policy.mode != routeModePriorityFailover {
+	// The first reconstruction requires verified original ownership. Later
+	// candidates use the same complete history after a proven safe failure.
+	if (!attempted && operation.stateOwnerIdentity == [32]byte{}) || operation.route.policy.mode != routeModePriorityFailover {
 		return targetBinding{}, false
 	}
 	for _, target := range operation.route.targets {
 		_, attempted := operation.attemptedTargets[target.id]
 		if target.id != operation.pinnedTargetID && !attempted && target.provider != nil &&
-			target.provider.kind == providerTypeAzureOpenAI && target.provider.supportsEndpoint(endpoint) {
+			conversationMigrationProviderSupported(target.provider.kind) && target.provider.supportsEndpoint(endpoint) {
 			return target, true
 		}
 	}
@@ -460,8 +481,8 @@ func (h *ProxyHandler) tryConversationMigration(ctx context.Context, operation *
 	t.attempted, t.migrated = true, true
 	t.mu.Unlock()
 	operation.mu.Lock()
-	// This is the sole exception to the original owner pin. No saved ownership
-	// fact changes, and the operation cannot switch targets again.
+	// Reconstruction is the sole exception to the original owner pin. Saved
+	// ownership never changes, and attemptedTargets prevents revisiting a target.
 	operation.pinnedTargetID, operation.hardPinned = target.id, true
 	operation.stateOwnerIdentity = [32]byte{}
 	operation.bootstrapConversation = nil
@@ -526,6 +547,11 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 		Input: append(cloneRawMessages(t.input), output.items...), Instructions: t.instructions, Tools: t.tools, Migrated: t.migrated,
 		AdditionalTools: cloneRawMessages(t.additionalTools),
 		Stored:          !bytes.Equal(bytes.TrimSpace(t.fields["store"]), []byte("false")),
+	}
+	if target, ok := t.operation.route.targetByID(info.targetID); ok && target.provider != nil && target.provider.kind == providerTypeCopilot {
+		// Copilot continuations use our durable snapshots, including when
+		// store was omitted. Keep its IDs as local history anchors.
+		snapshot.Stored = false
 	}
 	if err := validateConversationToolSequence(snapshot.Input, true); err != nil {
 		return nil, conversationRequestError(err)
