@@ -233,12 +233,6 @@ func normalizeAndValidatePolicyProfileConfig(profile *PolicyProfileConfig, path 
 	if profile.Classifier.TimeoutMS < 100 || profile.Classifier.TimeoutMS > 10000 {
 		return configPathError(classifierPath+".timeout_ms", "must be between 100 and 10000")
 	}
-	if !profile.Classifier.maxCompletionTokensSet && profile.Classifier.MaxCompletionTokens == 0 {
-		profile.Classifier.MaxCompletionTokens = defaultPolicyClassifierMaxCompletionTokens
-	}
-	if profile.Classifier.MaxCompletionTokens < 32 || profile.Classifier.MaxCompletionTokens > 1024 {
-		return configPathError(classifierPath+".max_completion_tokens", "must be between 32 and 1024")
-	}
 	if !profile.Classifier.maxRequestBytesSet && profile.Classifier.MaxRequestBytes == 0 {
 		profile.Classifier.MaxRequestBytes = defaultPolicyClassifierMaxRequestBytes
 	}
@@ -306,7 +300,7 @@ func policyProfileControlsReasoning(profile PolicyProfileConfig) bool {
 }
 
 func validatePolicyProfileConfigReferences(
-	profile PolicyProfileConfig,
+	profile *PolicyProfileConfig,
 	profileIndex int,
 	routes map[string]*ModelRouteConfig,
 	providers map[string]providerConfigDescriptor,
@@ -335,7 +329,7 @@ func validatePolicyProfileConfigReferences(
 	if err != nil {
 		return err
 	}
-	if policyProfileControlsReasoning(profile) {
+	if policyProfileControlsReasoning(*profile) {
 		if err := validatePolicyReasoningEffort(profile.Lightweight.ReasoningEffort, path+".lightweight.reasoning_effort", lightweight, profile.Lightweight.Route); err != nil {
 			return err
 		}
@@ -353,6 +347,18 @@ func validatePolicyProfileConfigReferences(
 	classifierProvider, err := validatePolicyClassifierRoute(classifier, path+".classifier.route", providers)
 	if err != nil {
 		return err
+	}
+	if classifierProvider.kind == providerTypeTypeSafeCompatible {
+		if profile.Classifier.maxCompletionTokensSet || profile.Classifier.MaxCompletionTokens != 0 {
+			return configPathError(path+".classifier.max_completion_tokens", "is not supported by the TypeSafe protocol")
+		}
+	} else {
+		if !profile.Classifier.maxCompletionTokensSet && profile.Classifier.MaxCompletionTokens == 0 {
+			profile.Classifier.MaxCompletionTokens = defaultPolicyClassifierMaxCompletionTokens
+		}
+		if profile.Classifier.MaxCompletionTokens < 32 || profile.Classifier.MaxCompletionTokens > 1024 {
+			return configPathError(path+".classifier.max_completion_tokens", "must be between 32 and 1024")
+		}
 	}
 	if profile.Classifier.ReasoningEffort != "" {
 		if classifierProvider.kind == providerTypeTypeSafeCompatible {

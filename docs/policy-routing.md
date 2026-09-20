@@ -177,7 +177,7 @@ Unavailable and uncertain fallbacks are not cached in v1.
 | classifier `profile` | `coding_agent_v1` |
 | classifier `reasoning_effort` | omitted, provider default |
 | `timeout_ms` | `3000` |
-| `max_completion_tokens` | `256` |
+| `max_completion_tokens` | `256`, Chat classifiers only |
 | `max_request_bytes` | `16000` |
 | `recent_turns` | `4` |
 | `max_concurrency` | `4` |
@@ -189,7 +189,7 @@ Valid classifier profile ranges are:
 |---|---|
 | `reasoning_effort` | optional non-empty value from the classifier route's `reasoning_effort` allowlist |
 | `timeout_ms` | `100..10000` |
-| `max_completion_tokens` | `32..1024` |
+| `max_completion_tokens` | `32..1024`, Chat classifiers only |
 | `max_request_bytes` | `1024..65536` |
 | `recent_turns` | `0..8` |
 | `max_concurrency` | `1..32` |
@@ -325,7 +325,7 @@ The classifier route must use `exposure: internal`, `internal_purpose: policy_cl
 
 Vekil sends bounded canonical facts as `state` and asks seven independent `choice` questions in one request. Booleans use explicit `true`/`false` choices and tool estimates use integer choices `0..128`. The adapter converts selected choices into the same policy signals used by Chat classifiers. Provider probabilities and confidence do not affect routing. Admission, deadlines, observe mode, fallbacks, and usage accounting remain shared.
 
-The TypeSafe protocol has no documented request-level non-storage option. Omit `classifier_no_store_supported` or set it to `false`, and explicitly set `data_policy.allow_provider_retention: true`. The usual content-forwarding and trust-domain checks still apply. Classifier `reasoning_effort` is unsupported; `max_completion_tokens` applies only to Chat-based classifiers and is not sent to TypeSafe.
+The TypeSafe protocol has no documented request-level non-storage option. Omit `classifier_no_store_supported` or set it to `false`, and explicitly set `data_policy.allow_provider_retention: true`. The usual content-forwarding and trust-domain checks still apply. Omit classifier `reasoning_effort` and `max_completion_tokens`; TypeSafe does not support either field, and validation rejects them when configured.
 
 For direct Jev, use `base_url: https://api.typesafe.ai/v1` and `upstream_model: jev-latest`. See [the TypeSafe policy example](../examples/policy-routing-typesafe.yaml), which uses Jev to classify requests for Copilot terminal models. A compatible gateway can use the same adapter by changing the base URL, credentials, and model ID.
 

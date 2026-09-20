@@ -21,6 +21,9 @@ func newPolicyTypeSafeClassifier(options policyHTTPClassifierOptions, send polic
 	if options.ReasoningEffort != "" {
 		return nil, fmt.Errorf("TypeSafe classification does not support reasoning_effort")
 	}
+	if options.MaxCompletionTokens != 0 {
+		return nil, fmt.Errorf("TypeSafe classification does not support max_completion_tokens")
+	}
 	classifier, err := newPolicyHTTPClassifier(options, send)
 	if err != nil {
 		return nil, err

@@ -27,6 +27,7 @@ func policyTypeSafeTestConfig(lightURL, powerfulURL, classifierURL, mode string)
 	cfg.ModelRoutes[2].Endpoints = []string{providerEndpointSystemOne}
 	cfg.ModelRoutes[2].Targets[0].Provider = "evaluation"
 	cfg.ModelRoutes[2].Targets[0].UpstreamModel = "test-evaluator"
+	cfg.PolicyProfiles[0].Classifier.MaxCompletionTokens = 0
 	cfg.PolicyProfiles[0].DataPolicy.AllowProviderRetention = true
 	return cfg
 }
@@ -93,6 +94,7 @@ func TestPolicyTypeSafeConfig(t *testing.T) {
 		{"no terminal use", func(c *ProvidersConfig) { c.PolicyProfiles[0].Lightweight.Route = "classifier-route" }, "reserved for internal purpose"},
 		{"one send", func(c *ProvidersConfig) { c.ModelRoutes[2].Routing.MaxUpstreamSends = 2 }, "max_upstream_sends"},
 		{"no reasoning", func(c *ProvidersConfig) { c.PolicyProfiles[0].Classifier.ReasoningEffort = "low" }, "reasoning_effort"},
+		{"no completion tokens", func(c *ProvidersConfig) { c.PolicyProfiles[0].Classifier.MaxCompletionTokens = 256 }, "classifier.max_completion_tokens"},
 		{"no reasoning metadata", func(c *ProvidersConfig) { c.ModelRoutes[2].ReasoningEffort = []string{"low"} }, "reasoning_effort"},
 		{"relative path", func(c *ProvidersConfig) { c.Providers[2].SystemOnePath = "evaluate" }, "systemone_path"},
 		{"path query", func(c *ProvidersConfig) { c.Providers[2].SystemOnePath = "/evaluate?key=secret" }, "systemone_path"},
@@ -155,6 +157,9 @@ func TestPolicyTypeSafeConfigDecodesOffline(t *testing.T) {
 			if decoded.Providers[2].SystemOnePath != "/custom-evaluate" {
 				t.Fatal("custom endpoint was lost")
 			}
+			if decoded.PolicyProfiles[0].Classifier.MaxCompletionTokens != 0 {
+				t.Fatal("TypeSafe classifier acquired a Chat completion-token default")
+			}
 			if err := ValidateProvidersConfigFile(path); err != nil {
 				t.Fatal(err)
 			}
@@ -162,6 +167,60 @@ func TestPolicyTypeSafeConfigDecodesOffline(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatal("offline validation contacted a provider")
+	}
+}
+
+func TestPolicyTypeSafeCompletionTokenConfig(t *testing.T) {
+	for _, format := range []string{"json", "yaml"} {
+		for _, test := range []struct {
+			name  string
+			set   bool
+			value int
+		}{
+			{name: "omitted"},
+			{name: "explicit zero", set: true},
+			{name: "custom limit", set: true, value: 64},
+			{name: "Chat default", set: true, value: 256},
+		} {
+			t.Run(format+"/"+test.name, func(t *testing.T) {
+				cfg := policyTypeSafeTestConfig("https://light.example", "https://power.example", "https://evaluation.example", "observe")
+				second := clonePolicyProfileConfig(cfg.PolicyProfiles[0])
+				second.ID, second.PublicID = "second-policy", "second-model"
+				cfg.PolicyProfiles = append(cfg.PolicyProfiles, second)
+				body, err := json.Marshal(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var document map[string]any
+				if err := json.Unmarshal(body, &document); err != nil {
+					t.Fatal(err)
+				}
+				if test.set {
+					profile := document["policy_profiles"].([]any)[1].(map[string]any)
+					profile["classifier"].(map[string]any)["max_completion_tokens"] = test.value
+				}
+				if format == "json" {
+					body, err = json.Marshal(document)
+				} else {
+					body, err = yaml.Marshal(document)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(t.TempDir(), "providers."+format)
+				if err := os.WriteFile(path, body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				err = ValidateProvidersConfigFile(path)
+				if !test.set {
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), "policy_profiles[1].classifier.max_completion_tokens: is not supported by the TypeSafe protocol") {
+					t.Fatalf("validation error = %v, want unsupported completion-token setting", err)
+				}
+			})
+		}
 	}
 }
 

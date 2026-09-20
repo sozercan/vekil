@@ -409,7 +409,8 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 
 	preflightContracts := make(map[string]PolicyClassifierConfig, len(validated.config.PolicyProfiles))
 	preflightOwners := make(map[string]int, len(validated.config.PolicyProfiles))
-	for profileIndex, profile := range validated.config.PolicyProfiles {
+	for profileIndex := range validated.config.PolicyProfiles {
+		profile := &validated.config.PolicyProfiles[profileIndex]
 		if err := validatePolicyProfileConfigReferences(profile, profileIndex, routeConfigs, providers, policyReferences); err != nil {
 			return validatedProvidersConfig{}, err
 		}
