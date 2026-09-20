@@ -728,6 +728,7 @@ cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
 | Big Pickle | big-pickle | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
 | Ox Alpha Free | x-preview-f-free | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
 | Muse Spark Free | muse-spark-free | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
+| Jev Free | jev-free | `https://opencode.ai/zen/v1/systemone` | - |
 
 ## Pricing
 
@@ -737,6 +738,7 @@ cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
 | Big Pickle | Free | Free | Free | - |
 | Ox Alpha Free | Free | Free | Free | - |
 | Muse Spark Free | Free | Free | Free | - |
+| Jev Free | Free | Free | - | - |
 
 ### Retirement dates
 
@@ -752,11 +754,18 @@ EOF_ZEN_EXPECTED
 if "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
   "${zen_parser_dir}/zen.mdx" > "${zen_parser_dir}/actual.tsv" \
   && cmp -s "${zen_parser_dir}/expected.tsv" "${zen_parser_dir}/actual.tsv"; then
-  record_success "Zen free-label parser joins pricing labels to endpoint aliases"
+  record_success "Zen free-label parser joins aliases and excludes classifiers"
 else
-  record_failure "Zen free-label parser joins pricing labels to endpoint aliases" \
+  record_failure "Zen free-label parser joins aliases and excludes classifiers" \
     "$(diff -u "${zen_parser_dir}/expected.tsv" "${zen_parser_dir}/actual.tsv" 2>&1 || true)"
 fi
+
+sed 's@/systemone@/unknown-evaluation@g' "${zen_parser_dir}/zen.mdx" \
+  > "${zen_parser_dir}/unknown-endpoint.mdx"
+expect_hard_failure_with_stderr "Zen free-label parser still rejects unknown endpoints" 4 \
+  'unsupported endpoint for Jev Free: https://opencode.ai/zen/v1/unknown-evaluation' \
+  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/unknown-endpoint.mdx"
 
 cat > "${zen_parser_dir}/missing-endpoint.mdx" <<'EOF_ZEN_MISSING'
 ## Endpoints
