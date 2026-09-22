@@ -442,6 +442,8 @@ Each bounded decision record carries IDs/enums/counts, latency/failure categorie
 
 Generation hashes use normalized values and exclude secret values. Decision records, logs, and aggregate labels never contain prompt text, raw classifier output, tool arguments, credentials, or classifier rationale.
 
+TypeSafe classifier HTTP responses emit an info-level `policy classifier request completed` receipt, including failures. Each receipt records `policy_id`, the configured classifier `model`, `status_code`, `traffic_bucket` (`preflight` or `request`), and `reported_usage` from the physical-send ledger. Request receipts include the parent `operation_id` when available, including detached observe work. `generation_id` is included only when an unambiguous `providerMetadata.gateway.generationId` or `provider_metadata.gateway.generationId` matches `^gen_[A-Za-z0-9]{26}$`. Missing or invalid IDs are omitted. These receipts do not contain response bodies or headers, do not alter routing or retries, and do not establish the cost of a call whose usage is missing. Transport failures without an HTTP response produce no response receipt.
+
 ## Evaluation gates before enforcement
 
 Do not enable production enforcement because observe-mode routing percentages look plausible. The operator release gate requires an actual end-to-end policy evaluation:

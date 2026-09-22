@@ -609,6 +609,7 @@ func validatePolicyPublicRequestContract(body []byte, contract publicModelContra
 func (c *chatPolicyRoutingController) enforce(ctx context.Context, profile *compiledPolicyProfile, input chatPolicyInput, facts policyClassifierFacts, bucket string) (chatOperationPlan, error) {
 	classifyCtx, cancel := c.h.newPolicyClassificationContext(ctx, time.Duration(profile.config.Classifier.TimeoutMS)*time.Millisecond)
 	classifyCtx = withPolicyStatsBucket(classifyCtx, bucket)
+	classifyCtx = context.WithValue(classifyCtx, policyClassifierOperationIDContextKey{}, input.OperationID)
 	classifyCtx, dispatchEvidence := withPolicyClassifierDispatchEvidence(classifyCtx)
 	start := time.Now()
 	result := profile.classifierRuntime.classify(classifyCtx, facts)
@@ -686,6 +687,7 @@ func (c *chatPolicyRoutingController) launchObservation(ctx context.Context, pro
 		defer lease.release()
 		observeCtx, cancel := c.h.newPolicyObserveContext(time.Duration(profile.config.Classifier.TimeoutMS) * time.Millisecond)
 		observeCtx = withPolicyStatsBucket(observeCtx, bucket)
+		observeCtx = context.WithValue(observeCtx, policyClassifierOperationIDContextKey{}, input.OperationID)
 		observeCtx, dispatchEvidence := withPolicyClassifierDispatchEvidence(observeCtx)
 		start := time.Now()
 		signals, err := profile.classifierAdapter.Classify(observeCtx, facts)
@@ -938,7 +940,7 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 		if endpoint == providerEndpointResponses {
 			response, err = h.sendPolicyClassifierOverResponses(ctx, route, target, owner, prepared, headers)
 		} else {
-			response, err = h.sendPolicyClassifierJSON(ctx, target, owner, endpoint, prepared, headers)
+			response, err = h.sendPolicyClassifierJSON(ctx, target, owner, endpoint, prepared, headers, profile.ID)
 		}
 		if err != nil {
 			return policyClassifierHTTPResponse{}, err
@@ -959,7 +961,7 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 	})
 }
 
-func (h *ProxyHandler) sendPolicyClassifierJSON(ctx context.Context, target targetBinding, owner providerModel, endpoint string, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
+func (h *ProxyHandler) sendPolicyClassifierJSON(ctx context.Context, target targetBinding, owner providerModel, endpoint string, body []byte, headers http.Header, policyID string) (policyClassifierHTTPResponse, error) {
 	req, err := h.newProviderJSONInferenceRequest(ctx, target.provider, http.MethodPost, endpoint, body, headers, "", owner)
 	if err != nil {
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, true)
@@ -987,7 +989,11 @@ func (h *ProxyHandler) sendPolicyClassifierJSON(ctx context.Context, target targ
 		preSend := !observation.wroteHeaders.Load() && !observation.wroteRequest.Load()
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, preSend)
 	}
-	return readPolicyClassifierHTTPResponse(resp)
+	response, readErr := readPolicyClassifierHTTPResponse(resp)
+	if endpoint == providerEndpointSystemOne {
+		h.logPolicyTypeSafeReceipt(ctx, policyID, target.upstreamModel, resp, response.Body)
+	}
+	return response, readErr
 }
 
 func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, route *modelRoute, target targetBinding, owner providerModel, chatBody []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
