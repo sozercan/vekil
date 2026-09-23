@@ -417,19 +417,22 @@ func (t *conversationTurn) finish() {
 	t.store.release(t.root)
 }
 
-// An unsupported completion already executed upstream. Expose it unchanged,
-// clear the attempt marker because the outcome is known, and leave the turn
-// without a snapshot. The caller holds t.mu.
-func (t *conversationTurn) unprotect(targetID, reason string) {
-	t.unprotected, t.blocked = true, true
+// An unsupported completion already executed upstream. Clear the attempt
+// marker because the outcome is known, then expose the completion unchanged
+// without a snapshot. A marker that cannot be cleared withholds the completion
+// like a failed snapshot save does. The caller holds t.mu.
+func (t *conversationTurn) unprotect(targetID, reason string) error {
 	if t.pending {
 		if err := t.store.clearAttempt(t.root); err != nil {
-			t.h.logConversationRecovery(t.operation, "blocked", targetID, "storage_unavailable")
-		} else {
-			t.pending = false
+			t.blocked = true
+			t.h.logConversationRecovery(t.operation, "blocked", targetID, conversationFailureReason(err))
+			return conversationRequestError(err)
 		}
+		t.pending = false
 	}
+	t.unprotected, t.blocked = true, true
 	t.h.logConversationRecovery(t.operation, "unprotected", targetID, reason)
+	return nil
 }
 
 func (t *conversationTurn) recoveryHeader() string {
@@ -584,7 +587,9 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 	output, err := canonicalConversationInput(response["output"], true)
 	if err != nil {
 		if conversationUnsupportedState(err) {
-			t.unprotect(info.targetID, conversationFailureReason(err))
+			if err := t.unprotect(info.targetID, conversationFailureReason(err)); err != nil {
+				return nil, err
+			}
 			return data, nil
 		}
 		return nil, conversationRequestError(err)

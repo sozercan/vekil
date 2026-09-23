@@ -115,6 +115,7 @@ type ProviderConfig struct {
 
 	trustDomainSet                bool
 	classifierNoStoreSupportedSet bool
+	hostedToolsSet                bool
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the

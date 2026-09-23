@@ -265,7 +265,8 @@ func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.R
 		return nil, err
 	}
 	var action map[string]json.RawMessage
-	if json.Unmarshal(item["action"], &action) != nil || action == nil || rawJSONString(item["id"]) == "" {
+	if json.Unmarshal(item["action"], &action) != nil || action == nil || rawJSONString(item["id"]) == "" ||
+		rawJSONString(item["status"]) != "completed" {
 		return nil, errConversationHostedState
 	}
 	normalizedAction := make(map[string]json.RawMessage, len(action))

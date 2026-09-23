@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -182,6 +183,65 @@ func TestConversationMigrationForwardsUnsupportedStateUnprotected(t *testing.T) 
 	}
 }
 
+func TestConversationWebSearchCallCanonicalForm(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		item string
+		want string
+	}{
+		{"completed with sources", `{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"docs","sources":[{"type":"url","url":"https://example.com"}]}}`,
+			`{"action":{"query":"docs","type":"search"},"id":"ws_1","status":"completed","type":"web_search_call"}`},
+		{"open page", `{"type":"web_search_call","id":"ws_2","status":"completed","action":{"type":"open_page","url":"https://example.com"}}`,
+			`{"action":{"type":"open_page","url":"https://example.com"},"id":"ws_2","status":"completed","type":"web_search_call"}`},
+		{"missing status", `{"type":"web_search_call","id":"ws_3","action":{"type":"search","query":"docs"}}`, ""},
+		{"in progress", `{"type":"web_search_call","id":"ws_4","status":"in_progress","action":{"type":"search","query":"docs"}}`, ""},
+		{"missing id", `{"type":"web_search_call","status":"completed","action":{"type":"search","query":"docs"}}`, ""},
+		{"missing action type", `{"type":"web_search_call","id":"ws_5","status":"completed","action":{"query":"docs"}}`, ""},
+		{"unknown field", `{"type":"web_search_call","id":"ws_6","status":"completed","action":{"type":"search"},"results":[]}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input, err := canonicalConversationInput(json.RawMessage("["+tc.item+"]"), true)
+			if tc.want == "" {
+				if !errors.Is(err, errConversationHostedState) {
+					t.Fatalf("err = %v, want unsupported state", err)
+				}
+				return
+			}
+			if err != nil || len(input.items) != 1 || string(input.items[0]) != tc.want {
+				t.Fatalf("canonical = %s (err %v), want %s", input.items, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestConversationMigrationOptimizesUnprotectedRequests(t *testing.T) {
+	originalOutput := strings.Repeat("original tool output ", 64)
+	var sends atomic.Int32
+	h, _ := newConversationAPIHandler(t, routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/models") {
+			return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+		}
+		body, _ := io.ReadAll(req.Body)
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		if bytes.Contains(body, []byte(originalOutput)) || !bytes.Contains(body, []byte("reduced output")) {
+			t.Errorf("unprotected request skipped the optimizer: %s", body)
+		}
+		return conversationResponse(t, req, fmt.Sprintf("unprotected-%d", sends.Add(1)), conversationText("Read.")), nil
+	}), nil)
+	configureRecordingToolOptimizer(h, &recordingToolOptimizer{})
+	result := conversationPOST(t, h, map[string]any{
+		"tools": []any{map[string]any{"type": "code_interpreter", "container": "provider-owned"}},
+		"input": []any{
+			map[string]any{"role": "user", "content": "Read the command output."},
+			map[string]any{"type": "function_call", "call_id": "optimizer-call", "name": "shell_command", "arguments": `{"command":"cat big.log"}`},
+			map[string]any{"type": "function_call_output", "call_id": "optimizer-call", "output": originalOutput},
+		},
+	}, http.Header{"X-Vekil-History-Complete": {"true"}})
+	if result.Code != http.StatusOK || sends.Load() != 1 || strings.Contains(result.Body.String(), `"history":"saved"`) {
+		t.Fatalf("unprotected request = %d %s sends=%d", result.Code, result.Body.String(), sends.Load())
+	}
+}
+
 func TestProviderHostedToolsConfigValidation(t *testing.T) {
 	base := func() ProvidersConfig {
 		return ProvidersConfig{
@@ -237,7 +297,7 @@ func TestProviderHostedToolsConfigValidation(t *testing.T) {
 	})
 	t.Run("schema v1", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "providers.yaml")
-		body := "schema_version: 1\nproviders:\n  - id: upstream\n    type: openai-compatible\n    base_url: https://example.test/v1\n    auth_type: none\n    hosted_tools: [web_search]\n"
+		body := "schema_version: 1\nproviders:\n  - id: upstream\n    type: openai-compatible\n    base_url: https://example.test/v1\n    auth_type: none\n    hosted_tools: []\n"
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}

@@ -474,7 +474,7 @@ func validateSchemaV2FeatureFields(cfg ProvidersConfig, schemaVersion int) error
 		if provider.classifierNoStoreSupportedSet || provider.ClassifierNoStoreSupported != nil {
 			return configPathError(fmt.Sprintf("providers[%d].classifier_no_store_supported", providerIndex), "requires schema_version: 2")
 		}
-		if len(provider.HostedTools) > 0 {
+		if provider.hostedToolsSet || len(provider.HostedTools) > 0 {
 			return configPathError(fmt.Sprintf("providers[%d].hosted_tools", providerIndex), "requires schema_version: 2")
 		}
 	}
@@ -1650,6 +1650,7 @@ func markJSONProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			}
 			_, cfg.Providers[index].trustDomainSet = providers[index]["trust_domain"]
 			_, cfg.Providers[index].classifierNoStoreSupportedSet = providers[index]["classifier_no_store_supported"]
+			_, cfg.Providers[index].hostedToolsSet = providers[index]["hosted_tools"]
 		}
 	}
 
@@ -1743,6 +1744,7 @@ func markYAMLProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			}
 			cfg.Providers[index].trustDomainSet = yamlMappingHasField(provider, "trust_domain")
 			cfg.Providers[index].classifierNoStoreSupportedSet = yamlMappingHasField(provider, "classifier_no_store_supported")
+			cfg.Providers[index].hostedToolsSet = yamlMappingHasField(provider, "hosted_tools")
 		}
 	}
 	if routes := yamlMappingValue(root, "model_routes"); routes != nil && routes.Kind == yaml.SequenceNode {
