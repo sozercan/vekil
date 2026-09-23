@@ -20,7 +20,9 @@ func TestConversationMigrationContentContract(t *testing.T) {
 		{"empty annotations", `{"type":"output_text","text":"Answer.","annotations":[],"logprobs":[]}`, true},
 		{"null annotations", `{"type":"output_text","text":"Answer.","annotations":null,"logprobs":null}`, true},
 		{"token probabilities", `{"type":"output_text","text":"Answer.","logprobs":[{"token":"Answer","logprob":-0.1,"bytes":[65],"top_logprobs":[]}]}`, true},
-		{"URL citation", `{"type":"output_text","text":"Answer.","annotations":[{"type":"url_citation","url":"https://example.com","title":"Source","start_index":0,"end_index":6}]}`, false},
+		{"URL citation", `{"type":"output_text","text":"Answer.","annotations":[{"type":"url_citation","url":"https://example.com","title":"Source","start_index":0,"end_index":6}]}`, true},
+		{"URL citation without offsets", `{"type":"output_text","text":"Answer.","annotations":[{"type":"url_citation","url":"https://example.com"}]}`, true},
+		{"URL citation with unknown field", `{"type":"output_text","text":"Answer.","annotations":[{"type":"url_citation","url":"https://example.com","file_id":"file-private"}]}`, false},
 		{"file citation", `{"type":"input_text","text":"Answer.","annotations":[{"type":"file_citation","file_id":"file-private","index":0}]}`, false},
 		{"invalid annotations", `{"type":"text","text":"Answer.","annotations":{}}`, false},
 		{"unknown text field", `{"type":"output_text","text":"Answer.","reference":"file-private"}`, false},
@@ -51,20 +53,24 @@ func TestConversationMigrationContentContract(t *testing.T) {
 					if tc.allowed {
 						conversationCompleted(t, response, stream)
 					} else {
+						// Unsupported content runs unprotected: the turn completes
+						// normally but nothing is saved for later reconstruction.
 						body := response.Body.String()
-						if !strings.Contains(body, "conversation_state_unsupported") || strings.Contains(body, `"history":"saved"`) || strings.Contains(body, `"status":"completed"`) {
-							t.Fatalf("unsupported content accepted: %d %s", response.Code, body)
+						if response.Code != http.StatusOK || strings.Contains(body, `"history":"saved"`) || !strings.Contains(body, `"status":"completed"`) {
+							t.Fatalf("unsupported content was not forwarded unprotected: %d %s", response.Code, body)
 						}
 						if _, err := h.conversationHistory.lookupResponse("azure", "content-response"); !errors.Is(err, errConversationHistoryMissing) {
 							t.Fatalf("unsupported content was saved: %v", err)
 						}
+						if output && !stream && response.Header().Get("X-Vekil-Conversation-Recovery") != "unprotected" {
+							t.Fatalf("recovery header = %q, want unprotected", response.Header().Get("X-Vekil-Conversation-Recovery"))
+						}
+						if !output && response.Header().Get("X-Vekil-Conversation-Recovery") != "" {
+							t.Fatalf("unprotected request reported recovery %q", response.Header().Get("X-Vekil-Conversation-Recovery"))
+						}
 					}
-					wantSends := int32(1)
-					if !output && !tc.allowed {
-						wantSends = 0
-					}
-					if sends.Load() != wantSends {
-						t.Fatalf("sends = %d, want %d", sends.Load(), wantSends)
+					if sends.Load() != 1 {
+						t.Fatalf("sends = %d, want 1", sends.Load())
 					}
 				})
 			}

@@ -77,6 +77,11 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 			result.anchors = append(result.anchors, conversationAnchor{"item", id})
 		}
 		if status := rawJSONString(item["status"]); status != "" && status != "completed" {
+			if kind == "web_search_call" {
+				// A failed or in-progress hosted search is upstream state, not
+				// an incomplete client turn.
+				return conversationInput{}, errConversationHostedState
+			}
 			return conversationInput{}, errConversationIncomplete
 		}
 		// Azure/Codex turn attribution is not visible conversation content.
@@ -145,6 +150,25 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 				}
 				item["output"] = content
 			}
+		case "web_search_call":
+			if err := conversationItemFields(item, "type", "id", "status", "action"); err != nil {
+				return conversationInput{}, err
+			}
+			var action map[string]json.RawMessage
+			if json.Unmarshal(item["action"], &action) != nil || action == nil || rawJSONString(item["id"]) == "" {
+				return conversationInput{}, errConversationHostedState
+			}
+			// The Responses input schema requires the call ID and status on a
+			// replayed web search. Keep both; the query and results are visible
+			// history and the upstream owns no other state for the item.
+			item["status"], _ = json.Marshal("completed")
+			item["type"], _ = json.Marshal(kind)
+			normalized, err := json.Marshal(item)
+			if err != nil {
+				return conversationInput{}, errConversationHostedState
+			}
+			result.items = append(result.items, normalized)
+			continue
 		default:
 			return conversationInput{}, errConversationHostedState
 		}
@@ -189,11 +213,13 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 				return nil, err
 			}
 			// Azure emits empty annotations and token logprobs on ordinary text.
-			// References are visible content that this history format cannot replay.
+			// Web search citations are visible assistant content. File and
+			// container references are provider state this history cannot replay.
+			var annotations []map[string]any
 			if raw, present := part["annotations"]; present {
-				var annotations []json.RawMessage
-				if json.Unmarshal(raw, &annotations) != nil || len(annotations) != 0 {
-					return nil, errConversationHostedState
+				var err error
+				if annotations, err = canonicalConversationAnnotations(raw, role); err != nil {
+					return nil, err
 				}
 			}
 			if err := json.Unmarshal(part["text"], &text); err != nil {
@@ -203,7 +229,11 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 			if role == "assistant" {
 				kind = "output_text"
 			}
-			normalized = append(normalized, map[string]any{"type": kind, "text": text})
+			content := map[string]any{"type": kind, "text": text}
+			if len(annotations) > 0 {
+				content["annotations"] = annotations
+			}
+			normalized = append(normalized, content)
 		case "refusal":
 			if err := conversationItemFields(part, "type", "refusal"); err != nil {
 				return nil, err
@@ -220,6 +250,47 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 	return encoded, err
 }
 
+func canonicalConversationAnnotations(raw json.RawMessage, role string) ([]map[string]any, error) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, nil
+	}
+	var annotations []map[string]json.RawMessage
+	if json.Unmarshal(raw, &annotations) != nil {
+		return nil, errConversationHostedState
+	}
+	if len(annotations) == 0 {
+		return nil, nil
+	}
+	if role != "assistant" {
+		return nil, errConversationHostedState
+	}
+	normalized := make([]map[string]any, 0, len(annotations))
+	for _, annotation := range annotations {
+		if rawJSONString(annotation["type"]) != "url_citation" {
+			return nil, errConversationHostedState
+		}
+		if err := conversationItemFields(annotation, "type", "url", "title", "start_index", "end_index"); err != nil {
+			return nil, err
+		}
+		var url, title string
+		var start, end int64
+		if json.Unmarshal(annotation["url"], &url) != nil || url == "" {
+			return nil, errConversationHostedState
+		}
+		if raw, present := annotation["title"]; present && json.Unmarshal(raw, &title) != nil {
+			return nil, errConversationHostedState
+		}
+		if raw, present := annotation["start_index"]; present && json.Unmarshal(raw, &start) != nil {
+			return nil, errConversationHostedState
+		}
+		if raw, present := annotation["end_index"]; present && json.Unmarshal(raw, &end) != nil {
+			return nil, errConversationHostedState
+		}
+		normalized = append(normalized, map[string]any{"type": "url_citation", "url": url, "title": title, "start_index": start, "end_index": end})
+	}
+	return normalized, nil
+}
+
 func validateConversationTools(raw json.RawMessage, depth int) error {
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil
@@ -232,11 +303,15 @@ func validateConversationTools(raw json.RawMessage, depth int) error {
 		return errConversationHostedState
 	}
 	for _, tool := range tools {
-		switch rawJSONString(tool["type"]) {
+		switch kind := rawJSONString(tool["type"]); kind {
 		case "function", "custom":
 			if strings.TrimSpace(rawJSONString(tool["name"])) == "" {
 				return errConversationHostedState
 			}
+		case "web_search", "web_search_preview":
+			// Web search executes upstream, but its definition and completed
+			// call items are visible history. Migration targets must declare
+			// hosted_tools support before they receive them.
 		case "namespace":
 			if err := validateConversationTools(tool["tools"], depth+1); err != nil {
 				return err
@@ -352,7 +427,7 @@ func conversationDeltaInput(items []json.RawMessage) bool {
 			Role string `json:"role"`
 		}
 		_ = json.Unmarshal(raw, &item)
-		if item.Type == "function_call" || item.Type == "custom_tool_call" || (item.Type == "message" && item.Role == "assistant") {
+		if item.Type == "function_call" || item.Type == "custom_tool_call" || item.Type == "web_search_call" || (item.Type == "message" && item.Role == "assistant") {
 			return false
 		}
 	}

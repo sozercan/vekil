@@ -201,7 +201,7 @@ func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http
 			return newResponseBodyWriteError(resp, err, false, true, false)
 		}
 		changed = true
-		resp.Header.Set("X-Vekil-Conversation-Recovery", "saved")
+		resp.Header.Set("X-Vekil-Conversation-Recovery", info.conversation.recoveryHeader())
 	}
 
 	copyPassthroughHeaders(w.Header(), resp.Header)
