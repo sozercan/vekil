@@ -13,24 +13,39 @@ import (
 	"testing"
 )
 
+// The upstream completion as Azure emits it: the search action carries result
+// sources and the cited text carries annotations.
 func conversationWebSearchOutput() []any {
 	return []any{
-		map[string]any{"type": "reasoning", "id": "reason-east-1", "encrypted_content": "private-east-1", "summary": []any{}},
-		map[string]any{"type": "web_search_call", "id": "ws-1", "status": "completed", "action": map[string]any{"type": "search", "query": "vekil migration docs"}},
-		map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{
+		map[string]any{"type": "reasoning", "id": "rs_east1", "encrypted_content": "private-east-1", "summary": []any{}},
+		map[string]any{"type": "web_search_call", "id": "ws_1", "status": "completed", "action": map[string]any{"type": "search", "query": "vekil migration docs", "sources": []any{map[string]any{"type": "url", "url": "https://example.com/docs"}}}},
+		map[string]any{"type": "message", "id": "msg_east1", "role": "assistant", "content": []any{map[string]any{
 			"type": "output_text", "text": "The docs describe migration.",
 			"annotations": []any{map[string]any{"type": "url_citation", "url": "https://example.com/docs", "title": "Docs", "start_index": 0, "end_index": 8}},
 		}}},
 	}
 }
 
+// The same turn as Codex replays it on the next request: prefixed IDs kept,
+// unknown action fields and annotations dropped, encrypted reasoning retained.
+func conversationWebSearchCodexReplay() []any {
+	return []any{
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Find the docs."}}},
+		map[string]any{"type": "reasoning", "id": "rs_east1", "encrypted_content": "private-east-1", "summary": []any{}},
+		map[string]any{"type": "web_search_call", "id": "ws_1", "status": "completed", "action": map[string]any{"type": "search", "query": "vekil migration docs"}},
+		map[string]any{"type": "message", "id": "msg_east1", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "The docs describe migration."}}},
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Summarize."}}},
+	}
+}
+
 func TestConversationMigrationReplaysWebSearchToDeclaredTargets(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		declared bool
-		stream   bool
+		name        string
+		declared    bool
+		stream      bool
+		fullHistory bool
 	}{
-		{"declared", true, false}, {"declared stream", true, true}, {"undeclared", false, false},
+		{"declared", true, false, false}, {"declared stream", true, true, false}, {"declared codex full history", true, true, true}, {"undeclared", false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var failed atomic.Bool
@@ -84,7 +99,11 @@ func TestConversationMigrationReplaysWebSearchToDeclaredTargets(t *testing.T) {
 				t.Fatal("initial turn did not use east")
 			}
 			failed.Store(true)
-			second := conversationPOST(t, h, map[string]any{"previous_response_id": "east-1", "input": "Summarize.", "stream": tc.stream}, http.Header{"X-Codex-Turn-State": {"turn-east-1"}})
+			fields := map[string]any{"previous_response_id": "east-1", "input": "Summarize.", "stream": tc.stream}
+			if tc.fullHistory {
+				fields = map[string]any{"input": conversationWebSearchCodexReplay(), "stream": tc.stream, "store": false}
+			}
+			second := conversationPOST(t, h, fields, http.Header{"X-Codex-Turn-State": {"turn-east-1"}})
 			if !tc.declared {
 				// West never declared web search, so it cannot replay the call.
 				if second.Code < 400 || west.Load() != 0 {
@@ -96,13 +115,17 @@ func TestConversationMigrationReplaysWebSearchToDeclaredTargets(t *testing.T) {
 			if rawJSONString(response["id"]) != "west-1" || !bytes.Contains(response["vekil"], []byte(`"migration":"completed"`)) {
 				t.Fatalf("web search conversation did not migrate: %s", second.Body.String())
 			}
-			for _, want := range []string{`"type":"web_search"`, `"external_web_access":false`, `"type":"web_search_call"`, `"id":"ws-1"`, `"status":"completed"`, "vekil migration docs", `"type":"url_citation"`, "https://example.com/docs", "The docs describe migration.", "Find the docs.", "Summarize.", "edit_file"} {
+			for _, want := range []string{`"type":"web_search"`, `"external_web_access":false`, `"action":{"query":"vekil migration docs","type":"search"},"id":"ws_1","status":"completed","type":"web_search_call"`, "The docs describe migration.", "Find the docs.", "Summarize.", "edit_file"} {
 				if !strings.Contains(westBody, want) {
 					t.Errorf("reconstructed history is missing %s", want)
 				}
 			}
-			if strings.Contains(westBody, "private-east") || strings.Contains(westBody, "previous_response_id") {
-				t.Fatal("west received east-owned state")
+			// Saved history matches what Codex replays: no citations, no result
+			// sources, and none of east's private state.
+			for _, unwanted := range []string{"url_citation", "sources", "private-east", "previous_response_id", "msg_east1"} {
+				if strings.Contains(westBody, unwanted) {
+					t.Errorf("reconstructed history carries %s", unwanted)
+				}
 			}
 		})
 	}

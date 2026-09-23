@@ -151,21 +151,9 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 				item["output"] = content
 			}
 		case "web_search_call":
-			if err := conversationItemFields(item, "type", "id", "status", "action"); err != nil {
-				return conversationInput{}, err
-			}
-			var action map[string]json.RawMessage
-			if json.Unmarshal(item["action"], &action) != nil || action == nil || rawJSONString(item["id"]) == "" {
-				return conversationInput{}, errConversationHostedState
-			}
-			// The Responses input schema requires the call ID and status on a
-			// replayed web search. Keep both; the query and results are visible
-			// history and the upstream owns no other state for the item.
-			item["status"], _ = json.Marshal("completed")
-			item["type"], _ = json.Marshal(kind)
-			normalized, err := json.Marshal(item)
+			normalized, err := canonicalConversationWebSearchCall(item)
 			if err != nil {
-				return conversationInput{}, errConversationHostedState
+				return conversationInput{}, err
 			}
 			result.items = append(result.items, normalized)
 			continue
@@ -213,12 +201,11 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 				return nil, err
 			}
 			// Azure emits empty annotations and token logprobs on ordinary text.
-			// Web search citations are visible assistant content. File and
-			// container references are provider state this history cannot replay.
-			var annotations []map[string]any
+			// Web search citations are dropped: Codex does not retain them, so
+			// its replayed history must match the saved text without them. File
+			// and container references are provider state this history cannot replay.
 			if raw, present := part["annotations"]; present {
-				var err error
-				if annotations, err = canonicalConversationAnnotations(raw, role); err != nil {
+				if err := validateConversationAnnotations(raw, role); err != nil {
 					return nil, err
 				}
 			}
@@ -229,11 +216,7 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 			if role == "assistant" {
 				kind = "output_text"
 			}
-			content := map[string]any{"type": kind, "text": text}
-			if len(annotations) > 0 {
-				content["annotations"] = annotations
-			}
-			normalized = append(normalized, content)
+			normalized = append(normalized, map[string]any{"type": kind, "text": text})
 		case "refusal":
 			if err := conversationItemFields(part, "type", "refusal"); err != nil {
 				return nil, err
@@ -250,45 +233,57 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 	return encoded, err
 }
 
-func canonicalConversationAnnotations(raw json.RawMessage, role string) ([]map[string]any, error) {
+func validateConversationAnnotations(raw json.RawMessage, role string) error {
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil, nil
+		return nil
 	}
 	var annotations []map[string]json.RawMessage
 	if json.Unmarshal(raw, &annotations) != nil {
-		return nil, errConversationHostedState
+		return errConversationHostedState
 	}
 	if len(annotations) == 0 {
-		return nil, nil
+		return nil
 	}
 	if role != "assistant" {
-		return nil, errConversationHostedState
+		return errConversationHostedState
 	}
-	normalized := make([]map[string]any, 0, len(annotations))
 	for _, annotation := range annotations {
 		if rawJSONString(annotation["type"]) != "url_citation" {
-			return nil, errConversationHostedState
+			return errConversationHostedState
 		}
 		if err := conversationItemFields(annotation, "type", "url", "title", "start_index", "end_index"); err != nil {
-			return nil, err
+			return err
 		}
-		var url, title string
-		var start, end int64
-		if json.Unmarshal(annotation["url"], &url) != nil || url == "" {
-			return nil, errConversationHostedState
-		}
-		if raw, present := annotation["title"]; present && json.Unmarshal(raw, &title) != nil {
-			return nil, errConversationHostedState
-		}
-		if raw, present := annotation["start_index"]; present && json.Unmarshal(raw, &start) != nil {
-			return nil, errConversationHostedState
-		}
-		if raw, present := annotation["end_index"]; present && json.Unmarshal(raw, &end) != nil {
-			return nil, errConversationHostedState
-		}
-		normalized = append(normalized, map[string]any{"type": "url_citation", "url": url, "title": title, "start_index": start, "end_index": end})
 	}
-	return normalized, nil
+	return nil
+}
+
+// Codex replays a web search call with its prefixed ID, status and the action
+// fields it parsed. Keep exactly those so saved history matches the replay.
+func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.RawMessage, error) {
+	if err := conversationItemFields(item, "type", "id", "status", "action"); err != nil {
+		return nil, err
+	}
+	var action map[string]json.RawMessage
+	if json.Unmarshal(item["action"], &action) != nil || action == nil || rawJSONString(item["id"]) == "" {
+		return nil, errConversationHostedState
+	}
+	normalizedAction := make(map[string]json.RawMessage, len(action))
+	for _, field := range []string{"type", "query", "queries", "url", "pattern"} {
+		if value, present := action[field]; present && !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			normalizedAction[field] = value
+		}
+	}
+	if rawJSONString(normalizedAction["type"]) == "" {
+		return nil, errConversationHostedState
+	}
+	encodedAction, err := json.Marshal(normalizedAction)
+	if err != nil {
+		return nil, errConversationHostedState
+	}
+	return json.Marshal(map[string]json.RawMessage{
+		"type": json.RawMessage(`"web_search_call"`), "id": item["id"], "status": json.RawMessage(`"completed"`), "action": encodedAction,
+	})
 }
 
 func validateConversationTools(raw json.RawMessage, depth int) error {

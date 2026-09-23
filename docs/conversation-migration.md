@@ -104,12 +104,13 @@ Item-level turn metadata is excluded from visible history and reconstruction.
 
 The supported history is text, function/custom tools executed by the client,
 tool namespaces, and hosted web search. A `web_search` or `web_search_preview`
-tool definition, completed `web_search_call` items and `url_citation`
-annotations are visible history: the query and cited text are replayed
-verbatim, including the call ID and status the Responses input schema
-requires. Only a target whose provider declares the capability can receive
-them, so a conversation that uses web search skips undeclared targets during
-migration:
+tool definition and completed `web_search_call` items are visible history.
+A saved call keeps the prefixed item ID, `completed` status and the action's
+`type`, `query`, `queries`, `url` and `pattern` fields, which is what Codex
+replays; result sources and `url_citation` annotations on the cited text are
+accepted and dropped because Codex does not retain them either. Only a target
+whose provider declares the capability can receive the call items, so a
+conversation that uses web search skips undeclared targets during migration:
 
 ```yaml
 providers:
