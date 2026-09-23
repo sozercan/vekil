@@ -258,6 +258,14 @@ func validateConversationAnnotations(raw json.RawMessage, role string) error {
 	return nil
 }
 
+// Codex parses each web search action variant into a fixed field set and
+// keeps only prefixed item IDs on replay.
+var conversationWebSearchActionFields = map[string][]string{
+	"search":       {"query", "queries"},
+	"open_page":    {"url"},
+	"find_in_page": {"url", "pattern"},
+}
+
 // Codex replays a web search call with its prefixed ID, status and the action
 // fields it parsed. Keep exactly those so saved history matches the replay.
 func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.RawMessage, error) {
@@ -265,18 +273,20 @@ func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.R
 		return nil, err
 	}
 	var action map[string]json.RawMessage
-	if json.Unmarshal(item["action"], &action) != nil || action == nil || rawJSONString(item["id"]) == "" ||
+	prefix, suffix, prefixed := strings.Cut(rawJSONString(item["id"]), "_")
+	if json.Unmarshal(item["action"], &action) != nil || action == nil || !prefixed || prefix == "" || suffix == "" ||
 		rawJSONString(item["status"]) != "completed" {
 		return nil, errConversationHostedState
 	}
-	normalizedAction := make(map[string]json.RawMessage, len(action))
-	for _, field := range []string{"type", "query", "queries", "url", "pattern"} {
+	fields, known := conversationWebSearchActionFields[rawJSONString(action["type"])]
+	if !known {
+		return nil, errConversationHostedState
+	}
+	normalizedAction := map[string]json.RawMessage{"type": action["type"]}
+	for _, field := range fields {
 		if value, present := action[field]; present && !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 			normalizedAction[field] = value
 		}
-	}
-	if rawJSONString(normalizedAction["type"]) == "" {
-		return nil, errConversationHostedState
 	}
 	encodedAction, err := json.Marshal(normalizedAction)
 	if err != nil {
