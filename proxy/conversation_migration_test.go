@@ -278,7 +278,7 @@ func TestConversationMigrationFullHistoryAndIsolation(t *testing.T) {
 }
 
 func TestConversationMigrationBlocksUnsafeRequestsAndRetries(t *testing.T) {
-	for _, scenario := range []string{"unknown ID", "compaction", "hosted tool", "unmatched result", "pending tool", "ambiguous write", "partial stream", "DONE without completion", "encrypted rejection"} {
+	for _, scenario := range []string{"unknown ID", "compaction", "unmatched result", "pending tool", "ambiguous write", "partial stream", "DONE without completion", "encrypted rejection"} {
 		t.Run(scenario, func(t *testing.T) {
 			var sends, west atomic.Int32
 			var fail atomic.Bool
@@ -320,8 +320,6 @@ func TestConversationMigrationBlocksUnsafeRequestsAndRetries(t *testing.T) {
 				fields["previous_response_id"] = "unknown"
 			case "compaction":
 				fields["input"] = []any{map[string]any{"type": "compaction", "encrypted_content": "opaque"}}
-			case "hosted tool":
-				fields["tools"] = []any{map[string]any{"type": "code_interpreter", "container": "provider-owned"}}
 			case "unmatched result":
 				fields["input"] = []any{map[string]any{"type": "function_call_output", "call_id": "unknown", "output": "done"}}
 			case "partial stream", "DONE without completion":

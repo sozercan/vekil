@@ -77,6 +77,11 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 			result.anchors = append(result.anchors, conversationAnchor{"item", id})
 		}
 		if status := rawJSONString(item["status"]); status != "" && status != "completed" {
+			if kind == "web_search_call" {
+				// A failed or in-progress hosted search is upstream state, not
+				// an incomplete client turn.
+				return conversationInput{}, errConversationHostedState
+			}
 			return conversationInput{}, errConversationIncomplete
 		}
 		// Azure/Codex turn attribution is not visible conversation content.
@@ -145,6 +150,13 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 				}
 				item["output"] = content
 			}
+		case "web_search_call":
+			normalized, err := canonicalConversationWebSearchCall(item)
+			if err != nil {
+				return conversationInput{}, err
+			}
+			result.items = append(result.items, normalized)
+			continue
 		default:
 			return conversationInput{}, errConversationHostedState
 		}
@@ -189,11 +201,12 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 				return nil, err
 			}
 			// Azure emits empty annotations and token logprobs on ordinary text.
-			// References are visible content that this history format cannot replay.
+			// Web search citations are dropped: Codex does not retain them, so
+			// its replayed history must match the saved text without them. File
+			// and container references are provider state this history cannot replay.
 			if raw, present := part["annotations"]; present {
-				var annotations []json.RawMessage
-				if json.Unmarshal(raw, &annotations) != nil || len(annotations) != 0 {
-					return nil, errConversationHostedState
+				if err := validateConversationAnnotations(raw, role); err != nil {
+					return nil, err
 				}
 			}
 			if err := json.Unmarshal(part["text"], &text); err != nil {
@@ -220,6 +233,82 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 	return encoded, err
 }
 
+func validateConversationAnnotations(raw json.RawMessage, role string) error {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var annotations []map[string]json.RawMessage
+	if json.Unmarshal(raw, &annotations) != nil {
+		return errConversationHostedState
+	}
+	if len(annotations) == 0 {
+		return nil
+	}
+	if role != "assistant" {
+		return errConversationHostedState
+	}
+	for _, annotation := range annotations {
+		if rawJSONString(annotation["type"]) != "url_citation" {
+			return errConversationHostedState
+		}
+		if err := conversationItemFields(annotation, "type", "url", "title", "start_index", "end_index"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Codex parses each web search action variant into a fixed field set and
+// keeps only prefixed item IDs on replay.
+var conversationWebSearchActionFields = map[string][]string{
+	"search":       {"query", "queries"},
+	"open_page":    {"url"},
+	"find_in_page": {"url", "pattern"},
+}
+
+// Codex replays a web search call with its prefixed ID, status and the action
+// fields it parsed. Keep exactly those so saved history matches the replay.
+func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.RawMessage, error) {
+	if err := conversationItemFields(item, "type", "id", "status", "action"); err != nil {
+		return nil, err
+	}
+	var action map[string]json.RawMessage
+	prefix, suffix, prefixed := strings.Cut(rawJSONString(item["id"]), "_")
+	if json.Unmarshal(item["action"], &action) != nil || action == nil || !prefixed || prefix == "" || suffix == "" ||
+		rawJSONString(item["status"]) != "completed" {
+		return nil, errConversationHostedState
+	}
+	fields, known := conversationWebSearchActionFields[rawJSONString(action["type"])]
+	if !known {
+		return nil, errConversationHostedState
+	}
+	normalizedAction := map[string]json.RawMessage{"type": action["type"]}
+	for _, field := range fields {
+		value, present := action[field]
+		if !present || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			continue
+		}
+		// Codex parses queries as a string list and every other field as a string.
+		var typed any
+		if field == "queries" {
+			typed = new([]string)
+		} else {
+			typed = new(string)
+		}
+		if json.Unmarshal(value, typed) != nil {
+			return nil, errConversationHostedState
+		}
+		normalizedAction[field], _ = json.Marshal(typed)
+	}
+	encodedAction, err := json.Marshal(normalizedAction)
+	if err != nil {
+		return nil, errConversationHostedState
+	}
+	return json.Marshal(map[string]json.RawMessage{
+		"type": json.RawMessage(`"web_search_call"`), "id": item["id"], "status": json.RawMessage(`"completed"`), "action": encodedAction,
+	})
+}
+
 func validateConversationTools(raw json.RawMessage, depth int) error {
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil
@@ -232,11 +321,15 @@ func validateConversationTools(raw json.RawMessage, depth int) error {
 		return errConversationHostedState
 	}
 	for _, tool := range tools {
-		switch rawJSONString(tool["type"]) {
+		switch kind := rawJSONString(tool["type"]); kind {
 		case "function", "custom":
 			if strings.TrimSpace(rawJSONString(tool["name"])) == "" {
 				return errConversationHostedState
 			}
+		case "web_search", "web_search_preview":
+			// Web search executes upstream, but its definition and completed
+			// call items are visible history. Migration targets must declare
+			// hosted_tools support before they receive them.
 		case "namespace":
 			if err := validateConversationTools(tool["tools"], depth+1); err != nil {
 				return err
@@ -352,7 +445,7 @@ func conversationDeltaInput(items []json.RawMessage) bool {
 			Role string `json:"role"`
 		}
 		_ = json.Unmarshal(raw, &item)
-		if item.Type == "function_call" || item.Type == "custom_tool_call" || (item.Type == "message" && item.Role == "assistant") {
+		if item.Type == "function_call" || item.Type == "custom_tool_call" || item.Type == "web_search_call" || (item.Type == "message" && item.Role == "assistant") {
 			return false
 		}
 	}

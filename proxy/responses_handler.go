@@ -347,13 +347,17 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses_history", prepareErr)
 			return
 		}
-		if turn := routeOperation.conversation; turn != nil {
-			prepared.body, prepared.stateBindingBody = body, body
-			prepared.extraHeaders = headers
-			prepared.upstreamHeaders = responsesUpstreamHeaders(headers, prepared.streaming)
+		if h.conversationMigrationEnabled(routeOperation.route) {
+			// Preparation deferred the optimizer rewrite for this route. Apply it
+			// here for protected and unprotected turns alike.
 			scope := responsesRequestToolExecutionScope(prepared.headerToolScope, metadata.PreviousResponseID)
-			turn.toolContexts, turn.toolScope = h.toolContexts, scope
-			prepared.body = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(upstreamCtx, body, prepared.model, "responses", true, turn.toolContexts, turn.toolScope)
+			if turn := routeOperation.conversation; turn != nil {
+				prepared.body, prepared.stateBindingBody = body, body
+				prepared.extraHeaders = headers
+				prepared.upstreamHeaders = responsesUpstreamHeaders(headers, prepared.streaming)
+				turn.toolContexts, turn.toolScope = h.toolContexts, scope
+			}
+			prepared.body = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(upstreamCtx, body, prepared.model, "responses", true, h.toolContexts, scope)
 		}
 		if err := h.applyExplicitRequestStateBinding(routeOperation, prepared.stateBindingBody, prepared.extraHeaders); err != nil {
 			h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses_state_binding", err)

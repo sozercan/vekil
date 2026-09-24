@@ -109,11 +109,13 @@ type ProviderConfig struct {
 	ModelDiscovery             string                      `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
 	TrustDomain                string                      `json:"trust_domain,omitempty" yaml:"trust_domain,omitempty"`
 	ClassifierNoStoreSupported *bool                       `json:"classifier_no_store_supported,omitempty" yaml:"classifier_no_store_supported,omitempty"`
+	HostedTools                []string                    `json:"hosted_tools,omitempty" yaml:"hosted_tools,omitempty"`
 	Headers                    CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
 	Models                     []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
 
 	trustDomainSet                bool
 	classifierNoStoreSupportedSet bool
+	hostedToolsSet                bool
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
@@ -153,6 +155,7 @@ type providerRuntime struct {
 	modelDiscovery             providerModelDiscovery
 	trustDomain                string
 	classifierNoStoreSupported *bool
+	hostedTools                map[string]bool
 	includeModels              map[string]struct{}
 	excludeModels              map[string]struct{}
 	hiddenModels               map[string]struct{}
@@ -1226,6 +1229,7 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		modelDiscovery:             providerModelDiscoveryStatic,
 		trustDomain:                strings.TrimSpace(cfg.TrustDomain),
 		classifierNoStoreSupported: cloneBoolPtr(cfg.ClassifierNoStoreSupported),
+		hostedTools:                providerHostedToolSet(cfg.HostedTools),
 		includeModels:              make(map[string]struct{}, len(cfg.IncludeModels)),
 		excludeModels:              make(map[string]struct{}, len(cfg.ExcludeModels)),
 		hiddenModels:               make(map[string]struct{}),

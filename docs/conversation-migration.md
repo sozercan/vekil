@@ -103,12 +103,32 @@ accepted as a string map of up to 64 entries and 16 KiB per request.
 Item-level turn metadata is excluded from visible history and reconstruction.
 
 The supported history is text, function/custom tools executed by the client,
-and tool namespaces. Images, audio, references, hosted tools, provider
+tool namespaces, and hosted web search. A `web_search` or `web_search_preview`
+tool definition and completed `web_search_call` items are visible history.
+A saved call keeps the prefixed item ID, `completed` status and the action's
+`type`, `query`, `queries`, `url` and `pattern` fields, which is what Codex
+replays; result sources and `url_citation` annotations on the cited text are
+accepted and dropped because Codex does not retain them either. Only a target
+whose provider declares the capability can receive the call items, so a
+conversation that uses web search skips undeclared targets during migration:
+
+```yaml
+providers:
+  - id: azure-eastus2
+    type: azure-openai
+    hosted_tools: [web_search]
+```
+
+Images, audio, file references, other hosted tools, provider
 `conversation`/`prompt` state, background generation, automatic truncation and
-compaction are unsupported. Encrypted compaction or a summary cannot prove that
-the original conversation is complete. Supply the original visible history;
-Vekil does not invent a checkpoint. Automatic HTTP/WebSocket compaction and the
-legacy encrypted-content retry are disabled for protected turns.
+compaction are unsupported. A request or completion carrying them is not
+rejected: Vekil forwards the turn unprotected on the normal route, logs the
+reason, and saves no history for it. Later failover cannot reconstruct that
+turn, and a response-ID continuation from an unprotected completion returns
+`conversation_history_unavailable`. Encrypted compaction or a summary cannot
+prove that the original conversation is complete. Supply the original visible
+history; Vekil does not invent a checkpoint. Automatic HTTP/WebSocket compaction
+and the legacy encrypted-content retry are disabled for protected turns.
 
 ## A switch and later turns
 
@@ -180,16 +200,16 @@ If an upstream reuses a saved response ID, Vekil withholds the new completion
 and leaves that turn uncertain. The collision does not disable the shared store.
 
 HTTP responses report `X-Vekil-Conversation-Recovery: recording` during streaming
-and `saved` for a completed JSON response. The authoritative completion contains
-`vekil: {"history":"saved","target":"west"}`, with
-`"migration":"completed"` only on the turn that switched. WebSocket completion
-objects carry the same fields. Fixed-content logs distinguish `attempted`,
-`completed` and `blocked` recovery. A `recording` header alone is not a saved
-completion.
+and `saved` for a completed JSON response. A completed JSON response whose
+output could not be saved reports `unprotected` instead. The authoritative
+completion contains `vekil: {"history":"saved","target":"west"}`, with
+`"migration":"completed"` only on the turn that switched; an unprotected
+completion has no `vekil` field. WebSocket completion objects carry the same
+fields. Fixed-content logs distinguish `attempted`, `completed`, `blocked` and
+`unprotected` recovery. A `recording` header alone is not a saved completion.
 
-Errors use `conversation_history_unavailable`, `conversation_history_incomplete`,
-`conversation_tools_pending`, `conversation_state_unsupported` or
-`conversation_compaction_unrecoverable` for invalid recovery input. Uncertain
+Errors use `conversation_history_unavailable`, `conversation_history_incomplete`
+or `conversation_tools_pending` for invalid recovery input. Uncertain
 execution returns `409` with `conversation_execution_uncertain`. Storage and
 capacity failures return `503` with `conversation_history_storage_unavailable`
 or `conversation_history_capacity_exceeded`. After stream commitment, a terminal

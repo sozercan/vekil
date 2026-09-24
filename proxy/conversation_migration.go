@@ -32,6 +32,7 @@ type conversationTurn struct {
 	additionalTools []json.RawMessage
 	toolContexts    *ToolExecutionContextStore
 	toolScope       string
+	hostedTools     map[string]bool
 	pending         bool
 	dispatched      bool
 	saved           bool
@@ -39,6 +40,7 @@ type conversationTurn struct {
 	migrated        bool
 	attempted       bool
 	blocked         bool
+	unprotected     bool
 }
 
 func (h *ProxyHandler) initializeConversationHistory() error {
@@ -92,12 +94,22 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 	if json.Unmarshal(body, &fields) != nil || fields == nil {
 		return fail(errConversationHistoryPartial)
 	}
+	// Hosted state that this history format cannot replay does not block the
+	// turn. It runs on the normal route without a snapshot, so later failover
+	// cannot reconstruct it; contract violations of readable history still fail.
+	unprotected := func(err error) ([]byte, http.Header, error) {
+		if !conversationUnsupportedState(err) {
+			return fail(err)
+		}
+		h.logConversationRecovery(operation, "unprotected", "", conversationFailureReason(err))
+		return body, headers, nil
+	}
 	if err := validateConversationRequestFields(fields); err != nil {
-		return fail(err)
+		return unprotected(err)
 	}
 	input, err := canonicalConversationInput(fields["input"], false)
 	if err != nil {
-		return fail(err)
+		return unprotected(err)
 	}
 	store := h.conversationHistory
 	routeID := operation.route.public.routeID
@@ -206,6 +218,7 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		}
 		turn.fields["input"], _ = json.Marshal(append(cloneRawMessages(turn.additionalTools), rawInput...))
 	}
+	turn.hostedTools = conversationHostedTools(turn.tools, turn.additionalTools, turn.input)
 	if len(turn.input)+len(turn.additionalTools) > maxConversationHistoryItems ||
 		rawMessagesSize(turn.input)+rawMessagesSize(turn.additionalTools)+len(turn.instructions)+len(turn.tools) > store.config.MaxHistoryBytes {
 		return fail(errConversationHistoryCapacity)
@@ -404,6 +417,37 @@ func (t *conversationTurn) finish() {
 	t.store.release(t.root)
 }
 
+// An unsupported completion already executed upstream. Clear the attempt
+// marker because the outcome is known, then expose the completion unchanged
+// without a snapshot. A marker that cannot be cleared withholds the completion
+// like a failed snapshot save does. The caller holds t.mu.
+func (t *conversationTurn) unprotect(targetID, reason string) error {
+	if t.pending {
+		if err := t.store.clearAttempt(t.root); err != nil {
+			t.blocked = true
+			t.h.logConversationRecovery(t.operation, "blocked", targetID, conversationFailureReason(err))
+			return conversationRequestError(err)
+		}
+		t.pending = false
+	}
+	t.unprotected, t.blocked = true, true
+	t.h.logConversationRecovery(t.operation, "unprotected", targetID, reason)
+	return nil
+}
+
+func (t *conversationTurn) recoveryHeader() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.unprotected {
+		return "unprotected"
+	}
+	return "saved"
+}
+
+func conversationUnsupportedState(err error) bool {
+	return errors.Is(err, errConversationHostedState) || errors.Is(err, errConversationCompaction)
+}
+
 func (h *ProxyHandler) logConversationRecovery(operation *routeOperation, outcome, targetID, reason string) {
 	if h == nil || h.log == nil || operation == nil || operation.route == nil {
 		return
@@ -434,8 +478,11 @@ func (h *ProxyHandler) conversationMigrationTarget(ctx context.Context, operatio
 	}
 	for _, target := range operation.route.targets {
 		_, attempted := operation.attemptedTargets[target.id]
+		// A target that has not declared the conversation's hosted tools cannot
+		// replay their call items, so it is skipped rather than tried.
 		if target.id != operation.pinnedTargetID && !attempted && target.provider != nil &&
-			conversationMigrationProviderSupported(target.provider.kind) && target.provider.supportsEndpoint(endpoint) {
+			conversationMigrationProviderSupported(target.provider.kind) && target.provider.supportsEndpoint(endpoint) &&
+			target.provider.supportsHostedTools(t.hostedTools) {
 			return target, true
 		}
 	}
@@ -504,6 +551,9 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 	if t.closed {
 		return nil, context.Canceled
 	}
+	if t.unprotected {
+		return data, nil
+	}
 	if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
 		if t.saved {
 			return data, nil
@@ -536,6 +586,12 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 	}
 	output, err := canonicalConversationInput(response["output"], true)
 	if err != nil {
+		if conversationUnsupportedState(err) {
+			if err := t.unprotect(info.targetID, conversationFailureReason(err)); err != nil {
+				return nil, err
+			}
+			return data, nil
+		}
 		return nil, conversationRequestError(err)
 	}
 	if len(t.input)+len(t.additionalTools)+len(output.items) > maxConversationHistoryItems {
@@ -599,7 +655,7 @@ func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		b.turn.mu.Lock()
-		saved := b.turn.saved
+		saved := b.turn.saved || b.turn.unprotected
 		b.turn.mu.Unlock()
 		_, _, storageFailure := durableStateFailureDetails(err)
 		if !saved && !storageFailure && providerRequestErrorCode(err) == "" {

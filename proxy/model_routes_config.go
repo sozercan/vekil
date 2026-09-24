@@ -255,6 +255,11 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 				return validatedProvidersConfig{}, configPathError(fmt.Sprintf("providers[%d].trust_domain", providerIndex), "must not contain control characters")
 			}
 			provider.ClassifierNoStoreSupported = cloneBoolPtr(provider.ClassifierNoStoreSupported)
+			normalized, err := normalizeProviderHostedTools(provider.HostedTools, fmt.Sprintf("providers[%d].hosted_tools", providerIndex))
+			if err != nil {
+				return validatedProvidersConfig{}, err
+			}
+			provider.HostedTools = normalized
 		}
 	}
 
@@ -469,6 +474,9 @@ func validateSchemaV2FeatureFields(cfg ProvidersConfig, schemaVersion int) error
 		if provider.classifierNoStoreSupportedSet || provider.ClassifierNoStoreSupported != nil {
 			return configPathError(fmt.Sprintf("providers[%d].classifier_no_store_supported", providerIndex), "requires schema_version: 2")
 		}
+		if provider.hostedToolsSet || len(provider.HostedTools) > 0 {
+			return configPathError(fmt.Sprintf("providers[%d].hosted_tools", providerIndex), "requires schema_version: 2")
+		}
 	}
 	for routeIndex, route := range cfg.ModelRoutes {
 		if route.exposureSet || strings.TrimSpace(route.Exposure) != "" {
@@ -499,6 +507,7 @@ func cloneProvidersConfigForValidation(cfg ProvidersConfig) ProvidersConfig {
 			provider.IncludeModels = append([]string(nil), cfg.Providers[index].IncludeModels...)
 			provider.ExcludeModels = append([]string(nil), cfg.Providers[index].ExcludeModels...)
 			provider.ClassifierNoStoreSupported = cloneBoolPtr(cfg.Providers[index].ClassifierNoStoreSupported)
+			provider.HostedTools = append([]string(nil), cfg.Providers[index].HostedTools...)
 			if cfg.Providers[index].ExtraHeaders != nil {
 				provider.ExtraHeaders = make(map[string]string, len(cfg.Providers[index].ExtraHeaders))
 				for key, value := range cfg.Providers[index].ExtraHeaders {
@@ -1308,7 +1317,7 @@ var providerConfigFields = configFieldSet(
 	"id", "type", "default", "include_models", "exclude_models", "base_url", "auth_mode",
 	"api_key", "api_key_env", "api_version", "token_scope", "auth_type", "auth_header",
 	"auth_prefix", "extra_headers", "chat_completions_path", "responses_path", "messages_path",
-	"models_path", "systemone_path", "model_discovery", "trust_domain", "classifier_no_store_supported", "headers", "models",
+	"models_path", "systemone_path", "model_discovery", "trust_domain", "classifier_no_store_supported", "hosted_tools", "headers", "models",
 )
 
 var providerModelConfigFields = configFieldSet(
@@ -1641,6 +1650,7 @@ func markJSONProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			}
 			_, cfg.Providers[index].trustDomainSet = providers[index]["trust_domain"]
 			_, cfg.Providers[index].classifierNoStoreSupportedSet = providers[index]["classifier_no_store_supported"]
+			_, cfg.Providers[index].hostedToolsSet = providers[index]["hosted_tools"]
 		}
 	}
 
@@ -1734,6 +1744,7 @@ func markYAMLProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			}
 			cfg.Providers[index].trustDomainSet = yamlMappingHasField(provider, "trust_domain")
 			cfg.Providers[index].classifierNoStoreSupportedSet = yamlMappingHasField(provider, "classifier_no_store_supported")
+			cfg.Providers[index].hostedToolsSet = yamlMappingHasField(provider, "hosted_tools")
 		}
 	}
 	if routes := yamlMappingValue(root, "model_routes"); routes != nil && routes.Kind == yaml.SequenceNode {
