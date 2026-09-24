@@ -185,6 +185,59 @@ func TestLoadProvidersConfigForMenubar(t *testing.T) {
 	})
 }
 
+func TestReloadProvidersStateReadsEditedConfig(t *testing.T) {
+	stubUserConfigDir(t)
+	prevCfg, prevProvidersCfg, prevErr := providersState()
+	t.Cleanup(func() {
+		setProvidersState(prevCfg, prevProvidersCfg, prevErr)
+	})
+
+	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
+	writeProviders := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(providersPath, []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+	}
+	reload := func() proxy.ProvidersConfig {
+		t.Helper()
+		cfg, err := reloadProvidersState()
+		if err != nil {
+			t.Fatalf("reloadProvidersState() error = %v", err)
+		}
+		return cfg
+	}
+
+	writeProviders("providers:\n  - id: azure\n    type: azure-openai\n")
+	if err := saveMenubarConfig(menubarConfig{ProvidersConfigPath: providersPath}); err != nil {
+		t.Fatalf("saveMenubarConfig() error = %v", err)
+	}
+	if cfg := reload(); len(cfg.Providers) != 1 || cfg.Providers[0].ID != "azure" {
+		t.Fatalf("first reload Providers = %v, want azure provider", cfg.Providers)
+	}
+
+	writeProviders("providers:\n  - id: azure-west\n    type: azure-openai\n")
+	if cfg := reload(); len(cfg.Providers) != 1 || cfg.Providers[0].ID != "azure-west" {
+		t.Fatalf("reload after edit Providers = %v, want azure-west provider", cfg.Providers)
+	}
+
+	writeProviders("providers: [")
+	if _, err := reloadProvidersState(); !errors.Is(err, errProvidersConfigLoad) {
+		t.Fatalf("reloadProvidersState() error = %v, want wrapped providers config error", err)
+	}
+	if got := providersMenuTitle(); got != "Providers: Invalid (providers.yaml)" {
+		t.Fatalf("providersMenuTitle() after invalid edit = %q, want %q", got, "Providers: Invalid (providers.yaml)")
+	}
+
+	writeProviders("providers:\n  - id: azure-east\n    type: azure-openai\n")
+	if cfg := reload(); len(cfg.Providers) != 1 || cfg.Providers[0].ID != "azure-east" {
+		t.Fatalf("reload after fix Providers = %v, want azure-east provider", cfg.Providers)
+	}
+	if got := providersMenuTitle(); got != "Providers: providers.yaml" {
+		t.Fatalf("providersMenuTitle() after fix = %q, want %q", got, "Providers: providers.yaml")
+	}
+}
+
 func TestProvidersConfigErrorPresentation(t *testing.T) {
 	menubarErr := errors.Join(errMenubarConfigLoad, errors.New("decode menubar config"))
 	providersErr := errors.Join(errProvidersConfigLoad, errors.New("decode providers config"))

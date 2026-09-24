@@ -57,6 +57,8 @@ On macOS, the app adds directories from your interactive login shell's `PATH` at
 
 Use `Choose Providers Config…` to select the same JSON/YAML file you would pass with `--providers-config`. The app saves the selected path for future launches and launch-at-login starts. `Use Default Copilot Routing` clears the saved path.
 
+Every **Start Vekil** reads the saved path and the providers file again, and fetches a remote URL again. To apply an edited file, choose **Stop Vekil** and then **Start Vekil**. You don't need to quit the app. If the edited file is invalid, Start shows the error and stays enabled, so you can fix the file and start again.
+
 The top-level `state_bindings` configuration applies to both the CLI and tray
 app. Schema-v2 explicit routes default to durable ownership with capacity
 8,388,608; `mode: memory` opts out. The same private OS application-data file is
@@ -67,7 +69,7 @@ distinct configured file for a separate instance. The dashboard shows retained
 entries, capacity, database size, and capacity warnings. See
 [State Recovery](state-recovery.md) for macOS/Linux storage and recovery details.
 
-Startup authentication and semantic-policy classifier preflight run in a cancellable worker. Provider-config and authentication actions are temporarily disabled while that worker is active, while Quit and the other tray events remain responsive. Use **Cancel Starting Vekil** to abort startup; Vekil closes any listener opened by the canceled attempt before an automatic config restart can begin.
+Providers-config loading, startup authentication, and semantic-policy classifier preflight run in a cancellable worker. Provider-config and authentication actions are temporarily disabled while that worker is active, while Quit and the other tray events remain responsive. Use **Cancel Starting Vekil** to abort startup; Vekil closes any listener opened by the canceled attempt before an automatic config restart can begin.
 
 ## Linux Tray
 
