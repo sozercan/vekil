@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -1256,6 +1257,28 @@ func TestLoadProvidersConfigFileURLRedactsRequestError(t *testing.T) {
 	}
 	if wantSource := server.URL + "/providers.yaml"; !strings.Contains(err.Error(), wantSource) {
 		t.Fatalf("LoadProvidersConfigFile() error = %v, want sanitized source %q", err, wantSource)
+	}
+}
+
+func TestLoadProvidersConfigFileContextCancelsRemoteFetch(t *testing.T) {
+	t.Parallel()
+
+	requested := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(requested)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		<-requested
+		cancel()
+	}()
+
+	_, err := LoadProvidersConfigFileContext(ctx, server.URL+"/providers.yaml")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("LoadProvidersConfigFileContext() error = %v, want context canceled", err)
 	}
 }
 

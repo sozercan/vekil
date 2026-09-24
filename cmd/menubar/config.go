@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -103,13 +104,13 @@ func saveMenubarConfig(cfg menubarConfig) error {
 	return nil
 }
 
-func loadProvidersConfigForMenubar() (menubarConfig, proxy.ProvidersConfig, error) {
+func loadProvidersConfigForMenubar(ctx context.Context) (menubarConfig, proxy.ProvidersConfig, error) {
 	cfg, err := loadMenubarConfig()
 	if err != nil {
 		return menubarConfig{}, proxy.ProvidersConfig{}, fmt.Errorf("%w: %w", errMenubarConfigLoad, err)
 	}
 
-	providersCfg, err := proxy.LoadProvidersConfigFile(cfg.ProvidersConfigPath)
+	providersCfg, err := proxy.LoadProvidersConfigFileContext(ctx, cfg.ProvidersConfigPath)
 	if err != nil {
 		return cfg, proxy.ProvidersConfig{}, fmt.Errorf("%w: %w", errProvidersConfigLoad, err)
 	}
