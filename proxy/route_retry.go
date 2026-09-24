@@ -71,6 +71,40 @@ func routeCanSwitchAfterAttempt(ctx context.Context, operation *routeOperation, 
 		len(orderedRouteTargets(operation.route, operation, endpoint)) > 0
 }
 
+// Only failures acquiring this provider's credentials are eligible here. Request
+// validation and configuration failures must not turn into cross-provider retries.
+func (h *ProxyHandler) explicitRouteCredentialFailureDecision(ctx context.Context, operation *routeOperation, endpoint string, kind routeAttemptKind, err error) routeRetryDecision {
+	if providerRequestErrorCode(err) != upstreamAuthUnavailableCode {
+		return routeRetrySuppressedNonretryable
+	}
+	if ctx.Err() != nil || h.ShuttingDown() {
+		return routeRetrySuppressedLifecycle
+	}
+	if operation.inbound != nil && operation.inbound.Err() != nil {
+		return routeRetrySuppressedAdmission
+	}
+	if operation.route.policy.mode != routeModePriorityFailover {
+		return routeRetrySuppressedMode
+	}
+	if operation.pinnedTarget() != "" || !operation.allowsAutomaticTargetSwitch(kind) {
+		return routeRetrySuppressedState
+	}
+	operation.mu.Lock()
+	commitment := operation.commitment
+	budgetAvailable := operation.remainingTargetAttempts > 0 && operation.remainingUpstreamSends > 0
+	operation.mu.Unlock()
+	if commitment != downstreamCommitmentNone {
+		return routeRetrySuppressedCommitment
+	}
+	if !budgetAvailable {
+		return routeRetrySuppressedBudget
+	}
+	if len(orderedRouteTargets(operation.route, operation, endpoint)) == 0 {
+		return routeRetrySuppressedNoTarget
+	}
+	return routeRetrySwitchTarget
+}
+
 func (h *ProxyHandler) explicitRouteRejectionDecision(ctx context.Context, operation *routeOperation, target targetBinding, endpoint string, kind routeAttemptKind, failure routeAttemptFailure, traffic azureRouteTraffic) routeRetryDecision {
 	delay, validReset := parseRetryAfter(failure.retryAfter)
 	azureRecovery := target.provider.kind == providerTypeAzureOpenAI && failure.statusCode == http.StatusTooManyRequests && validReset

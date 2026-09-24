@@ -53,7 +53,9 @@ The `GitHub Auth` submenu exposes the same auth choices as the CLI:
 
 Copilot-backed configs require GitHub auth or `COPILOT_GITHUB_TOKEN`. Provider-only configs that omit Copilot do not require GitHub auth and can keep running after sign-out. See [Provider Routing](provider-routing.md) for provider-specific auth details.
 
-On macOS, the app adds directories from your interactive login shell's `PATH` at launch, keeping inherited directories first. This lets Azure CLI authentication and other configured commands work when the app starts through Finder or at login. The lookup imports only `PATH` and has a two-second timeout; if shell startup fails, the app keeps its inherited `PATH`.
+On macOS, the app adds directories from your interactive login shell's `PATH` at launch. This lets Azure CLI authentication and other configured commands work when the app starts through Finder or at login. The lookup imports only `PATH` and has a five-second timeout.
+
+If shell startup fails or times out, the app appends `/opt/homebrew/bin` and `/usr/local/bin` as fallbacks and still logs the lookup warning. Shell recovery and fallback keep inherited directories first and only append missing absolute directories, never empty or relative entries. The app does not retry the shell lookup.
 
 Use `Choose Providers Config…` to select the same JSON/YAML file you would pass with `--providers-config`. The app saves the selected path for future launches and launch-at-login starts. `Use Default Copilot Routing` clears the saved path.
 

@@ -228,15 +228,18 @@ resource.
 | Observed outcome | Switch to the next target |
 |------------------|---------------------------|
 | DNS, dial, or TLS failure before request bytes could be written | Yes, if admission, deadline, cleanup, and budgets still allow it |
+| Local credential acquisition failure before inference dispatch | Yes, if the operation is unpinned and admission, commitment, and budgets still allow it |
 | Authoritative HTTP `429` with no contradictory execution evidence | Yes |
 | Adapter-certified pre-execution overload/unavailable rejection, such as a supported `503`/`529` | Yes |
 | Adapter-certified pre-output Responses terminal admission failure | Yes, only when that exact condition proves no semantic/tool execution |
 | Azure Responses failed JSON inside HTTP `200` | Yes, within the bounded inspection limit and only without output or usage |
 | Client cancellation, shutdown, or total operation deadline | No |
-| Authentication, configuration, invalid-request, or content-policy error | No |
+| Upstream authentication rejection, configuration, invalid-request, or content-policy error | No |
 | Reset/timeout after request write, generic `502`/`504`, or other ambiguous delivery | No |
 | Partial success body, text/reasoning/tool output, malformed/unknown event, or any downstream commitment | No |
 | Known provider state owned by the previous target, or unknown/conflicting explicit-route state | No |
+
+Local Azure identity or Copilot credential failures can skip a target without spending an upstream-send slot. They still consume a target attempt. This does not retry upstream `401`/`403` responses or bypass provider-state ownership. If credential acquisition remains the final failure, OpenAI-compatible HTTP responses and Responses WebSocket error frames report `503` with `code: upstream_auth_unavailable` and the credential diagnostic. A credential failure during a scheduled same-target retry preserves the previous upstream rejection rather than replacing it.
 
 Attempts never overlap. Before switching, the failed response body and local readers/pumps must terminate. If delivery, semantic progress, commitment, state ownership, or cleanup is uncertain, Vekil returns an error instead of risking a duplicate generation, duplicate billing, duplicate server-side tool activity, or corrupted continuation.
 
