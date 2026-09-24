@@ -284,9 +284,21 @@ func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.R
 	}
 	normalizedAction := map[string]json.RawMessage{"type": action["type"]}
 	for _, field := range fields {
-		if value, present := action[field]; present && !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			normalizedAction[field] = value
+		value, present := action[field]
+		if !present || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			continue
 		}
+		// Codex parses queries as a string list and every other field as a string.
+		var typed any
+		if field == "queries" {
+			typed = new([]string)
+		} else {
+			typed = new(string)
+		}
+		if json.Unmarshal(value, typed) != nil {
+			return nil, errConversationHostedState
+		}
+		normalizedAction[field], _ = json.Marshal(typed)
 	}
 	encodedAction, err := json.Marshal(normalizedAction)
 	if err != nil {
