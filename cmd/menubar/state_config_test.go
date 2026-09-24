@@ -55,7 +55,7 @@ func TestDurableStateMenubarSharesProviderConfigAndStore(t *testing.T) {
 	if err := saveMenubarConfig(menubarConfig{ProvidersConfigPath: file}); err != nil {
 		t.Fatal(err)
 	}
-	_, loaded, err := loadProvidersConfigForMenubar()
+	_, loaded, err := loadProvidersConfigForMenubar(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}

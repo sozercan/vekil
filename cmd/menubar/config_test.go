@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -116,7 +117,7 @@ func TestLoadProvidersConfigForMenubar(t *testing.T) {
 	t.Run("missing menubar file uses default config", func(t *testing.T) {
 		stubUserConfigDir(t)
 
-		cfg, providersCfg, err := loadProvidersConfigForMenubar()
+		cfg, providersCfg, err := loadProvidersConfigForMenubar(t.Context())
 		if err != nil {
 			t.Fatalf("loadProvidersConfigForMenubar() error = %v", err)
 		}
@@ -138,7 +139,7 @@ func TestLoadProvidersConfigForMenubar(t *testing.T) {
 			t.Fatalf("WriteFile() error = %v", err)
 		}
 
-		_, _, err := loadProvidersConfigForMenubar()
+		_, _, err := loadProvidersConfigForMenubar(t.Context())
 		if !errors.Is(err, errMenubarConfigLoad) {
 			t.Fatalf("loadProvidersConfigForMenubar() error = %v, want wrapped menubar config error", err)
 		}
@@ -151,7 +152,7 @@ func TestLoadProvidersConfigForMenubar(t *testing.T) {
 			t.Fatalf("saveMenubarConfig() error = %v", err)
 		}
 
-		cfg, _, err := loadProvidersConfigForMenubar()
+		cfg, _, err := loadProvidersConfigForMenubar(t.Context())
 		if !errors.Is(err, errProvidersConfigLoad) {
 			t.Fatalf("loadProvidersConfigForMenubar() error = %v, want wrapped providers config error", err)
 		}
@@ -172,7 +173,7 @@ func TestLoadProvidersConfigForMenubar(t *testing.T) {
 			t.Fatalf("saveMenubarConfig() error = %v", err)
 		}
 
-		cfg, providersCfg, err := loadProvidersConfigForMenubar()
+		cfg, providersCfg, err := loadProvidersConfigForMenubar(t.Context())
 		if err != nil {
 			t.Fatalf("loadProvidersConfigForMenubar() error = %v", err)
 		}
@@ -201,7 +202,7 @@ func TestReloadProvidersStateReadsEditedConfig(t *testing.T) {
 	}
 	reload := func() proxy.ProvidersConfig {
 		t.Helper()
-		cfg, err := reloadProvidersState()
+		cfg, err := reloadProvidersState(t.Context())
 		if err != nil {
 			t.Fatalf("reloadProvidersState() error = %v", err)
 		}
@@ -222,7 +223,7 @@ func TestReloadProvidersStateReadsEditedConfig(t *testing.T) {
 	}
 
 	writeProviders("providers: [")
-	if _, err := reloadProvidersState(); !errors.Is(err, errProvidersConfigLoad) {
+	if _, err := reloadProvidersState(t.Context()); !errors.Is(err, errProvidersConfigLoad) {
 		t.Fatalf("reloadProvidersState() error = %v, want wrapped providers config error", err)
 	}
 	if got := providersMenuTitle(); got != "Providers: Invalid (providers.yaml)" {
@@ -235,6 +236,16 @@ func TestReloadProvidersStateReadsEditedConfig(t *testing.T) {
 	}
 	if got := providersMenuTitle(); got != "Providers: providers.yaml" {
 		t.Fatalf("providersMenuTitle() after fix = %q, want %q", got, "Providers: providers.yaml")
+	}
+
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	writeProviders("providers: [")
+	if _, err := reloadProvidersState(canceled); err == nil {
+		t.Fatal("reloadProvidersState(canceled) error = nil, want load error")
+	}
+	if got := providersMenuTitle(); got != "Providers: providers.yaml" {
+		t.Fatalf("providersMenuTitle() after canceled reload = %q, want %q", got, "Providers: providers.yaml")
 	}
 }
 

@@ -18,7 +18,7 @@ const (
 	remoteProvidersConfigTimeout     = 15 * time.Second
 )
 
-func readProvidersConfigSource(source string) ([]byte, error) {
+func readProvidersConfigSource(ctx context.Context, source string) ([]byte, error) {
 	configURL, remote, err := parseProvidersConfigURL(source)
 	if err != nil {
 		return nil, err
@@ -32,7 +32,7 @@ func readProvidersConfigSource(source string) ([]byte, error) {
 	}
 	displaySource := ProvidersConfigSourceDisplay(source)
 
-	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, configURL.String(), nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, configURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("fetch providers config %q: %w", displaySource, providersConfigRequestError(err))
 	}

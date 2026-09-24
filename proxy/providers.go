@@ -276,13 +276,19 @@ func providerRequestErrorCode(err error) string {
 // an HTTP(S) URL. Remote sources are fetched once per call with a bounded body
 // and timeout; Vekil does not poll them for changes.
 func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
+	return LoadProvidersConfigFileContext(context.Background(), path)
+}
+
+// LoadProvidersConfigFileContext is LoadProvidersConfigFile with a context that
+// cancels a remote fetch.
+func LoadProvidersConfigFileContext(ctx context.Context, path string) (ProvidersConfig, error) {
 	var cfg ProvidersConfig
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return cfg, nil
 	}
 
-	body, err := readProvidersConfigSource(path)
+	body, err := readProvidersConfigSource(ctx, path)
 	if err != nil {
 		return cfg, err
 	}

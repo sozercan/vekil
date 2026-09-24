@@ -67,7 +67,7 @@ func main() {
 	}
 	authenticator.DisableAutoDeviceFlow = true
 
-	menubarCfg, providersCfg, providersConfigErr = loadProvidersConfigForMenubar()
+	menubarCfg, providersCfg, providersConfigErr = loadProvidersConfigForMenubar(context.Background())
 	if providersConfigErr != nil {
 		logProvidersConfigLoadError(providersConfigErr)
 	}
@@ -204,16 +204,19 @@ func startProxy() {
 	go func() {
 		// Reload on every start so edits to the saved providers config apply
 		// after Stop and Start without relaunching the app.
-		cfg, configErr := reloadProvidersState()
+		cfg, configErr := reloadProvidersState(ctx)
 		completeProxyStartup(generation, runProxyStartup(ctx, authn, cfg, configErr))
 	}()
 }
 
 // reloadProvidersState re-reads the saved menubar config and the providers
-// config it selects, then publishes the result for the menu.
-func reloadProvidersState() (proxy.ProvidersConfig, error) {
-	cfg, loadedProvidersCfg, err := loadProvidersConfigForMenubar()
-	setProvidersState(cfg, loadedProvidersCfg, err)
+// config it selects, then publishes the result for the menu. A canceled reload
+// says nothing about the file, so it leaves the published state unchanged.
+func reloadProvidersState(ctx context.Context) (proxy.ProvidersConfig, error) {
+	cfg, loadedProvidersCfg, err := loadProvidersConfigForMenubar(ctx)
+	if ctx.Err() == nil {
+		setProvidersState(cfg, loadedProvidersCfg, err)
+	}
 	return loadedProvidersCfg, err
 }
 
