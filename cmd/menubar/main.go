@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"fyne.io/systray"
+	"github.com/sozercan/vekil/aikit"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
@@ -281,6 +282,27 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 	if err != nil {
 		return proxyStartFailure("invalid state bindings configuration", "Vekil Start Failed", fmt.Sprintf("Invalid state bindings override.\n\n%v", err), err)
 	}
+	// AIKit containers must be running before the server routes to them.
+	cfg, aikitGroup, err := aikit.StartProviders(ctx, cfg, aikit.ProviderStartOptions{
+		Progress:    &aikitStartupLog{},
+		Environment: os.Environ(),
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return proxyStartResult{err: ctx.Err()}
+		}
+		return proxyStartFailure(
+			"aikit start failed",
+			"Vekil Start Failed",
+			fmt.Sprintf("Could not start the AIKit model container.\n\n%v", err),
+			err,
+		)
+	}
+	closeAIKit := func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = aikitGroup.Close(closeCtx)
+	}
 	nextSrv, err := server.New(
 		authn,
 		log,
@@ -294,6 +316,7 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 		),
 	)
 	if err != nil {
+		closeAIKit()
 		return proxyStartFailure(
 			"server init failed",
 			"Vekil Start Failed",
@@ -301,9 +324,13 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 			err,
 		)
 	}
+	var current menubarProxyServer = nextSrv
+	if aikitGroup != nil {
+		current = aikitProxyServer{menubarProxyServer: nextSrv, group: aikitGroup}
+	}
 	if nextSrv.UsesCopilot() {
 		if _, err := authn.GetToken(ctx); err != nil {
-			_ = stopMenubarProxyServer(nextSrv, 10*time.Second)
+			_ = stopMenubarProxyServer(current, 10*time.Second)
 			if ctx.Err() != nil {
 				return proxyStartResult{err: ctx.Err()}
 			}
@@ -317,7 +344,7 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 	}
 	if cfg.UsesCopilot() {
 		if err := nextSrv.ValidateDynamicProviderModels(ctx); err != nil {
-			_ = stopMenubarProxyServer(nextSrv, 10*time.Second)
+			_ = stopMenubarProxyServer(current, 10*time.Second)
 			if ctx.Err() != nil {
 				return proxyStartResult{err: ctx.Err()}
 			}
@@ -330,10 +357,11 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		_ = stopMenubarProxyServer(nextSrv, 10*time.Second)
+		_ = stopMenubarProxyServer(current, 10*time.Second)
 		return proxyStartResult{err: err}
 	}
 	if err := nextSrv.Start(); err != nil {
+		closeAIKit()
 		return proxyStartFailure(
 			"server start failed",
 			"Vekil Start Failed",
@@ -345,7 +373,7 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 	// Each classifier route already has its own configured timeout. The startup
 	// worker keeps the aggregate operation cancellable without imposing a second,
 	// shorter deadline over a sequence of otherwise healthy routes.
-	if err := initializeProxyPolicyRouting(ctx, nextSrv); err != nil {
+	if err := initializeProxyPolicyRouting(ctx, current); err != nil {
 		if ctx.Err() != nil {
 			return proxyStartResult{err: ctx.Err()}
 		}
@@ -357,7 +385,7 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 		)
 	}
 
-	return proxyStartResult{server: nextSrv}
+	return proxyStartResult{server: current}
 }
 
 func initializeProxyPolicyRouting(ctx context.Context, current menubarProxyServer) error {

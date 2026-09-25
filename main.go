@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pkg/browser"
+	"github.com/sozercan/vekil/aikit"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
@@ -265,9 +266,50 @@ func defaultConfigValidateDeps() configValidateDeps {
 	return configValidateDeps{
 		stdout:                          os.Stdout,
 		stderr:                          os.Stderr,
-		validateProvidersConfigFile:     proxy.ValidateProvidersConfigFile,
-		validateProvidersConfigFileLive: proxy.ValidateProvidersConfigFileLive,
+		validateProvidersConfigFile:     validateProvidersConfigFileWithAIKit,
+		validateProvidersConfigFileLive: validateProvidersConfigFileLiveWithAIKit,
 	}
+}
+
+// validateProvidersConfigFileWithAIKit adds offline checks of aikit model
+// references to ordinary structural validation.
+func validateProvidersConfigFileWithAIKit(source string) error {
+	if err := proxy.ValidateProvidersConfigFile(source); err != nil {
+		return err
+	}
+	cfg, err := proxy.LoadProvidersConfigFile(source)
+	if err != nil {
+		return err
+	}
+	return aikit.ValidateProviderReferences(cfg)
+}
+
+// validateProvidersConfigFileLiveWithAIKit starts aikit providers for the
+// duration of a live validation, which must reach every configured upstream.
+func validateProvidersConfigFileLiveWithAIKit(ctx context.Context, source string) error {
+	cfg, err := proxy.LoadProvidersConfigFile(source)
+	if err != nil {
+		return err
+	}
+	if !cfg.HasAIKitProviders() {
+		return proxy.ValidateProvidersConfigFileLive(ctx, source)
+	}
+	if err := aikit.ValidateProviderReferences(cfg); err != nil {
+		return err
+	}
+	started, group, err := aikit.StartProviders(ctx, cfg, aikit.ProviderStartOptions{
+		Progress:    os.Stderr,
+		Environment: os.Environ(),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = group.Close(closeCtx)
+	}()
+	return proxy.ValidateProvidersConfigLive(ctx, started)
 }
 
 func runConfigWithDeps(args []string, deps configValidateDeps) int {
@@ -686,6 +728,22 @@ func runServe() {
 		log.Fatal("failed to load providers config", logger.Err(err))
 	}
 
+	// Signals must stop containers that are still pulling or loading, so the
+	// context exists before any aikit provider starts.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// log.Fatal exits without running deferred calls, so every exit below
+	// stops the containers explicitly.
+	providersCfg, aikitGroup, err := aikit.StartProviders(ctx, providersCfg, aikit.ProviderStartOptions{
+		Progress:    os.Stderr,
+		Environment: os.Environ(),
+	})
+	if err != nil {
+		log.Fatal("failed to start aikit providers", logger.Err(err))
+	}
+	stopAIKit := func() { stopServeAIKitProviders(aikitGroup, log) }
+
 	srv, err := server.New(
 		authenticator,
 		log,
@@ -706,14 +764,28 @@ func runServe() {
 		),
 	)
 	if err != nil {
+		stopAIKit()
 		log.Fatal("failed to initialize server", logger.Err(err))
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	if err := serveUntilContextDone(ctx, srv, authenticator, serveUsesCopilot(srv, providersCfg.UsesCopilot()), log); err != nil {
+		stopAIKit()
 		log.Fatal("serve error", logger.Err(err))
+	}
+	stopAIKit()
+}
+
+func stopServeAIKitProviders(group *aikit.Group, log *logger.Logger) {
+	if group == nil {
+		return
+	}
+	for _, hint := range group.KeepHints() {
+		log.Info("aikit container kept running", logger.F("hint", hint))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := group.Close(ctx); err != nil {
+		log.Warn("failed to stop aikit containers", logger.Err(err))
 	}
 }
 

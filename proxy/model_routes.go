@@ -39,6 +39,9 @@ type targetBinding struct {
 	upstreamModelJSON json.RawMessage
 	wirePolicy        providerRequestPolicy
 	legacyOwner       providerModel
+	// failoverOnContextOverflow certifies this target's context-overflow
+	// rejections as safe to replay on the next target.
+	failoverOnContextOverflow bool
 }
 
 type routePolicy struct {

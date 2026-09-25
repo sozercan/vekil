@@ -3647,6 +3647,9 @@ func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *route
 	azurePermit := azureRouteTrafficFromRequest(req).permit
 	azurePermit.holdResponseBody()
 	resp.Body = &routeAttemptTransportBody{inner: resp.Body, owner: owner, observation: observation, azurePermit: azurePermit}
+	if err == nil {
+		resp = normalizeUpstreamDialectResponse(req, resp)
+	}
 	return resp, err
 }
 
@@ -3691,6 +3694,18 @@ func prepareRouteTargetBody(body []byte, requestedModel, endpoint string, route 
 	prepared := append([]byte(nil), body...)
 	if endpoint == providerEndpointResponses {
 		prepared, _ = stripUnsupportedResponsesRequestFields(prepared, target.provider)
+		if target.provider != nil && target.provider.dialect == providerUpstreamDialectLocalAI {
+			if err := validateFunctionToolsOnlyResponsesRequest(prepared, target.provider.id); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if target.provider != nil && target.provider.dialect == providerUpstreamDialectLocalAI {
+		normalized, err := normalizeLocalAIRequest(prepared, endpoint)
+		if err != nil {
+			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+		}
+		prepared = normalized
 	}
 	if !providerUsesAzureClassicDeploymentPath(target.provider, endpoint) {
 		rewritten, _, err := rewriteRequestModelForProviderFromModel(prepared, requestedModel, target.upstreamModel)
@@ -3706,6 +3721,9 @@ func prepareRouteTargetBody(body []byte, requestedModel, endpoint string, route 
 func routeAdapterMayExplicitlyReject(target targetBinding, endpoint string, statusCode int) bool {
 	if target.provider == nil {
 		return false
+	}
+	if routeTargetMayRejectContextOverflow(target, endpoint, statusCode) {
+		return true
 	}
 	if statusCode == http.StatusTooManyRequests {
 		return true
@@ -3723,9 +3741,27 @@ func routeAdapterMayExplicitlyReject(target targetBinding, endpoint string, stat
 	}
 }
 
+// routeTargetMayRejectContextOverflow reports whether a status could be a
+// context-overflow rejection that the target's route may fail over from. The
+// body must still certify the overflow before the executor switches targets.
+func routeTargetMayRejectContextOverflow(target targetBinding, endpoint string, statusCode int) bool {
+	if !target.failoverOnContextOverflow {
+		return false
+	}
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusRequestEntityTooLarge {
+		return false
+	}
+	return endpoint == providerEndpointChatCompletions || endpoint == providerEndpointResponses || endpoint == providerEndpointMessages
+}
+
 func routeAdapterCertifiesHTTPRejection(target targetBinding, endpoint string, response *capturedRouteResponse) bool {
 	if response == nil || target.provider == nil || response.bodyIncomplete || !routeHTTPRejectionBodyAllowsReplay(response) {
 		return false
+	}
+	if routeTargetMayRejectContextOverflow(target, endpoint, response.statusCode) {
+		if _, overflow := parseUpstreamContextOverflow(response.statusCode, response.body); overflow {
+			return true
+		}
 	}
 	if response.statusCode == http.StatusTooManyRequests {
 		return true

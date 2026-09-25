@@ -3,6 +3,7 @@ package launch
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -103,6 +104,11 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 			"ANTHROPIC_SMALL_FAST_MODEL",
 			"ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
 		)
+	}
+	if hasModel && input.LocalModel != nil && input.LocalModel.ContextTokens > 0 {
+		// Claude Code otherwise assumes a large window for an unknown model and
+		// overflows the local server before it compacts.
+		envSet["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = strconv.FormatInt(input.LocalModel.ContextTokens, 10)
 	}
 	envUnset = mergeEnvironmentKeys(commonAgentCredentialEnvironment, envUnset, input.SensitiveEnv)
 

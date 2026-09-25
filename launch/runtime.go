@@ -168,6 +168,7 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 			SensitiveEnv:  opts.SensitiveEnv,
 			Environment:   opts.Environment,
 			NoProxy:       loopbackNoProxyValue(opts.Environment, baseURL),
+			LocalModel:    opts.LocalModel,
 			DryRun:        true,
 		})
 		if err != nil {
@@ -254,6 +255,7 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 		SensitiveEnv:  opts.SensitiveEnv,
 		Environment:   opts.Environment,
 		NoProxy:       loopbackNoProxyValue(opts.Environment, baseURL),
+		LocalModel:    opts.LocalModel,
 	})
 	if err != nil {
 		return result, err

@@ -27,6 +27,7 @@ Other targets are in the `Makefile`. Scoped suites, race matrices, and benchmark
 |------|---------|
 | root `main` package, `server/`, `auth/`, `logger/`, `models/`, `cmd/menubar/` | CLI/server lifecycle, GitHub auth, structured logging, data-only API structs, tray app |
 | `launch/` | Ephemeral proxy supervision, agent adapters, child environment sanitization, and session summaries |
+| `aikit/`, `proxy/aikit_provider_config.go`, `proxy/localai_*.go` | AIKit model containers started before the proxy; `type: aikit` config validation; LocalAI dialect request, response, and overflow normalization |
 | `proxy/chat_handlers.go`, `proxy/translator.go`, `proxy/streaming.go`, `proxy/openai_stream_reader.go` | Anthropic/OpenAI chat translation, native-Chat forced-stream aggregation, SSE translation and passthrough |
 | `proxy/chat_execution.go`, `proxy/chat_route*.go`, `proxy/chat_over_responses_*.go`, `proxy/responses_chat_*.go`, `proxy/chat_stream_events.go` | Deep Chat execution seam, native-Chat/Responses selection, strict Chat-to-Responses conversion, typed canonical stream events, and bounded tool replay |
 | `proxy/gemini*.go` | Gemini-native handlers plus Gemini↔OpenAI request/response and streaming translation |
@@ -57,6 +58,7 @@ When adding `proxy/*.go`, follow the nearest existing responsibility and naming 
 - **Azure support is OpenAI-compatible provider routing, not a separate public surface**: Azure deployment names stay internal to provider config, Azure auth is provider-configured as either API-key or SDK-backed Entra auth, and Azure `/models` probing is only a best-effort metadata overlay for configured models.
 - **OpenAI Codex support is file-auth-backed provider routing**: Codex models use the CLI ChatGPT auth file, dynamic `/models` discovery, and `/responses`-only routing.
 - **Proxy websocket bridging is not upstream realtime**: `GET /v1/responses` uses upstream HTTP `/responses` by default. The optional native upstream transport keeps Copilot sessions on a persistent Responses websocket and disables automatic HTTP compaction after connection establishment. Do not describe either transport as native Azure websocket or `/realtime` support.
+- **AIKit containers belong to the CLI, not the proxy**: `vekil launch`, `vekil serve`, and the tray app start `type: aikit` providers with `aikit.StartProviders` before constructing the proxy and stop them on every exit path. `proxy/` must never run containers; an unmaterialized aikit provider fails at runtime build. LocalAI quirks stay behind `upstream_dialect: localai`. See `docs/aikit.md`.
 - **Tool optimizers are opt-in and fail-open**: keep them disabled by default. External optimizer errors, timeouts, invalid JSON, or invalid replacements must fall back to the original payload and preserve default passthrough behavior.
 - **Minimal dependencies**: Keep third-party deps minimal and justify new production dependencies by the feature boundary they support.
 - **Distroless container**: Single static binary, `CGO_ENABLED=0`.
