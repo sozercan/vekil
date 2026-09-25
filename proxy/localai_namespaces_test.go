@@ -58,6 +58,11 @@ func TestFlattenLocalAINamespaceTools(t *testing.T) {
 	if out, aliases, err := flattenLocalAINamespaceTools([]byte(`{"tools":[{"type":"function","name":"f"}]}`)); err != nil || aliases != nil || string(out) != `{"tools":[{"type":"function","name":"f"}]}` {
 		t.Fatalf("plain request changed: %s %v %v", out, aliases, err)
 	}
+	escaped := `{"tools":[{"type":"name\u0073pace","name":"ns","tools":[{"type":"function","name":"f"}]}]}`
+	out, escapedAliases, err := flattenLocalAINamespaceTools([]byte(escaped))
+	if err != nil || escapedAliases["ns__f"] != (localAIToolAlias{namespace: "ns", name: "f"}) || strings.Contains(string(out), "pace") {
+		t.Fatalf("escaped namespace = %s, %v, %v", out, escapedAliases, err)
+	}
 	ambiguous := `{"tools":[{"type":"namespace","name":"a__b","tools":[{"type":"function","name":"c"}]}],"input":[{"type":"function_call","namespace":"a","name":"b__c","call_id":"c","arguments":"{}"}]}`
 	if _, _, err := flattenLocalAINamespaceTools([]byte(ambiguous)); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("ambiguous alias error = %v", err)

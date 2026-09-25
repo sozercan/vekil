@@ -99,16 +99,14 @@ func StartProviders(ctx context.Context, cfg proxy.ProvidersConfig, opts Provide
 		}
 		session, err := startProviderSession(ctx, *provider, engines, opts)
 		if err != nil {
-			closeGroup(group)
-			return proxy.ProvidersConfig{}, nil, fmt.Errorf("providers[%d] (%s): %w", index, provider.ID, err)
+			return proxy.ProvidersConfig{}, nil, rollBack(group, fmt.Errorf("providers[%d] (%s): %w", index, provider.ID, err))
 		}
 		group.add(session)
 		MaterializeProvider(provider, session, routeReferenced[strings.TrimSpace(provider.ID)])
 		setRouteContextWindows(&out, unsetRouteWindows, strings.TrimSpace(provider.ID), int64(session.ContextTokens))
 	}
 	if err := proxy.ValidateProvidersConfig(out); err != nil {
-		closeGroup(group)
-		return proxy.ProvidersConfig{}, nil, fmt.Errorf("validate started aikit providers: %w", err)
+		return proxy.ProvidersConfig{}, nil, rollBack(group, fmt.Errorf("validate started aikit providers: %w", err))
 	}
 	return out, group, nil
 }
@@ -132,10 +130,13 @@ func (g *Group) Discard(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// closeGroup rolls back a failed start; persistence applies only to a
-// successfully started group.
-func closeGroup(group *Group) {
-	_ = group.Discard(context.Background())
+// rollBack removes the containers of a failed start, whose persistence applies
+// only to a successfully started group, and reports any it could not remove.
+func rollBack(group *Group, cause error) error {
+	if err := group.Discard(context.Background()); err != nil {
+		return errors.Join(cause, fmt.Errorf("clean up started aikit containers: %w", err))
+	}
+	return cause
 }
 
 func startProviderSession(ctx context.Context, provider proxy.ProviderConfig, engines map[string]*Engine, opts ProviderStartOptions) (*Session, error) {
@@ -204,7 +205,8 @@ func MaterializeProvider(provider *proxy.ProviderConfig, session *Session, route
 		if len(model.Endpoints) == 0 {
 			model.Endpoints = proxy.AIKitModelEndpoints()
 		}
-		if model.ContextWindow == nil {
+		// A declared window may be smaller, never larger than what loaded.
+		if model.ContextWindow == nil || *model.ContextWindow > contextWindow {
 			value := contextWindow
 			model.ContextWindow = &value
 		}

@@ -32,9 +32,6 @@ var localAIAliasBodyLimit = 64 << 20
 // Function-call history items that name a namespace are flattened the same
 // way. The returned aliases map flattened names back for the response.
 func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, error) {
-	if !bytes.Contains(body, []byte(`"namespace"`)) {
-		return body, nil, nil
-	}
 	var payload map[string]json.RawMessage
 	if json.Unmarshal(body, &payload) != nil {
 		return body, nil, nil

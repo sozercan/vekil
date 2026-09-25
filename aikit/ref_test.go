@@ -43,10 +43,7 @@ func TestParseReference(t *testing.T) {
 		{name: "url not gguf", raw: "https://example.com/model.bin", wantErr: "must point to a .gguf file"},
 		{name: "plain http remote", raw: "http://example.com/model.gguf", wantErr: "must use https"},
 		{name: "plain http hugging face", raw: "http://huggingface.co/org/repo/resolve/main/model.gguf", wantErr: "must use https"},
-		{
-			name: "plain http loopback", raw: "http://127.0.0.1:8000/model.gguf",
-			kind: RefRunnerGGUF, source: "http://127.0.0.1:8000/model.gguf", modelName: "model",
-		},
+		{name: "loopback", raw: "https://localhost:8443/model.gguf", wantErr: "runner container cannot reach"},
 		{name: "url with credentials", raw: "https://user:pass@example.com/model.gguf", wantErr: "must not embed credentials"},
 		{name: "premade selector", raw: "multi:v1#chat-model", kind: RefImage, image: "ghcr.io/kaito-project/aikit/multi:v1", premade: true},
 		{name: "image selector", raw: "ghcr.io/me/multi:v1#chat-model", kind: RefImage, image: "ghcr.io/me/multi:v1"},
@@ -84,6 +81,19 @@ func TestParsePrefixed(t *testing.T) {
 	}
 	if _, err := ParsePrefixed("qwen3.8:27b"); err == nil {
 		t.Fatal("ParsePrefixed accepted a value without the prefix")
+	}
+}
+
+func TestParseReferenceErrorsHideURLSecrets(t *testing.T) {
+	for _, raw := range []string{
+		"https://user:secret@example.com/model.gguf",
+		"http://user:secret@example.com/model.gguf?token=secret",
+		"https://example.com/model.bin?token=secret",
+	} {
+		_, err := ParseReference(raw)
+		if err == nil || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("ParseReference(%q) error = %v", raw, err)
+		}
 	}
 }
 

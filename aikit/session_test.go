@@ -346,12 +346,13 @@ func TestStartRunnerGGUFElsewhereGetsNoHuggingFaceToken(t *testing.T) {
 	fake.onRun = func(c *fakeContainer) {
 		c.port = fake.serveLocalAI(nil, func() int { return 65536 })
 	}
-	ref, err := ParseReference(source.URL + "/models/tiny.gguf")
+	ref, err := ParseReference("https://models.example.com/models/tiny.gguf")
 	if err != nil {
 		t.Fatalf("ParseReference: %v", err)
 	}
 	session, progress, err := startTestSession(t, fake, fake.engine(EngineDocker, AccelNone), Options{
 		Reference:   ref,
+		HTTPClient:  &http.Client{Transport: rewriteTransport{target: source.URL, base: http.DefaultTransport}},
 		Environment: []string{"HF_TOKEN=hf_test"},
 	})
 	if err != nil {
@@ -392,10 +393,10 @@ type rewriteTransport struct {
 	base   http.RoundTripper
 }
 
-// RoundTrip sends huggingface.co requests to the test server and everything
-// else, such as container readiness checks, to its real destination.
+// RoundTrip sends requests for the remote model hosts to the test server and
+// everything else, such as container readiness checks, to its real destination.
 func (r rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Host != "huggingface.co" {
+	if req.URL.Host != "huggingface.co" && req.URL.Host != "models.example.com" {
 		return r.base.RoundTrip(req)
 	}
 	clone := req.Clone(req.Context())

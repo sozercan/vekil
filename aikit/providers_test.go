@@ -31,7 +31,7 @@ func TestStartProvidersMaterializesAIKitProviders(t *testing.T) {
 	fake := seedProviderFake(t)
 	cfg := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{
 		{ID: "local", Type: "aikit", Default: true, AIKit: &proxy.AIKitProviderConfig{Model: "qwen3.8:27b", ContextSize: 32768}},
-		{ID: "named", Type: "aikit", AIKit: &proxy.AIKitProviderConfig{Model: "qwen3.8:27b"}, Models: []proxy.ProviderModelConfig{{PublicID: "local-qwen", Name: "Local Qwen"}}},
+		{ID: "named", Type: "aikit", AIKit: &proxy.AIKitProviderConfig{Model: "qwen3.8:27b"}, Models: []proxy.ProviderModelConfig{{PublicID: "local-qwen", Name: "Local Qwen", ContextWindow: int64Ptr(200000)}}},
 	}}
 	var progress bytes.Buffer
 	out, group, err := StartProviders(context.Background(), cfg, ProviderStartOptions{Progress: &progress, Environment: []string{}, Executor: fake})
@@ -197,3 +197,5 @@ func TestValidateProviderReferences(t *testing.T) {
 		}
 	}
 }
+
+func int64Ptr(value int64) *int64 { return &value }

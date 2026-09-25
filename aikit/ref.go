@@ -190,26 +190,31 @@ func parseHuggingFaceShorthand(raw string) (Reference, error) {
 }
 
 func parseGGUFURL(raw, fileURL string) (Reference, error) {
+	display := displayURL(raw)
 	parsed, err := url.Parse(fileURL)
 	if err != nil || parsed.Host == "" {
-		return Reference{}, fmt.Errorf("aikit model %q is not a valid URL", raw)
+		return Reference{}, fmt.Errorf("aikit model %q is not a valid URL", display)
 	}
-	secure := parsed.Scheme == "https" || parsed.Scheme == "http" && loopbackHost(parsed.Hostname())
-	if !secure {
-		return Reference{}, fmt.Errorf("aikit model %q must use https (plain http is allowed only for localhost)", raw)
+	if parsed.Scheme != "https" {
+		return Reference{}, fmt.Errorf("aikit model %q must use https", display)
+	}
+	// The runner downloads from inside its container, where loopback is the
+	// container itself.
+	if loopbackHost(parsed.Hostname()) {
+		return Reference{}, fmt.Errorf("aikit model %q points at this machine, which the runner container cannot reach", display)
 	}
 	if parsed.User != nil {
-		return Reference{}, fmt.Errorf("aikit model %q must not embed credentials; set HF_TOKEN instead", raw)
+		return Reference{}, fmt.Errorf("aikit model %q must not embed credentials; set HF_TOKEN instead", display)
 	}
 	// The runner receives the URL as a container argument, which is visible
 	// in process listings and container metadata, so signed URLs cannot be
 	// passed safely.
 	if parsed.RawQuery != "" || parsed.Fragment != "" || strings.Contains(fileURL, "#") {
-		return Reference{}, fmt.Errorf("aikit model %q must not include a query string or fragment; the runner would expose it on the container command line", redactURL(raw))
+		return Reference{}, fmt.Errorf("aikit model %q must not include a query string or fragment; the runner would expose it on the container command line", display)
 	}
 	filename := path.Base(parsed.Path)
 	if !ggufFilePattern.MatchString(filename) {
-		return Reference{}, fmt.Errorf("aikit model %q must point to a .gguf file with a safe filename", raw)
+		return Reference{}, fmt.Errorf("aikit model %q must point to a .gguf file with a safe filename", display)
 	}
 	return Reference{
 		Raw:       raw,
@@ -217,6 +222,23 @@ func parseGGUFURL(raw, fileURL string) (Reference, error) {
 		Source:    fileURL,
 		ModelName: strings.TrimSuffix(filename, ".gguf"),
 	}, nil
+}
+
+// displayURL removes credentials, query, and fragment from a URL for messages.
+func displayURL(raw string) string {
+	value := redactURL(raw)
+	scheme, rest, found := strings.Cut(value, "://")
+	if !found {
+		return value
+	}
+	authority, tail, hasTail := strings.Cut(rest, "/")
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		authority = authority[at+1:]
+	}
+	if hasTail {
+		return scheme + "://" + authority + "/" + tail
+	}
+	return scheme + "://" + authority
 }
 
 func loopbackHost(host string) bool {
