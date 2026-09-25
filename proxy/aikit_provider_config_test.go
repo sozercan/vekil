@@ -152,6 +152,7 @@ func TestLoadProvidersConfigRejectsInvalidAIKitProviders(t *testing.T) {
 		{name: "managed base_url", file: "p.yaml", content: "providers:\n  - id: local\n    type: aikit\n    base_url: http://localhost:8080/v1\n    aikit: {model: qwen3.8:27b}\n", want: "providers[0].base_url: is managed by vekil"},
 		{name: "bad runtime", file: "p.yaml", content: "providers:\n  - id: local\n    type: aikit\n    aikit: {model: qwen3.8:27b, runtime: nerdctl}\n", want: "must be auto, docker, or podman"},
 		{name: "bad backend", file: "p.yaml", content: "providers:\n  - id: local\n    type: aikit\n    aikit: {model: qwen3.8:27b, backend: diffusers}\n", want: "must be llama-cpp or vllm-cpp"},
+		{name: "messages endpoint", file: "p.yaml", content: "providers:\n  - id: local\n    type: aikit\n    aikit: {model: qwen3.8:27b}\n    models: [{public_id: m, endpoints: [/v1/messages]}]\n", want: "serve only /chat/completions and /responses"},
 		{name: "bad timeout", file: "p.yaml", content: "providers:\n  - id: local\n    type: aikit\n    aikit: {model: qwen3.8:27b, load_timeout: soon}\n", want: "providers[0].aikit.load_timeout"},
 		{name: "block on other type", file: "p.yaml", content: "providers:\n  - id: local\n    type: openai-compatible\n    base_url: http://x/v1\n    aikit: {model: qwen3.8:27b}\n    models: [{public_id: m}]\n", want: "requires type aikit"},
 		{name: "unknown yaml key", file: "p.yaml", content: "schema_version: 2\nproviders:\n  - id: local\n    type: aikit\n    aikit: {model: qwen3.8:27b, gpu: true}\n", want: "gpu"},

@@ -311,7 +311,8 @@ func validateProvidersConfigFileLiveWithAIKit(ctx context.Context, source string
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = group.Close(closeCtx)
+		// Live validation containers are temporary, even with keep: true.
+		_ = group.Discard(closeCtx)
 	}()
 	return proxy.ValidateProvidersConfigLive(ctx, started)
 }

@@ -28,10 +28,8 @@ func TestParseReference(t *testing.T) {
 			name: "gguf url", raw: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf",
 			kind: RefRunnerGGUF, source: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf", modelName: "Qwen3.5-2B-Q4_K_M",
 		},
-		{
-			name: "gguf url with query", raw: "https://example.com/models/tiny.gguf?download=true",
-			kind: RefRunnerGGUF, source: "https://example.com/models/tiny.gguf?download=true", modelName: "tiny",
-		},
+		{name: "gguf url with query", raw: "https://example.com/models/tiny.gguf?X-Amz-Signature=secret", wantErr: "must not include a query string"},
+		{name: "gguf url with fragment", raw: "https://example.com/models/tiny.gguf#part", wantErr: "must not include a query string"},
 		{
 			name: "hf shorthand gguf", raw: "hf.co/unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q4_K_M.gguf",
 			kind: RefRunnerGGUF, source: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf", modelName: "Qwen3.5-2B-Q4_K_M",
@@ -90,10 +88,13 @@ func TestParsePrefixed(t *testing.T) {
 }
 
 func TestReferenceRedacted(t *testing.T) {
-	signed, _ := ParseReference("https://bucket.example.com/m.gguf?X-Amz-Signature=secret#frag")
+	signed := Reference{Kind: RefRunnerGGUF, Raw: "https://bucket.example.com/m.gguf?X-Amz-Signature=secret#frag"}
 	image, _ := ParseReference("ghcr.io/org/model:v1#chat")
 	if signed.Redacted() != "https://bucket.example.com/m.gguf" || image.Redacted() != "ghcr.io/org/model:v1#chat" {
 		t.Fatalf("Redacted = %q, %q", signed.Redacted(), image.Redacted())
+	}
+	if _, err := ParseReference(signed.Raw); err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("signed URL error = %v", err)
 	}
 }
 

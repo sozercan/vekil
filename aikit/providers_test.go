@@ -114,6 +114,23 @@ func TestStartProvidersKeepsConfiguredRouteContextWindows(t *testing.T) {
 	}
 }
 
+func TestGroupDiscardRemovesKeptContainers(t *testing.T) {
+	fake := seedProviderFake(t)
+	cfg := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{
+		{ID: "local", Type: "aikit", Default: true, AIKit: &proxy.AIKitProviderConfig{Model: "qwen3.8:27b", Keep: true}},
+	}}
+	_, group, err := StartProviders(context.Background(), cfg, ProviderStartOptions{Environment: []string{}, Executor: fake})
+	if err != nil {
+		t.Fatalf("StartProviders: %v", err)
+	}
+	if err := group.Close(context.Background()); err != nil || len(fake.containers) != 1 {
+		t.Fatalf("Close removed a kept container: %v, containers %d", err, len(fake.containers))
+	}
+	if err := group.Discard(context.Background()); err != nil || len(fake.containers) != 0 {
+		t.Fatalf("Discard = %v, containers left %d", err, len(fake.containers))
+	}
+}
+
 func TestSessionCloseCanBeRetried(t *testing.T) {
 	fake := seedProviderFake(t)
 	cfg := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{

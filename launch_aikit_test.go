@@ -145,13 +145,6 @@ func TestPrintAIKitDryRun(t *testing.T) {
 		}
 	}
 
-	signed, _ := aikit.ParseReference("https://bucket.example.com/m.gguf?X-Amz-Signature=secret#frag")
-	out.Reset()
-	printAIKitDryRun(&out, signed, launchAIKitOptions{})
-	if strings.Contains(out.String(), "secret") || strings.Contains(out.String(), "frag") {
-		t.Fatalf("dry-run printed URL credentials: %q", out.String())
-	}
-
 	image, _ := aikit.ParseReference("ghcr.io/org/model:v1")
 	out.Reset()
 	printAIKitDryRun(&out, image, launchAIKitOptions{})

@@ -101,6 +101,15 @@ func validateAIKitProvider(provider ProviderConfig, index int) error {
 	if _, err := block.LoadTimeoutDuration(); err != nil {
 		return configPathError(path+".aikit.load_timeout", "%v", err)
 	}
+	for modelIndex, model := range provider.Models {
+		for _, endpoint := range model.Endpoints {
+			switch strings.TrimSpace(endpoint) {
+			case providerEndpointChatCompletions, providerEndpointResponses:
+			default:
+				return configPathError(fmt.Sprintf("%s.models[%d].endpoints", path, modelIndex), "aikit models serve only /chat/completions and /responses")
+			}
+		}
+	}
 	// vekil owns the connection to the container it starts.
 	forbidden := []struct {
 		name string

@@ -373,7 +373,7 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		cancelStartup()
 		defer closeLaunchAIKit(stderr, session, group)
 		if signalValue != nil {
-			return 130
+			return launch.SignalExitCode(signalValue)
 		}
 		if startErr != nil {
 			_, _ = fmt.Fprintf(stderr, "error: %v\n", startErr)

@@ -201,6 +201,12 @@ func parseGGUFURL(raw, fileURL string) (Reference, error) {
 	if parsed.User != nil {
 		return Reference{}, fmt.Errorf("aikit model %q must not embed credentials; set HF_TOKEN instead", raw)
 	}
+	// The runner receives the URL as a container argument, which is visible
+	// in process listings and container metadata, so signed URLs cannot be
+	// passed safely.
+	if parsed.RawQuery != "" || parsed.Fragment != "" || strings.Contains(fileURL, "#") {
+		return Reference{}, fmt.Errorf("aikit model %q must not include a query string or fragment; the runner would expose it on the container command line", redactURL(raw))
+	}
 	filename := path.Base(parsed.Path)
 	if !ggufFilePattern.MatchString(filename) {
 		return Reference{}, fmt.Errorf("aikit model %q must point to a .gguf file with a safe filename", raw)

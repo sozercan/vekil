@@ -97,3 +97,9 @@ func TestCodexAdapterAppliesFunctionToolSafeguardsToLocalModels(t *testing.T) {
 		t.Fatalf("--search error = %v", err)
 	}
 }
+
+func TestSignalExitCodeMatchesLauncher(t *testing.T) {
+	if got := SignalExitCode(os.Interrupt); got != processSignalExitCode(os.Interrupt) {
+		t.Fatalf("SignalExitCode(os.Interrupt) = %d", got)
+	}
+}

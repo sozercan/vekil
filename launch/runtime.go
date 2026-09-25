@@ -778,3 +778,9 @@ func printSessionSummary(w io.Writer, snapshot statsSnapshot) {
 		}
 	}
 }
+
+// SignalExitCode is the exit status a launcher reports after a managed signal,
+// such as 130 for SIGINT and 143 for SIGTERM on Unix.
+func SignalExitCode(signalValue os.Signal) int {
+	return processSignalExitCode(signalValue)
+}
