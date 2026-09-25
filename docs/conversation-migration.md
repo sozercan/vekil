@@ -205,8 +205,10 @@ interrupting an agent mid-turn, owns that turn's outcome. Vekil saves the
 completed output items it delivered before the disconnect, in output order, as a
 snapshot of that response, then clears the marker. An item counts as delivered
 once a later event of the stream has been sent after it. The next turn may include those items and their
-tool results, or omit them and branch from the earlier history. Response-ID
-continuations of the interrupted response are rebuilt from the delivered items.
+tool results, or omit them and branch from the earlier history. When at least
+one completed item was delivered, a response-ID continuation of the interrupted
+response is rebuilt from those items. Otherwise, continue from the previous
+response.
 Items the client did not receive from Vekil still fail as incomplete history.
 Unfinished messages that arrived only as deltas are not saved. Vekil does not
 repeat the request automatically. A shutdown, crash or upstream disconnect is
