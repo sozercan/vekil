@@ -194,8 +194,9 @@ func parseGGUFURL(raw, fileURL string) (Reference, error) {
 	if err != nil || parsed.Host == "" {
 		return Reference{}, fmt.Errorf("aikit model %q is not a valid URL", raw)
 	}
-	if parsed.Scheme != "https" && parsed.Scheme != "http" {
-		return Reference{}, fmt.Errorf("aikit model %q must use http or https", raw)
+	secure := parsed.Scheme == "https" || parsed.Scheme == "http" && loopbackHost(parsed.Hostname())
+	if !secure {
+		return Reference{}, fmt.Errorf("aikit model %q must use https (plain http is allowed only for localhost)", raw)
 	}
 	if parsed.User != nil {
 		return Reference{}, fmt.Errorf("aikit model %q must not embed credentials; set HF_TOKEN instead", raw)
@@ -210,6 +211,15 @@ func parseGGUFURL(raw, fileURL string) (Reference, error) {
 		Source:    fileURL,
 		ModelName: strings.TrimSuffix(filename, ".gguf"),
 	}, nil
+}
+
+func loopbackHost(host string) bool {
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
 }
 
 // DefaultBackend returns the backend a reference uses when none is requested.

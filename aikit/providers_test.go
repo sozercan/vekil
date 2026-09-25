@@ -80,6 +80,12 @@ func TestStartProvidersLeavesRouteOnlyProvidersToRoutes(t *testing.T) {
 	if len(out.Providers[0].Models) != 0 {
 		t.Fatalf("route-only provider exposed models: %+v", out.Providers[0].Models)
 	}
+	if window := out.ModelRoutes[0].ContextWindow; window == nil || *window != 65536 {
+		t.Fatalf("route context_window = %v, want the served 65536", window)
+	}
+	if cfg.ModelRoutes[0].ContextWindow != nil {
+		t.Fatal("input config route was mutated")
+	}
 }
 
 func TestStartProvidersCleansUpOnFailure(t *testing.T) {

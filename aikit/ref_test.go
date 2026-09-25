@@ -43,6 +43,12 @@ func TestParseReference(t *testing.T) {
 		{name: "hf repo without commit", raw: "hf.co/Qwen/Qwen3-0.6B", wantErr: "must pin a full 40-character commit"},
 		{name: "hf repo short commit", raw: "hf.co/Qwen/Qwen3-0.6B@abc", wantErr: "must pin a full 40-character commit"},
 		{name: "url not gguf", raw: "https://example.com/model.bin", wantErr: "must point to a .gguf file"},
+		{name: "plain http remote", raw: "http://example.com/model.gguf", wantErr: "must use https"},
+		{name: "plain http hugging face", raw: "http://huggingface.co/org/repo/resolve/main/model.gguf", wantErr: "must use https"},
+		{
+			name: "plain http loopback", raw: "http://127.0.0.1:8000/model.gguf",
+			kind: RefRunnerGGUF, source: "http://127.0.0.1:8000/model.gguf", modelName: "model",
+		},
 		{name: "url with credentials", raw: "https://user:pass@example.com/model.gguf", wantErr: "must not embed credentials"},
 		{name: "premade selector", raw: "multi:v1#chat-model", kind: RefImage, image: "ghcr.io/kaito-project/aikit/multi:v1", premade: true},
 		{name: "image selector", raw: "ghcr.io/me/multi:v1#chat-model", kind: RefImage, image: "ghcr.io/me/multi:v1"},

@@ -101,6 +101,26 @@ model_routes:
 	}
 }
 
+func TestLoadProvidersConfigRouteOnlyAIKitProviderHasNoPlaceholderModel(t *testing.T) {
+	path := writeProvidersConfig(t, "providers.yaml", `
+schema_version: 2
+state_bindings: {mode: memory}
+providers:
+  - id: local
+    type: aikit
+    default: true
+    aikit: {model: qwen3.8:27b}
+model_routes:
+  - id: aikit-local
+    public_id: aikit-local
+    endpoints: [/chat/completions]
+    targets: [{id: local, provider: local, upstream_model: qwen-3.8-27b}]
+`)
+	if _, err := LoadProvidersConfigFile(path); err != nil {
+		t.Fatalf("route public ID collided with a validation placeholder: %v", err)
+	}
+}
+
 func TestLoadProvidersConfigRejectsInvalidAIKitProviders(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -376,7 +376,8 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 			_, _ = fmt.Fprintf(stderr, "error: %v\n", startErr)
 			return 1
 		}
-		launchOpts.SensitiveEnv = launchSensitiveEnvironment(providersCfg)
+		// AIKit startup may read HF_TOKEN; the agent must not inherit it.
+		launchOpts.SensitiveEnv = append(launchSensitiveEnvironment(providersCfg), "HF_TOKEN")
 		launchOpts.LocalModel = launchLocalModelProfile(providersCfg, opts.model)
 	} else if opts.model != "" {
 		launchOpts.LocalModel = launchLocalModelProfile(providersCfg, opts.model)

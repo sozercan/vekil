@@ -139,6 +139,12 @@ func validateAIKitProvider(provider ProviderConfig, index int) error {
 // container runs, so routes, policies, and model IDs validate normally.
 func aikitValidationShadow(cfg ProvidersConfig) (ProvidersConfig, []int, error) {
 	shadow := cloneProvidersConfigForValidation(cfg)
+	routeReferenced := map[string]bool{}
+	for _, route := range cfg.ModelRoutes {
+		for _, target := range route.Targets {
+			routeReferenced[strings.TrimSpace(target.Provider)] = true
+		}
+	}
 	var indexes []int
 	for index := range shadow.Providers {
 		provider := &shadow.Providers[index]
@@ -157,7 +163,8 @@ func aikitValidationShadow(cfg ProvidersConfig) (ProvidersConfig, []int, error) 
 		provider.AuthType = string(providerAuthTypeNone)
 		provider.AIKit = nil
 		provider.UpstreamDialect = string(providerUpstreamDialectLocalAI)
-		if len(provider.Models) == 0 {
+		// Routes own the public contract of a route-referenced provider.
+		if len(provider.Models) == 0 && !routeReferenced[strings.TrimSpace(provider.ID)] {
 			provider.Models = []ProviderModelConfig{{PublicID: "aikit-" + strings.TrimSpace(provider.ID)}}
 		}
 	}

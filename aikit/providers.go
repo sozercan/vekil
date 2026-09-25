@@ -93,6 +93,7 @@ func StartProviders(ctx context.Context, cfg proxy.ProvidersConfig, opts Provide
 		}
 		group.add(session)
 		MaterializeProvider(provider, session, routeReferenced[strings.TrimSpace(provider.ID)])
+		setRouteContextWindows(&out, strings.TrimSpace(provider.ID), int64(session.ContextTokens))
 	}
 	if err := proxy.ValidateProvidersConfig(out); err != nil {
 		closeGroup(group)
@@ -181,6 +182,33 @@ func MaterializeProvider(provider *proxy.ProviderConfig, session *Session, route
 		}
 	}
 	provider.Models = models
+}
+
+// setRouteContextWindows gives routes that target providerID and leave
+// context_window unset the served context, keeping the smallest across
+// started targets. Route-only providers carry no model metadata of their own.
+func setRouteContextWindows(cfg *proxy.ProvidersConfig, providerID string, contextTokens int64) {
+	if len(cfg.ModelRoutes) == 0 {
+		return
+	}
+	routes := append([]proxy.ModelRouteConfig(nil), cfg.ModelRoutes...)
+	for index := range routes {
+		route := &routes[index]
+		targetsProvider := false
+		for _, target := range route.Targets {
+			if strings.TrimSpace(target.Provider) == providerID {
+				targetsProvider = true
+			}
+		}
+		if !targetsProvider {
+			continue
+		}
+		if route.ContextWindow == nil || *route.ContextWindow > contextTokens {
+			value := contextTokens
+			route.ContextWindow = &value
+		}
+	}
+	cfg.ModelRoutes = routes
 }
 
 func routeReferencedProviders(cfg proxy.ProvidersConfig) map[string]bool {

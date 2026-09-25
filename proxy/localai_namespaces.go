@@ -96,13 +96,16 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 		var items []map[string]json.RawMessage
 		if json.Unmarshal(raw, &items) == nil {
 			changed := false
-			for _, item := range items {
+			for index, item := range items {
 				namespace := jsonStringField(item, "namespace")
 				if namespace == "" || jsonStringField(item, "type") != "function_call" {
 					continue
 				}
 				name := jsonStringField(item, "name")
 				alias := namespace + localAIToolSeparator + name
+				if topLevel[alias] {
+					return nil, nil, localAIToolError(fmt.Sprintf("input[%d].name", index), fmt.Sprintf("flattened name %q collides with another tool", alias))
+				}
 				item["name"] = mustMarshalJSON(alias)
 				delete(item, "namespace")
 				if _, known := aliases[alias]; !known {

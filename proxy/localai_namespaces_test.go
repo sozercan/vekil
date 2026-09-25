@@ -53,6 +53,10 @@ func TestFlattenLocalAINamespaceTools(t *testing.T) {
 	if out, aliases, err := flattenLocalAINamespaceTools([]byte(`{"tools":[{"type":"function","name":"f"}]}`)); err != nil || aliases != nil || string(out) != `{"tools":[{"type":"function","name":"f"}]}` {
 		t.Fatalf("plain request changed: %s %v %v", out, aliases, err)
 	}
+	historyCollision := `{"tools":[{"type":"function","name":"ns__f"},{"type":"namespace","name":"other","tools":[{"type":"function","name":"g"}]}],"input":[{"type":"function_call","namespace":"ns","name":"f","call_id":"c","arguments":"{}"}]}`
+	if _, _, err := flattenLocalAINamespaceTools([]byte(historyCollision)); err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("history collision error = %v", err)
+	}
 	collision := `{"tools":[{"type":"function","name":"ns__f"},{"type":"namespace","name":"ns","tools":[{"type":"function","name":"f"}]}]}`
 	if _, _, err := flattenLocalAINamespaceTools([]byte(collision)); err == nil || !strings.Contains(err.Error(), "collides") {
 		t.Fatalf("collision error = %v", err)

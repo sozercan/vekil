@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sozercan/vekil/aikit"
 	"github.com/sozercan/vekil/logger"
@@ -18,7 +19,11 @@ type aikitProxyServer struct {
 }
 
 func (s aikitProxyServer) Stop(ctx context.Context) error {
-	return errors.Join(s.menubarProxyServer.Stop(ctx), s.group.Close(ctx))
+	stopErr := s.menubarProxyServer.Stop(ctx)
+	// Graceful shutdown may use up ctx; removing containers needs its own time.
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return errors.Join(stopErr, s.group.Close(cleanupCtx))
 }
 
 // aikitStartupLog forwards AIKit start progress lines to the tray log.

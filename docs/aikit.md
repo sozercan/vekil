@@ -24,7 +24,7 @@ with `upstream_dialect: localai`.
 | Pre-made name | `qwen3.8:27b` | `ghcr.io/kaito-project/aikit/<name>:<tag>`, or its `applesilicon/` variant on a podman libkrun machine |
 | Image reference | `ghcr.io/org/model:v1`, `localhost/model:dev` | that image |
 | Image with several models | `ghcr.io/org/multi:v1#chat-model` | the named model from the image config |
-| GGUF URL | `https://example.com/model-Q4_K_M.gguf` | a runner image that downloads the file at startup |
+| GGUF URL | `https://example.com/model-Q4_K_M.gguf` (plain `http` only for `localhost`) | a runner image that downloads the file at startup |
 | Hugging Face GGUF file | `hf.co/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf` | the same, on the repository's `main` revision |
 | Hugging Face repository | `hf.co/Qwen/Qwen3-0.6B@<40-hex commit>` | the vllm.cpp runner (see [Backends](#backends)) |
 
@@ -165,7 +165,8 @@ Vekil owns the connection, so `base_url`, authentication fields, endpoint
 paths, `model_discovery`, model filters, and `hosted_tools` are rejected on an
 aikit provider. Without `models`, the provider exposes the served model name
 (for example `qwen-3.8-27b`), unless routes reference the provider, in which
-case the routes define its public contract. The agent context floor does not
+case the routes define its public contract; a route that leaves
+`context_window` unset gets the served context. The agent context floor does not
 apply here; set `context_size` for sessions that need more than the default.
 
 - `vekil serve`, the tray app, and `vekil launch --providers-config` start aikit
