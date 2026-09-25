@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
@@ -195,4 +196,50 @@ func sendRouteAuthProtocolRequest(t *testing.T, handler *ProxyHandler, protocol 
 		t.Fatalf("response.completed has no response object: %+v", frame)
 	}
 	return http.StatusOK, response
+}
+
+func TestOpenAICodexCredentialFailureProtocol(t *testing.T) {
+	for _, missing := range []bool{true, false} {
+		for _, protocol := range []string{"HTTP", "WebSocket"} {
+			t.Run(fmt.Sprintf("missing=%t/%s", missing, protocol), func(t *testing.T) {
+				codexHome := t.TempDir()
+				t.Setenv("CODEX_HOME", codexHome)
+				if !missing {
+					// No refresh token: stale credentials fail without an OAuth call.
+					writeTestOpenAICodexAuth(t, codexHome, testOpenAICodexTokens(t, time.Now().Add(-time.Hour), "test-account", false, ""))
+				}
+				var sends atomic.Int32
+				handler, err := NewProxyHandler(
+					auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
+					WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+						ID: "codex", Type: string(providerTypeOpenAICodex), Default: true, BaseURL: "https://codex.example",
+					}}}),
+					func(h *ProxyHandler) {
+						h.client = &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+							sends.Add(1)
+							return nil, fmt.Errorf("unexpected upstream or OAuth request: %s %s", req.Method, req.URL)
+						})}
+					},
+				)
+				if err != nil {
+					t.Fatalf("NewProxyHandler() error = %v", err)
+				}
+				t.Cleanup(handler.BeginShutdown)
+				status, payload := sendRouteAuthProtocolRequest(t, handler, protocol)
+				detail, ok := payload["error"].(map[string]interface{})
+				if status != http.StatusServiceUnavailable || !ok || detail["code"] != upstreamAuthUnavailableCode {
+					t.Fatalf("status=%d payload=%+v, want 503 upstream_auth_unavailable", status, payload)
+				}
+				message, _ := detail["message"].(string)
+				for _, want := range []string{`provider "codex"`, "OpenAI Codex auth failed", "codex login"} {
+					if !strings.Contains(message, want) {
+						t.Errorf("message=%q, want credential diagnostic %q", message, want)
+					}
+				}
+				if sends.Load() != 0 {
+					t.Fatalf("upstream or OAuth sends=%d, want 0", sends.Load())
+				}
+			})
+		}
+	}
 }
