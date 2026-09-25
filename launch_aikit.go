@@ -57,6 +57,9 @@ func validateLaunchAIKitOptions(ref aikit.Reference, opts launchAIKitOptions) er
 	default:
 		return fmt.Errorf("unsupported --runtime %q: use auto, docker, or podman", opts.runtime)
 	}
+	if opts.contextSize > 0 && opts.contextSize < aikit.AgentMinimumContextTokens {
+		return fmt.Errorf("--context-size %d is below the %d tokens a coding agent needs", opts.contextSize, aikit.AgentMinimumContextTokens)
+	}
 	_, err := aikit.ResolveBackend(ref, opts.backend)
 	return err
 }

@@ -113,10 +113,14 @@ func StartProviders(ctx context.Context, cfg proxy.ProvidersConfig, opts Provide
 	return out, group, nil
 }
 
+// closeGroup rolls back a failed start. Kept containers are removed too,
+// because persistence applies only to a successfully started group.
 func closeGroup(group *Group) {
-	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-	defer cancel()
-	_ = group.Close(ctx)
+	for _, session := range group.Sessions() {
+		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		_ = session.discard(ctx)
+		cancel()
+	}
 }
 
 func startProviderSession(ctx context.Context, provider proxy.ProviderConfig, engines map[string]*Engine, opts ProviderStartOptions) (*Session, error) {

@@ -58,6 +58,10 @@ func TestFlattenLocalAINamespaceTools(t *testing.T) {
 	if out, aliases, err := flattenLocalAINamespaceTools([]byte(`{"tools":[{"type":"function","name":"f"}]}`)); err != nil || aliases != nil || string(out) != `{"tools":[{"type":"function","name":"f"}]}` {
 		t.Fatalf("plain request changed: %s %v %v", out, aliases, err)
 	}
+	ambiguous := `{"tools":[{"type":"namespace","name":"a__b","tools":[{"type":"function","name":"c"}]}],"input":[{"type":"function_call","namespace":"a","name":"b__c","call_id":"c","arguments":"{}"}]}`
+	if _, _, err := flattenLocalAINamespaceTools([]byte(ambiguous)); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous alias error = %v", err)
+	}
 	historyCollision := `{"tools":[{"type":"function","name":"ns__f"},{"type":"namespace","name":"other","tools":[{"type":"function","name":"g"}]}],"input":[{"type":"function_call","namespace":"ns","name":"f","call_id":"c","arguments":"{}"}]}`
 	if _, _, err := flattenLocalAINamespaceTools([]byte(historyCollision)); err == nil || !strings.Contains(err.Error(), "collides") {
 		t.Fatalf("history collision error = %v", err)

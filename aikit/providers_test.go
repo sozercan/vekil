@@ -138,7 +138,7 @@ func TestSessionCloseCanBeRetried(t *testing.T) {
 func TestStartProvidersCleansUpOnFailure(t *testing.T) {
 	fake := seedProviderFake(t)
 	cfg := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{
-		{ID: "ok", Type: "aikit", Default: true, AIKit: &proxy.AIKitProviderConfig{Model: "qwen3.8:27b"}},
+		{ID: "ok", Type: "aikit", Default: true, AIKit: &proxy.AIKitProviderConfig{Model: "qwen3.8:27b", Keep: true}},
 		{ID: "bad", Type: "aikit", AIKit: &proxy.AIKitProviderConfig{Model: "missing:tag"}},
 	}}
 	_, _, err := StartProviders(context.Background(), cfg, ProviderStartOptions{Environment: []string{}, Executor: fake})
@@ -168,6 +168,8 @@ func TestValidateProviderReferences(t *testing.T) {
 	}
 	for _, block := range []proxy.AIKitProviderConfig{
 		{Model: "qwen3.8"},
+		{Model: "hf.co/org/repo@" + strings.Repeat("a", 40)},
+		{Model: "hf.co/org/repo/file.gguf", Backend: "vllm-cpp"},
 		{Model: "qwen3.8:27b", Backend: "llama-cpp"},
 		{Model: "hf.co/org/repo@" + strings.Repeat("a", 40), Backend: "llama-cpp"},
 	} {

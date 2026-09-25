@@ -171,6 +171,7 @@ func TestValidateLaunchAIKitOptions(t *testing.T) {
 		{premade, launchAIKitOptions{runtime: "nerdctl"}, "unsupported --runtime"},
 		{runner, launchAIKitOptions{backend: "diffusers"}, "unsupported backend"},
 		{premade, launchAIKitOptions{backend: "llama-cpp"}, "applies to runner references"},
+		{premade, launchAIKitOptions{contextSize: 8192}, "below the 49152"},
 	} {
 		if err := validateLaunchAIKitOptions(tc.ref, tc.opts); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("validateLaunchAIKitOptions(%+v) = %v, want %q", tc.opts, err, tc.want)

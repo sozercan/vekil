@@ -109,6 +109,24 @@ func (s *Session) Close(ctx context.Context) error {
 	return nil
 }
 
+// discard removes a container this process started, even one marked keep,
+// when startup is rolled back. A reused container belongs to an earlier run.
+func (s *Session) discard(ctx context.Context) error {
+	if s == nil || s.Reused {
+		return nil
+	}
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closed {
+		return nil
+	}
+	if err := s.engine.remove(ctx, s.ContainerID); err != nil {
+		return err
+	}
+	s.closed = true
+	return nil
+}
+
 // KeepHint tells the user how to stop a kept container.
 func (s *Session) KeepHint() string {
 	return fmt.Sprintf("%s left running as %s; stop it with `%s rm -f %s`", s.ModelName, s.ContainerName, s.engine.Name, s.ContainerName)
@@ -237,18 +255,24 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 // request against the reference.
 func ResolveBackend(ref Reference, requested string) (string, error) {
 	requested = strings.TrimSpace(requested)
-	if requested == "" {
-		return ref.DefaultBackend(), nil
+	backend := ref.DefaultBackend()
+	if requested != "" {
+		normalized, ok := normalizeBackend(requested)
+		if !ok {
+			return "", fmt.Errorf("unsupported backend %q: use llama-cpp or vllm-cpp", requested)
+		}
+		if !ref.IsRunner() {
+			return "", fmt.Errorf("--backend applies to runner references (hf.co/... or https .gguf URLs); image %s declares its own backend", ref.Redacted())
+		}
+		if ref.Kind == RefRunnerRepo && normalized != BackendVLLMCPP {
+			return "", fmt.Errorf("repository references are served by vllm-cpp; use an https .gguf URL for llama-cpp")
+		}
+		backend = normalized
 	}
-	backend, ok := normalizeBackend(requested)
-	if !ok {
-		return "", fmt.Errorf("unsupported backend %q: use llama-cpp or vllm-cpp", requested)
-	}
-	if !ref.IsRunner() {
-		return "", fmt.Errorf("--backend applies to runner references (hf.co/... or https .gguf URLs); image %s declares its own backend", ref.Redacted())
-	}
-	if ref.Kind == RefRunnerRepo && backend != BackendVLLMCPP {
-		return "", fmt.Errorf("repository references are served by vllm-cpp; use an https .gguf URL for llama-cpp")
+	// A vllm.cpp runner cannot be given an agent-sized KV pool; fail here
+	// rather than after a pull and download.
+	if ref.IsRunner() && backend == BackendVLLMCPP {
+		return "", fmt.Errorf("vllm.cpp runner references are not supported: %w", errVLLMCPPPoolSizing)
 	}
 	return backend, nil
 }

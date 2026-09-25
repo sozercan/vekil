@@ -121,6 +121,24 @@ model_routes:
 	}
 }
 
+func TestLoadProvidersConfigAIKitPlaceholderAvoidsConfiguredIDs(t *testing.T) {
+	path := writeProvidersConfig(t, "providers.yaml", `
+providers:
+  - id: local
+    type: aikit
+    default: true
+    aikit: {model: qwen3.8:27b}
+  - id: other
+    type: openai-compatible
+    base_url: http://other.example/v1
+    models:
+      - public_id: aikit-local
+`)
+	if _, err := LoadProvidersConfigFile(path); err != nil {
+		t.Fatalf("validation placeholder collided with a configured public ID: %v", err)
+	}
+}
+
 func TestLoadProvidersConfigRejectsInvalidAIKitProviders(t *testing.T) {
 	tests := []struct {
 		name    string

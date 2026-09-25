@@ -110,11 +110,15 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 				if topLevel[alias] {
 					return nil, nil, localAIToolError(fmt.Sprintf("input[%d].name", index), fmt.Sprintf("flattened name %q collides with another tool", alias))
 				}
+				// Names may contain the separator, so a/b__c and a__b/c flatten to
+				// the same name; restoring either would pick the wrong tool.
+				mapping := localAIToolAlias{namespace: namespace, name: name}
+				if known, exists := aliases[alias]; exists && known != mapping {
+					return nil, nil, localAIToolError(fmt.Sprintf("input[%d].name", index), fmt.Sprintf("flattened name %q is ambiguous", alias))
+				}
+				aliases[alias] = mapping
 				item["name"] = mustMarshalJSON(alias)
 				delete(item, "namespace")
-				if _, known := aliases[alias]; !known {
-					aliases[alias] = localAIToolAlias{namespace: namespace, name: name}
-				}
 				changed = true
 			}
 			if changed {

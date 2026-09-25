@@ -274,12 +274,13 @@ func defaultConfigValidateDeps() configValidateDeps {
 // validateProvidersConfigFileWithAIKit adds offline checks of aikit model
 // references to ordinary structural validation.
 func validateProvidersConfigFileWithAIKit(source string) error {
-	if err := proxy.ValidateProvidersConfigFile(source); err != nil {
-		return err
-	}
+	// Load once: a remote source may return different content on a refetch.
 	cfg, err := proxy.LoadProvidersConfigFile(source)
 	if err != nil {
 		return err
+	}
+	if err := proxy.ValidateProvidersConfig(cfg); err != nil {
+		return fmt.Errorf("validate providers config %q: %w", proxy.ProvidersConfigSourceDisplay(source), err)
 	}
 	return aikit.ValidateProviderReferences(cfg)
 }
@@ -295,7 +296,7 @@ func validateProvidersConfigFileLiveWithAIKit(ctx context.Context, source string
 		return err
 	}
 	if !cfg.HasAIKitProviders() {
-		return proxy.ValidateProvidersConfigFileLive(ctx, source)
+		return proxy.ValidateProvidersConfigLive(ctx, cfg)
 	}
 	if err := aikit.ValidateProviderReferences(cfg); err != nil {
 		return err

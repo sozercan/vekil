@@ -165,10 +165,47 @@ func aikitValidationShadow(cfg ProvidersConfig) (ProvidersConfig, []int, error) 
 		provider.UpstreamDialect = string(providerUpstreamDialectLocalAI)
 		// Routes own the public contract of a route-referenced provider.
 		if len(provider.Models) == 0 && !routeReferenced[strings.TrimSpace(provider.ID)] {
-			provider.Models = []ProviderModelConfig{{PublicID: "aikit-" + strings.TrimSpace(provider.ID)}}
+			provider.Models = []ProviderModelConfig{{PublicID: unusedValidationPublicID(cfg, "aikit-"+strings.TrimSpace(provider.ID))}}
 		}
 	}
 	return shadow, indexes, nil
+}
+
+// unusedValidationPublicID returns base, or base with a numeric suffix, such
+// that none of its normalized aliases matches a public ID the config declares.
+// The placeholder exists only during validation and must not cause a
+// collision the running config would not have.
+func unusedValidationPublicID(cfg ProvidersConfig, base string) string {
+	used := map[string]bool{}
+	add := func(publicID string) {
+		for _, alias := range configuredPublicModelAliases(publicID) {
+			used[alias] = true
+		}
+	}
+	for _, provider := range cfg.Providers {
+		for _, model := range provider.Models {
+			add(model.PublicID)
+		}
+	}
+	for _, route := range cfg.ModelRoutes {
+		add(route.PublicID)
+	}
+	for _, profile := range cfg.PolicyProfiles {
+		add(profile.PublicID)
+	}
+	candidate := base
+	for suffix := 2; ; suffix++ {
+		free := true
+		for _, alias := range configuredPublicModelAliases(candidate) {
+			if used[alias] {
+				free = false
+			}
+		}
+		if free {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d", base, suffix)
+	}
 }
 
 func validateAndNormalizeProvidersConfigWithAIKit(cfg ProvidersConfig) (validatedProvidersConfig, error) {

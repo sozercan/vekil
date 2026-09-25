@@ -26,7 +26,7 @@ with `upstream_dialect: localai`.
 | Image with several models | `ghcr.io/org/multi:v1#chat-model` | the named model from the image config |
 | GGUF URL | `https://example.com/model-Q4_K_M.gguf` (plain `http` only for `localhost`) | a runner image that downloads the file at startup |
 | Hugging Face GGUF file | `hf.co/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf` | the same, on the repository's `main` revision |
-| Hugging Face repository | `hf.co/Qwen/Qwen3-0.6B@<40-hex commit>` | the vllm.cpp runner (see [Backends](#backends)) |
+| Hugging Face repository | `hf.co/Qwen/Qwen3-0.6B@<40-hex commit>` | the vllm.cpp runner; refused for now (see [Backends](#backends)) |
 
 Pre-made names need a tag. A full image reference must start with a registry
 host (`ghcr.io/…`, `localhost/…`, `registry:5000/…`).
