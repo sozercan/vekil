@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -343,6 +344,27 @@ func TestConversationMigrationInterruptKeepsUncertainTurnsBlocked(t *testing.T) 
 			retry := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Try again."}, nil)
 			if retry.Code != http.StatusConflict || sends.Load() != 2 || !strings.Contains(retry.Body.String(), "conversation_execution_uncertain") {
 				t.Fatalf("uncertain turn released: %d %s", retry.Code, retry.Body.String())
+			}
+		})
+	}
+}
+
+func TestConversationMigrationDeliveryStagingIsBounded(t *testing.T) {
+	message := func(index int, text string) map[string]json.RawMessage {
+		item, _ := json.Marshal(map[string]any{"type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": text}}})
+		return map[string]json.RawMessage{"output_index": json.RawMessage(strconv.Itoa(index)), "item": item}
+	}
+	for _, scenario := range []string{"history bytes", "duplicate index"} {
+		t.Run(scenario, func(t *testing.T) {
+			turn := &conversationTurn{store: &conversationHistoryStore{config: ConversationMigrationConfig{MaxHistoryBytes: 1024}}}
+			turn.observeDelivery("response.output_item.done", message(0, "small"), explicitRouteResponseInfo{})
+			next := message(1, strings.Repeat("x", 2048))
+			if scenario == "duplicate index" {
+				next = message(0, "again")
+			}
+			turn.observeDelivery("response.output_item.done", next, explicitRouteResponseInfo{})
+			if !turn.deliveredInvalid || len(turn.staged) != 0 {
+				t.Fatalf("staging was not disabled: invalid=%v staged=%d", turn.deliveredInvalid, len(turn.staged))
 			}
 		})
 	}

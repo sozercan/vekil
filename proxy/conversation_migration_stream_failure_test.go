@@ -169,3 +169,36 @@ func TestConversationMigrationQuotaEvidenceHoldsPreambleForFailover(t *testing.T
 		})
 	}
 }
+
+func TestConversationMigrationPrecommitFailureWithUsageAllowsRetry(t *testing.T) {
+	var sends, west atomic.Int32
+	transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/models") {
+			return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+		}
+		if strings.HasPrefix(req.URL.Host, "west.") {
+			west.Add(1)
+		}
+		switch sends.Add(1) {
+		case 1:
+			return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
+		case 2:
+			// Reported usage makes the failure unsafe to replay on another
+			// target, but the terminal event still carries no output.
+			failed := "event: response.failed\ndata: " + `{"type":"response.failed","response":{"id":"resp-failed","object":"response","status":"failed","error":{"code":"rate_limit_exceeded","message":"Rate limit reached."},"output":[],"usage":{"input_tokens":120,"output_tokens":0,"total_tokens":120}}}` + "\n\n"
+			return conversationStreamResponse(req, nil, conversationLifecycleEvent(t, "response.created", "in_progress", 0), failed), nil
+		}
+		return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
+	})
+	h, _ := newConversationAPIHandler(t, transport, nil)
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
+
+	failed := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, nil)
+	if failed.Code < http.StatusBadRequest || strings.Contains(failed.Body.String(), "conversation_execution_uncertain") || sends.Load() != 2 || west.Load() != 0 {
+		t.Fatalf("precommit failure: code=%d sends=%d west=%d %s", failed.Code, sends.Load(), west.Load(), conversationBodyTail(failed))
+	}
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Try again."}, nil), false)
+	if sends.Load() != 3 || west.Load() != 0 {
+		t.Fatalf("retry was not a single owner send: sends=%d west=%d", sends.Load(), west.Load())
+	}
+}

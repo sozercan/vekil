@@ -44,6 +44,8 @@ type conversationTurn struct {
 	// websocket consumers read the next event only after writing the previous.
 	deliveryEvents      int
 	staged              []conversationStagedItem
+	stagedIndexes       map[int]bool
+	stagedBytes         int
 	deliveredResponseID string
 	deliveredInvalid    bool
 	deliveryInfo        explicitRouteResponseInfo
@@ -561,6 +563,18 @@ func (h *ProxyHandler) tryConversationMigration(ctx context.Context, operation *
 		return nil, false, nil
 	}
 	if !safeConversationMigrationFailure(failure) {
+		if failure.progress == upstreamProgressTerminalFailure && failure.commitment == downstreamCommitmentNone && failure.cleanupDone {
+			// Only an output-free terminal event is translated before commitment,
+			// so like a committed one its outcome is known. Release the marker
+			// and return the translated failure to the client.
+			t.mu.Lock()
+			err := t.releaseFailedAttempt(nil, "")
+			t.mu.Unlock()
+			if err != nil {
+				return nil, true, err
+			}
+			return nil, false, nil
+		}
 		if t.clientEnded() && (errors.Is(failure.err, context.Canceled) || errors.Is(failure.err, context.DeadlineExceeded)) {
 			// The client's disconnect ended this attempt, so its outcome is not
 			// uncertain. An upstream failure that preceded the disconnect is.
@@ -744,7 +758,7 @@ func (t *conversationTurn) observeDelivery(eventType string, envelope map[string
 	if !t.haveDeliveryInfo {
 		t.deliveryInfo, t.haveDeliveryInfo = info, true
 	} else if info.targetID != t.deliveryInfo.targetID || info.routeID != t.deliveryInfo.routeID {
-		t.deliveredInvalid = true
+		t.invalidateDelivery()
 	}
 	switch eventType {
 	case "response.queued", "response.created", "response.in_progress":
@@ -755,28 +769,43 @@ func (t *conversationTurn) observeDelivery(eventType string, envelope map[string
 		if t.deliveredResponseID == "" {
 			t.deliveredResponseID = response.ID
 		} else if response.ID != "" && response.ID != t.deliveredResponseID {
-			t.deliveredInvalid = true
+			t.invalidateDelivery()
 		}
 	case "response.output_item.done":
+		if t.deliveredInvalid {
+			return
+		}
 		item, ok := envelope["item"]
 		if !ok {
-			t.deliveredInvalid = true
+			t.invalidateDelivery()
 			return
 		}
 		var index *int
 		output, err := canonicalConversationInput(append(append([]byte("["), item...), ']'), true)
-		if err != nil || json.Unmarshal(envelope["output_index"], &index) != nil || index == nil || *index < 0 {
-			t.deliveredInvalid = true
+		if err != nil || json.Unmarshal(envelope["output_index"], &index) != nil || index == nil || *index < 0 || t.stagedIndexes[*index] {
+			t.invalidateDelivery()
 			return
 		}
-		for _, staged := range t.staged {
-			if staged.index == *index {
-				t.deliveredInvalid = true
-				return
-			}
+		// Stop staging once the output could not fit a snapshot anyway.
+		size := rawMessagesSize(output.items)
+		if len(t.staged) >= maxConversationHistoryItems || t.stagedBytes+size > t.store.config.MaxHistoryBytes {
+			t.invalidateDelivery()
+			return
 		}
+		if t.stagedIndexes == nil {
+			t.stagedIndexes = make(map[int]bool)
+		}
+		t.stagedIndexes[*index] = true
+		t.stagedBytes += size
 		t.staged = append(t.staged, conversationStagedItem{event: t.deliveryEvents, index: *index, output: output})
 	}
+}
+
+// invalidateDelivery disables the delivered snapshot and drops staged items.
+// The caller holds t.mu.
+func (t *conversationTurn) invalidateDelivery() {
+	t.deliveredInvalid = true
+	t.staged, t.stagedIndexes, t.stagedBytes = nil, nil, 0
 }
 
 // deliveredOutput returns staged items whose event was followed by another
