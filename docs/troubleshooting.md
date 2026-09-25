@@ -142,6 +142,32 @@ To investigate repeated throttling, record the error code, reset, timestamp, and
 headers provide additional account-specific diagnostics. Avoid sharing request
 contents or credentials.
 
+## `409 conversation_execution_uncertain`: an earlier attempt may have executed
+
+This code appears only on [conversation migration](conversation-migration.md)
+routes. An earlier turn of the same conversation was dispatched, but Vekil did
+not save its completion. The upstream stream broke after output reached the
+client, or Vekil shut down or crashed before it knew the outcome. Every later
+turn of that conversation returns this `409`, including after restart, so a
+client's automatic retries fail immediately. Other conversations are unaffected.
+
+Two common interruptions do not cause this code. An upstream failure that
+arrives before any output, such as an Azure `429` sent after HTTP `200`, reaches
+the client unchanged so it can retry. A client that disconnects or cancels a
+turn, such as an interrupted agent, keeps the conversation usable; see
+[conversation migration](conversation-migration.md#storage-diagnostics-and-deletion).
+
+What to do first: start a new conversation in the client. To keep the blocked
+conversation, stop Vekil and run `vekil state prune-history` with a cutoff after
+the failed attempt, as described in
+[Storage, diagnostics and deletion](conversation-migration.md#storage-diagnostics-and-deletion).
+Pruning also deletes every older snapshot, and the next turn of a pruned
+conversation must resend its history with `X-Vekil-History-Complete: true`.
+
+To investigate, find the earlier attempt in `/stats.json` `recent_attempts` using
+the `X-Vekil-Request-ID` of the first failed turn. Record its status, delivery,
+`semantic_progress`, and `downstream_commitment`.
+
 ## `408 user_request_timeout`: timed out reading request body
 
 ### Symptom

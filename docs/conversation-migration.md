@@ -193,9 +193,23 @@ expires or evicts automatically. Capacity errors preserve existing snapshots.
 Before dispatch, Vekil commits an attempt marker. Before exposing a completed
 response, it atomically saves history and clears that marker. If a crash or
 incomplete stream leaves execution uncertain, later continuation is blocked to
-avoid duplicate work. A saved completion survives restart. A lost client
-connection before receiving the completion can still require inspection of the
-client's local work; Vekil does not repeat the request automatically.
+avoid duplicate work. An upstream terminal failure (`response.failed`, `error`,
+`response.incomplete` or `response.cancelled`) is not uncertain when it carries
+no output and no output event preceded it. Vekil clears the marker and forwards
+that failure unchanged, so the client can retry the turn. A saved completion
+survives restart.
+
+A client that disconnects or cancels its own request, for example by
+interrupting an agent mid-turn, owns that turn's outcome. Vekil saves the
+completed output items it delivered before the disconnect as a snapshot of that
+response, then clears the marker. The next turn may include those items and their
+tool results, or omit them and branch from the earlier history. Response-ID
+continuations of the interrupted response are rebuilt from the delivered items.
+Items the client did not receive from Vekil still fail as incomplete history.
+Unfinished messages that arrived only as deltas are not saved. Vekil does not
+repeat the request automatically. A shutdown, crash or upstream disconnect is
+not a client decision and still leaves execution uncertain.
+
 If an upstream reuses a saved response ID, Vekil withholds the new completion
 and leaves that turn uncertain. The collision does not disable the shared store.
 
@@ -205,8 +219,10 @@ output could not be saved reports `unprotected` instead. The authoritative
 completion contains `vekil: {"history":"saved","target":"west"}`, with
 `"migration":"completed"` only on the turn that switched; an unprotected
 completion has no `vekil` field. WebSocket completion objects carry the same
-fields. Fixed-content logs distinguish `attempted`, `completed`, `blocked` and
-`unprotected` recovery. A `recording` header alone is not a saved completion.
+fields. Fixed-content logs distinguish `attempted`, `completed`, `blocked`,
+`unprotected`, `failed` and `interrupted` recovery. `failed` records a released
+pre-output upstream failure. `interrupted` records a client disconnect and
+whether delivered history was saved. A `recording` header alone is not a saved completion.
 
 Errors use `conversation_history_unavailable`, `conversation_history_incomplete`
 or `conversation_tools_pending` for invalid recovery input. Uncertain

@@ -2425,7 +2425,7 @@ func (o *routeAttemptResponseObserver) observeResponsesEvent(eventType, data str
 func routeAttemptResponsesEventProgress(event responsesWebSocketStreamEvent) upstreamSemanticProgress {
 	typeName := strings.ToLower(strings.TrimSpace(event.Type))
 	switch typeName {
-	case "response.created", "response.in_progress":
+	case "response.queued", "response.created", "response.in_progress":
 		if responsesOutputHasProgress(event.Response.Output) || !event.Response.Usage.isZero() {
 			return upstreamProgressSemanticOutput
 		}
@@ -3829,9 +3829,19 @@ func routeAttemptPreparedTerminalFromResponse(resp *http.Response) (responsesWeb
 func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, operation *routeOperation, route *modelRoute, target targetBinding, resp *http.Response) (*http.Response, *routeAttemptFailure) {
 	transportOwner := routeAttemptTransportOwnership(resp.Body)
 	prepared := newResponsesPreparedStreamWithPolicy(resp, responsesPrecommitMaxPeekBytes, true, true)
-	result, hasResult, awaitSource, err := prepared.await(operation.inbound, ctx, responsesPrecommitPeekTimeout)
+	peekTimeout := responsesPrecommitPeekTimeout
+	if quotaTimeout, _, ok := explicitResponsesQuotaHold(resp.Header); ok {
+		peekTimeout = quotaTimeout
+	}
+	result, hasResult, awaitSource, err := prepared.await(operation.inbound, ctx, peekTimeout)
 	if hasResult && result.failure != nil {
 		h.observeCopilotResponseFailure(resp.Request, *result.failure, responsesFailureHeaders(*result.failure, resp.Header))
+	}
+	if err == nil && operation.inbound != nil && operation.inbound.Err() != nil {
+		// Inbound cancellation owns the downstream response even if the peek
+		// pump publishes a simultaneous decision. Do not commit a target or a
+		// 200 header for a client that has already gone away.
+		result, hasResult, awaitSource, err = peekResult{}, false, responsesPreparedAwaitInbound, operation.inbound.Err()
 	}
 	if err != nil {
 		cleanupDone := prepared.abortAndWait(upstreamErrorDetailDrainTimeout)
@@ -3943,9 +3953,27 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 // semantic event, terminal event, timeout, or byte bound makes the target
 // irrevocable.
 func newResponsesPreparedStreamWithPolicy(resp *http.Response, maxPeekBytes int, observeTerminal, holdPreamble bool) *responsesPreparedStream {
-	// Explicit priority routes commit at the configured peek byte bound. Legacy
-	// quota-aware preamble holding may use the larger compatibility cap.
-	return newResponsesPreparedStreamConfigured(resp, maxPeekBytes, observeTerminal, holdPreamble, maxPeekBytes)
+	// Explicit priority routes commit at the configured peek byte bound unless
+	// quota evidence extends the hold to the larger compatibility cap.
+	heldPreambleMaxBytes := maxPeekBytes
+	if _, quotaBytes, ok := explicitResponsesQuotaHold(resp.Header); ok {
+		heldPreambleMaxBytes = quotaBytes
+	}
+	return newResponsesPreparedStreamConfigured(resp, maxPeekBytes, observeTerminal, holdPreamble, heldPreambleMaxBytes)
+}
+
+// explicitResponsesQuotaHold extends precommit bounds for an explicit route
+// whose upstream headers already report exhausted quota. Azure can admit such a
+// stream, emit its preamble after prefill of a large prompt, and only then fail
+// with a 429 that the next target could serve. Echoed instructions and tools
+// can also push that preamble past the ordinary byte bound. Semantic output
+// still commits immediately, so healthy streams only wait for their first
+// output event.
+func explicitResponsesQuotaHold(headers http.Header) (time.Duration, int, bool) {
+	if !responsesQuotaEvidence(headers) {
+		return 0, 0, false
+	}
+	return responsesPrecommitQuotaHoldTimeout, responsesPrecommitHeldPreambleMaxBytes, true
 }
 
 func (s *responsesPreparedStream) abortAndWait(timeout time.Duration) bool {

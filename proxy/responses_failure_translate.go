@@ -19,6 +19,7 @@ const (
 	responsesPrecommitPeekTimeout          = 750 * time.Millisecond
 	responsesPrecommitMaxPeekBytes         = 64 * 1024
 	responsesPrecommitHeldPreambleMaxBytes = 512 * 1024
+	responsesPrecommitQuotaHoldTimeout     = 10 * time.Second
 	responsesPeekReadChunkSize             = 4 * 1024
 	responsesPeekCancellationGrace         = 10 * time.Millisecond
 	// responsesFailureTapMaxBuffer bounds how much of an in-flight SSE event the
@@ -1525,7 +1526,7 @@ func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName s
 		terminalType = eventName
 	}
 	event.Type = terminalType
-	result.preamble = terminalType == "response.created" || terminalType == "response.in_progress"
+	result.preamble = terminalType == "response.queued" || terminalType == "response.created" || terminalType == "response.in_progress"
 	switch terminalType {
 	case "response.completed", "response.failed", "response.incomplete", "response.cancelled", "response.canceled", "error":
 		terminal := event
