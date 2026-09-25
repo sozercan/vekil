@@ -2,7 +2,7 @@
 
 # Live AIKit smoke: runs a small real model through Vekil end to end.
 #
-# 1. `vekil serve` with a `type: aikit` provider on a pre-made image checks
+# 1. The `vekil` server with a `type: aikit` provider on a pre-made image checks
 #    Chat, Anthropic Messages, and Responses (including LocalAI dialect
 #    normalization and context-overflow mapping), then verifies the container
 #    is removed on shutdown.
@@ -84,7 +84,7 @@ free_port() {
 }
 
 # ---------------------------------------------------------------------------
-# Scenario 1: vekil serve with a type: aikit provider.
+# Scenario 1: the vekil server with a type: aikit provider.
 # ---------------------------------------------------------------------------
 
 CONFIG="$SMOKE_DIR/providers.yaml"
@@ -104,17 +104,17 @@ EOF
 
 PORT="$(free_port)"
 BASE="http://127.0.0.1:${PORT}"
-log "starting vekil serve on ${BASE} with aikit:${AIKIT_IMAGE_MODEL}"
+log "starting vekil server on ${BASE} with aikit:${AIKIT_IMAGE_MODEL}"
 PROVIDERS_CONFIG="$CONFIG" "$VEKIL_BIN" --host 127.0.0.1 --port "$PORT" >"$SMOKE_DIR/serve.log" 2>&1 &
 SERVE_PID=$!
 
 deadline=$((SECONDS + READY_TIMEOUT_SECONDS))
 until curl -fsS --max-time 5 "$BASE/readyz" >/dev/null 2>&1; do
-  kill -0 "$SERVE_PID" 2>/dev/null || die "vekil serve exited before becoming ready (see $SMOKE_DIR/serve.log)"
-  [ "$SECONDS" -lt "$deadline" ] || die "vekil serve was not ready within ${READY_TIMEOUT_SECONDS}s"
+  kill -0 "$SERVE_PID" 2>/dev/null || die "vekil server exited before becoming ready (see $SMOKE_DIR/serve.log)"
+  [ "$SECONDS" -lt "$deadline" ] || die "vekil server was not ready within ${READY_TIMEOUT_SECONDS}s"
   sleep 3
 done
-log "vekil serve is ready"
+log "vekil server is ready"
 
 python3 - "$BASE" <<'PY'
 import json
@@ -191,10 +191,10 @@ status, body = call("/v1/responses", {"model": MODEL, "store": False, "input": b
 check("responses overflow is context_length_exceeded", status == 400 and "context_length_exceeded" in body, body)
 PY
 
-log "stopping vekil serve"
+log "stopping vekil server"
 kill -INT "$SERVE_PID"
 wait "$SERVE_PID" || true
-[ -z "$(owned_containers "$SERVE_PID")" ] || die "vekil serve left AIKit containers running"
+[ -z "$(owned_containers "$SERVE_PID")" ] || die "vekil server left AIKit containers running"
 log "ok   serve removed its container"
 SERVE_PID=""
 

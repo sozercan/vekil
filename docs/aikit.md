@@ -169,7 +169,7 @@ case the routes define its public contract; a route that leaves
 `context_window` unset gets the served context. The agent context floor does not
 apply here; set `context_size` for sessions that need more than the default.
 
-- `vekil serve`, the tray app, and `vekil launch --providers-config` start aikit
+- The server (`vekil --providers-config`), the tray app, and `vekil launch --providers-config` start aikit
   providers before the proxy and remove them on shutdown.
 - `vekil config validate` checks aikit providers offline, including their model
   references. `--live` starts the containers for the duration of the check.

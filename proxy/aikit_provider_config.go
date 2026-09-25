@@ -238,7 +238,7 @@ func validateAndNormalizeProvidersConfigWithAIKit(cfg ProvidersConfig) (validate
 }
 
 func unmaterializedAIKitProviderError(id string) error {
-	return fmt.Errorf("provider %q has type aikit, which the vekil CLI must start before serving (vekil serve, vekil launch, or the tray app)", id)
+	return fmt.Errorf("provider %q has type aikit, which the vekil CLI must start before serving (vekil --providers-config, vekil launch, or the tray app)", id)
 }
 
 // AIKitModelEndpoints are the native endpoints an AIKit (LocalAI) model

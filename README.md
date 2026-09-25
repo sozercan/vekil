@@ -28,6 +28,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 - **Codex compatibility shims** for compaction and memory summarization
 - **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
 - **One-command Claude Code, Codex CLI, and GitHub Copilot CLI launchers** with ephemeral loopback proxies and no persistent client routing changes
+- **Local models** from [AIKit](https://github.com/kaito-project/aikit) images, started in Docker or Podman for a session and removed when it ends; see [Local AIKit Models](docs/aikit.md)
 
 ## Quick Start
 
@@ -111,6 +112,33 @@ model namespace; with `--model`, Vekil restricts the session to that model. Use
 `--dry-run` to inspect the plan without starting the proxy or agent. See [Agent
 Launchers](docs/agent-launchers.md) for supported CLI versions, endpoint
 requirements, forwarded arguments, logs, and isolation details.
+
+### Run a local model
+
+With Docker or Podman installed, `--model aikit:<ref>` runs an
+[AIKit](https://github.com/kaito-project/aikit) model container for the session
+and removes it when the agent exits. No GitHub sign-in is needed:
+
+```bash
+vekil launch claude --model aikit:qwen3.8:27b
+vekil launch codex  --model aikit:gpt-oss:20b
+vekil launch claude --model aikit:hf.co/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf
+```
+
+To serve a local model to any client, add a `type: aikit` provider and start
+Vekil with `vekil --providers-config providers.yaml`:
+
+```yaml
+providers:
+  - id: local
+    type: aikit
+    aikit:
+      model: llama3.2:1b
+```
+
+On Apple Silicon, Vekil uses a Podman libkrun machine for GPU acceleration when
+one is running, and otherwise falls back to Docker on the CPU. See [Local AIKit
+Models](docs/aikit.md) for model references, context sizing, and flags.
 
 **First-run auth** depends on your providers:
 
