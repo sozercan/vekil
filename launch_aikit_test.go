@@ -226,3 +226,15 @@ func TestLaunchDryRunRejectsInvalidAIKitProviderReference(t *testing.T) {
 		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
 	}
 }
+
+func TestLaunchDryRunAIKitContextSizeReachesModelMetadata(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	code := runLaunchCommand([]string{"copilot", "--model", "aikit:qwen3.8:27b", "--context-size", "98304", "--binary", binary, "--dry-run"}, &stderr)
+	if code != 0 || !strings.Contains(stderr.String(), "COPILOT_PROVIDER_MAX_PROMPT_TOKENS=") {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+}

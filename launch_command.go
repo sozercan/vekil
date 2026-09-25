@@ -310,6 +310,10 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 			}
 			launchOpts.Model = placeholder
 			launchOpts.DryRunModel = &launch.ModelInfo{ID: placeholder, Name: placeholder, SupportedEndpoints: proxy.AIKitModelEndpoints()}
+			if opts.aikit.contextSize > 0 {
+				window := int64(opts.aikit.contextSize)
+				launchOpts.DryRunModel.ContextWindow = &window
+			}
 			launchOpts.LocalModel = &launch.LocalModel{ContextTokens: int64(opts.aikit.contextSize), FunctionToolsOnly: true}
 		} else if opts.model != "" {
 			launchOpts.LocalModel = launchLocalModelProfile(providersCfg, opts.model)
