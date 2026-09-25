@@ -230,6 +230,15 @@ func (r Reference) DefaultBackend() string {
 	return BackendLlamaCPP
 }
 
+// Redacted returns the reference with any URL query or fragment removed, since
+// signed download URLs carry credentials there.
+func (r Reference) Redacted() string {
+	if r.Kind == RefRunnerGGUF {
+		return redactURL(r.Raw)
+	}
+	return r.Raw
+}
+
 // UsesHuggingFace reports whether the model is downloaded from Hugging Face,
 // the only host HF_TOKEN may be sent to.
 func (r Reference) UsesHuggingFace() bool {

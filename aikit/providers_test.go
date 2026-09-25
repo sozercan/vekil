@@ -3,6 +3,7 @@ package aikit
 import (
 	"bytes"
 	"context"
+	"errors"
 	"reflect"
 	"strconv"
 	"strings"
@@ -85,6 +86,52 @@ func TestStartProvidersLeavesRouteOnlyProvidersToRoutes(t *testing.T) {
 	}
 	if cfg.ModelRoutes[0].ContextWindow != nil {
 		t.Fatal("input config route was mutated")
+	}
+}
+
+func TestStartProvidersKeepsConfiguredRouteContextWindows(t *testing.T) {
+	fake := seedProviderFake(t)
+	configured := int64(128000)
+	targets := []proxy.ModelRouteTargetConfig{{ID: "local", Provider: "local", UpstreamModel: "qwen-3.8-27b"}}
+	cfg := proxy.ProvidersConfig{
+		SchemaVersion: 2,
+		StateBindings: &proxy.StateBindingsConfig{Mode: "memory"},
+		Providers: []proxy.ProviderConfig{
+			{ID: "local", Type: "aikit", Default: true, AIKit: &proxy.AIKitProviderConfig{Model: "qwen3.8:27b"}},
+		},
+		ModelRoutes: []proxy.ModelRouteConfig{
+			{ID: "explicit", PublicID: "explicit", Endpoints: []string{"/chat/completions"}, ContextWindow: &configured, Targets: targets},
+			{ID: "implicit", PublicID: "implicit", Endpoints: []string{"/chat/completions"}, Targets: targets},
+		},
+	}
+	out, group, err := StartProviders(context.Background(), cfg, ProviderStartOptions{Environment: []string{}, Executor: fake})
+	if err != nil {
+		t.Fatalf("StartProviders: %v", err)
+	}
+	defer func() { _ = group.Close(context.Background()) }()
+	if *out.ModelRoutes[0].ContextWindow != 128000 || *out.ModelRoutes[1].ContextWindow != 65536 {
+		t.Fatalf("route windows = %d, %d", *out.ModelRoutes[0].ContextWindow, *out.ModelRoutes[1].ContextWindow)
+	}
+}
+
+func TestSessionCloseCanBeRetried(t *testing.T) {
+	fake := seedProviderFake(t)
+	cfg := proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{
+		{ID: "local", Type: "aikit", Default: true, AIKit: &proxy.AIKitProviderConfig{Model: "qwen3.8:27b"}},
+	}}
+	_, group, err := StartProviders(context.Background(), cfg, ProviderStartOptions{Environment: []string{}, Executor: fake})
+	if err != nil {
+		t.Fatalf("StartProviders: %v", err)
+	}
+	fake.failures["docker rm"] = errors.New("engine busy")
+	fake.failures["podman rm"] = errors.New("engine busy")
+	if err := group.Close(context.Background()); err == nil {
+		t.Fatal("Close succeeded while removal failed")
+	}
+	delete(fake.failures, "docker rm")
+	delete(fake.failures, "podman rm")
+	if err := group.Close(context.Background()); err != nil || len(fake.containers) != 0 {
+		t.Fatalf("retry Close = %v, containers left %d", err, len(fake.containers))
 	}
 }
 

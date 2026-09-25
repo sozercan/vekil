@@ -504,3 +504,19 @@ func (p *probeObserver) Output(ctx context.Context, name string, args ...string)
 	}
 	return p.fakeEngine.Output(ctx, name, args...)
 }
+
+func TestRemoteInspectionRefusesHTTPSDowngrade(t *testing.T) {
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("request followed a downgrade redirect with Authorization %q", r.Header.Get("Authorization"))
+	}))
+	defer plain.Close()
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/m.gguf", http.StatusFound)
+	}))
+	defer secure.Close()
+	ref := Reference{Kind: RefRunnerGGUF, Source: secure.URL + "/m.gguf", ModelName: "m"}
+	_, err := inspectRemoteGGUF(context.Background(), secure.Client(), ref, "hf_test")
+	if err == nil || !strings.Contains(err.Error(), "refusing redirect from https to http") {
+		t.Fatalf("error = %v", err)
+	}
+}

@@ -81,8 +81,8 @@ type Session struct {
 	Reused               bool
 	Keep                 bool
 
-	closeOnce sync.Once
-	closeErr  error
+	closeMu sync.Mutex
+	closed  bool
 }
 
 // OpenAIBaseURL is the provider base URL for the session.
@@ -96,13 +96,17 @@ func (s *Session) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	s.closeOnce.Do(func() {
-		if s.Keep {
-			return
-		}
-		s.closeErr = s.engine.remove(ctx, s.ContainerID)
-	})
-	return s.closeErr
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closed || s.Keep {
+		return nil
+	}
+	// A failed removal can be retried by a later Close.
+	if err := s.engine.remove(ctx, s.ContainerID); err != nil {
+		return err
+	}
+	s.closed = true
+	return nil
 }
 
 // KeepHint tells the user how to stop a kept container.
@@ -150,21 +154,9 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 	if opts.Selector == "" {
 		opts.Selector = ref.Selector
 	}
-	backend := strings.TrimSpace(opts.Backend)
-	if backend != "" {
-		normalized, ok := normalizeBackend(backend)
-		if !ok {
-			return nil, fmt.Errorf("unsupported backend %q: use llama-cpp or vllm-cpp", backend)
-		}
-		backend = normalized
-		if !ref.IsRunner() {
-			return nil, fmt.Errorf("--backend applies to runner references (hf.co/... or https .gguf URLs); image %s declares its own backend", ref.Raw)
-		}
-		if ref.Kind == RefRunnerRepo && backend != BackendVLLMCPP {
-			return nil, fmt.Errorf("repository references are served by vllm-cpp; use an https .gguf URL for llama-cpp")
-		}
-	} else {
-		backend = ref.DefaultBackend()
+	backend, err := ResolveBackend(ref, opts.Backend)
+	if err != nil {
+		return nil, err
 	}
 
 	image, notice := resolveImage(ref, engine, backend)
@@ -179,7 +171,7 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 		}
 	}
 
-	image, err := ensureImage(ctx, engine, ref, image, status, progress)
+	image, err = ensureImage(ctx, engine, ref, image, status, progress)
 	if err != nil {
 		return nil, err
 	}
@@ -239,6 +231,26 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 		}
 		return nil, failure.err(plan, decision)
 	}
+}
+
+// ResolveBackend returns the backend that serves ref, checking an explicit
+// request against the reference.
+func ResolveBackend(ref Reference, requested string) (string, error) {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return ref.DefaultBackend(), nil
+	}
+	backend, ok := normalizeBackend(requested)
+	if !ok {
+		return "", fmt.Errorf("unsupported backend %q: use llama-cpp or vllm-cpp", requested)
+	}
+	if !ref.IsRunner() {
+		return "", fmt.Errorf("--backend applies to runner references (hf.co/... or https .gguf URLs); image %s declares its own backend", ref.Redacted())
+	}
+	if ref.Kind == RefRunnerRepo && backend != BackendVLLMCPP {
+		return "", fmt.Errorf("repository references are served by vllm-cpp; use an https .gguf URL for llama-cpp")
+	}
+	return backend, nil
 }
 
 func resolveImage(ref Reference, engine *Engine, backend string) (string, string) {

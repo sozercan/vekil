@@ -336,8 +336,28 @@ func redactURL(raw string) string {
 	return raw
 }
 
+// secureRedirects copies client with a redirect policy that never leaves
+// https, so credentials on the first request cannot follow a downgrade.
+func secureRedirects(client *http.Client) *http.Client {
+	secured := *client
+	previous := client.CheckRedirect
+	secured.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+			return fmt.Errorf("refusing redirect from https to %s", req.URL.Scheme)
+		}
+		if previous != nil {
+			return previous(req, via)
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return &secured
+}
+
 func inspectRemoteGGUF(ctx context.Context, client *http.Client, ref Reference, token string) (modelPlan, error) {
-	reader := &rangeReader{ctx: ctx, client: client, url: ref.Source, token: token}
+	reader := &rangeReader{ctx: ctx, client: secureRedirects(client), url: ref.Source, token: token}
 	info, err := ReadGGUFInfo(reader)
 	if err != nil && !errors.Is(err, errGGUFNotFound) {
 		return modelPlan{}, fmt.Errorf("read GGUF metadata from %s: %w", redactURL(ref.Source), err)
@@ -360,7 +380,7 @@ func inspectRemoteRepository(ctx context.Context, client *http.Client, ref Refer
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := client.Do(req)
+	resp, err := secureRedirects(client).Do(req)
 	if err != nil {
 		return modelPlan{}, fmt.Errorf("fetch %s: %w", configURL, err)
 	}

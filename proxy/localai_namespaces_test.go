@@ -50,6 +50,11 @@ func TestFlattenLocalAINamespaceTools(t *testing.T) {
 		t.Fatalf("allowed_tools = %s, %v", out, err)
 	}
 
+	out, emptyAliases, err := flattenLocalAINamespaceTools([]byte(`{"tools":[{"type":"function","name":"f"},{"type":"namespace","name":"empty","tools":[]}]}`))
+	if err != nil || emptyAliases != nil || strings.Contains(string(out), "namespace") || !strings.Contains(string(out), `"name":"f"`) {
+		t.Fatalf("empty namespace = %s, %v, %v", out, emptyAliases, err)
+	}
+
 	if out, aliases, err := flattenLocalAINamespaceTools([]byte(`{"tools":[{"type":"function","name":"f"}]}`)); err != nil || aliases != nil || string(out) != `{"tools":[{"type":"function","name":"f"}]}` {
 		t.Fatalf("plain request changed: %s %v %v", out, aliases, err)
 	}

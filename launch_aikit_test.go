@@ -139,10 +139,45 @@ func TestPrintAIKitDryRun(t *testing.T) {
 	var out bytes.Buffer
 	printAIKitDryRun(&out, ref, launchAIKitOptions{contextSize: 65536, keep: true})
 	text := out.String()
-	for _, want := range []string{"runners/llama-cpp-<cpu|cuda>", "resolve/main/model-Q4.gguf", "context: 65536", "kept running"} {
+	for _, want := range []string{"hf.co/org/repo/model-Q4.gguf", "runners/llama-cpp-<cpu|cuda>", "context: 65536", "kept running"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("dry-run output %q missing %q", text, want)
 		}
+	}
+
+	signed, _ := aikit.ParseReference("https://bucket.example.com/m.gguf?X-Amz-Signature=secret#frag")
+	out.Reset()
+	printAIKitDryRun(&out, signed, launchAIKitOptions{})
+	if strings.Contains(out.String(), "secret") || strings.Contains(out.String(), "frag") {
+		t.Fatalf("dry-run printed URL credentials: %q", out.String())
+	}
+
+	image, _ := aikit.ParseReference("ghcr.io/org/model:v1")
+	out.Reset()
+	printAIKitDryRun(&out, image, launchAIKitOptions{})
+	if strings.Contains(out.String(), "applesilicon") {
+		t.Fatalf("full image dry-run mentions an applesilicon variant: %q", out.String())
+	}
+}
+
+func TestValidateLaunchAIKitOptions(t *testing.T) {
+	premade, _ := aikit.ParseReference("qwen3.8:27b")
+	runner, _ := aikit.ParseReference("hf.co/org/repo/m.gguf")
+	for _, tc := range []struct {
+		ref  aikit.Reference
+		opts launchAIKitOptions
+		want string
+	}{
+		{premade, launchAIKitOptions{runtime: "nerdctl"}, "unsupported --runtime"},
+		{runner, launchAIKitOptions{backend: "diffusers"}, "unsupported backend"},
+		{premade, launchAIKitOptions{backend: "llama-cpp"}, "applies to runner references"},
+	} {
+		if err := validateLaunchAIKitOptions(tc.ref, tc.opts); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("validateLaunchAIKitOptions(%+v) = %v, want %q", tc.opts, err, tc.want)
+		}
+	}
+	if err := validateLaunchAIKitOptions(runner, launchAIKitOptions{runtime: "podman", backend: "llama-cpp"}); err != nil {
+		t.Fatalf("valid options: %v", err)
 	}
 }
 

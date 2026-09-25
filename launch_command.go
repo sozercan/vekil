@@ -272,6 +272,9 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 	aikitModel := aikit.HasPrefix(opts.model)
 	if aikitModel {
 		aikitRef, err = aikit.ParsePrefixed(opts.model)
+		if err == nil {
+			err = validateLaunchAIKitOptions(aikitRef, opts.aikit)
+		}
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 			return 2

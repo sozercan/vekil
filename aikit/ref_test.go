@@ -89,6 +89,14 @@ func TestParsePrefixed(t *testing.T) {
 	}
 }
 
+func TestReferenceRedacted(t *testing.T) {
+	signed, _ := ParseReference("https://bucket.example.com/m.gguf?X-Amz-Signature=secret#frag")
+	image, _ := ParseReference("ghcr.io/org/model:v1#chat")
+	if signed.Redacted() != "https://bucket.example.com/m.gguf" || image.Redacted() != "ghcr.io/org/model:v1#chat" {
+		t.Fatalf("Redacted = %q, %q", signed.Redacted(), image.Redacted())
+	}
+}
+
 func TestReferenceUsesHuggingFace(t *testing.T) {
 	for raw, want := range map[string]bool{
 		"hf.co/org/repo/file.gguf":                               true,

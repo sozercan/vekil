@@ -50,12 +50,14 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 		}
 	}
 	aliases := localAIToolAliases{}
+	sawNamespace := false
 	flattened := make([]map[string]json.RawMessage, 0, len(tools))
 	for index, tool := range tools {
 		if jsonStringField(tool, "type") != "namespace" {
 			flattened = append(flattened, tool)
 			continue
 		}
+		sawNamespace = true
 		namespace := jsonStringField(tool, "name")
 		if namespace == "" {
 			return nil, nil, localAIToolError(fmt.Sprintf("tools[%d].name", index), "namespace tools need a name")
@@ -89,7 +91,9 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 			flattened = append(flattened, flat)
 		}
 	}
-	if len(aliases) > 0 {
+	if sawNamespace {
+		// An empty namespace has no callable tools; drop it rather than send a
+		// declaration LocalAI would ignore.
 		payload["tools"] = mustMarshalJSON(flattened)
 	}
 	if raw, ok := payload["input"]; ok {
@@ -118,7 +122,7 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 			}
 		}
 	}
-	if len(aliases) == 0 {
+	if len(aliases) == 0 && !sawNamespace {
 		return body, nil, nil
 	}
 	if raw, ok := payload["tool_choice"]; ok {
@@ -129,6 +133,9 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(aliases) == 0 {
+		return out, nil, nil
 	}
 	return out, aliases, nil
 }

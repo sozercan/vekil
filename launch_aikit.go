@@ -49,6 +49,18 @@ func watchStartupSignals(signals <-chan os.Signal, cancel context.CancelFunc) fu
 	}
 }
 
+// validateLaunchAIKitOptions rejects option values a launch would refuse, so a
+// dry run fails the same way.
+func validateLaunchAIKitOptions(ref aikit.Reference, opts launchAIKitOptions) error {
+	switch opts.runtime {
+	case "", aikit.EngineAuto, aikit.EngineDocker, aikit.EnginePodman:
+	default:
+		return fmt.Errorf("unsupported --runtime %q: use auto, docker, or podman", opts.runtime)
+	}
+	_, err := aikit.ResolveBackend(ref, opts.backend)
+	return err
+}
+
 // startLaunchAIKitModel starts the container for `--model aikit:<ref>`.
 func startLaunchAIKitModel(ctx context.Context, ref aikit.Reference, opts launchAIKitOptions, stderr io.Writer) (*aikit.Session, error) {
 	engine, err := aikit.DetectEngine(ctx, nil, aikit.DetectOptions{Preference: opts.runtime})
@@ -163,16 +175,15 @@ func launchLocalModelProfile(cfg proxy.ProvidersConfig, modelID string) *launch.
 
 // printAIKitDryRun describes the container a real launch would start.
 func printAIKitDryRun(w io.Writer, ref aikit.Reference, opts launchAIKitOptions) {
-	_, _ = fmt.Fprintf(w, "aikit model: %s\n", ref.Raw)
-	switch ref.Kind {
-	case aikit.RefImage:
+	_, _ = fmt.Fprintf(w, "aikit model: %s\n", ref.Redacted())
+	switch {
+	case ref.Premade:
 		_, _ = fmt.Fprintf(w, "  image: %s (an applesilicon/ variant on a podman libkrun machine)\n", ref.Image)
+	case ref.Kind == aikit.RefImage:
+		_, _ = fmt.Fprintf(w, "  image: %s\n", ref.Image)
 	default:
-		backend := opts.backend
-		if backend == "" {
-			backend = ref.DefaultBackend()
-		}
-		_, _ = fmt.Fprintf(w, "  runner: %s/runners/%s-<cpu|cuda>:latest\n  source: %s\n", aikit.PremadeRegistry, backend, ref.Source)
+		backend, _ := aikit.ResolveBackend(ref, opts.backend)
+		_, _ = fmt.Fprintf(w, "  runner: %s/runners/%s-<cpu|cuda>:latest\n", aikit.PremadeRegistry, backend)
 	}
 	runtime := opts.runtime
 	if runtime == "" {

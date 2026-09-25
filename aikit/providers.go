@@ -50,7 +50,12 @@ func (g *Group) Close(ctx context.Context) error {
 	}
 	var errs []error
 	for _, session := range g.Sessions() {
-		if err := session.Close(ctx); err != nil {
+		// Each removal gets its own time so one stalled engine call cannot
+		// leave the remaining containers running.
+		sessionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		err := session.Close(sessionCtx)
+		cancel()
+		if err != nil {
 			errs = append(errs, fmt.Errorf("remove %s: %w", session.ContainerName, err))
 		}
 	}
@@ -81,6 +86,12 @@ func StartProviders(ctx context.Context, cfg proxy.ProvidersConfig, opts Provide
 	group := &Group{}
 	engines := map[string]*Engine{}
 	routeReferenced := routeReferencedProviders(cfg)
+	unsetRouteWindows := map[int]bool{}
+	for index, route := range cfg.ModelRoutes {
+		if route.ContextWindow == nil {
+			unsetRouteWindows[index] = true
+		}
+	}
 	for index := range out.Providers {
 		provider := &out.Providers[index]
 		if !provider.IsAIKit() {
@@ -93,7 +104,7 @@ func StartProviders(ctx context.Context, cfg proxy.ProvidersConfig, opts Provide
 		}
 		group.add(session)
 		MaterializeProvider(provider, session, routeReferenced[strings.TrimSpace(provider.ID)])
-		setRouteContextWindows(&out, strings.TrimSpace(provider.ID), int64(session.ContextTokens))
+		setRouteContextWindows(&out, unsetRouteWindows, strings.TrimSpace(provider.ID), int64(session.ContextTokens))
 	}
 	if err := proxy.ValidateProvidersConfig(out); err != nil {
 		closeGroup(group)
@@ -184,15 +195,19 @@ func MaterializeProvider(provider *proxy.ProviderConfig, session *Session, route
 	provider.Models = models
 }
 
-// setRouteContextWindows gives routes that target providerID and leave
-// context_window unset the served context, keeping the smallest across
-// started targets. Route-only providers carry no model metadata of their own.
-func setRouteContextWindows(cfg *proxy.ProvidersConfig, providerID string, contextTokens int64) {
-	if len(cfg.ModelRoutes) == 0 {
+// setRouteContextWindows gives routes that target providerID and were
+// configured without context_window the served context, keeping the smallest
+// across started targets. Configured windows are left alone. Route-only
+// providers carry no model metadata of their own.
+func setRouteContextWindows(cfg *proxy.ProvidersConfig, unset map[int]bool, providerID string, contextTokens int64) {
+	if len(unset) == 0 {
 		return
 	}
 	routes := append([]proxy.ModelRouteConfig(nil), cfg.ModelRoutes...)
 	for index := range routes {
+		if !unset[index] {
+			continue
+		}
 		route := &routes[index]
 		targetsProvider := false
 		for _, target := range route.Targets {
@@ -232,13 +247,8 @@ func ValidateProviderReferences(cfg proxy.ProvidersConfig) error {
 		if err != nil {
 			return fmt.Errorf("providers[%d].aikit.model: %w", index, err)
 		}
-		if backend := strings.TrimSpace(provider.AIKit.Backend); backend != "" {
-			if !ref.IsRunner() {
-				return fmt.Errorf("providers[%d].aikit.backend: applies only to runner references (hf.co/... or https .gguf URLs)", index)
-			}
-			if ref.Kind == RefRunnerRepo && backend != BackendVLLMCPP {
-				return fmt.Errorf("providers[%d].aikit.backend: repository references are served by vllm-cpp", index)
-			}
+		if _, err := ResolveBackend(ref, provider.AIKit.Backend); err != nil {
+			return fmt.Errorf("providers[%d].aikit.backend: %w", index, err)
 		}
 	}
 	return nil
