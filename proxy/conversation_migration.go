@@ -788,6 +788,9 @@ func (t *conversationTurn) observeDelivery(eventType string, envelope map[string
 		}
 		// Stop staging once the output could not fit a snapshot anyway.
 		size := rawMessagesSize(output.items)
+		for _, anchor := range output.anchors {
+			size += len(anchor.value)
+		}
 		if len(t.staged) >= maxConversationHistoryItems || t.stagedBytes+size > t.store.config.MaxHistoryBytes {
 			t.invalidateDelivery()
 			return

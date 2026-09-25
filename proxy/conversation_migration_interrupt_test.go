@@ -354,12 +354,17 @@ func TestConversationMigrationDeliveryStagingIsBounded(t *testing.T) {
 		item, _ := json.Marshal(map[string]any{"type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": text}}})
 		return map[string]json.RawMessage{"output_index": json.RawMessage(strconv.Itoa(index)), "item": item}
 	}
-	for _, scenario := range []string{"history bytes", "duplicate index"} {
+	for _, scenario := range []string{"history bytes", "reasoning bytes", "duplicate index"} {
 		t.Run(scenario, func(t *testing.T) {
 			turn := &conversationTurn{store: &conversationHistoryStore{config: ConversationMigrationConfig{MaxHistoryBytes: 1024}}}
 			turn.observeDelivery("response.output_item.done", message(0, "small"), explicitRouteResponseInfo{})
 			next := message(1, strings.Repeat("x", 2048))
-			if scenario == "duplicate index" {
+			switch scenario {
+			case "reasoning bytes":
+				// Reasoning is kept only as anchors, which still occupy memory.
+				item, _ := json.Marshal(map[string]any{"type": "reasoning", "encrypted_content": strings.Repeat("e", 2048), "summary": []any{}})
+				next = map[string]json.RawMessage{"output_index": json.RawMessage("1"), "item": item}
+			case "duplicate index":
 				next = message(0, "again")
 			}
 			turn.observeDelivery("response.output_item.done", next, explicitRouteResponseInfo{})
