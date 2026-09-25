@@ -615,3 +615,11 @@ func TestLocalAIBodyWrappersKeepRouteLifecycle(t *testing.T) {
 		t.Fatal("prefixed body dropped route-attempt ownership")
 	}
 }
+
+func TestValidateFunctionToolsOnlyRejectsCatalogsBeyondPeekBudget(t *testing.T) {
+	huge := `{"instructions":"` + strings.Repeat("x", localAIOverflowPeekBytes/2+1) + `","tools":[{"type":"function","name":"f"}]}`
+	err := validateFunctionToolsOnlyResponsesRequest([]byte(huge), "local")
+	if providerRequestErrorCode(err) != "context_length_exceeded" {
+		t.Fatalf("error = %v (code %q)", err, providerRequestErrorCode(err))
+	}
+}

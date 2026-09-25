@@ -876,7 +876,9 @@ func providersRequireGitHubAuth(cfg proxy.ProvidersConfig, err error) bool {
 }
 
 func onExit() {
-	if current := proxyLifecycle.shutdown(); current != nil && current.IsRunning() {
+	// Stop even a server that already exited: it may still own AIKit
+	// containers, and Stop is idempotent.
+	if current := proxyLifecycle.shutdown(); current != nil {
 		_ = stopMenubarProxyServer(current, 5*time.Second)
 	}
 }

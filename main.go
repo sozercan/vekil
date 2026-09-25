@@ -287,7 +287,7 @@ func validateProvidersConfigFileWithAIKit(source string) error {
 
 // validateProvidersConfigFileLiveWithAIKit starts aikit providers for the
 // duration of a live validation, which must reach every configured upstream.
-func validateProvidersConfigFileLiveWithAIKit(ctx context.Context, source string) error {
+func validateProvidersConfigFileLiveWithAIKit(ctx context.Context, source string) (err error) {
 	// Ctrl-C while a model pulls or loads must still remove its container.
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -312,7 +312,9 @@ func validateProvidersConfigFileLiveWithAIKit(ctx context.Context, source string
 		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		// Live validation containers are temporary, even with keep: true.
-		_ = group.Discard(closeCtx)
+		if discardErr := group.Discard(closeCtx); discardErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove temporary aikit containers: %w", discardErr))
+		}
 	}()
 	return proxy.ValidateProvidersConfigLive(ctx, started)
 }

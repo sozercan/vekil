@@ -24,15 +24,30 @@ var functionToolsOnlyResponsesInputItems = map[string]struct{}{
 // drop instead of refusing.
 func validateFunctionToolsOnlyResponsesRequest(body []byte, providerID string) error {
 	var request struct {
-		Tools      []json.RawMessage `json:"tools"`
-		ToolChoice json.RawMessage   `json:"tool_choice"`
-		Input      json.RawMessage   `json:"input"`
+		Tools        json.RawMessage `json:"tools"`
+		ToolChoice   json.RawMessage `json:"tool_choice"`
+		Input        json.RawMessage `json:"input"`
+		Instructions json.RawMessage `json:"instructions"`
 	}
 	if err := json.Unmarshal(body, &request); err != nil {
 		// Malformed bodies are rejected by the ordinary request path.
 		return nil
 	}
-	for index, rawTool := range request.Tools {
+	// LocalAI echoes tools and instructions in its first two stream events.
+	// Past the overflow peek budget, a streamed overflow could no longer be
+	// caught; that much text is millions of tokens, beyond any local context.
+	if len(request.Tools)+len(request.Instructions) > localAIOverflowPeekBytes/2 {
+		return &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			code:       "context_length_exceeded",
+			err:        fmt.Errorf("provider %q: tools and instructions total %d bytes, more than a local model's context can hold", providerID, len(request.Tools)+len(request.Instructions)),
+		}
+	}
+	var tools []json.RawMessage
+	if len(request.Tools) > 0 && json.Unmarshal(request.Tools, &tools) != nil {
+		return nil
+	}
+	for index, rawTool := range tools {
 		var tool struct {
 			Type string `json:"type"`
 		}

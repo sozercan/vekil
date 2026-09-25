@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 type menubarProxyServer interface {
@@ -52,7 +53,11 @@ func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (context.Co
 		if l.server.IsRunning() {
 			return nil, 0, false
 		}
+		// A server that exited on its own may still own AIKit containers;
+		// Stop releases them. Run it outside the lock.
+		dropped := l.server
 		l.server = nil
+		go func() { _ = stopMenubarProxyServer(dropped, 10*time.Second) }()
 	}
 
 	ctx, cancel := context.WithCancel(parent)

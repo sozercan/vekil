@@ -203,3 +203,36 @@ func TestInitializeProxyPolicyRoutingCancellationStopsListener(t *testing.T) {
 		t.Fatal("canceled startup left the listener running")
 	}
 }
+
+type stopRecordingServer struct {
+	fakeMenubarProxyServer
+	stopped chan struct{}
+}
+
+func (s *stopRecordingServer) Stop(ctx context.Context) error {
+	err := s.fakeMenubarProxyServer.Stop(ctx)
+	close(s.stopped)
+	return err
+}
+
+func TestMenubarProxyLifecycleStopsExitedServerBeforeRestart(t *testing.T) {
+	var lifecycle menubarProxyLifecycle
+	_, generation, ok := lifecycle.beginStartup(t.Context())
+	if !ok {
+		t.Fatal("beginStartup() = false, want true")
+	}
+	exited := &stopRecordingServer{stopped: make(chan struct{})}
+	if got, _ := lifecycle.finishStartup(generation, exited); got != proxyStartupCurrent {
+		t.Fatalf("finishStartup() = %v, want current", got)
+	}
+	// The server exited on its own; a restart must still Stop it so any AIKit
+	// containers it owns are removed.
+	if _, _, ok := lifecycle.beginStartup(t.Context()); !ok {
+		t.Fatal("restart beginStartup() = false, want true")
+	}
+	select {
+	case <-exited.stopped:
+	case <-t.Context().Done():
+		t.Fatal("exited server was dropped without Stop")
+	}
+}

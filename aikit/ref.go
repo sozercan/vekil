@@ -7,6 +7,7 @@ package aikit
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"path"
 	"regexp"
@@ -242,12 +243,12 @@ func displayURL(raw string) string {
 }
 
 func loopbackHost(host string) bool {
-	switch strings.ToLower(host) {
-	case "localhost", "127.0.0.1", "::1":
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
 		return true
-	default:
-		return false
 	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // DefaultBackend returns the backend a reference uses when none is requested.
