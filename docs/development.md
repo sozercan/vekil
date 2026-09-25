@@ -138,7 +138,7 @@ go test ./proxy -run '^$' -bench '^BenchmarkConversationHistoryAdmission$' -benc
 
 Coverage includes HTTP JSON/SSE, local tool history, full-input and response-ID
 recovery, immutable older branches, WebSocket reconnect, uncertain execution,
-storage faults/capacity/corruption, concurrent admission, offline deletion and
+HTTP and WebSocket client interrupts, storage faults/capacity/corruption, concurrent admission, offline deletion and
 process kills around history commits. Core CI runs these tests on Linux and
 the Darwin durable-storage job runs them on macOS. Complete the production gate
 before live Azure/Copilot validation. A live check must use a separate providers
