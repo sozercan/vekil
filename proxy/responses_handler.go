@@ -257,6 +257,13 @@ func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWrite
 	if h.handleShutdownError(w, r, upstreamCtx, err) {
 		return
 	}
+	if r != nil && r.Context().Err() != nil && errors.Is(err, context.Canceled) {
+		// The client closed the request before any provider outcome, for
+		// example by interrupting an agent. Record the client-first abort as
+		// 499, as the websocket bridge does, rather than an upstream failure.
+		w.WriteHeader(499)
+		return
+	}
 	if _, code, ok := durableStateFailureDetails(err); ok {
 		h.log.Error("local provider-state storage failed", logger.F("endpoint", endpoint), logger.F("error_code", code))
 		writeDurableStateFailure(w, err)

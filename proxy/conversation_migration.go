@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 
@@ -35,12 +36,26 @@ type conversationTurn struct {
 	hostedTools     map[string]bool
 	pending         bool
 	dispatched      bool
-	saved           bool
-	closed          bool
-	migrated        bool
-	attempted       bool
-	blocked         bool
-	unprotected     bool
+	exposed         bool
+	failed          bool
+	streamUncertain bool
+	// Completed output items staged from the committed response. An item is
+	// delivered once a later event has been handed downstream: HTTP and
+	// websocket consumers read the next event only after writing the previous.
+	deliveryEvents      int
+	staged              []conversationStagedItem
+	stagedIndexes       map[int]bool
+	stagedBytes         int
+	deliveredResponseID string
+	deliveredInvalid    bool
+	deliveryInfo        explicitRouteResponseInfo
+	haveDeliveryInfo    bool
+	saved               bool
+	closed              bool
+	migrated            bool
+	attempted           bool
+	blocked             bool
+	unprotected         bool
 }
 
 func (h *ProxyHandler) initializeConversationHistory() error {
@@ -395,7 +410,9 @@ func (t *conversationTurn) finish() {
 		return
 	}
 	t.closed = true
-	if t.pending && !t.saved {
+	if t.pending && !t.saved && t.dispatched && !t.blocked && !t.streamUncertain && t.clientEnded() {
+		t.releaseInterruptedAttempt()
+	} else if t.pending && !t.saved {
 		safe := !t.dispatched
 		if t.dispatched {
 			_, _, traces := t.operation.snapshot()
@@ -433,6 +450,46 @@ func (t *conversationTurn) unprotect(targetID, reason string) error {
 	t.unprotected, t.blocked = true, true
 	t.h.logConversationRecovery(t.operation, "unprotected", targetID, reason)
 	return nil
+}
+
+// An upstream terminal failure before any output is a known outcome: the client
+// received nothing it could act on, so a retry cannot duplicate work. Clear the
+// attempt marker and forward the upstream failure unchanged so the client can
+// apply its own retry policy. Output before or inside the failure leaves
+// execution uncertain. The caller holds t.mu.
+func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMessage, targetID string) error {
+	if t.saved || t.exposed || conversationEventHasOutput(envelope) {
+		return conversationRequestError(errConversationIncomplete)
+	}
+	if t.pending {
+		if err := t.store.clearAttempt(t.root); err != nil {
+			t.blocked = true
+			t.h.logConversationRecovery(t.operation, "blocked", targetID, conversationFailureReason(err))
+			return conversationRequestError(err)
+		}
+		t.pending = false
+	}
+	if !t.failed {
+		t.failed = true
+		t.h.logConversationRecovery(t.operation, "failed", targetID, "no_output")
+	}
+	return nil
+}
+
+// conversationEventHasOutput reports whether a lifecycle or terminal event
+// carries response output. A malformed response object counts as output.
+func conversationEventHasOutput(envelope map[string]json.RawMessage) bool {
+	raw, ok := envelope["response"]
+	if !ok || rawJSONIsNullOrEmpty(raw) {
+		return false
+	}
+	var response struct {
+		Output json.RawMessage `json:"output"`
+	}
+	if json.Unmarshal(raw, &response) != nil {
+		return true
+	}
+	return responsesOutputHasProgress(response.Output)
 }
 
 func (t *conversationTurn) recoveryHeader() string {
@@ -506,6 +563,24 @@ func (h *ProxyHandler) tryConversationMigration(ctx context.Context, operation *
 		return nil, false, nil
 	}
 	if !safeConversationMigrationFailure(failure) {
+		if failure.progress == upstreamProgressTerminalFailure && failure.commitment == downstreamCommitmentNone && failure.cleanupDone {
+			// Only an output-free terminal event is translated before commitment,
+			// so like a committed one its outcome is known. Release the marker
+			// and return the translated failure to the client.
+			t.mu.Lock()
+			err := t.releaseFailedAttempt(nil, "")
+			t.mu.Unlock()
+			if err != nil {
+				return nil, true, err
+			}
+			return nil, false, nil
+		}
+		if t.clientEnded() && (errors.Is(failure.err, context.Canceled) || errors.Is(failure.err, context.DeadlineExceeded)) {
+			// The client's disconnect ended this attempt, so its outcome is not
+			// uncertain. An upstream failure that preceded the disconnect is.
+			// Report the attempt's own failure; finish records the interrupt.
+			return nil, false, nil
+		}
 		if t.dispatched && failure.delivery == requestDeliveredOrAmbiguous {
 			t.mu.Lock()
 			t.blocked = true
@@ -555,7 +630,7 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 		return data, nil
 	}
 	if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
-		if t.saved {
+		if t.saved || t.failed {
 			return data, nil
 		}
 		return nil, conversationRequestError(errConversationIncomplete)
@@ -568,9 +643,21 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 	eventType := rawJSONString(envelope["type"])
 	if eventType != "" {
 		if eventType != "response.completed" {
-			if eventType == "response.incomplete" || eventType == "response.failed" || eventType == "response.cancelled" || eventType == "response.canceled" || eventType == "error" {
-				return nil, conversationRequestError(errConversationIncomplete)
+			switch eventType {
+			case "response.incomplete", "response.failed", "response.cancelled", "response.canceled", "error":
+				if err := t.releaseFailedAttempt(envelope, info.targetID); err != nil {
+					return nil, err
+				}
+				return data, nil
+			case "response.queued", "response.created", "response.in_progress":
+				if conversationEventHasOutput(envelope) {
+					t.exposed = true
+				}
+			default:
+				// Unrecognized events count as output so they cannot hide progress.
+				t.exposed = true
 			}
+			t.observeDelivery(eventType, envelope, info)
 			return data, nil
 		}
 		response = nil
@@ -594,27 +681,10 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 		}
 		return nil, conversationRequestError(err)
 	}
-	if len(t.input)+len(t.additionalTools)+len(output.items) > maxConversationHistoryItems {
-		return nil, conversationRequestError(errConversationHistoryCapacity)
-	}
-	snapshot := &conversationSnapshot{
-		ResponseID: rawJSONString(response["id"]), RouteID: info.routeID, TargetID: info.targetID, Identity: info.stateIdentity,
-		Root: t.root, Scope: t.scope, Created: t.store.d.now().Unix(),
-		Input: append(cloneRawMessages(t.input), output.items...), Instructions: t.instructions, Tools: t.tools, Migrated: t.migrated,
-		AdditionalTools: cloneRawMessages(t.additionalTools),
-		Stored:          !bytes.Equal(bytes.TrimSpace(t.fields["store"]), []byte("false")),
-	}
-	if target, ok := t.operation.route.targetByID(info.targetID); ok && target.provider != nil && target.provider.kind == providerTypeCopilot {
-		// Copilot continuations use our durable snapshots, including when
-		// store was omitted. Keep its IDs as local history anchors.
-		snapshot.Stored = false
-	}
-	if err := validateConversationToolSequence(snapshot.Input, true); err != nil {
+	stored := !bytes.Equal(bytes.TrimSpace(t.fields["store"]), []byte("false"))
+	snapshot, err := t.historySnapshot(rawJSONString(response["id"]), info, output, stored)
+	if err != nil {
 		return nil, conversationRequestError(err)
-	}
-	snapshot.Indexes = t.store.anchorIndexes(info.routeID, output.anchors)
-	if prefixes := t.store.prefixIndexes(info.routeID, snapshot.Scope, snapshot.Input); len(prefixes) > 0 {
-		snapshot.Indexes = append(snapshot.Indexes, prefixes[len(prefixes)-1])
 	}
 	if !t.saved {
 		if err := t.store.save(snapshot); err != nil {
@@ -646,6 +716,165 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 	return encoded, nil
 }
 
+// historySnapshot builds the immutable snapshot of this turn's history followed
+// by output from one upstream response.
+func (t *conversationTurn) historySnapshot(responseID string, info explicitRouteResponseInfo, output conversationInput, stored bool) (*conversationSnapshot, error) {
+	if len(t.input)+len(t.additionalTools)+len(output.items) > maxConversationHistoryItems {
+		return nil, errConversationHistoryCapacity
+	}
+	snapshot := &conversationSnapshot{
+		ResponseID: responseID, RouteID: info.routeID, TargetID: info.targetID, Identity: info.stateIdentity,
+		Root: t.root, Scope: t.scope, Created: t.store.d.now().Unix(),
+		Input: append(cloneRawMessages(t.input), output.items...), Instructions: t.instructions, Tools: t.tools, Migrated: t.migrated,
+		AdditionalTools: cloneRawMessages(t.additionalTools),
+		Stored:          stored,
+	}
+	if target, ok := t.operation.route.targetByID(info.targetID); ok && target.provider != nil && target.provider.kind == providerTypeCopilot {
+		// Copilot continuations use our durable snapshots, including when
+		// store was omitted. Keep its IDs as local history anchors.
+		snapshot.Stored = false
+	}
+	if err := validateConversationToolSequence(snapshot.Input, true); err != nil {
+		return nil, err
+	}
+	snapshot.Indexes = t.store.anchorIndexes(info.routeID, output.anchors)
+	if prefixes := t.store.prefixIndexes(info.routeID, snapshot.Scope, snapshot.Input); len(prefixes) > 0 {
+		snapshot.Indexes = append(snapshot.Indexes, prefixes[len(prefixes)-1])
+	}
+	return snapshot, nil
+}
+
+type conversationStagedItem struct {
+	event, index int
+	output       conversationInput
+}
+
+// observeDelivery stages the response and completed output items being sent
+// to the client, so a client interrupt can save exactly the delivered history.
+// Items that cannot be represented, or output from another response, disable
+// the delivered snapshot. The caller holds t.mu.
+func (t *conversationTurn) observeDelivery(eventType string, envelope map[string]json.RawMessage, info explicitRouteResponseInfo) {
+	t.deliveryEvents++
+	if !t.haveDeliveryInfo {
+		t.deliveryInfo, t.haveDeliveryInfo = info, true
+	} else if info.targetID != t.deliveryInfo.targetID || info.routeID != t.deliveryInfo.routeID {
+		t.invalidateDelivery()
+	}
+	switch eventType {
+	case "response.queued", "response.created", "response.in_progress":
+		var response struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(envelope["response"], &response)
+		if t.deliveredResponseID == "" {
+			t.deliveredResponseID = response.ID
+		} else if response.ID != "" && response.ID != t.deliveredResponseID {
+			t.invalidateDelivery()
+		}
+	case "response.output_item.done":
+		if t.deliveredInvalid {
+			return
+		}
+		item, ok := envelope["item"]
+		if !ok {
+			t.invalidateDelivery()
+			return
+		}
+		var index *int
+		output, err := canonicalConversationInput(append(append([]byte("["), item...), ']'), true)
+		if err != nil || json.Unmarshal(envelope["output_index"], &index) != nil || index == nil || *index < 0 || t.stagedIndexes[*index] {
+			t.invalidateDelivery()
+			return
+		}
+		// Stop staging once the output could not fit a snapshot anyway.
+		size := rawMessagesSize(output.items)
+		for _, anchor := range output.anchors {
+			size += len(anchor.value)
+		}
+		if len(t.staged) >= maxConversationHistoryItems || t.stagedBytes+size > t.store.config.MaxHistoryBytes {
+			t.invalidateDelivery()
+			return
+		}
+		if t.stagedIndexes == nil {
+			t.stagedIndexes = make(map[int]bool)
+		}
+		t.stagedIndexes[*index] = true
+		t.stagedBytes += size
+		t.staged = append(t.staged, conversationStagedItem{event: t.deliveryEvents, index: *index, output: output})
+	}
+}
+
+// invalidateDelivery disables the delivered snapshot and drops staged items.
+// The caller holds t.mu.
+func (t *conversationTurn) invalidateDelivery() {
+	t.deliveredInvalid = true
+	t.staged, t.stagedIndexes, t.stagedBytes = nil, nil, 0
+}
+
+// deliveredOutput returns staged items whose event was followed by another
+// handed-off event, in output_index order. The caller holds t.mu.
+func (t *conversationTurn) deliveredOutput() conversationInput {
+	var delivered []conversationStagedItem
+	for _, staged := range t.staged {
+		if staged.event <= t.deliveryEvents-2 {
+			delivered = append(delivered, staged)
+		}
+	}
+	sort.Slice(delivered, func(i, j int) bool { return delivered[i].index < delivered[j].index })
+	var output conversationInput
+	for _, staged := range delivered {
+		output.items = append(output.items, staged.output.items...)
+		output.anchors = append(output.anchors, staged.output.anchors...)
+	}
+	return output
+}
+
+// A client that ends its own request owns the outcome: it received exactly the
+// events delivered so far and decides whether to act on them. Save completed
+// delivered items as a snapshot, so a continuation that includes them matches
+// verified history, and release the attempt either way. Only the target's own
+// delivered output is saved; the client cannot add items it did not receive.
+// The caller holds t.mu.
+func (t *conversationTurn) releaseInterruptedAttempt() {
+	targetID := t.deliveryInfo.targetID
+	delivered := t.deliveredOutput()
+	if (len(delivered.items) > 0 || len(delivered.anchors) > 0) && !t.deliveredInvalid && t.deliveredResponseID != "" && t.haveDeliveryInfo {
+		// Recover interrupted response-ID continuations from what the client
+		// received, not from an upstream copy that may have continued.
+		snapshot, err := t.historySnapshot(t.deliveredResponseID, t.deliveryInfo, delivered, false)
+		if err == nil {
+			err = t.store.save(snapshot)
+		}
+		if err == nil {
+			t.pending = false
+			t.h.logConversationRecovery(t.operation, "interrupted", targetID, "delivered_history_saved")
+			return
+		}
+		// A reused response ID keeps the marker, like a completed turn does.
+		if errors.Is(err, errConversationHistoryStorage) || errors.Is(err, errConversationHistoryUncertain) {
+			t.h.logConversationRecovery(t.operation, "blocked", targetID, conversationFailureReason(err))
+			return
+		}
+	}
+	if err := t.store.clearAttempt(t.root); err != nil {
+		t.h.logConversationRecovery(t.operation, "blocked", targetID, "storage_unavailable")
+		return
+	}
+	t.pending = false
+	reason := "no_delivered_items"
+	if len(delivered.items) > 0 || len(delivered.anchors) > 0 || t.deliveredInvalid {
+		reason = "delivered_history_unavailable"
+	}
+	t.h.logConversationRecovery(t.operation, "interrupted", targetID, reason)
+}
+
+// clientEnded reports whether the client, rather than Vekil or its upstream,
+// ended this turn's request. A shutdown is never the client's decision.
+func (t *conversationTurn) clientEnded() bool {
+	inbound := t.operation.inbound
+	return inbound != nil && inbound.Err() != nil && !t.h.ShuttingDown()
+}
+
 type conversationCompletionBody struct {
 	io.ReadCloser
 	turn *conversationTurn
@@ -655,7 +884,12 @@ func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		b.turn.mu.Lock()
-		saved := b.turn.saved || b.turn.unprotected
+		saved := b.turn.saved || b.turn.unprotected || b.turn.failed
+		if !saved && !b.turn.clientEnded() {
+			// The stream ended without a known outcome while the client was
+			// still connected. A later disconnect must not release it.
+			b.turn.streamUncertain = true
+		}
 		b.turn.mu.Unlock()
 		_, _, storageFailure := durableStateFailureDetails(err)
 		if !saved && !storageFailure && providerRequestErrorCode(err) == "" {
