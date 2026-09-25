@@ -1,0 +1,50 @@
+name: Live AIKit Smoke
+
+# Credential-free live smoke for local AIKit models. It runs a small Llama 3.2
+# 1B model in Docker through `vekil serve` (a pre-made image as a `type: aikit`
+# provider) and `vekil launch` (a Hugging Face GGUF runner reference with a
+# stub agent). Needs no secrets, so it runs on every pull request, including
+# forks. See docs/development.md.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-aikit-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  aikit-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: make build
+
+      - name: Run live AIKit smoke
+        env:
+          AIKIT_RUNTIME: docker
+          LIVE_AIKIT_SMOKE_DIR: ${{ runner.temp }}/live-aikit-smoke
+        run: scripts/live-aikit-smoke.sh
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          for log in "$RUNNER_TEMP"/live-aikit-smoke/*.log; do
+            [ -f "$log" ] || continue
+            echo "--- $log ---"
+            tail -n 200 "$log"
+          done

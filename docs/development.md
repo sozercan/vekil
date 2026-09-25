@@ -508,6 +508,22 @@ SMOKE_PROVIDER=zen PROVIDERS_CONFIG=examples/opencode-zen-free.yaml \
   scripts/live-cli-smoke.sh
 ```
 
+## Live AIKit Smoke Workflow
+
+The [`Live AIKit Smoke`](../.github/workflows/live-aikit-smoke.yaml) workflow runs on every pull request targeting `main`, on pushes to `main`, and on manual dispatch. It needs no secrets. [`scripts/live-aikit-smoke.sh`](../scripts/live-aikit-smoke.sh) runs a small Llama 3.2 1B model in Docker on the CPU:
+
+1. `vekil serve` with a `type: aikit` provider on the pre-made `llama3.2:1b` image. It checks Chat (plain, streamed, and with two system messages), Anthropic Messages (plain and streamed), and Responses with a function tool, plus the LocalAI dialect's `400 unsupported_tool_type` for a custom tool. It then sends a prompt about 1.3 times the served context and requires `context_length_exceeded` on Chat (plain and streamed) and Responses, and `prompt is too long` on Messages. Finally it stops the server and requires its container to be gone.
+2. `vekil launch claude` with a Hugging Face GGUF runner reference and a stub agent that reports a supported Claude Code version. The stub records `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, which must be at least the 49,152-token agent floor, and sends one Messages request through the launched proxy. The launch must exit cleanly and remove its container.
+
+Pulls and model loads can take several minutes, so the script waits up to 25 minutes for readiness. To run it locally, use Docker or a podman machine:
+
+```bash
+make build
+AIKIT_RUNTIME=podman scripts/live-aikit-smoke.sh
+```
+
+`AIKIT_IMAGE_MODEL` and `AIKIT_RUNNER_MODEL` select other models. The runner scenario leaves its model download in a `vekil-aikit-<hash>` volume for reuse.
+
 ## Live Copilot Direct-Bearer Smoke Workflow
 
 The [`Live Copilot Direct Bearer Smoke`](../.github/workflows/live-copilot-direct-bearer-smoke.yaml) workflow is focused credentialed coverage for direct `COPILOT_GITHUB_TOKEN` authentication. It uses a dedicated fine-grained PAT to verify that Vekil returns the original environment token from `GetToken` without contacting `api.github.com`, a second call uses the in-memory cache, and `GetResponsesToken` preserves the same direct bearer. The test then reads Copilot's live `/models` catalog, selects an advertised `/responses` model from the explicit `gpt-5.6-luna`, `gpt-5-mini`, `gpt-5.4-mini` allowlist, and requires one bounded `store: false` inference to return a completed response with non-empty output text. It records exactly those two successful upstream requests and verifies that neither `access-token` nor `api-key.json` is written.
