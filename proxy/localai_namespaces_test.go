@@ -32,6 +32,24 @@ func TestFlattenLocalAINamespaceTools(t *testing.T) {
 		t.Fatalf("aliases = %v", aliases)
 	}
 
+	// History-only namespaces keep their original name in the alias map.
+	history := `{"tools":[{"type":"namespace","name":"a","tools":[{"type":"function","name":"f"}]}],"input":[{"type":"function_call","namespace":"old","name":"g","call_id":"c","arguments":"{}"}]}`
+	_, historyAliases, err := flattenLocalAINamespaceTools([]byte(history))
+	if err != nil || historyAliases["old__g"] != (localAIToolAlias{namespace: "old", name: "g"}) {
+		t.Fatalf("history aliases = %v, %v", historyAliases, err)
+	}
+
+	choice := `{"tools":[{"type":"namespace","name":"agents","tools":[{"type":"function","name":"spawn"}]}],"tool_choice":{"type":"function","namespace":"agents","name":"spawn"}}`
+	out, _, err = flattenLocalAINamespaceTools([]byte(choice))
+	if err != nil || !strings.Contains(string(out), `"tool_choice":{"name":"agents__spawn","type":"function"}`) {
+		t.Fatalf("tool_choice = %s, %v", out, err)
+	}
+	allowed := `{"tools":[{"type":"namespace","name":"agents","tools":[{"type":"function","name":"spawn"}]}],"tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","namespace":"agents","name":"spawn"},{"type":"function","name":"plain"}]}}`
+	out, _, err = flattenLocalAINamespaceTools([]byte(allowed))
+	if err != nil || !strings.Contains(string(out), `{"name":"agents__spawn","type":"function"}`) || !strings.Contains(string(out), `{"name":"plain","type":"function"}`) {
+		t.Fatalf("allowed_tools = %s, %v", out, err)
+	}
+
 	if out, aliases, err := flattenLocalAINamespaceTools([]byte(`{"tools":[{"type":"function","name":"f"}]}`)); err != nil || aliases != nil || string(out) != `{"tools":[{"type":"function","name":"f"}]}` {
 		t.Fatalf("plain request changed: %s %v %v", out, aliases, err)
 	}
@@ -42,6 +60,18 @@ func TestFlattenLocalAINamespaceTools(t *testing.T) {
 	custom := `{"tools":[{"type":"namespace","name":"ns","tools":[{"type":"custom","name":"f"}]}]}`
 	if _, _, err := flattenLocalAINamespaceTools([]byte(custom)); err == nil || providerRequestErrorCode(err) != "unsupported_tool_type" {
 		t.Fatalf("custom child error = %v", err)
+	}
+}
+
+func TestRestoreLocalAIToolAliasesPassesLargeBodiesThrough(t *testing.T) {
+	previous := localAIAliasBodyLimit
+	localAIAliasBodyLimit = 16
+	t.Cleanup(func() { localAIAliasBodyLimit = previous })
+	body := `{"id":"r","output":[{"type":"function_call","name":"mcp__repl__js"}]}`
+	resp := restoreLocalAIToolAliases(upstreamResponse(http.StatusOK, "application/json", strings.NewReader(body)), localAIToolAliases{"mcp__repl__js": {namespace: "mcp__repl", name: "js"}})
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != body {
+		t.Fatalf("large body = %q, want it unchanged", got)
 	}
 }
 

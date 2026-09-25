@@ -261,7 +261,7 @@ func normalizeUpstreamDialectResponse(req *http.Request, resp *http.Response) *h
 func normalizeLocalAIErrorResponse(resp *http.Response, param string) *http.Response {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, localAIErrorBodyLimit+1))
 	if err != nil || len(body) > localAIErrorBodyLimit {
-		resp.Body = prefixedReadCloser{Reader: io.MultiReader(bytes.NewReader(body), resp.Body), close: resp.Body.Close}
+		resp.Body = newLocalAIPrefixedBody(body, resp.Body)
 		return resp
 	}
 	_ = resp.Body.Close()
@@ -296,6 +296,37 @@ func syntheticOverflowResponse(resp *http.Response, overflow contextOverflow, pa
 	}
 }
 
+// localAIBodyLifecycle delegates route-attempt lifecycle hooks to the upstream
+// body a LocalAI wrapper reads from, as other response-body wrappers do.
+type localAIBodyLifecycle struct {
+	source io.ReadCloser
+}
+
+func (l localAIBodyLifecycle) cancelRouteAttempt() { cancelRouteAttemptBody(l.source) }
+
+func (l localAIBodyLifecycle) routeAttemptTransportOwnership() *routeAttemptTransportOwner {
+	return routeAttemptTransportOwnership(l.source)
+}
+
+func (l localAIBodyLifecycle) canceledAtFailure() bool {
+	observed, ok := l.source.(interface{ canceledAtFailure() bool })
+	return ok && observed.canceledAtFailure()
+}
+
+// localAIPrefixedBody replays bytes already read before the rest of a body.
+type localAIPrefixedBody struct {
+	localAIBodyLifecycle
+	reader io.Reader
+}
+
+func newLocalAIPrefixedBody(prefix []byte, source io.ReadCloser) *localAIPrefixedBody {
+	return &localAIPrefixedBody{localAIBodyLifecycle: localAIBodyLifecycle{source: source}, reader: io.MultiReader(bytes.NewReader(prefix), source)}
+}
+
+func (b *localAIPrefixedBody) Read(p []byte) (int, error) { return b.reader.Read(p) }
+
+func (b *localAIPrefixedBody) Close() error { return b.source.Close() }
+
 type streamChunk struct {
 	data []byte
 	err  error
@@ -304,18 +335,18 @@ type streamChunk struct {
 // chunkReadCloser reads a body through a goroutine so a caller can stop
 // waiting for it at a deadline without losing data.
 type chunkReadCloser struct {
+	localAIBodyLifecycle
 	prefix  []byte
 	chunks  <-chan streamChunk
 	pending []byte
 	err     error
-	body    io.Closer
 	stop    chan struct{}
 	once    sync.Once
 }
 
 func newChunkReader(body io.ReadCloser) (*chunkReadCloser, <-chan streamChunk) {
 	chunks := make(chan streamChunk, 8)
-	reader := &chunkReadCloser{chunks: chunks, body: body, stop: make(chan struct{})}
+	reader := &chunkReadCloser{localAIBodyLifecycle: localAIBodyLifecycle{source: body}, chunks: chunks, stop: make(chan struct{})}
 	go func() {
 		defer close(chunks)
 		buf := make([]byte, 16<<10)
@@ -370,7 +401,7 @@ func (c *chunkReadCloser) Close() error {
 	var err error
 	c.once.Do(func() {
 		close(c.stop)
-		err = c.body.Close()
+		err = c.source.Close()
 	})
 	return err
 }
@@ -700,7 +731,8 @@ func localAIMessagesNeedRewrite(messages []localAIMessage, hasInstructions bool)
 	for _, message := range messages {
 		if isSystemRole(message.role) {
 			systemCount++
-			if seenOther || systemCount > 1 {
+			// Templates that know only the system role may reject developer.
+			if seenOther || systemCount > 1 || message.role == "developer" {
 				return true
 			}
 			continue

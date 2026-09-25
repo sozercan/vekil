@@ -23,6 +23,10 @@ type localAIToolAlias struct {
 
 type localAIToolAliases map[string]localAIToolAlias
 
+// localAIAliasBodyLimit bounds how much of a non-streaming reply is buffered
+// to restore tool names.
+var localAIAliasBodyLimit = 64 << 20
+
 // flattenLocalAINamespaceTools replaces Responses namespace tools with their
 // function children, because LocalAI serves only top-level function tools.
 // Function-call history items that name a namespace are flattened the same
@@ -97,11 +101,12 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 				if namespace == "" || jsonStringField(item, "type") != "function_call" {
 					continue
 				}
-				alias := namespace + localAIToolSeparator + jsonStringField(item, "name")
+				name := jsonStringField(item, "name")
+				alias := namespace + localAIToolSeparator + name
 				item["name"] = mustMarshalJSON(alias)
 				delete(item, "namespace")
 				if _, known := aliases[alias]; !known {
-					aliases[alias] = localAIToolAlias{namespace: namespace, name: jsonStringField(item, "name")}
+					aliases[alias] = localAIToolAlias{namespace: namespace, name: name}
 				}
 				changed = true
 			}
@@ -113,11 +118,55 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 	if len(aliases) == 0 {
 		return body, nil, nil
 	}
+	if raw, ok := payload["tool_choice"]; ok {
+		if rewritten, changed := flattenLocalAIToolChoice(raw); changed {
+			payload["tool_choice"] = rewritten
+		}
+	}
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return nil, nil, err
 	}
 	return out, aliases, nil
+}
+
+// flattenLocalAIToolChoice renames namespaced function choices, including the
+// entries of an allowed_tools choice, to their flattened names.
+func flattenLocalAIToolChoice(raw json.RawMessage) (json.RawMessage, bool) {
+	var choice map[string]json.RawMessage
+	if json.Unmarshal(raw, &choice) != nil {
+		return raw, false
+	}
+	changed := flattenNamespacedToolReference(choice)
+	if jsonStringField(choice, "type") == "allowed_tools" {
+		var tools []map[string]json.RawMessage
+		if json.Unmarshal(choice["tools"], &tools) == nil {
+			toolsChanged := false
+			for _, tool := range tools {
+				if flattenNamespacedToolReference(tool) {
+					toolsChanged = true
+				}
+			}
+			if toolsChanged {
+				choice["tools"] = mustMarshalJSON(tools)
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+	return mustMarshalJSON(choice), true
+}
+
+func flattenNamespacedToolReference(reference map[string]json.RawMessage) bool {
+	namespace := jsonStringField(reference, "namespace")
+	if namespace == "" || jsonStringField(reference, "type") != "function" {
+		return false
+	}
+	reference["name"] = mustMarshalJSON(namespace + localAIToolSeparator + jsonStringField(reference, "name"))
+	delete(reference, "namespace")
+	return true
 }
 
 func localAIToolError(param, detail string) error {
@@ -214,12 +263,13 @@ func restoreLocalAIToolAliases(resp *http.Response, aliases localAIToolAliases) 
 		resp.ContentLength = -1
 		return resp
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	_ = resp.Body.Close()
-	if err != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(localAIAliasBodyLimit)+1))
+	if err != nil || len(body) > localAIAliasBodyLimit {
+		// Too large or unreadable to rewrite: pass it through unchanged.
+		resp.Body = newLocalAIPrefixedBody(body, resp.Body)
 		return resp
 	}
+	_ = resp.Body.Close()
 	if restored, ok := aliases.restoreResponse(body); ok {
 		body = restored
 	}
@@ -231,7 +281,7 @@ func restoreLocalAIToolAliases(resp *http.Response, aliases localAIToolAliases) 
 
 // localAIAliasStream rewrites complete SSE events as they arrive.
 type localAIAliasStream struct {
-	source  io.ReadCloser
+	localAIBodyLifecycle
 	reader  *bufio.Reader
 	aliases localAIToolAliases
 	pending []byte
@@ -240,7 +290,7 @@ type localAIAliasStream struct {
 }
 
 func newLocalAIAliasStream(source io.ReadCloser, aliases localAIToolAliases) *localAIAliasStream {
-	return &localAIAliasStream{source: source, reader: bufio.NewReaderSize(source, 64<<10), aliases: aliases}
+	return &localAIAliasStream{localAIBodyLifecycle: localAIBodyLifecycle{source: source}, reader: bufio.NewReaderSize(source, 64<<10), aliases: aliases}
 }
 
 func (s *localAIAliasStream) Read(buf []byte) (int, error) {

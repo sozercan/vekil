@@ -278,11 +278,14 @@ func TestStartReapsOrphans(t *testing.T) {
 	}
 }
 
-func TestStartRunnerGGUF(t *testing.T) {
+func runnerSource(t *testing.T, requireToken bool, sawToken, sawRange *atomic.Bool) *httptest.Server {
+	t.Helper()
 	gguf := testGGUF("llama", 131072)
-	var sawRange atomic.Bool
 	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer hf_test" {
+		if r.Header.Get("Authorization") != "" {
+			sawToken.Store(true)
+		}
+		if requireToken && r.Header.Get("Authorization") != "Bearer hf_test" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -291,20 +294,27 @@ func TestStartRunnerGGUF(t *testing.T) {
 		}
 		http.ServeContent(w, r, "tiny.gguf", time.Time{}, bytes.NewReader(gguf))
 	}))
-	defer source.Close()
+	t.Cleanup(source.Close)
+	return source
+}
 
+func TestStartRunnerGGUFFromHuggingFace(t *testing.T) {
+	var sawToken, sawRange atomic.Bool
+	source := runnerSource(t, true, &sawToken, &sawRange)
 	fake := newFakeEngine(t)
 	runner := "ghcr.io/kaito-project/aikit/runners/llama-cpp-cpu:latest"
 	fake.images[runner] = map[string][]byte{}
 	fake.onRun = func(c *fakeContainer) {
 		c.port = fake.serveLocalAI(nil, func() int { return 65536 })
 	}
-	ref, err := ParseReference(source.URL + "/models/tiny.gguf")
+	ref, err := ParseReference("hf.co/org/repo/tiny.gguf")
 	if err != nil {
 		t.Fatalf("ParseReference: %v", err)
 	}
+	client := &http.Client{Transport: rewriteTransport{target: source.URL, base: http.DefaultTransport}}
 	session, progress, err := startTestSession(t, fake, fake.engine(EnginePodman, AccelAppleSilicon), Options{
 		Reference:   ref,
+		HTTPClient:  client,
 		Environment: []string{"HF_TOKEN=hf_test"},
 	})
 	if err != nil {
@@ -325,6 +335,34 @@ func TestStartRunnerGGUF(t *testing.T) {
 	}
 	if !strings.Contains(progress, "no Apple Silicon runner images") || !strings.Contains(progress, "on podman (CPU runner)") {
 		t.Fatalf("progress = %q", progress)
+	}
+}
+
+func TestStartRunnerGGUFElsewhereGetsNoHuggingFaceToken(t *testing.T) {
+	var sawToken, sawRange atomic.Bool
+	source := runnerSource(t, false, &sawToken, &sawRange)
+	fake := newFakeEngine(t)
+	fake.images["ghcr.io/kaito-project/aikit/runners/llama-cpp-cpu:latest"] = map[string][]byte{}
+	fake.onRun = func(c *fakeContainer) {
+		c.port = fake.serveLocalAI(nil, func() int { return 65536 })
+	}
+	ref, err := ParseReference(source.URL + "/models/tiny.gguf")
+	if err != nil {
+		t.Fatalf("ParseReference: %v", err)
+	}
+	session, progress, err := startTestSession(t, fake, fake.engine(EngineDocker, AccelNone), Options{
+		Reference:   ref,
+		Environment: []string{"HF_TOKEN=hf_test"},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v\n%s", err, progress)
+	}
+	defer func() { _ = session.Close(context.Background()) }()
+	if sawToken.Load() {
+		t.Fatal("HF_TOKEN was sent to a non-Hugging Face host")
+	}
+	if run := strings.Join(fake.runs[0], " "); strings.Contains(run, "HF_TOKEN") {
+		t.Fatalf("runner received HF_TOKEN for a non-Hugging Face source: %q", run)
 	}
 }
 
@@ -354,7 +392,12 @@ type rewriteTransport struct {
 	base   http.RoundTripper
 }
 
+// RoundTrip sends huggingface.co requests to the test server and everything
+// else, such as container readiness checks, to its real destination.
 func (r rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host != "huggingface.co" {
+		return r.base.RoundTrip(req)
+	}
 	clone := req.Clone(req.Context())
 	target, _ := http.NewRequest(req.Method, r.target+req.URL.Path, nil)
 	clone.URL = target.URL

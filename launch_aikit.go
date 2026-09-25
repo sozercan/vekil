@@ -33,23 +33,19 @@ var aikitLaunchFlagNames = []string{"context-size", "runtime", "backend", "keep"
 // the same channel can then be handed to the agent supervisor.
 func watchStartupSignals(signals <-chan os.Signal, cancel context.CancelFunc) func() os.Signal {
 	done := make(chan struct{})
-	received := make(chan os.Signal, 1)
+	finished := make(chan os.Signal, 1)
 	go func() {
 		select {
 		case signalValue := <-signals:
-			received <- signalValue
 			cancel()
+			finished <- signalValue
 		case <-done:
+			finished <- nil
 		}
 	}()
 	return func() os.Signal {
 		close(done)
-		select {
-		case signalValue := <-received:
-			return signalValue
-		default:
-			return nil
-		}
+		return <-finished
 	}
 }
 
@@ -115,16 +111,38 @@ func providersHaveDefault(providers []proxy.ProviderConfig) bool {
 	return false
 }
 
-// launchLocalModelProfile describes the pinned model when a started aikit
-// provider serves it.
+// launchLocalModelProfile describes the pinned model when an aikit or LocalAI
+// provider serves it, directly or as a target of its model route.
 func launchLocalModelProfile(cfg proxy.ProvidersConfig, modelID string) *launch.LocalModel {
 	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
 		return nil
 	}
+	localProviders := map[string]bool{}
 	for _, provider := range cfg.Providers {
-		local := provider.IsAIKit() || strings.TrimSpace(provider.UpstreamDialect) == "localai"
-		if !local {
+		if provider.IsAIKit() || strings.TrimSpace(provider.UpstreamDialect) == "localai" {
+			localProviders[strings.TrimSpace(provider.ID)] = true
+		}
+	}
+	for _, route := range cfg.ModelRoutes {
+		if strings.TrimSpace(route.PublicID) != modelID {
+			continue
+		}
+		// Any local target means requests must fit the function-tools-only
+		// contract; the route's own context window, when set, is authoritative.
+		for _, target := range route.Targets {
+			if localProviders[strings.TrimSpace(target.Provider)] {
+				profile := &launch.LocalModel{FunctionToolsOnly: true}
+				if route.ContextWindow != nil {
+					profile.ContextTokens = *route.ContextWindow
+				}
+				return profile
+			}
+		}
+		return nil
+	}
+	for _, provider := range cfg.Providers {
+		if !localProviders[strings.TrimSpace(provider.ID)] {
 			continue
 		}
 		for _, model := range provider.Models {

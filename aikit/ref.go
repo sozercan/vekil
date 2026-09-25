@@ -220,6 +220,24 @@ func (r Reference) DefaultBackend() string {
 	return BackendLlamaCPP
 }
 
+// UsesHuggingFace reports whether the model is downloaded from Hugging Face,
+// the only host HF_TOKEN may be sent to.
+func (r Reference) UsesHuggingFace() bool {
+	switch r.Kind {
+	case RefRunnerRepo:
+		return true
+	case RefRunnerGGUF:
+		parsed, err := url.Parse(r.Source)
+		if err != nil {
+			return false
+		}
+		host := strings.ToLower(parsed.Hostname())
+		return host == "huggingface.co" || host == "hf.co" || strings.HasSuffix(host, ".huggingface.co")
+	default:
+		return false
+	}
+}
+
 // IsRunner reports whether the reference downloads its model at startup.
 func (r Reference) IsRunner() bool {
 	return r.Kind == RefRunnerGGUF || r.Kind == RefRunnerRepo

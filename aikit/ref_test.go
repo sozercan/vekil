@@ -83,6 +83,26 @@ func TestParsePrefixed(t *testing.T) {
 	}
 }
 
+func TestReferenceUsesHuggingFace(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"hf.co/org/repo/file.gguf":                               true,
+		"https://huggingface.co/org/repo/resolve/main/file.gguf": true,
+		"https://cdn-lfs.huggingface.co/org/repo/file.gguf":      true,
+		"hf.co/org/repo@" + strings.Repeat("a", 40):              true,
+		"https://example.com/huggingface.co/file.gguf":           false,
+		"https://huggingface.co.evil.example/org/repo/file.gguf": false,
+		"qwen3.8:27b": false,
+	} {
+		ref, err := ParseReference(raw)
+		if err != nil {
+			t.Fatalf("ParseReference(%q): %v", raw, err)
+		}
+		if got := ref.UsesHuggingFace(); got != want {
+			t.Fatalf("UsesHuggingFace(%q) = %v, want %v", raw, got, want)
+		}
+	}
+}
+
 func TestReferenceDefaultBackend(t *testing.T) {
 	image, _ := ParseReference("qwen3.8:27b")
 	repo, _ := ParseReference("hf.co/Qwen/Qwen3-0.6B@" + strings.Repeat("c", 40))

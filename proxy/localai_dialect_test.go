@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -583,5 +584,32 @@ func TestNormalizeLocalAIResponsesInput(t *testing.T) {
 	stringInput := `{"instructions":"x","input":"hi"}`
 	if out, _ := normalizeLocalAIRequest([]byte(stringInput), providerEndpointResponses); string(out) != stringInput {
 		t.Fatalf("string input changed: %s", out)
+	}
+}
+
+func TestNormalizeLocalAIRequestRewritesLoneDeveloperMessage(t *testing.T) {
+	out, err := normalizeLocalAIRequest([]byte(`{"messages":[{"role":"developer","content":"rules"},{"role":"user","content":"hi"}]}`), providerEndpointChatCompletions)
+	if err != nil || !strings.Contains(string(out), `{"content":"rules","role":"system"}`) {
+		t.Fatalf("chat = %s, %v", out, err)
+	}
+	out, err = normalizeLocalAIRequest([]byte(`{"input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"rules"}]},{"role":"user","content":"hi"}]}`), providerEndpointResponses)
+	if err != nil || !strings.Contains(string(out), `"instructions":"rules"`) || strings.Contains(string(out), "developer") {
+		t.Fatalf("responses = %s, %v", out, err)
+	}
+}
+
+func TestLocalAIBodyWrappersKeepRouteLifecycle(t *testing.T) {
+	owner := &routeAttemptTransportOwner{}
+	source := &routeAttemptTransportBody{inner: io.NopCloser(strings.NewReader(normalChatStream)), owner: owner}
+	peeked := peekLocalAIStreamOverflow(context.Background(), &http.Response{StatusCode: 200, Header: http.Header{}, Body: source}, providerEndpointChatCompletions, "messages")
+	if routeAttemptTransportOwnership(peeked.Body) != owner {
+		t.Fatal("stream peek dropped route-attempt ownership")
+	}
+	aliased := restoreLocalAIToolAliases(&http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: peeked.Body}, localAIToolAliases{"a__b": {namespace: "a", name: "b"}})
+	if routeAttemptTransportOwnership(aliased.Body) != owner {
+		t.Fatal("alias stream dropped route-attempt ownership")
+	}
+	if routeAttemptTransportOwnership(newLocalAIPrefixedBody(nil, source)) != owner {
+		t.Fatal("prefixed body dropped route-attempt ownership")
 	}
 }

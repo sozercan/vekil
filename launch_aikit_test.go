@@ -163,3 +163,25 @@ func TestConfigValidateAcceptsAIKitProviders(t *testing.T) {
 		t.Fatalf("invalid reference error = %v", err)
 	}
 }
+
+func TestLaunchLocalModelProfileThroughModelRoute(t *testing.T) {
+	window := int64(65536)
+	cfg := proxy.ProvidersConfig{
+		SchemaVersion: 2,
+		Providers: []proxy.ProviderConfig{
+			{ID: "copilot", Type: "copilot"},
+			{ID: "local", Type: "openai-compatible", BaseURL: "http://127.0.0.1:1/v1", UpstreamDialect: "localai"},
+		},
+		ModelRoutes: []proxy.ModelRouteConfig{
+			{ID: "coder", PublicID: "coder", ContextWindow: &window, Targets: []proxy.ModelRouteTargetConfig{{ID: "local", Provider: "local"}, {ID: "cloud", Provider: "copilot"}}},
+			{ID: "cloud-only", PublicID: "cloud-only", Targets: []proxy.ModelRouteTargetConfig{{ID: "cloud", Provider: "copilot"}}},
+		},
+	}
+	profile := launchLocalModelProfile(cfg, "coder")
+	if profile == nil || !profile.FunctionToolsOnly || profile.ContextTokens != 65536 {
+		t.Fatalf("route profile = %+v", profile)
+	}
+	if launchLocalModelProfile(cfg, "cloud-only") != nil {
+		t.Fatal("a route without local targets got a local profile")
+	}
+}

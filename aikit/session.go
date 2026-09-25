@@ -184,7 +184,10 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 		return nil, err
 	}
 
-	token := huggingFaceToken(environment)
+	token := ""
+	if ref.UsesHuggingFace() {
+		token = huggingFaceToken(environment)
+	}
 	var plan modelPlan
 	switch ref.Kind {
 	case RefImage:

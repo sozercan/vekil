@@ -242,5 +242,6 @@ exact rule.
 - Runner references mount a named volume `vekil-aikit-<hash>` at `/models`, so a
   downloaded model is reused. Remove it with `docker volume rm` or `podman
   volume rm`.
-- `HF_TOKEN` is read for gated Hugging Face models. It is passed to runner
-  containers by name, so its value never appears on a command line.
+- `HF_TOKEN` is used only for Hugging Face sources (`hf.co/…` and
+  `huggingface.co` URLs), for gated models. It is passed to runner containers
+  by name, so its value never appears on a command line.

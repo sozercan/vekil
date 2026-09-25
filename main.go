@@ -287,6 +287,9 @@ func validateProvidersConfigFileWithAIKit(source string) error {
 // validateProvidersConfigFileLiveWithAIKit starts aikit providers for the
 // duration of a live validation, which must reach every configured upstream.
 func validateProvidersConfigFileLiveWithAIKit(ctx context.Context, source string) error {
+	// Ctrl-C while a model pulls or loads must still remove its container.
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	cfg, err := proxy.LoadProvidersConfigFile(source)
 	if err != nil {
 		return err
