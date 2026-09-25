@@ -195,14 +195,16 @@ response, it atomically saves history and clears that marker. If a crash or
 incomplete stream leaves execution uncertain, later continuation is blocked to
 avoid duplicate work. An upstream terminal failure (`response.failed`, `error`,
 `response.incomplete` or `response.cancelled`) is not uncertain when it carries
-no output and no output event preceded it. Vekil clears the marker and forwards
-that failure unchanged, so the client can retry the turn. A saved completion
-survives restart.
+no output and no output event preceded it. Before the stream is committed, a
+certified failure may instead [fail over](provider-routing.md) to another target.
+After commitment, Vekil clears the marker and forwards that failure unchanged, so
+the client can retry the turn. A saved completion survives restart.
 
 A client that disconnects or cancels its own request, for example by
 interrupting an agent mid-turn, owns that turn's outcome. Vekil saves the
-completed output items it delivered before the disconnect as a snapshot of that
-response, then clears the marker. The next turn may include those items and their
+completed output items it delivered before the disconnect, in output order, as a
+snapshot of that response, then clears the marker. An item counts as delivered
+once a later event of the stream has been sent after it. The next turn may include those items and their
 tool results, or omit them and branch from the earlier history. Response-ID
 continuations of the interrupted response are rebuilt from the delivered items.
 Items the client did not receive from Vekil still fail as incomplete history.

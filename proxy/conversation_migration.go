@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 
@@ -37,8 +38,12 @@ type conversationTurn struct {
 	dispatched      bool
 	exposed         bool
 	failed          bool
-	// Completed output delivered to the client from the committed response.
-	delivered           conversationInput
+	streamUncertain bool
+	// Completed output items staged from the committed response. An item is
+	// delivered once a later event has been handed downstream: HTTP and
+	// websocket consumers read the next event only after writing the previous.
+	deliveryEvents      int
+	staged              []conversationStagedItem
 	deliveredResponseID string
 	deliveredInvalid    bool
 	deliveryInfo        explicitRouteResponseInfo
@@ -403,7 +408,7 @@ func (t *conversationTurn) finish() {
 		return
 	}
 	t.closed = true
-	if t.pending && !t.saved && t.dispatched && t.clientEnded() {
+	if t.pending && !t.saved && t.dispatched && !t.blocked && !t.streamUncertain && t.clientEnded() {
 		t.releaseInterruptedAttempt()
 	} else if t.pending && !t.saved {
 		safe := !t.dispatched
@@ -724,11 +729,17 @@ func (t *conversationTurn) historySnapshot(responseID string, info explicitRoute
 	return snapshot, nil
 }
 
-// observeDelivery records the response and completed output items delivered
-// to the client, so a client interrupt can save exactly that history. Items
-// that cannot be represented, or output from another response, disable the
-// delivered snapshot. The caller holds t.mu.
+type conversationStagedItem struct {
+	event, index int
+	output       conversationInput
+}
+
+// observeDelivery stages the response and completed output items being sent
+// to the client, so a client interrupt can save exactly the delivered history.
+// Items that cannot be represented, or output from another response, disable
+// the delivered snapshot. The caller holds t.mu.
 func (t *conversationTurn) observeDelivery(eventType string, envelope map[string]json.RawMessage, info explicitRouteResponseInfo) {
+	t.deliveryEvents++
 	if !t.haveDeliveryInfo {
 		t.deliveryInfo, t.haveDeliveryInfo = info, true
 	} else if info.targetID != t.deliveryInfo.targetID || info.routeID != t.deliveryInfo.routeID {
@@ -751,14 +762,38 @@ func (t *conversationTurn) observeDelivery(eventType string, envelope map[string
 			t.deliveredInvalid = true
 			return
 		}
+		var index *int
 		output, err := canonicalConversationInput(append(append([]byte("["), item...), ']'), true)
-		if err != nil {
+		if err != nil || json.Unmarshal(envelope["output_index"], &index) != nil || index == nil || *index < 0 {
 			t.deliveredInvalid = true
 			return
 		}
-		t.delivered.items = append(t.delivered.items, output.items...)
-		t.delivered.anchors = append(t.delivered.anchors, output.anchors...)
+		for _, staged := range t.staged {
+			if staged.index == *index {
+				t.deliveredInvalid = true
+				return
+			}
+		}
+		t.staged = append(t.staged, conversationStagedItem{event: t.deliveryEvents, index: *index, output: output})
 	}
+}
+
+// deliveredOutput returns staged items whose event was followed by another
+// handed-off event, in output_index order. The caller holds t.mu.
+func (t *conversationTurn) deliveredOutput() conversationInput {
+	var delivered []conversationStagedItem
+	for _, staged := range t.staged {
+		if staged.event <= t.deliveryEvents-2 {
+			delivered = append(delivered, staged)
+		}
+	}
+	sort.Slice(delivered, func(i, j int) bool { return delivered[i].index < delivered[j].index })
+	var output conversationInput
+	for _, staged := range delivered {
+		output.items = append(output.items, staged.output.items...)
+		output.anchors = append(output.anchors, staged.output.anchors...)
+	}
+	return output
 }
 
 // A client that ends its own request owns the outcome: it received exactly the
@@ -769,10 +804,11 @@ func (t *conversationTurn) observeDelivery(eventType string, envelope map[string
 // The caller holds t.mu.
 func (t *conversationTurn) releaseInterruptedAttempt() {
 	targetID := t.deliveryInfo.targetID
-	if len(t.delivered.items) > 0 && !t.deliveredInvalid && t.deliveredResponseID != "" && t.haveDeliveryInfo {
+	delivered := t.deliveredOutput()
+	if (len(delivered.items) > 0 || len(delivered.anchors) > 0) && !t.deliveredInvalid && t.deliveredResponseID != "" && t.haveDeliveryInfo {
 		// Recover interrupted response-ID continuations from what the client
 		// received, not from an upstream copy that may have continued.
-		snapshot, err := t.historySnapshot(t.deliveredResponseID, t.deliveryInfo, t.delivered, false)
+		snapshot, err := t.historySnapshot(t.deliveredResponseID, t.deliveryInfo, delivered, false)
 		if err == nil {
 			err = t.store.save(snapshot)
 		}
@@ -781,8 +817,9 @@ func (t *conversationTurn) releaseInterruptedAttempt() {
 			t.h.logConversationRecovery(t.operation, "interrupted", targetID, "delivered_history_saved")
 			return
 		}
-		if errors.Is(err, errConversationHistoryStorage) {
-			t.h.logConversationRecovery(t.operation, "blocked", targetID, "storage_unavailable")
+		// A reused response ID keeps the marker, like a completed turn does.
+		if errors.Is(err, errConversationHistoryStorage) || errors.Is(err, errConversationHistoryUncertain) {
+			t.h.logConversationRecovery(t.operation, "blocked", targetID, conversationFailureReason(err))
 			return
 		}
 	}
@@ -791,8 +828,8 @@ func (t *conversationTurn) releaseInterruptedAttempt() {
 		return
 	}
 	t.pending = false
-	reason := "no_visible_items"
-	if len(t.delivered.items) > 0 || t.deliveredInvalid {
+	reason := "no_delivered_items"
+	if len(delivered.items) > 0 || len(delivered.anchors) > 0 || t.deliveredInvalid {
 		reason = "delivered_history_unavailable"
 	}
 	t.h.logConversationRecovery(t.operation, "interrupted", targetID, reason)
@@ -815,6 +852,11 @@ func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		b.turn.mu.Lock()
 		saved := b.turn.saved || b.turn.unprotected || b.turn.failed
+		if !saved && !b.turn.clientEnded() {
+			// The stream ended without a known outcome while the client was
+			// still connected. A later disconnect must not release it.
+			b.turn.streamUncertain = true
+		}
 		b.turn.mu.Unlock()
 		_, _, storageFailure := durableStateFailureDetails(err)
 		if !saved && !storageFailure && providerRequestErrorCode(err) == "" {

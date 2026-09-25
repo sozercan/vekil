@@ -152,8 +152,9 @@ turn of that conversation returns this `409`, including after restart, so a
 client's automatic retries fail immediately. Other conversations are unaffected.
 
 Two common interruptions do not cause this code. An upstream failure that
-arrives before any output, such as an Azure `429` sent after HTTP `200`, reaches
-the client unchanged so it can retry. A client that disconnects or cancels a
+arrives before any output, such as an Azure `429` sent after HTTP `200`, either
+fails over before the stream is committed or reaches the client unchanged after
+commitment, so the client can retry. A client that disconnects or cancels a
 turn, such as an interrupted agent, keeps the conversation usable; see
 [conversation migration](conversation-migration.md#storage-diagnostics-and-deletion).
 
