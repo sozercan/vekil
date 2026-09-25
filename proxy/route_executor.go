@@ -3046,7 +3046,8 @@ func (f routeAttemptFailure) precedence() int {
 	if f.delivery == requestDeliveredOrAmbiguous {
 		return 4
 	}
-	if f.decision == routeRetrySuppressedNonretryable || f.decision == routeRetrySuppressedState ||
+	if providerRequestErrorCode(f.err) == upstreamAuthUnavailableCode ||
+		f.decision == routeRetrySuppressedNonretryable || f.decision == routeRetrySuppressedState ||
 		f.decision == routeRetrySuppressedLifecycle || errors.Is(f.err, context.Canceled) || errors.Is(f.err, context.DeadlineExceeded) {
 		return 3
 	}
@@ -3172,9 +3173,13 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				suppressPendingRouteRetry(operation, failures, routeRetrySuppressedNonretryable, nil)
 				break
 			}
-			failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedNonretryable}
+			decision := h.explicitRouteCredentialFailureDecision(ctx, operation, endpoint, kind, err)
+			failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDefinitelyNotDelivered, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, decision: decision, cleanupDone: true}
 			failures = append(failures, failure)
 			operation.appendTrace(routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, CleanupDone: true})
+			if decision == routeRetrySwitchTarget {
+				continue
+			}
 			break
 		}
 		responseInfo := explicitRouteResponseInfo{
@@ -3252,6 +3257,8 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				}
 			} else if ctx.Err() != nil || h.ShuttingDown() {
 				decision = routeRetrySuppressedLifecycle
+			} else if providerRequestErrorCode(admissionErr) == upstreamAuthUnavailableCode {
+				decision = h.explicitRouteCredentialFailureDecision(ctx, operation, endpoint, kind, admissionErr)
 			}
 			failure.decision = decision
 			failures = append(failures, failure)

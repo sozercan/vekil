@@ -57,7 +57,7 @@ var (
 
 func main() {
 	if err := initializeMenubarPATH(); err != nil {
-		log.Warn("could not load login shell PATH; using inherited PATH", logger.Err(err))
+		log.Warn("could not fully recover menubar PATH", logger.Err(err))
 	}
 
 	var err error

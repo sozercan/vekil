@@ -47,8 +47,9 @@ func TestInitializeMenubarPATHFindsShellCommands(t *testing.T) {
 			if got, err := exec.LookPath("rtk"); err != nil || got != filepath.Join(interactiveBin, "rtk") {
 				t.Fatalf("interactive shell command lookup = %q, %v", got, err)
 			}
-			if !strings.HasPrefix(os.Getenv("PATH"), inheritedPath+":") {
-				t.Fatalf("inherited PATH precedence was lost: %q", os.Getenv("PATH"))
+			wantPath := inheritedPath + ":" + interactiveBin + ":" + loginBin
+			if got := os.Getenv("PATH"); got != wantPath {
+				t.Fatalf("PATH = %q, want %q", got, wantPath)
 			}
 			if got := os.Getenv("VEKIL_TEST_EXISTING_VALUE"); got != "inherited" {
 				t.Fatalf("imported a shell variable other than PATH: %q", got)
@@ -70,16 +71,21 @@ func TestInitializeMenubarPATHDoesNotAddRelativeSearches(t *testing.T) {
 	if _, err := exec.LookPath("vekil-relative-command"); !errors.Is(err, exec.ErrNotFound) {
 		t.Fatalf("command in cwd became discoverable: %v", err)
 	}
+	if got := os.Getenv("PATH"); got != "/usr/bin:/bin" {
+		t.Fatalf("PATH = %q, want only inherited directories", got)
+	}
 }
 
-func TestInitializeMenubarPATHKeepsInheritedOnFailure(t *testing.T) {
+func TestInitializeMenubarPATHFallsBackOnFailure(t *testing.T) {
 	tests := []struct {
 		name    string
 		profile string
 		shell   string
+		timeout bool
 	}{
 		{name: "missing shell", shell: "/nonexistent-vekil-test-shell"},
 		{name: "relative shell", shell: "zsh"},
+		{name: "timeout", timeout: true},
 		{name: "shell exits early", profile: "printf '/incorrect/path\\n'\nexit 0\n"},
 		{name: "shell fails", profile: "exit 1\n"},
 		{name: "empty PATH", profile: "export PATH=''\n"},
@@ -93,11 +99,62 @@ func TestInitializeMenubarPATHKeepsInheritedOnFailure(t *testing.T) {
 			if tc.shell != "" {
 				t.Setenv("SHELL", tc.shell)
 			}
-			if err := initializeMenubarPATH(); err == nil {
-				t.Fatal("expected PATH recovery to fail")
+			ctx := context.Background()
+			if tc.timeout {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, time.Unix(1, 0))
+				defer cancel()
 			}
-			if got := os.Getenv("PATH"); got != inheritedPath {
-				t.Fatalf("PATH changed after failure: %q", got)
+			err := initializeMenubarPATHWithContext(ctx)
+			if err == nil {
+				t.Fatal("expected the shell lookup warning despite fallback")
+			}
+			if tc.timeout && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("PATH lookup error = %v, want deadline exceeded", err)
+			}
+			wantPath := inheritedPath + ":/opt/homebrew/bin:/usr/local/bin"
+			if got := os.Getenv("PATH"); got != wantPath {
+				t.Fatalf("fallback PATH = %q, want %q", got, wantPath)
+			}
+		})
+	}
+}
+
+func TestInitializeMenubarPATHFallbackKeepsInheritedPrecedence(t *testing.T) {
+	tests := []struct {
+		name      string
+		inherited string
+		want      string
+	}{
+		{
+			name: "empty PATH",
+			want: "/opt/homebrew/bin:/usr/local/bin",
+		},
+		{
+			name:      "Homebrew already inherited",
+			inherited: "/opt/homebrew/bin:/usr/bin:/bin",
+			want:      "/opt/homebrew/bin:/usr/bin:/bin:/usr/local/bin",
+		},
+		{
+			name:      "local bin already inherited",
+			inherited: "/usr/local/bin:/usr/bin:/bin",
+			want:      "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
+		},
+		{
+			name:      "both already inherited in reverse order",
+			inherited: "/usr/local/bin:/usr/bin:/opt/homebrew/bin:/bin",
+			want:      "/usr/local/bin:/usr/bin:/opt/homebrew/bin:/bin",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PATH", tc.inherited)
+			t.Setenv("SHELL", "/nonexistent-vekil-test-shell")
+			if err := initializeMenubarPATH(); err == nil {
+				t.Fatal("expected the shell lookup warning despite fallback")
+			}
+			if got := os.Getenv("PATH"); got != tc.want {
+				t.Fatalf("fallback PATH = %q, want %q", got, tc.want)
 			}
 		})
 	}

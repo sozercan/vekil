@@ -55,13 +55,15 @@ func writeOpenAIUpstreamRequestFailure(w http.ResponseWriter, statusCode int, er
 		return
 	}
 	retryAfter, upstreamHeaders := upstreamErrorRetryMetadata(err)
-	writeOpenAIErrorWithRetryAfter(
+	writeOpenAIErrorWithRetryAfterDetails(
 		w,
 		statusCode,
 		formatUpstreamRequestFailure(err, "upstream request failed"),
 		"server_error",
 		retryAfter,
 		upstreamHeaders,
+		"",
+		providerRequestErrorCode(err),
 	)
 }
 

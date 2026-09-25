@@ -16,22 +16,22 @@ import (
 // initializeMenubarPATH runs before authentication or background workers start.
 // Launch Services does not inherit the PATH configured by a terminal's shell.
 func initializeMenubarPATH() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return initializeMenubarPATHWithContext(ctx)
+}
+
+func initializeMenubarPATHWithContext(ctx context.Context) error {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/zsh"
 	}
-	if !filepath.IsAbs(shell) {
-		return fmt.Errorf("login shell must be an absolute path")
+	shellPath, lookupErr := loginShellPATH(ctx, shell)
+	if lookupErr != nil {
+		shellPath = "/opt/homebrew/bin:/usr/local/bin"
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	shellPath, err := loginShellPATH(ctx, shell)
-	if err != nil {
-		return err
-	}
-
-	// Keep inherited command precedence. Only append absolute shell directories;
+	// Keep inherited command precedence. Only append missing absolute directories;
 	// empty and relative entries must not add searches under the app's cwd.
 	paths := filepath.SplitList(os.Getenv("PATH"))
 	seen := make(map[string]bool, len(paths))
@@ -44,10 +44,14 @@ func initializeMenubarPATH() error {
 			seen[path] = true
 		}
 	}
-	return os.Setenv("PATH", strings.Join(paths, string(os.PathListSeparator)))
+	// Report lookup failures even when the fallback PATH was installed.
+	return errors.Join(lookupErr, os.Setenv("PATH", strings.Join(paths, string(os.PathListSeparator))))
 }
 
 func loginShellPATH(ctx context.Context, shell string) (string, error) {
+	if !filepath.IsAbs(shell) {
+		return "", fmt.Errorf("login shell must be an absolute path")
+	}
 	// A NUL separates startup banners from printenv's output. Read only PATH,
 	// using absolute system commands so even an empty inherited PATH works.
 	cmd := exec.CommandContext(ctx, shell, "-ilc", `/usr/bin/printf '\000'; exec /usr/bin/printenv PATH`)

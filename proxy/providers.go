@@ -234,6 +234,8 @@ type openAICodexModelPayload struct {
 	DefaultReasoningLevel       string                       `json:"default_reasoning_level"`
 }
 
+const upstreamAuthUnavailableCode = "upstream_auth_unavailable"
+
 type providerRequestError struct {
 	statusCode int
 	code       string
@@ -2578,7 +2580,7 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 			credential, err = h.auth.GetCredential(req.Context())
 		}
 		if err != nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+			return &providerRequestError{statusCode: http.StatusServiceUnavailable, code: upstreamAuthUnavailableCode, err: fmt.Errorf("provider %q Copilot auth failed: %w", provider.id, err)}
 		}
 		h.setCopilotHeadersForProvider(req, credential.Token, provider, endpoint)
 		*req = *req.WithContext(context.WithValue(req.Context(), copilotSourceFingerprintContextKey{}, credential.SourceFingerprint))
@@ -2595,7 +2597,7 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 			}
 			token, err := provider.azureToken.AccessToken(req.Context())
 			if err != nil {
-				return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q Azure identity auth failed: %w", provider.id, err)}
+				return &providerRequestError{statusCode: http.StatusServiceUnavailable, code: upstreamAuthUnavailableCode, err: fmt.Errorf("provider %q Azure identity auth failed: %w", provider.id, err)}
 			}
 			req.Header.Set("Authorization", "Bearer "+token)
 		default:
@@ -2609,7 +2611,7 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 		}
 		credentials, err := provider.codexAuth.credentials(req.Context(), h.client)
 		if err != nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+			return &providerRequestError{statusCode: http.StatusServiceUnavailable, code: upstreamAuthUnavailableCode, err: fmt.Errorf("provider %q OpenAI Codex auth failed: %w", provider.id, err)}
 		}
 		req.Header.Set("Authorization", "Bearer "+credentials.accessToken)
 		if credentials.accountID != "" {

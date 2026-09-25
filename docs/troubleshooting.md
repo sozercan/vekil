@@ -35,6 +35,27 @@ client-supported context if continuation cannot be restored. Do not strip state
 or switch providers to bypass this check. Enabling durable mode after proof has
 already been lost does not reconstruct it or permit cross-target replay.
 
+## `503 upstream_auth_unavailable`: provider credentials are unavailable
+
+Vekil could not obtain credentials for the selected provider before sending its
+inference request. The OpenAI-compatible error message identifies the provider
+and credential failure; Responses WebSocket error frames carry the same code and
+`status_code: 503`. This covers Azure identity, Copilot sign-in, and OpenAI Codex
+file-auth failures, not authentication errors returned by an inference upstream.
+
+For Azure CLI errors, first distinguish an unavailable executable from an expired
+sign-in. The macOS menubar app recovers your shell PATH with a five-second limit
+and falls back to `/opt/homebrew/bin` and `/usr/local/bin` if that lookup fails.
+A CLI installed elsewhere still needs a working shell PATH. If the diagnostic
+requests sign-in, restore the Azure CLI session with `az login`. PATH recovery
+cannot renew credentials. See [menubar authentication](menubar.md).
+
+An unpinned `priority_failover` route may try the next configured target without
+sending inference to the unavailable provider. State-bound requests keep their
+owner, and normal cancellation and attempt budgets still apply. Restore that
+provider's credentials when failover is unavailable; do not strip conversation
+state to force a switch.
+
 ## `429`: upstream rate limit
 
 Keep the `Retry-After` response header. Vekil preserves long resets and returns
