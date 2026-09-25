@@ -561,8 +561,9 @@ func (h *ProxyHandler) tryConversationMigration(ctx context.Context, operation *
 		return nil, false, nil
 	}
 	if !safeConversationMigrationFailure(failure) {
-		if t.clientEnded() {
-			// The client ended this request, so its outcome is not uncertain.
+		if t.clientEnded() && (errors.Is(failure.err, context.Canceled) || errors.Is(failure.err, context.DeadlineExceeded)) {
+			// The client's disconnect ended this attempt, so its outcome is not
+			// uncertain. An upstream failure that preceded the disconnect is.
 			// Report the attempt's own failure; finish records the interrupt.
 			return nil, false, nil
 		}

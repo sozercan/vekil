@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -287,15 +288,26 @@ func TestConversationMigrationClientInterruptKeepsConversationUsable(t *testing.
 }
 
 func TestConversationMigrationInterruptKeepsUncertainTurnsBlocked(t *testing.T) {
-	for _, scenario := range []string{"upstream cut before client cancel", "reused response ID"} {
+	for _, scenario := range []string{"upstream reset before client cancel", "upstream cut before client cancel", "reused response ID"} {
 		t.Run(scenario, func(t *testing.T) {
 			var sends atomic.Int32
+			inbound, cancelInbound := context.WithCancel(t.Context())
+			defer cancelInbound()
 			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 				if strings.HasSuffix(req.URL.Path, "/models") {
 					return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
 				}
 				if sends.Add(1) == 1 {
 					return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
+				}
+				if scenario == "upstream reset before client cancel" {
+					// The request may have reached the upstream before the reset,
+					// and the client disconnects just after it.
+					if trace := httptrace.ContextClientTrace(req.Context()); trace != nil {
+						trace.WroteHeaders()
+					}
+					cancelInbound()
+					return nil, io.ErrUnexpectedEOF
 				}
 				delta := conversationInterruptEvent(t, "response.output_text.delta", map[string]any{"item_id": "msg-1", "output_index": 1, "content_index": 0, "delta": "partial"})
 				if scenario == "upstream cut before client cancel" {
@@ -315,11 +327,16 @@ func TestConversationMigrationInterruptKeepsUncertainTurnsBlocked(t *testing.T) 
 			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
 
 			// The client disconnects only after the proxy observed the outcome.
-			marker := " again"
-			if scenario == "upstream cut before client cancel" {
-				marker = "conversation_execution_uncertain"
+			switch scenario {
+			case "upstream reset before client cancel":
+				req := httptest.NewRequestWithContext(inbound, http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding","previous_response_id":"seed","input":"Next.","stream":true}`))
+				req.Header.Set("Content-Type", "application/json")
+				h.HandleResponses(httptest.NewRecorder(), req)
+			case "upstream cut before client cancel":
+				conversationInterruptedPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil, "conversation_execution_uncertain", nil)
+			default:
+				conversationInterruptedPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil, " again", nil)
 			}
-			conversationInterruptedPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil, marker, nil)
 			if !strings.Contains(logs.String(), `"outcome":"blocked"`) {
 				t.Fatalf("uncertain turn was not blocked: %s", logs.String())
 			}
