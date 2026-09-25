@@ -200,9 +200,7 @@ func MaterializeProvider(provider *proxy.ProviderConfig, session *Session, route
 	models := append([]proxy.ProviderModelConfig(nil), provider.Models...)
 	for index := range models {
 		model := &models[index]
-		if strings.TrimSpace(model.Deployment) == "" {
-			model.Deployment = session.ModelName
-		}
+		model.Deployment = session.ModelName
 		if len(model.Endpoints) == 0 {
 			model.Endpoints = proxy.AIKitModelEndpoints()
 		}

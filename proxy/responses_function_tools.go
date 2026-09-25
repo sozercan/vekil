@@ -47,11 +47,22 @@ func validateFunctionToolsOnlyResponsesRequest(body []byte, providerID string) e
 	}
 	if choice := bytes.TrimSpace(request.ToolChoice); len(choice) > 0 && choice[0] == '{' {
 		var toolChoice struct {
-			Type string `json:"type"`
+			Type  string `json:"type"`
+			Tools []struct {
+				Type string `json:"type"`
+			} `json:"tools"`
 		}
-		if err := json.Unmarshal(choice, &toolChoice); err == nil && toolChoice.Type != "function" && toolChoice.Type != "allowed_tools" {
-			return functionToolsOnlyError(providerID, "tool_choice.type", "unsupported_tool_type",
-				fmt.Sprintf("%q is not supported; only function tool choices are", toolChoice.Type))
+		if err := json.Unmarshal(choice, &toolChoice); err == nil {
+			if toolChoice.Type != "function" && toolChoice.Type != "allowed_tools" {
+				return functionToolsOnlyError(providerID, "tool_choice.type", "unsupported_tool_type",
+					fmt.Sprintf("%q is not supported; only function tool choices are", toolChoice.Type))
+			}
+			for index, allowed := range toolChoice.Tools {
+				if allowed.Type != "function" {
+					return functionToolsOnlyError(providerID, fmt.Sprintf("tool_choice.tools[%d].type", index), "unsupported_tool_type",
+						fmt.Sprintf("%q is not supported; only function tools are", allowed.Type))
+				}
+			}
 		}
 	}
 	input := bytes.TrimSpace(request.Input)

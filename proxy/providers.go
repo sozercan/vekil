@@ -1382,6 +1382,11 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		if err != nil {
 			return nil, fmt.Errorf("provider %q: %w", id, err)
 		}
+		// Launchers identify LocalAI models from static config to apply their
+		// function-tool safeguards; discovered models would bypass that.
+		if dialect == providerUpstreamDialectLocalAI && modelDiscovery != providerModelDiscoveryStatic {
+			return nil, fmt.Errorf("provider %q: upstream_dialect localai requires static models (model_discovery: static)", id)
+		}
 
 		runtime.baseURL = baseURL
 		runtime.paths = paths

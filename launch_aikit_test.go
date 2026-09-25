@@ -214,3 +214,15 @@ func TestLaunchLocalModelProfileThroughModelRoute(t *testing.T) {
 		t.Fatal("a route without local targets got a local profile")
 	}
 }
+
+func TestLaunchDryRunRejectsInvalidAIKitProviderReference(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "providers.yaml")
+	if err := os.WriteFile(path, []byte("providers:\n  - id: local\n    type: aikit\n    aikit:\n      model: qwen3.8\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	code := runLaunchCommand([]string{"claude", "--providers-config", path, "--model", "local-model", "--dry-run"}, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "needs a tag") {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+}

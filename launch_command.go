@@ -264,6 +264,9 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 	}
 
 	providersCfg, err := proxy.LoadProvidersConfigFile(opts.providersConfigPath)
+	if err == nil {
+		err = aikit.ValidateProviderReferences(providersCfg)
+	}
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: failed to load providers config: %v\n", err)
 		return 1

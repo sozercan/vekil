@@ -100,9 +100,9 @@ With `--runtime auto`:
   `nvidia-smi` lists a GPU, containers get `--gpus all` (Docker) or
   `--device nvidia.com/gpu=all` (podman with CDI).
 
-When the engine runs in a VM (podman machine or Docker Desktop), Vekil fails
-before starting a container whose weights alone exceed 90% of the VM's memory
-and prints the command that raises it.
+On macOS, where the engine runs in a VM (podman machine or Docker Desktop),
+Vekil fails before starting a container whose weights alone exceed 90% of the
+VM's memory and prints the command that raises it.
 
 Pre-made models without an `applesilicon/` image fall back to the standard
 image, which runs on the CPU. Runner images have no Apple Silicon build and
@@ -159,11 +159,11 @@ providers:
 | `aikit.backend` | Runner backend. |
 | `aikit.keep` | Leave the container running when Vekil exits. |
 | `aikit.load_timeout` | Go duration bounding the model load. |
-| `models` | Public IDs for the served model. Omitted `deployment`, `endpoints`, and `context_window` are filled from the running container. |
+| `models` | Public IDs for the served model. `deployment` is always the model the container loads; omitted `endpoints` and `context_window` are filled from the running container. |
 
 Vekil owns the connection, so `base_url`, authentication fields, endpoint
-paths, `model_discovery`, model filters, and `hosted_tools` are rejected on an
-aikit provider. Without `models`, the provider exposes the served model name
+paths, `model_discovery`, model filters, `hosted_tools`, `upstream_dialect`, and
+`models[].deployment` are rejected on an aikit provider. Without `models`, the provider exposes the served model name
 (for example `qwen-3.8-27b`), unless routes reference the provider, in which
 case the routes define its public contract; a route that leaves
 `context_window` unset gets the served context. The agent context floor does not
@@ -180,7 +180,8 @@ apply here; set `context_size` for sessions that need more than the default.
 
 `upstream_dialect: localai` on an `openai-compatible` provider corrects LocalAI
 behaviors that would otherwise fail silently or confuse clients. AIKit
-providers set it automatically; set it yourself for a LocalAI server you run.
+providers set it automatically; set it yourself for a LocalAI server you run,
+declaring its models statically (`model_discovery: static`).
 
 - **Function tools only.** LocalAI's Responses API drops non-function tools and
   unknown input items without an error. Vekil rejects hosted and custom tools,

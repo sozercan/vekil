@@ -102,6 +102,9 @@ func validateAIKitProvider(provider ProviderConfig, index int) error {
 		return configPathError(path+".aikit.load_timeout", "%v", err)
 	}
 	for modelIndex, model := range provider.Models {
+		if strings.TrimSpace(model.Deployment) != "" {
+			return configPathError(fmt.Sprintf("%s.models[%d].deployment", path, modelIndex), "is managed by vekil for type aikit; it is the model the container loads")
+		}
 		for _, endpoint := range model.Endpoints {
 			switch strings.TrimSpace(endpoint) {
 			case providerEndpointChatCompletions, providerEndpointResponses:
@@ -134,6 +137,7 @@ func validateAIKitProvider(provider ProviderConfig, index int) error {
 		{"include_models", len(provider.IncludeModels) > 0},
 		{"exclude_models", len(provider.ExcludeModels) > 0},
 		{"hosted_tools", len(provider.HostedTools) > 0},
+		{"upstream_dialect", strings.TrimSpace(provider.UpstreamDialect) != ""},
 	}
 	for _, field := range forbidden {
 		if field.set {

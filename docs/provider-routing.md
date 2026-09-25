@@ -446,7 +446,7 @@ Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decodi
 | `auth_type` | generic providers | `bearer`, `api-key-header`, or `none`. Defaults to `bearer` when a key is present, otherwise `none`. |
 | `auth_header`, `auth_prefix` | generic providers | Header name and optional prefix for `api-key-header`, or overrides for bearer auth. |
 | `extra_headers` | generic providers | Fixed headers to add to every upstream request after client Copilot headers are stripped. |
-| `upstream_dialect` | `openai-compatible` | `localai` corrects LocalAI protocol behavior: function-tool-only Responses checks with namespace flattening, a single leading system message, and `context_length_exceeded` errors for context overflow. See [Local AIKit Models](aikit.md#localai-dialect). |
+| `upstream_dialect` | `openai-compatible` | `localai` corrects LocalAI protocol behavior: function-tool-only Responses checks with namespace flattening, a single leading system message, and `context_length_exceeded` errors for context overflow. Requires static models. See [Local AIKit Models](aikit.md#localai-dialect). |
 | `aikit` | `aikit` | Model reference and container settings for a `type: aikit` provider. See [Local AIKit Models](aikit.md#providers-configuration). |
 | `chat_completions_path` | `openai-compatible` | Upstream native Chat path, used when the selected model allows `/chat/completions`. Defaults to `/chat/completions`. |
 | `responses_path` | `openai-compatible` | Upstream native Responses path for direct Responses and Responses-backed Chat. Defaults to `/responses`; models must still opt in with `/responses`. |

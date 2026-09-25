@@ -252,6 +252,8 @@ func TestValidateFunctionToolsOnlyResponsesRequest(t *testing.T) {
 		{name: "namespace of functions", body: `{"tools":[{"type":"namespace","name":"mcp","tools":[{"type":"function","name":"x"}]}]}`},
 		{name: "hosted tool choice", body: `{"tool_choice":{"type":"web_search"}}`, code: "unsupported_tool_type"},
 		{name: "function tool choice", body: `{"tool_choice":{"type":"function","name":"f"}}`},
+		{name: "allowed function tools", body: `{"tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"f"}]}}`},
+		{name: "allowed hosted tool", body: `{"tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"web_search"}]}}`, code: "unsupported_tool_type"},
 		{name: "custom tool call item", body: `{"input":[{"type":"custom_tool_call","call_id":"c","name":"apply_patch","input":"x"}]}`, code: "unsupported_input_item"},
 		{name: "web search call item", body: `{"input":[{"type":"web_search_call","id":"w"}]}`, code: "unsupported_input_item"},
 	}
