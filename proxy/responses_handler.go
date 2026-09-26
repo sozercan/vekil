@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1091,9 +1092,7 @@ func writeCompactResponse(w http.ResponseWriter, summaryText string, retainedOut
 		"encrypted_content": encodeSyntheticCompaction(summaryText),
 	})
 
-	output := make([]json.RawMessage, 0, len(retainedOutput)+1)
-	output = append(output, retainedOutput...)
-	output = append(output, json.RawMessage(compactionItem))
+	output := append(slices.Clip(retainedOutput), json.RawMessage(compactionItem))
 
 	compactResp := struct {
 		Output []json.RawMessage `json:"output"`
