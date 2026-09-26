@@ -199,4 +199,9 @@ func TestValidateProvidersConfigUpstreamDialect(t *testing.T) {
 	if err := ValidateProvidersConfig(cfg); err == nil || !strings.Contains(err.Error(), "requires static models") {
 		t.Fatalf("dynamic discovery error = %v", err)
 	}
+	cfg.SchemaVersion = 2
+	cfg.Providers[0] = ProviderConfig{ID: "local", Type: "openai-compatible", BaseURL: "http://localhost:8080/v1", UpstreamDialect: "localai", HostedTools: []string{"web_search"}, Models: []ProviderModelConfig{{PublicID: "m"}}}
+	if err := ValidateProvidersConfig(cfg); err == nil || !strings.Contains(err.Error(), "does not support hosted_tools") {
+		t.Fatalf("hosted tools error = %v", err)
+	}
 }

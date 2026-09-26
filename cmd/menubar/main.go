@@ -195,7 +195,7 @@ type proxyStartResult struct {
 }
 
 func startProxy() {
-	ctx, generation, ok := proxyLifecycle.beginStartup(context.Background())
+	ctx, generation, stopPrevious, ok := proxyLifecycle.beginStartup(context.Background())
 	if !ok {
 		return
 	}
@@ -203,6 +203,7 @@ func startProxy() {
 	setProxyStartingUI()
 	authn := authenticator
 	go func() {
+		stopPrevious()
 		// Reload on every start so edits to the saved providers config apply
 		// after Stop and Start without relaunching the app.
 		cfg, configErr := reloadProvidersState(ctx)

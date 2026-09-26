@@ -166,7 +166,8 @@ paths, `model_discovery`, model filters, `hosted_tools`, `upstream_dialect`, and
 `models[].deployment` are rejected on an aikit provider. Without `models`, the provider exposes the served model name
 (for example `qwen-3.8-27b`), unless routes reference the provider, in which
 case the routes define its public contract; a route that leaves
-`context_window` unset gets the served context. The agent context floor does not
+`context_window` unset gets the served context. A route target's `upstream_model`
+must be the served model name, or startup fails after the container loads. The agent context floor does not
 apply here; set `context_size` for sessions that need more than the default.
 
 - The server (`vekil --providers-config`), the tray app, and `vekil launch --providers-config` start aikit

@@ -102,6 +102,9 @@ func StartProviders(ctx context.Context, cfg proxy.ProvidersConfig, opts Provide
 			return proxy.ProvidersConfig{}, nil, rollBack(group, fmt.Errorf("providers[%d] (%s): %w", index, provider.ID, err))
 		}
 		group.add(session)
+		if err := checkRouteTargetModels(cfg, strings.TrimSpace(provider.ID), session.ModelName); err != nil {
+			return proxy.ProvidersConfig{}, nil, rollBack(group, fmt.Errorf("providers[%d] (%s): %w", index, provider.ID, err))
+		}
 		MaterializeProvider(provider, session, routeReferenced[strings.TrimSpace(provider.ID)])
 		setRouteContextWindows(&out, unsetRouteWindows, strings.TrimSpace(provider.ID), int64(session.ContextTokens))
 	}
@@ -243,6 +246,23 @@ func setRouteContextWindows(cfg *proxy.ProvidersConfig, unset map[int]bool, prov
 		}
 	}
 	cfg.ModelRoutes = routes
+}
+
+// checkRouteTargetModels fails when a route target asks providerID for a model
+// other than the one its container loaded, which LocalAI would refuse on every
+// request.
+func checkRouteTargetModels(cfg proxy.ProvidersConfig, providerID, modelName string) error {
+	for _, route := range cfg.ModelRoutes {
+		for _, target := range route.Targets {
+			if strings.TrimSpace(target.Provider) != providerID {
+				continue
+			}
+			if upstream := strings.TrimSpace(target.UpstreamModel); upstream != modelName {
+				return fmt.Errorf("model_routes %q target %q sets upstream_model %q, but the container serves %q", route.ID, target.ID, upstream, modelName)
+			}
+		}
+	}
+	return nil
 }
 
 func routeReferencedProviders(cfg proxy.ProvidersConfig) map[string]bool {

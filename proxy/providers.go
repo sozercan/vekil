@@ -1387,6 +1387,11 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		if dialect == providerUpstreamDialectLocalAI && modelDiscovery != providerModelDiscoveryStatic {
 			return nil, fmt.Errorf("provider %q: upstream_dialect localai requires static models (model_discovery: static)", id)
 		}
+		// The LocalAI dialect rejects every non-function tool, so advertising a
+		// hosted tool would attract requests it then refuses.
+		if dialect == providerUpstreamDialectLocalAI && len(cfg.HostedTools) > 0 {
+			return nil, fmt.Errorf("provider %q: upstream_dialect localai does not support hosted_tools", id)
+		}
 
 		runtime.baseURL = baseURL
 		runtime.paths = paths

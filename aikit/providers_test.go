@@ -89,6 +89,28 @@ func TestStartProvidersLeavesRouteOnlyProvidersToRoutes(t *testing.T) {
 	}
 }
 
+func TestStartProvidersRejectsRouteTargetsForAnotherModel(t *testing.T) {
+	fake := seedProviderFake(t)
+	cfg := proxy.ProvidersConfig{
+		SchemaVersion: 2,
+		StateBindings: &proxy.StateBindingsConfig{Mode: "memory"},
+		Providers: []proxy.ProviderConfig{
+			{ID: "local", Type: "aikit", Default: true, AIKit: &proxy.AIKitProviderConfig{Model: "qwen3.8:27b"}},
+		},
+		ModelRoutes: []proxy.ModelRouteConfig{{
+			ID: "coder", PublicID: "coder", Endpoints: []string{"/chat/completions"},
+			Targets: []proxy.ModelRouteTargetConfig{{ID: "local", Provider: "local", UpstreamModel: "qwen-3.8-72b"}},
+		}},
+	}
+	_, _, err := StartProviders(context.Background(), cfg, ProviderStartOptions{Environment: []string{}, Executor: fake})
+	if err == nil || !strings.Contains(err.Error(), `upstream_model "qwen-3.8-72b"`) || !strings.Contains(err.Error(), `serves "qwen-3.8-27b"`) {
+		t.Fatalf("error = %v", err)
+	}
+	if len(fake.containers) != 0 {
+		t.Fatalf("containers left after failure: %d", len(fake.containers))
+	}
+}
+
 func TestStartProvidersKeepsConfiguredRouteContextWindows(t *testing.T) {
 	fake := seedProviderFake(t)
 	configured := int64(128000)

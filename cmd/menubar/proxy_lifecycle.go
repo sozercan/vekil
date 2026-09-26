@@ -38,7 +38,10 @@ type menubarProxyLifecycle struct {
 	shuttingDown        bool
 }
 
-func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (context.Context, uint64, bool) {
+// beginStartup admits one startup attempt. The returned stopPrevious stops a
+// server that exited on its own; the caller runs it outside the lock before
+// starting the replacement.
+func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (_ context.Context, _ uint64, stopPrevious func(), _ bool) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -47,17 +50,19 @@ func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (context.Co
 	defer l.mu.Unlock()
 
 	if l.shuttingDown || l.startupCancel != nil {
-		return nil, 0, false
+		return nil, 0, nil, false
 	}
+	stopPrevious = func() {}
 	if l.server != nil {
 		if l.server.IsRunning() {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
-		// A server that exited on its own may still own AIKit containers;
-		// Stop releases them. Run it outside the lock.
+		// A server that exited on its own may still own AIKit containers.
+		// Stopping it first keeps the replacement from loading another model
+		// beside them.
 		dropped := l.server
 		l.server = nil
-		go func() { _ = stopMenubarProxyServer(dropped, 10*time.Second) }()
+		stopPrevious = func() { _ = stopMenubarProxyServer(dropped, 10*time.Second) }
 	}
 
 	ctx, cancel := context.WithCancel(parent)
@@ -65,7 +70,7 @@ func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (context.Co
 	l.startupCancel = cancel
 	l.startupCanceled = false
 	l.restartAfterStartup = false
-	return ctx, l.startupGeneration, true
+	return ctx, l.startupGeneration, stopPrevious, true
 }
 
 func (l *menubarProxyLifecycle) cancelStartup(restart bool) bool {

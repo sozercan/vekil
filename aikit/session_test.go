@@ -3,6 +3,7 @@ package aikit
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -154,6 +155,23 @@ func TestStartReportsNonOOMFailure(t *testing.T) {
 	}
 	if len(fake.runs) != 1 {
 		t.Fatalf("non-OOM failure was retried %d times", len(fake.runs))
+	}
+}
+
+func TestStartReportsCleanupFailureInsteadOfRetrying(t *testing.T) {
+	fake, ref := seededPremade(t, premadeConfig, 262144)
+	fake.failures["docker rm"] = errors.New("engine busy")
+	fake.onRun = func(c *fakeContainer) {
+		c.running = false
+		c.exit = 1
+		c.logs = "llama_init_from_model: failed to allocate buffer for kv cache\n"
+	}
+	_, _, err := startTestSession(t, fake, fake.engine(EngineDocker, AccelNone), Options{Reference: ref, MinimumContextTokens: AgentMinimumContextTokens})
+	if err == nil || !strings.Contains(err.Error(), "engine busy") || !strings.Contains(err.Error(), "out of memory") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(fake.runs) != 1 {
+		t.Fatalf("load was retried %d times beside a container that could not be removed", len(fake.runs))
 	}
 }
 

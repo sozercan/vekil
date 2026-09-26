@@ -378,7 +378,7 @@ func runOnce(
 	loadTimeout time.Duration,
 	client *http.Client,
 	status statusPrinter,
-) (*Session, *loadFailure, error) {
+) (_ *Session, failure *loadFailure, err error) {
 	name := "vekil-aikit-" + randomSuffix()
 	args := []string{
 		"--name", name,
@@ -433,11 +433,24 @@ func runOnce(
 	}
 	succeeded := false
 	defer func() {
-		if !succeeded {
-			removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-			defer cancel()
-			_ = engine.remove(removeCtx, id)
+		if succeeded {
+			return
 		}
+		removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+		removeErr := engine.remove(removeCtx, id)
+		if removeErr == nil {
+			return
+		}
+		// A container that could not be removed still holds memory, so report
+		// it instead of retrying the load beside it.
+		removeErr = fmt.Errorf("remove %s: %w", name, removeErr)
+		if failure != nil {
+			err = errors.Join(failure.err(plan, decision), removeErr)
+			failure = nil
+			return
+		}
+		err = errors.Join(err, removeErr)
 	}()
 
 	infos, err := engine.inspect(ctx, id)
@@ -460,7 +473,7 @@ func runOnce(
 
 	started := time.Now()
 	status.printf("loading %s (this can take several minutes for large models)", plan.ModelName)
-	failure, err := waitLoaded(ctx, engine, id, session.BaseURL, loadTimeout, client)
+	failure, err = waitLoaded(ctx, engine, id, session.BaseURL, loadTimeout, client)
 	if err != nil {
 		return nil, nil, err
 	}
