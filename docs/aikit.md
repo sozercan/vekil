@@ -244,7 +244,9 @@ exact rule.
   no longer running, except kept ones, and does not start a model while one of
   them cannot be removed. A long-running process, such as the tray app, also
   retries its own failed removals before it starts another model. Remove a kept container with
-  `docker rm -f` or `podman rm -f`.
+  `docker rm -f` or `podman rm -f`. A start that finds a matching kept container
+  running but not ready, for example still loading for another launch, fails
+  instead of loading a second copy.
 - Runner references mount a named volume `vekil-aikit-<hash>` at `/models`, so a
   downloaded model is reused. Remove it with `docker volume rm` or `podman
   volume rm`.

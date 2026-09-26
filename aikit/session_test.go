@@ -302,6 +302,28 @@ func TestStartKeepReusesRunningContainer(t *testing.T) {
 	}
 }
 
+func TestStartKeepRefusesToLoadBesideAnUnreadyKeptContainer(t *testing.T) {
+	fake, ref := seededPremade(t, premadeConfig, 262144)
+	var ready atomic.Bool
+	ready.Store(true)
+	fake.onRun = func(c *fakeContainer) {
+		c.port = fake.serveLocalAI(ready.Load, func() int { return 65536 })
+	}
+	engine := fake.engine(EngineDocker, AccelNone)
+	first, _, err := startTestSession(t, fake, engine, Options{Reference: ref, Keep: true})
+	if err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	ready.Store(false)
+	_, _, err = startTestSession(t, fake, engine, Options{Reference: ref, Keep: true})
+	if err == nil || !strings.Contains(err.Error(), "running but not ready") || !strings.Contains(err.Error(), first.ContainerName) {
+		t.Fatalf("error = %v", err)
+	}
+	if len(fake.runs) != 1 {
+		t.Fatalf("started %d containers, want only the kept one", len(fake.runs))
+	}
+}
+
 func TestStartRefusesToLoadBesideAnUnremovableOrphan(t *testing.T) {
 	fake, ref := seededPremade(t, premadeConfig, 262144)
 	fake.mu.Lock()

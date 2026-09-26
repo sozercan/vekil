@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeMenubarProxyServer struct {
@@ -243,5 +244,42 @@ func TestMenubarProxyLifecycleStopsExitedServerBeforeRestart(t *testing.T) {
 	case <-exited.stopped:
 	default:
 		t.Fatal("stopPrevious returned before the exited server stopped")
+	}
+}
+
+func TestMenubarProxyLifecycleExitWaitsForCanceledStartup(t *testing.T) {
+	var lifecycle menubarProxyLifecycle
+	ctx, _, _, ok := lifecycle.beginStartup(t.Context())
+	if !ok {
+		t.Fatal("beginStartup() = false, want true")
+	}
+	cleaned := make(chan struct{})
+	go func() {
+		defer lifecycle.startupWorkerDone()
+		<-ctx.Done()
+		// Stands in for removing the containers a canceled startup started.
+		time.Sleep(50 * time.Millisecond)
+		close(cleaned)
+	}()
+	lifecycle.shutdown()
+	if !lifecycle.waitForStartupWorkers(2 * time.Second) {
+		t.Fatal("waitForStartupWorkers() timed out")
+	}
+	select {
+	case <-cleaned:
+	default:
+		t.Fatal("exit wait returned before the canceled startup cleaned up")
+	}
+	if _, _, _, ok := lifecycle.beginStartup(t.Context()); ok {
+		t.Fatal("beginStartup() admitted a startup after shutdown")
+	}
+
+	var stuck menubarProxyLifecycle
+	if _, _, _, ok := stuck.beginStartup(t.Context()); !ok {
+		t.Fatal("beginStartup() = false, want true")
+	}
+	stuck.shutdown()
+	if stuck.waitForStartupWorkers(50 * time.Millisecond) {
+		t.Fatal("waitForStartupWorkers() = true for a startup that never finished")
 	}
 }

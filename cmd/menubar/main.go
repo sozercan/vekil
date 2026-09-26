@@ -203,6 +203,7 @@ func startProxy() {
 	setProxyStartingUI()
 	authn := authenticator
 	go func() {
+		defer proxyLifecycle.startupWorkerDone()
 		if err := stopPrevious(); err != nil {
 			log.Warn("failed to stop the previous proxy", logger.Err(err))
 		}
@@ -895,5 +896,10 @@ func onExit() {
 	// containers, and Stop is idempotent.
 	if current := proxyLifecycle.shutdown(); current != nil {
 		_ = stopMenubarProxyServer(current, 5*time.Second)
+	}
+	// A canceled startup removes the AIKit containers it started on its way
+	// out. Wait for it, bounded so a hung container engine cannot block exit.
+	if !proxyLifecycle.waitForStartupWorkers(45 * time.Second) {
+		log.Warn("exiting before an in-flight startup finished cleaning up")
 	}
 }

@@ -49,6 +49,14 @@ func TestFlattenLocalAINamespaceTools(t *testing.T) {
 	if err != nil || !strings.Contains(string(out), `{"name":"agents__spawn","type":"function"}`) || !strings.Contains(string(out), `{"name":"plain","type":"function"}`) {
 		t.Fatalf("allowed_tools = %s, %v", out, err)
 	}
+	previousBudget := localAINamespaceDescriptionBudget
+	localAINamespaceDescriptionBudget = 10
+	t.Cleanup(func() { localAINamespaceDescriptionBudget = previousBudget })
+	large := `{"tools":[{"type":"namespace","name":"n","description":"four","tools":[{"type":"function","name":"a"},{"type":"function","name":"b"},{"type":"function","name":"c"}]}]}`
+	if _, _, err := flattenLocalAINamespaceTools([]byte(large)); err == nil || !strings.Contains(err.Error(), "too large to repeat") {
+		t.Fatalf("repeated description error = %v", err)
+	}
+	localAINamespaceDescriptionBudget = previousBudget
 	for _, ambiguous := range []string{
 		`{"tools":[{"type":"namespace","name":"a__b","tools":[{"type":"function","name":"c"}]}],"tool_choice":{"type":"function","namespace":"a","name":"b__c"}}`,
 		`{"tools":[{"type":"namespace","name":"a__b","tools":[{"type":"function","name":"c"}]}],"tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","namespace":"a","name":"b__c"}]}}`,

@@ -15,6 +15,10 @@ import (
 // convention.
 const localAIToolSeparator = "__"
 
+// localAINamespaceDescriptionBudget bounds the namespace description text
+// copied into flattened children, matching the overflow peek budget.
+var localAINamespaceDescriptionBudget = 16 << 20
+
 // localAIToolAlias restores a flattened function name to its namespace tool.
 type localAIToolAlias struct {
 	namespace string
@@ -48,6 +52,7 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 	}
 	aliases := localAIToolAliases{}
 	sawNamespace := false
+	copiedDescriptions := 0
 	flattened := make([]map[string]json.RawMessage, 0, len(tools))
 	for index, tool := range tools {
 		if jsonStringField(tool, "type") != "namespace" {
@@ -82,6 +87,12 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 				flat[key] = value
 			}
 			flat["name"] = mustMarshalJSON(alias)
+			// Each child repeats its namespace's description, so bound the
+			// copies rather than let a small request expand without limit.
+			copiedDescriptions += len(namespaceDescription)
+			if copiedDescriptions > localAINamespaceDescriptionBudget {
+				return nil, nil, localAIToolError(fmt.Sprintf("tools[%d].description", index), "namespace descriptions are too large to repeat for each tool")
+			}
 			if description := combinePolicyResponsesToolDescriptions(namespaceDescription, jsonStringField(child, "description")); description != "" {
 				flat["description"] = mustMarshalJSON(description)
 			}

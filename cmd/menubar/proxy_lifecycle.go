@@ -36,6 +36,10 @@ type menubarProxyLifecycle struct {
 	restartAfterStartup bool
 	startupGeneration   uint64
 	shuttingDown        bool
+
+	// workers counts admitted startup goroutines until they finish, including
+	// any cleanup after their result is superseded, so exit can wait for them.
+	workers sync.WaitGroup
 }
 
 // beginStartup admits one startup attempt. The returned stopPrevious stops a
@@ -70,7 +74,29 @@ func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (_ context.
 	l.startupCancel = cancel
 	l.startupCanceled = false
 	l.restartAfterStartup = false
+	l.workers.Add(1)
 	return ctx, l.startupGeneration, stopPrevious, true
+}
+
+// startupWorkerDone marks the end of a goroutine admitted by beginStartup.
+func (l *menubarProxyLifecycle) startupWorkerDone() {
+	l.workers.Done()
+}
+
+// waitForStartupWorkers waits, up to limit, for admitted startups to finish.
+// Call it after shutdown, which admits no new ones.
+func (l *menubarProxyLifecycle) waitForStartupWorkers(limit time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		l.workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(limit):
+		return false
+	}
 }
 
 func (l *menubarProxyLifecycle) cancelStartup(restart bool) bool {

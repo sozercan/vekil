@@ -186,7 +186,11 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 	}
 	spec := specHash(image, backend, ref.Source, opts.Selector, opts.ContextTokens, opts.MinimumContextTokens)
 	if opts.Keep {
-		if session := findReusable(ctx, engine, spec, client); session != nil {
+		session, err := findReusable(ctx, engine, spec, client)
+		if err != nil {
+			return nil, err
+		}
+		if session != nil {
 			status.printf("reusing running container %s (%s, context %d)", session.ContainerName, session.ModelName, session.ContextTokens)
 			return session, nil
 		}
@@ -654,10 +658,13 @@ func verifyServedContext(ctx context.Context, client *http.Client, baseURL, mode
 	return nil
 }
 
-func findReusable(ctx context.Context, engine *Engine, spec string, client *http.Client) *Session {
+// findReusable returns a ready kept container for spec. A matching one that is
+// running but not ready, perhaps still loading for another launch, is an
+// error: it holds the model's memory, so a second copy must not load beside it.
+func findReusable(ctx context.Context, engine *Engine, spec string, client *http.Client) (*Session, error) {
 	infos, err := engine.listByLabel(ctx, LabelSpec+"="+spec)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	for _, info := range infos {
 		labels := info.Config.Labels
@@ -668,19 +675,16 @@ func findReusable(ctx context.Context, engine *Engine, spec string, client *http
 			_ = engine.remove(ctx, info.ID)
 			continue
 		}
-		port, ok := info.hostPort(containerPort)
-		if !ok {
-			continue
-		}
-		baseURL := "http://127.0.0.1:" + port
-		if !readyOK(ctx, client, baseURL) {
-			continue
-		}
-		contextTokens, _ := strconv.Atoi(labels[LabelContext])
 		name := strings.TrimPrefix(info.Name, "/")
 		if name == "" {
 			name = info.ID
 		}
+		port, ok := info.hostPort(containerPort)
+		baseURL := "http://127.0.0.1:" + port
+		if !ok || !readyOK(ctx, client, baseURL) {
+			return nil, fmt.Errorf("kept container %s for this model is running but not ready; wait for it to finish loading, or remove it with %s rm -f %s", name, engine.Name, name)
+		}
+		contextTokens, _ := strconv.Atoi(labels[LabelContext])
 		return &Session{
 			engine:        engine,
 			ContainerID:   info.ID,
@@ -691,9 +695,9 @@ func findReusable(ctx context.Context, engine *Engine, spec string, client *http
 			ContextTokens: contextTokens,
 			Reused:        true,
 			Keep:          true,
-		}
+		}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // unremoved holds containers this process failed to remove after a failed
