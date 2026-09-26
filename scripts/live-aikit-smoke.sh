@@ -167,7 +167,9 @@ check("anthropic stream", status == 200 and "message_stop" in body, body)
 
 tool = {"type": "function", "name": "get_weather", "description": "Get the weather for a city",
         "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}
-status, body = call("/v1/responses", {"model": MODEL, "store": False, "max_output_tokens": 64,
+# Greedy decoding: LocalAI's llama.cpp backend intermittently fails with
+# "Unexpected error in RPC handling" on sampled 1B tool calls.
+status, body = call("/v1/responses", {"model": MODEL, "store": False, "max_output_tokens": 64, "temperature": 0,
                                       "instructions": "You are terse.",
                                       "input": [{"type": "message", "role": "developer", "content": "Use tools when useful."},
                                                 {"role": "user", "content": "What is the weather in Paris?"}],
