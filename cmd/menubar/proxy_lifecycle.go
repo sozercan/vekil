@@ -41,7 +41,7 @@ type menubarProxyLifecycle struct {
 // beginStartup admits one startup attempt. The returned stopPrevious stops a
 // server that exited on its own; the caller runs it outside the lock before
 // starting the replacement.
-func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (_ context.Context, _ uint64, stopPrevious func(), _ bool) {
+func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (_ context.Context, _ uint64, stopPrevious func() error, _ bool) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -52,7 +52,7 @@ func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (_ context.
 	if l.shuttingDown || l.startupCancel != nil {
 		return nil, 0, nil, false
 	}
-	stopPrevious = func() {}
+	stopPrevious = func() error { return nil }
 	if l.server != nil {
 		if l.server.IsRunning() {
 			return nil, 0, nil, false
@@ -62,7 +62,7 @@ func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (_ context.
 		// beside them.
 		dropped := l.server
 		l.server = nil
-		stopPrevious = func() { _ = stopMenubarProxyServer(dropped, 10*time.Second) }
+		stopPrevious = func() error { return stopMenubarProxyServer(dropped, 10*time.Second) }
 	}
 
 	ctx, cancel := context.WithCancel(parent)

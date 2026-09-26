@@ -124,7 +124,7 @@ func (g *Group) Discard(ctx context.Context) error {
 	var errs []error
 	for _, session := range g.Sessions() {
 		sessionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-		err := session.discard(sessionCtx)
+		err := session.Discard(sessionCtx)
 		cancel()
 		if err != nil {
 			errs = append(errs, fmt.Errorf("remove %s: %w", session.ContainerName, err))

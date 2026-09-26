@@ -457,6 +457,9 @@ func TestStartApplesiliconFallsBackToStandardImage(t *testing.T) {
 	if len(fake.pulls) != 2 || !strings.Contains(fake.pulls[0], "/applesilicon/") {
 		t.Fatalf("pulls = %v", fake.pulls)
 	}
+	if strings.Contains(strings.Join(fake.runs[0], " "), "/dev/dri") || !strings.Contains(progress, "on podman (CPU)") {
+		t.Fatalf("CPU fallback run = %v, progress = %q", fake.runs[0], progress)
+	}
 }
 
 // startTestSessionAfterPull seeds image files when the fake engine pulls them.

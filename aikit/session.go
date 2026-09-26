@@ -109,9 +109,9 @@ func (s *Session) Close(ctx context.Context) error {
 	return nil
 }
 
-// discard removes a container this process started, even one marked keep,
+// Discard removes a container this process started, even one marked keep,
 // when startup is rolled back. A reused container belongs to an earlier run.
-func (s *Session) discard(ctx context.Context) error {
+func (s *Session) Discard(ctx context.Context) error {
 	if s == nil || s.Reused {
 		return nil
 	}
@@ -393,7 +393,10 @@ func runOnce(
 		"-p", "127.0.0.1::8080",
 	}
 	cpuRunner := plan.CacheVolume != "" && strings.Contains(plan.Image, "-cpu:")
-	if !cpuRunner {
+	// A pre-made model whose applesilicon/ variant was unavailable runs the
+	// standard image, which cannot use the Apple GPU.
+	cpuFallback := opts.Reference.Premade && engine.Accel == AccelAppleSilicon && plan.Image == opts.Reference.Image
+	if !cpuRunner && !cpuFallback {
 		args = append(args, engine.GPUArgs()...)
 	}
 	for _, value := range decision.Env {
@@ -412,8 +415,11 @@ func runOnce(
 	args = append(args, plan.RunnerArgs...)
 
 	where := engine.Describe()
-	if cpuRunner {
+	switch {
+	case cpuRunner:
 		where = engine.Name + " (CPU runner)"
+	case cpuFallback:
+		where = engine.Name + " (CPU)"
 	}
 	status.printf("starting %s on %s (context %d)", plan.ModelName, where, decision.Tokens)
 	id, err := engine.run(ctx, args...)

@@ -236,7 +236,9 @@ func TestMenubarProxyLifecycleStopsExitedServerBeforeRestart(t *testing.T) {
 		t.Fatal("exited server was stopped under the lifecycle lock")
 	default:
 	}
-	stopPrevious()
+	if err := stopPrevious(); err != nil {
+		t.Fatalf("stopPrevious() = %v", err)
+	}
 	select {
 	case <-exited.stopped:
 	default:

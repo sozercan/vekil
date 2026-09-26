@@ -205,9 +205,19 @@ func printAIKitDryRun(w io.Writer, ref aikit.Reference, opts launchAIKitOptions)
 }
 
 // closeLaunchAIKit stops started containers and prints kept-container hints.
-func closeLaunchAIKit(stderr io.Writer, session *aikit.Session, group *aikit.Group) {
+// With discard, it removes kept containers too.
+func closeLaunchAIKit(stderr io.Writer, session *aikit.Session, group *aikit.Group, discard bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if discard {
+		if err := session.Discard(ctx); err != nil {
+			_, _ = fmt.Fprintf(stderr, "vekil: warning: aikit: remove %s: %v\n", session.ContainerName, err)
+		}
+		if err := group.Discard(ctx); err != nil {
+			_, _ = fmt.Fprintf(stderr, "vekil: warning: aikit: %v\n", err)
+		}
+		return
+	}
 	if session != nil {
 		if session.Keep {
 			_, _ = fmt.Fprintf(stderr, "vekil: aikit: %s\n", session.KeepHint())

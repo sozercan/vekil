@@ -378,7 +378,9 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		}()
 		signalValue := stopWatch()
 		cancelStartup()
-		defer closeLaunchAIKit(stderr, session, group)
+		// A failed or interrupted startup removes even kept containers: no
+		// agent ran, so there is nothing to keep them for.
+		defer closeLaunchAIKit(stderr, session, group, startErr != nil || signalValue != nil)
 		if signalValue != nil {
 			return launch.SignalExitCode(signalValue)
 		}

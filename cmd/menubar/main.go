@@ -203,7 +203,9 @@ func startProxy() {
 	setProxyStartingUI()
 	authn := authenticator
 	go func() {
-		stopPrevious()
+		if err := stopPrevious(); err != nil {
+			log.Warn("failed to stop the previous proxy; its local model containers may still be running", logger.Err(err))
+		}
 		// Reload on every start so edits to the saved providers config apply
 		// after Stop and Start without relaunching the app.
 		cfg, configErr := reloadProvidersState(ctx)
