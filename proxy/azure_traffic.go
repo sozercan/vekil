@@ -188,8 +188,9 @@ type azureTrafficPermit struct {
 	controller *azureTrafficController
 	key        azureDeploymentKey
 	entry      *azureCooldown
-	// Protected by controller.mu. Requesting release does not end ownership
-	// while an abandoned transport body is still being read or closed.
+	// Protected by controller.mu. Unless streamed output resolved the probe,
+	// requesting release does not end ownership while an abandoned transport
+	// body is still being read or closed.
 	bodyPending      bool
 	activeReads      int
 	closing          bool
@@ -258,16 +259,37 @@ func (p *azureTrafficPermit) release() {
 	p.releaseIfCompleteLocked()
 }
 
+// Streamed output proves the deployment admitted the probe, so hand recovery to
+// the next queued caller instead of holding it for the whole generation. Header
+// exhaustion and later streamed throttles still renew the shared cooldown.
+func (p *azureTrafficPermit) resolveProbe() {
+	if p == nil || p.controller == nil {
+		return
+	}
+	p.controller.mu.Lock()
+	defer p.controller.mu.Unlock()
+	p.releaseProbeLocked()
+}
+
 func (p *azureTrafficPermit) releaseIfCompleteLocked() {
-	if p.released || !p.releaseRequested || p.bodyPending || p.activeReads != 0 {
+	if !p.releaseRequested || p.bodyPending || p.activeReads != 0 {
+		return
+	}
+	p.releaseProbeLocked()
+}
+
+// Release at most once: a resolved permit's later cleanup must not end the
+// probe that the next caller now owns on the same entry.
+func (p *azureTrafficPermit) releaseProbeLocked() {
+	if p.released {
 		return
 	}
 	p.released = true
 	c := p.controller
 	p.entry.probe = false
-	// While a recovery queue exists, release one caller per completed
-	// attempt. Deleting the entry and waking everyone would recreate the
-	// burst that exhausted the token quota.
+	// While a recovery queue exists, release one caller per admitted or
+	// completed attempt. Deleting the entry and waking everyone would recreate
+	// the burst that exhausted the token quota.
 	if len(p.entry.queue) == 0 && !p.entry.until.After(c.timeNow()) && c.cooldowns[p.key] == p.entry {
 		delete(c.cooldowns, p.key)
 	}

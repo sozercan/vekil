@@ -612,7 +612,81 @@ func TestExplicitRouteAzurePinnedWebSocketTurnRetries(t *testing.T) {
 	}
 }
 
-func TestExplicitRouteAzureProbeLateThrottleDelaysQueuedRequest(t *testing.T) {
+func TestExplicitRouteAzureProbeOutputReleasesQueuedRequest(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
+	var calls atomic.Int32
+	h, route := explicitRouteTestHandler(t, &http.Client{Transport: routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		resp := routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, azureRetryCompletedSSE)
+		if calls.Add(1) == 1 {
+			resp.Body = reader
+		}
+		return resp, nil
+	})}, routeModePrimaryOnly, 1, 1, explicitRouteTestProvider("primary", "http://primary.example", "key"))
+	t.Cleanup(h.BeginShutdown)
+	advance := azureTrafficTestClock(h)
+	seed := azureTrafficTestRequest(t, h, t.Context(), "primary", "http://primary.example", "deployment-a")
+	azureRouteTrafficFromRequest(seed).observe(429, http.Header{"Retry-After": {"1"}})
+	advance(time.Second)
+	execute := func() <-chan azureTrafficTestResult {
+		done := make(chan azureTrafficTestResult, 1)
+		go func() {
+			ctx := withRouteOperation(t.Context(), newRouteOperation(route, t.Context()))
+			resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
+			done <- azureTrafficTestResult{blocked: resp, err: err}
+		}()
+		return done
+	}
+	first := execute()
+	// The pipe accepts the preamble only after the probe holds the permit.
+	if _, err := io.WriteString(writer, "data: "+`{"type":"response.created","response":{"id":"resp_probe","status":"in_progress","output":[]}}`+"\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	second := execute()
+	waitForAzureTrafficWaiters(t, h, 1)
+	if calls.Load() != 1 {
+		t.Fatal("queued request overlapped the probe preamble")
+	}
+	output := "data: " + `{"type":"response.output_text.delta","delta":"partial"}` + "\n\n"
+	if _, err := io.WriteString(writer, output); err != nil {
+		t.Fatal(err)
+	}
+	probe := receiveAzureTrafficResult(t, first)
+	if probe.err != nil || probe.blocked == nil {
+		t.Fatalf("probe = %+v", probe)
+	}
+	defer func() { _ = probe.blocked.Body.Close() }()
+	var streamed strings.Builder
+	buf := make([]byte, 4096)
+	for !strings.Contains(streamed.String(), output) {
+		n, err := probe.blocked.Body.Read(buf)
+		streamed.Write(buf[:n])
+		if err != nil {
+			t.Fatalf("probe output: %v after %q", err, streamed.String())
+		}
+	}
+	// The probe's generation is still open; its output released the queue.
+	result := receiveAzureTrafficResult(t, second)
+	if result.err != nil || result.blocked == nil || calls.Load() != 2 {
+		t.Fatalf("queued request = %+v, calls=%d", result, calls.Load())
+	}
+	if _, err := io.Copy(io.Discard, result.blocked.Body); err != nil {
+		t.Fatal(err)
+	}
+	_ = result.blocked.Body.Close()
+	_ = writer.Close()
+	_, _ = io.Copy(io.Discard, probe.blocked.Body)
+	_ = probe.blocked.Body.Close()
+	waitForAzureTrafficWaiters(t, h, 0)
+	h.azureTraffic.mu.Lock()
+	defer h.azureTraffic.mu.Unlock()
+	if len(h.azureTraffic.cooldowns) != 0 {
+		t.Fatal("recovery retained the probe or queue after completion")
+	}
+}
+
+func TestExplicitRouteAzureProbeLateThrottleDelaysLaterRequest(t *testing.T) {
 	reader, writer := io.Pipe()
 	defer func() { _ = reader.Close() }()
 	defer func() { _ = writer.Close() }()
@@ -644,20 +718,22 @@ func TestExplicitRouteAzureProbeLateThrottleDelaysQueuedRequest(t *testing.T) {
 		t.Fatalf("probe = %+v", first)
 	}
 	defer func() { _ = first.blocked.Body.Close() }()
-	second := make(chan azureTrafficTestResult, 1)
-	go func() { second <- execute() }()
-	waitForAzureTrafficWaiters(t, h, 1)
+	// Output released the probe; the throttle after it renews the cooldown
+	// for requests that have not been admitted yet.
 	if _, err := io.Copy(io.Discard, first.blocked.Body); err != nil {
 		t.Fatal(err)
 	}
+	second := make(chan azureTrafficTestResult, 1)
+	go func() { second <- execute() }()
+	waitForAzureTrafficWaiters(t, h, 1)
 	advance(4 * time.Second)
 	if calls.Load() != 1 {
-		t.Fatal("late throttle released the queued request before reset")
+		t.Fatal("late throttle released the later request before reset")
 	}
 	advance(time.Second)
 	result := receiveAzureTrafficResult(t, second)
 	if result.err != nil || result.blocked == nil || calls.Load() != 2 {
-		t.Fatalf("queued request = %+v, calls=%d", result, calls.Load())
+		t.Fatalf("later request = %+v, calls=%d", result, calls.Load())
 	}
 	defer func() { _ = result.blocked.Body.Close() }()
 	if _, err := io.Copy(io.Discard, result.blocked.Body); err != nil {

@@ -195,6 +195,53 @@ func TestAzureTrafficRecoveryQueueSerializesAndRenews(t *testing.T) {
 	waitForAzureTrafficWaiters(t, h, 0)
 }
 
+func TestAzureTrafficResolvedProbeAdmitsNextCaller(t *testing.T) {
+	h := &ProxyHandler{}
+	t.Cleanup(h.BeginShutdown)
+	advance := azureTrafficTestClock(h)
+	req := azureTrafficTestRequest(t, h, t.Context(), "east", "https://east.example", "deployment")
+	metadata := azureRouteTrafficFromRequest(req)
+	metadata.observe(429, http.Header{"Retry-After": {"5"}})
+	advance(5 * time.Second)
+	probe, blocked, err := h.acquireAzureRouteInference(req, false)
+	if err != nil || blocked != nil || probe == nil {
+		t.Fatalf("first probe: permit=%v blocked=%v err=%v", probe, blocked, err)
+	}
+	probe.holdResponseBody()
+	second := acquireAzureTrafficAsync(h, req)
+	waitForAzureTrafficWaiters(t, h, 1)
+	// Streamed output hands recovery to the next caller while the first
+	// generation's body is still open.
+	probe.resolveProbe()
+	next := receiveAzureTrafficResult(t, second)
+	if next.err != nil || next.blocked != nil || next.permit == nil {
+		t.Fatalf("second probe = %+v", next)
+	}
+	third := acquireAzureTrafficAsync(h, req)
+	waitForAzureTrafficWaiters(t, h, 1)
+	probe.release()
+	probe.completeResponseBody()
+	h.azureTraffic.mu.Lock()
+	entry := h.azureTraffic.cooldowns[metadata.key]
+	active := entry != nil && entry.probe && len(entry.queue) == 1
+	h.azureTraffic.mu.Unlock()
+	if !active {
+		t.Fatal("resolved permit cleanup ended the next caller's probe")
+	}
+	next.permit.release()
+	last := receiveAzureTrafficResult(t, third)
+	if last.err != nil || last.blocked != nil || last.permit == nil {
+		t.Fatalf("third probe = %+v", last)
+	}
+	last.permit.release()
+	waitForAzureTrafficWaiters(t, h, 0)
+	h.azureTraffic.mu.Lock()
+	defer h.azureTraffic.mu.Unlock()
+	if len(h.azureTraffic.cooldowns) != 0 {
+		t.Fatal("recovery retained the cooldown after the queue drained")
+	}
+}
+
 func TestAzureTrafficWaitCancellationAndBounds(t *testing.T) {
 	for _, shutdown := range []bool{false, true} {
 		t.Run(map[bool]string{false: "disconnect", true: "shutdown"}[shutdown], func(t *testing.T) {
