@@ -2694,6 +2694,11 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			logger.F("response_bytes", len(errBody)),
 		)
 		mergeHeaderValues(w.Header(), result.Headers)
+		if overflow, ok := parseUpstreamContextOverflow(resp.StatusCode, errBody); ok {
+			// Claude Code compacts when it can parse "prompt is too long: N tokens > M".
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", overflow.anthropicMessage())
+			return
+		}
 		writeAnthropicError(w, resp.StatusCode, mapAnthropicUpstreamStatus(resp.StatusCode), detail)
 		return
 	}

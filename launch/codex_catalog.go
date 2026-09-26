@@ -81,7 +81,7 @@ func cloneStringMap(input map[string]interface{}) map[string]interface{} {
 	return output
 }
 
-func buildCodexModelCatalog(executable resolvedExecutable, environment []string, model ModelInfo, dryRun bool) ([]byte, error) {
+func buildCodexModelCatalog(executable resolvedExecutable, environment []string, model ModelInfo, functionToolsOnly, dryRun bool) ([]byte, error) {
 	template := fallbackCodexModelTemplate()
 	if !dryRun {
 		template = loadCodexModelTemplate(executable, environment, model.ID)
@@ -142,7 +142,7 @@ func buildCodexModelCatalog(executable resolvedExecutable, environment []string,
 	template["support_verbosity"] = false
 	template["supports_search_tool"] = false
 	template["experimental_supported_tools"] = []interface{}{}
-	if strings.TrimSpace(model.OwnedBy) == PolicyModelOwner {
+	if strings.TrimSpace(model.OwnedBy) == PolicyModelOwner || functionToolsOnly {
 		applyPolicyCodexCatalogRestrictions(template)
 	}
 	template["supports_parallel_tool_calls"] = model.Capabilities.Supports.ParallelToolCalls

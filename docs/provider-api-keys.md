@@ -70,7 +70,7 @@ Use `auth_type: api-key-header` and `auth_header` for providers that do not acce
 After exporting the environment variables referenced by `api_key_env`, start Vekil with the config and check:
 
 ```bash
-vekil serve --providers-config ./providers.yaml
+vekil --providers-config ./providers.yaml
 curl http://localhost:1337/readyz
 curl http://localhost:1337/v1/models
 ```

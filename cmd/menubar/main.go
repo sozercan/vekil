@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"fyne.io/systray"
+	"github.com/sozercan/vekil/aikit"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
@@ -194,7 +195,7 @@ type proxyStartResult struct {
 }
 
 func startProxy() {
-	ctx, generation, ok := proxyLifecycle.beginStartup(context.Background())
+	ctx, generation, stopPrevious, ok := proxyLifecycle.beginStartup(context.Background())
 	if !ok {
 		return
 	}
@@ -202,6 +203,20 @@ func startProxy() {
 	setProxyStartingUI()
 	authn := authenticator
 	go func() {
+		defer proxyLifecycle.startupWorkerDone()
+		if err := stopPrevious(); err != nil {
+			log.Warn("failed to stop the previous proxy", logger.Err(err))
+		}
+		// Never load a model beside containers an earlier stop could not remove.
+		if err := retryAIKitCleanups(); err != nil {
+			completeProxyStartup(generation, proxyStartFailure(
+				"aikit cleanup failed",
+				"Vekil Start Failed",
+				fmt.Sprintf("Could not remove the previous local model container, so Vekil did not start another beside it.\n\n%v", err),
+				err,
+			))
+			return
+		}
 		// Reload on every start so edits to the saved providers config apply
 		// after Stop and Start without relaunching the app.
 		cfg, configErr := reloadProvidersState(ctx)
@@ -281,6 +296,30 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 	if err != nil {
 		return proxyStartFailure("invalid state bindings configuration", "Vekil Start Failed", fmt.Sprintf("Invalid state bindings override.\n\n%v", err), err)
 	}
+	// AIKit containers must be running before the server routes to them.
+	cfg, aikitGroup, err := aikit.StartProviders(ctx, cfg, aikit.ProviderStartOptions{
+		Progress:    &aikitStartupLog{},
+		Environment: os.Environ(),
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return proxyStartResult{err: ctx.Err()}
+		}
+		return proxyStartFailure(
+			"aikit start failed",
+			"Vekil Start Failed",
+			fmt.Sprintf("Could not start the AIKit model container.\n\n%v", err),
+			err,
+		)
+	}
+	// A startup that fails before serving removes its containers, even kept
+	// ones; keep applies to a proxy that ran.
+	started := false
+	defer func() {
+		if !started && aikitGroup != nil {
+			_ = runAIKitCleanup(aikitGroup.Discard)
+		}
+	}()
 	nextSrv, err := server.New(
 		authn,
 		log,
@@ -301,9 +340,13 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 			err,
 		)
 	}
+	var current menubarProxyServer = nextSrv
+	if aikitGroup != nil {
+		current = aikitProxyServer{menubarProxyServer: nextSrv, group: aikitGroup}
+	}
 	if nextSrv.UsesCopilot() {
 		if _, err := authn.GetToken(ctx); err != nil {
-			_ = stopMenubarProxyServer(nextSrv, 10*time.Second)
+			_ = stopMenubarProxyServer(current, 10*time.Second)
 			if ctx.Err() != nil {
 				return proxyStartResult{err: ctx.Err()}
 			}
@@ -317,7 +360,7 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 	}
 	if cfg.UsesCopilot() {
 		if err := nextSrv.ValidateDynamicProviderModels(ctx); err != nil {
-			_ = stopMenubarProxyServer(nextSrv, 10*time.Second)
+			_ = stopMenubarProxyServer(current, 10*time.Second)
 			if ctx.Err() != nil {
 				return proxyStartResult{err: ctx.Err()}
 			}
@@ -330,7 +373,7 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		_ = stopMenubarProxyServer(nextSrv, 10*time.Second)
+		_ = stopMenubarProxyServer(current, 10*time.Second)
 		return proxyStartResult{err: err}
 	}
 	if err := nextSrv.Start(); err != nil {
@@ -345,7 +388,7 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 	// Each classifier route already has its own configured timeout. The startup
 	// worker keeps the aggregate operation cancellable without imposing a second,
 	// shorter deadline over a sequence of otherwise healthy routes.
-	if err := initializeProxyPolicyRouting(ctx, nextSrv); err != nil {
+	if err := initializeProxyPolicyRouting(ctx, current); err != nil {
 		if ctx.Err() != nil {
 			return proxyStartResult{err: ctx.Err()}
 		}
@@ -357,7 +400,8 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 		)
 	}
 
-	return proxyStartResult{server: nextSrv}
+	started = true
+	return proxyStartResult{server: current}
 }
 
 func initializeProxyPolicyRouting(ctx context.Context, current menubarProxyServer) error {
@@ -848,7 +892,12 @@ func providersRequireGitHubAuth(cfg proxy.ProvidersConfig, err error) bool {
 }
 
 func onExit() {
-	if current := proxyLifecycle.shutdown(); current != nil && current.IsRunning() {
+	// Stop even a server that already exited: it may still own AIKit
+	// containers, and Stop is idempotent.
+	if current := proxyLifecycle.shutdown(); current != nil {
 		_ = stopMenubarProxyServer(current, 5*time.Second)
 	}
+	// A canceled startup removes the AIKit containers it started on its way
+	// out; exiting first would leave them running.
+	proxyLifecycle.waitForStartupWorkers()
 }

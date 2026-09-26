@@ -36,6 +36,7 @@ Chat-compatible ingress converges before provider I/O: public OpenAI Chat, trans
 |---------|---------------|
 | `main` | CLI dispatch, server setup, shared startup authentication, graceful shutdown |
 | `launch/` | ephemeral proxy supervision, agent adapters, child environment sanitization, and session summaries |
+| `aikit/` | AIKit model containers: reference parsing, container-engine detection, GGUF inspection, context sizing, load supervision, and rewriting `type: aikit` providers into static `openai-compatible` providers before the proxy starts |
 | `auth/` | GitHub OAuth device code flow, Copilot token exchange, disk caching, auto-refresh |
 | `proxy/` | HTTP handlers, public-entry/terminal-route registries, policy planning/classification, provider routing, Anthropic/OpenAI and Gemini/OpenAI translation, Responses compatibility, optional tool optimizer hooks, SSE streaming, retry logic, and provider-specific request/auth helpers outside GitHub OAuth |
 | `models/` | Request and response type definitions only |

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeMenubarProxyServer struct {
@@ -36,7 +37,7 @@ func (s *fakeMenubarProxyServer) IsRunning() bool {
 
 func TestMenubarProxyLifecycleCancelStartup(t *testing.T) {
 	var lifecycle menubarProxyLifecycle
-	ctx, generation, ok := lifecycle.beginStartup(t.Context())
+	ctx, generation, _, ok := lifecycle.beginStartup(t.Context())
 	if !ok {
 		t.Fatal("beginStartup() = false, want true")
 	}
@@ -65,7 +66,7 @@ func TestMenubarProxyLifecycleCancelStartup(t *testing.T) {
 
 func TestMenubarProxyLifecycleUsesPublishedServerScope(t *testing.T) {
 	var lifecycle menubarProxyLifecycle
-	_, generation, ok := lifecycle.beginStartup(t.Context())
+	_, generation, _, ok := lifecycle.beginStartup(t.Context())
 	if !ok {
 		t.Fatal("beginStartup() = false, want true")
 	}
@@ -84,14 +85,14 @@ func TestMenubarProxyLifecycleUsesPublishedServerScope(t *testing.T) {
 
 func TestMenubarProxyLifecycleCanceledStartupBlocksReplacementUntilCleanup(t *testing.T) {
 	var lifecycle menubarProxyLifecycle
-	firstCtx, firstGeneration, ok := lifecycle.beginStartup(t.Context())
+	firstCtx, firstGeneration, _, ok := lifecycle.beginStartup(t.Context())
 	if !ok {
 		t.Fatal("first beginStartup() = false, want true")
 	}
 	if !lifecycle.cancelStartup(true) {
 		t.Fatal("cancelStartup() = false, want true")
 	}
-	if _, _, ok := lifecycle.beginStartup(t.Context()); ok {
+	if _, _, _, ok := lifecycle.beginStartup(t.Context()); ok {
 		t.Fatal("replacement startup began before canceled listener cleanup")
 	}
 	select {
@@ -107,7 +108,7 @@ func TestMenubarProxyLifecycleCanceledStartupBlocksReplacementUntilCleanup(t *te
 		t.Fatal("canceled startup published a running server")
 	}
 
-	_, secondGeneration, ok := lifecycle.beginStartup(t.Context())
+	_, secondGeneration, _, ok := lifecycle.beginStartup(t.Context())
 	if !ok {
 		t.Fatal("replacement beginStartup() = false after cleanup, want true")
 	}
@@ -125,7 +126,7 @@ func TestMenubarProxyLifecycleCanceledStartupBlocksReplacementUntilCleanup(t *te
 
 func TestMenubarProxyLifecycleShutdownCancelsStartupAndRejectsCompletion(t *testing.T) {
 	var lifecycle menubarProxyLifecycle
-	ctx, generation, ok := lifecycle.beginStartup(t.Context())
+	ctx, generation, _, ok := lifecycle.beginStartup(t.Context())
 	if !ok {
 		t.Fatal("beginStartup() = false, want true")
 	}
@@ -140,7 +141,7 @@ func TestMenubarProxyLifecycleShutdownCancelsStartupAndRejectsCompletion(t *test
 	if got, restart := lifecycle.finishStartup(generation, &fakeMenubarProxyServer{running: true}); got != proxyStartupSuperseded || restart {
 		t.Fatalf("finishStartup() = (%v, %v), want (superseded, false)", got, restart)
 	}
-	if _, _, ok := lifecycle.beginStartup(t.Context()); ok {
+	if _, _, _, ok := lifecycle.beginStartup(t.Context()); ok {
 		t.Fatal("beginStartup() succeeded after shutdown")
 	}
 }
@@ -201,5 +202,73 @@ func TestInitializeProxyPolicyRoutingCancellationStopsListener(t *testing.T) {
 	case <-current.stopped:
 	case <-t.Context().Done():
 		t.Fatal("canceled startup left the listener running")
+	}
+}
+
+type stopRecordingServer struct {
+	fakeMenubarProxyServer
+	stopped chan struct{}
+}
+
+func (s *stopRecordingServer) Stop(ctx context.Context) error {
+	err := s.fakeMenubarProxyServer.Stop(ctx)
+	close(s.stopped)
+	return err
+}
+
+func TestMenubarProxyLifecycleStopsExitedServerBeforeRestart(t *testing.T) {
+	var lifecycle menubarProxyLifecycle
+	_, generation, _, ok := lifecycle.beginStartup(t.Context())
+	if !ok {
+		t.Fatal("beginStartup() = false, want true")
+	}
+	exited := &stopRecordingServer{stopped: make(chan struct{})}
+	if got, _ := lifecycle.finishStartup(generation, exited); got != proxyStartupCurrent {
+		t.Fatalf("finishStartup() = %v, want current", got)
+	}
+	// The server exited on its own; a restart must Stop it, removing any AIKit
+	// containers it owns, before the replacement starts.
+	_, _, stopPrevious, ok := lifecycle.beginStartup(t.Context())
+	if !ok {
+		t.Fatal("restart beginStartup() = false, want true")
+	}
+	select {
+	case <-exited.stopped:
+		t.Fatal("exited server was stopped under the lifecycle lock")
+	default:
+	}
+	if err := stopPrevious(); err != nil {
+		t.Fatalf("stopPrevious() = %v", err)
+	}
+	select {
+	case <-exited.stopped:
+	default:
+		t.Fatal("stopPrevious returned before the exited server stopped")
+	}
+}
+
+func TestMenubarProxyLifecycleExitWaitsForCanceledStartup(t *testing.T) {
+	var lifecycle menubarProxyLifecycle
+	ctx, _, _, ok := lifecycle.beginStartup(t.Context())
+	if !ok {
+		t.Fatal("beginStartup() = false, want true")
+	}
+	cleaned := make(chan struct{})
+	go func() {
+		defer lifecycle.startupWorkerDone()
+		<-ctx.Done()
+		// Stands in for removing the containers a canceled startup started.
+		time.Sleep(50 * time.Millisecond)
+		close(cleaned)
+	}()
+	lifecycle.shutdown()
+	lifecycle.waitForStartupWorkers()
+	select {
+	case <-cleaned:
+	default:
+		t.Fatal("exit wait returned before the canceled startup cleaned up")
+	}
+	if _, _, _, ok := lifecycle.beginStartup(t.Context()); ok {
+		t.Fatal("beginStartup() admitted a startup after shutdown")
 	}
 }

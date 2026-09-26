@@ -224,6 +224,10 @@ func (h *ProxyHandler) resolveProviderRequestForModelWithValidation(body []byte,
 
 	rewrittenBody, err := prepareResolvedProviderRequestBodyWithValidation(body, model, endpoint, provider, owner, bodyValidated)
 	if err != nil {
+		var providerErr *providerRequestError
+		if errors.As(err, &providerErr) {
+			return nil, providerModel{}, nil, err
+		}
 		return nil, providerModel{}, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 	return provider, owner, rewrittenBody, nil
@@ -249,6 +253,19 @@ func prepareResolvedProviderRequestBodyWithValidation(
 ) ([]byte, error) {
 	if provider == nil {
 		return nil, fmt.Errorf("provider is required")
+	}
+	if provider.dialect == providerUpstreamDialectLocalAI {
+		if endpoint == providerEndpointResponses {
+			if err := validateFunctionToolsOnlyResponsesRequest(body, provider.id); err != nil {
+				return nil, err
+			}
+		}
+		normalized, err := normalizeLocalAIRequest(body, endpoint)
+		if err != nil {
+			return nil, err
+		}
+		body = normalized
+		bodyValidated = false
 	}
 
 	rewrittenBody := body
@@ -346,6 +363,10 @@ func (h *ProxyHandler) postResolvedProviderRequestForModel(
 
 	preparedBody, err := prepareResolvedProviderRequestBody(body, requestModel, endpoint, provider, owner)
 	if err != nil {
+		var providerErr *providerRequestError
+		if errors.As(err, &providerErr) {
+			return nil, err
+		}
 		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
 

@@ -168,6 +168,7 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 			SensitiveEnv:  opts.SensitiveEnv,
 			Environment:   opts.Environment,
 			NoProxy:       loopbackNoProxyValue(opts.Environment, baseURL),
+			LocalModel:    opts.LocalModel,
 			DryRun:        true,
 		})
 		if err != nil {
@@ -254,6 +255,7 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 		SensitiveEnv:  opts.SensitiveEnv,
 		Environment:   opts.Environment,
 		NoProxy:       loopbackNoProxyValue(opts.Environment, baseURL),
+		LocalModel:    opts.LocalModel,
 	})
 	if err != nil {
 		return result, err
@@ -775,4 +777,10 @@ func printSessionSummary(w io.Writer, snapshot statsSnapshot) {
 			_, _ = fmt.Fprintf(w, "  accounting: %d nano-AIU, %d compute units\n", usage.TotalNanoAIU, usage.ComputeUnits)
 		}
 	}
+}
+
+// SignalExitCode is the exit status a launcher reports after a managed signal,
+// such as 130 for SIGINT and 143 for SIGTERM on Unix.
+func SignalExitCode(signalValue os.Signal) int {
+	return processSignalExitCode(signalValue)
 }

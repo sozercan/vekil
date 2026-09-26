@@ -170,7 +170,7 @@ func TestCodexAdapterPrepareWithoutModelUsesCodexDefault(t *testing.T) {
 }
 
 func TestCodexCatalogClearsUnsupportedDonorCapabilities(t *testing.T) {
-	body, err := buildCodexModelCatalog(resolvedExecutable{}, nil, ModelInfo{ID: "text-only"}, true)
+	body, err := buildCodexModelCatalog(resolvedExecutable{}, nil, ModelInfo{ID: "text-only"}, false, true)
 	if err != nil {
 		t.Fatalf("buildCodexModelCatalog() error = %v", err)
 	}

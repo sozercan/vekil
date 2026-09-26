@@ -49,6 +49,16 @@ type ModelCapabilitySupports struct {
 	Vision            bool     `json:"vision,omitempty"`
 }
 
+// LocalModel describes a launcher-started local model server, such as an AIKit
+// container. It carries facts the proxy's model metadata cannot express.
+type LocalModel struct {
+	// ContextTokens is the context window the server actually loaded.
+	ContextTokens int64
+	// FunctionToolsOnly reports that the server accepts only function tools
+	// on the Responses API, so agents must not declare hosted or custom tools.
+	FunctionToolsOnly bool
+}
+
 // PrepareInput contains the resolved values an agent adapter needs to construct
 // its child process. BaseURL is the root Vekil URL without a trailing slash.
 // Model is zero-valued when selection is delegated to the agent CLI.
@@ -61,7 +71,10 @@ type PrepareInput struct {
 	SensitiveEnv  []string
 	Environment   []string
 	NoProxy       string
-	DryRun        bool
+	// LocalModel is set when the pinned model runs on a launcher-started local
+	// server.
+	LocalModel *LocalModel
+	DryRun     bool
 }
 
 // PreparedProcess is an agent-specific process plan. EnvSet and EnvUnset are
@@ -109,9 +122,12 @@ type Options struct {
 	LogPath          string
 	DryRunBaseURL    string
 	DryRunModel      *ModelInfo
-	Signals          <-chan os.Signal
-	DryRun           bool
-	NoSummary        bool
+	// LocalModel is passed to the adapter when the pinned model runs on a
+	// launcher-started local server.
+	LocalModel *LocalModel
+	Signals    <-chan os.Signal
+	DryRun     bool
+	NoSummary  bool
 }
 
 // Result is the completed launcher outcome. A non-zero child exit is represented
