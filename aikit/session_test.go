@@ -176,6 +176,7 @@ func TestStartLoadTimeoutCoversOOMRetries(t *testing.T) {
 }
 
 func TestStartReportsCleanupFailureInsteadOfRetrying(t *testing.T) {
+	t.Cleanup(func() { unremoved.ids = nil })
 	fake, ref := seededPremade(t, premadeConfig, 262144)
 	fake.failures["docker rm"] = errors.New("engine busy")
 	fake.onRun = func(c *fakeContainer) {
@@ -187,8 +188,23 @@ func TestStartReportsCleanupFailureInsteadOfRetrying(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "engine busy") || !strings.Contains(err.Error(), "out of memory") {
 		t.Fatalf("error = %v", err)
 	}
-	if len(fake.runs) != 1 {
-		t.Fatalf("load was retried %d times beside a container that could not be removed", len(fake.runs))
+	if len(fake.runs) != 1 || len(fake.containers) != 2 {
+		t.Fatalf("runs = %d, containers = %d; want the probe and the failed load left behind", len(fake.runs), len(fake.containers))
+	}
+
+	// The same process retries the removal before its next start, even though
+	// orphan reaping skips containers a running process owns.
+	delete(fake.failures, "docker rm")
+	fake.onRun = func(c *fakeContainer) {
+		c.port = fake.serveLocalAI(nil, func() int { return 65536 })
+	}
+	session, _, err := startTestSession(t, fake, fake.engine(EngineDocker, AccelNone), Options{Reference: ref, MinimumContextTokens: AgentMinimumContextTokens})
+	if err != nil {
+		t.Fatalf("second Start: %v", err)
+	}
+	defer func() { _ = session.Close(context.Background()) }()
+	if len(fake.containers) != 1 {
+		t.Fatalf("containers = %d, want only the new session", len(fake.containers))
 	}
 }
 

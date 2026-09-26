@@ -140,7 +140,7 @@ func launchLocalModelProfile(cfg proxy.ProvidersConfig, modelID string) *launch.
 		}
 	}
 	for _, route := range cfg.ModelRoutes {
-		if !proxy.PublicModelIDMatches(route.PublicID, modelID) {
+		if strings.TrimSpace(route.PublicID) != modelID {
 			continue
 		}
 		// Any local target means requests must fit the function-tools-only
@@ -161,7 +161,7 @@ func launchLocalModelProfile(cfg proxy.ProvidersConfig, modelID string) *launch.
 			continue
 		}
 		for _, model := range provider.Models {
-			if !proxy.PublicModelIDMatches(model.PublicID, modelID) {
+			if strings.TrimSpace(model.PublicID) != modelID {
 				continue
 			}
 			profile := &launch.LocalModel{FunctionToolsOnly: true}

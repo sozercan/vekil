@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -159,7 +160,9 @@ func inspectImage(ctx context.Context, engine *Engine, image, selector string) (
 	defer func() {
 		removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		defer cancel()
-		_ = engine.remove(removeCtx, probe)
+		if engine.remove(removeCtx, probe) != nil {
+			rememberUnremoved(engine, probe)
+		}
 	}()
 
 	configReader, _, configCloser, err := engine.copyFileOut(ctx, probe, localAIConfigPath)
@@ -283,7 +286,7 @@ func (r *rangeReader) fill() {
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
-		r.err = fmt.Errorf("fetch %s: %w", redactURL(r.url), err)
+		r.err = fmt.Errorf("fetch %s: %w", redactURL(r.url), redactURLError(err))
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -336,6 +339,16 @@ func redactURL(raw string) string {
 	return raw
 }
 
+// redactURLError strips the query and credentials from the URL a failed
+// request reports. After a redirect, that URL can be a signed download link.
+func redactURLError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	return &url.Error{Op: urlErr.Op, URL: displayURL(urlErr.URL), Err: urlErr.Err}
+}
+
 // secureRedirects copies client with a redirect policy that never leaves
 // https, so credentials on the first request cannot follow a downgrade.
 func secureRedirects(client *http.Client) *http.Client {
@@ -382,7 +395,7 @@ func inspectRemoteRepository(ctx context.Context, client *http.Client, ref Refer
 	}
 	resp, err := secureRedirects(client).Do(req)
 	if err != nil {
-		return modelPlan{}, fmt.Errorf("fetch %s: %w", configURL, err)
+		return modelPlan{}, fmt.Errorf("fetch %s: %w", configURL, redactURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {

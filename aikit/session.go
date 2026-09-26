@@ -454,7 +454,9 @@ func runOnce(
 			return
 		}
 		// A container that could not be removed still holds memory, so report
-		// it instead of retrying the load beside it.
+		// it instead of retrying the load beside it, and retry the removal
+		// before the next start.
+		rememberUnremoved(engine, id)
 		removeErr = fmt.Errorf("remove %s: %w", name, removeErr)
 		if failure != nil {
 			err = errors.Join(failure.err(plan, decision), removeErr)
@@ -694,15 +696,56 @@ func findReusable(ctx context.Context, engine *Engine, spec string, client *http
 	return nil
 }
 
+// unremoved holds containers this process failed to remove after a failed
+// start. Orphan reaping skips containers a running process owns, so a
+// long-running process such as the tray retries these explicitly.
+var unremoved struct {
+	mu  sync.Mutex
+	ids map[string]string // container ID -> engine name
+}
+
+func rememberUnremoved(engine *Engine, id string) {
+	unremoved.mu.Lock()
+	defer unremoved.mu.Unlock()
+	if unremoved.ids == nil {
+		unremoved.ids = map[string]string{}
+	}
+	unremoved.ids[id] = engine.Name
+}
+
+// retryUnremoved removes containers rememberUnremoved recorded for engine.
+func retryUnremoved(ctx context.Context, engine *Engine) []error {
+	unremoved.mu.Lock()
+	var ids []string
+	for id, name := range unremoved.ids {
+		if name == engine.Name {
+			ids = append(ids, id)
+		}
+	}
+	unremoved.mu.Unlock()
+	var errs []error
+	for _, id := range ids {
+		if err := engine.remove(ctx, id); err != nil {
+			errs = append(errs, fmt.Errorf("remove %s: %w", id, err))
+			continue
+		}
+		unremoved.mu.Lock()
+		delete(unremoved.ids, id)
+		unremoved.mu.Unlock()
+	}
+	return errs
+}
+
 // reapOrphans removes containers left by vekil processes on this host that are
-// no longer running and reports removals that fail. Kept containers are left
-// alone. A failed listing is ignored; the next engine command reports it.
+// no longer running, and containers this process failed to remove, reporting
+// removals that fail. Kept containers are left alone. A failed listing is
+// ignored; the next engine command reports it.
 func reapOrphans(ctx context.Context, engine *Engine) error {
+	errs := retryUnremoved(ctx, engine)
 	infos, err := engine.listByLabel(ctx, LabelManaged)
 	if err != nil {
-		return nil
+		return errors.Join(errs...)
 	}
-	var errs []error
 	host := hostName()
 	for _, info := range infos {
 		labels := info.Config.Labels
