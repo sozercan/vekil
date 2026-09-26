@@ -230,15 +230,17 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 		return nil, err
 	}
 
+	// --load-timeout bounds loading across out-of-memory retries, not each one.
+	loadDeadline := time.Now().Add(loadTimeout)
 	for {
-		session, failure, err := runOnce(ctx, engine, plan, decision, opts, spec, token != "", loadTimeout, client, status)
+		session, failure, err := runOnce(ctx, engine, plan, decision, opts, spec, token != "", time.Until(loadDeadline), client, status)
 		if err != nil {
 			return nil, err
 		}
 		if failure == nil {
 			return session, nil
 		}
-		if failure.oom && decision.Retryable {
+		if failure.oom && decision.Retryable && time.Until(loadDeadline) > 0 {
 			next, ok := halvedContext(decision.Tokens, opts.MinimumContextTokens)
 			if ok {
 				status.printf("%s ran out of memory at context %d; retrying at %d", plan.ModelName, decision.Tokens, next)

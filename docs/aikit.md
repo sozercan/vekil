@@ -47,7 +47,7 @@ vekil launch claude  --model aikit:qwen3.8:27b --dry-run
 | `--runtime auto\|docker\|podman` | Container engine. Default `auto`; see [Container engines](#container-engines). |
 | `--backend llama-cpp\|vllm-cpp` | Backend for a runner reference. Default: `llama-cpp` for GGUF files, `vllm-cpp` for repositories. |
 | `--keep` | Leave the container running after the agent exits and reuse it on the next launch with the same model, backend, and context. |
-| `--load-timeout D` | Maximum time for the model to load. Default `10m`. Pulling is not counted. |
+| `--load-timeout D` | Maximum time for the model to load, including out-of-memory retries. Default `10m`. Pulling is not counted. |
 
 These flags require `--model aikit:<ref>`. Without a providers config the launch
 serves only the local model, so no GitHub authentication is needed. With

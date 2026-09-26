@@ -158,6 +158,23 @@ func TestStartReportsNonOOMFailure(t *testing.T) {
 	}
 }
 
+func TestStartLoadTimeoutCoversOOMRetries(t *testing.T) {
+	fake, ref := seededPremade(t, premadeConfig, 262144)
+	fake.onRun = func(c *fakeContainer) {
+		time.Sleep(150 * time.Millisecond)
+		c.running = false
+		c.exit = 1
+		c.logs = "llama_init_from_model: failed to allocate buffer for kv cache\n"
+	}
+	_, _, err := startTestSession(t, fake, fake.engine(EngineDocker, AccelNone), Options{Reference: ref, MinimumContextTokens: AgentMinimumContextTokens, LoadTimeout: 100 * time.Millisecond})
+	if err == nil {
+		t.Fatal("Start succeeded, want an error")
+	}
+	if len(fake.runs) != 1 {
+		t.Fatalf("retried %d times after the load timeout was spent", len(fake.runs)-1)
+	}
+}
+
 func TestStartReportsCleanupFailureInsteadOfRetrying(t *testing.T) {
 	fake, ref := seededPremade(t, premadeConfig, 262144)
 	fake.failures["docker rm"] = errors.New("engine busy")

@@ -343,6 +343,8 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 	signal.Notify(signals, managedSignals...)
 	defer signal.Stop(signals)
 
+	// Until the agent has run, any failure removes even kept AIKit containers.
+	discardAIKit := true
 	// AIKit containers start before the proxy, which routes to their ports.
 	if aikitModel || providersCfg.HasAIKitProviders() {
 		startupCtx, cancelStartup := context.WithCancel(context.Background())
@@ -378,9 +380,7 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		}()
 		signalValue := stopWatch()
 		cancelStartup()
-		// A failed or interrupted startup removes even kept containers: no
-		// agent ran, so there is nothing to keep them for.
-		defer closeLaunchAIKit(stderr, session, group, startErr != nil || signalValue != nil)
+		defer func() { closeLaunchAIKit(stderr, session, group, discardAIKit) }()
 		if signalValue != nil {
 			return launch.SignalExitCode(signalValue)
 		}
@@ -438,6 +438,7 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 	launchOpts.LogPath = logPath
 	launchOpts.Signals = signals
 	result, err := launch.Run(context.Background(), proxyRuntime, target.adapter, launchOpts)
+	discardAIKit = err != nil
 	if err != nil {
 		if errors.Is(err, launch.ErrBinaryNotFound) {
 			_, _ = fmt.Fprintf(stderr, "error: %v; %s or pass --binary\n", err, target.installHelp)
