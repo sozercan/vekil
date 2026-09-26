@@ -898,8 +898,6 @@ func onExit() {
 		_ = stopMenubarProxyServer(current, 5*time.Second)
 	}
 	// A canceled startup removes the AIKit containers it started on its way
-	// out. Wait for it, bounded so a hung container engine cannot block exit.
-	if !proxyLifecycle.waitForStartupWorkers(45 * time.Second) {
-		log.Warn("exiting before an in-flight startup finished cleaning up")
-	}
+	// out; exiting first would leave them running.
+	proxyLifecycle.waitForStartupWorkers()
 }

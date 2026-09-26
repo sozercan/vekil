@@ -262,9 +262,7 @@ func TestMenubarProxyLifecycleExitWaitsForCanceledStartup(t *testing.T) {
 		close(cleaned)
 	}()
 	lifecycle.shutdown()
-	if !lifecycle.waitForStartupWorkers(2 * time.Second) {
-		t.Fatal("waitForStartupWorkers() timed out")
-	}
+	lifecycle.waitForStartupWorkers()
 	select {
 	case <-cleaned:
 	default:
@@ -272,14 +270,5 @@ func TestMenubarProxyLifecycleExitWaitsForCanceledStartup(t *testing.T) {
 	}
 	if _, _, _, ok := lifecycle.beginStartup(t.Context()); ok {
 		t.Fatal("beginStartup() admitted a startup after shutdown")
-	}
-
-	var stuck menubarProxyLifecycle
-	if _, _, _, ok := stuck.beginStartup(t.Context()); !ok {
-		t.Fatal("beginStartup() = false, want true")
-	}
-	stuck.shutdown()
-	if stuck.waitForStartupWorkers(50 * time.Millisecond) {
-		t.Fatal("waitForStartupWorkers() = true for a startup that never finished")
 	}
 }

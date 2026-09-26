@@ -417,6 +417,18 @@ func TestLocalAIDialectResponsesRejectsDroppedToolsAndMapsOverflow(t *testing.T)
 		t.Fatalf("rejected request reached LocalAI: %v", seen)
 	}
 
+	// A developer message that normalization moves into instructions counts
+	// toward the fields LocalAI echoes before a streamed overflow.
+	echoed := `{"model":"qwen-local","store":false,"input":[{"type":"message","role":"developer","content":"` + strings.Repeat("x", localAIOverflowPeekBytes/2+1) + `"},{"role":"user","content":"hi"}]}`
+	w = httptest.NewRecorder()
+	h.HandleResponses(w, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(echoed)))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), `"code":"context_length_exceeded"`) {
+		t.Fatalf("echoed fields: %d %.300s", w.Code, w.Body.String())
+	}
+	if len(seen) != 0 {
+		t.Fatalf("oversized request reached LocalAI: %v", seen)
+	}
+
 	overflow := `{"model":"qwen-local","store":false,"input":"OVERFLOW"}`
 	w = httptest.NewRecorder()
 	h.HandleResponses(w, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(overflow)))
@@ -616,10 +628,24 @@ func TestLocalAIBodyWrappersKeepRouteLifecycle(t *testing.T) {
 	}
 }
 
-func TestValidateFunctionToolsOnlyRejectsCatalogsBeyondPeekBudget(t *testing.T) {
+func TestCheckLocalAIEchoedFieldsRejectsCatalogsBeyondPeekBudget(t *testing.T) {
 	huge := `{"instructions":"` + strings.Repeat("x", localAIOverflowPeekBytes/2+1) + `","tools":[{"type":"function","name":"f"}]}`
-	err := validateFunctionToolsOnlyResponsesRequest([]byte(huge), "local")
+	err := checkLocalAIEchoedFields([]byte(huge), "local")
 	if providerRequestErrorCode(err) != "context_length_exceeded" {
 		t.Fatalf("error = %v (code %q)", err, providerRequestErrorCode(err))
+	}
+
+	// A large developer message passes the early validation, but
+	// normalization moves it into instructions, which LocalAI echoes.
+	developer := `{"tools":[{"type":"function","name":"f"}],"input":[{"type":"message","role":"developer","content":"` + strings.Repeat("x", localAIOverflowPeekBytes/2+1) + `"},{"role":"user","content":"hi"}]}`
+	if err := validateFunctionToolsOnlyResponsesRequest([]byte(developer), "local"); err != nil {
+		t.Fatalf("early validation: %v", err)
+	}
+	normalized, err := normalizeLocalAIRequest([]byte(developer), providerEndpointResponses)
+	if err != nil {
+		t.Fatalf("normalizeLocalAIRequest: %v", err)
+	}
+	if err := checkLocalAIEchoedFields(normalized, "local"); providerRequestErrorCode(err) != "context_length_exceeded" {
+		t.Fatalf("normalized error = %v (code %q)", err, providerRequestErrorCode(err))
 	}
 }

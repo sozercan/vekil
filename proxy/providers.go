@@ -2774,6 +2774,9 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 		if err != nil {
 			return nil, err
 		}
+		if err := checkLocalAIEchoedFields(body, provider.id); err != nil {
+			return nil, err
+		}
 	}
 	req, err := h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
 	if err == nil && req != nil {

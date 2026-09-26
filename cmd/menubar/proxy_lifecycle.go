@@ -83,20 +83,12 @@ func (l *menubarProxyLifecycle) startupWorkerDone() {
 	l.workers.Done()
 }
 
-// waitForStartupWorkers waits, up to limit, for admitted startups to finish.
-// Call it after shutdown, which admits no new ones.
-func (l *menubarProxyLifecycle) waitForStartupWorkers(limit time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		l.workers.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true
-	case <-time.After(limit):
-		return false
-	}
+// waitForStartupWorkers waits for admitted startups to finish. Call it after
+// shutdown, which cancels them and admits no new ones. It needs no deadline of
+// its own: a canceled startup's remaining steps, including each container
+// removal of a rollback, are bounded individually.
+func (l *menubarProxyLifecycle) waitForStartupWorkers() {
+	l.workers.Wait()
 }
 
 func (l *menubarProxyLifecycle) cancelStartup(restart bool) bool {

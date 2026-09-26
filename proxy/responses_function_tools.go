@@ -19,29 +19,41 @@ var functionToolsOnlyResponsesInputItems = map[string]struct{}{
 	"item_reference":       {},
 }
 
+// checkLocalAIEchoedFields runs on the final LocalAI Responses body, after
+// normalization and namespace flattening, which can both grow the fields
+// LocalAI echoes in its first two stream events: tools and instructions. Past
+// the overflow peek budget, a streamed overflow could no longer be caught; that
+// much text is millions of tokens, beyond any local context.
+func checkLocalAIEchoedFields(body []byte, providerID string) error {
+	var request struct {
+		Tools        json.RawMessage `json:"tools"`
+		Instructions json.RawMessage `json:"instructions"`
+	}
+	if json.Unmarshal(body, &request) != nil {
+		return nil
+	}
+	if size := len(request.Tools) + len(request.Instructions); size > localAIOverflowPeekBytes/2 {
+		return &providerRequestError{
+			statusCode: http.StatusBadRequest,
+			code:       "context_length_exceeded",
+			err:        fmt.Errorf("provider %q: tools and instructions total %d bytes, more than a local model's context can hold", providerID, size),
+		}
+	}
+	return nil
+}
+
 // validateFunctionToolsOnlyResponsesRequest rejects Responses tools and input
 // items that a provider configured with responses_function_tools_only would
 // drop instead of refusing.
 func validateFunctionToolsOnlyResponsesRequest(body []byte, providerID string) error {
 	var request struct {
-		Tools        json.RawMessage `json:"tools"`
-		ToolChoice   json.RawMessage `json:"tool_choice"`
-		Input        json.RawMessage `json:"input"`
-		Instructions json.RawMessage `json:"instructions"`
+		Tools      json.RawMessage `json:"tools"`
+		ToolChoice json.RawMessage `json:"tool_choice"`
+		Input      json.RawMessage `json:"input"`
 	}
 	if err := json.Unmarshal(body, &request); err != nil {
 		// Malformed bodies are rejected by the ordinary request path.
 		return nil
-	}
-	// LocalAI echoes tools and instructions in its first two stream events.
-	// Past the overflow peek budget, a streamed overflow could no longer be
-	// caught; that much text is millions of tokens, beyond any local context.
-	if len(request.Tools)+len(request.Instructions) > localAIOverflowPeekBytes/2 {
-		return &providerRequestError{
-			statusCode: http.StatusBadRequest,
-			code:       "context_length_exceeded",
-			err:        fmt.Errorf("provider %q: tools and instructions total %d bytes, more than a local model's context can hold", providerID, len(request.Tools)+len(request.Instructions)),
-		}
 	}
 	var tools []json.RawMessage
 	if len(request.Tools) > 0 && json.Unmarshal(request.Tools, &tools) != nil {
