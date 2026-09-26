@@ -371,6 +371,14 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 }
 
 func (h *ProxyHandler) sendRetryRequest(req *http.Request, inference bool) (*http.Response, error) {
+	resp, err := h.sendRetryRequestRaw(req, inference)
+	if err == nil && inference {
+		resp = normalizeUpstreamDialectResponse(req, resp)
+	}
+	return resp, err
+}
+
+func (h *ProxyHandler) sendRetryRequestRaw(req *http.Request, inference bool) (*http.Response, error) {
 	if inference {
 		if resp, handled, err := h.maybeSendNativeResponses(req); handled {
 			return resp, err

@@ -86,32 +86,39 @@ type ProvidersConfig struct {
 
 // ProviderConfig configures one upstream provider instance.
 type ProviderConfig struct {
-	ID                         string                      `json:"id" yaml:"id"`
-	Type                       string                      `json:"type" yaml:"type"`
-	Default                    bool                        `json:"default,omitempty" yaml:"default,omitempty"`
-	IncludeModels              []string                    `json:"include_models,omitempty" yaml:"include_models,omitempty"`
-	ExcludeModels              []string                    `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
-	BaseURL                    string                      `json:"base_url,omitempty" yaml:"base_url,omitempty"`
-	AuthMode                   string                      `json:"auth_mode,omitempty" yaml:"auth_mode,omitempty"`
-	APIKey                     string                      `json:"api_key,omitempty" yaml:"api_key,omitempty"`
-	APIKeyEnv                  string                      `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
-	APIVersion                 string                      `json:"api_version,omitempty" yaml:"api_version,omitempty"`
-	TokenScope                 string                      `json:"token_scope,omitempty" yaml:"token_scope,omitempty"`
-	AuthType                   string                      `json:"auth_type,omitempty" yaml:"auth_type,omitempty"`
-	AuthHeader                 string                      `json:"auth_header,omitempty" yaml:"auth_header,omitempty"`
-	AuthPrefix                 string                      `json:"auth_prefix,omitempty" yaml:"auth_prefix,omitempty"`
-	ExtraHeaders               map[string]string           `json:"extra_headers,omitempty" yaml:"extra_headers,omitempty"`
-	ChatCompletionsPath        string                      `json:"chat_completions_path,omitempty" yaml:"chat_completions_path,omitempty"`
-	ResponsesPath              string                      `json:"responses_path,omitempty" yaml:"responses_path,omitempty"`
-	MessagesPath               string                      `json:"messages_path,omitempty" yaml:"messages_path,omitempty"`
-	ModelsPath                 string                      `json:"models_path,omitempty" yaml:"models_path,omitempty"`
-	SystemOnePath              string                      `json:"systemone_path,omitempty" yaml:"systemone_path,omitempty"`
-	ModelDiscovery             string                      `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
-	TrustDomain                string                      `json:"trust_domain,omitempty" yaml:"trust_domain,omitempty"`
-	ClassifierNoStoreSupported *bool                       `json:"classifier_no_store_supported,omitempty" yaml:"classifier_no_store_supported,omitempty"`
-	HostedTools                []string                    `json:"hosted_tools,omitempty" yaml:"hosted_tools,omitempty"`
-	Headers                    CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
-	Models                     []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
+	ID                         string            `json:"id" yaml:"id"`
+	Type                       string            `json:"type" yaml:"type"`
+	Default                    bool              `json:"default,omitempty" yaml:"default,omitempty"`
+	IncludeModels              []string          `json:"include_models,omitempty" yaml:"include_models,omitempty"`
+	ExcludeModels              []string          `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
+	BaseURL                    string            `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	AuthMode                   string            `json:"auth_mode,omitempty" yaml:"auth_mode,omitempty"`
+	APIKey                     string            `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	APIKeyEnv                  string            `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
+	APIVersion                 string            `json:"api_version,omitempty" yaml:"api_version,omitempty"`
+	TokenScope                 string            `json:"token_scope,omitempty" yaml:"token_scope,omitempty"`
+	AuthType                   string            `json:"auth_type,omitempty" yaml:"auth_type,omitempty"`
+	AuthHeader                 string            `json:"auth_header,omitempty" yaml:"auth_header,omitempty"`
+	AuthPrefix                 string            `json:"auth_prefix,omitempty" yaml:"auth_prefix,omitempty"`
+	ExtraHeaders               map[string]string `json:"extra_headers,omitempty" yaml:"extra_headers,omitempty"`
+	ChatCompletionsPath        string            `json:"chat_completions_path,omitempty" yaml:"chat_completions_path,omitempty"`
+	ResponsesPath              string            `json:"responses_path,omitempty" yaml:"responses_path,omitempty"`
+	MessagesPath               string            `json:"messages_path,omitempty" yaml:"messages_path,omitempty"`
+	ModelsPath                 string            `json:"models_path,omitempty" yaml:"models_path,omitempty"`
+	SystemOnePath              string            `json:"systemone_path,omitempty" yaml:"systemone_path,omitempty"`
+	ModelDiscovery             string            `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
+	TrustDomain                string            `json:"trust_domain,omitempty" yaml:"trust_domain,omitempty"`
+	ClassifierNoStoreSupported *bool             `json:"classifier_no_store_supported,omitempty" yaml:"classifier_no_store_supported,omitempty"`
+	HostedTools                []string          `json:"hosted_tools,omitempty" yaml:"hosted_tools,omitempty"`
+	// UpstreamDialect names an upstream implementation whose protocol quirks
+	// Vekil corrects. "localai" rejects Responses tools and items LocalAI would
+	// silently drop and normalizes its context-overflow errors.
+	// openai-compatible providers only.
+	UpstreamDialect string `json:"upstream_dialect,omitempty" yaml:"upstream_dialect,omitempty"`
+	// AIKit configures the model container behind a type: aikit provider.
+	AIKit   *AIKitProviderConfig        `json:"aikit,omitempty" yaml:"aikit,omitempty"`
+	Headers CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
+	Models  []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
 
 	trustDomainSet                bool
 	classifierNoStoreSupportedSet bool
@@ -156,6 +163,7 @@ type providerRuntime struct {
 	trustDomain                string
 	classifierNoStoreSupported *bool
 	hostedTools                map[string]bool
+	dialect                    providerUpstreamDialect
 	includeModels              map[string]struct{}
 	excludeModels              map[string]struct{}
 	hiddenModels               map[string]struct{}
@@ -379,6 +387,9 @@ func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderMo
 				// discovered catalog, so dry-run cannot resolve them statically.
 				continue
 			}
+		case providerTypeAIKit:
+			// Unstarted AIKit providers resolve their declared models with the
+			// endpoints they will serve once the container runs.
 		case providerTypeTypeSafeCompatible:
 			// Evaluation providers have no public model catalog.
 			continue
@@ -403,11 +414,11 @@ func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderMo
 			}
 			matchedProvider = true
 
-			model, err := buildStaticProviderModel(
-				providerID,
-				rawModel,
-				providerEndpointPolicyFor(kind).defaultStaticEndpoints(),
-			)
+			defaultEndpoints := providerEndpointPolicyFor(kind).defaultStaticEndpoints()
+			if kind == providerTypeAIKit {
+				defaultEndpoints = AIKitModelEndpoints()
+			}
+			model, err := buildStaticProviderModel(providerID, rawModel, defaultEndpoints)
 			if err != nil {
 				return ProviderModelConfig{}, false, err
 			}
@@ -1221,8 +1232,14 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 	kind := providerType(strings.TrimSpace(cfg.Type))
 	switch kind {
 	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
+	case providerTypeAIKit:
+		return nil, unmaterializedAIKitProviderError(id)
 	default:
 		return nil, fmt.Errorf("provider %q has unsupported type %q", id, cfg.Type)
+	}
+	dialect, err := configuredProviderUpstreamDialect(kind, cfg.UpstreamDialect)
+	if err != nil {
+		return nil, fmt.Errorf("provider %q: %w", id, err)
 	}
 
 	if kind != providerTypeTypeSafeCompatible && strings.TrimSpace(cfg.SystemOnePath) != "" {
@@ -1238,6 +1255,7 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		trustDomain:                strings.TrimSpace(cfg.TrustDomain),
 		classifierNoStoreSupported: cloneBoolPtr(cfg.ClassifierNoStoreSupported),
 		hostedTools:                providerHostedToolSet(cfg.HostedTools),
+		dialect:                    dialect,
 		includeModels:              make(map[string]struct{}, len(cfg.IncludeModels)),
 		excludeModels:              make(map[string]struct{}, len(cfg.ExcludeModels)),
 		hiddenModels:               make(map[string]struct{}),
@@ -1363,6 +1381,16 @@ func buildProviderRuntimeForProvidersConfig(cfg ProviderConfig, defaultCopilotUR
 		modelDiscovery, err := configuredProviderModelDiscovery(kind, cfg.ModelDiscovery)
 		if err != nil {
 			return nil, fmt.Errorf("provider %q: %w", id, err)
+		}
+		// Launchers identify LocalAI models from static config to apply their
+		// function-tool safeguards; discovered models would bypass that.
+		if dialect == providerUpstreamDialectLocalAI && modelDiscovery != providerModelDiscoveryStatic {
+			return nil, fmt.Errorf("provider %q: upstream_dialect localai requires static models (model_discovery: static)", id)
+		}
+		// The LocalAI dialect rejects every non-function tool, so advertising a
+		// hosted tool would attract requests it then refuses.
+		if dialect == providerUpstreamDialectLocalAI && len(cfg.HostedTools) > 0 {
+			return nil, fmt.Errorf("provider %q: upstream_dialect localai does not support hosted_tools", id)
 		}
 
 		runtime.baseURL = baseURL
@@ -2740,6 +2768,16 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 	if err != nil {
 		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
+	var toolAliases localAIToolAliases
+	if provider != nil && provider.dialect == providerUpstreamDialectLocalAI && path == providerEndpointResponses {
+		body, toolAliases, err = flattenLocalAINamespaceTools(body)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkLocalAIEchoedFields(body, provider.id); err != nil {
+			return nil, err
+		}
+	}
 	req, err := h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
 	if err == nil && req != nil {
 		// Inference retries reserve every physical send explicitly. Disable the
@@ -2755,6 +2793,7 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 		}
 		req = withCopilotInferenceRequest(req, provider, path, body, owners...)
 		req = withTaskInferenceRequest(req, path)
+		req = withProviderUpstreamDialect(req, provider, path, toolAliases)
 	}
 	return req, err
 }

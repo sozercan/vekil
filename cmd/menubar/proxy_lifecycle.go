@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 type menubarProxyServer interface {
@@ -35,9 +36,16 @@ type menubarProxyLifecycle struct {
 	restartAfterStartup bool
 	startupGeneration   uint64
 	shuttingDown        bool
+
+	// workers counts admitted startup goroutines until they finish, including
+	// any cleanup after their result is superseded, so exit can wait for them.
+	workers sync.WaitGroup
 }
 
-func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (context.Context, uint64, bool) {
+// beginStartup admits one startup attempt. The returned stopPrevious stops a
+// server that exited on its own; the caller runs it outside the lock before
+// starting the replacement.
+func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (_ context.Context, _ uint64, stopPrevious func() error, _ bool) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -46,13 +54,19 @@ func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (context.Co
 	defer l.mu.Unlock()
 
 	if l.shuttingDown || l.startupCancel != nil {
-		return nil, 0, false
+		return nil, 0, nil, false
 	}
+	stopPrevious = func() error { return nil }
 	if l.server != nil {
 		if l.server.IsRunning() {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
+		// A server that exited on its own may still own AIKit containers.
+		// Stopping it first keeps the replacement from loading another model
+		// beside them.
+		dropped := l.server
 		l.server = nil
+		stopPrevious = func() error { return stopMenubarProxyServer(dropped, 10*time.Second) }
 	}
 
 	ctx, cancel := context.WithCancel(parent)
@@ -60,7 +74,21 @@ func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (context.Co
 	l.startupCancel = cancel
 	l.startupCanceled = false
 	l.restartAfterStartup = false
-	return ctx, l.startupGeneration, true
+	l.workers.Add(1)
+	return ctx, l.startupGeneration, stopPrevious, true
+}
+
+// startupWorkerDone marks the end of a goroutine admitted by beginStartup.
+func (l *menubarProxyLifecycle) startupWorkerDone() {
+	l.workers.Done()
+}
+
+// waitForStartupWorkers waits for admitted startups to finish. Call it after
+// shutdown, which cancels them and admits no new ones. It needs no deadline of
+// its own: a canceled startup's remaining steps, including each container
+// removal of a rollback, are bounded individually.
+func (l *menubarProxyLifecycle) waitForStartupWorkers() {
+	l.workers.Wait()
 }
 
 func (l *menubarProxyLifecycle) cancelStartup(restart bool) bool {

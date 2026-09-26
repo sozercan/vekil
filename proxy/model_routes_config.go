@@ -64,6 +64,10 @@ type ModelRouteRoutingConfig struct {
 	Mode              string `json:"mode,omitempty" yaml:"mode,omitempty"`
 	MaxTargetAttempts int    `json:"max_target_attempts,omitempty" yaml:"max_target_attempts,omitempty"`
 	MaxUpstreamSends  int    `json:"max_upstream_sends,omitempty" yaml:"max_upstream_sends,omitempty"`
+	// FailoverOnContextOverflow lets a priority_failover route move to its next
+	// target when a target rejects the prompt as longer than its context window,
+	// for example a small local model backed by a larger hosted one.
+	FailoverOnContextOverflow bool `json:"failover_on_context_overflow,omitempty" yaml:"failover_on_context_overflow,omitempty"`
 
 	modeSet              bool
 	maxTargetAttemptsSet bool
@@ -72,9 +76,10 @@ type ModelRouteRoutingConfig struct {
 
 func (c *ModelRouteRoutingConfig) UnmarshalJSON(data []byte) error {
 	type routingFields struct {
-		Mode              string `json:"mode"`
-		MaxTargetAttempts int    `json:"max_target_attempts"`
-		MaxUpstreamSends  int    `json:"max_upstream_sends"`
+		Mode                      string `json:"mode"`
+		MaxTargetAttempts         int    `json:"max_target_attempts"`
+		MaxUpstreamSends          int    `json:"max_upstream_sends"`
+		FailoverOnContextOverflow bool   `json:"failover_on_context_overflow"`
 	}
 	var decoded routingFields
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -87,21 +92,23 @@ func (c *ModelRouteRoutingConfig) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*c = ModelRouteRoutingConfig{
-		Mode:                 decoded.Mode,
-		MaxTargetAttempts:    decoded.MaxTargetAttempts,
-		MaxUpstreamSends:     decoded.MaxUpstreamSends,
-		modeSet:              present["mode"] != nil,
-		maxTargetAttemptsSet: present["max_target_attempts"] != nil,
-		maxUpstreamSendsSet:  present["max_upstream_sends"] != nil,
+		Mode:                      decoded.Mode,
+		MaxTargetAttempts:         decoded.MaxTargetAttempts,
+		MaxUpstreamSends:          decoded.MaxUpstreamSends,
+		FailoverOnContextOverflow: decoded.FailoverOnContextOverflow,
+		modeSet:                   present["mode"] != nil,
+		maxTargetAttemptsSet:      present["max_target_attempts"] != nil,
+		maxUpstreamSendsSet:       present["max_upstream_sends"] != nil,
 	}
 	return nil
 }
 
 func (c *ModelRouteRoutingConfig) UnmarshalYAML(node *yaml.Node) error {
 	type routingFields struct {
-		Mode              string `yaml:"mode"`
-		MaxTargetAttempts int    `yaml:"max_target_attempts"`
-		MaxUpstreamSends  int    `yaml:"max_upstream_sends"`
+		Mode                      string `yaml:"mode"`
+		MaxTargetAttempts         int    `yaml:"max_target_attempts"`
+		MaxUpstreamSends          int    `yaml:"max_upstream_sends"`
+		FailoverOnContextOverflow bool   `yaml:"failover_on_context_overflow"`
 	}
 	if node == nil {
 		return nil
@@ -111,7 +118,7 @@ func (c *ModelRouteRoutingConfig) UnmarshalYAML(node *yaml.Node) error {
 		for index := 0; index+1 < len(node.Content); index += 2 {
 			key := node.Content[index].Value
 			switch key {
-			case "mode", "max_target_attempts", "max_upstream_sends":
+			case "mode", "max_target_attempts", "max_upstream_sends", "failover_on_context_overflow":
 				present[key] = true
 			default:
 				return fmt.Errorf("field %s not found in type proxy.ModelRouteRoutingConfig", key)
@@ -123,12 +130,13 @@ func (c *ModelRouteRoutingConfig) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	*c = ModelRouteRoutingConfig{
-		Mode:                 decoded.Mode,
-		MaxTargetAttempts:    decoded.MaxTargetAttempts,
-		MaxUpstreamSends:     decoded.MaxUpstreamSends,
-		modeSet:              present["mode"],
-		maxTargetAttemptsSet: present["max_target_attempts"],
-		maxUpstreamSendsSet:  present["max_upstream_sends"],
+		Mode:                      decoded.Mode,
+		MaxTargetAttempts:         decoded.MaxTargetAttempts,
+		MaxUpstreamSends:          decoded.MaxUpstreamSends,
+		FailoverOnContextOverflow: decoded.FailoverOnContextOverflow,
+		modeSet:                   present["mode"],
+		maxTargetAttemptsSet:      present["max_target_attempts"],
+		maxUpstreamSendsSet:       present["max_upstream_sends"],
 	}
 	return nil
 }
@@ -164,6 +172,14 @@ func (c ProvidersConfig) EffectiveSchemaVersion() int {
 // ValidateProvidersConfig validates a decoded provider configuration without
 // contacting provider model or inference endpoints.
 func ValidateProvidersConfig(cfg ProvidersConfig) error {
+	if cfg.HasAIKitProviders() {
+		// Unstarted AIKit providers validate as the provider they become.
+		shadow, _, err := aikitValidationShadow(cfg)
+		if err != nil {
+			return err
+		}
+		cfg = shadow
+	}
 	validated, err := validateAndNormalizeProvidersConfig(cfg)
 	if err != nil {
 		return err
@@ -207,6 +223,11 @@ func providersConfigSchemaSupportsPolicyRouting(version int) bool {
 }
 
 func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvidersConfig, error) {
+	for _, provider := range cfg.Providers {
+		if provider.IsAIKit() || provider.AIKit != nil {
+			return validateAndNormalizeProvidersConfigWithAIKit(cfg)
+		}
+	}
 	validated := validatedProvidersConfig{
 		config:                   cloneProvidersConfigForValidation(cfg),
 		schemaVersion:            cfg.EffectiveSchemaVersion(),
@@ -508,6 +529,10 @@ func cloneProvidersConfigForValidation(cfg ProvidersConfig) ProvidersConfig {
 			provider.ExcludeModels = append([]string(nil), cfg.Providers[index].ExcludeModels...)
 			provider.ClassifierNoStoreSupported = cloneBoolPtr(cfg.Providers[index].ClassifierNoStoreSupported)
 			provider.HostedTools = append([]string(nil), cfg.Providers[index].HostedTools...)
+			if cfg.Providers[index].AIKit != nil {
+				block := *cfg.Providers[index].AIKit
+				provider.AIKit = &block
+			}
 			if cfg.Providers[index].ExtraHeaders != nil {
 				provider.ExtraHeaders = make(map[string]string, len(cfg.Providers[index].ExtraHeaders))
 				for key, value := range cfg.Providers[index].ExtraHeaders {
@@ -1106,6 +1131,9 @@ func normalizeAndValidateModelRouteForSchema(route *ModelRouteConfig, path strin
 	if route.Routing.MaxUpstreamSends < route.Routing.MaxTargetAttempts {
 		return configPathError(path+".routing.max_upstream_sends", "must be at least max_target_attempts (%d)", route.Routing.MaxTargetAttempts)
 	}
+	if route.Routing.FailoverOnContextOverflow && routeMode(route.Routing.Mode) != routeModePriorityFailover {
+		return configPathError(path+".routing.failover_on_context_overflow", "requires routing.mode %q", routeModePriorityFailover)
+	}
 	return nil
 }
 
@@ -1271,6 +1299,7 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 				wirePolicy: providerRequestPolicy{
 					useMaxCompletionTokens: targetCfg.UseMaxCompletionTokens != nil && *targetCfg.UseMaxCompletionTokens,
 				},
+				failoverOnContextOverflow: routeCfg.Routing.FailoverOnContextOverflow,
 			})
 		}
 
@@ -1317,7 +1346,8 @@ var providerConfigFields = configFieldSet(
 	"id", "type", "default", "include_models", "exclude_models", "base_url", "auth_mode",
 	"api_key", "api_key_env", "api_version", "token_scope", "auth_type", "auth_header",
 	"auth_prefix", "extra_headers", "chat_completions_path", "responses_path", "messages_path",
-	"models_path", "systemone_path", "model_discovery", "trust_domain", "classifier_no_store_supported", "hosted_tools", "headers", "models",
+	"models_path", "systemone_path", "model_discovery", "trust_domain", "classifier_no_store_supported", "hosted_tools",
+	"upstream_dialect", "aikit", "headers", "models",
 )
 
 var providerModelConfigFields = configFieldSet(
@@ -1337,7 +1367,7 @@ var modelRouteTargetConfigFields = configFieldSet(
 )
 
 var modelRouteRoutingConfigFields = configFieldSet(
-	"mode", "max_target_attempts", "max_upstream_sends",
+	"mode", "max_target_attempts", "max_upstream_sends", "failover_on_context_overflow",
 )
 
 var policyProfileConfigFields = configFieldSet(
@@ -1400,6 +1430,11 @@ func validateJSONConfigFieldPaths(body []byte) error {
 			path := fmt.Sprintf("providers[%d]", index)
 			if err := validateJSONKnownFields(provider, providerConfigFields, path); err != nil {
 				return err
+			}
+			if block, ok := provider["aikit"].(map[string]interface{}); ok {
+				if err := validateJSONKnownFields(block, aikitProviderConfigFields, path+".aikit"); err != nil {
+					return err
+				}
 			}
 			if models, ok := provider["models"].([]interface{}); ok {
 				for modelIndex, rawModel := range models {
@@ -1526,6 +1561,11 @@ func validateYAMLConfigFieldPaths(body []byte) error {
 			path := fmt.Sprintf("providers[%d]", index)
 			if err := validateYAMLKnownFields(provider, providerConfigFields, path); err != nil {
 				return err
+			}
+			if block := yamlMappingValue(provider, "aikit"); block != nil && block.Kind == yaml.MappingNode {
+				if err := validateYAMLKnownFields(block, aikitProviderConfigFields, path+".aikit"); err != nil {
+					return err
+				}
 			}
 			if models := yamlMappingValue(provider, "models"); models != nil && models.Kind == yaml.SequenceNode {
 				for modelIndex, model := range models.Content {

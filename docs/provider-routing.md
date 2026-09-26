@@ -136,6 +136,10 @@ routing:
 
 The two targets must implement the same public contract. If endpoint support, reasoning behavior, tool semantics, vision support, context limits, or other client-visible behavior differs, expose separate public routes instead of putting the targets in one pool. Target order is failover order; schema version 2 has no weights, random picker, affinity, or sticky-routing field.
 
+### Context overflow failover
+
+`routing.failover_on_context_overflow: true` is the one opt-in exception for context limits. It requires `mode: priority_failover` and lets a request move to the next target when the current target rejects the prompt as longer than its context window, which suits a small local model backed by a larger hosted one. The rejection must be a `400`, `413`, or `422` whose JSON error body reports the overflow (`context_length_exceeded`, llama.cpp's `exceed_context_size_error`, or equivalent wording, including numeric `code` values) and carries no output, and it must arrive before anything is written to the client. [LocalAI dialect](aikit.md#localai-dialect) providers report LocalAI's `500` and streamed overflows in that form. Other invalid-request errors never switch targets. Budget one extra upstream send, as in the [Local AIKit Models](aikit.md#local-first-failover) example.
+
 The same schema-version-2 contract also includes:
 
 - `model_routes[].exposure: public|internal`, with omitted exposure defaulting to `public`;
@@ -234,6 +238,7 @@ resource.
 | Adapter-certified pre-output Responses terminal admission failure | Yes, only when that exact condition proves no semantic/tool execution |
 | Azure Responses failed JSON inside HTTP `200` | Yes, within the bounded inspection limit and only without output or usage |
 | Client cancellation, shutdown, or total operation deadline | No |
+| Certified context-overflow rejection on a route with `failover_on_context_overflow: true` | Yes, see [Context overflow failover](#context-overflow-failover) |
 | Upstream authentication rejection, configuration, invalid-request, or content-policy error | No |
 | Reset/timeout after request write, generic `502`/`504`, or other ambiguous delivery | No |
 | Partial success body, text/reasoning/tool output, malformed/unknown event, or any downstream commitment | No |
@@ -435,12 +440,14 @@ Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decodi
 
 | Field | Applies To | Purpose |
 |-------|------------|---------|
-| `type` | all providers | Use `openai-compatible`, `anthropic-compatible`, or `typesafe-compatible` for generic providers. TypeSafe is limited to internal policy classification. |
+| `type` | all providers | Use `openai-compatible`, `anthropic-compatible`, or `typesafe-compatible` for generic providers. TypeSafe is limited to internal policy classification. `aikit` runs an AIKit model container; see [Local AIKit Models](aikit.md). |
 | `base_url` | generic providers | Upstream origin and any fixed API prefix. The proxy appends only the configured path field. |
 | `api_key`, `api_key_env` | generic providers | Static credential value or the name of any environment variable you choose. |
 | `auth_type` | generic providers | `bearer`, `api-key-header`, or `none`. Defaults to `bearer` when a key is present, otherwise `none`. |
 | `auth_header`, `auth_prefix` | generic providers | Header name and optional prefix for `api-key-header`, or overrides for bearer auth. |
 | `extra_headers` | generic providers | Fixed headers to add to every upstream request after client Copilot headers are stripped. |
+| `upstream_dialect` | `openai-compatible` | `localai` corrects LocalAI protocol behavior: function-tool-only Responses checks with namespace flattening, a single leading system message, and `context_length_exceeded` errors for context overflow. Requires static models. See [Local AIKit Models](aikit.md#localai-dialect). |
+| `aikit` | `aikit` | Model reference and container settings for a `type: aikit` provider. See [Local AIKit Models](aikit.md#providers-configuration). |
 | `chat_completions_path` | `openai-compatible` | Upstream native Chat path, used when the selected model allows `/chat/completions`. Defaults to `/chat/completions`. |
 | `responses_path` | `openai-compatible` | Upstream native Responses path for direct Responses and Responses-backed Chat. Defaults to `/responses`; models must still opt in with `/responses`. |
 | `messages_path` | `anthropic-compatible` | Upstream path for public `POST /v1/messages`. Defaults to `/v1/messages`. |
@@ -488,7 +495,7 @@ providers:
           - /chat/completions
 ```
 
-For AIKit's default quick-start port, use `base_url: http://localhost:8080/v1` and set `deployment` to the model name served by the image, such as `llama-3.1-8b-instruct`.
+For AIKit's default quick-start port, use `base_url: http://localhost:8080/v1` and set `deployment` to the model name served by the image, such as `llama-3.1-8b-instruct`. Add `upstream_dialect: localai` for any LocalAI or AIKit server so Vekil corrects LocalAI's tool, system-message, and context-overflow behavior. To have Vekil start and stop an AIKit model container itself, use `type: aikit` instead; see [Local AIKit Models](aikit.md).
 
 Z.ai-style OpenAI-compatible providers can use the same config, but set `base_url` exactly to the upstream API base documented by the provider. Do not append `/v1` unless the provider's OpenAI-compatible base URL includes it.
 

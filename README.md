@@ -28,6 +28,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 - **Codex compatibility shims** for compaction and memory summarization
 - **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
 - **One-command Claude Code, Codex CLI, and GitHub Copilot CLI launchers** with ephemeral loopback proxies and no persistent client routing changes
+- **Local models** from [AIKit](https://github.com/kaito-project/aikit) images, started in Docker or Podman for a session and removed when it ends; see [Local AIKit Models](docs/aikit.md)
 
 ## Quick Start
 
@@ -112,6 +113,33 @@ model namespace; with `--model`, Vekil restricts the session to that model. Use
 Launchers](docs/agent-launchers.md) for supported CLI versions, endpoint
 requirements, forwarded arguments, logs, and isolation details.
 
+### Run a local model
+
+With Docker or Podman installed, `--model aikit:<ref>` runs an
+[AIKit](https://github.com/kaito-project/aikit) model container for the session
+and removes it when the agent exits. No GitHub sign-in is needed:
+
+```bash
+vekil launch claude --model aikit:qwen3.8:27b
+vekil launch codex  --model aikit:gpt-oss:20b
+vekil launch claude --model aikit:hf.co/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf
+```
+
+To serve a local model to any client, add a `type: aikit` provider and start
+Vekil with `vekil --providers-config providers.yaml`:
+
+```yaml
+providers:
+  - id: local
+    type: aikit
+    aikit:
+      model: llama3.2:1b
+```
+
+On Apple Silicon, Vekil uses a Podman libkrun machine for GPU acceleration when
+one is running, and otherwise falls back to Docker on the CPU. See [Local AIKit
+Models](docs/aikit.md) for model references, context sizing, and flags.
+
 **First-run auth** depends on your providers:
 
 - **Copilot** — `vekil login` uses Vekil-managed GitHub device-code sign-in; first proxy startup starts the same flow when needed. To use your current GitHub CLI account instead, opt in with `vekil login --github-cli` (or `--gh`). `vekil logout` clears cached auth and disables future silent `gh` reuse until you opt in again. `COPILOT_GITHUB_TOKEN` remains the explicit non-interactive override.
@@ -136,6 +164,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |
 | [Client Examples](docs/clients.md)                           | Copy-paste snippets per client      |
 | [Agent Launchers](docs/agent-launchers.md)                   | One-command coding-agent sessions   |
+| [Local AIKit Models](docs/aikit.md)                          | Run local models in containers      |
 | [Troubleshooting](docs/troubleshooting.md)                   | Recovery for client-visible errors  |
 | [API Reference](docs/api.md)                                 | Endpoint behavior and compatibility |
 | [Architecture](docs/architecture.md)                         | Package layout and design notes     |

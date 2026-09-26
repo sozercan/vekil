@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sozercan/vekil/aikit"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/launch"
 	"github.com/sozercan/vekil/logger"
@@ -38,6 +39,7 @@ type launchAgentOptions struct {
 	dryRun                   bool
 	noSummary                bool
 	forwardedArgs            []string
+	aikit                    launchAIKitOptions
 }
 
 type launchClaudeOptions = launchAgentOptions
@@ -118,6 +120,9 @@ func printLaunchUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "  vekil launch codex [--model MODEL] [options] -- [codex args...]")
 	_, _ = fmt.Fprintln(w, "  vekil launch copilot --model MODEL [options] -- [copilot args...]")
 	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "MODEL may be aikit:<ref> to run a local AIKit model in a container, for example")
+	_, _ = fmt.Fprintln(w, "aikit:qwen3.8:27b, aikit:ghcr.io/org/image:tag, or aikit:hf.co/org/repo/file.gguf.")
+	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "Supported launch targets:")
 	_, _ = fmt.Fprintln(w, "  claude     Start an ephemeral local Vekil proxy and run Claude Code")
 	_, _ = fmt.Fprintln(w, "  codex      Start an ephemeral local Vekil proxy and run Codex CLI")
@@ -137,9 +142,9 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 		fs.PrintDefaults()
 	}
 
-	modelHelp := "Public Vekil model ID to pin (omit to let " + target.displayName + " choose its default)"
+	modelHelp := "Public Vekil model ID to pin, or aikit:<ref> to run a local AIKit model (omit to let " + target.displayName + " choose its default)"
 	if target.requiresModel {
-		modelHelp = "Public Vekil model ID to use (required by " + target.displayName + " custom-provider mode)"
+		modelHelp = "Public Vekil model ID to use, or aikit:<ref> to run a local AIKit model (required by " + target.displayName + " custom-provider mode)"
 	}
 	model := fs.String("model", "", modelHelp)
 	binary := fs.String("binary", "", "Path or command name for "+target.displayName)
@@ -154,16 +159,36 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	policyRoutingMode := fs.String("policy-routing", getPolicyRoutingModeEnv(), "Policy routing mode: config (follow providers YAML), off, observe, or enforce")
 	dryRun := fs.Bool("dry-run", false, "Print the child-process plan without starting a proxy; dynamic model metadata remains unresolved")
 	noSummary := fs.Bool("no-summary", false, "Do not print an end-of-session usage summary")
+	contextSize := fs.Int("context-size", 0, "Context window for an aikit: model (default 65536, capped at the model's trained context)")
+	runtimeFlag := fs.String("runtime", aikit.EngineAuto, "Container engine for an aikit: model: auto, docker, or podman")
+	backend := fs.String("backend", "", "Backend for an aikit: runner reference: llama-cpp or vllm-cpp")
+	keep := fs.Bool("keep", false, "Keep an aikit: model container running after the agent exits and reuse it next time")
+	loadTimeout := fs.Duration("load-timeout", aikit.DefaultLoadTimeout, "Maximum time for an aikit: model to load")
 
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
 	modelWasSet := false
+	var aikitFlagsSet []string
 	fs.Visit(func(flagValue *flag.Flag) {
 		if flagValue.Name == "model" {
 			modelWasSet = true
 		}
+		for _, name := range aikitLaunchFlagNames {
+			if flagValue.Name == name {
+				aikitFlagsSet = append(aikitFlagsSet, "--"+name)
+			}
+		}
 	})
+	if len(aikitFlagsSet) > 0 && !aikit.HasPrefix(*model) {
+		return opts, fmt.Errorf("%s requires --model aikit:<ref>", strings.Join(aikitFlagsSet, ", "))
+	}
+	if *contextSize < 0 {
+		return opts, fmt.Errorf("--context-size must not be negative")
+	}
+	if *loadTimeout <= 0 {
+		return opts, fmt.Errorf("--load-timeout must be positive")
+	}
 	if modelWasSet && strings.TrimSpace(*model) == "" {
 		return opts, fmt.Errorf("--model must not be empty")
 	}
@@ -198,6 +223,13 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 		dryRun:                   *dryRun,
 		noSummary:                *noSummary,
 		forwardedArgs:            append([]string(nil), fs.Args()...),
+		aikit: launchAIKitOptions{
+			contextSize: *contextSize,
+			runtime:     strings.TrimSpace(*runtimeFlag),
+			backend:     strings.TrimSpace(*backend),
+			keep:        *keep,
+			loadTimeout: *loadTimeout,
+		},
 	}, nil
 }
 
@@ -232,9 +264,24 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 	}
 
 	providersCfg, err := proxy.LoadProvidersConfigFile(opts.providersConfigPath)
+	if err == nil {
+		err = aikit.ValidateProviderReferences(providersCfg)
+	}
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: failed to load providers config: %v\n", err)
 		return 1
+	}
+	var aikitRef aikit.Reference
+	aikitModel := aikit.HasPrefix(opts.model)
+	if aikitModel {
+		aikitRef, err = aikit.ParsePrefixed(opts.model)
+		if err == nil {
+			err = validateLaunchAIKitOptions(aikitRef, opts.aikit)
+		}
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+			return 2
+		}
 	}
 	localToken, err := newLaunchToken()
 	if err != nil {
@@ -255,7 +302,21 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		NoSummary:      opts.noSummary,
 	}
 	if opts.dryRun {
-		if opts.model != "" {
+		if aikitModel {
+			printAIKitDryRun(stderr, aikitRef, opts.aikit)
+			placeholder := aikitRef.ModelName
+			if placeholder == "" {
+				placeholder = "aikit-model"
+			}
+			launchOpts.Model = placeholder
+			launchOpts.DryRunModel = &launch.ModelInfo{ID: placeholder, Name: placeholder, SupportedEndpoints: proxy.AIKitModelEndpoints()}
+			if opts.aikit.contextSize > 0 {
+				window := int64(opts.aikit.contextSize)
+				launchOpts.DryRunModel.ContextWindow = &window
+			}
+			launchOpts.LocalModel = &launch.LocalModel{ContextTokens: int64(opts.aikit.contextSize), FunctionToolsOnly: true}
+		} else if opts.model != "" {
+			launchOpts.LocalModel = launchLocalModelProfile(providersCfg, opts.model)
 			model, found, resolveErr := resolveLaunchDryRunModelInfo(providersCfg, opts.model)
 			if resolveErr != nil {
 				_, _ = fmt.Fprintf(stderr, "error: resolve dry-run model metadata: %v\n", resolveErr)
@@ -275,6 +336,63 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 			return 1
 		}
 		return result.ExitCode
+	}
+
+	managedSignals := managedLaunchSignals()
+	signals := make(chan os.Signal, len(managedSignals))
+	signal.Notify(signals, managedSignals...)
+	defer signal.Stop(signals)
+
+	// Until the agent has run, any failure removes even kept AIKit containers.
+	discardAIKit := true
+	// AIKit containers start before the proxy, which routes to their ports.
+	if aikitModel || providersCfg.HasAIKitProviders() {
+		startupCtx, cancelStartup := context.WithCancel(context.Background())
+		stopWatch := watchStartupSignals(signals, cancelStartup)
+		var session *aikit.Session
+		var group *aikit.Group
+		startErr := func() error {
+			if providersCfg.HasAIKitProviders() {
+				started, startedGroup, err := aikit.StartProviders(startupCtx, providersCfg, aikit.ProviderStartOptions{
+					Progress:    stderr,
+					Environment: os.Environ(),
+				})
+				if err != nil {
+					return err
+				}
+				providersCfg, group = started, startedGroup
+			}
+			if aikitModel {
+				started, err := startLaunchAIKitModel(startupCtx, aikitRef, opts.aikit, stderr)
+				if err != nil {
+					return err
+				}
+				session = started
+				merged, err := mergeLaunchAIKitProvider(providersCfg, session)
+				if err != nil {
+					return err
+				}
+				providersCfg = merged
+				opts.model = session.ModelName
+				launchOpts.Model = opts.model
+			}
+			return nil
+		}()
+		signalValue := stopWatch()
+		cancelStartup()
+		defer func() { closeLaunchAIKit(stderr, session, group, discardAIKit) }()
+		if signalValue != nil {
+			return launch.SignalExitCode(signalValue)
+		}
+		if startErr != nil {
+			_, _ = fmt.Fprintf(stderr, "error: %v\n", startErr)
+			return 1
+		}
+		// AIKit startup may read HF_TOKEN; the agent must not inherit it.
+		launchOpts.SensitiveEnv = append(launchSensitiveEnvironment(providersCfg), "HF_TOKEN")
+		launchOpts.LocalModel = launchLocalModelProfile(providersCfg, opts.model)
+	} else if opts.model != "" {
+		launchOpts.LocalModel = launchLocalModelProfile(providersCfg, opts.model)
 	}
 
 	authenticator, err := auth.NewAuthenticator(opts.tokenDir)
@@ -318,12 +436,9 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		log:           log,
 	}
 	launchOpts.LogPath = logPath
-	managedSignals := managedLaunchSignals()
-	signals := make(chan os.Signal, len(managedSignals))
-	signal.Notify(signals, managedSignals...)
-	defer signal.Stop(signals)
 	launchOpts.Signals = signals
 	result, err := launch.Run(context.Background(), proxyRuntime, target.adapter, launchOpts)
+	discardAIKit = err != nil
 	if err != nil {
 		if errors.Is(err, launch.ErrBinaryNotFound) {
 			_, _ = fmt.Fprintf(stderr, "error: %v; %s or pass --binary\n", err, target.installHelp)

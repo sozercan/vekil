@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pkg/browser"
+	"github.com/sozercan/vekil/aikit"
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/proxy"
@@ -265,9 +266,57 @@ func defaultConfigValidateDeps() configValidateDeps {
 	return configValidateDeps{
 		stdout:                          os.Stdout,
 		stderr:                          os.Stderr,
-		validateProvidersConfigFile:     proxy.ValidateProvidersConfigFile,
-		validateProvidersConfigFileLive: proxy.ValidateProvidersConfigFileLive,
+		validateProvidersConfigFile:     validateProvidersConfigFileWithAIKit,
+		validateProvidersConfigFileLive: validateProvidersConfigFileLiveWithAIKit,
 	}
+}
+
+// validateProvidersConfigFileWithAIKit adds offline checks of aikit model
+// references to ordinary structural validation.
+func validateProvidersConfigFileWithAIKit(source string) error {
+	// Load once: a remote source may return different content on a refetch.
+	cfg, err := proxy.LoadProvidersConfigFile(source)
+	if err != nil {
+		return err
+	}
+	if err := proxy.ValidateProvidersConfig(cfg); err != nil {
+		return fmt.Errorf("validate providers config %q: %w", proxy.ProvidersConfigSourceDisplay(source), err)
+	}
+	return aikit.ValidateProviderReferences(cfg)
+}
+
+// validateProvidersConfigFileLiveWithAIKit starts aikit providers for the
+// duration of a live validation, which must reach every configured upstream.
+func validateProvidersConfigFileLiveWithAIKit(ctx context.Context, source string) (err error) {
+	// Ctrl-C while a model pulls or loads must still remove its container.
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	cfg, err := proxy.LoadProvidersConfigFileContext(ctx, source)
+	if err != nil {
+		return err
+	}
+	if !cfg.HasAIKitProviders() {
+		return proxy.ValidateProvidersConfigLive(ctx, cfg)
+	}
+	if err := aikit.ValidateProviderReferences(cfg); err != nil {
+		return err
+	}
+	started, group, err := aikit.StartProviders(ctx, cfg, aikit.ProviderStartOptions{
+		Progress:    os.Stderr,
+		Environment: os.Environ(),
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		// Live validation containers are temporary, even with keep: true.
+		if discardErr := group.Discard(closeCtx); discardErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove temporary aikit containers: %w", discardErr))
+		}
+	}()
+	return proxy.ValidateProvidersConfigLive(ctx, started)
 }
 
 func runConfigWithDeps(args []string, deps configValidateDeps) int {
@@ -686,6 +735,22 @@ func runServe() {
 		log.Fatal("failed to load providers config", logger.Err(err))
 	}
 
+	// Signals must stop containers that are still pulling or loading, so the
+	// context exists before any aikit provider starts.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// log.Fatal exits without running deferred calls, so every exit below
+	// stops the containers explicitly.
+	providersCfg, aikitGroup, err := aikit.StartProviders(ctx, providersCfg, aikit.ProviderStartOptions{
+		Progress:    os.Stderr,
+		Environment: os.Environ(),
+	})
+	if err != nil {
+		log.Fatal("failed to start aikit providers", logger.Err(err))
+	}
+	stopAIKit := func(discard bool) { stopServeAIKitProviders(aikitGroup, log, discard) }
+
 	srv, err := server.New(
 		authenticator,
 		log,
@@ -706,14 +771,39 @@ func runServe() {
 		),
 	)
 	if err != nil {
+		// The server never ran, so kept containers are removed too.
+		stopAIKit(true)
 		log.Fatal("failed to initialize server", logger.Err(err))
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	if err := serveUntilContextDone(ctx, srv, authenticator, serveUsesCopilot(srv, providersCfg.UsesCopilot()), log); err != nil {
+		// A serve error, such as a port already in use, removes kept
+		// containers too; keep applies to a normal shutdown.
+		stopAIKit(true)
 		log.Fatal("serve error", logger.Err(err))
+	}
+	stopAIKit(false)
+}
+
+// stopServeAIKitProviders stops the server's containers. With discard, it
+// removes kept containers too.
+func stopServeAIKitProviders(group *aikit.Group, log *logger.Logger, discard bool) {
+	if group == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if discard {
+		if err := group.Discard(ctx); err != nil {
+			log.Warn("failed to remove aikit containers", logger.Err(err))
+		}
+		return
+	}
+	for _, hint := range group.KeepHints() {
+		log.Info("aikit container kept running", logger.F("hint", hint))
+	}
+	if err := group.Close(ctx); err != nil {
+		log.Warn("failed to stop aikit containers", logger.Err(err))
 	}
 }
 

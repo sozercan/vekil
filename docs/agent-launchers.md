@@ -22,6 +22,7 @@ vekil launch codex
 vekil launch claude --model claude-sonnet-4.5
 vekil launch codex --model gpt-5.4-mini
 vekil launch copilot --model gpt-5.4-mini
+vekil launch claude --model aikit:qwen3.8:27b
 ```
 
 Use the same provider configuration accepted by the normal server:
@@ -95,6 +96,24 @@ hosted web search, remote compaction, freeform apply-patch, and inherited speed
 tiers. If a delegated Codex default resolves to `owned_by: vekil-policy`, pin
 that ID explicitly instead.
 
+## Local AIKit models
+
+`--model aikit:<ref>` runs a local [AIKit](https://github.com/kaito-project/aikit)
+model in a Docker or podman container for the session instead of routing to a
+hosted provider:
+
+```bash
+vekil launch claude --model aikit:qwen3.8:27b
+vekil launch codex --model aikit:gpt-oss:20b --context-size 98304
+vekil launch copilot --model aikit:hf.co/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf
+```
+
+The container starts before the proxy, loads the model, and is removed when the
+agent exits unless `--keep` is given. The agent is pinned to the served model
+and told the context the container actually loaded. See
+[Local AIKit Models](aikit.md) for references, engine selection, context sizing,
+and the flags below.
+
 ## Lifecycle
 
 Every launcher:
@@ -133,6 +152,11 @@ normal global policy-controller startup behavior.
 | `--policy-routing config|off|observe|enforce` | Policy-routing mode. `config` follows YAML profile modes and is the default; other values apply a process-wide safety ceiling. |
 | `--proxy-log PATH` | New JSON proxy log path; existing files and links are rejected. |
 | `--dry-run` | Print the child-process plan without starting a proxy or agent. Static model metadata is resolved; catalog-only metadata is marked unresolved. |
+| `--context-size N` | Context window for an `aikit:` model. |
+| `--runtime auto\|docker\|podman` | Container engine for an `aikit:` model. |
+| `--backend llama-cpp\|vllm-cpp` | Backend for an `aikit:` runner reference. |
+| `--keep` | Keep an `aikit:` model container running and reuse it next time. |
+| `--load-timeout DURATION` | Maximum time for an `aikit:` model to load (default `10m`). |
 | `--no-summary` | Suppress the end-of-session request/token summary. |
 
 ```bash
@@ -254,8 +278,10 @@ this flow. Vekil instead injects a transient, per-launch
 - `supports_websockets=false` keeps the launcher on deterministic HTTP Responses;
 - generated context budgets prefer the model's prompt/input limit over its
   total context window, while preserving explicit public catalog overrides;
-- for a policy-owned Chat model, Vekil disables hosted web search, remote
-  compaction, Responses Lite, and code-only tool modes; removes Codex's freeform `apply_patch` declaration; and translates
+- for a policy-owned Chat model, and for a local AIKit or LocalAI model, Vekil
+  disables hosted web search, remote compaction, Responses Lite, and code-only
+  tool modes and removes Codex's freeform `apply_patch` declaration; for a
+  policy-owned Chat model it also translates
   stateless Responses messages, bounded `text.format` structured-output schemas,
   and function/namespace tools through canonical Chat; namespace children receive
   deterministic Chat-safe aliases and are restored in Responses function-call

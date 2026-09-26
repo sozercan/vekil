@@ -16,6 +16,12 @@ func ValidateProvidersConfigFileLive(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
+	return ValidateProvidersConfigLive(ctx, cfg)
+}
+
+// ValidateProvidersConfigLive is ValidateProvidersConfigFileLive for a loaded
+// configuration whose AIKit providers, if any, are already running.
+func ValidateProvidersConfigLive(ctx context.Context, cfg ProvidersConfig) error {
 	authenticator, err := auth.NewAuthenticator(os.Getenv("TOKEN_DIR"))
 	if err != nil {
 		return fmt.Errorf("initialize live-validation authentication: %w", err)
