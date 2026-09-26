@@ -291,7 +291,7 @@ func validateProvidersConfigFileLiveWithAIKit(ctx context.Context, source string
 	// Ctrl-C while a model pulls or loads must still remove its container.
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	cfg, err := proxy.LoadProvidersConfigFile(source)
+	cfg, err := proxy.LoadProvidersConfigFileContext(ctx, source)
 	if err != nil {
 		return err
 	}
@@ -749,7 +749,7 @@ func runServe() {
 	if err != nil {
 		log.Fatal("failed to start aikit providers", logger.Err(err))
 	}
-	stopAIKit := func() { stopServeAIKitProviders(aikitGroup, log) }
+	stopAIKit := func(discard bool) { stopServeAIKitProviders(aikitGroup, log, discard) }
 
 	srv, err := server.New(
 		authenticator,
@@ -771,26 +771,35 @@ func runServe() {
 		),
 	)
 	if err != nil {
-		stopAIKit()
+		// The server never ran, so kept containers are removed too.
+		stopAIKit(true)
 		log.Fatal("failed to initialize server", logger.Err(err))
 	}
 
 	if err := serveUntilContextDone(ctx, srv, authenticator, serveUsesCopilot(srv, providersCfg.UsesCopilot()), log); err != nil {
-		stopAIKit()
+		stopAIKit(false)
 		log.Fatal("serve error", logger.Err(err))
 	}
-	stopAIKit()
+	stopAIKit(false)
 }
 
-func stopServeAIKitProviders(group *aikit.Group, log *logger.Logger) {
+// stopServeAIKitProviders stops the server's containers. With discard, it
+// removes kept containers too.
+func stopServeAIKitProviders(group *aikit.Group, log *logger.Logger, discard bool) {
 	if group == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if discard {
+		if err := group.Discard(ctx); err != nil {
+			log.Warn("failed to remove aikit containers", logger.Err(err))
+		}
 		return
 	}
 	for _, hint := range group.KeepHints() {
 		log.Info("aikit container kept running", logger.F("hint", hint))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	if err := group.Close(ctx); err != nil {
 		log.Warn("failed to stop aikit containers", logger.Err(err))
 	}

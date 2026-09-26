@@ -204,7 +204,17 @@ func startProxy() {
 	authn := authenticator
 	go func() {
 		if err := stopPrevious(); err != nil {
-			log.Warn("failed to stop the previous proxy; its local model containers may still be running", logger.Err(err))
+			log.Warn("failed to stop the previous proxy", logger.Err(err))
+		}
+		// Never load a model beside containers an earlier stop could not remove.
+		if err := retryAIKitCleanups(); err != nil {
+			completeProxyStartup(generation, proxyStartFailure(
+				"aikit cleanup failed",
+				"Vekil Start Failed",
+				fmt.Sprintf("Could not remove the previous local model container, so Vekil did not start another beside it.\n\n%v", err),
+				err,
+			))
+			return
 		}
 		// Reload on every start so edits to the saved providers config apply
 		// after Stop and Start without relaunching the app.
@@ -301,11 +311,14 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 			err,
 		)
 	}
-	closeAIKit := func() {
-		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = aikitGroup.Close(closeCtx)
-	}
+	// A startup that fails before serving removes its containers, even kept
+	// ones; keep applies to a proxy that ran.
+	started := false
+	defer func() {
+		if !started && aikitGroup != nil {
+			_ = runAIKitCleanup(aikitGroup.Discard)
+		}
+	}()
 	nextSrv, err := server.New(
 		authn,
 		log,
@@ -319,7 +332,6 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 		),
 	)
 	if err != nil {
-		closeAIKit()
 		return proxyStartFailure(
 			"server init failed",
 			"Vekil Start Failed",
@@ -364,7 +376,6 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 		return proxyStartResult{err: err}
 	}
 	if err := nextSrv.Start(); err != nil {
-		closeAIKit()
 		return proxyStartFailure(
 			"server start failed",
 			"Vekil Start Failed",
@@ -388,6 +399,7 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 		)
 	}
 
+	started = true
 	return proxyStartResult{server: current}
 }
 

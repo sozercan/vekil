@@ -237,6 +237,10 @@ func (g ggufReader) skip(valueType uint32, depth int) error {
 			}
 			return g.discard(count * size)
 		}
+		// Every string or nested array spends at least an 8-byte length.
+		if count > maxGGUFHeaderBytes/8 {
+			return fmt.Errorf("gguf array of %d elements exceeds the metadata limit", count)
+		}
 		for i := uint64(0); i < count; i++ {
 			if err := g.skip(elementType, depth+1); err != nil {
 				return err

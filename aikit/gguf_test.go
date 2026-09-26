@@ -137,4 +137,17 @@ func TestReadGGUFInfoErrors(t *testing.T) {
 	if _, err := ReadGGUFInfo(bytes.NewReader(v1)); err == nil || !strings.Contains(err.Error(), "unsupported GGUF version") {
 		t.Fatalf("v1 error = %v", err)
 	}
+
+	// A string array declaring more elements than the metadata budget can
+	// hold is refused before any element is read.
+	var huge ggufBuilder
+	huge.kvString("general.architecture", "llama")
+	huge.str("tokenizer.ggml.tokens")
+	_ = binary.Write(&huge.buf, binary.LittleEndian, uint32(ggufTypeArray))
+	_ = binary.Write(&huge.buf, binary.LittleEndian, uint32(ggufTypeString))
+	_ = binary.Write(&huge.buf, binary.LittleEndian, uint64(1)<<40)
+	huge.count++
+	if _, err := ReadGGUFInfo(bytes.NewReader(huge.bytes(3))); err == nil || !strings.Contains(err.Error(), "exceeds the metadata limit") {
+		t.Fatalf("huge string array error = %v", err)
+	}
 }

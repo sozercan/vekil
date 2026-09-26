@@ -122,7 +122,8 @@ LocalAI never sends. Vekil therefore always chooses a value:
   request would not fit. A model trained for less, such as phi-4 (16k), is
   refused before any container starts.
 - If a default-sized load runs out of memory, the container is restarted at half
-  the context, down to that floor.
+  the context, halving again on each failure down to that floor (8192 tokens
+  for a `type: aikit` provider).
 - An image whose config fixes `context_size` is used at that size, with a
   warning. A fixed size below the floor, or one that conflicts with
   `--context-size`, is refused; rebuild the image without `context_size`.
