@@ -23,3 +23,17 @@ func TestRangeReaderRedactsRedirectedURLs(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestInspectionRefusesRedirectsToLoopback(t *testing.T) {
+	for _, target := range []string{"https://127.0.0.2/model.gguf", "https://[::1]/model.gguf", "https://files.localhost/model.gguf"} {
+		source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target, http.StatusFound)
+		}))
+		reader := &rangeReader{ctx: context.Background(), client: secureRedirects(source.Client()), url: source.URL + "/model.gguf"}
+		_, err := reader.Read(make([]byte, 16))
+		source.Close()
+		if err == nil || !strings.Contains(err.Error(), "runner container cannot reach") {
+			t.Fatalf("redirect to %s: error = %v", target, err)
+		}
+	}
+}

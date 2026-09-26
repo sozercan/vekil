@@ -3748,7 +3748,7 @@ func routeTargetMayRejectContextOverflow(target targetBinding, endpoint string, 
 	if !target.failoverOnContextOverflow {
 		return false
 	}
-	if statusCode != http.StatusBadRequest && statusCode != http.StatusRequestEntityTooLarge {
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusRequestEntityTooLarge && statusCode != http.StatusUnprocessableEntity {
 		return false
 	}
 	return endpoint == providerEndpointChatCompletions || endpoint == providerEndpointResponses || endpoint == providerEndpointMessages

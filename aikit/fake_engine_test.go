@@ -49,6 +49,9 @@ type fakeEngine struct {
 
 	// onRun decides how a started container behaves.
 	onRun func(c *fakeContainer)
+	// runErrAfterCreate makes run fail after creating its container, like a
+	// CLI that loses the daemon before printing the ID.
+	runErrAfterCreate error
 	// servers backs published ports with real HTTP listeners.
 	servers []*httptest.Server
 }
@@ -227,6 +230,9 @@ func (f *fakeEngine) run(args []string) ([]byte, error) {
 		f.mu.Unlock()
 		f.onRun(c)
 		f.mu.Lock()
+	}
+	if f.runErrAfterCreate != nil {
+		return nil, f.runErrAfterCreate
 	}
 	return []byte(c.id + "\n"), nil
 }

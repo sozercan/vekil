@@ -649,3 +649,18 @@ func TestCheckLocalAIEchoedFieldsRejectsCatalogsBeyondPeekBudget(t *testing.T) {
 		t.Fatalf("normalized error = %v (code %q)", err, providerRequestErrorCode(err))
 	}
 }
+
+func TestRouteTargetMayRejectContextOverflowStatuses(t *testing.T) {
+	target := targetBinding{failoverOnContextOverflow: true}
+	for _, status := range []int{http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity} {
+		if !routeTargetMayRejectContextOverflow(target, providerEndpointChatCompletions, status) {
+			t.Fatalf("status %d is not an overflow candidate", status)
+		}
+	}
+	if routeTargetMayRejectContextOverflow(target, providerEndpointChatCompletions, http.StatusInternalServerError) {
+		t.Fatal("status 500 is an overflow candidate")
+	}
+	if routeTargetMayRejectContextOverflow(targetBinding{}, providerEndpointChatCompletions, http.StatusBadRequest) {
+		t.Fatal("a target without failover_on_context_overflow is an overflow candidate")
+	}
+}

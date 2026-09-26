@@ -158,6 +158,19 @@ func TestStartReportsNonOOMFailure(t *testing.T) {
 	}
 }
 
+func TestStartRemovesContainerCreatedByAFailedRun(t *testing.T) {
+	t.Cleanup(func() { unremoved.ids = nil })
+	fake, ref := seededPremade(t, premadeConfig, 262144)
+	fake.runErrAfterCreate = errors.New("lost connection to the daemon")
+	_, _, err := startTestSession(t, fake, fake.engine(EngineDocker, AccelNone), Options{Reference: ref})
+	if err == nil || !strings.Contains(err.Error(), "lost connection") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(fake.runs) != 1 || len(fake.containers) != 0 {
+		t.Fatalf("runs = %d, containers = %d; want the created container removed", len(fake.runs), len(fake.containers))
+	}
+}
+
 func TestStartLoadTimeoutCoversOOMRetries(t *testing.T) {
 	fake, ref := seededPremade(t, premadeConfig, 262144)
 	fake.onRun = func(c *fakeContainer) {

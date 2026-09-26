@@ -358,6 +358,11 @@ func secureRedirects(client *http.Client) *http.Client {
 		if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
 			return fmt.Errorf("refusing redirect from https to %s", req.URL.Scheme)
 		}
+		// The runner container cannot reach this machine's loopback, so a
+		// redirect there would inspect a file the runner cannot download.
+		if loopbackHost(req.URL.Hostname()) {
+			return fmt.Errorf("refusing redirect to %s, which the runner container cannot reach", req.URL.Hostname())
+		}
 		if previous != nil {
 			return previous(req, via)
 		}

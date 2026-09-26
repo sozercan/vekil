@@ -433,6 +433,13 @@ func runOnce(
 	status.printf("starting %s on %s (context %d)", plan.ModelName, where, decision.Tokens)
 	id, err := engine.run(ctx, args...)
 	if err != nil {
+		// The engine may have created the container before the command failed,
+		// for example on cancellation. Its name is this attempt's, so remove it.
+		removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		if removeErr := engine.remove(removeCtx, name); removeErr != nil && !isNoSuchContainer(removeErr) {
+			rememberUnremoved(engine, name)
+		}
+		cancel()
 		return nil, nil, fmt.Errorf("start %s: %w", plan.Image, err)
 	}
 	session := &Session{
@@ -730,7 +737,7 @@ func retryUnremoved(ctx context.Context, engine *Engine) []error {
 	unremoved.mu.Unlock()
 	var errs []error
 	for _, id := range ids {
-		if err := engine.remove(ctx, id); err != nil {
+		if err := engine.remove(ctx, id); err != nil && !isNoSuchContainer(err) {
 			errs = append(errs, fmt.Errorf("remove %s: %w", id, err))
 			continue
 		}
@@ -739,6 +746,12 @@ func retryUnremoved(ctx context.Context, engine *Engine) []error {
 		unremoved.mu.Unlock()
 	}
 	return errs
+}
+
+// isNoSuchContainer reports an engine error for a container that is already
+// gone, which Docker and Podman word the same way.
+func isNoSuchContainer(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "no such container")
 }
 
 // reapOrphans removes containers left by vekil processes on this host that are
