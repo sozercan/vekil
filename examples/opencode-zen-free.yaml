@@ -53,13 +53,19 @@ providers:
       - public_id: "big-pickle"
         endpoints:
           - /chat/completions
-      - public_id: "hy3-free"
+      - public_id: "ling-3.0-flash-fin-free"
+        endpoints:
+          - /chat/completions
+      - public_id: "longcat-2.5-preview-free"
         endpoints:
           - /chat/completions
       - public_id: "mimo-v2.5-free"
         endpoints:
           - /chat/completions
-      - public_id: "muse-spark-1.2-contributor-free"
+      - public_id: "mimo-v2.6-flash-free"
+        endpoints:
+          - /chat/completions
+      - public_id: "muse-spark-1.3-contributor-free"
         endpoints:
           - /responses
       - public_id: "nemotron-3-ultra-free"
@@ -68,7 +74,7 @@ providers:
       - public_id: "nemotron-3.5-lightning-free"
         endpoints:
           - /chat/completions
-      - public_id: "x-preview-f-free"
+      - public_id: "space-bunny-free"
         endpoints:
           - /chat/completions
     # END GENERATED: OpenCode Zen free models
