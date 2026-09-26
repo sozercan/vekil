@@ -105,9 +105,12 @@ routes; classifier admission and version-1 retries retain their existing behavio
 A wait that reaches the five-minute cap returns a local `429` with the message
 `Azure deployment rate limit is still active` and no upstream send. Codex 0.157
 does not retry HTTP `429`, so it ends the turn with `exceeded retry limit, last
-status: 429 Too Many Requests`. This affects provider-bound threads that cannot
-migrate, such as threads with Codex compaction items. Fresh threads fail over
-instead. If this repeats, the deployment's TPM is below sustained demand.
+status: 429 Too Many Requests`. This affects any request that must stay on the
+cooling deployment: provider-bound threads that cannot migrate (such as threads
+with Codex compaction items), `primary_only` routes, and routes without another
+eligible target. On `priority_failover` routes, fresh requests fail over to an
+eligible target instead. If this repeats, the deployment's TPM is below
+sustained demand.
 
 Client retries start new operation send budgets, but share these deployment
 cooldowns within the process. Vekil does not deduplicate identical requests,
