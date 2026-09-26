@@ -3110,7 +3110,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		attemptNow = h.stats.now
 	}
 	kind := routeAttemptKindFromContext(ctx)
-	failures := make([]routeAttemptFailure, 0, route.policy.maxTargetAttempts)
+	var failures []routeAttemptFailure
 	retryTargetID := ""
 	for {
 		targets := orderedRouteTargets(route, operation, endpoint)
