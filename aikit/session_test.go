@@ -322,6 +322,17 @@ func TestStartKeepRefusesToLoadBesideAnUnreadyKeptContainer(t *testing.T) {
 	if len(fake.runs) != 1 {
 		t.Fatalf("started %d containers, want only the kept one", len(fake.runs))
 	}
+
+	// A failed lookup cannot rule out a running kept copy either.
+	ready.Store(true)
+	fake.failures["docker ps -a -q --no-trunc --filter label="+LabelSpec] = errors.New("engine busy")
+	_, _, err = startTestSession(t, fake, engine, Options{Reference: ref, Keep: true})
+	if err == nil || !strings.Contains(err.Error(), "list kept containers") {
+		t.Fatalf("lookup failure error = %v", err)
+	}
+	if len(fake.runs) != 1 {
+		t.Fatalf("started %d containers after a failed lookup", len(fake.runs))
+	}
 }
 
 func TestStartRefusesToLoadBesideAnUnremovableOrphan(t *testing.T) {

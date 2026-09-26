@@ -664,7 +664,8 @@ func verifyServedContext(ctx context.Context, client *http.Client, baseURL, mode
 func findReusable(ctx context.Context, engine *Engine, spec string, client *http.Client) (*Session, error) {
 	infos, err := engine.listByLabel(ctx, LabelSpec+"="+spec)
 	if err != nil {
-		return nil, nil
+		// A kept copy may be running; do not load another beside it blind.
+		return nil, fmt.Errorf("list kept containers: %w", err)
 	}
 	for _, info := range infos {
 		labels := info.Config.Labels
