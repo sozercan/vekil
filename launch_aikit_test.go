@@ -105,6 +105,10 @@ func TestLaunchLocalModelProfileForUnstartedAIKitProvider(t *testing.T) {
 	if profile == nil || profile.ContextTokens != 98304 || !profile.FunctionToolsOnly {
 		t.Fatalf("profile = %+v", profile)
 	}
+	cfg.Providers[0].Models[0].PublicID = "claude-sonnet-4-5"
+	if profile := launchLocalModelProfile(cfg, "claude-sonnet-4.5"); profile == nil || profile.ContextTokens != 98304 {
+		t.Fatalf("normalized provider alias profile = %+v", profile)
+	}
 }
 
 func TestWatchStartupSignals(t *testing.T) {
@@ -209,6 +213,10 @@ func TestLaunchLocalModelProfileThroughModelRoute(t *testing.T) {
 	profile := launchLocalModelProfile(cfg, "coder")
 	if profile == nil || !profile.FunctionToolsOnly || profile.ContextTokens != 65536 {
 		t.Fatalf("route profile = %+v", profile)
+	}
+	cfg.ModelRoutes[0].PublicID = "claude-sonnet-4.5"
+	if profile := launchLocalModelProfile(cfg, "claude-sonnet-4-5"); profile == nil || profile.ContextTokens != 65536 {
+		t.Fatalf("normalized route alias profile = %+v", profile)
 	}
 	if launchLocalModelProfile(cfg, "cloud-only") != nil {
 		t.Fatal("a route without local targets got a local profile")

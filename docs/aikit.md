@@ -241,7 +241,8 @@ exact rule.
 
 - Containers are named `vekil-aikit-<id>` and labeled `dev.vekil.aikit`. A later
   Vekil run removes containers left by a Vekil process on the same host that is
-  no longer running, except kept ones. Remove a kept container with
+  no longer running, except kept ones, and does not start a model while one of
+  them cannot be removed. Remove a kept container with
   `docker rm -f` or `podman rm -f`.
 - Runner references mount a named volume `vekil-aikit-<hash>` at `/models`, so a
   downloaded model is reused. Remove it with `docker volume rm` or `podman

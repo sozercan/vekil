@@ -127,7 +127,11 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 		return body, nil, nil
 	}
 	if raw, ok := payload["tool_choice"]; ok {
-		if rewritten, changed := flattenLocalAIToolChoice(raw); changed {
+		rewritten, changed, err := flattenLocalAIToolChoice(raw, aliases, topLevel)
+		if err != nil {
+			return nil, nil, err
+		}
+		if changed {
 			payload["tool_choice"] = rewritten
 		}
 	}
@@ -143,20 +147,25 @@ func flattenLocalAINamespaceTools(body []byte) ([]byte, localAIToolAliases, erro
 
 // flattenLocalAIToolChoice renames namespaced function choices, including the
 // entries of an allowed_tools choice, to their flattened names.
-func flattenLocalAIToolChoice(raw json.RawMessage) (json.RawMessage, bool) {
+func flattenLocalAIToolChoice(raw json.RawMessage, aliases localAIToolAliases, topLevel map[string]bool) (json.RawMessage, bool, error) {
 	var choice map[string]json.RawMessage
 	if json.Unmarshal(raw, &choice) != nil {
-		return raw, false
+		return raw, false, nil
 	}
-	changed := flattenNamespacedToolReference(choice)
+	changed, err := flattenNamespacedToolReference(choice, aliases, topLevel, "tool_choice")
+	if err != nil {
+		return nil, false, err
+	}
 	if jsonStringField(choice, "type") == "allowed_tools" {
 		var tools []map[string]json.RawMessage
 		if json.Unmarshal(choice["tools"], &tools) == nil {
 			toolsChanged := false
-			for _, tool := range tools {
-				if flattenNamespacedToolReference(tool) {
-					toolsChanged = true
+			for index, tool := range tools {
+				flattened, err := flattenNamespacedToolReference(tool, aliases, topLevel, fmt.Sprintf("tool_choice.tools[%d]", index))
+				if err != nil {
+					return nil, false, err
 				}
+				toolsChanged = toolsChanged || flattened
 			}
 			if toolsChanged {
 				choice["tools"] = mustMarshalJSON(tools)
@@ -165,19 +174,27 @@ func flattenLocalAIToolChoice(raw json.RawMessage) (json.RawMessage, bool) {
 		}
 	}
 	if !changed {
-		return raw, false
+		return raw, false, nil
 	}
-	return mustMarshalJSON(choice), true
+	return mustMarshalJSON(choice), true, nil
 }
 
-func flattenNamespacedToolReference(reference map[string]json.RawMessage) bool {
+func flattenNamespacedToolReference(reference map[string]json.RawMessage, aliases localAIToolAliases, topLevel map[string]bool, param string) (bool, error) {
 	namespace := jsonStringField(reference, "namespace")
 	if namespace == "" || jsonStringField(reference, "type") != "function" {
-		return false
+		return false, nil
 	}
-	reference["name"] = mustMarshalJSON(namespace + localAIToolSeparator + jsonStringField(reference, "name"))
+	name := jsonStringField(reference, "name")
+	alias := namespace + localAIToolSeparator + name
+	// As in history items, a/b__c and a__b/c flatten to the same name, so a
+	// choice must not select a different declared tool.
+	known, exists := aliases[alias]
+	if topLevel[alias] || (exists && known != (localAIToolAlias{namespace: namespace, name: name})) {
+		return false, localAIToolError(param+".name", fmt.Sprintf("flattened name %q is ambiguous", alias))
+	}
+	reference["name"] = mustMarshalJSON(alias)
 	delete(reference, "namespace")
-	return true
+	return true, nil
 }
 
 func localAIToolError(param, detail string) error {

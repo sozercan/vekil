@@ -1184,6 +1184,25 @@ func containsControlCharacter(value string) bool {
 	return false
 }
 
+// PublicModelIDMatches reports whether a requested model resolves to publicID:
+// exactly, or through the normalized aliases that explicit routes reserve.
+func PublicModelIDMatches(publicID, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	if model == strings.TrimSpace(publicID) {
+		return true
+	}
+	normalized := NormalizeModelName(model)
+	for _, alias := range configuredPublicModelAliases(publicID) {
+		if alias == normalized {
+			return true
+		}
+	}
+	return false
+}
+
 func configuredPublicModelAliases(publicID string) []string {
 	publicID = strings.TrimSpace(publicID)
 	if publicID == "" {

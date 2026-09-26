@@ -777,7 +777,9 @@ func runServe() {
 	}
 
 	if err := serveUntilContextDone(ctx, srv, authenticator, serveUsesCopilot(srv, providersCfg.UsesCopilot()), log); err != nil {
-		stopAIKit(false)
+		// A serve error, such as a port already in use, removes kept
+		// containers too; keep applies to a normal shutdown.
+		stopAIKit(true)
 		log.Fatal("serve error", logger.Err(err))
 	}
 	stopAIKit(false)

@@ -286,6 +286,21 @@ func TestStartKeepReusesRunningContainer(t *testing.T) {
 	}
 }
 
+func TestStartRefusesToLoadBesideAnUnremovableOrphan(t *testing.T) {
+	fake, ref := seededPremade(t, premadeConfig, 262144)
+	fake.mu.Lock()
+	fake.newContainer(ref.Image, []string{"--label", LabelManaged + "=true", "--label", LabelOwner + "=" + hostName() + "/999999999"})
+	fake.mu.Unlock()
+	fake.failures["docker rm"] = errors.New("engine busy")
+	_, _, err := startTestSession(t, fake, fake.engine(EngineDocker, AccelNone), Options{Reference: ref})
+	if err == nil || !strings.Contains(err.Error(), "remove orphaned aikit containers") || !strings.Contains(err.Error(), "engine busy") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(fake.runs) != 0 {
+		t.Fatalf("started %d containers beside the orphan", len(fake.runs))
+	}
+}
+
 func TestStartReapsOrphans(t *testing.T) {
 	fake, ref := seededPremade(t, premadeConfig, 262144)
 	host := hostName()

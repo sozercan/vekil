@@ -49,6 +49,15 @@ func TestFlattenLocalAINamespaceTools(t *testing.T) {
 	if err != nil || !strings.Contains(string(out), `{"name":"agents__spawn","type":"function"}`) || !strings.Contains(string(out), `{"name":"plain","type":"function"}`) {
 		t.Fatalf("allowed_tools = %s, %v", out, err)
 	}
+	for _, ambiguous := range []string{
+		`{"tools":[{"type":"namespace","name":"a__b","tools":[{"type":"function","name":"c"}]}],"tool_choice":{"type":"function","namespace":"a","name":"b__c"}}`,
+		`{"tools":[{"type":"namespace","name":"a__b","tools":[{"type":"function","name":"c"}]}],"tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","namespace":"a","name":"b__c"}]}}`,
+		`{"tools":[{"type":"function","name":"a__b"},{"type":"namespace","name":"n","tools":[{"type":"function","name":"x"}]}],"tool_choice":{"type":"function","namespace":"a","name":"b"}}`,
+	} {
+		if _, _, err := flattenLocalAINamespaceTools([]byte(ambiguous)); err == nil || !strings.Contains(err.Error(), "is ambiguous") {
+			t.Fatalf("ambiguous choice %s error = %v", ambiguous, err)
+		}
+	}
 
 	out, emptyAliases, err := flattenLocalAINamespaceTools([]byte(`{"tools":[{"type":"function","name":"f"},{"type":"namespace","name":"empty","tools":[]}]}`))
 	if err != nil || emptyAliases != nil || strings.Contains(string(out), "namespace") || !strings.Contains(string(out), `"name":"f"`) {

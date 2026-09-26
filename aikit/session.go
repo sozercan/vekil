@@ -166,7 +166,10 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 		return nil, fmt.Errorf("context size must not be negative")
 	}
 
-	reapOrphans(ctx, engine)
+	if err := reapOrphans(ctx, engine); err != nil {
+		// An orphan may still hold the memory this model needs.
+		return nil, fmt.Errorf("remove orphaned aikit containers: %w", err)
+	}
 
 	ref := opts.Reference
 	if opts.Selector == "" {
@@ -692,12 +695,14 @@ func findReusable(ctx context.Context, engine *Engine, spec string, client *http
 }
 
 // reapOrphans removes containers left by vekil processes on this host that are
-// no longer running. Kept containers are left alone.
-func reapOrphans(ctx context.Context, engine *Engine) {
+// no longer running and reports removals that fail. Kept containers are left
+// alone. A failed listing is ignored; the next engine command reports it.
+func reapOrphans(ctx context.Context, engine *Engine) error {
 	infos, err := engine.listByLabel(ctx, LabelManaged)
 	if err != nil {
-		return
+		return nil
 	}
+	var errs []error
 	host := hostName()
 	for _, info := range infos {
 		labels := info.Config.Labels
@@ -712,8 +717,11 @@ func reapOrphans(ctx context.Context, engine *Engine) {
 		if err != nil || pid == os.Getpid() || processAlive(pid) {
 			continue
 		}
-		_ = engine.remove(ctx, info.ID)
+		if err := engine.remove(ctx, info.ID); err != nil {
+			errs = append(errs, fmt.Errorf("remove %s: %w", info.ID, err))
+		}
 	}
+	return errors.Join(errs...)
 }
 
 func ownerLabel() string { return hostName() + "/" + strconv.Itoa(os.Getpid()) }
