@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -93,15 +94,17 @@ const (
 	// Streamed output a client can keep but cannot execute.
 	conversationStreamedReasoning = "event: response.output_item.done\ndata: " + `{"type":"response.output_item.done","output_index":0,"item":{"id":"rs_streamed","type":"reasoning","encrypted_content":"streamed-encrypted","summary":[]}}` + "\n\n"
 	conversationStreamedTextDelta = "event: response.output_text.delta\ndata: " + `{"type":"response.output_text.delta","item_id":"msg_streamed","output_index":1,"content_index":0,"delta":"partial"}` + "\n\n"
-	// Part of a tool call, which a client may already be executing.
+	// Part of a tool call. The client has not received all of it.
 	conversationStreamedArgumentsDelta = "event: response.function_call_arguments.delta\ndata: " + `{"type":"response.function_call_arguments.delta","item_id":"fc_streamed","output_index":1,"delta":"{}"}` + "\n\n"
+	// A completed tool call, which a client such as Codex runs as it arrives.
+	conversationStreamedCall = "event: response.output_item.done\ndata: " + `{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_streamed","type":"function_call","status":"completed","call_id":"call-streamed","name":"edit","arguments":"{}"}}` + "\n\n"
 )
 
-func TestConversationMigrationCommittedFailureBeforeExecutableOutputAllowsRetry(t *testing.T) {
-	blocked := map[string]bool{"tool call before failure": true, "tool call in keepalive": true, "tool call in failure": true}
+func TestConversationMigrationCommittedFailureAllowsRetry(t *testing.T) {
+	blocked := map[string]bool{"partial tool call before failure": true, "tool call in keepalive": true, "tool call in failure": true}
 	for _, scenario := range []string{
 		"failed", "error event", "queued then failed", "keepalive then error event", "reasoning and message before failure", "message in keepalive",
-		"tool call before failure", "tool call in keepalive", "tool call in failure",
+		"completed tool call before failure", "partial tool call before failure", "tool call in keepalive", "tool call in failure",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			var sends, west atomic.Int32
@@ -131,7 +134,9 @@ func TestConversationMigrationCommittedFailureBeforeExecutableOutputAllowsRetry(
 					case "message in keepalive":
 						keepalive := "event: keepalive\ndata: " + `{"type":"keepalive","sequence_number":2,"response":{"id":"resp-streamed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}]}}` + "\n\n"
 						return conversationStreamResponse(req, nil, created, keepalive, conversationRateLimitError), nil
-					case "tool call before failure":
+					case "completed tool call before failure":
+						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall, conversationRateLimitFailed), nil
+					case "partial tool call before failure":
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedArgumentsDelta, conversationRateLimitFailed), nil
 					case "tool call in keepalive":
 						keepalive := "event: keepalive\ndata: " + `{"type":"keepalive","sequence_number":2,"response":{"id":"resp-streamed","output":[{"type":"function_call","call_id":"call-1","name":"edit","arguments":"{}"}]}}` + "\n\n"
@@ -153,7 +158,8 @@ func TestConversationMigrationCommittedFailureBeforeExecutableOutputAllowsRetry(
 			}
 			retry := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Try again."}, nil)
 			if blocked[scenario] {
-				// A tool call reached the client, so the outcome remains uncertain.
+				// Executable output that Vekil could not save keeps the outcome
+				// uncertain.
 				if !strings.Contains(failed.Body.String(), "conversation_execution_uncertain") {
 					t.Fatalf("missing execution uncertainty diagnostic: %s", conversationBodyTail(failed))
 				}
@@ -175,16 +181,22 @@ func TestConversationMigrationCommittedFailureBeforeExecutableOutputAllowsRetry(
 	}
 }
 
-func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *testing.T) {
+func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 	reset := errors.New("connection reset by peer")
-	released := map[string]bool{"reasoning then close": true, "message then reset": true}
+	released := map[string]string{
+		"reasoning then close": "stream_ended", "message then reset": "stream_ended",
+		"tool call then close": "delivered_history_saved", "tool call then close, Codex retry": "delivered_history_saved",
+	}
+	session := http.Header{"Session_id": {"client-a"}}
 	for _, scenario := range []string{
-		"reasoning then close", "message then reset",
-		"tool call then close", "arguments then reset", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
+		"reasoning then close", "message then reset", "tool call then close", "tool call then close, Codex retry",
+		"arguments then reset", "unrecognized event then close", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			var h *ProxyHandler
 			var sends, west atomic.Int32
+			var retriedBody atomic.Value
+			retriedBody.Store("")
 			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 				if strings.HasSuffix(req.URL.Path, "/models") {
 					return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
@@ -204,9 +216,11 @@ func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *te
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning), nil
 					case "message then reset":
 						return conversationStreamResponse(req, nil, created, conversationStreamedTextDelta, reset), nil
-					case "tool call then close":
-						call := conversationOutputItemDone(t, 1, map[string]any{"id": "fc_streamed", "type": "function_call", "status": "completed", "call_id": "call-streamed", "name": "edit", "arguments": "{}"})
-						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, call), nil
+					case "tool call then close", "tool call then close, Codex retry":
+						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall), nil
+					case "unrecognized event then close":
+						vendor := "event: response.vendor_progress\ndata: " + `{"type":"response.vendor_progress","output_index":1}` + "\n\n"
+						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, vendor), nil
 					case "arguments then reset":
 						return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDelta, reset), nil
 					case "proxy error after upstream close":
@@ -228,6 +242,9 @@ func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *te
 					}
 					return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, time.Minute), nil
 				}
+				body, _ := io.ReadAll(req.Body)
+				retriedBody.Store(string(body))
+				req.Body = io.NopCloser(bytes.NewReader(body))
 				return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
 			})
 			logs := &conversationLogBuffer{}
@@ -236,9 +253,9 @@ func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *te
 				options = append(options, WithStreamingUpstreamTimeout(500*time.Millisecond))
 			}
 			h, _ = newConversationAPIHandler(t, transport, nil, options...)
-			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
+			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, session), false)
 
-			ended := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, nil)
+			ended := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, session)
 			if ended.Code != http.StatusOK || sends.Load() != 2 {
 				t.Fatalf("ended turn: code=%d sends=%d %s", ended.Code, sends.Load(), conversationBodyTail(ended))
 			}
@@ -249,9 +266,22 @@ func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *te
 				}
 				return
 			}
-			// Codex retries the identical request after a stream ends early.
-			retry := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil)
-			if !released[scenario] {
+			// A client may retry without what it received, branching from the
+			// earlier history.
+			retryFields := map[string]any{"previous_response_id": "seed", "input": "Next."}
+			if scenario == "tool call then close, Codex retry" {
+				// Codex runs the delivered call and resends it with its output.
+				retryFields = map[string]any{"input": []any{
+					map[string]any{"role": "user", "content": "Seed."}, conversationText("Known earlier answer."),
+					map[string]any{"role": "user", "content": "Next."},
+					map[string]any{"id": "rs_streamed", "type": "reasoning", "encrypted_content": "streamed-encrypted", "summary": []any{}},
+					map[string]any{"id": "fc_streamed", "type": "function_call", "status": "completed", "call_id": "call-streamed", "name": "edit", "arguments": "{}"},
+					map[string]any{"type": "function_call_output", "call_id": "call-streamed", "output": "edited"},
+				}}
+			}
+			retry := conversationPOST(t, h, retryFields, session)
+			reason, ok := released[scenario]
+			if !ok {
 				if retry.Code != http.StatusConflict || sends.Load() != 2 || !strings.Contains(retry.Body.String(), "conversation_execution_uncertain") {
 					t.Fatalf("uncertain turn released: %d %s", retry.Code, retry.Body.String())
 				}
@@ -259,12 +289,15 @@ func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *te
 			}
 			// The client sees the upstream's own truncated stream, not a proxy
 			// uncertainty error.
-			if strings.Contains(ended.Body.String(), "conversation_execution_uncertain") || !strings.Contains(logs.String(), `"reason":"stream_ended"`) {
+			if strings.Contains(ended.Body.String(), "conversation_execution_uncertain") || !strings.Contains(logs.String(), `"reason":"`+reason+`"`) {
 				t.Fatalf("ended turn was not released: %s\nlogs: %s", conversationBodyTail(ended), logs.String())
 			}
 			conversationCompleted(t, retry, false)
 			if sends.Load() != 3 || west.Load() != 0 {
 				t.Fatalf("retry was not a single owner send: sends=%d west=%d", sends.Load(), west.Load())
+			}
+			if body := retriedBody.Load().(string); scenario == "tool call then close, Codex retry" && (!strings.Contains(body, "call-streamed") || !strings.Contains(body, "edited")) {
+				t.Fatalf("retry lost the delivered call or its output: %s", body)
 			}
 		})
 	}
@@ -289,8 +322,8 @@ func conversationWebSocketFailedTurn(t *testing.T, conn *websocket.Conn, fields 
 	}
 }
 
-func TestConversationMigrationWebSocketUpstreamEndBeforeExecutableOutputAllowsRetry(t *testing.T) {
-	for _, scenario := range []string{"reasoning then close", "tool call then close"} {
+func TestConversationMigrationWebSocketUpstreamEndAllowsRetry(t *testing.T) {
+	for _, scenario := range []string{"reasoning then close", "tool call then close", "partial tool call then close"} {
 		t.Run(scenario, func(t *testing.T) {
 			var sends atomic.Int32
 			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -302,9 +335,11 @@ func TestConversationMigrationWebSocketUpstreamEndBeforeExecutableOutputAllowsRe
 				case 1:
 					return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
 				case 2:
-					if scenario == "tool call then close" {
-						call := conversationOutputItemDone(t, 1, map[string]any{"id": "fc_streamed", "type": "function_call", "status": "completed", "call_id": "call-streamed", "name": "edit", "arguments": "{}"})
-						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, call), nil
+					switch scenario {
+					case "tool call then close":
+						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall), nil
+					case "partial tool call then close":
+						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedArgumentsDelta), nil
 					}
 					return conversationStreamResponse(req, nil, created, conversationStreamedReasoning), nil
 				}
@@ -318,7 +353,7 @@ func TestConversationMigrationWebSocketUpstreamEndBeforeExecutableOutputAllowsRe
 
 			turn := func() map[string]any { return map[string]any{"previous_response_id": "seed", "input": "Next."} }
 			ended := conversationWebSocketFailedTurn(t, conn, turn())
-			if scenario == "tool call then close" {
+			if scenario == "partial tool call then close" {
 				retry := conversationWebSocketFailedTurn(t, conn, turn())
 				if sends.Load() != 2 || !strings.Contains(retry, "conversation_execution_uncertain") {
 					t.Fatalf("uncertain turn released: sends=%d %s", sends.Load(), retry)

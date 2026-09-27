@@ -38,7 +38,11 @@ type conversationTurn struct {
 	dispatched      bool
 	// A handed-off event may belong to an item a client can execute, such as
 	// a tool call. Reasoning and assistant messages cannot run anything.
-	executable      bool
+	executable bool
+	// Executable items handed off in part, by output_index, and whether a
+	// handed-off event carried executable content that staging cannot save.
+	openItems       map[int]bool
+	unstaged        bool
 	failed          bool
 	streamUncertain bool
 	// Completed output items staged from the committed response. An item is
@@ -603,17 +607,25 @@ func (t *conversationTurn) unprotect(targetID, reason string) error {
 	return nil
 }
 
-// An upstream that ends an attempt before handing off anything executable
-// leaves a known outcome: the client received at most reasoning and assistant
-// messages, which it cannot run, so a retry cannot duplicate work. The upstream
-// ends it with a terminal failure event, or by closing or resetting the stream
-// without one (reason stream_ended). Clear the attempt marker and forward the
-// upstream failure unchanged so the client can apply its own retry policy. A
-// tool call or other executable item before or inside the failure leaves
-// execution uncertain. The caller holds t.mu.
+// An upstream that ends an attempt leaves a known outcome: the client received
+// exactly what Vekil handed off. The upstream ends it with a terminal failure
+// event, or by closing or resetting the stream without one (reason
+// stream_ended). Reasoning and assistant messages cannot run anything. A
+// completed tool call may have run, so the items handed off are saved first,
+// and a continuation that includes the call and its output matches verified
+// history. Clear the attempt marker and forward the upstream failure unchanged
+// so the client can apply its own retry policy. Executable output that cannot
+// be saved, or that sits inside the failure event itself, leaves execution
+// uncertain. The caller holds t.mu.
 func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMessage, targetID, reason string) error {
-	if t.saved || t.executable || conversationEventHasExecutableOutput(envelope) {
+	if t.saved || conversationEventHasExecutableOutput(envelope) {
 		return conversationRequestError(errConversationIncomplete)
+	}
+	if t.executable {
+		if err := t.saveEndedHistory(targetID); err != nil {
+			return err
+		}
+		reason = "delivered_history_saved"
 	}
 	if t.pending {
 		if err := t.store.clearAttempt(t.root); err != nil {
@@ -687,6 +699,67 @@ func conversationEventInert(eventType string, envelope map[string]json.RawMessag
 		return true
 	}
 	return false
+}
+
+// conversationEventStaged reports whether an executable event belongs to an
+// output item whose response.output_item.done stages it as delivered history.
+func conversationEventStaged(eventType string) bool {
+	switch eventType {
+	case "response.output_item.added", "response.output_item.done",
+		"response.function_call_arguments.delta", "response.function_call_arguments.done",
+		"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+		"response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
+		return true
+	}
+	return false
+}
+
+// trackExecutableItem follows a handed-off executable item from its first
+// event to its response.output_item.done. An event that belongs to no staged
+// item marks the turn unstaged. The caller holds t.mu.
+func (t *conversationTurn) trackExecutableItem(eventType string, envelope map[string]json.RawMessage) {
+	var index *int
+	if !conversationEventStaged(eventType) || json.Unmarshal(envelope["output_index"], &index) != nil || index == nil {
+		t.unstaged = true
+		return
+	}
+	if eventType == "response.output_item.done" {
+		delete(t.openItems, *index)
+		return
+	}
+	if t.openItems == nil {
+		t.openItems = make(map[int]bool)
+	}
+	t.openItems[*index] = true
+}
+
+// saveEndedHistory saves every item an upstream-ended attempt handed off, after
+// executable output reached the client. The end followed each handed-off item,
+// so all of them count as delivered. The client owns that outcome, as after an
+// interrupt: Codex runs a delivered tool call and resends it with its output.
+// An item handed off only in part, content staging cannot save, or a failed
+// save leaves execution uncertain. Saving clears the marker. The caller holds
+// t.mu.
+func (t *conversationTurn) saveEndedHistory(targetID string) error {
+	delivered := t.deliveredOutput(true)
+	if t.unstaged || len(t.openItems) > 0 || t.deliveredInvalid || !t.haveDeliveryInfo || t.deliveredResponseID == "" ||
+		len(delivered.items) == 0 && len(delivered.anchors) == 0 {
+		return conversationRequestError(errConversationIncomplete)
+	}
+	snapshot, err := t.historySnapshot(t.deliveredResponseID, t.deliveryInfo, delivered, false)
+	if err == nil {
+		err = t.store.save(snapshot)
+	}
+	if errors.Is(err, errConversationHistoryStorage) || errors.Is(err, errConversationHistoryCapacity) || errors.Is(err, errConversationHistoryUncertain) {
+		t.blocked = true
+		t.h.logConversationRecovery(t.operation, "blocked", targetID, conversationFailureReason(err))
+		return conversationRequestError(err)
+	}
+	if err != nil {
+		return conversationRequestError(errConversationIncomplete)
+	}
+	t.pending = false
+	return nil
 }
 
 func (t *conversationTurn) recoveryHeader() string {
@@ -848,14 +921,16 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 				return data, nil
 			case "response.queued", "response.created", "response.in_progress", "keepalive":
 				// Upstreams emit keepalives while a long generation is quiet.
+				// Output inside them is never staged.
 				if conversationEventHasExecutableOutput(envelope) {
-					t.executable = true
+					t.executable, t.unstaged = true, true
 				}
 			default:
 				// Unrecognized events count as executable so they cannot hide a
 				// tool call.
 				if !conversationEventInert(eventType, envelope) {
 					t.executable = true
+					t.trackExecutableItem(eventType, envelope)
 				}
 			}
 			t.observeDelivery(eventType, envelope, info)
@@ -1013,11 +1088,12 @@ func (t *conversationTurn) invalidateDelivery() {
 }
 
 // deliveredOutput returns staged items whose event was followed by another
-// handed-off event, in output_index order. The caller holds t.mu.
-func (t *conversationTurn) deliveredOutput() conversationInput {
+// handed-off event, or every staged item once the upstream ended the stream,
+// in output_index order. The caller holds t.mu.
+func (t *conversationTurn) deliveredOutput(ended bool) conversationInput {
 	var delivered []conversationStagedItem
 	for _, staged := range t.staged {
-		if staged.event <= t.deliveryEvents-2 {
+		if ended || staged.event <= t.deliveryEvents-2 {
 			delivered = append(delivered, staged)
 		}
 	}
@@ -1038,7 +1114,7 @@ func (t *conversationTurn) deliveredOutput() conversationInput {
 // The caller holds t.mu.
 func (t *conversationTurn) releaseInterruptedAttempt() {
 	targetID := t.deliveryInfo.targetID
-	delivered := t.deliveredOutput()
+	delivered := t.deliveredOutput(false)
 	if (len(delivered.items) > 0 || len(delivered.anchors) > 0) && !t.deliveredInvalid && t.deliveredResponseID != "" && t.haveDeliveryInfo {
 		// Recover interrupted response-ID continuations from what the client
 		// received, not from an upstream copy that may have continued.

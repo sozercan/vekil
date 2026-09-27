@@ -204,20 +204,24 @@ expires or evicts automatically. Capacity errors preserve existing snapshots.
 Before dispatch, Vekil commits an attempt marker. Before exposing a completed
 response, it atomically saves history and clears that marker. If a crash or
 incomplete stream leaves execution uncertain, later continuation is blocked to
-avoid duplicate work. An upstream failure is not uncertain when nothing
-executable reached the client: no tool call, hosted tool call or other item
-besides reasoning and assistant messages, either streamed before the failure or
-carried in it. A client can keep reasoning and messages but cannot run them.
-Vekil treats an event it does not recognize as executable. The failure can be a
-terminal event (`response.failed`, `error`, `response.incomplete` or
-`response.cancelled`), or the upstream closing or resetting the stream without
-one. A stream that Vekil itself ends, through a processing error, its streaming
-timeout or shutdown, stays uncertain. Before the stream is committed, a
-certified failure may instead [fail over](provider-routing.md) to another
-target. After commitment, Vekil clears the marker and forwards that failure
-unchanged, so the client can retry the turn. Output delivered before the
-failure is not saved, so the next turn continues from the previous response. A
-saved completion survives restart.
+avoid duplicate work. An upstream failure is not uncertain: the client received
+exactly what Vekil handed off. The failure can be a terminal event
+(`response.failed`, `error`, `response.incomplete` or `response.cancelled`), or
+the upstream closing or resetting the stream without one. Reasoning and
+assistant messages cannot run anything, so the next turn continues from the
+previous response. A completed tool call or hosted tool call may have run, so
+Vekil first saves every item it handed off as a snapshot of that response, as
+after a client interrupt. Codex runs a delivered call and resends it with its
+output, and that continuation matches the saved history. A turn may also omit
+those items and branch from the earlier history. Execution stays uncertain when
+a tool call reached the client only in part, when executable output arrived
+inside the failure event or a `keepalive`, when an event Vekil does not
+recognize was handed off, or when the handed-off items cannot be saved. A stream
+that Vekil itself ends, through a processing error, its streaming timeout or
+shutdown, stays uncertain too. Before the stream is committed, a certified
+failure may instead [fail over](provider-routing.md) to another target. After
+commitment, Vekil clears the marker and forwards that failure unchanged, so the
+client can retry the turn. A saved completion survives restart.
 
 A client that disconnects or cancels its own request, for example by
 interrupting an agent mid-turn, owns that turn's outcome. Vekil saves the
@@ -231,8 +235,7 @@ response.
 Items the client did not receive from Vekil still fail as incomplete history.
 Unfinished messages that arrived only as deltas are not saved. Vekil does not
 repeat the request automatically. A shutdown or crash is not a client decision
-and still leaves execution uncertain, as does an upstream disconnect after a
-tool call.
+and still leaves execution uncertain.
 
 If an upstream reuses a saved response ID, Vekil withholds the new completion
 and leaves that turn uncertain. The collision does not disable the shared store.
@@ -245,8 +248,9 @@ completion contains `vekil: {"history":"saved","target":"west"}`, with
 completion has no `vekil` field. WebSocket completion objects carry the same
 fields. Fixed-content logs distinguish `attempted`, `completed`, `blocked`,
 `unprotected`, `failed` and `interrupted` recovery. `failed` records a released
-upstream failure, with reason `failure_event` for a terminal event or
-`stream_ended` for a stream the upstream ended without one. `interrupted` records a client disconnect and
+upstream failure, with reason `failure_event` for a terminal event,
+`stream_ended` for a stream the upstream ended without one, or
+`delivered_history_saved` when a completed tool call was saved first. `interrupted` records a client disconnect and
 whether delivered history was saved. A `recording` header alone is not a saved completion.
 
 Errors use `conversation_history_unavailable`, `conversation_history_incomplete`

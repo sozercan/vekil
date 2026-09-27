@@ -159,20 +159,23 @@ contents or credentials.
 
 This code appears only on [conversation migration](conversation-migration.md)
 routes. An earlier turn of the same conversation was dispatched, but Vekil did
-not save its completion. The upstream stream broke after a tool call reached
-the client, Vekil ended the stream itself, or Vekil shut down or crashed before
-it knew the outcome. Every later turn of that conversation returns this `409`,
-including after restart, so a client's automatic retries fail immediately.
-Other conversations are unaffected.
+not save its completion. A tool call reached the client only in part or in a
+form Vekil could not save before the upstream stream broke, Vekil ended the
+stream itself, or Vekil shut down or crashed before it knew the outcome. Every
+later turn of that conversation returns this `409`, including after restart, so
+a client's automatic retries fail immediately. Other conversations are
+unaffected.
 
-Two common interruptions do not cause this code. An upstream failure that
-arrives before any tool call, such as an Azure `429` sent after HTTP `200`,
+Two common interruptions do not cause this code. An upstream failure, such as
+an Azure `429` sent after HTTP `200` or a stream that closes partway through,
 either fails over before the stream is committed or reaches the client
 unchanged after commitment, so the client can retry. This includes a long
-quiet stream that sent only `keepalive` events, and a stream that sent only
-reasoning or message text before the upstream failed or closed it. A client
-that disconnects or cancels a turn, such as an interrupted agent, keeps the
-conversation usable; see
+quiet stream that sent only `keepalive` events, a stream that sent only
+reasoning or message text, and a stream that delivered a completed tool call.
+In the last case Vekil saves what it delivered, so Codex's retry, which carries
+the call and its output, continues the conversation. A client that disconnects
+or cancels a turn, such as an interrupted agent, keeps the conversation usable;
+see
 [conversation migration](conversation-migration.md#storage-diagnostics-and-deletion).
 
 What to do first: start a new conversation in the client. To keep the blocked
