@@ -807,6 +807,8 @@ type routeAttemptTransportBody struct {
 	owner       *routeAttemptTransportOwner
 	observation *routeSendObservation
 	azurePermit *azureTrafficPermit
+	attemptCtx  context.Context
+	upstreamEnd *upstreamBodyEnd
 	closeOnce   sync.Once
 	closeErr    error
 }
@@ -822,6 +824,9 @@ func (b *routeAttemptTransportBody) Read(p []byte) (int, error) {
 	n, err := b.inner.Read(p)
 	if n > 0 {
 		b.observation.observeBodyBytes(n)
+	}
+	if err != nil {
+		b.upstreamEnd.observe(b.attemptCtx, err)
 	}
 	return n, err
 }
@@ -3196,6 +3201,9 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			providerID:   target.provider.id,
 			conversation: operation.conversation,
 		}
+		if operation.conversation != nil {
+			responseInfo.upstreamEnd = &upstreamBodyEnd{}
+		}
 		req = req.WithContext(withExplicitRouteResponseInfo(req.Context(), responseInfo))
 		req.GetBody = nil
 		req = h.withAzureRouteTraffic(req, target)
@@ -3653,7 +3661,8 @@ func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *route
 	receipt.finish(resp, err)
 	azurePermit := azureRouteTrafficFromRequest(req).permit
 	azurePermit.holdResponseBody()
-	resp.Body = &routeAttemptTransportBody{inner: resp.Body, owner: owner, observation: observation, azurePermit: azurePermit}
+	info, _ := req.Context().Value(explicitRouteResponseContextKey{}).(explicitRouteResponseInfo)
+	resp.Body = &routeAttemptTransportBody{inner: resp.Body, owner: owner, observation: observation, azurePermit: azurePermit, attemptCtx: attemptCtx, upstreamEnd: info.upstreamEnd}
 	return resp, err
 }
 

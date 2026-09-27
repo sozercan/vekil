@@ -159,17 +159,20 @@ contents or credentials.
 
 This code appears only on [conversation migration](conversation-migration.md)
 routes. An earlier turn of the same conversation was dispatched, but Vekil did
-not save its completion. The upstream stream broke after output reached the
-client, or Vekil shut down or crashed before it knew the outcome. Every later
-turn of that conversation returns this `409`, including after restart, so a
-client's automatic retries fail immediately. Other conversations are unaffected.
+not save its completion. The upstream stream broke after a tool call reached
+the client, Vekil ended the stream itself, or Vekil shut down or crashed before
+it knew the outcome. Every later turn of that conversation returns this `409`,
+including after restart, so a client's automatic retries fail immediately.
+Other conversations are unaffected.
 
 Two common interruptions do not cause this code. An upstream failure that
-arrives before any output, such as an Azure `429` sent after HTTP `200`, either
-fails over before the stream is committed or reaches the client unchanged after
-commitment, so the client can retry. This includes a long quiet stream that
-sent only `keepalive` events before failing. A client that disconnects or
-cancels a turn, such as an interrupted agent, keeps the conversation usable; see
+arrives before any tool call, such as an Azure `429` sent after HTTP `200`,
+either fails over before the stream is committed or reaches the client
+unchanged after commitment, so the client can retry. This includes a long
+quiet stream that sent only `keepalive` events, and a stream that sent only
+reasoning or message text before the upstream failed or closed it. A client
+that disconnects or cancels a turn, such as an interrupted agent, keeps the
+conversation usable; see
 [conversation migration](conversation-migration.md#storage-diagnostics-and-deletion).
 
 What to do first: start a new conversation in the client. To keep the blocked
