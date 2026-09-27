@@ -357,12 +357,14 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		if h.conversationMigrationEnabled(routeOperation.route) {
 			// Preparation deferred the optimizer rewrite for this route. Apply it
-			// here for protected and unprotected turns alike.
+			// here for protected and unprotected turns alike. An unprotected turn
+			// after a switch also drops the earlier owner's reasoning, so
+			// ownership validation checks the request that is forwarded.
 			scope := responsesRequestToolExecutionScope(prepared.headerToolScope, metadata.PreviousResponseID)
+			prepared.stateBindingBody = body
+			prepared.extraHeaders = headers
+			prepared.upstreamHeaders = responsesUpstreamHeaders(headers, prepared.streaming)
 			if turn := routeOperation.conversation; turn != nil {
-				prepared.body, prepared.stateBindingBody = body, body
-				prepared.extraHeaders = headers
-				prepared.upstreamHeaders = responsesUpstreamHeaders(headers, prepared.streaming)
 				turn.toolContexts, turn.toolScope = h.toolContexts, scope
 			}
 			prepared.body = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(upstreamCtx, body, prepared.model, "responses", true, h.toolContexts, scope)
@@ -785,12 +787,31 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	if routeOperation != nil {
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
-		if err := h.applyExplicitRequestStateBinding(routeOperation, stateBindingBody, extraHeaders); err != nil {
+		writeStateFailure := func(err error) {
 			if writeDurableStateFailure(w, err) {
 				return
 			}
 			statusCode := upstreamStatusCode(err, http.StatusBadRequest)
 			writeOpenAIErrorWithDetails(w, statusCode, err.Error(), "invalid_request_error", "", providerRequestErrorCode(err))
+		}
+		// After a conversation switch, compaction input still carries the
+		// earlier owner's reasoning. Rebuild the dispatch body from the
+		// owner-only request so it gets the same sanitization.
+		ownedBody, ownedHeaders, rewritten, err := h.prepareCompactOwnerRequest(routeOperation, stateBindingBody, extraHeaders)
+		if err != nil {
+			writeStateFailure(err)
+			return
+		}
+		if rewritten {
+			stateBindingBody, extraHeaders = ownedBody, ownedHeaders
+			body = nil
+			if err := json.Unmarshal(h.rewriteResponsesRequestBody(stateBindingBody, "responses/compact", false), &body); err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
+				return
+			}
+		}
+		if err := h.applyExplicitRequestStateBinding(routeOperation, stateBindingBody, extraHeaders); err != nil {
+			writeStateFailure(err)
 			return
 		}
 	}

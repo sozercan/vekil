@@ -172,6 +172,34 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 	return result, nil
 }
 
+// readableConversationHistory canonicalizes full input that history cannot
+// save. It returns the canonical items before the first unsupported item and
+// the anchors of every supported item, which still locate the saved lineage.
+func readableConversationHistory(raw json.RawMessage) conversationInput {
+	var rawItems []json.RawMessage
+	if json.Unmarshal(raw, &rawItems) != nil || len(rawItems) > maxConversationHistoryItems {
+		return conversationInput{}
+	}
+	var readable conversationInput
+	prefix := true
+	for _, rawItem := range rawItems {
+		item, err := canonicalConversationItem(rawItem)
+		if err != nil {
+			prefix = false
+			continue
+		}
+		readable.anchors = append(readable.anchors, item.anchors...)
+		if prefix {
+			readable.items = append(readable.items, item.items...)
+		}
+	}
+	return readable
+}
+
+func canonicalConversationItem(raw json.RawMessage) (conversationInput, error) {
+	return canonicalConversationInput(append(append([]byte("["), raw...), ']'), false)
+}
+
 func conversationItemFields(item map[string]json.RawMessage, allowed ...string) error {
 	for field := range item {
 		found := false
@@ -266,16 +294,18 @@ var conversationWebSearchActionFields = map[string][]string{
 	"find_in_page": {"url", "pattern"},
 }
 
-// Codex replays a web search call with its prefixed ID, status and the action
-// fields it parsed. Keep exactly those so saved history matches the replay.
+// Codex replays a web search call with its status, the action fields it parsed
+// and its ID only when prefixed. Copilot issues opaque IDs that Codex drops, so
+// a call without a prefixed ID is saved without one; Azure and Copilot accept
+// an ID-less call. Keep exactly those fields so saved history matches the replay.
 func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.RawMessage, error) {
 	if err := conversationItemFields(item, "type", "id", "status", "action"); err != nil {
 		return nil, err
 	}
 	var action map[string]json.RawMessage
-	prefix, suffix, prefixed := strings.Cut(rawJSONString(item["id"]), "_")
-	if json.Unmarshal(item["action"], &action) != nil || action == nil || !prefixed || prefix == "" || suffix == "" ||
-		rawJSONString(item["status"]) != "completed" {
+	var id *string
+	if json.Unmarshal(item["action"], &action) != nil || action == nil || rawJSONString(item["status"]) != "completed" ||
+		(item["id"] != nil && json.Unmarshal(item["id"], &id) != nil) {
 		return nil, errConversationHostedState
 	}
 	fields, known := conversationWebSearchActionFields[rawJSONString(action["type"])]
@@ -304,9 +334,13 @@ func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.R
 	if err != nil {
 		return nil, errConversationHostedState
 	}
-	return json.Marshal(map[string]json.RawMessage{
-		"type": json.RawMessage(`"web_search_call"`), "id": item["id"], "status": json.RawMessage(`"completed"`), "action": encodedAction,
-	})
+	canonical := map[string]json.RawMessage{
+		"type": json.RawMessage(`"web_search_call"`), "status": json.RawMessage(`"completed"`), "action": encodedAction,
+	}
+	if prefix, suffix, prefixed := strings.Cut(rawJSONString(item["id"]), "_"); prefixed && prefix != "" && suffix != "" {
+		canonical["id"] = item["id"]
+	}
+	return json.Marshal(canonical)
 }
 
 func validateConversationTools(raw json.RawMessage, depth int) error {
