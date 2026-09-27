@@ -108,9 +108,13 @@ tool definition and completed `web_search_call` items are visible history.
 A saved call keeps the prefixed item ID, `completed` status and the action's
 `type`, `query`, `queries`, `url` and `pattern` fields, which is what Codex
 replays; result sources and `url_citation` annotations on the cited text are
-accepted and dropped because Codex does not retain them either. Only a target
-whose provider declares the capability can receive the call items, so a
-conversation that uses web search skips undeclared targets during migration:
+accepted and dropped because Codex does not retain them either. Copilot issues
+opaque item IDs, which Codex drops on replay, so a call without a prefixed ID
+is saved and replayed without one. Azure rejects a foreign search ID that does
+not start with `ws` or exceeds 64 characters, and it accepts an ID-less call.
+Only a target whose provider declares the capability can receive the call
+items, so a conversation that uses web search skips undeclared targets during
+migration:
 
 ```yaml
 providers:
@@ -123,8 +127,14 @@ Images, audio, file references, other hosted tools, provider
 `conversation`/`prompt` state, background generation, automatic truncation and
 compaction are unsupported. A request or completion carrying them is not
 rejected: Vekil forwards the turn unprotected on the normal route, logs the
-reason, and saves no history for it. Later failover cannot reconstruct that
-turn, and a response-ID continuation from an unprotected completion returns
+reason, and saves no history for it. After a switch, a full-history client
+still replays the earlier owner's encrypted reasoning. When that mixed state
+would fail ownership validation, the unprotected turn instead runs only on the
+saved owner of the conversation's latest snapshot, without failover. It keeps
+only that owner's encrypted reasoning and drops the turn-state header.
+`/v1/responses/compact` follows the same rule, and its output is never saved
+as history. Later failover cannot reconstruct an unprotected turn, and a
+response-ID continuation from an unprotected completion returns
 `conversation_history_unavailable`. Encrypted compaction or a summary cannot
 prove that the original conversation is complete. Supply the original visible
 history; Vekil does not invent a checkpoint. Automatic HTTP/WebSocket compaction

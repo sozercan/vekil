@@ -116,8 +116,16 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		if !conversationUnsupportedState(err) {
 			return fail(err)
 		}
-		h.logConversationRecovery(operation, "unprotected", "", conversationFailureReason(err))
-		return body, headers, nil
+		source, owned, ownedHeaders, ownerErr := h.resolveMixedOwnerRequest(operation, fields, body, headers)
+		if ownerErr != nil {
+			return nil, nil, ownerErr
+		}
+		targetID := ""
+		if source != nil {
+			targetID = source.TargetID
+		}
+		h.logConversationRecovery(operation, "unprotected", targetID, conversationFailureReason(err))
+		return owned, ownedHeaders, nil
 	}
 	if err := validateConversationRequestFields(fields); err != nil {
 		return unprotected(err)
@@ -143,20 +151,9 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 			return fail(err)
 		}
 	} else {
-		source, err = store.lookupIndexes(store.anchorIndexes(routeID, input.anchors))
+		source, err = store.lookupFullHistory(routeID, headers, input)
 		if err != nil {
 			return fail(err)
-		}
-		prefix, err := store.lookupIndexes(store.prefixIndexes(routeID, store.clientScope(routeID, headers), input.items))
-		if err != nil {
-			return fail(err)
-		}
-		// A client may replay streamed item IDs absent from the terminal
-		// response. An older anchor must not hide a newer complete snapshot,
-		// but a matching prefix cannot override a different anchored lineage.
-		if prefix != nil && (source == nil || (prefix.Root == source.Root &&
-			len(prefix.Input) > len(source.Input) && conversationHasPrefix(prefix.Input, source.Input))) {
-			source = prefix
 		}
 	}
 	fullInput := input.items
@@ -201,20 +198,7 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		if len(input.additionalTools) == 0 {
 			turn.additionalTools = cloneRawMessages(source.AdditionalTools)
 		}
-		if _, exists := operation.route.targetByID(source.TargetID); !exists {
-			return fail(errDurableStateIdentity)
-		}
-		if err := operation.forcePinnedTarget(source.TargetID); err != nil {
-			return fail(errDurableStateIdentity)
-		}
-		operation.mu.Lock()
-		operation.stateOwnerIdentity = source.Identity
-		operation.mu.Unlock()
-		// A readable snapshot does not override missing or conflicting ownership
-		// proof. Check the original response before a store:false reconstruction
-		// removes its ID from the upstream request.
-		if err := h.applyDurableRequestStateBinding(h.stateBindings, operation, []stateBindingToken{{stateBindingTypeResponseID, source.ResponseID}}); err != nil {
-			h.logConversationRecovery(operation, "blocked", source.TargetID, "owner_unverified")
+		if err := h.pinConversationOwner(operation, source); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -297,7 +281,7 @@ func (t *conversationTurn) currentOwnerHistoryRequest(headers http.Header) ([]by
 	if json.Unmarshal(t.fields["input"], &rawItems) != nil {
 		return nil, nil, errConversationHistoryPartial
 	}
-	owner := t.store.d.encodeOwner(stateBindingOwner{routeID: t.source.RouteID, targetID: t.source.TargetID, identity: t.source.Identity})
+	owner := t.store.snapshotOwner(t.source)
 	items := make([]json.RawMessage, 0, len(rawItems))
 	visible := 0
 	for _, raw := range rawItems {
@@ -312,14 +296,12 @@ func (t *conversationTurn) currentOwnerHistoryRequest(headers http.Header) ([]by
 			continue
 		}
 		if item.Type == "reasoning" {
-			if item.Encrypted != "" {
-				binding := t.h.stateBindings.lookup(stateBindingTypeEncryptedContent, item.Encrypted)
-				if binding.err != nil {
-					return nil, nil, binding.err
-				}
-				if binding.outcome == stateBindingLookupKnown && binding.owner == owner {
-					items = append(items, raw)
-				}
+			owned, err := t.h.ownsConversationReasoning(owner, item.Encrypted)
+			if err != nil {
+				return nil, nil, err
+			}
+			if owned {
+				items = append(items, raw)
 			}
 			continue
 		}
@@ -333,6 +315,164 @@ func (t *conversationTurn) currentOwnerHistoryRequest(headers http.Header) ([]by
 		return nil, nil, errConversationHistoryPartial
 	}
 	return t.historyRequest(items, headers)
+}
+
+// pinConversationOwner selects a saved conversation's exact owner. A readable
+// snapshot does not override missing or conflicting ownership proof, so check
+// the original response before a store:false reconstruction removes its ID
+// from the upstream request.
+func (h *ProxyHandler) pinConversationOwner(operation *routeOperation, source *conversationSnapshot) error {
+	if _, exists := operation.route.targetByID(source.TargetID); !exists || operation.forcePinnedTarget(source.TargetID) != nil {
+		h.logConversationRecovery(operation, "blocked", "", conversationFailureReason(errDurableStateIdentity))
+		return conversationRequestError(errDurableStateIdentity)
+	}
+	operation.mu.Lock()
+	operation.stateOwnerIdentity = source.Identity
+	operation.mu.Unlock()
+	if err := h.applyDurableRequestStateBinding(h.stateBindings, operation, []stateBindingToken{{stateBindingTypeResponseID, source.ResponseID}}); err != nil {
+		h.logConversationRecovery(operation, "blocked", source.TargetID, "owner_unverified")
+		return err
+	}
+	return nil
+}
+
+func (s *conversationHistoryStore) snapshotOwner(source *conversationSnapshot) stateBindingOwner {
+	return s.d.encodeOwner(stateBindingOwner{routeID: source.RouteID, targetID: source.TargetID, identity: source.Identity})
+}
+
+// ownsConversationReasoning reports whether encrypted reasoning is bound to the
+// saved owner. After a switch, any other reasoning belongs to an earlier owner.
+func (h *ProxyHandler) ownsConversationReasoning(owner stateBindingOwner, encrypted string) (bool, error) {
+	if encrypted == "" {
+		return false, nil
+	}
+	binding := h.stateBindings.lookup(stateBindingTypeEncryptedContent, encrypted)
+	if binding.err != nil {
+		return false, binding.err
+	}
+	return binding.outcome == stateBindingLookupKnown && binding.owner == owner, nil
+}
+
+// resolveMixedOwnerRequest handles a request that history cannot save. After
+// a switch, a full-history client still replays the earlier owner's encrypted
+// reasoning, which ownership validation rejects as mixed state. The request
+// then runs only on the saved owner with only its reasoning; source is nil and
+// the request is unchanged when nothing conflicts.
+func (h *ProxyHandler) resolveMixedOwnerRequest(operation *routeOperation, fields map[string]json.RawMessage, body []byte, headers http.Header) (*conversationSnapshot, []byte, http.Header, error) {
+	source := h.mixedOwnerConversationSource(operation, fields, body, headers)
+	if source == nil {
+		return nil, body, headers, nil
+	}
+	if err := h.pinConversationOwner(operation, source); err != nil {
+		return nil, nil, nil, err
+	}
+	owned, ownedHeaders, err := h.ownerReasoningRequest(fields, headers, source)
+	if err != nil {
+		h.logConversationRecovery(operation, "blocked", source.TargetID, conversationFailureReason(err))
+		return nil, nil, nil, conversationRequestError(err)
+	}
+	return source, owned, ownedHeaders, nil
+}
+
+// prepareCompactOwnerRequest resolves mixed replayed state for
+// /responses/compact on a migration-enabled route. Compaction output is never
+// saved as history, so it follows the unprotected-turn rules. It reports
+// whether it rewrote the request.
+func (h *ProxyHandler) prepareCompactOwnerRequest(operation *routeOperation, body []byte, headers http.Header) ([]byte, http.Header, bool, error) {
+	if operation == nil || !h.conversationMigrationEnabled(operation.route) {
+		return body, headers, false, nil
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || fields == nil {
+		return body, headers, false, nil
+	}
+	source, owned, ownedHeaders, err := h.resolveMixedOwnerRequest(operation, fields, body, headers)
+	if err != nil || source == nil {
+		return owned, ownedHeaders, false, err
+	}
+	h.logConversationRecovery(operation, "unprotected", source.TargetID, conversationFailureReason(errConversationCompaction))
+	return owned, ownedHeaders, true, nil
+}
+
+// mixedOwnerConversationSource returns the saved owner of a switched
+// conversation whose unprotected full-history request would otherwise fail
+// ownership validation with mixed state. Every other request, including one
+// whose lookup fails, keeps ordinary routing and validation. Response-ID,
+// provider-conversation and import requests carry no earlier owner's items.
+func (h *ProxyHandler) mixedOwnerConversationSource(operation *routeOperation, fields map[string]json.RawMessage, body []byte, headers http.Header) *conversationSnapshot {
+	if rawJSONHasNonEmptyValue(fields["previous_response_id"]) || rawJSONHasNonEmptyValue(fields["conversation"]) ||
+		headerGetCI(headers, "X-Vekil-History-Complete") != "" {
+		return nil
+	}
+	routeID := operation.route.public.routeID
+	tokens, err := extractResponsesRequestState(body, headers, true)
+	if err != nil || len(tokens) == 0 {
+		return nil
+	}
+	if result := h.stateBindings.resolveForRoute(routeID, operation.pinnedTarget(), tokens); result.err != nil || result.outcome != stateBindingLookupConflict {
+		return nil
+	}
+	// The saved lineage must be a prefix of the readable history, as it must
+	// for a protected continuation.
+	readable := readableConversationHistory(fields["input"])
+	source, err := h.conversationHistory.lookupFullHistory(routeID, headers, readable)
+	if err != nil || source == nil || !source.Migrated || !conversationHasPrefix(readable.items, source.Input) {
+		return nil
+	}
+	return source
+}
+
+// lookupFullHistory finds the saved snapshot that full input continues, by the
+// provider anchors it replays or by its visible prefix within the client scope.
+func (s *conversationHistoryStore) lookupFullHistory(routeID string, headers http.Header, input conversationInput) (*conversationSnapshot, error) {
+	source, err := s.lookupIndexes(s.anchorIndexes(routeID, input.anchors))
+	if err != nil {
+		return nil, err
+	}
+	prefix, err := s.lookupIndexes(s.prefixIndexes(routeID, s.clientScope(routeID, headers), input.items))
+	if err != nil {
+		return nil, err
+	}
+	// A client may replay streamed item IDs absent from the terminal
+	// response. An older anchor must not hide a newer complete snapshot,
+	// but a matching prefix cannot override a different anchored lineage.
+	if prefix != nil && (source == nil || (prefix.Root == source.Root &&
+		len(prefix.Input) > len(source.Input) && conversationHasPrefix(prefix.Input, source.Input))) {
+		source = prefix
+	}
+	return source, nil
+}
+
+// ownerReasoningRequest forwards the client's own items unsaved, keeping only
+// reasoning proven to belong to the saved owner.
+func (h *ProxyHandler) ownerReasoningRequest(fields map[string]json.RawMessage, headers http.Header, source *conversationSnapshot) ([]byte, http.Header, error) {
+	var rawItems []json.RawMessage
+	if json.Unmarshal(fields["input"], &rawItems) != nil {
+		return nil, nil, errConversationHistoryPartial
+	}
+	owner := h.conversationHistory.snapshotOwner(source)
+	items := make([]json.RawMessage, 0, len(rawItems))
+	for _, raw := range rawItems {
+		var item map[string]json.RawMessage
+		if json.Unmarshal(raw, &item) == nil && rawJSONString(item["type"]) == "reasoning" {
+			owned, err := h.ownsConversationReasoning(owner, rawJSONString(item["encrypted_content"]))
+			if err != nil {
+				return nil, nil, err
+			}
+			if !owned {
+				continue
+			}
+		}
+		items = append(items, raw)
+	}
+	body, err := json.Marshal(copyResponsesRequestFieldsWithInput(fields, items))
+	if err != nil {
+		return nil, nil, errConversationHistoryPartial
+	}
+	headers = headers.Clone()
+	// A turn-state header from before the switch would name the earlier owner.
+	deleteConversationHeader(headers, "X-Codex-Turn-State")
+	return body, headers, nil
 }
 
 func (t *conversationTurn) historyRequest(input []json.RawMessage, headers http.Header) ([]byte, http.Header, error) {
