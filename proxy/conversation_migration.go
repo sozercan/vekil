@@ -24,6 +24,7 @@ type conversationTurn struct {
 	store           *conversationHistoryStore
 	operation       *routeOperation
 	source          *conversationSnapshot
+	sourceKey       []byte
 	root            string
 	scope           string
 	input           []json.RawMessage
@@ -192,6 +193,7 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 	}
 	if source != nil {
 		turn.root, turn.migrated = source.Root, source.Migrated
+		turn.sourceKey = store.responseKey(source.RouteID, source.ResponseID)
 		if turn.scope == "" {
 			turn.scope = source.Scope
 		}
@@ -228,7 +230,7 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		rawMessagesSize(turn.input)+rawMessagesSize(turn.additionalTools)+len(turn.instructions)+len(turn.tools) > store.config.MaxHistoryBytes {
 		return fail(errConversationHistoryCapacity)
 	}
-	if err := store.acquire(turn.root); err != nil {
+	if err := store.acquireFrom(turn.root, turn.sourceKey); err != nil {
 		return fail(err)
 	}
 	operation.conversation = turn
@@ -540,7 +542,7 @@ func (t *conversationTurn) persistIntent() error {
 	if t.pending {
 		return nil
 	}
-	if err := t.store.beginAttempt(t.root, t.operation.operationID()); err != nil {
+	if err := t.store.beginAttemptFrom(t.root, t.operation.operationID(), t.sourceKey); err != nil {
 		return conversationRequestError(err)
 	}
 	t.pending = true
@@ -610,13 +612,13 @@ func (t *conversationTurn) unprotect(targetID, reason string) error {
 // An upstream that ends an attempt leaves a known outcome: the client received
 // exactly what Vekil handed off. The upstream ends it with a terminal failure
 // event, or by closing or resetting the stream without one (reason
-// stream_ended). Reasoning and assistant messages cannot run anything. A
-// completed tool call may have run, so the items handed off are saved first,
-// and a continuation that includes the call and its output matches verified
-// history. Clear the attempt marker and forward the upstream failure unchanged
-// so the client can apply its own retry policy. Executable output that cannot
-// be saved, or that sits inside the failure event itself, leaves execution
-// uncertain. The caller holds t.mu.
+// stream_ended). Reasoning and assistant messages cannot run anything, so the
+// attempt marker is cleared. A completed tool call may have run, so the items
+// handed off are saved and the marker admits only a continuation that includes
+// the call and its output. Either way the upstream failure is forwarded
+// unchanged so the client can apply its own retry policy. Executable output
+// that cannot be saved, or that sits inside the failure event itself, leaves
+// execution uncertain. The caller holds t.mu.
 func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMessage, targetID, reason string) error {
 	if t.saved || conversationEventHasExecutableOutput(envelope) {
 		return conversationRequestError(errConversationIncomplete)
@@ -735,11 +737,11 @@ func (t *conversationTurn) trackExecutableItem(eventType string, envelope map[st
 
 // saveEndedHistory saves every item an upstream-ended attempt handed off, after
 // executable output reached the client. The end followed each handed-off item,
-// so all of them count as delivered. The client owns that outcome, as after an
-// interrupt: Codex runs a delivered tool call and resends it with its output.
+// so all of them count as delivered. Codex runs a delivered tool call and
+// resends it with its output; that continuation is admitted. The marker stays
+// for any turn that branches from earlier history, which could repeat the call.
 // An item handed off only in part, content staging cannot save, or a failed
-// save leaves execution uncertain. Saving clears the marker. The caller holds
-// t.mu.
+// save leaves execution uncertain. The caller holds t.mu.
 func (t *conversationTurn) saveEndedHistory(targetID string) error {
 	delivered := t.deliveredOutput(true)
 	if t.unstaged || len(t.openItems) > 0 || t.deliveredInvalid || !t.haveDeliveryInfo || t.deliveredResponseID == "" ||
@@ -748,7 +750,7 @@ func (t *conversationTurn) saveEndedHistory(targetID string) error {
 	}
 	snapshot, err := t.historySnapshot(t.deliveredResponseID, t.deliveryInfo, delivered, false)
 	if err == nil {
-		err = t.store.save(snapshot)
+		err = t.store.saveDelivered(snapshot)
 	}
 	if errors.Is(err, errConversationHistoryStorage) || errors.Is(err, errConversationHistoryCapacity) || errors.Is(err, errConversationHistoryUncertain) {
 		t.blocked = true

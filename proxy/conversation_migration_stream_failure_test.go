@@ -157,6 +157,16 @@ func TestConversationMigrationCommittedFailureAllowsRetry(t *testing.T) {
 				t.Fatalf("committed failure: code=%d sends=%d west=%d %s", failed.Code, sends.Load(), west.Load(), conversationBodyTail(failed))
 			}
 			retry := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Try again."}, nil)
+			if scenario == "completed tool call before failure" {
+				// A branch from before the delivered call could repeat it. The
+				// continuation that returns the call's output is admitted.
+				if retry.Code != http.StatusConflict || sends.Load() != 2 {
+					t.Fatalf("branch after a delivered call was admitted: %d %s", retry.Code, conversationBodyTail(retry))
+				}
+				retry = conversationPOST(t, h, map[string]any{"previous_response_id": conversationStreamedResponseID, "input": []any{
+					map[string]any{"type": "function_call_output", "call_id": "call-streamed", "output": "edited"},
+				}}, nil)
+			}
 			if blocked[scenario] {
 				// Executable output that Vekil could not save keeps the outcome
 				// uncertain.
@@ -190,7 +200,7 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 	session := http.Header{"Session_id": {"client-a"}}
 	for _, scenario := range []string{
 		"reasoning then close", "message then reset", "tool call then close", "tool call then close, Codex retry",
-		"arguments then reset", "unrecognized event then close", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
+		"tool call then close, branch retry", "arguments then reset", "unrecognized event then close", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			var h *ProxyHandler
@@ -216,7 +226,7 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning), nil
 					case "message then reset":
 						return conversationStreamResponse(req, nil, created, conversationStreamedTextDelta, reset), nil
-					case "tool call then close", "tool call then close, Codex retry":
+					case "tool call then close", "tool call then close, Codex retry", "tool call then close, branch retry":
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall), nil
 					case "unrecognized event then close":
 						vendor := "event: response.vendor_progress\ndata: " + `{"type":"response.vendor_progress","output_index":1}` + "\n\n"
@@ -266,10 +276,16 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 				}
 				return
 			}
-			// A client may retry without what it received, branching from the
-			// earlier history.
+			// After reasoning or a message, a client may retry from the earlier
+			// history. After a delivered tool call, only a continuation that
+			// returns the call's output is admitted; a branch could repeat it.
 			retryFields := map[string]any{"previous_response_id": "seed", "input": "Next."}
-			if scenario == "tool call then close, Codex retry" {
+			switch scenario {
+			case "tool call then close":
+				retryFields = map[string]any{"previous_response_id": conversationStreamedResponseID, "input": []any{
+					map[string]any{"type": "function_call_output", "call_id": "call-streamed", "output": "edited"},
+				}}
+			case "tool call then close, Codex retry":
 				// Codex runs the delivered call and resends it with its output.
 				retryFields = map[string]any{"input": []any{
 					map[string]any{"role": "user", "content": "Seed."}, conversationText("Known earlier answer."),
@@ -296,7 +312,7 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 			if sends.Load() != 3 || west.Load() != 0 {
 				t.Fatalf("retry was not a single owner send: sends=%d west=%d", sends.Load(), west.Load())
 			}
-			if body := retriedBody.Load().(string); scenario == "tool call then close, Codex retry" && (!strings.Contains(body, "call-streamed") || !strings.Contains(body, "edited")) {
+			if body := retriedBody.Load().(string); strings.HasPrefix(scenario, "tool call then close") && (!strings.Contains(body, "call-streamed") || !strings.Contains(body, "edited")) {
 				t.Fatalf("retry lost the delivered call or its output: %s", body)
 			}
 		})
@@ -363,7 +379,17 @@ func TestConversationMigrationWebSocketUpstreamEndAllowsRetry(t *testing.T) {
 			if strings.Contains(ended, "conversation_execution_uncertain") {
 				t.Fatalf("ended turn reported uncertainty: %s", ended)
 			}
-			conversationWebSocketTurn(t, conn, turn())
+			next := turn()
+			if scenario == "tool call then close" {
+				// A branch could repeat the delivered call; its continuation cannot.
+				if branch := conversationWebSocketFailedTurn(t, conn, turn()); sends.Load() != 2 || !strings.Contains(branch, "conversation_execution_uncertain") {
+					t.Fatalf("branch after a delivered call was admitted: sends=%d %s", sends.Load(), branch)
+				}
+				next = map[string]any{"previous_response_id": conversationStreamedResponseID, "input": []any{
+					map[string]any{"type": "function_call_output", "call_id": "call-streamed", "output": "edited"},
+				}}
+			}
+			conversationWebSocketTurn(t, conn, next)
 			if sends.Load() != 3 {
 				t.Fatalf("retry was not a single owner send: sends=%d", sends.Load())
 			}

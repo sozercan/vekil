@@ -212,8 +212,10 @@ assistant messages cannot run anything, so the next turn continues from the
 previous response. A completed tool call or hosted tool call may have run, so
 Vekil first saves every item it handed off as a snapshot of that response, as
 after a client interrupt. Codex runs a delivered call and resends it with its
-output, and that continuation matches the saved history. A turn may also omit
-those items and branch from the earlier history. Execution stays uncertain when
+output, and that continuation matches the saved history. Only a turn that
+continues from those items is admitted; a turn that branches from the earlier
+history still gets the `409`, because it could repeat the call. Execution stays
+uncertain when
 a tool call reached the client only in part, when executable output arrived
 inside the failure event or a `keepalive`, when an event Vekil does not
 recognize was handed off, or when the handed-off items cannot be saved. A stream

@@ -161,7 +161,9 @@ This code appears only on [conversation migration](conversation-migration.md)
 routes. An earlier turn of the same conversation was dispatched, but Vekil did
 not save its completion. A tool call reached the client only in part or in a
 form Vekil could not save before the upstream stream broke, Vekil ended the
-stream itself, or Vekil shut down or crashed before it knew the outcome. Every
+stream itself, or Vekil shut down or crashed before it knew the outcome. After
+a completed tool call, a turn that retries from before that call instead of
+returning its output also gets this `409`, because it could repeat the call. Every
 later turn of that conversation returns this `409`, including after restart, so
 a client's automatic retries fail immediately. Other conversations are
 unaffected.

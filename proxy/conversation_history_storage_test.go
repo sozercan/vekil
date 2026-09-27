@@ -128,6 +128,45 @@ func TestConversationHistoryStorageReopenRetainsCompleteSnapshots(t *testing.T) 
 	retained.release(first.Root)
 }
 
+func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t *testing.T) {
+	bindings, history, file := newConversationHistoryStorageFixture(t, ConversationMigrationConfig{})
+	now := time.Now()
+	parent := conversationHistoryStorageSnapshot(history, "response-parent", "delivered-root", now)
+	saveConversationHistoryStorageSnapshot(t, history, parent)
+	delivered := conversationHistoryStorageSnapshot(history, "response-delivered", parent.Root, now)
+	parentKey := history.responseKey(parent.RouteID, parent.ResponseID)
+	deliveredKey := history.responseKey(delivered.RouteID, delivered.ResponseID)
+	if err := history.beginAttemptFrom(parent.Root, "ended-operation", parentKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.saveDelivered(delivered); err != nil {
+		t.Fatal(err)
+	}
+	// The released marker survives a reopen and its integrity check.
+	closeDurableStoreFixture(t, bindings)
+	_, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
+	requireConversationHistoryStorageSnapshot(t, retained, delivered)
+	for _, source := range [][]byte{nil, parentKey} {
+		if err := retained.acquireFrom(parent.Root, source); !errors.Is(err, errConversationHistoryUncertain) {
+			t.Fatalf("branch from %x admitted: %v", source, err)
+		}
+	}
+	if err := retained.acquireFrom(parent.Root, deliveredKey); err != nil {
+		t.Fatalf("continuation refused: %v", err)
+	}
+	retained.release(parent.Root)
+	if err := retained.beginAttemptFrom(parent.Root, "continuation-operation", deliveredKey); err != nil {
+		t.Fatalf("continuation attempt refused: %v", err)
+	}
+	if retained.counts.pending != 1 {
+		t.Fatalf("pending attempts = %d, want the continuation's alone", retained.counts.pending)
+	}
+	// The continuation now owns an ordinary marker.
+	if err := retained.acquireFrom(parent.Root, deliveredKey); !errors.Is(err, errConversationHistoryUncertain) {
+		t.Fatalf("continuation marker admitted another turn: %v", err)
+	}
+}
+
 func TestConversationHistoryStorageCapacityNeverEvicts(t *testing.T) {
 	for _, bound := range []string{"snapshots", "total bytes", "history bytes"} {
 		t.Run(bound, func(t *testing.T) {
