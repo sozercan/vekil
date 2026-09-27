@@ -475,6 +475,9 @@ func (h *ProxyHandler) ownerReasoningRequest(fields map[string]json.RawMessage, 
 	if err != nil {
 		return nil, nil, errConversationHistoryPartial
 	}
+	if len(body) > maxLargeRequestBodySize {
+		return nil, nil, errConversationHistoryCapacity
+	}
 	headers = headers.Clone()
 	// A turn-state header from before the switch would name the earlier owner.
 	deleteConversationHeader(headers, "X-Codex-Turn-State")
