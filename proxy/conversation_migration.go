@@ -653,6 +653,9 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 				if conversationEventHasOutput(envelope) {
 					t.exposed = true
 				}
+			case "keepalive":
+				// Upstreams emit these while a long generation is quiet. They
+				// carry no output or state.
 			default:
 				// Unrecognized events count as output so they cannot hide progress.
 				t.exposed = true
@@ -883,16 +886,30 @@ type conversationCompletionBody struct {
 func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil && !errors.Is(err, context.Canceled) {
-		b.turn.mu.Lock()
-		saved := b.turn.saved || b.turn.unprotected || b.turn.failed
-		if !saved && !b.turn.clientEnded() {
+		t := b.turn
+		_, _, storageFailure := durableStateFailureDetails(err)
+		upstreamEnded := !storageFailure && providerRequestErrorCode(err) == ""
+		t.mu.Lock()
+		saved := t.saved || t.unprotected || t.failed
+		if !saved && !t.clientEnded() {
+			if upstreamEnded && !t.blocked && !t.exposed {
+				// The upstream stream ended before any output reached the
+				// client. Like a pre-output failure event, the client has
+				// nothing to act on, so release the attempt and forward the
+				// upstream error unchanged.
+				releaseErr := t.releaseFailedAttempt(nil, t.deliveryInfo.targetID)
+				t.mu.Unlock()
+				if releaseErr != nil {
+					return n, releaseErr
+				}
+				return n, err
+			}
 			// The stream ended without a known outcome while the client was
 			// still connected. A later disconnect must not release it.
-			b.turn.streamUncertain = true
+			t.streamUncertain = true
 		}
-		b.turn.mu.Unlock()
-		_, _, storageFailure := durableStateFailureDetails(err)
-		if !saved && !storageFailure && providerRequestErrorCode(err) == "" {
+		t.mu.Unlock()
+		if !saved && upstreamEnded {
 			return n, conversationRequestError(errConversationIncomplete)
 		}
 	}
