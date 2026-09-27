@@ -88,8 +88,11 @@ See [Azure's rate-limit guidance](https://learn.microsoft.com/en-us/azure/foundr
 for the remaining-capacity and reset headers.
 
 Azure recovery admits one request at a time per deployment until its waiting
-queue drains. Each permit lasts through response completion or close, so a long
-generation can delay other requests to that deployment. Each deployment may
+queue drains. A streamed permit ends at the first text, reasoning, or tool
+output, because that output shows Azure admitted the request. A throttle later in
+the same stream still renews the cooldown for requests not yet admitted.
+Rejections, non-streaming responses, and streams without output keep the permit
+until the response completes or closes. Each deployment may
 queue at most 16 requests and 16 MiB of request bodies. The process keeps at most
 256 deployment cooldowns, 64 waiting requests, and 64 MiB of queued request bodies.
 Requests larger than 16 MiB can run immediately but cannot enter a recovery queue.
@@ -98,6 +101,16 @@ shutdown cancel it. Queue overflow returns `503 rate_limit_queue_full` for a new
 admission. A retry that cannot wait returns its last upstream rejection, retaining
 the reset and request correlation. These limits apply to explicit Azure inference
 routes; classifier admission and version-1 retries retain their existing behavior.
+
+A wait that reaches the five-minute cap returns a local `429` with the message
+`Azure deployment rate limit is still active` and no upstream send. Codex 0.157
+does not retry HTTP `429`, so it ends the turn with `exceeded retry limit, last
+status: 429 Too Many Requests`. This affects any request that must stay on the
+cooling deployment: provider-bound threads that cannot migrate (such as threads
+with Codex compaction items), `primary_only` routes, and routes without another
+eligible target. On `priority_failover` routes, fresh requests fail over to an
+eligible target instead. If this repeats, the deployment's TPM is below
+sustained demand.
 
 Client retries start new operation send budgets, but share these deployment
 cooldowns within the process. Vekil does not deduplicate identical requests,

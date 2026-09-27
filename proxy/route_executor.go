@@ -2302,6 +2302,13 @@ func (o *routeAttemptResponseObserver) applyStreamingTerminal(outcome routeAttem
 	return true
 }
 
+func (o *routeAttemptResponseObserver) mergeStreamingEventProgress(progress upstreamSemanticProgress) {
+	o.progress = mergeUpstreamSemanticProgress(o.progress, progress)
+	if progress == upstreamProgressSemanticOutput || progress == upstreamProgressToolActivity {
+		o.azureTraffic.permit.resolveProbe()
+	}
+}
+
 func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) bool {
 	data = strings.TrimSpace(data)
 	if o.usageOnly && !taskUsageStreamEventNeedsInspection(o.endpoint, eventType, data) {
@@ -2329,7 +2336,7 @@ func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) b
 			return o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
 		}
 		if !o.terminal {
-			o.progress = mergeUpstreamSemanticProgress(o.progress, inspection.progress)
+			o.mergeStreamingEventProgress(inspection.progress)
 		}
 		return false
 	default:
@@ -2356,7 +2363,7 @@ func (o *routeAttemptResponseObserver) observeSSEEvent(eventType, data string) b
 			return o.applyStreamingTerminal(routeAttemptOutcomeSucceeded, upstreamProgressTerminalSuccess)
 		}
 		if !o.terminal {
-			o.progress = mergeUpstreamSemanticProgress(o.progress, inspection.progress)
+			o.mergeStreamingEventProgress(inspection.progress)
 		}
 		return false
 	}
@@ -2416,7 +2423,7 @@ func (o *routeAttemptResponseObserver) observeResponsesEvent(eventType, data str
 		return true
 	default:
 		if !o.terminal {
-			o.progress = mergeUpstreamSemanticProgress(o.progress, routeAttemptResponsesEventProgress(event))
+			o.mergeStreamingEventProgress(routeAttemptResponsesEventProgress(event))
 		}
 		return false
 	}
