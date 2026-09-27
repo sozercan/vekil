@@ -177,13 +177,13 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 // the anchors of every supported item, which still locate the saved lineage.
 func readableConversationHistory(raw json.RawMessage) conversationInput {
 	var rawItems []json.RawMessage
-	if json.Unmarshal(raw, &rawItems) != nil {
+	if json.Unmarshal(raw, &rawItems) != nil || len(rawItems) > maxConversationHistoryItems {
 		return conversationInput{}
 	}
 	var readable conversationInput
 	prefix := true
 	for _, rawItem := range rawItems {
-		item, err := canonicalConversationInput(append(append([]byte("["), rawItem...), ']'), false)
+		item, err := canonicalConversationItem(rawItem)
 		if err != nil {
 			prefix = false
 			continue
@@ -194,6 +194,10 @@ func readableConversationHistory(raw json.RawMessage) conversationInput {
 		}
 	}
 	return readable
+}
+
+func canonicalConversationItem(raw json.RawMessage) (conversationInput, error) {
+	return canonicalConversationInput(append(append([]byte("["), raw...), ']'), false)
 }
 
 func conversationItemFields(item map[string]json.RawMessage, allowed ...string) error {
@@ -299,7 +303,9 @@ func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.R
 		return nil, err
 	}
 	var action map[string]json.RawMessage
-	if json.Unmarshal(item["action"], &action) != nil || action == nil || rawJSONString(item["status"]) != "completed" {
+	var id *string
+	if json.Unmarshal(item["action"], &action) != nil || action == nil || rawJSONString(item["status"]) != "completed" ||
+		(item["id"] != nil && json.Unmarshal(item["id"], &id) != nil) {
 		return nil, errConversationHostedState
 	}
 	fields, known := conversationWebSearchActionFields[rawJSONString(action["type"])]

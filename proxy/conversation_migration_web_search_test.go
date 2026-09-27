@@ -210,6 +210,9 @@ func TestConversationWebSearchCallCanonicalForm(t *testing.T) {
 		{"in progress", `{"type":"web_search_call","id":"ws_4","status":"in_progress","action":{"type":"search","query":"docs"}}`, ""},
 		{"missing id", `{"type":"web_search_call","status":"completed","action":{"type":"search","query":"docs"}}`,
 			`{"action":{"query":"docs","type":"search"},"status":"completed","type":"web_search_call"}`},
+		{"null id", `{"type":"web_search_call","id":null,"status":"completed","action":{"type":"search","query":"docs"}}`,
+			`{"action":{"query":"docs","type":"search"},"status":"completed","type":"web_search_call"}`},
+		{"non-string id", `{"type":"web_search_call","id":7,"status":"completed","action":{"type":"search","query":"docs"}}`, ""},
 		{"missing action type", `{"type":"web_search_call","id":"ws_5","status":"completed","action":{"query":"docs"}}`, ""},
 		{"unknown field", `{"type":"web_search_call","id":"ws_6","status":"completed","action":{"type":"search"},"results":[]}`, ""},
 	} {

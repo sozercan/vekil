@@ -390,6 +390,48 @@ func TestConversationMigrationCompactsMigratedConversationOnSavedOwner(t *testin
 	}
 }
 
+// Azure rejects Copilot's 428-character IDs, so an unprotected turn on an Azure
+// owner must not forward the IDs a client kept from earlier Copilot output.
+func TestConversationMigrationUnprotectedTurnDropsEarlierOwnerItemIDs(t *testing.T) {
+	var eastDown atomic.Bool
+	var westBodies []string
+	eastOutput, westOutput := conversationCopilotWebSearchOutput("private-east-1"), conversationAzureOutput("west")
+	h, _ := newConversationAPIHandler(t, conversationSwitchTransport(t, &eastDown, eastOutput, conversationWestOutputs(t, westOutput), &westBodies), conversationSwitchConfig(t))
+	tools := []any{map[string]any{"type": "web_search"}}
+	history := []any{conversationUserText("Find the docs.")}
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": history, "tools": tools, "store": false}, nil), false)
+	eastDown.Store(true)
+	history = append(history, eastOutput...)
+	history = append(history, conversationUserText("Continue."))
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": history, "tools": tools, "store": false}, nil), false)
+
+	history = append(history, westOutput...)
+	history = append(history, conversationImageMessage())
+	result := conversationPOST(t, h, map[string]any{"input": history, "tools": tools, "store": false}, nil)
+	if result.Code != http.StatusOK || len(westBodies) != 2 {
+		t.Fatalf("unsupported turn on the migrated owner was not forwarded: %d %s", result.Code, result.Body.String())
+	}
+	forwarded := westBodies[1]
+	for _, kind := range []string{"rs", "ws", "msg"} {
+		if strings.Contains(forwarded, conversationCopilotItemID(kind)) {
+			t.Errorf("west request carries east's %s item ID: %s", kind, forwarded)
+		}
+	}
+	if !strings.Contains(forwarded, conversationIDLessSearch) || !strings.Contains(forwarded, "input_image") || strings.Contains(forwarded, "private-east-1") {
+		t.Errorf("west request carries the wrong history: %s", forwarded)
+	}
+}
+
+func TestReadableConversationHistoryHonorsItemLimit(t *testing.T) {
+	items := make([]any, maxConversationHistoryItems+1)
+	for i := range items {
+		items[i] = conversationUserText("x")
+	}
+	if readable := readableConversationHistory(mustJSON(t, items)); len(readable.items) != 0 || len(readable.anchors) != 0 {
+		t.Fatalf("readable history over the item limit = %d items, %d anchors", len(readable.items), len(readable.anchors))
+	}
+}
+
 func TestReadableConversationHistoryStopsAtUnsupportedItems(t *testing.T) {
 	items := []any{conversationUserText("Start.")}
 	items = append(items, conversationAzureOutput("east")...)

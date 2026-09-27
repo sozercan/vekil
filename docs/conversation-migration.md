@@ -131,7 +131,8 @@ reason, and saves no history for it. After a switch, a full-history client
 still replays the earlier owner's encrypted reasoning. When that mixed state
 would fail ownership validation, the unprotected turn instead runs only on the
 saved owner of the conversation's latest snapshot, without failover. It keeps
-only that owner's encrypted reasoning and drops the turn-state header.
+only that owner's encrypted reasoning, drops the turn-state header, and sends
+readable items without their earlier provider IDs.
 `/v1/responses/compact` follows the same rule, and its output is never saved
 as history. Later failover cannot reconstruct an unprotected turn, and a
 response-ID continuation from an unprotected completion returns

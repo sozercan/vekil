@@ -444,7 +444,7 @@ func (s *conversationHistoryStore) lookupFullHistory(routeID string, headers htt
 }
 
 // ownerReasoningRequest forwards the client's own items unsaved, keeping only
-// reasoning proven to belong to the saved owner.
+// reasoning proven to belong to the saved owner and no earlier provider IDs.
 func (h *ProxyHandler) ownerReasoningRequest(fields map[string]json.RawMessage, headers http.Header, source *conversationSnapshot) ([]byte, http.Header, error) {
 	var rawItems []json.RawMessage
 	if json.Unmarshal(fields["input"], &rawItems) != nil {
@@ -459,9 +459,15 @@ func (h *ProxyHandler) ownerReasoningRequest(fields map[string]json.RawMessage, 
 			if err != nil {
 				return nil, nil, err
 			}
-			if !owned {
-				continue
+			if owned {
+				items = append(items, raw)
 			}
+			continue
+		}
+		// As in a protected continuation, readable items lose earlier owners'
+		// provider IDs. Items that history cannot save are forwarded as sent.
+		if canonical, err := canonicalConversationItem(raw); err == nil && len(canonical.items) == 1 {
+			raw = canonical.items[0]
 		}
 		items = append(items, raw)
 	}
