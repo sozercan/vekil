@@ -649,7 +649,8 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 					return nil, err
 				}
 				return data, nil
-			case "response.queued", "response.created", "response.in_progress":
+			case "response.queued", "response.created", "response.in_progress", "keepalive":
+				// Upstreams emit keepalives while a long generation is quiet.
 				if conversationEventHasOutput(envelope) {
 					t.exposed = true
 				}
