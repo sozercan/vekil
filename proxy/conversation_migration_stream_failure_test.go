@@ -76,7 +76,7 @@ const (
 )
 
 func TestConversationMigrationCommittedFailureBeforeOutputAllowsRetry(t *testing.T) {
-	for _, scenario := range []string{"failed", "error event", "queued then failed", "keepalive then error event", "output before failure"} {
+	for _, scenario := range []string{"failed", "error event", "queued then failed", "keepalive then error event", "output before failure", "output in keepalive"} {
 		t.Run(scenario, func(t *testing.T) {
 			var sends, west atomic.Int32
 			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -102,6 +102,9 @@ func TestConversationMigrationCommittedFailureBeforeOutputAllowsRetry(t *testing
 						return conversationStreamResponse(req, nil, created, conversationKeepalive, conversationKeepalive, conversationRateLimitError), nil
 					case "output before failure":
 						return conversationStreamResponse(req, nil, created, "data: "+`{"type":"response.output_text.delta","delta":"partial"}`+"\n\n", conversationRateLimitFailed), nil
+					case "output in keepalive":
+						keepalive := "event: keepalive\ndata: " + `{"type":"keepalive","sequence_number":2,"response":{"id":"resp-streamed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}]}}` + "\n\n"
+						return conversationStreamResponse(req, nil, created, keepalive, conversationRateLimitError), nil
 					}
 					return conversationStreamResponse(req, nil, created, conversationRateLimitFailed), nil
 				}
@@ -115,7 +118,7 @@ func TestConversationMigrationCommittedFailureBeforeOutputAllowsRetry(t *testing
 				t.Fatalf("committed failure: code=%d sends=%d west=%d %s", failed.Code, sends.Load(), west.Load(), conversationBodyTail(failed))
 			}
 			retry := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Try again."}, nil)
-			if scenario == "output before failure" {
+			if scenario == "output before failure" || scenario == "output in keepalive" {
 				// Output reached the client, so the outcome remains uncertain.
 				if !strings.Contains(failed.Body.String(), "conversation_execution_uncertain") {
 					t.Fatalf("missing execution uncertainty diagnostic: %s", conversationBodyTail(failed))
