@@ -215,15 +215,16 @@ after a client interrupt. Codex runs a delivered call and resends it with its
 output, and that continuation matches the saved history. Only a turn that
 continues from those items is admitted; a turn that branches from the earlier
 history still gets the `409`, because it could repeat the call. Execution stays
-uncertain when
-a tool call reached the client only in part, when executable output arrived
-inside the failure event or a `keepalive`, when an event Vekil does not
-recognize was handed off, or when the handed-off items cannot be saved. A stream
-that Vekil itself ends, through a processing error, its streaming timeout or
-shutdown, stays uncertain too. Before the stream is committed, a certified
-failure may instead [fail over](provider-routing.md) to another target. After
-commitment, Vekil clears the marker and forwards that failure unchanged, so the
-client can retry the turn. A saved completion survives restart.
+uncertain when a tool call reached the client only in part, when executable
+output arrived inside the failure event or a `keepalive`, when an event Vekil
+does not recognize was handed off, or when the handed-off items cannot be saved.
+A stream that Vekil itself ends, through a processing error, its streaming
+timeout or shutdown, stays uncertain too. Before the stream is committed, a
+certified failure may instead [fail over](provider-routing.md) to another
+target. After commitment, Vekil forwards that failure unchanged, so the client
+can retry the turn. After only reasoning and messages, it clears the marker.
+After a completed tool call, it keeps the marker pointed at the saved items
+until a turn continues from them. A saved completion survives restart.
 
 A client that disconnects or cancels its own request, for example by
 interrupting an agent mid-turn, owns that turn's outcome. Vekil saves the
