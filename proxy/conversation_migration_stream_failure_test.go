@@ -43,12 +43,20 @@ func conversationStreamResponse(req *http.Request, header http.Header, parts ...
 			case error:
 				_ = pw.CloseWithError(value)
 				return
+			case conversationCloseOnCancel:
+				<-req.Context().Done()
+				_ = pw.Close()
+				return
 			}
 		}
 		_ = pw.Close()
 	}()
 	return &http.Response{StatusCode: http.StatusOK, Header: header, Body: pr, ContentLength: -1, Request: req}
 }
+
+// conversationCloseOnCancel ends the body with a clean EOF once the request is
+// canceled, like a body that unblocks without reporting the cancellation.
+type conversationCloseOnCancel struct{}
 
 // conversationStreamedResponseID identifies the response announced by
 // conversationLifecycleEvent.
@@ -172,7 +180,7 @@ func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *te
 	released := map[string]bool{"reasoning then close": true, "message then reset": true}
 	for _, scenario := range []string{
 		"reasoning then close", "message then reset",
-		"tool call then close", "arguments then reset", "proxy error after upstream close", "proxy deadline", "storage failure on release",
+		"tool call then close", "arguments then reset", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			var h *ProxyHandler
@@ -215,13 +223,16 @@ func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *te
 						return conversationStreamResponse(req, nil, "data: "+`{"type":"response.output_text.delta","delta":"partial"}`+"\n\n"), nil
 					}
 					// Vekil's streaming deadline ends the quiet upstream.
+					if scenario == "proxy deadline then clean close" {
+						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationCloseOnCancel{}), nil
+					}
 					return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, time.Minute), nil
 				}
 				return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
 			})
 			logs := &conversationLogBuffer{}
 			options := []Option{func(h *ProxyHandler) { h.log = logger.NewWithWriter(logger.LevelInfo, logs) }}
-			if scenario == "proxy deadline" {
+			if strings.HasPrefix(scenario, "proxy deadline") {
 				options = append(options, WithStreamingUpstreamTimeout(500*time.Millisecond))
 			}
 			h, _ = newConversationAPIHandler(t, transport, nil, options...)

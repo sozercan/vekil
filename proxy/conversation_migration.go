@@ -1077,16 +1077,16 @@ func (t *conversationTurn) clientEnded() bool {
 }
 
 // upstreamBodyEnd records how one attempt's upstream response body ended when
-// the upstream, rather than Vekil, ended it: a clean EOF, or a read error while
+// the upstream, rather than Vekil, ended it: a clean EOF or a read error while
 // the attempt's request was still live. Vekil's own close, cancellation or
-// deadline is not recorded.
+// deadline is not recorded, even when the body then reports EOF.
 type upstreamBodyEnd struct {
 	mu  sync.Mutex
 	err error
 }
 
 func (e *upstreamBodyEnd) observe(ctx context.Context, err error) {
-	if e == nil || err == nil || (err != io.EOF && (ctx == nil || ctx.Err() != nil || errors.Is(err, http.ErrBodyReadAfterClose))) {
+	if e == nil || err == nil || ctx == nil || ctx.Err() != nil || errors.Is(err, http.ErrBodyReadAfterClose) {
 		return
 	}
 	e.mu.Lock()
