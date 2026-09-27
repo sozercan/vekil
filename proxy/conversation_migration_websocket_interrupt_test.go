@@ -145,8 +145,17 @@ func TestConversationMigrationWebSocketClientInterruptKeepsConversationUsable(t 
 			if resumed["id"] != "resumed" || sends.Load() != 3 || west.Load() != 0 {
 				t.Fatalf("resume was not one owner send: id=%v sends=%d west=%d", resumed["id"], sends.Load(), west.Load())
 			}
-			if recovery := logs.String(); !strings.Contains(recovery, `"outcome":"interrupted"`) || strings.Contains(recovery, `"outcome":"blocked"`) {
+			recovery := logs.String()
+			if !strings.Contains(recovery, `"outcome":"interrupted"`) {
 				t.Fatalf("interrupt recovery logs: %s", recovery)
+			}
+			for _, line := range strings.Split(recovery, "\n") {
+				// The resume can arrive before the socket close finishes the
+				// interrupted turn. conversationWebSocketResume retries that
+				// concurrent_turn refusal; any other block is a failure.
+				if strings.Contains(line, `"outcome":"blocked"`) && !strings.Contains(line, `"reason":"concurrent_turn"`) {
+					t.Fatalf("interrupt recovery logs: %s", recovery)
+				}
 			}
 			body := resumedBody.Load().(string)
 			if scenario == "after items" && (!strings.Contains(body, "Partial answer.") || !strings.Contains(body, "aborted") || strings.Contains(body, "Unfinished")) {
