@@ -21,6 +21,9 @@ type explicitRouteResponseInfo struct {
 	providerID    string
 	stateIdentity [32]byte
 	conversation  *conversationTurn
+	// upstreamEnd is set for conversation turns and shared by every copy of
+	// one attempt's info, so the attempt's transport body can record it.
+	upstreamEnd *upstreamBodyEnd
 }
 
 type explicitRouteResponseContextKey struct{}
@@ -418,7 +421,7 @@ func normalizeResponsesStreamBodyWithBinding(h *ProxyHandler, source io.ReadClos
 		return h.bindExplicitStateTokens(info, tokens)
 	}, transforms...)
 	if info.conversation != nil {
-		return &conversationCompletionBody{ReadCloser: body, turn: info.conversation}
+		return &conversationCompletionBody{ReadCloser: body, turn: info.conversation, targetID: info.targetID, upstreamEnd: info.upstreamEnd}
 	}
 	return body
 }

@@ -298,7 +298,8 @@ func TestConversationMigrationBlocksUnsafeRequestsAndRetries(t *testing.T) {
 						}
 						return nil, io.ErrUnexpectedEOF
 					case "partial stream":
-						return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, "data: "+`{"type":"response.output_text.delta","delta":"partial"}`+"\n\n"), nil
+						// A partial tool call may already be executable by the client.
+						return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, "data: "+`{"type":"response.function_call_arguments.delta","item_id":"fc-1","output_index":0,"delta":"{}"}`+"\n\n"), nil
 					case "DONE without completion":
 						return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, "data: "+`{"type":"response.output_text.delta","delta":"partial"}`+"\n\ndata: [DONE]\n\n"), nil
 					case "encrypted rejection":

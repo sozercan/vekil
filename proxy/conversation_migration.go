@@ -36,7 +36,9 @@ type conversationTurn struct {
 	hostedTools     map[string]bool
 	pending         bool
 	dispatched      bool
-	exposed         bool
+	// A handed-off event may belong to an item a client can execute, such as
+	// a tool call. Reasoning and assistant messages cannot run anything.
+	executable      bool
 	failed          bool
 	streamUncertain bool
 	// Completed output items staged from the committed response. An item is
@@ -601,13 +603,16 @@ func (t *conversationTurn) unprotect(targetID, reason string) error {
 	return nil
 }
 
-// An upstream terminal failure before any output is a known outcome: the client
-// received nothing it could act on, so a retry cannot duplicate work. Clear the
-// attempt marker and forward the upstream failure unchanged so the client can
-// apply its own retry policy. Output before or inside the failure leaves
+// An upstream that ends an attempt before handing off anything executable
+// leaves a known outcome: the client received at most reasoning and assistant
+// messages, which it cannot run, so a retry cannot duplicate work. The upstream
+// ends it with a terminal failure event, or by closing or resetting the stream
+// without one (reason stream_ended). Clear the attempt marker and forward the
+// upstream failure unchanged so the client can apply its own retry policy. A
+// tool call or other executable item before or inside the failure leaves
 // execution uncertain. The caller holds t.mu.
-func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMessage, targetID string) error {
-	if t.saved || t.exposed || conversationEventHasOutput(envelope) {
+func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMessage, targetID, reason string) error {
+	if t.saved || t.executable || conversationEventHasExecutableOutput(envelope) {
 		return conversationRequestError(errConversationIncomplete)
 	}
 	if t.pending {
@@ -620,14 +625,15 @@ func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMess
 	}
 	if !t.failed {
 		t.failed = true
-		t.h.logConversationRecovery(t.operation, "failed", targetID, "no_output")
+		t.h.logConversationRecovery(t.operation, "failed", targetID, reason)
 	}
 	return nil
 }
 
-// conversationEventHasOutput reports whether a lifecycle or terminal event
-// carries response output. A malformed response object counts as output.
-func conversationEventHasOutput(envelope map[string]json.RawMessage) bool {
+// conversationEventHasExecutableOutput reports whether a lifecycle or terminal
+// event carries response output a client could execute. A malformed response
+// object counts as executable.
+func conversationEventHasExecutableOutput(envelope map[string]json.RawMessage) bool {
 	raw, ok := envelope["response"]
 	if !ok || rawJSONIsNullOrEmpty(raw) {
 		return false
@@ -638,7 +644,49 @@ func conversationEventHasOutput(envelope map[string]json.RawMessage) bool {
 	if json.Unmarshal(raw, &response) != nil {
 		return true
 	}
-	return responsesOutputHasProgress(response.Output)
+	if !responsesOutputHasProgress(response.Output) {
+		return false
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(response.Output, &items) != nil {
+		return true
+	}
+	for _, item := range items {
+		if !conversationItemInert(item) {
+			return true
+		}
+	}
+	return false
+}
+
+// conversationItemInert reports whether an output item is reasoning or an
+// assistant message: content a client displays or keeps, but cannot execute.
+func conversationItemInert(raw json.RawMessage) bool {
+	var item struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &item) != nil {
+		return false
+	}
+	return item.Type == "reasoning" || item.Type == "message"
+}
+
+// conversationEventInert reports whether a streamed output event can only
+// belong to reasoning or an assistant message. Any other event, including an
+// unrecognized one, may be part of a tool call or hosted tool execution.
+func conversationEventInert(eventType string, envelope map[string]json.RawMessage) bool {
+	switch eventType {
+	case "response.output_item.added", "response.output_item.done":
+		return conversationItemInert(envelope["item"])
+	case "response.content_part.added", "response.content_part.done",
+		"response.output_text.delta", "response.output_text.done", "response.output_text.annotation.added",
+		"response.refusal.delta", "response.refusal.done",
+		"response.reasoning_text.delta", "response.reasoning_text.done",
+		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done":
+		return true
+	}
+	return false
 }
 
 func (t *conversationTurn) recoveryHeader() string {
@@ -717,7 +765,7 @@ func (h *ProxyHandler) tryConversationMigration(ctx context.Context, operation *
 			// so like a committed one its outcome is known. Release the marker
 			// and return the translated failure to the client.
 			t.mu.Lock()
-			err := t.releaseFailedAttempt(nil, "")
+			err := t.releaseFailedAttempt(nil, "", "failure_event")
 			t.mu.Unlock()
 			if err != nil {
 				return nil, true, err
@@ -794,18 +842,21 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 		if eventType != "response.completed" {
 			switch eventType {
 			case "response.incomplete", "response.failed", "response.cancelled", "response.canceled", "error":
-				if err := t.releaseFailedAttempt(envelope, info.targetID); err != nil {
+				if err := t.releaseFailedAttempt(envelope, info.targetID, "failure_event"); err != nil {
 					return nil, err
 				}
 				return data, nil
 			case "response.queued", "response.created", "response.in_progress", "keepalive":
 				// Upstreams emit keepalives while a long generation is quiet.
-				if conversationEventHasOutput(envelope) {
-					t.exposed = true
+				if conversationEventHasExecutableOutput(envelope) {
+					t.executable = true
 				}
 			default:
-				// Unrecognized events count as output so they cannot hide progress.
-				t.exposed = true
+				// Unrecognized events count as executable so they cannot hide a
+				// tool call.
+				if !conversationEventInert(eventType, envelope) {
+					t.executable = true
+				}
 			}
 			t.observeDelivery(eventType, envelope, info)
 			return data, nil
@@ -1025,24 +1076,74 @@ func (t *conversationTurn) clientEnded() bool {
 	return inbound != nil && inbound.Err() != nil && !t.h.ShuttingDown()
 }
 
+// upstreamBodyEnd records how one attempt's upstream response body ended when
+// the upstream, rather than Vekil, ended it: a clean EOF or a read error while
+// the attempt's request was still live. Vekil's own close, cancellation or
+// deadline is not recorded, even when the body then reports EOF.
+type upstreamBodyEnd struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (e *upstreamBodyEnd) observe(ctx context.Context, err error) {
+	if e == nil || err == nil || ctx == nil || ctx.Err() != nil || errors.Is(err, http.ErrBodyReadAfterClose) {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.err == nil {
+		e.err = err
+	}
+}
+
+// endedBy reports whether err, as the normalized stream surfaced it, is the
+// upstream's own end of the body rather than an error Vekil raised while
+// processing the stream.
+func (e *upstreamBodyEnd) endedBy(err error) bool {
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	ended := e.err
+	e.mu.Unlock()
+	if ended == io.EOF {
+		return err == io.EOF
+	}
+	return ended != nil && errors.Is(err, ended)
+}
+
 type conversationCompletionBody struct {
 	io.ReadCloser
-	turn *conversationTurn
+	turn        *conversationTurn
+	targetID    string
+	upstreamEnd *upstreamBodyEnd
 }
 
 func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		b.turn.mu.Lock()
-		saved := b.turn.saved || b.turn.unprotected || b.turn.failed
-		if !saved && !b.turn.clientEnded() {
-			// The stream ended without a known outcome while the client was
-			// still connected. A later disconnect must not release it.
-			b.turn.streamUncertain = true
+		known := b.turn.saved || b.turn.unprotected || b.turn.failed
+		var releaseErr error
+		if !known && !b.turn.clientEnded() {
+			// An upstream that ended the stream itself before anything executable
+			// was handed off leaves a known outcome. Otherwise the stream ended
+			// without one while the client was still connected, and a later
+			// disconnect must not release it.
+			if b.upstreamEnd.endedBy(err) {
+				releaseErr = b.turn.releaseFailedAttempt(nil, b.targetID, "stream_ended")
+				known = releaseErr == nil
+			}
+			if !known {
+				b.turn.streamUncertain = true
+			}
 		}
 		b.turn.mu.Unlock()
+		if releaseErr != nil {
+			return n, releaseErr
+		}
 		_, _, storageFailure := durableStateFailureDetails(err)
-		if !saved && !storageFailure && providerRequestErrorCode(err) == "" {
+		if !known && !storageFailure && providerRequestErrorCode(err) == "" {
 			return n, conversationRequestError(errConversationIncomplete)
 		}
 	}

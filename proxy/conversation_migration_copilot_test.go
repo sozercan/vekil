@@ -214,7 +214,7 @@ func TestConversationMigrationCopilotStopsAfterUnsafeBackup(t *testing.T) {
 					}
 					return nil, io.ErrUnexpectedEOF
 				case "partial stream":
-					return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, "data: "+`{"type":"response.output_text.delta","delta":"partial"}`+"\n\n"), nil
+					return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, "data: "+`{"type":"response.function_call_arguments.delta","item_id":"fc-1","output_index":0,"delta":"{}"}`+"\n\n"), nil
 				default:
 					return routeExecutorTestResponse(req, 403, nil, `{"error":{"code":"forbidden"}}`), nil
 				}
