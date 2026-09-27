@@ -195,11 +195,12 @@ response, it atomically saves history and clears that marker. If a crash or
 incomplete stream leaves execution uncertain, later continuation is blocked to
 avoid duplicate work. An upstream terminal failure (`response.failed`, `error`,
 `response.incomplete` or `response.cancelled`) is not uncertain when it carries
-no output and no output event preceded it. Upstream `keepalive` events are not
-output. Before the stream is committed, a certified failure may instead
-[fail over](provider-routing.md) to another target. After commitment, Vekil
-clears the marker and forwards that failure unchanged, so the client can retry
-the turn. A saved completion survives restart.
+no output and no output event preceded it. An upstream `keepalive` event is not
+an output event unless it carries response output. Before the stream is
+committed, a certified failure may instead [fail over](provider-routing.md) to
+another target. After commitment, Vekil clears the marker and forwards that
+failure unchanged, so the client can retry the turn. A saved completion
+survives restart.
 
 A client that disconnects or cancels its own request, for example by
 interrupting an agent mid-turn, owns that turn's outcome. Vekil saves the
