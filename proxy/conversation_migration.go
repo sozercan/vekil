@@ -1124,18 +1124,24 @@ func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		b.turn.mu.Lock()
 		known := b.turn.saved || b.turn.unprotected || b.turn.failed
+		var releaseErr error
 		if !known && !b.turn.clientEnded() {
 			// An upstream that ended the stream itself before anything executable
 			// was handed off leaves a known outcome. Otherwise the stream ended
 			// without one while the client was still connected, and a later
 			// disconnect must not release it.
-			if b.upstreamEnd.endedBy(err) && b.turn.releaseFailedAttempt(nil, b.targetID, "stream_ended") == nil {
-				known = true
-			} else {
+			if b.upstreamEnd.endedBy(err) {
+				releaseErr = b.turn.releaseFailedAttempt(nil, b.targetID, "stream_ended")
+				known = releaseErr == nil
+			}
+			if !known {
 				b.turn.streamUncertain = true
 			}
 		}
 		b.turn.mu.Unlock()
+		if releaseErr != nil {
+			return n, releaseErr
+		}
 		_, _, storageFailure := durableStateFailureDetails(err)
 		if !known && !storageFailure && providerRequestErrorCode(err) == "" {
 			return n, conversationRequestError(errConversationIncomplete)

@@ -3661,8 +3661,14 @@ func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *route
 	receipt.finish(resp, err)
 	azurePermit := azureRouteTrafficFromRequest(req).permit
 	azurePermit.holdResponseBody()
-	info, _ := req.Context().Value(explicitRouteResponseContextKey{}).(explicitRouteResponseInfo)
-	resp.Body = &routeAttemptTransportBody{inner: resp.Body, owner: owner, observation: observation, azurePermit: azurePermit, attemptCtx: attemptCtx, upstreamEnd: info.upstreamEnd}
+	var upstreamEnd *upstreamBodyEnd
+	if !handled {
+		// The native WebSocket body reports the same close when Vekil rejects a
+		// frame as when the peer disconnects, so its ends stay uncertain.
+		info, _ := req.Context().Value(explicitRouteResponseContextKey{}).(explicitRouteResponseInfo)
+		upstreamEnd = info.upstreamEnd
+	}
+	resp.Body = &routeAttemptTransportBody{inner: resp.Body, owner: owner, observation: observation, azurePermit: azurePermit, attemptCtx: attemptCtx, upstreamEnd: upstreamEnd}
 	return resp, err
 }
 

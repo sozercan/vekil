@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -171,9 +172,10 @@ func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *te
 	released := map[string]bool{"reasoning then close": true, "message then reset": true}
 	for _, scenario := range []string{
 		"reasoning then close", "message then reset",
-		"tool call then close", "arguments then reset", "proxy error after upstream close", "proxy deadline",
+		"tool call then close", "arguments then reset", "proxy error after upstream close", "proxy deadline", "storage failure on release",
 	} {
 		t.Run(scenario, func(t *testing.T) {
+			var h *ProxyHandler
 			var sends, west atomic.Int32
 			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 				if strings.HasSuffix(req.URL.Path, "/models") {
@@ -204,6 +206,13 @@ func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *te
 						// event before it, so the stream did not end on its own.
 						ambiguous := "data: " + `{"type":"response.output_text.delta","delta":"a","delta":"b"}` + "\n\n"
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, ambiguous), nil
+					case "storage failure on release":
+						// The stream carries no state to bind, so clearing the marker
+						// is the next durable commit.
+						h.stateBindings.durable.mu.Lock()
+						h.stateBindings.durable.beforeCommit = func() error { return syscall.ENOSPC }
+						h.stateBindings.durable.mu.Unlock()
+						return conversationStreamResponse(req, nil, "data: "+`{"type":"response.output_text.delta","delta":"partial"}`+"\n\n"), nil
 					}
 					// Vekil's streaming deadline ends the quiet upstream.
 					return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, time.Minute), nil
@@ -215,12 +224,19 @@ func TestConversationMigrationUpstreamEndBeforeExecutableOutputAllowsRetry(t *te
 			if scenario == "proxy deadline" {
 				options = append(options, WithStreamingUpstreamTimeout(500*time.Millisecond))
 			}
-			h, _ := newConversationAPIHandler(t, transport, nil, options...)
+			h, _ = newConversationAPIHandler(t, transport, nil, options...)
 			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
 
 			ended := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, nil)
 			if ended.Code != http.StatusOK || sends.Load() != 2 {
 				t.Fatalf("ended turn: code=%d sends=%d %s", ended.Code, sends.Load(), conversationBodyTail(ended))
+			}
+			if scenario == "storage failure on release" {
+				// The client receives the storage failure, not execution uncertainty.
+				if body := ended.Body.String(); !strings.Contains(body, "conversation_history_storage_unavailable") || strings.Contains(body, "conversation_execution_uncertain") {
+					t.Fatalf("marker-clear failure was not reported: %s", conversationBodyTail(ended))
+				}
+				return
 			}
 			// Codex retries the identical request after a stream ends early.
 			retry := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil)
