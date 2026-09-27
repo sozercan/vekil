@@ -199,10 +199,7 @@ no output and no output event preceded it. Upstream `keepalive` events are not
 output. Before the stream is committed, a certified failure may instead
 [fail over](provider-routing.md) to another target. After commitment, Vekil
 clears the marker and forwards that failure unchanged, so the client can retry
-the turn. An upstream stream that ends without a terminal event is handled the
-same way when no output event reached the client: Vekil clears the marker and
-ends the client stream as the upstream did, without an uncertainty error. A
-saved completion survives restart.
+the turn. A saved completion survives restart.
 
 A client that disconnects or cancels its own request, for example by
 interrupting an agent mid-turn, owns that turn's outcome. Vekil saves the
@@ -215,8 +212,8 @@ response is rebuilt from those items. Otherwise, continue from the previous
 response.
 Items the client did not receive from Vekil still fail as incomplete history.
 Unfinished messages that arrived only as deltas are not saved. Vekil does not
-repeat the request automatically. A shutdown, a crash, or an upstream disconnect
-after output is not a client decision and still leaves execution uncertain.
+repeat the request automatically. A shutdown, crash or upstream disconnect is
+not a client decision and still leaves execution uncertain.
 
 If an upstream reuses a saved response ID, Vekil withholds the new completion
 and leaves that turn uncertain. The collision does not disable the shared store.

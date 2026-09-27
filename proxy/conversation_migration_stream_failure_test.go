@@ -13,8 +13,7 @@ import (
 
 // conversationStreamResponse writes string parts as SSE body chunks and waits
 // between them for any time.Duration part, like an upstream that emits its
-// preamble before deciding the request's outcome. An error part breaks the
-// stream with that error instead of closing it cleanly.
+// preamble before deciding the request's outcome.
 func conversationStreamResponse(req *http.Request, header http.Header, parts ...any) *http.Response {
 	if header == nil {
 		header = make(http.Header)
@@ -35,9 +34,6 @@ func conversationStreamResponse(req *http.Request, header http.Header, parts ...
 					_ = pw.CloseWithError(req.Context().Err())
 					return
 				}
-			case error:
-				_ = pw.CloseWithError(value)
-				return
 			}
 		}
 		_ = pw.Close()
@@ -133,64 +129,6 @@ func TestConversationMigrationCommittedFailureBeforeOutputAllowsRetry(t *testing
 			// rate-limit code, rather than a proxy uncertainty error.
 			if !strings.Contains(failed.Body.String(), "rate_limit_exceeded") || strings.Contains(failed.Body.String(), "conversation_execution_uncertain") {
 				t.Fatalf("upstream failure was not forwarded: %s", conversationBodyTail(failed))
-			}
-			conversationCompleted(t, retry, false)
-			if sends.Load() != 3 || west.Load() != 0 {
-				t.Fatalf("retry was not a single owner send: sends=%d west=%d", sends.Load(), west.Load())
-			}
-		})
-	}
-}
-
-func TestConversationMigrationStreamEndBeforeOutputAllowsRetry(t *testing.T) {
-	for _, scenario := range []string{"closed after preamble", "reset after keepalive", "closed after output"} {
-		t.Run(scenario, func(t *testing.T) {
-			var sends, west atomic.Int32
-			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				if strings.HasSuffix(req.URL.Path, "/models") {
-					return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
-				}
-				if strings.HasPrefix(req.URL.Host, "west.") {
-					west.Add(1)
-				}
-				// The oversized preamble commits the stream before it ends.
-				created := conversationLifecycleEvent(t, "response.created", "in_progress", 2*responsesPrecommitMaxPeekBytes)
-				switch sends.Add(1) {
-				case 1:
-					return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
-				case 2:
-					// Each stream ends without a terminal event.
-					switch scenario {
-					case "reset after keepalive":
-						return conversationStreamResponse(req, nil, created, conversationKeepalive, io.ErrUnexpectedEOF), nil
-					case "closed after output":
-						return conversationStreamResponse(req, nil, created, "data: "+`{"type":"response.output_text.delta","delta":"partial"}`+"\n\n"), nil
-					}
-					return conversationStreamResponse(req, nil, created), nil
-				}
-				return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
-			})
-			h, _ := newConversationAPIHandler(t, transport, nil)
-			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
-
-			ended := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, nil)
-			if ended.Code != http.StatusOK || sends.Load() != 2 || west.Load() != 0 {
-				t.Fatalf("ended stream: code=%d sends=%d west=%d %s", ended.Code, sends.Load(), west.Load(), conversationBodyTail(ended))
-			}
-			retry := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Try again."}, nil)
-			if scenario == "closed after output" {
-				// Output reached the client, so the outcome remains uncertain.
-				if !strings.Contains(ended.Body.String(), "conversation_execution_uncertain") {
-					t.Fatalf("missing execution uncertainty diagnostic: %s", conversationBodyTail(ended))
-				}
-				if retry.Code != http.StatusConflict || sends.Load() != 2 || !strings.Contains(retry.Body.String(), "conversation_execution_uncertain") {
-					t.Fatalf("uncertain turn retried: %d %s", retry.Code, conversationBodyTail(retry))
-				}
-				return
-			}
-			// Only output-free frames reached the client, which can retry.
-			if strings.Contains(ended.Body.String(), "conversation_execution_uncertain") {
-				t.Fatalf("output-free stream end reported uncertainty: %s", conversationBodyTail(ended))
 			}
 			conversationCompleted(t, retry, false)
 			if sends.Load() != 3 || west.Load() != 0 {

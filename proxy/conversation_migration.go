@@ -886,30 +886,16 @@ type conversationCompletionBody struct {
 func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil && !errors.Is(err, context.Canceled) {
-		t := b.turn
-		_, _, storageFailure := durableStateFailureDetails(err)
-		upstreamEnded := !storageFailure && providerRequestErrorCode(err) == ""
-		t.mu.Lock()
-		saved := t.saved || t.unprotected || t.failed
-		if !saved && !t.clientEnded() {
-			if upstreamEnded && !t.blocked && !t.exposed {
-				// The upstream stream ended before any output reached the
-				// client. Like a pre-output failure event, the client has
-				// nothing to act on, so release the attempt and forward the
-				// upstream error unchanged.
-				releaseErr := t.releaseFailedAttempt(nil, t.deliveryInfo.targetID)
-				t.mu.Unlock()
-				if releaseErr != nil {
-					return n, releaseErr
-				}
-				return n, err
-			}
+		b.turn.mu.Lock()
+		saved := b.turn.saved || b.turn.unprotected || b.turn.failed
+		if !saved && !b.turn.clientEnded() {
 			// The stream ended without a known outcome while the client was
 			// still connected. A later disconnect must not release it.
-			t.streamUncertain = true
+			b.turn.streamUncertain = true
 		}
-		t.mu.Unlock()
-		if !saved && upstreamEnded {
+		b.turn.mu.Unlock()
+		_, _, storageFailure := durableStateFailureDetails(err)
+		if !saved && !storageFailure && providerRequestErrorCode(err) == "" {
 			return n, conversationRequestError(errConversationIncomplete)
 		}
 	}

@@ -154,10 +154,9 @@ client's automatic retries fail immediately. Other conversations are unaffected.
 Two common interruptions do not cause this code. An upstream failure that
 arrives before any output, such as an Azure `429` sent after HTTP `200`, either
 fails over before the stream is committed or reaches the client unchanged after
-commitment, so the client can retry. This also covers a stream that stops
-without a terminal event, and a long quiet stream that sent only `keepalive`
-events before failing. A client that disconnects or cancels a turn, such as an
-interrupted agent, keeps the conversation usable; see
+commitment, so the client can retry. This includes a long quiet stream that
+sent only `keepalive` events before failing. A client that disconnects or
+cancels a turn, such as an interrupted agent, keeps the conversation usable; see
 [conversation migration](conversation-migration.md#storage-diagnostics-and-deletion).
 
 What to do first: start a new conversation in the client. To keep the blocked
