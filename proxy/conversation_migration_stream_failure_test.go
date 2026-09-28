@@ -284,7 +284,8 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 	}
 	session := http.Header{"Session_id": {"client-a"}}
 	for _, scenario := range []string{
-		"reasoning then close", "message then reset", "completed message then close, full-history retry", "tool call then close", "tool call then close, Codex retry",
+		"reasoning then close", "message then reset", "completed message then close, full-history retry", "completed message then close, reused response ID",
+		"tool call then close", "tool call then close, Codex retry",
 		"tool call then close, branch retry", "arguments then reset", "complete arguments then close", "arguments closed by another item", "arguments replaced by another item",
 		"unrecognized event then close", "DONE without completion", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
 	} {
@@ -319,6 +320,10 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, vendor), nil
 					case "completed message then close, full-history retry":
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedMessage), nil
+					case "completed message then close, reused response ID":
+						// Saving the delivered message would collide with the seed.
+						reused := strings.ReplaceAll(created, conversationStreamedResponseID, "seed")
+						return conversationStreamResponse(req, nil, reused, conversationStreamedMessage), nil
 					case "arguments then reset":
 						return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDelta, reset), nil
 					case "complete arguments then close":
@@ -628,7 +633,7 @@ func conversationWebSocketFailedTurn(t *testing.T, conn *websocket.Conn, fields 
 	for {
 		frame := mustReadWebSocketJSONSkipMetadata(t, conn)
 		switch frame["type"] {
-		case "error", "response.failed":
+		case "error", "response.failed", "response.incomplete":
 			encoded, _ := json.Marshal(frame)
 			return string(encoded)
 		case "response.completed":
@@ -638,7 +643,7 @@ func conversationWebSocketFailedTurn(t *testing.T, conn *websocket.Conn, fields 
 }
 
 func TestConversationMigrationWebSocketUpstreamEndAllowsRetry(t *testing.T) {
-	for _, scenario := range []string{"reasoning then close", "tool call then close", "tool call then failed", "complete arguments then close"} {
+	for _, scenario := range []string{"reasoning then close", "tool call then close", "tool call then failed", "tool call then incomplete", "complete arguments then close"} {
 		t.Run(scenario, func(t *testing.T) {
 			var sends atomic.Int32
 			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -656,6 +661,10 @@ func TestConversationMigrationWebSocketUpstreamEndAllowsRetry(t *testing.T) {
 					case "tool call then failed":
 						// The bridge stops reading at the failure event, before EOF.
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall, conversationRateLimitFailed, time.Minute), nil
+					case "tool call then incomplete":
+						// The bridge ends the turn normally after response.incomplete.
+						incomplete := "event: response.incomplete\ndata: " + `{"type":"response.incomplete","response":{"id":"resp-streamed","object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}` + "\n\n"
+						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall, incomplete, time.Minute), nil
 					case "complete arguments then close":
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedArgumentsDone), nil
 					}

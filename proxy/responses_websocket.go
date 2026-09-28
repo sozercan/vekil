@@ -1797,6 +1797,10 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		routeOperation.setCommitment(downstreamCommitmentProtocolFrame)
 	}
 	streamResult, err := s.streamUpstreamResponseWithRequest(h, resp.Body, resp.Header, resp.Request, recordTurn)
+	if routeOperation != nil && (err == nil || errors.Is(err, errStreamFailedUpstream)) {
+		// The terminal event, and every event before it, reached the client.
+		routeOperation.conversation.failureDelivered()
+	}
 	if err != nil {
 		// The native reader recognizes terminal framing before the shared parser
 		// validates its contents. An invalid terminal must retire the session even
@@ -1810,10 +1814,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			return err
 		}
 		if errors.Is(err, errStreamFailedUpstream) {
-			if routeOperation != nil {
-				// The failure event, and every event before it, reached the client.
-				routeOperation.conversation.failureDelivered()
-			}
 			// Parsed response.failed and top-level error events account themselves before
 			// client delivery, so the outer handler must not record them again.
 			return nil

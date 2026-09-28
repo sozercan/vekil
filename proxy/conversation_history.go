@@ -338,7 +338,16 @@ func (s *conversationHistoryStore) acquireFrom(root string, source []byte, trust
 		return false, errConversationHistoryCapacity
 	}
 	if err := s.view(func(tx *bolt.Tx) error {
-		if value := tx.Bucket(conversationPendingBucket).Get(s.rootKey(root)); value != nil && !pendingReleasedTo(value, source) {
+		key := s.rootKey(root)
+		value := tx.Bucket(conversationPendingBucket).Get(key)
+		if value == nil {
+			return nil
+		}
+		// Neither the released pointer nor trust may read past a damaged record.
+		if _, err := s.pendingCreated(key, value); err != nil {
+			return err
+		}
+		if !pendingReleasedTo(value, source) {
 			if !trusted {
 				return errConversationHistoryUncertain
 			}

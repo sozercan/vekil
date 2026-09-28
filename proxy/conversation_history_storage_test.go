@@ -176,6 +176,32 @@ func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t 
 	if retained.counts.pending != 1 {
 		t.Fatalf("pending attempts = %d after a trusted replacement", retained.counts.pending)
 	}
+	retained.release(parent.Root)
+	// A damaged record that still names the delivered snapshot admits neither
+	// its continuation nor a trusted client.
+	redelivered := conversationHistoryStorageSnapshot(retained, "response-redelivered", parent.Root, now)
+	redeliveredKey := retained.responseKey(redelivered.RouteID, redelivered.ResponseID)
+	if err := retained.saveDelivered(redelivered); err != nil {
+		t.Fatal(err)
+	}
+	if err := retained.d.db.Update(func(tx *bolt.Tx) error {
+		pending := tx.Bucket(conversationPendingBucket)
+		key := retained.rootKey(parent.Root)
+		value := append([]byte(nil), pending.Get(key)...)
+		value[0] ^= 1
+		return pending.Put(key, value)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, trusted := range []bool{false, true} {
+		source := redeliveredKey
+		if trusted {
+			source = parentKey
+		}
+		if _, err := retained.acquireFrom(parent.Root, source, trusted); !errors.Is(err, errConversationHistoryStorage) {
+			t.Fatalf("damaged record admission (trusted=%t) = %v", trusted, err)
+		}
+	}
 }
 
 func TestConversationHistoryStorageCapacityNeverEvicts(t *testing.T) {

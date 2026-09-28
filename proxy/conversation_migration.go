@@ -784,8 +784,10 @@ func (t *conversationTurn) releaseEndedAttempt(targetID, reason string, ended bo
 			return err
 		}
 		reason = "delivered_history_saved"
-	} else {
-		t.saveEndedInertHistory(ended)
+	} else if err := t.saveEndedInertHistory(ended); err != nil {
+		t.blocked = true
+		t.h.logConversationRecovery(t.operation, "blocked", targetID, conversationFailureReason(err))
+		return conversationRequestError(err)
 	}
 	if t.pending {
 		if err := t.store.clearAttempt(t.root); err != nil {
@@ -939,16 +941,24 @@ func (t *conversationTurn) saveEndedHistory(targetID string, ended bool) error {
 // delivered, as after an interrupt, so a client that resends them, as Codex
 // does, continues from verified history. The save also clears the attempt
 // marker; when there is nothing to save or the save fails, the caller clears
-// it, since these items cannot run anything. The caller holds t.mu.
-func (t *conversationTurn) saveEndedInertHistory(ended bool) {
+// it, since these items cannot run anything. A reused response ID keeps the
+// marker, like a completed turn does. The caller holds t.mu.
+func (t *conversationTurn) saveEndedInertHistory(ended bool) error {
 	delivered := t.deliveredOutput(ended)
 	if len(delivered.items) == 0 && len(delivered.anchors) == 0 || t.deliveredInvalid || !t.haveDeliveryInfo || t.deliveredResponseID == "" {
-		return
+		return nil
 	}
 	snapshot, err := t.historySnapshot(t.deliveredResponseID, t.deliveryInfo, delivered, false)
-	if err == nil && t.store.save(snapshot) == nil {
+	if err == nil {
+		err = t.store.save(snapshot)
+	}
+	if errors.Is(err, errConversationHistoryUncertain) {
+		return err
+	}
+	if err == nil {
 		t.pending = false
 	}
+	return nil
 }
 
 // endedHistory returns the delivered items saveEndedHistory saves, or an error
