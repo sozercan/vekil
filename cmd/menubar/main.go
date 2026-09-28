@@ -63,7 +63,9 @@ func main() {
 	} else if file, err := openRotatingLogFile(path, menubarLogMaxBytes); err != nil {
 		log.Warn("could not open menubar log file", logger.Err(err))
 	} else {
-		log = logger.NewWithWriter(logger.ParseLevel("info"), io.MultiWriter(os.Stderr, file))
+		// MultiWriter stops at the first failing writer, so a closed stderr
+		// must come after the file.
+		log = logger.NewWithWriter(logger.ParseLevel("info"), io.MultiWriter(file, os.Stderr))
 	}
 	if err := initializeMenubarPATH(); err != nil {
 		log.Warn("could not fully recover menubar PATH", logger.Err(err))

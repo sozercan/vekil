@@ -184,7 +184,10 @@ client unchanged after commitment, so the client can retry. This includes a
 long quiet stream that sent only `keepalive` events, a stream that sent only
 reasoning, message text or part of a tool call, and a stream that delivered a
 completed tool call. In the last case Vekil saves what it delivered, so Codex's
-retry, which carries the call and its output, continues the conversation. A
+retry, which carries the call and its output, continues the conversation. The
+exception is a stream Vekil ends itself, through a streaming timeout or a
+restart, right after a completed tool call. Vekil cannot tell whether the client
+received that call, so the next turn gets this code. A
 client that disconnects or cancels a turn, such as an interrupted agent, keeps
 the conversation usable; see
 [conversation migration](conversation-migration.md#storage-diagnostics-and-deletion).

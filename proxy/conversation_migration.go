@@ -74,7 +74,7 @@ type conversationTurn struct {
 // then fails, and to resend both, with the tool's output, in its next request
 // (codex-rs core/src/session/turn.rs run_sampling_request and drain_in_flight,
 // stream_events_utils.rs handle_output_item_done).
-var minResendingCodexVersion = [3]int{0, 157, 0}
+var minResendingCodexVersion = [3]uint64{0, 157, 0}
 
 // resendingCodexProducts are the Codex front ends, named by their originator,
 // that share that verified turn loop (codex-rs login default_client.rs).
@@ -95,12 +95,12 @@ func conversationClientResendsDelivered(userAgent string) bool {
 	}
 	for i, part := range parts {
 		// ParseUint accepts digits only, without a sign.
-		n, err := strconv.ParseUint(part, 10, 32)
+		n, err := strconv.ParseUint(part, 10, 64)
 		if err != nil {
 			return false
 		}
-		if int(n) != minResendingCodexVersion[i] {
-			return int(n) > minResendingCodexVersion[i]
+		if n != minResendingCodexVersion[i] {
+			return n > minResendingCodexVersion[i]
 		}
 	}
 	return true
