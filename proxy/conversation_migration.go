@@ -51,8 +51,8 @@ type conversationTurn struct {
 	failed          bool
 	streamUncertain bool
 	// A terminal failure event that followed executable output settles its
-	// attempt once the client's consumer reads past failureOffset, the stream
-	// offset where the event starts: by then every earlier event was handed off.
+	// attempt once the client's consumer has read past failureOffset, the
+	// stream offset where the event starts, and reads again.
 	failureHandoff  bool
 	failureOffset   int64
 	failureTargetID string
@@ -704,8 +704,8 @@ func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMess
 	}
 	if t.executable {
 		// The event before this one may still be on its way to the client.
-		// Settle once the client reads this event (conversationCompletionBody.Read);
-		// a turn that could not be saved anyway reports that now.
+		// Settle once the client has read this event (streamReadStarting); a
+		// turn that could not be saved anyway reports that now.
 		if _, err := t.endedHistory(true); err != nil {
 			return err
 		}
@@ -722,18 +722,49 @@ func (t *conversationTurn) streamWrote(n int) {
 	t.mu.Unlock()
 }
 
-// readStream counts bytes the client's consumer read. Consumers read the stream
-// in order, so reading into a terminal failure event means every earlier event
-// was handed off, and the attempt that event ended can settle.
-func (t *conversationTurn) readStream(n int) error {
+// streamReadStarting settles an attempt that a terminal failure event ended
+// once a read of its stream starts after an earlier read returned the start of
+// that event. Readers pass the stream on in order and read again only after
+// the previous chunk was consumed downstream, even through the websocket
+// bridge's pump, so every event before the failure was handed off.
+func (t *conversationTurn) streamReadStarting() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.streamRead += int64(n)
-	if !t.failureHandoff || t.streamRead <= t.failureOffset {
+	if t.streamRead <= t.failureOffset {
+		return nil
+	}
+	return t.settleFailureEvent()
+}
+
+// failureDelivered settles an attempt that a terminal failure event ended once
+// the websocket bridge has written that event to the client. The bridge stops
+// reading at the event, so streamReadStarting never runs for it.
+func (t *conversationTurn) failureDelivered() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_ = t.settleFailureEvent()
+}
+
+// settleFailureEvent releases an attempt whose terminal failure event followed
+// executable output, once every event before it was handed off. A failure is
+// logged by the release, and finish reports a turn left pending. The caller
+// holds t.mu.
+func (t *conversationTurn) settleFailureEvent() error {
+	if !t.failureHandoff {
 		return nil
 	}
 	t.failureHandoff = false
 	return t.releaseEndedAttempt(t.failureTargetID, "failure_event", true)
+}
+
+// streamReadDone counts the bytes a read of the stream returned.
+func (t *conversationTurn) streamReadDone(n int) {
+	t.mu.Lock()
+	t.streamRead += int64(n)
+	t.mu.Unlock()
 }
 
 // An attempt that ends while the client stays connected leaves a known outcome:
@@ -1379,12 +1410,11 @@ type conversationCompletionBody struct {
 }
 
 func (b *conversationCompletionBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	if n > 0 {
-		if releaseErr := b.turn.readStream(n); releaseErr != nil {
-			return n, releaseErr
-		}
+	if releaseErr := b.turn.streamReadStarting(); releaseErr != nil {
+		return 0, releaseErr
 	}
+	n, err := b.ReadCloser.Read(p)
+	b.turn.streamReadDone(n)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		b.turn.mu.Lock()
 		known := b.turn.saved || b.turn.unprotected || b.turn.failed

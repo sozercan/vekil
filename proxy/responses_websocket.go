@@ -1810,6 +1810,10 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			return err
 		}
 		if errors.Is(err, errStreamFailedUpstream) {
+			if routeOperation != nil {
+				// The failure event, and every event before it, reached the client.
+				routeOperation.conversation.failureDelivered()
+			}
 			// Parsed response.failed and top-level error events account themselves before
 			// client delivery, so the outer handler must not record them again.
 			return nil
