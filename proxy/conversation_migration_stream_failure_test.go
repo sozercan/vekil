@@ -426,6 +426,8 @@ func TestConversationClientResendsDelivered(t *testing.T) {
 		"codex_cli_rs/0.156.9":               false,
 		"codex_cli_rs/0.0.0":                 false,
 		"codex_cli_rs/0.157.1-alpha.2":       false,
+		"codex_exec/0.157.-0":                false,
+		"codex_exec/0.+157.0":                false,
 		"codex_cli_rs":                       false,
 		"Mozilla/5.0 codex_cli_rs/0.157.1":   false,
 		"OpenAI/Python 1.40.0":               false,

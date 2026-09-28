@@ -94,12 +94,13 @@ func conversationClientResendsDelivered(userAgent string) bool {
 		return false
 	}
 	for i, part := range parts {
-		n, err := strconv.Atoi(part)
-		if err != nil || n < 0 {
+		// ParseUint accepts digits only, without a sign.
+		n, err := strconv.ParseUint(part, 10, 32)
+		if err != nil {
 			return false
 		}
-		if n != minResendingCodexVersion[i] {
-			return n > minResendingCodexVersion[i]
+		if int(n) != minResendingCodexVersion[i] {
+			return int(n) > minResendingCodexVersion[i]
 		}
 	}
 	return true
