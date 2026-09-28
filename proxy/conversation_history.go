@@ -319,30 +319,37 @@ func pendingReleasedTo(value, source []byte) bool {
 }
 
 func (s *conversationHistoryStore) acquire(root string) error {
-	return s.acquireFrom(root, nil)
+	_, err := s.acquireFrom(root, nil, false)
+	return err
 }
 
 // acquireFrom admits a turn whose history continues from the snapshot keyed
-// source, or from no snapshot when source is nil.
-func (s *conversationHistoryStore) acquireFrom(root string, source []byte) error {
+// source, or from no snapshot when source is nil. A pending record admits only
+// a continuation of the snapshot it was released to, unless trusted: the client
+// is known to resend everything it received, so a turn whose history validated
+// cannot hide delivered work. overrode reports that trust admitted the turn.
+func (s *conversationHistoryStore) acquireFrom(root string, source []byte, trusted bool) (overrode bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.active[root] {
-		return errConversationHistoryBusy
+		return false, errConversationHistoryBusy
 	}
 	if len(s.active) >= s.config.MaxSnapshots {
-		return errConversationHistoryCapacity
+		return false, errConversationHistoryCapacity
 	}
 	if err := s.view(func(tx *bolt.Tx) error {
 		if value := tx.Bucket(conversationPendingBucket).Get(s.rootKey(root)); value != nil && !pendingReleasedTo(value, source) {
-			return errConversationHistoryUncertain
+			if !trusted {
+				return errConversationHistoryUncertain
+			}
+			overrode = true
 		}
 		return nil
 	}); err != nil {
-		return err
+		return false, err
 	}
 	s.active[root] = true
-	return nil
+	return overrode, nil
 }
 
 func (s *conversationHistoryStore) release(root string) {
@@ -385,18 +392,18 @@ func (s *conversationHistoryStore) update(fn func(*bolt.Tx, *conversationHistory
 }
 
 func (s *conversationHistoryStore) beginAttempt(root, operationID string) error {
-	return s.beginAttemptFrom(root, operationID, nil)
+	return s.beginAttemptFrom(root, operationID, nil, false)
 }
 
-// beginAttemptFrom records a turn's attempt. A pending record released to the
-// turn's source snapshot is replaced; any other pending record refuses it.
-func (s *conversationHistoryStore) beginAttemptFrom(root, operationID string, source []byte) error {
+// beginAttemptFrom records a turn's attempt. A pending record that admits the
+// turn, as acquireFrom decides, is replaced; any other pending record refuses it.
+func (s *conversationHistoryStore) beginAttemptFrom(root, operationID string, source []byte, trusted bool) error {
 	return s.update(func(tx *bolt.Tx, counts *conversationHistoryCounts) error {
 		pending, snapshots := tx.Bucket(conversationPendingBucket), tx.Bucket(conversationSnapshotsBucket)
 		key := s.rootKey(root)
 		added := 1
 		if existing := pending.Get(key); existing != nil {
-			if !pendingReleasedTo(existing, source) {
+			if !trusted && !pendingReleasedTo(existing, source) {
 				return errConversationHistoryUncertain
 			}
 			added = 0

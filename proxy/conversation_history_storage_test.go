@@ -136,7 +136,7 @@ func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t 
 	delivered := conversationHistoryStorageSnapshot(history, "response-delivered", parent.Root, now)
 	parentKey := history.responseKey(parent.RouteID, parent.ResponseID)
 	deliveredKey := history.responseKey(delivered.RouteID, delivered.ResponseID)
-	if err := history.beginAttemptFrom(parent.Root, "ended-operation", parentKey); err != nil {
+	if err := history.beginAttemptFrom(parent.Root, "ended-operation", parentKey, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := history.saveDelivered(delivered); err != nil {
@@ -147,23 +147,34 @@ func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t 
 	_, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
 	requireConversationHistoryStorageSnapshot(t, retained, delivered)
 	for _, source := range [][]byte{nil, parentKey} {
-		if err := retained.acquireFrom(parent.Root, source); !errors.Is(err, errConversationHistoryUncertain) {
+		if _, err := retained.acquireFrom(parent.Root, source, false); !errors.Is(err, errConversationHistoryUncertain) {
 			t.Fatalf("branch from %x admitted: %v", source, err)
 		}
 	}
-	if err := retained.acquireFrom(parent.Root, deliveredKey); err != nil {
-		t.Fatalf("continuation refused: %v", err)
+	if overrode, err := retained.acquireFrom(parent.Root, deliveredKey, false); err != nil || overrode {
+		t.Fatalf("continuation admission = %t, %v", overrode, err)
 	}
 	retained.release(parent.Root)
-	if err := retained.beginAttemptFrom(parent.Root, "continuation-operation", deliveredKey); err != nil {
+	if err := retained.beginAttemptFrom(parent.Root, "continuation-operation", deliveredKey, false); err != nil {
 		t.Fatalf("continuation attempt refused: %v", err)
 	}
 	if retained.counts.pending != 1 {
 		t.Fatalf("pending attempts = %d, want the continuation's alone", retained.counts.pending)
 	}
-	// The continuation now owns an ordinary marker.
-	if err := retained.acquireFrom(parent.Root, deliveredKey); !errors.Is(err, errConversationHistoryUncertain) {
+	// The continuation now owns an ordinary marker, which only a trusted
+	// client passes and replaces.
+	if _, err := retained.acquireFrom(parent.Root, deliveredKey, false); !errors.Is(err, errConversationHistoryUncertain) {
 		t.Fatalf("continuation marker admitted another turn: %v", err)
+	}
+	if overrode, err := retained.acquireFrom(parent.Root, parentKey, true); err != nil || !overrode {
+		t.Fatalf("trusted admission = %t, %v", overrode, err)
+	}
+	retained.release(parent.Root)
+	if err := retained.beginAttemptFrom(parent.Root, "trusted-operation", parentKey, true); err != nil {
+		t.Fatalf("trusted attempt refused: %v", err)
+	}
+	if retained.counts.pending != 1 {
+		t.Fatalf("pending attempts = %d after a trusted replacement", retained.counts.pending)
 	}
 }
 

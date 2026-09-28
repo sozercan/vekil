@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -25,6 +26,7 @@ type conversationTurn struct {
 	operation       *routeOperation
 	source          *conversationSnapshot
 	sourceKey       []byte
+	trustedClient   bool
 	root            string
 	scope           string
 	input           []json.RawMessage
@@ -65,6 +67,38 @@ type conversationTurn struct {
 	attempted           bool
 	blocked             bool
 	unprotected         bool
+}
+
+// minResendingCodexVersion is the first Codex release verified to record every
+// output item it completes, to run a completed tool call even when the stream
+// then fails, and to resend both, with the tool's output, in its next request
+// (codex-rs core/src/session/turn.rs run_sampling_request and drain_in_flight,
+// stream_events_utils.rs handle_output_item_done).
+var minResendingCodexVersion = [3]int{0, 157, 0}
+
+// conversationClientResendsDelivered reports whether a User-Agent names a Codex
+// release at or after minResendingCodexVersion, such as "codex_exec/0.157.1
+// (Mac OS 27.0.0; arm64)". Pre-release and development versions do not count.
+func conversationClientResendsDelivered(userAgent string) bool {
+	product, _, _ := strings.Cut(strings.TrimSpace(userAgent), " ")
+	name, version, ok := strings.Cut(product, "/")
+	if !ok || !strings.HasPrefix(name, "codex") {
+		return false
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for i, part := range parts {
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 {
+			return false
+		}
+		if n != minResendingCodexVersion[i] {
+			return n > minResendingCodexVersion[i]
+		}
+	}
+	return true
 }
 
 func (h *ProxyHandler) initializeConversationHistory() error {
@@ -232,8 +266,17 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		rawMessagesSize(turn.input)+rawMessagesSize(turn.additionalTools)+len(turn.instructions)+len(turn.tools) > store.config.MaxHistoryBytes {
 		return fail(errConversationHistoryCapacity)
 	}
-	if err := store.acquireFrom(turn.root, turn.sourceKey); err != nil {
+	// A verified Codex client resends every item it completed, with its tool
+	// outputs. Its request reached here only by extending saved history with
+	// client input, so nothing it received from an unsettled attempt is missing:
+	// an unresolved marker cannot hide a tool call the model might repeat.
+	turn.trustedClient = conversationClientResendsDelivered(operation.clientUserAgent)
+	overrode, err := store.acquireFrom(turn.root, turn.sourceKey, turn.trustedClient)
+	if err != nil {
 		return fail(err)
+	}
+	if overrode {
+		h.logConversationRecovery(operation, "released", "", "client_resends_delivered")
 	}
 	operation.conversation = turn
 	// After a migration, a full-history client may still carry east's older
@@ -544,7 +587,7 @@ func (t *conversationTurn) persistIntent() error {
 	if t.pending {
 		return nil
 	}
-	if err := t.store.beginAttemptFrom(t.root, t.operation.operationID(), t.sourceKey); err != nil {
+	if err := t.store.beginAttemptFrom(t.root, t.operation.operationID(), t.sourceKey, t.trustedClient); err != nil {
 		return conversationRequestError(err)
 	}
 	t.pending = true

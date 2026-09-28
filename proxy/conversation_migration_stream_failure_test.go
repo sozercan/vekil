@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -379,6 +380,71 @@ func TestConversationMigrationShutdownMidStreamKeepsConversationUsable(t *testin
 	conversationCompleted(t, conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil), false)
 	if sends.Load() != 3 {
 		t.Fatalf("retry after restart was not one owner send: sends=%d", sends.Load())
+	}
+}
+
+func TestConversationClientResendsDelivered(t *testing.T) {
+	for userAgent, want := range map[string]bool{
+		"codex_exec/0.157.1 (Mac OS 27.0.0; arm64) ghostty/1.3.2": true,
+		"codex_cli_rs/0.157.0":               true,
+		"codex_cli_rs/1.0.0 (Linux; x86_64)": true,
+		"codex_cli_rs/0.156.9":               false,
+		"codex_cli_rs/0.0.0":                 false,
+		"codex_cli_rs/0.157.1-alpha.2":       false,
+		"codex_cli_rs":                       false,
+		"Mozilla/5.0 codex_cli_rs/0.157.1":   false,
+		"OpenAI/Python 1.40.0":               false,
+		"":                                   false,
+	} {
+		if got := conversationClientResendsDelivered(userAgent); got != want {
+			t.Errorf("conversationClientResendsDelivered(%q) = %t, want %t", userAgent, got, want)
+		}
+	}
+}
+
+func TestConversationMigrationCodexRetryPassesUnsettledAttempt(t *testing.T) {
+	for _, scenario := range []string{"complete arguments then close", "ambiguous write"} {
+		t.Run(scenario, func(t *testing.T) {
+			var sends atomic.Int32
+			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if strings.HasSuffix(req.URL.Path, "/models") {
+					return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+				}
+				switch sends.Add(1) {
+				case 1:
+					return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
+				case 2:
+					if scenario == "ambiguous write" {
+						// The request may have reached the upstream before the reset.
+						if trace := httptrace.ContextClientTrace(req.Context()); trace != nil {
+							trace.WroteHeaders()
+						}
+						return nil, io.ErrUnexpectedEOF
+					}
+					created := conversationLifecycleEvent(t, "response.created", "in_progress", 2*responsesPrecommitMaxPeekBytes)
+					return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDone), nil
+				}
+				return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
+			})
+			logs := &conversationLogBuffer{}
+			h, _ := newConversationAPIHandler(t, transport, nil, func(h *ProxyHandler) { h.log = logger.NewWithWriter(logger.LevelInfo, logs) })
+			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
+			conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, nil)
+
+			retry := func(userAgent string) *httptest.ResponseRecorder {
+				return conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, http.Header{"User-Agent": {userAgent}})
+			}
+			// Clients not verified to resend what they received stay blocked.
+			for _, userAgent := range []string{"OpenAI/Python 1.40.0", "codex_cli_rs/0.156.0"} {
+				if blocked := retry(userAgent); blocked.Code != http.StatusConflict || sends.Load() != 2 {
+					t.Fatalf("%s retry admitted: %d %s", userAgent, blocked.Code, blocked.Body.String())
+				}
+			}
+			conversationCompleted(t, retry("codex_exec/0.157.1 (Mac OS 27.0.0; arm64)"), false)
+			if sends.Load() != 3 || !strings.Contains(logs.String(), `"reason":"client_resends_delivered"`) {
+				t.Fatalf("Codex retry: sends=%d logs=%s", sends.Load(), logs.String())
+			}
+		})
 	}
 }
 

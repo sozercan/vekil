@@ -47,6 +47,7 @@ func (s *responsesWebSocketSession) postConversationCreateRequest(h *ProxyHandle
 		// The request planner clears it when the client starts a new chain.
 		headers.Set("X-Vekil-History-Complete", "true")
 	}
+	operation.clientUserAgent = s.userAgent
 	body, headers, err = h.prepareConversationTurn(operation, body, headers)
 	if err != nil {
 		return nil, err

@@ -349,6 +349,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 				upstreamCancel()
 			}
 		}
+		routeOperation.clientUserAgent = r.UserAgent()
 		body, headers, prepareErr := h.prepareConversationTurn(routeOperation, prepared.stateBindingBody, prepared.extraHeaders)
 		defer func() { routeOperation.conversation.finish() }()
 		if prepareErr != nil {
