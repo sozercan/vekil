@@ -246,8 +246,10 @@ cannot repeat the call. Vekil admits such a request past an unresolved attempt
 and replaces that attempt's marker. This covers crashes, ambiguous deliveries,
 streams Vekil could not settle and markers written by earlier Vekil versions.
 History validation still requires the saved history as a prefix and a result
-for every call. After it, Vekil accepts model output it never saved only from
-Codex, and only when an unresolved attempt explains it. Vekil recognizes Codex by a User-Agent that starts with
+for every call. After that prefix, Vekil accepts model output it never saved
+only from Codex. That output can come from such an attempt or from the last
+items of an interrupted stream, which Vekil could not confirm as delivered.
+Vekil recognizes Codex by a User-Agent that starts with
 `codex_cli_rs/`, `codex-tui/`, `codex_exec/` or `codex_vscode/` followed by a
 release version, such as `codex_exec/0.157.1 (...)`. Pre-release and
 development builds do not count. Other clients keep the marker. Probes of

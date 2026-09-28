@@ -215,9 +215,10 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 	fullInput := input.items
 	trusted := conversationClientResendsDelivered(operation.clientUserAgent)
 	// resent marks model output that Vekil never saved after the verified
-	// history. A verified Codex client resends the items it completed in an
-	// attempt Vekil could not settle, each tool call with its output, so the
-	// model cannot repeat them. Only that attempt's marker explains them.
+	// history. A verified Codex client resends every item it completed, each
+	// tool call with its output, so the model cannot repeat them: items from an
+	// attempt Vekil could not settle, or the last items of an interrupted or
+	// ended stream that Vekil could not confirm as delivered.
 	resent := false
 	if source != nil {
 		if previousID != "" {
@@ -298,10 +299,6 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 	overrode, err := store.acquireFrom(turn.root, turn.sourceKey, turn.trustedClient)
 	if err != nil {
 		return fail(err)
-	}
-	if resent && !overrode {
-		store.release(turn.root)
-		return fail(errConversationHistoryPartial)
 	}
 	if overrode {
 		h.logConversationRecovery(operation, "released", "", "client_resends_delivered")

@@ -272,6 +272,60 @@ func TestConversationMigrationFailureAfterUndeliveredCallAllowsRetry(t *testing.
 	}
 }
 
+func TestConversationMigrationCodexResendsCallAfterInterrupt(t *testing.T) {
+	var sends atomic.Int32
+	streaming := make(chan struct{})
+	transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/models") {
+			return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+		}
+		switch sends.Add(1) {
+		case 1:
+			return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
+		case 2:
+			created := conversationLifecycleEvent(t, "response.created", "in_progress", 2*responsesPrecommitMaxPeekBytes)
+			return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall, streaming, time.Minute), nil
+		}
+		return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
+	})
+	h, _ := newConversationAPIHandler(t, transport, nil)
+	session := func() http.Header { return http.Header{"Session_id": {"interrupted-thread"}} }
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, session()), false)
+
+	body, _ := json.Marshal(map[string]any{"model": "coding", "previous_response_id": "seed", "input": "Next.", "stream": true})
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)).WithContext(ctx)
+	req.Header = session()
+	req.Header.Set("Content-Type", "application/json")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.HandleResponses(httptest.NewRecorder(), req)
+	}()
+	select {
+	case <-streaming:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tool call was never streamed")
+	}
+	cancel()
+	<-done
+
+	// The interrupt saves only items followed by a later event, so the call is
+	// not saved. Codex ran it and resends it with its output.
+	headers := session()
+	headers.Set("User-Agent", "codex_exec/0.157.1")
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": []any{
+		map[string]any{"role": "user", "content": "Seed."}, conversationText("Known earlier answer."),
+		map[string]any{"role": "user", "content": "Next."},
+		map[string]any{"id": "rs_streamed", "type": "reasoning", "encrypted_content": "streamed-encrypted", "summary": []any{}},
+		map[string]any{"id": "fc_streamed", "type": "function_call", "status": "completed", "call_id": "call-streamed", "name": "edit", "arguments": "{}"},
+		map[string]any{"type": "function_call_output", "call_id": "call-streamed", "output": "edited"},
+	}}, headers), false)
+	if sends.Load() != 3 {
+		t.Fatalf("resend was not one owner send: sends=%d", sends.Load())
+	}
+}
+
 func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 	reset := errors.New("connection reset by peer")
 	released := map[string]string{
@@ -594,18 +648,16 @@ func TestConversationMigrationCodexRetryPassesUnsettledAttempt(t *testing.T) {
 				return conversationPOST(t, h, fields(), headers)
 			}
 			if scenario == "tool call then unrecognized event" {
-				// Without an unsettled attempt to explain it, unsaved model output
-				// is not a resend.
+				// A resent call without its output could be generated again.
 				headers := session()
 				headers.Set("User-Agent", "codex_exec/0.157.1")
-				early := conversationPOST(t, h, map[string]any{"input": []any{
+				unpaired := conversationPOST(t, h, map[string]any{"input": []any{
 					map[string]any{"role": "user", "content": "Seed."}, conversationText("Known earlier answer."),
 					map[string]any{"role": "user", "content": "Next."},
 					map[string]any{"type": "function_call", "call_id": "call-early", "name": "edit", "arguments": "{}"},
-					map[string]any{"type": "function_call_output", "call_id": "call-early", "output": "edited"},
 				}}, headers)
-				if early.Code != http.StatusBadRequest || sends.Load() != 1 {
-					t.Fatalf("unexplained model output admitted: %d %s", early.Code, early.Body.String())
+				if unpaired.Code != http.StatusBadRequest || sends.Load() != 1 {
+					t.Fatalf("resent call without output admitted: %d %s", unpaired.Code, unpaired.Body.String())
 				}
 			}
 			conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, session())
