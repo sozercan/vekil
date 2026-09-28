@@ -177,9 +177,10 @@ func TestConversationMigrationCommittedFailureAllowsRetry(t *testing.T) {
 			}
 			if blocked[scenario] {
 				// Executable output that Vekil could not save keeps the outcome
-				// uncertain.
-				if !strings.Contains(failed.Body.String(), "conversation_execution_uncertain") {
-					t.Fatalf("missing execution uncertainty diagnostic: %s", conversationBodyTail(failed))
+				// uncertain. The stream ends with response.failed, which Codex
+				// reports, rather than an error event, which it ignores.
+				if tail := conversationBodyTail(failed); !strings.Contains(tail, "event: response.failed") || !strings.Contains(tail, `"code":"conversation_execution_uncertain"`) {
+					t.Fatalf("missing execution uncertainty diagnostic: %s", tail)
 				}
 				if retry.Code != http.StatusConflict || sends.Load() != 2 || !strings.Contains(retry.Body.String(), "conversation_execution_uncertain") {
 					t.Fatalf("uncertain turn retried: %d %s", retry.Code, conversationBodyTail(retry))
