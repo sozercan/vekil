@@ -28,6 +28,9 @@ PUBLIC_MODEL="vekil-local-policy-smoke"
 LIGHTWEIGHT_REASONING_EFFORT="low"
 POWERFUL_REASONING_EFFORT="max"
 CLASSIFIER_DROP_SAMPLING_PARAMS="true"
+# Omitted mode mirrors the Copilot matrix, including Haiku sometimes following
+# the parallel task text and adding fetch_* calls to its classifier response.
+CLASSIFIER_EXTRA_TOOL_CALLS="false"
 
 log() {
   printf '==> %s\n' "$*" >&2
@@ -210,6 +213,7 @@ parser.add_argument("--terminal-model", required=True)
 parser.add_argument("--classifier-model", default="")
 parser.add_argument("--reasoning-effort", required=True)
 parser.add_argument("--classifier-drop-sampling-params", choices=("true", "false"), required=True)
+parser.add_argument("--classifier-extra-tool-calls", choices=("true", "false"), required=True)
 parser.add_argument("--secret", required=True)
 args = parser.parse_args()
 
@@ -490,8 +494,13 @@ class Handler(BaseHTTPRequestHandler):
         model = body["model"]
         if is_classifier:
             arguments = json.dumps(signals, separators=(",", ":"))
-            payload = tool_completion(model, [function_call(f"call_classifier_{sequence}", "emit_policy_signals", json.loads(arguments))])
-            self.send_json(200, payload)
+            calls = [function_call(f"call_classifier_{sequence}", "emit_policy_signals", json.loads(arguments))]
+            if args.classifier_extra_tool_calls == "true" and "Call both fetch_account and fetch_permissions" in json.dumps(body["messages"]):
+                calls += [
+                    function_call(f"call_classifier_account_{sequence}", "fetch_account", {}),
+                    function_call(f"call_classifier_permissions_{sequence}", "fetch_permissions", {}),
+                ]
+            self.send_json(200, tool_completion(model, calls))
             return
 
         choice = body.get("tool_choice")
@@ -562,6 +571,7 @@ start_mock_server() {
     --classifier-model "${classifier_model}" \
     --reasoning-effort "${effort}" \
     --classifier-drop-sampling-params "${CLASSIFIER_DROP_SAMPLING_PARAMS}" \
+    --classifier-extra-tool-calls "${CLASSIFIER_EXTRA_TOOL_CALLS}" \
     --secret "${secret}" \
     >"${case_dir}/server.log" 2>&1 &
   pid=$!
@@ -748,6 +758,7 @@ main() {
       LIGHTWEIGHT_REASONING_EFFORT=""
       POWERFUL_REASONING_EFFORT=""
       CLASSIFIER_DROP_SAMPLING_PARAMS="false"
+      CLASSIFIER_EXTRA_TOOL_CALLS="true"
       ;;
     *) fail "reasoning-effort test mode must be configured or omitted" ;;
   esac
@@ -829,8 +840,18 @@ main() {
   assert_wrapper_ports
   assert_ports_released
 
-  assert_mock_state lightweight 0 7
-  assert_mock_state primary 12 2
+  # A rejected parallel-tools classifier response moves that terminal request
+  # from the lightweight tier to the powerful primary.
+  local fallback_log='parallel tools classifier returned extra tool calls; Vekil rejected its output and used the uncertain tier'
+  if [[ "${CLASSIFIER_EXTRA_TOOL_CALLS}" == "true" ]]; then
+    grep -Fq "${fallback_log}" "${HARNESS_STDERR}" || fail "harness did not accept the proven classifier tool-call deviation"
+    assert_mock_state lightweight 0 6
+    assert_mock_state primary 12 3
+  else
+    ! grep -Fq "${fallback_log}" "${HARNESS_STDERR}" || fail "harness reported a classifier deviation that the mock did not produce"
+    assert_mock_state lightweight 0 7
+    assert_mock_state primary 12 2
+  fi
   assert_mock_state secondary 0 1
 
   assert_no_test_credentials "${HARNESS_STDOUT}"

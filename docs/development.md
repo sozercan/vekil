@@ -26,7 +26,7 @@ scripts/tests/live-smoke-reliability-test.sh  # deterministic mock-server/fake-C
 scripts/tests/live-chat-over-responses-smoke-test.sh  # deterministic Chat-over-Responses live-harness gates
 scripts/tests/live-policy-routing-smoke-test.sh  # deterministic semantic-policy process/cleanup gates
 scripts/tests/live-policy-routing-copilot-smoke-test.sh  # deterministic Copilot bridge/model-selection wrapper gate
-scripts/tests/live-policy-routing-smoke-test.sh omitted  # repeat the policy matrix without tier effort
+scripts/tests/live-policy-routing-smoke-test.sh omitted  # repeat without tier effort, plus the classifier's extra-tool-call deviation
 scripts/tests/live-policy-routing-responses-effort-smoke-test.sh  # deterministic Responses low/high routing gate
 ```
 
@@ -416,6 +416,8 @@ The common native-Chat live matrix covers:
 - retry-safe within-powerful-tier failover through a loopback validation shim that injects an authoritative precommit `429`;
 - representative local rejections with zero classifier and terminal sends; and
 - `/stats.json`, response, header, log, generation-hash, prompt/tool sentinel, upstream request-ID, and internal-topology redaction checks.
+
+Every classifier call must complete, with one exception. The parallel-tools task tells the terminal model to call `fetch_account` and `fetch_permissions`. The classifier model (Haiku in the Copilot matrix) sometimes follows that text too and returns both calls beside `emit_policy_signals`. Vekil rejects that response as `invalid_output` and uses the uncertain tier. The harness accepts that one outcome only when the control shim's record of the classifier response shows more than one tool call with exactly one `emit_policy_signals`. The shim logs tool names from a fixed synthetic allowlist, never arguments.
 
 In the Copilot matrix, the powerful targets are distinct models but share one Copilot service and loopback bridge. That proves sealed tier selection, retry accounting, target switching, and public-identity behavior; it does **not** prove independent cross-provider availability.
 
