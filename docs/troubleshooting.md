@@ -169,10 +169,8 @@ fail immediately. Other conversations are unaffected.
 Codex 0.157 and later is an exception. It always resends everything it
 received, so Vekil admits a Codex request whose history validates and replaces
 the old attempt. Sending a new message in Codex continues the conversation, and
-its own automatic retry usually does too. This does not help when the attempt
-delivered a completed tool call or assistant message that Vekil failed to save,
-for example before a crash: Codex resends that item, and history validation
-rejects it.
+its own automatic retry usually does too, including when it resends a tool call
+and its output that Vekil could not save before a crash.
 
 One case is recoverable for any client. After a turn that delivered a completed
 tool call ended, a turn that retries from before that call gets this `409`,
@@ -190,7 +188,7 @@ completed tool call. In the last case Vekil saves what it delivered, so Codex's
 retry, which carries the call and its output, continues the conversation. The
 exception is a stream Vekil ends itself, through a streaming timeout or a
 restart, right after a completed tool call. Vekil cannot tell whether the client
-received that call, so the next turn gets this code. A
+received that call, so the next turn gets this code unless it is Codex's. A
 client that disconnects or cancels a turn, such as an interrupted agent, keeps
 the conversation usable; see
 [conversation migration](conversation-migration.md#storage-diagnostics-and-deletion).

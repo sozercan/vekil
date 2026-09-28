@@ -213,16 +213,26 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		}
 	}
 	fullInput := input.items
+	trusted := conversationClientResendsDelivered(operation.clientUserAgent)
+	// resent marks model output that Vekil never saved after the verified
+	// history. A verified Codex client resends the items it completed in an
+	// attempt Vekil could not settle, each tool call with its output, so the
+	// model cannot repeat them. Only that attempt's marker explains them.
+	resent := false
 	if source != nil {
 		if previousID != "" {
 			if !conversationDeltaInput(input.items) || input.private {
-				return fail(errConversationHistoryPartial)
+				resent = true
 			}
 			fullInput = append(cloneRawMessages(source.Input), input.items...)
 		} else {
-			if !conversationHasPrefix(input.items, source.Input) || !conversationDeltaInput(input.items[len(source.Input):]) {
+			if !conversationHasPrefix(input.items, source.Input) {
 				return fail(errConversationHistoryPartial)
 			}
+			resent = !conversationDeltaInput(input.items[len(source.Input):])
+		}
+		if resent && !trusted {
+			return fail(errConversationHistoryPartial)
 		}
 	} else if !assertedComplete && (input.private || previousID != "" || headerGetCI(headers, "X-Codex-Turn-State") != "" || !conversationNewInput(input.items)) {
 		return fail(errConversationHistoryMissing)
@@ -281,12 +291,17 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 	}
 	// A verified Codex client resends every item it completed, with its tool
 	// outputs. Its request reached here only by extending saved history with
-	// client input, so nothing it received from an unsettled attempt is missing:
-	// an unresolved marker cannot hide a tool call the model might repeat.
-	turn.trustedClient = conversationClientResendsDelivered(operation.clientUserAgent)
+	// client input or with output resent from an unsettled attempt, so nothing
+	// it received is missing: an unresolved marker cannot hide a tool call the
+	// model might repeat.
+	turn.trustedClient = trusted
 	overrode, err := store.acquireFrom(turn.root, turn.sourceKey, turn.trustedClient)
 	if err != nil {
 		return fail(err)
+	}
+	if resent && !overrode {
+		store.release(turn.root)
+		return fail(errConversationHistoryPartial)
 	}
 	if overrode {
 		h.logConversationRecovery(operation, "released", "", "client_resends_delivered")
@@ -738,6 +753,8 @@ func (t *conversationTurn) releaseEndedAttempt(targetID, reason string, ended bo
 			return err
 		}
 		reason = "delivered_history_saved"
+	} else {
+		t.saveEndedInertHistory(ended)
 	}
 	if t.pending {
 		if err := t.store.clearAttempt(t.root); err != nil {
@@ -885,6 +902,22 @@ func (t *conversationTurn) saveEndedHistory(targetID string, ended bool) error {
 	}
 	t.pending = false
 	return nil
+}
+
+// saveEndedInertHistory saves the reasoning and messages an ended attempt
+// delivered, as after an interrupt, so a client that resends them, as Codex
+// does, continues from verified history. The save also clears the attempt
+// marker; when there is nothing to save or the save fails, the caller clears
+// it, since these items cannot run anything. The caller holds t.mu.
+func (t *conversationTurn) saveEndedInertHistory(ended bool) {
+	delivered := t.deliveredOutput(ended)
+	if len(delivered.items) == 0 && len(delivered.anchors) == 0 || t.deliveredInvalid || !t.haveDeliveryInfo || t.deliveredResponseID == "" {
+		return
+	}
+	snapshot, err := t.historySnapshot(t.deliveredResponseID, t.deliveryInfo, delivered, false)
+	if err == nil && t.store.save(snapshot) == nil {
+		t.pending = false
+	}
 }
 
 // endedHistory returns the delivered items saveEndedHistory saves, or an error

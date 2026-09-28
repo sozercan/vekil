@@ -210,8 +210,10 @@ the upstream ends it, with a terminal event (`response.failed`, `error`,
 `response.incomplete` or `response.cancelled`) or by closing or resetting the
 stream, and when Vekil ends it, through a processing error, its streaming
 deadline or a shutdown. Reasoning, assistant messages and tool calls that
-arrived only in part cannot run anything, so the next turn continues from the
-previous response. A completed tool call or hosted tool call may have run, so
+arrived only in part cannot run anything, so the next turn may continue from the
+previous response. Vekil saves the completed reasoning and messages it
+delivered, so a client that resends them, as Codex does, continues from verified
+history too. A completed tool call or hosted tool call may have run, so
 Vekil first saves every item it delivered as a snapshot of that response, as
 after a client interrupt. Codex runs a delivered call and resends it with its
 output, and that continuation matches the saved history. Only a turn that
@@ -238,16 +240,20 @@ A stream Vekil cannot settle ends with `response.failed` carrying
 
 Codex 0.157 and later record every item they complete, run a completed tool
 call even when its stream then fails, and resend both, with the tool's output,
-in their next request. A Codex request that passes history validation
-therefore carries nothing from an earlier attempt that Vekil did not save.
-Vekil admits it past an unresolved attempt and replaces that attempt's marker.
-This covers crashes, ambiguous deliveries and markers written by earlier Vekil
-versions, as long as the attempt delivered no completed tool call or assistant
-message that Vekil failed to save. Codex resends such an item, and history
-validation rejects it because Vekil cannot verify that the model produced it. Vekil recognizes Codex by a User-Agent that starts with
+in their next request. A Codex request therefore carries every item it received
+from an earlier attempt, and the model sees each resent call's output, so it
+cannot repeat the call. Vekil admits such a request past an unresolved attempt
+and replaces that attempt's marker. This covers crashes, ambiguous deliveries,
+streams Vekil could not settle and markers written by earlier Vekil versions.
+History validation still requires the saved history as a prefix and a result
+for every call. After it, Vekil accepts model output it never saved only from
+Codex, and only when an unresolved attempt explains it. Vekil recognizes Codex by a User-Agent that starts with
 `codex_cli_rs/`, `codex-tui/`, `codex_exec/` or `codex_vscode/` followed by a
 release version, such as `codex_exec/0.157.1 (...)`. Pre-release and
-development builds do not count. Other clients keep the marker.
+development builds do not count. Other clients keep the marker. Probes of
+opencode 1.18.30 and GitHub Copilot CLI 1.0.81 found neither eligible. opencode
+runs a delivered tool call, then retries the original request without it.
+Copilot CLI sends the stock OpenAI SDK User-Agent, so Vekil cannot recognize it.
 
 A client that disconnects or cancels its own request, for example by
 interrupting an agent mid-turn, owns that turn's outcome. Vekil saves the

@@ -99,6 +99,9 @@ const (
 	// Streamed output a client can keep but cannot execute.
 	conversationStreamedReasoning = "event: response.output_item.done\ndata: " + `{"type":"response.output_item.done","output_index":0,"item":{"id":"rs_streamed","type":"reasoning","encrypted_content":"streamed-encrypted","summary":[]}}` + "\n\n"
 	conversationStreamedTextDelta = "event: response.output_text.delta\ndata: " + `{"type":"response.output_text.delta","item_id":"msg_streamed","output_index":1,"content_index":0,"delta":"partial"}` + "\n\n"
+	// A completed assistant message, such as the preamble a model writes before
+	// its tool calls. Codex records it and resends it.
+	conversationStreamedMessage = "event: response.output_item.done\ndata: " + `{"type":"response.output_item.done","output_index":1,"item":{"id":"msg_streamed","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Checking the files."}]}}` + "\n\n"
 	// Part of a tool call. No client runs it before the call is complete.
 	conversationStreamedArgumentsDelta = "event: response.function_call_arguments.delta\ndata: " + `{"type":"response.function_call_arguments.delta","item_id":"fc_streamed","output_index":1,"delta":"{}"}` + "\n\n"
 	// Complete arguments without the finished item: a client could run them,
@@ -273,14 +276,15 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 	reset := errors.New("connection reset by peer")
 	released := map[string]string{
 		"reasoning then close": "stream_ended", "message then reset": "stream_ended", "arguments then reset": "stream_ended",
-		"tool call then close": "delivered_history_saved", "tool call then close, Codex retry": "delivered_history_saved",
+		"completed message then close, full-history retry": "stream_ended", "tool call then close": "delivered_history_saved",
+		"tool call then close, Codex retry": "delivered_history_saved",
 		// A stream Vekil ends leaves the client with exactly what it received too.
 		"proxy error after upstream close": "proxy_ended", "DONE without completion": "proxy_ended",
 		"proxy deadline": "proxy_ended", "proxy deadline then clean close": "proxy_ended",
 	}
 	session := http.Header{"Session_id": {"client-a"}}
 	for _, scenario := range []string{
-		"reasoning then close", "message then reset", "tool call then close", "tool call then close, Codex retry",
+		"reasoning then close", "message then reset", "completed message then close, full-history retry", "tool call then close", "tool call then close, Codex retry",
 		"tool call then close, branch retry", "arguments then reset", "complete arguments then close", "arguments closed by another item", "arguments replaced by another item",
 		"unrecognized event then close", "DONE without completion", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
 	} {
@@ -313,6 +317,8 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 					case "unrecognized event then close":
 						vendor := "event: response.vendor_progress\ndata: " + `{"type":"response.vendor_progress","output_index":1}` + "\n\n"
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, vendor), nil
+					case "completed message then close, full-history retry":
+						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedMessage), nil
 					case "arguments then reset":
 						return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDelta, reset), nil
 					case "complete arguments then close":
@@ -379,6 +385,15 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 			case "tool call then close":
 				retryFields = map[string]any{"previous_response_id": conversationStreamedResponseID, "input": []any{
 					map[string]any{"type": "function_call_output", "call_id": "call-streamed", "output": "edited"},
+				}}
+			case "completed message then close, full-history retry":
+				// A full-history client such as Codex keeps the completed items it
+				// received and resends them.
+				retryFields = map[string]any{"input": []any{
+					map[string]any{"role": "user", "content": "Seed."}, conversationText("Known earlier answer."),
+					map[string]any{"role": "user", "content": "Next."},
+					map[string]any{"id": "rs_streamed", "type": "reasoning", "encrypted_content": "streamed-encrypted", "summary": []any{}},
+					map[string]any{"id": "msg_streamed", "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "Checking the files."}}},
 				}}
 			case "tool call then close, Codex retry":
 				// Codex runs the delivered call and resends it with its output.
@@ -447,12 +462,13 @@ func TestConversationMigrationShutdownMidStreamKeepsConversationUsable(t *testin
 					t.Log(logs.String())
 				}
 			}()
-			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
+			session := func() http.Header { return http.Header{"Session_id": {"restart-thread"}} }
+			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, session()), false)
 
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, nil)
+				conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, session())
 			}()
 			select {
 			case <-streaming:
@@ -465,14 +481,23 @@ func TestConversationMigrationShutdownMidStreamKeepsConversationUsable(t *testin
 			<-done
 			stopConversationAPIHandler(t, h)
 			h, _ = newConversationAPIHandler(t, transport, &cfg)
-			retry := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil)
+			retry := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, session())
 			if scenario == "tool call last" {
 				// The last event is not confirmed as delivered, so a completed
 				// call among it keeps the turn uncertain.
 				if retry.Code != http.StatusConflict || sends.Load() != 2 {
 					t.Fatalf("unconfirmed tool call released: %d %s", retry.Code, retry.Body.String())
 				}
-				return
+				// Codex ran the call and resends it with its output.
+				headers := session()
+				headers.Set("User-Agent", "codex_exec/0.157.1")
+				retry = conversationPOST(t, h, map[string]any{"input": []any{
+					map[string]any{"role": "user", "content": "Seed."}, conversationText("Known earlier answer."),
+					map[string]any{"role": "user", "content": "Next."},
+					map[string]any{"id": "rs_streamed", "type": "reasoning", "encrypted_content": "streamed-encrypted", "summary": []any{}},
+					map[string]any{"id": "fc_streamed", "type": "function_call", "status": "completed", "call_id": "call-streamed", "name": "edit", "arguments": "{}"},
+					map[string]any{"type": "function_call_output", "call_id": "call-streamed", "output": "edited"},
+				}}, headers)
 			}
 			conversationCompleted(t, retry, false)
 			if sends.Load() != 3 {
@@ -508,7 +533,7 @@ func TestConversationClientResendsDelivered(t *testing.T) {
 }
 
 func TestConversationMigrationCodexRetryPassesUnsettledAttempt(t *testing.T) {
-	for _, scenario := range []string{"complete arguments then close", "ambiguous write"} {
+	for _, scenario := range []string{"complete arguments then close", "ambiguous write", "tool call then unrecognized event"} {
 		t.Run(scenario, func(t *testing.T) {
 			var sends atomic.Int32
 			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -527,21 +552,61 @@ func TestConversationMigrationCodexRetryPassesUnsettledAttempt(t *testing.T) {
 						return nil, io.ErrUnexpectedEOF
 					}
 					created := conversationLifecycleEvent(t, "response.created", "in_progress", 2*responsesPrecommitMaxPeekBytes)
+					if scenario == "tool call then unrecognized event" {
+						// The unrecognized event leaves the delivered call unsaved.
+						vendor := "event: response.vendor_progress\ndata: " + `{"type":"response.vendor_progress","output_index":2}` + "\n\n"
+						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall, vendor), nil
+					}
 					return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDone), nil
 				}
 				return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
 			})
 			logs := &conversationLogBuffer{}
 			h, _ := newConversationAPIHandler(t, transport, nil, func(h *ProxyHandler) { h.log = logger.NewWithWriter(logger.LevelInfo, logs) })
-			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
-			conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, nil)
+			// Codex identifies its thread with session_id.
+			session := func() http.Header { return http.Header{"Session_id": {"codex-thread"}} }
+			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, session()), false)
 
-			retry := func(userAgent string) *httptest.ResponseRecorder {
-				return conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, http.Header{"User-Agent": {userAgent}})
+			fields := func() map[string]any { return map[string]any{"previous_response_id": "seed", "input": "Next."} }
+			blockedCode := http.StatusConflict
+			if scenario == "tool call then unrecognized event" {
+				// Codex ran the call and resends it with its output, which Vekil
+				// never saved.
+				fields = func() map[string]any {
+					return map[string]any{"input": []any{
+						map[string]any{"role": "user", "content": "Seed."}, conversationText("Known earlier answer."),
+						map[string]any{"role": "user", "content": "Next."},
+						map[string]any{"id": "rs_streamed", "type": "reasoning", "encrypted_content": "streamed-encrypted", "summary": []any{}},
+						map[string]any{"id": "fc_streamed", "type": "function_call", "status": "completed", "call_id": "call-streamed", "name": "edit", "arguments": "{}"},
+						map[string]any{"type": "function_call_output", "call_id": "call-streamed", "output": "edited"},
+					}}
+				}
+				blockedCode = http.StatusBadRequest
 			}
+			retry := func(userAgent string) *httptest.ResponseRecorder {
+				headers := session()
+				headers.Set("User-Agent", userAgent)
+				return conversationPOST(t, h, fields(), headers)
+			}
+			if scenario == "tool call then unrecognized event" {
+				// Without an unsettled attempt to explain it, unsaved model output
+				// is not a resend.
+				headers := session()
+				headers.Set("User-Agent", "codex_exec/0.157.1")
+				early := conversationPOST(t, h, map[string]any{"input": []any{
+					map[string]any{"role": "user", "content": "Seed."}, conversationText("Known earlier answer."),
+					map[string]any{"role": "user", "content": "Next."},
+					map[string]any{"type": "function_call", "call_id": "call-early", "name": "edit", "arguments": "{}"},
+					map[string]any{"type": "function_call_output", "call_id": "call-early", "output": "edited"},
+				}}, headers)
+				if early.Code != http.StatusBadRequest || sends.Load() != 1 {
+					t.Fatalf("unexplained model output admitted: %d %s", early.Code, early.Body.String())
+				}
+			}
+			conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, session())
 			// Clients not verified to resend what they received stay blocked.
 			for _, userAgent := range []string{"OpenAI/Python 1.40.0", "codex_cli_rs/0.156.0"} {
-				if blocked := retry(userAgent); blocked.Code != http.StatusConflict || sends.Load() != 2 {
+				if blocked := retry(userAgent); blocked.Code != blockedCode || sends.Load() != 2 {
 					t.Fatalf("%s retry admitted: %d %s", userAgent, blocked.Code, blocked.Body.String())
 				}
 			}
