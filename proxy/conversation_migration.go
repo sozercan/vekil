@@ -37,11 +37,13 @@ type conversationTurn struct {
 	hostedTools     map[string]bool
 	pending         bool
 	dispatched      bool
-	// A handed-off event may belong to an item a client can execute, such as
-	// a tool call. Reasoning and assistant messages cannot run anything.
+	// A handed-off event may have given the client something it can run, such
+	// as a completed tool call. Reasoning, assistant messages and items handed
+	// off only in part cannot run anything.
 	executable bool
-	// Executable items handed off in part, by output_index, and whether a
-	// handed-off event carried executable content that staging cannot save.
+	// Items whose complete arguments were handed off without the finished item,
+	// by output_index, and whether a handed-off event carried executable
+	// content that staging cannot save.
 	openItems       map[int]bool
 	unstaged        bool
 	failed          bool
@@ -703,25 +705,23 @@ func conversationEventInert(eventType string, envelope map[string]json.RawMessag
 	return false
 }
 
-// conversationEventStaged reports whether an executable event belongs to an
-// output item whose response.output_item.done stages it as delivered history.
-func conversationEventStaged(eventType string) bool {
-	switch eventType {
-	case "response.output_item.added", "response.output_item.done",
-		"response.function_call_arguments.delta", "response.function_call_arguments.done",
-		"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
-		"response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
-		return true
-	}
-	return false
-}
-
-// trackExecutableItem follows a handed-off executable item from its first
-// event to its response.output_item.done. An event that belongs to no staged
-// item marks the turn unstaged. The caller holds t.mu.
+// trackExecutableItem records a handed-off event of an item that is neither
+// reasoning nor an assistant message. Clients run a tool call only once it is
+// complete, so an item's first event, its argument deltas and hosted search
+// progress make nothing runnable. Complete arguments without the finished item
+// could be run but not saved, and an event of no item staging recognizes cannot
+// be saved either. The caller holds t.mu.
 func (t *conversationTurn) trackExecutableItem(eventType string, envelope map[string]json.RawMessage) {
+	switch eventType {
+	case "response.output_item.added", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
+		"response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
+		return
+	}
+	t.executable = true
 	var index *int
-	if !conversationEventStaged(eventType) || json.Unmarshal(envelope["output_index"], &index) != nil || index == nil {
+	complete := eventType == "response.output_item.done" || eventType == "response.function_call_arguments.done" ||
+		eventType == "response.custom_tool_call_input.done"
+	if !complete || json.Unmarshal(envelope["output_index"], &index) != nil || index == nil {
 		t.unstaged = true
 		return
 	}
@@ -931,7 +931,6 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 				// Unrecognized events count as executable so they cannot hide a
 				// tool call.
 				if !conversationEventInert(eventType, envelope) {
-					t.executable = true
 					t.trackExecutableItem(eventType, envelope)
 				}
 			}
