@@ -70,6 +70,7 @@ parser.add_argument("--port", type=int, default=0)
 parser.add_argument("--canary-status", type=int, default=200)
 parser.add_argument("--canary-status-sequence", default="")
 parser.add_argument("--canary-message", default="")
+parser.add_argument("--canary-error-type", default="")
 parser.add_argument("--canary-bad-shape", action="store_true")
 parser.add_argument("--hang-chat", action="store_true")
 parser.add_argument("--compact-status", type=int, default=200)
@@ -144,7 +145,10 @@ class Handler(BaseHTTPRequestHandler):
                     "choices": [{"message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
                 })
             else:
-                self.send_json(status, {"error": {"message": message}})
+                error = {"message": message}
+                if args.canary_error_type:
+                    error["type"] = args.canary_error_type
+                self.send_json(status, {"error": error})
             return
         if self.path == "/v1/responses/compact":
             if args.compact_status != 200:
@@ -234,6 +238,9 @@ start_mock_server() {
   fi
   if [[ -n "${message}" ]]; then
     args+=(--canary-message "${message}")
+  fi
+  if [[ -n "${MOCK_CANARY_ERROR_TYPE:-}" ]]; then
+    args+=(--canary-error-type "${MOCK_CANARY_ERROR_TYPE}")
   fi
   if [[ "${bad_shape}" == "1" ]]; then
     args+=(--canary-bad-shape)
@@ -1252,6 +1259,33 @@ expect_hard_failure_with_stderr "removed Zen model is transient in raw smoke" 8 
   env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${removed_model_port}" \
     LIVE_ZEN_SMOKE_DIR="${removed_model_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
+
+# OpenCode restricts its free tier to the OpenCode client. The exact FreeTierError
+# must neutral-skip after one canary and before any client runs (exit42 clients
+# would fail the harness if invoked); the same text without that type stays hard.
+free_tier_message="Error from provider (Console): OpenCode's free tier can only be used from within OpenCode"
+free_tier_dir="${TMP_ROOT}/setup/zen-free-tier-client-restricted"
+MOCK_CANARY_ERROR_TYPE=FreeTierError start_mock_server "${free_tier_dir}/server" 403 "" "${free_tier_message}"
+free_tier_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${free_tier_dir}/bin" exit42 exit42 exit42
+free_tier_case="Zen free-tier client restriction is a neutral pre-client skip"
+if expect_success "${free_tier_case}" 8 \
+  env PATH="${free_tier_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${free_tier_port}" \
+    LIVE_CLI_SMOKE_DIR="${free_tier_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
+  free_tier_stderr="${TMP_ROOT}/cases/${free_tier_case//[^a-zA-Z0-9_.-]/_}/stderr"
+  if grep -Fq 'NEUTRAL SKIP: OpenCode Zen restricts its free tier to the OpenCode client' "${free_tier_stderr}" \
+    && [[ "$(grep -c 'refused by provider policy' "${free_tier_stderr}")" -eq 1 ]]; then
+    record_success "Zen free-tier restriction stops after one canary"
+  else
+    record_failure "Zen free-tier restriction stops after one canary" "missing skip reason or more than one refused canary"
+    cat "${free_tier_stderr}" >&2 || true
+  fi
+fi
+run_zen_case_expect_failure "Zen free-tier text without FreeTierError type is hard" 403 pass pass pass \
+  "${free_tier_message}"
 
 hanging_chat_dir="${TMP_ROOT}/setup/hanging-chat-canary"
 start_mock_server "${hanging_chat_dir}/server" 200 "" "" 0 1

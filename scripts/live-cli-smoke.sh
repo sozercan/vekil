@@ -676,7 +676,8 @@ EOF
 #     client must pass another candidate;
 #   - every installed client must pass independently on at least one candidate;
 #   - neutral exit 0 is allowed only if no model was reachable before any client
-#     was exercised.
+#     was exercised, or if the first canary gets Zen's exact HTTP 403
+#     FreeTierError refusing non-OpenCode clients.
 # Zen's configured free models advertise text Chat support, not reliable coding
 # tool use, so these client checks use a direct exact-text prompt. The
 # credentialed Copilot-mode checks above retain their file-reading fixture.
@@ -698,6 +699,7 @@ ZEN_MODEL_PREFS=(
 ATTEMPT_STATUS=""
 ATTEMPT_DETAIL=""
 ZEN_ANY_CLIENT_EXERCISED=0
+ZEN_CLIENT_RESTRICTION=""
 
 validate_zen_free_models_file() {
   [[ -n "${ZEN_FREE_MODELS_FILE}" ]] || return 0
@@ -750,8 +752,20 @@ zen_error_is_transient() {
     'promotion (has )?ended|free promotion[^[:alnum:]]+ended|^model [[:alnum:]_.:/-]+ is not supported$|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'
 }
 
+# Since 2026-09-17 OpenCode Zen answers anonymous free-tier requests from other
+# clients with HTTP 403 FreeTierError "OpenCode's free tier can only be used
+# from within OpenCode". That is a provider usage policy, not an outage. Vekil
+# must not impersonate the OpenCode client to get around it.
+zen_error_is_client_restricted() {
+  local type="$1"
+  local message="$2"
+  [[ "${type}" == "FreeTierError" ]] || return 1
+  printf '%s' "${message}" | grep -qiE 'free tier can only be used from within opencode'
+}
+
 # zen_canary <model> [artifact-tag] -> echoes:
-#   OK <detail> | TRANSIENT <recognized-reason> | FAIL <reason>
+#   OK <detail> | TRANSIENT <recognized-reason> | RESTRICTED <policy-message> |
+#   FAIL <reason>
 zen_canary() {
   local model="$1"
   local tag="${2:-initial}"
@@ -759,7 +773,7 @@ zen_canary() {
   local body="${SMOKE_DIR}/canary-${safe}.json"
   local request="${SMOKE_DIR}/canary-req-${safe}.json"
   local curl_error="${SMOKE_DIR}/canary-${safe}.curl.err"
-  local code errmsg curl_rc
+  local code errmsg errtype curl_rc
 
   jq -n --arg model "${model}" \
     '{model: $model, max_tokens: 16, messages: [{role: "user", content: "ping"}]}' \
@@ -819,6 +833,10 @@ zen_canary() {
     401|403)
       if printf '%s' "${errmsg}" | grep -qiE 'does not support /|unknown model|no upstream'; then
         printf 'FAIL proxy:%s\n' "${errmsg:0:80}"
+      elif [[ "${code}" == "403" ]] \
+        && errtype="$(jq -r '.error.type? // empty' "${body}" 2>/dev/null)" \
+        && zen_error_is_client_restricted "${errtype}" "${errmsg}"; then
+        printf 'RESTRICTED http-403:%s\n' "${errmsg:0:200}"
       elif zen_error_is_transient "${errmsg}"; then
         printf 'TRANSIENT message:%s\n' "${errmsg:0:80}"
       else
@@ -832,7 +850,9 @@ zen_canary() {
 }
 
 # run_harness_iterated <client> <model>... ->
-#   0 pass, 2 no initial reachability, 3 reachable candidates all incompatible.
+#   0 pass, 2 no initial reachability, 3 reachable candidates all incompatible,
+#   4 the provider refused the free tier to non-OpenCode clients (the policy
+#   applies to every free model, so remaining candidates are not probed).
 run_harness_iterated() {
   local client="$1"
   shift
@@ -846,6 +866,11 @@ run_harness_iterated() {
       TRANSIENT)
         log "[${client}] skip ${model} before CLI (${verdict#* })"
         continue
+        ;;
+      RESTRICTED)
+        ZEN_CLIENT_RESTRICTION="${verdict#* }"
+        log "[${client}] ${model} refused by provider policy (${ZEN_CLIENT_RESTRICTION})"
+        return 4
         ;;
       FAIL)
         die "[${client}] canary failed for ${model}: ${verdict#* }"
@@ -890,7 +915,7 @@ run_harness_iterated() {
         fi
         die "[${client}] ${model} remained reachable after CLI ${ATTEMPT_DETAIL}; refusing candidate fallback for client failure"
         ;;
-      FAIL)
+      FAIL|RESTRICTED)
         die "[${client}] ${model} CLI ${ATTEMPT_DETAIL}; second canary failed: ${second_verdict#* }"
         ;;
       *)
@@ -1142,6 +1167,18 @@ main_zen() {
         ;;
       3)
         die "[${client}] no reachable Zen model produced the exact expected output"
+        ;;
+      4)
+        if [[ "${ZEN_ANY_CLIENT_EXERCISED}" == "0" ]]; then
+          log "Zen smoke NEUTRAL SKIP: OpenCode Zen restricts its free tier to the OpenCode client (${ZEN_CLIENT_RESTRICTION})."
+          log "Vekil does not impersonate OpenCode; live Zen coverage needs a credential or model that OpenCode permits for API use."
+          if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+            printf '::warning title=OpenCode Zen smoke skipped::%s\n' \
+              "OpenCode Zen refused the anonymous free tier to non-OpenCode clients (HTTP 403 FreeTierError); no client was exercised."
+          fi
+          return 0
+        fi
+        die "[${client}] provider refused the free tier after the smoke had already exercised a reachable model"
         ;;
       *)
         die "[${client}] harness returned unexpected status ${rc}"

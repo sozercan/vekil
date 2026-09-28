@@ -6,8 +6,9 @@ name: Live OpenCode Zen Smoke
 # openai-compatible provider routing end to end through real coding-agent CLIs.
 #
 # The Zen free tier rotates and is rate-limited per IP. The script neutral-skips
-# only when no model is reachable before any CLI is exercised; once a canary
-# reaches a model, every installed CLI is an independent hard gate. See
+# only when no model is reachable before any CLI is exercised, including Zen's
+# HTTP 403 FreeTierError that limits the free tier to the OpenCode client; once a
+# canary reaches a model, every installed CLI is an independent hard gate. See
 # docs/development.md.
 
 on:
