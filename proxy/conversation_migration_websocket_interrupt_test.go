@@ -90,9 +90,13 @@ func TestConversationMigrationWebSocketClientInterruptKeepsConversationUsable(t 
 				return conversationResponse(t, req, "resumed", conversationText("Resumed.")), nil
 			})
 			logs := &conversationLogBuffer{}
+			// Only the client's close may end the held upstream. With the
+			// harness's 3s streaming deadline, a machine that stalls before the
+			// server reads the close lets that deadline end the attempt first,
+			// which Vekil records as failed (proxy_ended), not interrupted.
 			h, _ := newConversationAPIHandler(t, transport, nil, func(h *ProxyHandler) {
 				h.log = logger.NewWithWriter(logger.LevelInfo, logs)
-			})
+			}, WithStreamingUpstreamTimeout(time.Hour))
 			server := startResponsesWebSocketProxyServer(t, h)
 			session := http.Header{"Session_id": {"ws-client"}}
 			conn := mustDialResponsesWebSocket(t, server, session)
