@@ -57,6 +57,8 @@ On macOS, the app adds directories from your interactive login shell's `PATH` at
 
 If shell startup fails or times out, the app appends `/opt/homebrew/bin` and `/usr/local/bin` as fallbacks and still logs the lookup warning. Shell recovery and fallback keep inherited directories first and only append missing absolute directories, never empty or relative entries. The app does not retry the shell lookup.
 
+The app writes its logs, including the proxy's, to `~/Library/Logs/vekil/menubar.log` on macOS and to `vekil/logs/menubar.log` under the user cache directory elsewhere. A file that reaches 16 MiB moves to `menubar.log.1`, so at most two files are kept. The files are private to your user. Look there for `conversation recovery` lines when a conversation is blocked.
+
 Use `Choose Providers Config…` to select the same JSON/YAML file you would pass with `--providers-config`. The app saves the selected path for future launches and launch-at-login starts. `Use Default Copilot Routing` clears the saved path.
 
 Every **Start Vekil** reads the saved path and the providers file again, and fetches a remote URL again. To apply an edited file, choose **Stop Vekil** and then **Start Vekil**. You don't need to quit the app. If the edited file is invalid, Start shows the error and stays enabled, so you can fix the file and start again.
