@@ -159,31 +159,38 @@ contents or credentials.
 
 This code appears only on [conversation migration](conversation-migration.md)
 routes. An earlier turn of the same conversation was dispatched, but Vekil did
-not save its completion. A tool call reached the client only in part or in a
-form Vekil could not save before the upstream stream broke, Vekil ended the
-stream itself, or Vekil shut down or crashed before it knew the outcome. Every
-later turn of that conversation returns this `409`, including after restart, so
-a client's automatic retries fail immediately. Other conversations are
-unaffected.
+not save its completion or learn its outcome. A tool call's complete arguments
+reached the client without the finished call, executable content arrived that
+Vekil could not save, the request may have reached the upstream before a
+failure, a save failed, or Vekil crashed. Every later turn of that conversation
+returns this `409`, including after restart, so a client's automatic retries
+fail immediately. Other conversations are unaffected.
 
-One case is recoverable. After the upstream ended a turn that had delivered a
-completed tool call, a turn that retries from before that call gets this `409`,
+Codex 0.157 and later is an exception. It always resends everything it
+received, so Vekil admits a Codex request whose history validates and replaces
+the old attempt. Sending a new message in Codex continues the conversation, and
+its own automatic retry usually does too.
+
+One case is recoverable for any client. After a turn that delivered a completed
+tool call ended, a turn that retries from before that call gets this `409`,
 because it could repeat the call. A turn that continues from the delivered
 items and returns the call's output is still admitted, as Codex's own retry is.
 
-Two common interruptions do not cause this code. An upstream failure, such as
-an Azure `429` sent after HTTP `200` or a stream that closes partway through,
-either fails over before the stream is committed or reaches the client
-unchanged after commitment, so the client can retry. This includes a long
-quiet stream that sent only `keepalive` events, a stream that sent only
-reasoning or message text, and a stream that delivered a completed tool call.
-In the last case Vekil saves what it delivered, so Codex's retry, which carries
-the call and its output, continues the conversation. A client that disconnects
-or cancels a turn, such as an interrupted agent, keeps the conversation usable;
-see
+Common interruptions do not cause this code. A stream that the upstream or
+Vekil ends while the client stays connected, such as an Azure `429` sent after
+HTTP `200`, a stream that closes partway through, a streaming timeout or a
+Vekil restart, either fails over before the stream is committed or reaches the
+client unchanged after commitment, so the client can retry. This includes a
+long quiet stream that sent only `keepalive` events, a stream that sent only
+reasoning, message text or part of a tool call, and a stream that delivered a
+completed tool call. In the last case Vekil saves what it delivered, so Codex's
+retry, which carries the call and its output, continues the conversation. A
+client that disconnects or cancels a turn, such as an interrupted agent, keeps
+the conversation usable; see
 [conversation migration](conversation-migration.md#storage-diagnostics-and-deletion).
 
-What to do first: start a new conversation in the client. To keep the blocked
+What to do first: in Codex 0.157 or later, send a new message. With other
+clients, start a new conversation in the client. To keep the blocked
 conversation, stop Vekil and run `vekil state prune-history` with a cutoff after
 the failed attempt, as described in
 [Storage, diagnostics and deletion](conversation-migration.md#storage-diagnostics-and-deletion).
@@ -192,7 +199,9 @@ conversation must resend its history with `X-Vekil-History-Complete: true`.
 
 To investigate, find the earlier attempt in `/stats.json` `recent_attempts` using
 the `X-Vekil-Request-ID` of the first failed turn. Record its status, delivery,
-`semantic_progress`, and `downstream_commitment`.
+`semantic_progress`, and `downstream_commitment`. The `conversation recovery`
+log lines name each outcome and reason; the menubar app keeps them in
+`~/Library/Logs/vekil/menubar.log` on macOS (see [Menubar](menubar.md)).
 
 ## `408 user_request_timeout`: timed out reading request body
 
