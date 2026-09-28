@@ -213,7 +213,7 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 	session := http.Header{"Session_id": {"client-a"}}
 	for _, scenario := range []string{
 		"reasoning then close", "message then reset", "tool call then close", "tool call then close, Codex retry",
-		"tool call then close, branch retry", "arguments then reset", "complete arguments then close", "arguments closed by another item",
+		"tool call then close, branch retry", "arguments then reset", "complete arguments then close", "arguments closed by another item", "arguments replaced by another item",
 		"unrecognized event then close", "DONE without completion", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
 	} {
 		t.Run(scenario, func(t *testing.T) {
@@ -253,6 +253,11 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 						// A malformed stream finishes a different call at the same index.
 						other := conversationOutputItemDone(t, 1, map[string]any{"id": "fc_other", "type": "function_call", "status": "completed", "call_id": "call-other", "name": "edit", "arguments": "{}"})
 						return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDone, other), nil
+					case "arguments replaced by another item":
+						// A second call's arguments at the same index must not hide the first.
+						otherArguments := strings.ReplaceAll(conversationStreamedArgumentsDone, "fc_streamed", "fc_other")
+						other := conversationOutputItemDone(t, 1, map[string]any{"id": "fc_other", "type": "function_call", "status": "completed", "call_id": "call-other", "name": "edit", "arguments": "{}"})
+						return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDone, otherArguments, other), nil
 					case "DONE without completion":
 						return conversationStreamResponse(req, nil, created, conversationStreamedTextDelta, "data: [DONE]\n\n"), nil
 					case "proxy error after upstream close":
@@ -322,6 +327,11 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 			if !ok {
 				if retry.Code != http.StatusConflict || sends.Load() != 2 || !strings.Contains(retry.Body.String(), "conversation_execution_uncertain") {
 					t.Fatalf("uncertain turn released: %d %s", retry.Code, retry.Body.String())
+				}
+				// Only the branch retry follows a save; a saved snapshot would
+				// admit its continuations.
+				if saved := strings.Contains(logs.String(), `"reason":"delivered_history_saved"`); saved != (scenario == "tool call then close, branch retry") {
+					t.Fatalf("delivered history saved=%v\nlogs: %s", saved, logs.String())
 				}
 				return
 			}

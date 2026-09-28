@@ -808,7 +808,7 @@ func (t *conversationTurn) trackExecutableItem(eventType string, envelope map[st
 		return
 	}
 	id := rawJSONString(envelope["item_id"])
-	if id == "" {
+	if open, ok := t.openItems[*index]; id == "" || ok && open != id {
 		t.unstaged = true
 		return
 	}
