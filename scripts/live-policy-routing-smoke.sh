@@ -1505,7 +1505,8 @@ assert_classifier_completion() {
 # fetch_permissions. The live classifier sometimes obeys that text and returns
 # those calls beside emit_policy_signals. Vekil correctly rejects the output as
 # invalid and routes to the uncertain tier. Accept only that deviation, proven by
-# the shim-recorded classifier response; any other outcome still fails.
+# the shim-recorded classifier response: one emit_policy_signals call and extra
+# calls only to the tools the prompt names. Any other outcome still fails.
 assert_parallel_tools_classifier_outcome() {
   local before="$1"
   local after="$2"
@@ -1520,10 +1521,13 @@ assert_parallel_tools_classifier_outcome() {
     [split("\n")[] | fromjson? | select(.event == "request" and .request_kind == "classifier")]
     | last
     | .status == 200
-      and ((.classifier_tool_calls // []) | length) > 1
-      and ((.classifier_tool_calls // []) | map(select(. == "emit_policy_signals")) | length) == 1
+      and ((.classifier_tool_calls // []) as $calls
+        | ($calls | map(select(. == "emit_policy_signals")) | length) == 1
+          and ($calls | map(select(. != "emit_policy_signals"))) as $extra
+          | ($extra | length) > 0
+            and ($extra | all(. == "fetch_account" or . == "fetch_permissions")))
   ' "${SHIM_LOG}" >/dev/null || \
-    die "parallel tools classifier completion delta=$((completion_after - completion_before)), want 1 (before=${completion_before}, after=${completion_after}), and the classifier response did not contain extra tool calls"
+    die "parallel tools classifier completion delta=$((completion_after - completion_before)), want 1 (before=${completion_before}, after=${completion_after}), and the classifier response did not contain only the prompt's extra tool calls"
   assert_delta "parallel tools classifier completion" "${completion_before}" "${completion_after}" 0
   assert_delta "parallel tools classifier uncertain" "$(profile_metric "${before}" '["totals","classifier","uncertain"]')" "$(profile_metric "${after}" '["totals","classifier","uncertain"]')" 1
   assert_delta "parallel tools classifier unavailable" "$(profile_metric "${before}" '["totals","classifier","unavailable"]')" "$(profile_metric "${after}" '["totals","classifier","unavailable"]')" 0
