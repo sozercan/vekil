@@ -8,6 +8,13 @@ import (
 
 func TestRotatingLogFileKeepsOneBackup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "logs", "menubar.log")
+	// An existing readable file becomes private when it is opened.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	w, err := openRotatingLogFile(path, 16)
 	if err != nil {
 		t.Fatal(err)

@@ -213,7 +213,8 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 	session := http.Header{"Session_id": {"client-a"}}
 	for _, scenario := range []string{
 		"reasoning then close", "message then reset", "tool call then close", "tool call then close, Codex retry",
-		"tool call then close, branch retry", "arguments then reset", "complete arguments then close", "unrecognized event then close", "DONE without completion", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
+		"tool call then close, branch retry", "arguments then reset", "complete arguments then close", "arguments closed by another item",
+		"unrecognized event then close", "DONE without completion", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			var h *ProxyHandler
@@ -248,6 +249,10 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 						return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDelta, reset), nil
 					case "complete arguments then close":
 						return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDone), nil
+					case "arguments closed by another item":
+						// A malformed stream finishes a different call at the same index.
+						other := conversationOutputItemDone(t, 1, map[string]any{"id": "fc_other", "type": "function_call", "status": "completed", "call_id": "call-other", "name": "edit", "arguments": "{}"})
+						return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDone, other), nil
 					case "DONE without completion":
 						return conversationStreamResponse(req, nil, created, conversationStreamedTextDelta, "data: [DONE]\n\n"), nil
 					case "proxy error after upstream close":
@@ -337,49 +342,65 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 }
 
 func TestConversationMigrationShutdownMidStreamKeepsConversationUsable(t *testing.T) {
-	var sends atomic.Int32
-	streaming := make(chan struct{})
-	transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if strings.HasSuffix(req.URL.Path, "/models") {
-			return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
-		}
-		switch sends.Add(1) {
-		case 1:
-			return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
-		case 2:
-			created := conversationLifecycleEvent(t, "response.created", "in_progress", 2*responsesPrecommitMaxPeekBytes)
-			return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, streaming, time.Minute), nil
-		}
-		return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
-	})
-	logs := &conversationLogBuffer{}
-	h, cfg := newConversationAPIHandler(t, transport, nil, func(h *ProxyHandler) { h.log = logger.NewWithWriter(logger.LevelDebug, logs) })
-	defer func() {
-		if t.Failed() {
-			t.Log(logs.String())
-		}
-	}()
-	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
+	for _, scenario := range []string{"reasoning", "tool call last"} {
+		t.Run(scenario, func(t *testing.T) {
+			var sends atomic.Int32
+			streaming := make(chan struct{})
+			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if strings.HasSuffix(req.URL.Path, "/models") {
+					return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+				}
+				switch sends.Add(1) {
+				case 1:
+					return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
+				case 2:
+					parts := []any{conversationLifecycleEvent(t, "response.created", "in_progress", 2*responsesPrecommitMaxPeekBytes), conversationStreamedReasoning}
+					if scenario == "tool call last" {
+						parts = append(parts, conversationStreamedCall)
+					}
+					return conversationStreamResponse(req, nil, append(parts, streaming, time.Minute)...), nil
+				}
+				return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
+			})
+			logs := &conversationLogBuffer{}
+			h, cfg := newConversationAPIHandler(t, transport, nil, func(h *ProxyHandler) { h.log = logger.NewWithWriter(logger.LevelDebug, logs) })
+			defer func() {
+				if t.Failed() {
+					t.Log(logs.String())
+				}
+			}()
+			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, nil)
-	}()
-	select {
-	case <-streaming:
-	case <-time.After(5 * time.Second):
-		t.Fatal("stream never started")
-	}
-	// Restarting Vekil mid-turn ends the stream; the client holds only reasoning.
-	// Like the server, drain the handler before closing the store.
-	h.BeginShutdown()
-	<-done
-	stopConversationAPIHandler(t, h)
-	h, _ = newConversationAPIHandler(t, transport, &cfg)
-	conversationCompleted(t, conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil), false)
-	if sends.Load() != 3 {
-		t.Fatalf("retry after restart was not one owner send: sends=%d", sends.Load())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, nil)
+			}()
+			select {
+			case <-streaming:
+			case <-time.After(5 * time.Second):
+				t.Fatal("stream never started")
+			}
+			// Restarting Vekil mid-turn ends the stream. Like the server, drain
+			// the handler before closing the store.
+			h.BeginShutdown()
+			<-done
+			stopConversationAPIHandler(t, h)
+			h, _ = newConversationAPIHandler(t, transport, &cfg)
+			retry := conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil)
+			if scenario == "tool call last" {
+				// The last event is not confirmed as delivered, so a completed
+				// call among it keeps the turn uncertain.
+				if retry.Code != http.StatusConflict || sends.Load() != 2 {
+					t.Fatalf("unconfirmed tool call released: %d %s", retry.Code, retry.Body.String())
+				}
+				return
+			}
+			conversationCompleted(t, retry, false)
+			if sends.Load() != 3 {
+				t.Fatalf("retry after restart was not one owner send: sends=%d", sends.Load())
+			}
+		})
 	}
 }
 
@@ -388,6 +409,10 @@ func TestConversationClientResendsDelivered(t *testing.T) {
 		"codex_exec/0.157.1 (Mac OS 27.0.0; arm64) ghostty/1.3.2": true,
 		"codex_cli_rs/0.157.0":               true,
 		"codex_cli_rs/1.0.0 (Linux; x86_64)": true,
+		"codex-tui/0.160.2 (Mac OS 27.0.0)":  true,
+		"codex_vscode/0.157.1":               true,
+		"codexifier/1.0.0":                   false,
+		"codex_proxy/0.157.1":                false,
 		"codex_cli_rs/0.156.9":               false,
 		"codex_cli_rs/0.0.0":                 false,
 		"codex_cli_rs/0.157.1-alpha.2":       false,

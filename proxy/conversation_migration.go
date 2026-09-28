@@ -43,10 +43,10 @@ type conversationTurn struct {
 	// as a completed tool call. Reasoning, assistant messages and items handed
 	// off only in part cannot run anything.
 	executable bool
-	// Items whose complete arguments were handed off without the finished item,
-	// by output_index, and whether a handed-off event carried executable
+	// Item IDs whose complete arguments were handed off without the finished
+	// item, by output_index, and whether a handed-off event carried executable
 	// content that staging cannot save.
-	openItems       map[int]bool
+	openItems       map[int]string
 	unstaged        bool
 	failed          bool
 	streamUncertain bool
@@ -76,13 +76,17 @@ type conversationTurn struct {
 // stream_events_utils.rs handle_output_item_done).
 var minResendingCodexVersion = [3]int{0, 157, 0}
 
+// resendingCodexProducts are the Codex front ends, named by their originator,
+// that share that verified turn loop (codex-rs login default_client.rs).
+var resendingCodexProducts = map[string]bool{"codex_cli_rs": true, "codex-tui": true, "codex_exec": true, "codex_vscode": true}
+
 // conversationClientResendsDelivered reports whether a User-Agent names a Codex
-// release at or after minResendingCodexVersion, such as "codex_exec/0.157.1
+// front end at or after minResendingCodexVersion, such as "codex_exec/0.157.1
 // (Mac OS 27.0.0; arm64)". Pre-release and development versions do not count.
 func conversationClientResendsDelivered(userAgent string) bool {
 	product, _, _ := strings.Cut(strings.TrimSpace(userAgent), " ")
 	name, version, ok := strings.Cut(product, "/")
-	if !ok || !strings.HasPrefix(name, "codex") {
+	if !ok || !resendingCodexProducts[name] {
 		return false
 	}
 	parts := strings.Split(version, ".")
@@ -790,13 +794,28 @@ func (t *conversationTurn) trackExecutableItem(eventType string, envelope map[st
 		return
 	}
 	if eventType == "response.output_item.done" {
-		delete(t.openItems, *index)
+		// Only the same item closes complete arguments seen at its index.
+		if id, open := t.openItems[*index]; open {
+			var item struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(envelope["item"], &item) != nil || item.ID != id {
+				t.unstaged = true
+				return
+			}
+			delete(t.openItems, *index)
+		}
+		return
+	}
+	id := rawJSONString(envelope["item_id"])
+	if id == "" {
+		t.unstaged = true
 		return
 	}
 	if t.openItems == nil {
-		t.openItems = make(map[int]bool)
+		t.openItems = make(map[int]string)
 	}
-	t.openItems[*index] = true
+	t.openItems[*index] = id
 }
 
 // saveEndedHistory saves the items an ended attempt delivered, after executable
@@ -805,8 +824,24 @@ func (t *conversationTurn) trackExecutableItem(eventType string, envelope map[st
 // resends it with its output; that continuation is admitted. The marker stays
 // for any turn that branches from earlier history, which could repeat the call.
 // Complete arguments without the finished item, content staging cannot save,
-// or a failed save leaves execution uncertain. The caller holds t.mu.
+// a completed tool call among items not confirmed as delivered, or a failed
+// save leaves execution uncertain. The caller holds t.mu.
 func (t *conversationTurn) saveEndedHistory(targetID string, ended bool) error {
+	if !ended {
+		// A completed tool call the conservative rule leaves out may still have
+		// reached the client; a snapshot without it could let a continuation
+		// repeat it.
+		for _, staged := range t.staged {
+			if staged.event <= t.deliveryEvents-2 {
+				continue
+			}
+			for _, item := range staged.output.items {
+				if !conversationItemInert(item) {
+					return conversationRequestError(errConversationIncomplete)
+				}
+			}
+		}
+	}
 	delivered := t.deliveredOutput(ended)
 	if t.unstaged || len(t.openItems) > 0 || t.deliveredInvalid || !t.haveDeliveryInfo || t.deliveredResponseID == "" ||
 		len(delivered.items) == 0 && len(delivered.anchors) == 0 {

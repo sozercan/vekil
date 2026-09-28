@@ -220,7 +220,9 @@ history still gets the `409`, because it could repeat the call. Execution stays
 uncertain when a tool call's complete arguments arrived without the finished
 call, when executable output arrived inside the failure event or a `keepalive`,
 when an event Vekil does not recognize was handed off, or when the delivered
-items cannot be saved. It also stays uncertain after an ambiguous delivery
+items cannot be saved. When Vekil ends the stream, it cannot tell whether the
+client received the last events it handed off, so a completed tool call among
+them also stays uncertain. It also stays uncertain after an ambiguous delivery
 before commitment, a failed save, a reused response ID or a crash. Before the
 stream is committed, a certified failure may instead
 [fail over](provider-routing.md) to another target. After commitment, Vekil
@@ -236,9 +238,10 @@ in their next request. A Codex request that passes history validation
 therefore carries nothing from an earlier attempt that Vekil did not save.
 Vekil admits it past an unresolved attempt and replaces that attempt's marker.
 This covers crashes, ambiguous deliveries and markers written by earlier Vekil
-versions. Vekil recognizes Codex by a User-Agent such as
-`codex_exec/0.157.1 (...)`; pre-release and development builds do not count.
-Other clients keep the marker.
+versions. Vekil recognizes Codex by a User-Agent that starts with
+`codex_cli_rs/`, `codex-tui/`, `codex_exec/` or `codex_vscode/` followed by a
+release version, such as `codex_exec/0.157.1 (...)`. Pre-release and
+development builds do not count. Other clients keep the marker.
 
 A client that disconnects or cancels its own request, for example by
 interrupting an agent mid-turn, owns that turn's outcome. Vekil saves the

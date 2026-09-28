@@ -56,6 +56,11 @@ func (w *rotatingLogFile) open() error {
 	if err != nil {
 		return err
 	}
+	// The create mode does not apply to an existing file; keep it private.
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
 	info, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
