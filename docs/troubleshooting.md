@@ -166,9 +166,9 @@ failure, a save failed, or Vekil crashed. Every later turn of that conversation
 returns this `409`, including after restart, so a client's automatic retries
 fail immediately. Other conversations are unaffected.
 
-Codex 0.157 and later is an exception. It always resends everything it
-received, so Vekil admits a Codex request whose history validates and replaces
-the old attempt. Sending a new message in Codex continues the conversation, and
+Codex 0.157 and later is an exception. It resends every output item it
+completed, each tool call with its output, so Vekil admits a Codex request whose
+history validates and replaces the old attempt. Sending a new message in Codex continues the conversation, and
 its own automatic retry usually does too, including when it resends a tool call
 and its output that Vekil could not save before a crash.
 
