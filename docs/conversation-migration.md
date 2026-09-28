@@ -238,7 +238,9 @@ in their next request. A Codex request that passes history validation
 therefore carries nothing from an earlier attempt that Vekil did not save.
 Vekil admits it past an unresolved attempt and replaces that attempt's marker.
 This covers crashes, ambiguous deliveries and markers written by earlier Vekil
-versions. Vekil recognizes Codex by a User-Agent that starts with
+versions, as long as the attempt delivered no completed tool call or assistant
+message that Vekil failed to save. Codex resends such an item, and history
+validation rejects it because Vekil cannot verify that the model produced it. Vekil recognizes Codex by a User-Agent that starts with
 `codex_cli_rs/`, `codex-tui/`, `codex_exec/` or `codex_vscode/` followed by a
 release version, such as `codex_exec/0.157.1 (...)`. Pre-release and
 development builds do not count. Other clients keep the marker.
