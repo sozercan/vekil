@@ -174,7 +174,9 @@ changing the source GitHub credential does not.
 Older east IDs keep their original ownership and immutable history. Branching
 from one cannot acquire later west messages. Different conversations proceed
 independently; concurrent turns on one saved conversation return
-`conversation_turn_in_progress` rather than racing region changes.
+`conversation_turn_in_progress` rather than racing region changes. So does a
+turn that resumes from output an active turn has streamed but not saved yet,
+such as right after an interrupt, so the client can retry it.
 
 The proxy-owned WebSocket bridge follows the same rules. Reconnect by sending
 `response.create` with the saved `previous_response_id` and only new input, or
