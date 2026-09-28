@@ -60,6 +60,9 @@ type conversationHistoryStore struct {
 	config ConversationMigrationConfig
 	mu     sync.Mutex
 	active map[string]bool
+	// streaming maps the key of a response an active turn is streaming, and
+	// has not saved yet, to that turn's root.
+	streaming map[string]string
 	// The single writer rebuilds counts while validating records at startup.
 	// d.mu guards them, and updates publish only after the transaction commits.
 	counts conversationHistoryCounts
@@ -74,7 +77,7 @@ func newConversationHistoryStore(d *durableStateBindings, config ConversationMig
 	if d == nil {
 		return nil, configPathError("conversation_migration", "requires durable state_bindings, including process overrides")
 	}
-	s := &conversationHistoryStore{d: d, config: config.withDefaults(), active: make(map[string]bool)}
+	s := &conversationHistoryStore{d: d, config: config.withDefaults(), active: make(map[string]bool), streaming: make(map[string]string)}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.failed != nil || d.db == nil {
@@ -364,7 +367,35 @@ func (s *conversationHistoryStore) acquireFrom(root string, source []byte, trust
 func (s *conversationHistoryStore) release(root string) {
 	s.mu.Lock()
 	delete(s.active, root)
+	for key, streamingRoot := range s.streaming {
+		if streamingRoot == root {
+			delete(s.streaming, key)
+		}
+	}
 	s.mu.Unlock()
+}
+
+// markStreaming records that the active turn rooted at root streams the
+// response keyed key, until the turn is released.
+func (s *conversationHistoryStore) markStreaming(root string, key []byte) {
+	s.mu.Lock()
+	if s.active[root] {
+		s.streaming[string(key)] = root
+	}
+	s.mu.Unlock()
+}
+
+// turnActive reports whether a turn of the conversation rooted at root, or the
+// turn streaming the response keyed key, is still active. Its outcome, and
+// the history it saves, is not known yet.
+func (s *conversationHistoryStore) turnActive(root string, key []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if root != "" && s.active[root] {
+		return true
+	}
+	streamingRoot, ok := s.streaming[string(key)]
+	return ok && s.active[streamingRoot]
 }
 
 func (s *conversationHistoryStore) update(fn func(*bolt.Tx, *conversationHistoryCounts) error) error {

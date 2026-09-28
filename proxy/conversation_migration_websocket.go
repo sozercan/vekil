@@ -57,6 +57,7 @@ func (s *responsesWebSocketSession) postConversationCreateRequest(h *ProxyHandle
 	}
 	// Unsupported hosted state leaves the turn unprotected without a conversation.
 	if turn := operation.conversation; turn != nil {
+		turn.bridged = true
 		turn.toolContexts, turn.toolScope = s.toolContexts, s.toolScope
 	}
 	body = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, body, request.Model, "responses/websocket", true, s.toolContexts, s.toolScope)

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/http/httptrace"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -269,6 +270,82 @@ func TestConversationMigrationFailureAfterUndeliveredCallAllowsRetry(t *testing.
 	conversationCompleted(t, conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil), false)
 	if sends.Load() != 3 {
 		t.Fatalf("retry was not one owner send: sends=%d", sends.Load())
+	}
+}
+
+// conversationSignalingWriter records a streamed response and closes seen once
+// the client has been written an event containing marker.
+type conversationSignalingWriter struct {
+	*httptest.ResponseRecorder
+	marker string
+	seen   chan struct{}
+	once   sync.Once
+}
+
+func (w *conversationSignalingWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(p)
+	if bytes.Contains(p, []byte(w.marker)) {
+		w.once.Do(func() { close(w.seen) })
+	}
+	return n, err
+}
+
+func TestConversationMigrationUnsavedHistoryOfActiveTurnIsBusy(t *testing.T) {
+	var sends atomic.Int32
+	transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/models") {
+			return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+		}
+		switch sends.Add(1) {
+		case 1:
+			return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
+		case 2:
+			created := conversationLifecycleEvent(t, "response.created", "in_progress", 2*responsesPrecommitMaxPeekBytes)
+			return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedMessage, time.Minute), nil
+		}
+		return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
+	})
+	h, _ := newConversationAPIHandler(t, transport, nil)
+	session := func() http.Header { return http.Header{"Session_id": {"resuming-thread"}} }
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, session()), false)
+
+	body, _ := json.Marshal(map[string]any{"model": "coding", "previous_response_id": "seed", "input": "Next.", "stream": true})
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)).WithContext(ctx)
+	req.Header = session()
+	req.Header.Set("Content-Type", "application/json")
+	w := &conversationSignalingWriter{ResponseRecorder: httptest.NewRecorder(), marker: "Checking the files.", seen: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.HandleResponses(w, req)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	select {
+	case <-w.seen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the message never reached the client")
+	}
+
+	// A client that resumes before the interrupted or ending turn saved what it
+	// delivered gets the retryable in-progress error, not a history error.
+	for name, fields := range map[string]map[string]any{
+		"full history": {"input": []any{
+			map[string]any{"role": "user", "content": "Seed."}, conversationText("Known earlier answer."),
+			map[string]any{"role": "user", "content": "Next."},
+			map[string]any{"id": "rs_streamed", "type": "reasoning", "encrypted_content": "streamed-encrypted", "summary": []any{}},
+			map[string]any{"id": "msg_streamed", "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "Checking the files."}}},
+			map[string]any{"role": "user", "content": "After interrupt."},
+		}},
+		"response ID": {"previous_response_id": conversationStreamedResponseID, "input": "After interrupt."},
+	} {
+		resumed := conversationPOST(t, h, fields, session())
+		if resumed.Code != http.StatusConflict || !strings.Contains(resumed.Body.String(), "conversation_turn_in_progress") || sends.Load() != 2 {
+			t.Fatalf("%s resume during an active turn: %d %s", name, resumed.Code, resumed.Body.String())
+		}
 	}
 }
 

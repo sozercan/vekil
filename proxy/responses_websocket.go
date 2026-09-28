@@ -1797,9 +1797,9 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		routeOperation.setCommitment(downstreamCommitmentProtocolFrame)
 	}
 	streamResult, err := s.streamUpstreamResponseWithRequest(h, resp.Body, resp.Header, resp.Request, recordTurn)
-	if routeOperation != nil && (err == nil || errors.Is(err, errStreamFailedUpstream)) {
-		// The terminal event, and every event before it, reached the client.
-		routeOperation.conversation.failureDelivered()
+	if routeOperation != nil && !errors.Is(err, errResponsesWebSocketClientWrite) && (s.ctx == nil || s.ctx.Err() == nil) {
+		// The bridge wrote every output event it read, through the stream's end.
+		routeOperation.conversation.streamDelivered()
 	}
 	if err != nil {
 		// The native reader recognizes terminal framing before the shared parser

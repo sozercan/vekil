@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -50,12 +51,17 @@ type conversationTurn struct {
 	unstaged        bool
 	failed          bool
 	streamUncertain bool
-	// A terminal failure event that followed executable output settles its
-	// attempt once the client's consumer has read past failureOffset, the
-	// stream offset where the event starts, and reads again.
-	failureHandoff  bool
-	failureOffset   int64
-	failureTargetID string
+	// A known end settles its attempt only once every event before it was
+	// handed off. A terminal failure event after executable output waits until
+	// the consumer has read past handoffOffset, the stream offset where the
+	// event starts, and reads again. The websocket bridge reads ahead of its
+	// writer, so on a bridged turn any end waits until the bridge has written
+	// it (streamDelivered).
+	handoff         bool
+	handoffOffset   int64
+	handoffReason   string
+	handoffTargetID string
+	bridged         bool
 	streamWritten   int64
 	streamRead      int64
 	// Completed output items staged from the committed response. An item is
@@ -203,6 +209,10 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		// not import another client's hidden instructions or tool definitions.
 	} else if previousID != "" {
 		source, err = store.lookupResponse(routeID, previousID)
+		if errors.Is(err, errConversationHistoryMissing) && store.turnActive("", store.responseKey(routeID, previousID)) {
+			// The turn that streams this response has not saved it yet.
+			return fail(errConversationHistoryBusy)
+		}
 		if err != nil {
 			return fail(err)
 		}
@@ -220,6 +230,14 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 	// attempt Vekil could not settle, or the last items of an interrupted or
 	// ended stream that Vekil could not confirm as delivered.
 	resent := false
+	partial := func() ([]byte, http.Header, error) {
+		// A turn of this conversation that is still settling may be about to
+		// save the history this request continues, so the client may retry.
+		if store.turnActive(source.Root, nil) {
+			return fail(errConversationHistoryBusy)
+		}
+		return fail(errConversationHistoryPartial)
+	}
 	if source != nil {
 		if previousID != "" {
 			if !conversationDeltaInput(input.items) || input.private {
@@ -228,12 +246,12 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 			fullInput = append(cloneRawMessages(source.Input), input.items...)
 		} else {
 			if !conversationHasPrefix(input.items, source.Input) {
-				return fail(errConversationHistoryPartial)
+				return partial()
 			}
 			resent = !conversationDeltaInput(input.items[len(source.Input):])
 		}
 		if resent && !trusted {
-			return fail(errConversationHistoryPartial)
+			return partial()
 		}
 	} else if !assertedComplete && (input.private || previousID != "" || headerGetCI(headers, "X-Codex-Turn-State") != "" || !conversationNewInput(input.items)) {
 		return fail(errConversationHistoryMissing)
@@ -703,11 +721,7 @@ func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMess
 		// The event before this one may still be on its way to the client.
 		// Settle once the client has read this event (streamReadStarting); a
 		// turn that could not be saved anyway reports that now.
-		if _, err := t.endedHistory(true); err != nil {
-			return err
-		}
-		t.failureHandoff, t.failureOffset, t.failureTargetID = true, t.streamWritten, targetID
-		return nil
+		return t.deferEnd(targetID, reason, t.streamWritten)
 	}
 	return t.releaseEndedAttempt(targetID, reason, true)
 }
@@ -719,42 +733,58 @@ func (t *conversationTurn) streamWrote(n int) {
 	t.mu.Unlock()
 }
 
-// streamReadStarting settles an attempt that a terminal failure event ended
-// once a read of its stream starts after an earlier read returned the start of
-// that event. Readers pass the stream on in order and read again only after
-// the previous chunk was consumed downstream, even through the websocket
-// bridge's pump, so every event before the failure was handed off.
+// deferEnd defers settling a known end until every event before it was
+// handed off. offset is where the end starts in the stream; an end that only
+// the websocket bridge can confirm passes math.MaxInt64. A turn that could not
+// be saved anyway reports that now. The caller holds t.mu.
+func (t *conversationTurn) deferEnd(targetID, reason string, offset int64) error {
+	if t.handoff {
+		return nil
+	}
+	if t.executable {
+		if _, err := t.endedHistory(true); err != nil {
+			return err
+		}
+	}
+	t.handoff, t.handoffOffset, t.handoffReason, t.handoffTargetID = true, offset, reason, targetID
+	return nil
+}
+
+// streamReadStarting settles a deferred end once a read of its stream starts
+// after an earlier read returned the start of that end. Readers pass the
+// stream on in order and read again only after the previous chunk was consumed
+// downstream, even through the websocket bridge's pump, so every event before
+// the end was handed off.
 func (t *conversationTurn) streamReadStarting() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.streamRead <= t.failureOffset {
+	if t.streamRead <= t.handoffOffset {
 		return nil
 	}
-	return t.settleFailureEvent()
+	return t.settleHandoff()
 }
 
-// failureDelivered settles an attempt that a terminal failure event ended once
-// the websocket bridge has written that event to the client. The bridge stops
-// reading at the event, so streamReadStarting never runs for it.
-func (t *conversationTurn) failureDelivered() {
+// streamDelivered settles a deferred end once the websocket bridge has
+// written every event it read, through that end. A client that disconnects
+// first leaves the end to finish's interrupt path.
+func (t *conversationTurn) streamDelivered() {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	_ = t.settleFailureEvent()
+	_ = t.settleHandoff()
 }
 
-// settleFailureEvent releases an attempt whose terminal failure event followed
-// executable output, once every event before it was handed off. A failure is
-// logged by the release, and finish reports a turn left pending. The caller
-// holds t.mu.
-func (t *conversationTurn) settleFailureEvent() error {
-	if !t.failureHandoff {
+// settleHandoff releases an attempt whose deferred end has been handed off. A
+// failure is logged by the release, and finish reports a turn left pending.
+// The caller holds t.mu.
+func (t *conversationTurn) settleHandoff() error {
+	if !t.handoff {
 		return nil
 	}
-	t.failureHandoff = false
-	return t.releaseEndedAttempt(t.failureTargetID, "failure_event", true)
+	t.handoff = false
+	return t.releaseEndedAttempt(t.handoffTargetID, t.handoffReason, true)
 }
 
 // streamReadDone counts the bytes a read of the stream returned.
@@ -1122,7 +1152,7 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 		return data, nil
 	}
 	if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
-		if t.saved || t.failed || t.failureHandoff {
+		if t.saved || t.failed || t.handoff {
 			return data, nil
 		}
 		return nil, conversationRequestError(errConversationIncomplete)
@@ -1265,6 +1295,9 @@ func (t *conversationTurn) observeDelivery(eventType string, envelope map[string
 		_ = json.Unmarshal(envelope["response"], &response)
 		if t.deliveredResponseID == "" {
 			t.deliveredResponseID = response.ID
+			if response.ID != "" {
+				t.store.markStreaming(t.root, t.store.responseKey(info.routeID, response.ID))
+			}
 		} else if response.ID != "" && response.ID != t.deliveredResponseID {
 			t.invalidateDelivery()
 		}
@@ -1437,7 +1470,12 @@ func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 				if b.upstreamEnd.endedBy(err) {
 					reason = "stream_ended"
 				}
-				releaseErr = b.turn.releaseEndedAttempt(b.targetID, reason, true)
+				if b.turn.bridged {
+					// The bridge may still be writing what it read.
+					releaseErr = b.turn.deferEnd(b.targetID, reason, math.MaxInt64)
+				} else {
+					releaseErr = b.turn.releaseEndedAttempt(b.targetID, reason, true)
+				}
 				known, released = releaseErr == nil, releaseErr == nil
 			}
 			if !known {
