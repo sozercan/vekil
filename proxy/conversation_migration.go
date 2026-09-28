@@ -50,6 +50,14 @@ type conversationTurn struct {
 	unstaged        bool
 	failed          bool
 	streamUncertain bool
+	// A terminal failure event that followed executable output settles its
+	// attempt once the client's consumer reads past failureOffset, the stream
+	// offset where the event starts: by then every earlier event was handed off.
+	failureHandoff  bool
+	failureOffset   int64
+	failureTargetID string
+	streamWritten   int64
+	streamRead      int64
 	// Completed output items staged from the committed response. An item is
 	// delivered once a later event has been handed downstream: HTTP and
 	// websocket consumers read the next event only after writing the previous.
@@ -679,7 +687,38 @@ func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMess
 	if t.saved {
 		return conversationRequestError(errConversationIncomplete)
 	}
+	if t.executable {
+		// The event before this one may still be on its way to the client.
+		// Settle once the client reads this event (conversationCompletionBody.Read);
+		// a turn that could not be saved anyway reports that now.
+		if _, err := t.endedHistory(true); err != nil {
+			return err
+		}
+		t.failureHandoff, t.failureOffset, t.failureTargetID = true, t.streamWritten, targetID
+		return nil
+	}
 	return t.releaseEndedAttempt(targetID, reason, true)
+}
+
+// streamWrote counts the bytes written to the client's stream pipe.
+func (t *conversationTurn) streamWrote(n int) {
+	t.mu.Lock()
+	t.streamWritten += int64(n)
+	t.mu.Unlock()
+}
+
+// readStream counts bytes the client's consumer read. Consumers read the stream
+// in order, so reading into a terminal failure event means every earlier event
+// was handed off, and the attempt that event ended can settle.
+func (t *conversationTurn) readStream(n int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.streamRead += int64(n)
+	if !t.failureHandoff || t.streamRead <= t.failureOffset {
+		return nil
+	}
+	t.failureHandoff = false
+	return t.releaseEndedAttempt(t.failureTargetID, "failure_event", true)
 }
 
 // An attempt that ends while the client stays connected leaves a known outcome:
@@ -828,25 +867,9 @@ func (t *conversationTurn) trackExecutableItem(eventType string, envelope map[st
 // a completed tool call among items not confirmed as delivered, or a failed
 // save leaves execution uncertain. The caller holds t.mu.
 func (t *conversationTurn) saveEndedHistory(targetID string, ended bool) error {
-	if !ended {
-		// A completed tool call the conservative rule leaves out may still have
-		// reached the client; a snapshot without it could let a continuation
-		// repeat it.
-		for _, staged := range t.staged {
-			if staged.event <= t.deliveryEvents-2 {
-				continue
-			}
-			for _, item := range staged.output.items {
-				if !conversationItemInert(item) {
-					return conversationRequestError(errConversationIncomplete)
-				}
-			}
-		}
-	}
-	delivered := t.deliveredOutput(ended)
-	if t.unstaged || len(t.openItems) > 0 || t.deliveredInvalid || !t.haveDeliveryInfo || t.deliveredResponseID == "" ||
-		len(delivered.items) == 0 && len(delivered.anchors) == 0 {
-		return conversationRequestError(errConversationIncomplete)
+	delivered, err := t.endedHistory(ended)
+	if err != nil {
+		return err
 	}
 	snapshot, err := t.historySnapshot(t.deliveredResponseID, t.deliveryInfo, delivered, false)
 	if err == nil {
@@ -862,6 +885,32 @@ func (t *conversationTurn) saveEndedHistory(targetID string, ended bool) error {
 	}
 	t.pending = false
 	return nil
+}
+
+// endedHistory returns the delivered items saveEndedHistory saves, or an error
+// when execution stays uncertain. The caller holds t.mu.
+func (t *conversationTurn) endedHistory(ended bool) (conversationInput, error) {
+	if !ended {
+		// A completed tool call the conservative rule leaves out may still have
+		// reached the client; a snapshot without it could let a continuation
+		// repeat it.
+		for _, staged := range t.staged {
+			if staged.event <= t.deliveryEvents-2 {
+				continue
+			}
+			for _, item := range staged.output.items {
+				if !conversationItemInert(item) {
+					return conversationInput{}, conversationRequestError(errConversationIncomplete)
+				}
+			}
+		}
+	}
+	delivered := t.deliveredOutput(ended)
+	if t.unstaged || len(t.openItems) > 0 || t.deliveredInvalid || !t.haveDeliveryInfo || t.deliveredResponseID == "" ||
+		len(delivered.items) == 0 && len(delivered.anchors) == 0 {
+		return conversationInput{}, conversationRequestError(errConversationIncomplete)
+	}
+	return delivered, nil
 }
 
 func (t *conversationTurn) recoveryHeader() string {
@@ -1002,7 +1051,7 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 		return data, nil
 	}
 	if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
-		if t.saved || t.failed {
+		if t.saved || t.failed || t.failureHandoff {
 			return data, nil
 		}
 		return nil, conversationRequestError(errConversationIncomplete)
@@ -1298,6 +1347,11 @@ type conversationCompletionBody struct {
 
 func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		if releaseErr := b.turn.readStream(n); releaseErr != nil {
+			return n, releaseErr
+		}
+	}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		b.turn.mu.Lock()
 		known := b.turn.saved || b.turn.unprotected || b.turn.failed

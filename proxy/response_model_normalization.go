@@ -237,14 +237,17 @@ func (b *normalizedResponsesStreamBody) Close() error {
 	return err
 }
 
-func normalizeResponsesStreamBody(source io.ReadCloser, publicModel string, onEvent func([]byte) error, transforms ...func([]byte) ([]byte, error)) io.ReadCloser {
+// normalizeResponsesStreamBody rewrites each event's model and writes the event
+// to the returned body in one pipe write. written, when set, receives the size of
+// each write after the reader has consumed it.
+func normalizeResponsesStreamBody(source io.ReadCloser, publicModel string, onEvent func([]byte) error, written func(int), transforms ...func([]byte) ([]byte, error)) io.ReadCloser {
 	if source == nil || strings.TrimSpace(publicModel) == "" {
 		return source
 	}
 	pr, pw := io.Pipe()
 	wrapped := &normalizedResponsesStreamBody{reader: pr, source: source}
 	go func() {
-		err := copyNormalizedResponsesSSE(pw, source, publicModel, onEvent, transforms...)
+		err := copyNormalizedResponsesSSE(pw, source, publicModel, onEvent, written, transforms...)
 		_ = source.Close()
 		if err != nil {
 			_ = pw.CloseWithError(err)
@@ -255,7 +258,7 @@ func normalizeResponsesStreamBody(source io.ReadCloser, publicModel string, onEv
 	return wrapped
 }
 
-func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string, onEvent func([]byte) error, transforms ...func([]byte) ([]byte, error)) error {
+func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string, onEvent func([]byte) error, written func(int), transforms ...func([]byte) ([]byte, error)) error {
 	reader := bufio.NewReaderSize(src, openAIStreamScannerInitialBuffer)
 	var event bytes.Buffer
 	flush := func() error {
@@ -271,7 +274,10 @@ func copyNormalizedResponsesSSE(dst io.Writer, src io.Reader, publicModel string
 		if !changed {
 			rewritten = raw
 		}
-		_, err := dst.Write(rewritten)
+		n, err := dst.Write(rewritten)
+		if written != nil {
+			written(n)
+		}
 		return err
 	}
 
@@ -386,10 +392,12 @@ func rewriteResponsesSSEEventModel(raw []byte, publicModel string, onEvent func(
 
 func normalizeResponsesStreamBodyWithBinding(h *ProxyHandler, source io.ReadCloser, info explicitRouteResponseInfo) io.ReadCloser {
 	var transforms []func([]byte) ([]byte, error)
+	var written func(int)
 	if info.conversation != nil {
 		transforms = append(transforms, func(data []byte) ([]byte, error) {
 			return info.conversation.saveResponse(data, info)
 		})
+		written = info.conversation.streamWrote
 	}
 	body := normalizeResponsesStreamBody(source, info.publicID, func(data []byte) error {
 		durable := h != nil && h.stateBindings != nil && h.stateBindings.durable != nil
@@ -419,7 +427,7 @@ func normalizeResponsesStreamBodyWithBinding(h *ProxyHandler, source io.ReadClos
 			tokens = append(tokens, errorTokens...)
 		}
 		return h.bindExplicitStateTokens(info, tokens)
-	}, transforms...)
+	}, written, transforms...)
 	if info.conversation != nil {
 		return &conversationCompletionBody{ReadCloser: body, turn: info.conversation, targetID: info.targetID, upstreamEnd: info.upstreamEnd}
 	}

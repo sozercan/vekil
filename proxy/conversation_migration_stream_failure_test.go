@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -198,6 +199,73 @@ func TestConversationMigrationCommittedFailureAllowsRetry(t *testing.T) {
 				t.Fatalf("retry was not a single owner send: sends=%d west=%d", sends.Load(), west.Load())
 			}
 		})
+	}
+}
+
+// conversationStallingWriter stands in for a client whose connection stalls
+// while Vekil writes the event containing marker, then resets.
+type conversationStallingWriter struct {
+	*httptest.ResponseRecorder
+	marker  string
+	stalled chan struct{}
+	release chan struct{}
+}
+
+func (w *conversationStallingWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(w.marker)) {
+		close(w.stalled)
+		<-w.release
+		return 0, errors.New("connection reset by peer")
+	}
+	return w.ResponseRecorder.Write(p)
+}
+
+func TestConversationMigrationFailureAfterUndeliveredCallAllowsRetry(t *testing.T) {
+	var sends atomic.Int32
+	transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/models") {
+			return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+		}
+		switch sends.Add(1) {
+		case 1:
+			return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
+		case 2:
+			created := conversationLifecycleEvent(t, "response.created", "in_progress", 2*responsesPrecommitMaxPeekBytes)
+			return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall, conversationRateLimitFailed), nil
+		}
+		return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
+	})
+	h, _ := newConversationAPIHandler(t, transport, nil)
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
+
+	body, _ := json.Marshal(map[string]any{"model": "coding", "previous_response_id": "seed", "input": "Next.", "stream": true})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	w := &conversationStallingWriter{ResponseRecorder: httptest.NewRecorder(), marker: "call-streamed", stalled: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.HandleResponses(w, req)
+	}()
+	select {
+	case <-w.stalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tool call was never written")
+	}
+	// Vekil reads the failure event after the call while the call is still
+	// being written. The client then disconnects without receiving the call.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	close(w.release)
+	<-done
+
+	// The turn was the client's to end, and it never received the call, so a
+	// retry from the earlier history is admitted.
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil), false)
+	if sends.Load() != 3 {
+		t.Fatalf("retry was not one owner send: sends=%d", sends.Load())
 	}
 }
 
@@ -505,7 +573,7 @@ func conversationWebSocketFailedTurn(t *testing.T, conn *websocket.Conn, fields 
 }
 
 func TestConversationMigrationWebSocketUpstreamEndAllowsRetry(t *testing.T) {
-	for _, scenario := range []string{"reasoning then close", "tool call then close", "complete arguments then close"} {
+	for _, scenario := range []string{"reasoning then close", "tool call then close", "tool call then failed", "complete arguments then close"} {
 		t.Run(scenario, func(t *testing.T) {
 			var sends atomic.Int32
 			transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -520,6 +588,9 @@ func TestConversationMigrationWebSocketUpstreamEndAllowsRetry(t *testing.T) {
 					switch scenario {
 					case "tool call then close":
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall), nil
+					case "tool call then failed":
+						// The bridge stops reading at the failure event, before EOF.
+						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedCall, conversationRateLimitFailed, time.Minute), nil
 					case "complete arguments then close":
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, conversationStreamedArgumentsDone), nil
 					}
@@ -535,6 +606,12 @@ func TestConversationMigrationWebSocketUpstreamEndAllowsRetry(t *testing.T) {
 
 			turn := func() map[string]any { return map[string]any{"previous_response_id": "seed", "input": "Next."} }
 			ended := conversationWebSocketFailedTurn(t, conn, turn())
+			if scenario == "tool call then failed" {
+				// The bridge follows the forwarded response.failed with an error frame.
+				if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "error" {
+					t.Fatalf("missing upstream error frame: %v", frame)
+				}
+			}
 			if scenario == "complete arguments then close" {
 				retry := conversationWebSocketFailedTurn(t, conn, turn())
 				if sends.Load() != 2 || !strings.Contains(retry, "conversation_execution_uncertain") {
@@ -546,7 +623,7 @@ func TestConversationMigrationWebSocketUpstreamEndAllowsRetry(t *testing.T) {
 				t.Fatalf("ended turn reported uncertainty: %s", ended)
 			}
 			next := turn()
-			if scenario == "tool call then close" {
+			if strings.HasPrefix(scenario, "tool call then") {
 				// A branch could repeat the delivered call; its continuation cannot.
 				if branch := conversationWebSocketFailedTurn(t, conn, turn()); sends.Load() != 2 || !strings.Contains(branch, "conversation_execution_uncertain") {
 					t.Fatalf("branch after a delivered call was admitted: sends=%d %s", sends.Load(), branch)

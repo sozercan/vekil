@@ -216,7 +216,11 @@ Vekil first saves every item it delivered as a snapshot of that response, as
 after a client interrupt. Codex runs a delivered call and resends it with its
 output, and that continuation matches the saved history. Only a turn that
 continues from those items is admitted; a turn that branches from the earlier
-history still gets the `409`, because it could repeat the call. Execution stays
+history still gets the `409`, because it could repeat the call. After a
+completed tool call, Vekil settles a terminal event only once the client reads
+it, because the call may still be on its way to the client when the event
+arrives. A client that disconnects first owns the outcome, as after an
+interrupt. Execution stays
 uncertain when a tool call's complete arguments arrived without the finished
 call, when executable output arrived inside the failure event or a `keepalive`,
 when an event Vekil does not recognize was handed off, or when the delivered

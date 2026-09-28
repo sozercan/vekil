@@ -111,7 +111,7 @@ func TestNormalizeResponsesStreamBodyRewritesEventAndObservesBeforeRead(t *testi
 		}
 		observed = true
 		return nil
-	})
+	}, nil)
 	defer func() { _ = body.Close() }()
 	got, err := io.ReadAll(body)
 	if err != nil {
