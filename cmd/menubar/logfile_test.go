@@ -47,4 +47,11 @@ func TestRotatingLogFileKeepsOneBackup(t *testing.T) {
 	if current, _ = os.ReadFile(path); string(current) != "third line\n4th\n" {
 		t.Fatalf("reopened log = %q", current)
 	}
+	// An entry larger than the cap keeps its start and fits the cap.
+	if n, err := reopened.Write([]byte("an entry much longer than the cap\n")); err != nil || n != 34 {
+		t.Fatalf("oversized write = %d, %v", n, err)
+	}
+	if current, _ = os.ReadFile(path); string(current) != "an entry much l\n" {
+		t.Fatalf("oversized entry = %q", current)
+	}
 }

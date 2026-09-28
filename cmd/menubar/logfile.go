@@ -76,6 +76,12 @@ func (w *rotatingLogFile) Write(p []byte) (int, error) {
 	if w.file == nil {
 		return 0, os.ErrClosed
 	}
+	written := len(p)
+	if int64(len(p)) > w.maxBytes {
+		// Keep the start of an entry larger than the cap, so the file never
+		// exceeds it. Callers see the whole entry written.
+		p = append(p[:w.maxBytes-1:w.maxBytes-1], '\n')
+	}
 	if w.size > 0 && w.size+int64(len(p)) > w.maxBytes {
 		_ = w.file.Close()
 		w.file = nil
@@ -88,5 +94,8 @@ func (w *rotatingLogFile) Write(p []byte) (int, error) {
 	}
 	n, err := w.file.Write(p)
 	w.size += int64(n)
-	return n, err
+	if err != nil {
+		return n, err
+	}
+	return written, nil
 }
