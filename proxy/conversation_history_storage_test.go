@@ -459,8 +459,10 @@ func TestConversationHistoryStorageAdmissionAndCancellation(t *testing.T) {
 		t.Fatalf("concurrent admissions = %d, want 1", acquired)
 	}
 	history.release("contended-root")
-	for _, dispatched := range []bool{false, true} {
-		root := fmt.Sprintf("cancelled-%t", dispatched)
+	// An attempt Vekil ends without delivering anything is settled; one it
+	// blocked as uncertain keeps its marker.
+	for _, state := range []string{"undispatched", "dispatched", "blocked"} {
+		root := "cancelled-" + state
 		if err := history.acquire(root); err != nil {
 			t.Fatal(err)
 		}
@@ -468,17 +470,18 @@ func TestConversationHistoryStorageAdmissionAndCancellation(t *testing.T) {
 		if err := turn.persistIntent(); err != nil {
 			t.Fatal(err)
 		}
-		if dispatched {
+		if state != "undispatched" {
 			turn.dispatching()
 		}
+		turn.blocked = state == "blocked"
 		turn.finish()
 		turn.finish()
 		if err := turn.persistIntent(); !errors.Is(err, context.Canceled) {
 			t.Fatalf("closed turn persisted another intent: %v", err)
 		}
 		err := history.acquire(root)
-		if dispatched && !errors.Is(err, errConversationHistoryUncertain) || !dispatched && err != nil {
-			t.Fatalf("cancelled dispatched=%t admission = %v", dispatched, err)
+		if state == "blocked" && !errors.Is(err, errConversationHistoryUncertain) || state != "blocked" && err != nil {
+			t.Fatalf("cancelled %s admission = %v", state, err)
 		}
 		history.release(root)
 	}

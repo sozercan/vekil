@@ -48,6 +48,9 @@ func conversationStreamResponse(req *http.Request, header http.Header, parts ...
 				<-req.Context().Done()
 				_ = pw.Close()
 				return
+			case chan struct{}:
+				// Signal that every earlier part was read.
+				close(value)
 			}
 		}
 		_ = pw.Close()
@@ -201,11 +204,14 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 	released := map[string]string{
 		"reasoning then close": "stream_ended", "message then reset": "stream_ended", "arguments then reset": "stream_ended",
 		"tool call then close": "delivered_history_saved", "tool call then close, Codex retry": "delivered_history_saved",
+		// A stream Vekil ends leaves the client with exactly what it received too.
+		"proxy error after upstream close": "proxy_ended", "DONE without completion": "proxy_ended",
+		"proxy deadline": "proxy_ended", "proxy deadline then clean close": "proxy_ended",
 	}
 	session := http.Header{"Session_id": {"client-a"}}
 	for _, scenario := range []string{
 		"reasoning then close", "message then reset", "tool call then close", "tool call then close, Codex retry",
-		"tool call then close, branch retry", "arguments then reset", "complete arguments then close", "unrecognized event then close", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
+		"tool call then close, branch retry", "arguments then reset", "complete arguments then close", "unrecognized event then close", "DONE without completion", "proxy error after upstream close", "proxy deadline", "proxy deadline then clean close", "storage failure on release",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			var h *ProxyHandler
@@ -240,9 +246,11 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 						return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDelta, reset), nil
 					case "complete arguments then close":
 						return conversationStreamResponse(req, nil, created, conversationStreamedArgumentsDone), nil
+					case "DONE without completion":
+						return conversationStreamResponse(req, nil, created, conversationStreamedTextDelta, "data: [DONE]\n\n"), nil
 					case "proxy error after upstream close":
 						// The upstream closes cleanly, but Vekil rejects an ambiguous
-						// event before it, so the stream did not end on its own.
+						// event before it and ends the stream itself.
 						ambiguous := "data: " + `{"type":"response.output_text.delta","delta":"a","delta":"b"}` + "\n\n"
 						return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, ambiguous), nil
 					case "storage failure on release":
@@ -323,6 +331,53 @@ func TestConversationMigrationUpstreamEndAllowsRetry(t *testing.T) {
 				t.Fatalf("retry lost the delivered call or its output: %s", body)
 			}
 		})
+	}
+}
+
+func TestConversationMigrationShutdownMidStreamKeepsConversationUsable(t *testing.T) {
+	var sends atomic.Int32
+	streaming := make(chan struct{})
+	transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/models") {
+			return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+		}
+		switch sends.Add(1) {
+		case 1:
+			return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
+		case 2:
+			created := conversationLifecycleEvent(t, "response.created", "in_progress", 2*responsesPrecommitMaxPeekBytes)
+			return conversationStreamResponse(req, nil, created, conversationStreamedReasoning, streaming, time.Minute), nil
+		}
+		return conversationResponse(t, req, "retried", conversationText("Retried answer.")), nil
+	})
+	logs := &conversationLogBuffer{}
+	h, cfg := newConversationAPIHandler(t, transport, nil, func(h *ProxyHandler) { h.log = logger.NewWithWriter(logger.LevelDebug, logs) })
+	defer func() {
+		if t.Failed() {
+			t.Log(logs.String())
+		}
+	}()
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next.", "stream": true}, nil)
+	}()
+	select {
+	case <-streaming:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream never started")
+	}
+	// Restarting Vekil mid-turn ends the stream; the client holds only reasoning.
+	// Like the server, drain the handler before closing the store.
+	h.BeginShutdown()
+	<-done
+	stopConversationAPIHandler(t, h)
+	h, _ = newConversationAPIHandler(t, transport, &cfg)
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Next."}, nil), false)
+	if sends.Load() != 3 {
+		t.Fatalf("retry after restart was not one owner send: sends=%d", sends.Load())
 	}
 }
 

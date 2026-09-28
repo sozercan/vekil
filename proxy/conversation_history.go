@@ -21,6 +21,7 @@ var (
 	errConversationHistoryPartial   = errors.New("input does not contain the complete saved conversation; send the full history or previous_response_id with only new input")
 	errConversationHistoryBusy      = errors.New("another turn of this conversation is active; wait for it to complete before continuing or branching")
 	errConversationHistoryUncertain = errors.New("an earlier attempt may have executed without a saved completion; automatic recovery is blocked to avoid duplicate work")
+	errConversationStreamEnded      = errors.New("the response stream ended before the response completed")
 )
 
 var (

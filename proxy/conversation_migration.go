@@ -586,6 +586,13 @@ func (t *conversationTurn) finish() {
 			if err := t.store.clearAttempt(t.root); err != nil {
 				t.h.logConversationRecovery(t.operation, "blocked", "", "storage_unavailable")
 			}
+		} else if !t.blocked && !t.streamUncertain {
+			// Vekil ended the attempt before the stream reported its end, for
+			// example in a shutdown or at its streaming deadline. As after an
+			// interrupt, only items followed by another event count as delivered.
+			if err := t.releaseEndedAttempt(t.deliveryInfo.targetID, "proxy_ended", false); err != nil && !t.blocked {
+				t.h.logConversationRecovery(t.operation, "blocked", "", "execution_uncertain")
+			}
 		} else if !t.blocked {
 			t.h.logConversationRecovery(t.operation, "blocked", "", "execution_uncertain")
 		}
@@ -611,22 +618,36 @@ func (t *conversationTurn) unprotect(targetID, reason string) error {
 	return nil
 }
 
-// An upstream that ends an attempt leaves a known outcome: the client received
-// exactly what Vekil handed off. The upstream ends it with a terminal failure
-// event, or by closing or resetting the stream without one (reason
-// stream_ended). Reasoning and assistant messages cannot run anything, so the
-// attempt marker is cleared. A completed tool call may have run, so the items
-// handed off are saved and the marker admits only a continuation that includes
-// the call and its output. Either way the upstream failure is forwarded
-// unchanged so the client can apply its own retry policy. Executable output
-// that cannot be saved, or that sits inside the failure event itself, leaves
-// execution uncertain. The caller holds t.mu.
+// releaseFailedAttempt settles an attempt the upstream ended with a terminal
+// failure event. Executable output inside that event, which staging cannot
+// save, leaves execution uncertain. The caller holds t.mu.
 func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMessage, targetID, reason string) error {
-	if t.saved || conversationEventHasExecutableOutput(envelope) {
+	if conversationEventHasExecutableOutput(envelope) {
+		// Staging cannot save it, and the turn stays uncertain when the
+		// stream ends after this event too.
+		t.executable, t.unstaged = true, true
 		return conversationRequestError(errConversationIncomplete)
 	}
+	if t.saved {
+		return conversationRequestError(errConversationIncomplete)
+	}
+	return t.releaseEndedAttempt(targetID, reason, true)
+}
+
+// An attempt that ends while the client stays connected leaves a known outcome:
+// the client received exactly what Vekil handed off, whether the upstream ended
+// it (reasons failure_event and stream_ended) or Vekil did, through a
+// processing error, its streaming deadline or a shutdown (proxy_ended).
+// Reasoning and assistant messages cannot run anything, so the attempt marker
+// is cleared. A completed tool call may have run, so the items delivered are
+// saved and the marker admits only a continuation that includes the call and
+// its output. The failure reaches the client unchanged, so it can apply its own
+// retry policy. Executable output that cannot be saved leaves execution
+// uncertain. ended reports whether the client read past every handed-off
+// event. The caller holds t.mu.
+func (t *conversationTurn) releaseEndedAttempt(targetID, reason string, ended bool) error {
 	if t.executable {
-		if err := t.saveEndedHistory(targetID); err != nil {
+		if err := t.saveEndedHistory(targetID, ended); err != nil {
 			return err
 		}
 		reason = "delivered_history_saved"
@@ -735,15 +756,15 @@ func (t *conversationTurn) trackExecutableItem(eventType string, envelope map[st
 	t.openItems[*index] = true
 }
 
-// saveEndedHistory saves every item an upstream-ended attempt handed off, after
-// executable output reached the client. The end followed each handed-off item,
-// so all of them count as delivered. Codex runs a delivered tool call and
+// saveEndedHistory saves the items an ended attempt delivered, after executable
+// output reached the client. When the client read the end of the stream, every
+// handed-off item counts as delivered. Codex runs a delivered tool call and
 // resends it with its output; that continuation is admitted. The marker stays
 // for any turn that branches from earlier history, which could repeat the call.
-// An item handed off only in part, content staging cannot save, or a failed
-// save leaves execution uncertain. The caller holds t.mu.
-func (t *conversationTurn) saveEndedHistory(targetID string) error {
-	delivered := t.deliveredOutput(true)
+// Complete arguments without the finished item, content staging cannot save,
+// or a failed save leaves execution uncertain. The caller holds t.mu.
+func (t *conversationTurn) saveEndedHistory(targetID string, ended bool) error {
+	delivered := t.deliveredOutput(ended)
 	if t.unstaged || len(t.openItems) > 0 || t.deliveredInvalid || !t.haveDeliveryInfo || t.deliveredResponseID == "" ||
 		len(delivered.items) == 0 && len(delivered.anchors) == 0 {
 		return conversationRequestError(errConversationIncomplete)
@@ -1201,15 +1222,20 @@ func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		b.turn.mu.Lock()
 		known := b.turn.saved || b.turn.unprotected || b.turn.failed
+		released := false
 		var releaseErr error
 		if !known && !b.turn.clientEnded() {
-			// An upstream that ended the stream itself before anything executable
-			// was handed off leaves a known outcome. Otherwise the stream ended
-			// without one while the client was still connected, and a later
-			// disconnect must not release it.
-			if b.upstreamEnd.endedBy(err) {
-				releaseErr = b.turn.releaseFailedAttempt(nil, b.targetID, "stream_ended")
-				known = releaseErr == nil
+			// The stream ended while the client was still connected, so it read
+			// past every handed-off event: the outcome is known. A block recorded
+			// earlier, such as a failed save, keeps execution uncertain, and a
+			// later disconnect must not release it.
+			if !b.turn.blocked {
+				reason := "proxy_ended"
+				if b.upstreamEnd.endedBy(err) {
+					reason = "stream_ended"
+				}
+				releaseErr = b.turn.releaseEndedAttempt(b.targetID, reason, true)
+				known, released = releaseErr == nil, releaseErr == nil
 			}
 			if !known {
 				b.turn.streamUncertain = true
@@ -1218,6 +1244,11 @@ func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 		b.turn.mu.Unlock()
 		if releaseErr != nil {
 			return n, releaseErr
+		}
+		if released && providerRequestErrorCode(err) != "" {
+			// Report the failed stream, not the conversation error Vekil raised
+			// while it still looked uncertain.
+			return n, errConversationStreamEnded
 		}
 		_, _, storageFailure := durableStateFailureDetails(err)
 		if !known && !storageFailure && providerRequestErrorCode(err) == "" {
