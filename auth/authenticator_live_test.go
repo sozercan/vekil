@@ -21,7 +21,7 @@ import (
 
 const (
 	liveCopilotBaseURL       = "https://api.githubcopilot.com"
-	liveCopilotIntegrationID = "vscode-chat"
+	liveCopilotIntegrationID = "copilot-developer-cli"
 )
 
 type liveCopilotAuthObservation struct {
@@ -268,6 +268,21 @@ func TestSelectLiveCopilotResponsesModel(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := selectLiveCopilotResponsesModel(tt.models); got != tt.want {
 				t.Fatalf("selectLiveCopilotResponsesModel() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSetLiveCopilotRequestHeadersUsesCLIIntegration(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		t.Run(method, func(t *testing.T) {
+			req, err := http.NewRequest(method, liveCopilotBaseURL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			setLiveCopilotRequestHeaders(req, "github_pat_test")
+			if got := req.Header.Get("Copilot-Integration-Id"); got != "copilot-developer-cli" {
+				t.Fatalf("integration = %q, want copilot-developer-cli", got)
 			}
 		})
 	}

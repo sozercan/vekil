@@ -150,9 +150,9 @@ fields. Memory and legacy request behavior is unchanged.
 Ownership includes route/target/provider identity, the effective endpoint and
 query, physical model/deployment, and authenticated account/tenant scope from
 the **actual outbound request**. Reusing configuration labels does not authorize
-another owner. Changed endpoints, deployments, API keys, tenant headers, or
-principals reject retained state before inference; Vekil never guesses a target
-or silently drops context to recover. Copilot service-token refresh preserves
+another owner. Changed endpoints, deployments, API keys, tenant headers,
+Copilot integration IDs, or principals reject retained state before inference.
+Vekil never guesses a target or silently drops context to recover. Copilot service-token refresh preserves
 ownership when its source-credential fingerprint is stable. Legacy caches
 without that provenance cannot promise refresh continuity. Entra requires
 issuer, tenant and object identity from its acquired token; token scope is also
@@ -182,6 +182,42 @@ known. Responses-backed Chat tool replay remains a separate process-local
 store; durable ownership does not persist it or migrate state across targets.
 Migration-enabled Azure routes can instead reconnect using a locally saved
 response ID and new input, including when the upstream response used `store: false`.
+
+## Upgrading the Copilot OAuth/PAT integration default
+
+The OAuth/PAT default changes from `vscode-chat` to `copilot-developer-cli`.
+The integration ID is part of durable ownership, so the new default cannot
+continue state issued under the old one. Vekil does not migrate that ownership
+or retry retained state under another integration.
+
+Before upgrading an existing schema-v2 durable Copilot deployment, pin
+`vscode-chat` in each affected provider. Merge this into its existing `headers`
+block without changing provider, route or target IDs, credentials, or the store:
+
+```yaml
+headers:
+  default:
+    copilot_integration_id: vscode-chat
+```
+
+Endpoint profiles override `headers.default`. Keep any explicit
+`chat_completions` or `responses` integration set to the value that issued its
+state. A global `COPILOT_INTEGRATION_ID=vscode-chat` or
+`--copilot-integration-id=vscode-chat` also works when no provider or endpoint
+integration overrides it.
+
+Keep the pin until all stateful sessions using the old integration are retired.
+New sessions started while pinned also use the old integration, so stop starting
+new ones during the drain. Durable bindings do not expire automatically.
+Remove the pin only when clients can start fresh conversations under the CLI
+integration. Existing deployments already using an explicit integration should
+keep that setting.
+
+If an upgrade already caused ownership errors, restore the old integration and
+restart with the same store and owner configuration. Rejected continuations do
+not rewrite the stored owner. Do not delete the database or switch to memory
+mode to work around the error. This preserves local ownership proof; it cannot
+restore state that the upstream has expired or deleted.
 
 ## Retention, capacity and explicit pruning
 

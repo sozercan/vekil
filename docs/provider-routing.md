@@ -8,7 +8,11 @@ Use this file when editing provider credentials, model ownership, JSON/YAML prov
 
 For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly, and it overrides cached Vekil login state. Supported GitHub credentials are `gho_` OAuth user tokens, `ghu_` GitHub App user tokens, and `github_pat_` fine-grained PATs with the Copilot Requests permission. Vekil uses them directly where the Copilot upstream accepts them. The current exception is `/responses` with a `ghu_` credential: Copilot rejects that app-user bearer directly, so Vekil exchanges it through `/copilot_internal/v2/token` and caches the short-lived result in memory only. Vekil does not call the private Copilot user endpoint. Revoked, expired, unlicensed, or under-permissioned credentials surface as upstream authentication or permission failures.
 
-Unless explicitly overridden, direct `ghu_` credentials use the `copilot-language-server` integration ID for catalog and native Chat requests. Their exchanged Responses token uses `vscode-chat`; other direct credential types also use `vscode-chat`.
+Unless explicitly overridden, direct `gho_` OAuth credentials (including GitHub CLI OAuth) and `github_pat_` fine-grained PATs use the `copilot-developer-cli` integration ID for catalog, Chat, Responses, and native Responses websocket requests. This avoids relying on upstream integration fallback and applies Copilot CLI access policies, limits, and billing rules. The selected integration must support the credential type; explicit global, provider, and endpoint integration overrides are preserved.
+
+For existing durable routes, follow the [OAuth/PAT integration upgrade procedure](state-recovery.md#upgrading-the-copilot-oauthpat-integration-default) before restarting with the new default.
+
+Direct `ghu_` credentials continue to use `copilot-language-server` for catalog and native Chat requests. Their exchanged Responses token and other legacy Copilot tokens continue to use `vscode-chat`.
 
 Vekil intentionally ignores generic GitHub token variables such as `GH_TOKEN` and `GITHUB_TOKEN`. If you want Vekil to use an authenticated GitHub CLI account, opt in explicitly with `vekil login --github-cli` or `vekil login --gh`; Vekil then runs `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only, without copying it into Vekil's `access-token` or `api-key.json` caches.
 

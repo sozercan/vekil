@@ -61,6 +61,7 @@ const (
 	defaultCopilotEditorPluginVersion = "copilot-chat/0.26.7"
 	defaultCopilotUserAgent           = "GitHubCopilotChat/0.26.7"
 	defaultCopilotIntegrationID       = "vscode-chat"
+	directCopilotCLIIntegrationID     = "copilot-developer-cli"
 	directGitHubAppIntegrationID      = "copilot-language-server"
 	defaultCopilotGitHubAPIVersion    = "2026-08-20"
 	defaultCopilotOpenAIIntent        = "conversation-panel"
@@ -1231,7 +1232,7 @@ func (h *ProxyHandler) ServerWriteTimeout() time.Duration {
 }
 
 func setCopilotHeaders(req *http.Request, token string) {
-	setCopilotHeadersWithConfig(req, token, DefaultCopilotHeaderConfig())
+	setCopilotHeadersWithConfig(req, token, CopilotHeaderConfig{})
 }
 
 func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHeaderConfig) {
@@ -1248,8 +1249,14 @@ func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHea
 }
 
 func (c CopilotHeaderConfig) withCredentialDefaults(token string) CopilotHeaderConfig {
-	if c.IntegrationID == "" && strings.HasPrefix(strings.TrimSpace(token), "ghu_") {
-		c.IntegrationID = directGitHubAppIntegrationID
+	if c.IntegrationID == "" {
+		token = strings.TrimSpace(token)
+		switch {
+		case strings.HasPrefix(token, "gho_"), strings.HasPrefix(token, "github_pat_"):
+			c.IntegrationID = directCopilotCLIIntegrationID
+		case strings.HasPrefix(token, "ghu_"):
+			c.IntegrationID = directGitHubAppIntegrationID
+		}
 	}
 	return c.withDefaults()
 }

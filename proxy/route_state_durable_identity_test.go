@@ -262,6 +262,55 @@ func TestDurableResponsesCopilotSourceAndRefresh(t *testing.T) {
 	}
 }
 
+func TestDurableResponsesCopilotLegacyIntegrationOverride(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "")
+	for _, token := range []string{"gho_source", "github_pat_source"} {
+		t.Run(token, func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if got := r.Header.Get("Copilot-Integration-ID"); got != "vscode-chat" {
+					t.Errorf("integration = %q, want vscode-chat", got)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, durableWireFixture)
+			}))
+			defer upstream.Close()
+			store, config := newDurableStoreFixture(t, 32)
+			for i, step := range []struct {
+				name, integration, body string
+				status                  int
+				sends                   int32
+			}{
+				{"old default", "vscode-chat", `{"model":"public-model","input":"start"}`, http.StatusOK, 1},
+				{"new default", "", `{"model":"public-model","previous_response_id":"resp-durable-fixture","input":"continue"}`, http.StatusBadRequest, 1},
+				{"legacy override", "vscode-chat", `{"model":"public-model","previous_response_id":"resp-durable-fixture","input":"continue"}`, http.StatusOK, 2},
+			} {
+				if i > 0 {
+					var err error
+					store, err = newDurableStateBindingStore(config)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				p := explicitRouteTestProvider("primary", upstream.URL, "")
+				p.kind = providerTypeCopilot
+				p.headerProfiles.Default.IntegrationID = step.integration
+				h, _ := durableWireHandler(t, store, p)
+				h.auth = auth.NewTestAuthenticatorWithResponsesToken(token, token)
+				response := durableWireRequest(h, step.body, false, false)
+				if response.Code != step.status || calls.Load() != step.sends {
+					t.Fatalf("%s: status=%d sends=%d body=%s", step.name, response.Code, calls.Load(), response.Body.String())
+				}
+				h.BeginShutdown()
+				if err := h.WaitLifecycleWorkers(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func TestDurableNativeChatHeaderHasActualIdentity(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
