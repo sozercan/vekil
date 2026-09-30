@@ -10,6 +10,8 @@ For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a Gi
 
 Unless explicitly overridden, direct `gho_` OAuth credentials (including GitHub CLI OAuth) and `github_pat_` fine-grained PATs use the `copilot-developer-cli` integration ID for catalog, Chat, Responses, and native Responses websocket requests. This avoids relying on upstream integration fallback and applies Copilot CLI access policies, limits, and billing rules. The selected integration must support the credential type; explicit global, provider, and endpoint integration overrides are preserved.
 
+For existing durable routes, follow the [OAuth/PAT integration upgrade procedure](state-recovery.md#upgrading-the-copilot-oauthpat-integration-default) before restarting with the new default.
+
 Direct `ghu_` credentials continue to use `copilot-language-server` for catalog and native Chat requests. Their exchanged Responses token and other legacy Copilot tokens continue to use `vscode-chat`.
 
 Vekil intentionally ignores generic GitHub token variables such as `GH_TOKEN` and `GITHUB_TOKEN`. If you want Vekil to use an authenticated GitHub CLI account, opt in explicitly with `vekil login --github-cli` or `vekil login --gh`; Vekil then runs `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only, without copying it into Vekil's `access-token` or `api-key.json` caches.

@@ -78,6 +78,10 @@ Copilot CLI access policies, limits, and billing rules. Explicit integration
 overrides remain authoritative; endpoint profiles override provider defaults,
 which override the global setting.
 
+Existing durable Copilot deployments must [pin their previous integration
+before upgrading](state-recovery.md#upgrading-the-copilot-oauthpat-integration-default)
+to preserve state ownership.
+
 Vekil forwards explicit caller `X-Initiator` values of `user` or `agent`,
 `X-Interaction-Id`, and `X-Client-Session-Id` to Copilot inference requests.
 Each value must be unambiguous, contain no control characters, and fit within
