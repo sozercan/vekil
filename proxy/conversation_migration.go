@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -24,6 +26,8 @@ type conversationTurn struct {
 	store           *conversationHistoryStore
 	operation       *routeOperation
 	source          *conversationSnapshot
+	sourceKey       []byte
+	trustedClient   bool
 	root            string
 	scope           string
 	input           []json.RawMessage
@@ -36,11 +40,30 @@ type conversationTurn struct {
 	hostedTools     map[string]bool
 	pending         bool
 	dispatched      bool
-	// A handed-off event may belong to an item a client can execute, such as
-	// a tool call. Reasoning and assistant messages cannot run anything.
-	executable      bool
+	// A handed-off event may have given the client something it can run, such
+	// as a completed tool call. Reasoning, assistant messages and items handed
+	// off only in part cannot run anything.
+	executable bool
+	// Item IDs whose complete arguments were handed off without the finished
+	// item, by output_index, and whether a handed-off event carried executable
+	// content that staging cannot save.
+	openItems       map[int]string
+	unstaged        bool
 	failed          bool
 	streamUncertain bool
+	// A known end settles its attempt only once every event before it was
+	// handed off. A terminal failure event after executable output waits until
+	// the consumer has read past handoffOffset, the stream offset where the
+	// event starts, and reads again. The websocket bridge reads ahead of its
+	// writer, so on a bridged turn any end waits until the bridge has written
+	// it (streamDelivered).
+	handoff         bool
+	handoffOffset   int64
+	handoffReason   string
+	handoffTargetID string
+	bridged         bool
+	streamWritten   int64
+	streamRead      int64
 	// Completed output items staged from the committed response. An item is
 	// delivered once a later event has been handed downstream: HTTP and
 	// websocket consumers read the next event only after writing the previous.
@@ -58,6 +81,43 @@ type conversationTurn struct {
 	attempted           bool
 	blocked             bool
 	unprotected         bool
+}
+
+// minResendingCodexVersion is the first Codex release verified to record every
+// output item it completes, to run a completed tool call even when the stream
+// then fails, and to resend both, with the tool's output, in its next request
+// (codex-rs core/src/session/turn.rs run_sampling_request and drain_in_flight,
+// stream_events_utils.rs handle_output_item_done).
+var minResendingCodexVersion = [3]uint64{0, 157, 0}
+
+// resendingCodexProducts are the Codex front ends, named by their originator,
+// that share that verified turn loop (codex-rs login default_client.rs).
+var resendingCodexProducts = map[string]bool{"codex_cli_rs": true, "codex-tui": true, "codex_exec": true, "codex_vscode": true}
+
+// conversationClientResendsDelivered reports whether a User-Agent names a Codex
+// front end at or after minResendingCodexVersion, such as "codex_exec/0.157.1
+// (Mac OS 27.0.0; arm64)". Pre-release and development versions do not count.
+func conversationClientResendsDelivered(userAgent string) bool {
+	product, _, _ := strings.Cut(strings.TrimSpace(userAgent), " ")
+	name, version, ok := strings.Cut(product, "/")
+	if !ok || !resendingCodexProducts[name] {
+		return false
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for i, part := range parts {
+		// ParseUint accepts digits only, without a sign.
+		n, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return false
+		}
+		if n != minResendingCodexVersion[i] {
+			return n > minResendingCodexVersion[i]
+		}
+	}
+	return true
 }
 
 func (h *ProxyHandler) initializeConversationHistory() error {
@@ -149,6 +209,10 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		// not import another client's hidden instructions or tool definitions.
 	} else if previousID != "" {
 		source, err = store.lookupResponse(routeID, previousID)
+		if errors.Is(err, errConversationHistoryMissing) && store.turnActive("", store.responseKey(routeID, previousID)) {
+			// The turn that streams this response has not saved it yet.
+			return fail(errConversationHistoryBusy)
+		}
 		if err != nil {
 			return fail(err)
 		}
@@ -159,16 +223,35 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		}
 	}
 	fullInput := input.items
+	trusted := conversationClientResendsDelivered(operation.clientUserAgent)
+	// resent marks model output that Vekil never saved after the verified
+	// history. A verified Codex client resends every item it completed, each
+	// tool call with its output, so the model cannot repeat them: items from an
+	// attempt Vekil could not settle, or the last items of an interrupted or
+	// ended stream that Vekil could not confirm as delivered.
+	resent := false
+	partial := func() ([]byte, http.Header, error) {
+		// A turn of this conversation that is still settling may be about to
+		// save the history this request continues, so the client may retry.
+		if store.turnActive(source.Root, nil) {
+			return fail(errConversationHistoryBusy)
+		}
+		return fail(errConversationHistoryPartial)
+	}
 	if source != nil {
 		if previousID != "" {
 			if !conversationDeltaInput(input.items) || input.private {
-				return fail(errConversationHistoryPartial)
+				resent = true
 			}
 			fullInput = append(cloneRawMessages(source.Input), input.items...)
 		} else {
-			if !conversationHasPrefix(input.items, source.Input) || !conversationDeltaInput(input.items[len(source.Input):]) {
-				return fail(errConversationHistoryPartial)
+			if !conversationHasPrefix(input.items, source.Input) {
+				return partial()
 			}
+			resent = !conversationDeltaInput(input.items[len(source.Input):])
+		}
+		if resent && !trusted {
+			return partial()
 		}
 	} else if !assertedComplete && (input.private || previousID != "" || headerGetCI(headers, "X-Codex-Turn-State") != "" || !conversationNewInput(input.items)) {
 		return fail(errConversationHistoryMissing)
@@ -188,6 +271,7 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 	}
 	if source != nil {
 		turn.root, turn.migrated = source.Root, source.Migrated
+		turn.sourceKey = store.responseKey(source.RouteID, source.ResponseID)
 		if turn.scope == "" {
 			turn.scope = source.Scope
 		}
@@ -224,8 +308,18 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 		rawMessagesSize(turn.input)+rawMessagesSize(turn.additionalTools)+len(turn.instructions)+len(turn.tools) > store.config.MaxHistoryBytes {
 		return fail(errConversationHistoryCapacity)
 	}
-	if err := store.acquire(turn.root); err != nil {
+	// A verified Codex client resends every item it completed, with its tool
+	// outputs. Its request reached here only by extending saved history with
+	// client input or with output resent from an unsettled attempt, so nothing
+	// it received is missing: an unresolved marker cannot hide a tool call the
+	// model might repeat.
+	turn.trustedClient = trusted
+	overrode, err := store.acquireFrom(turn.root, turn.sourceKey, turn.trustedClient)
+	if err != nil {
 		return fail(err)
+	}
+	if overrode {
+		h.logConversationRecovery(operation, "released", "", "client_resends_delivered")
 	}
 	operation.conversation = turn
 	// After a migration, a full-history client may still carry east's older
@@ -536,7 +630,7 @@ func (t *conversationTurn) persistIntent() error {
 	if t.pending {
 		return nil
 	}
-	if err := t.store.beginAttempt(t.root, t.operation.operationID()); err != nil {
+	if err := t.store.beginAttemptFrom(t.root, t.operation.operationID(), t.sourceKey, t.trustedClient); err != nil {
 		return conversationRequestError(err)
 	}
 	t.pending = true
@@ -578,6 +672,13 @@ func (t *conversationTurn) finish() {
 			if err := t.store.clearAttempt(t.root); err != nil {
 				t.h.logConversationRecovery(t.operation, "blocked", "", "storage_unavailable")
 			}
+		} else if !t.blocked && !t.streamUncertain {
+			// Vekil ended the attempt before the stream reported its end, for
+			// example in a shutdown or at its streaming deadline. As after an
+			// interrupt, only items followed by another event count as delivered.
+			if err := t.releaseEndedAttempt(t.deliveryInfo.targetID, "proxy_ended", false); err != nil && !t.blocked {
+				t.h.logConversationRecovery(t.operation, "blocked", "", "execution_uncertain")
+			}
 		} else if !t.blocked {
 			t.h.logConversationRecovery(t.operation, "blocked", "", "execution_uncertain")
 		}
@@ -603,17 +704,117 @@ func (t *conversationTurn) unprotect(targetID, reason string) error {
 	return nil
 }
 
-// An upstream that ends an attempt before handing off anything executable
-// leaves a known outcome: the client received at most reasoning and assistant
-// messages, which it cannot run, so a retry cannot duplicate work. The upstream
-// ends it with a terminal failure event, or by closing or resetting the stream
-// without one (reason stream_ended). Clear the attempt marker and forward the
-// upstream failure unchanged so the client can apply its own retry policy. A
-// tool call or other executable item before or inside the failure leaves
-// execution uncertain. The caller holds t.mu.
+// releaseFailedAttempt settles an attempt the upstream ended with a terminal
+// failure event. Executable output inside that event, which staging cannot
+// save, leaves execution uncertain. The caller holds t.mu.
 func (t *conversationTurn) releaseFailedAttempt(envelope map[string]json.RawMessage, targetID, reason string) error {
-	if t.saved || t.executable || conversationEventHasExecutableOutput(envelope) {
+	if conversationEventHasExecutableOutput(envelope) {
+		// Staging cannot save it, and the turn stays uncertain when the
+		// stream ends after this event too.
+		t.executable, t.unstaged = true, true
 		return conversationRequestError(errConversationIncomplete)
+	}
+	if t.saved {
+		return conversationRequestError(errConversationIncomplete)
+	}
+	if t.executable {
+		// The event before this one may still be on its way to the client.
+		// Settle once the client has read this event (streamReadStarting); a
+		// turn that could not be saved anyway reports that now.
+		return t.deferEnd(targetID, reason, t.streamWritten)
+	}
+	return t.releaseEndedAttempt(targetID, reason, true)
+}
+
+// streamWrote counts the bytes written to the client's stream pipe.
+func (t *conversationTurn) streamWrote(n int) {
+	t.mu.Lock()
+	t.streamWritten += int64(n)
+	t.mu.Unlock()
+}
+
+// deferEnd defers settling a known end until every event before it was
+// handed off. offset is where the end starts in the stream; an end that only
+// the websocket bridge can confirm passes math.MaxInt64. A turn that could not
+// be saved anyway reports that now. The caller holds t.mu.
+func (t *conversationTurn) deferEnd(targetID, reason string, offset int64) error {
+	if t.handoff {
+		return nil
+	}
+	if t.executable {
+		if _, err := t.endedHistory(true); err != nil {
+			return err
+		}
+	}
+	t.handoff, t.handoffOffset, t.handoffReason, t.handoffTargetID = true, offset, reason, targetID
+	return nil
+}
+
+// streamReadStarting settles a deferred end once a read of its stream starts
+// after an earlier read returned the start of that end. Readers pass the
+// stream on in order and read again only after the previous chunk was consumed
+// downstream, even through the websocket bridge's pump, so every event before
+// the end was handed off.
+func (t *conversationTurn) streamReadStarting() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.streamRead <= t.handoffOffset {
+		return nil
+	}
+	return t.settleHandoff()
+}
+
+// streamDelivered settles a deferred end once the websocket bridge has
+// written every event it read, through that end. A client that disconnects
+// first leaves the end to finish's interrupt path.
+func (t *conversationTurn) streamDelivered() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_ = t.settleHandoff()
+}
+
+// settleHandoff releases an attempt whose deferred end has been handed off. A
+// failure is logged by the release, and finish reports a turn left pending.
+// The caller holds t.mu.
+func (t *conversationTurn) settleHandoff() error {
+	if !t.handoff {
+		return nil
+	}
+	t.handoff = false
+	return t.releaseEndedAttempt(t.handoffTargetID, t.handoffReason, true)
+}
+
+// streamReadDone counts the bytes a read of the stream returned.
+func (t *conversationTurn) streamReadDone(n int) {
+	t.mu.Lock()
+	t.streamRead += int64(n)
+	t.mu.Unlock()
+}
+
+// An attempt that ends while the client stays connected leaves a known outcome:
+// the client received exactly what Vekil handed off, whether the upstream ended
+// it (reasons failure_event and stream_ended) or Vekil did, through a
+// processing error, its streaming deadline or a shutdown (proxy_ended).
+// Reasoning and assistant messages cannot run anything, so the attempt marker
+// is cleared. A completed tool call may have run, so the items delivered are
+// saved and the marker admits only a continuation that includes the call and
+// its output. The failure reaches the client unchanged, so it can apply its own
+// retry policy. Executable output that cannot be saved leaves execution
+// uncertain. ended reports whether the client read past every handed-off
+// event. The caller holds t.mu.
+func (t *conversationTurn) releaseEndedAttempt(targetID, reason string, ended bool) error {
+	if t.executable {
+		if err := t.saveEndedHistory(targetID, ended); err != nil {
+			return err
+		}
+		reason = "delivered_history_saved"
+	} else if err := t.saveEndedInertHistory(ended); err != nil {
+		t.blocked = true
+		t.h.logConversationRecovery(t.operation, "blocked", targetID, conversationFailureReason(err))
+		return conversationRequestError(err)
 	}
 	if t.pending {
 		if err := t.store.clearAttempt(t.root); err != nil {
@@ -687,6 +888,130 @@ func conversationEventInert(eventType string, envelope map[string]json.RawMessag
 		return true
 	}
 	return false
+}
+
+// trackExecutableItem records a handed-off event of an item that is neither
+// reasoning nor an assistant message. Clients run a tool call only once it is
+// complete, so an item's first event, its argument deltas and hosted search
+// progress make nothing runnable. Complete arguments without the finished item
+// could be run but not saved, and an event of no item staging recognizes cannot
+// be saved either. The caller holds t.mu.
+func (t *conversationTurn) trackExecutableItem(eventType string, envelope map[string]json.RawMessage) {
+	switch eventType {
+	case "response.output_item.added", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
+		"response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
+		return
+	}
+	t.executable = true
+	var index *int
+	complete := eventType == "response.output_item.done" || eventType == "response.function_call_arguments.done" ||
+		eventType == "response.custom_tool_call_input.done"
+	if !complete || json.Unmarshal(envelope["output_index"], &index) != nil || index == nil {
+		t.unstaged = true
+		return
+	}
+	if eventType == "response.output_item.done" {
+		// Only the same item closes complete arguments seen at its index.
+		if id, open := t.openItems[*index]; open {
+			var item struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(envelope["item"], &item) != nil || item.ID != id {
+				t.unstaged = true
+				return
+			}
+			delete(t.openItems, *index)
+		}
+		return
+	}
+	id := rawJSONString(envelope["item_id"])
+	if open, ok := t.openItems[*index]; id == "" || ok && open != id {
+		t.unstaged = true
+		return
+	}
+	if t.openItems == nil {
+		t.openItems = make(map[int]string)
+	}
+	t.openItems[*index] = id
+}
+
+// saveEndedHistory saves the items an ended attempt delivered, after executable
+// output reached the client. When the client read the end of the stream, every
+// handed-off item counts as delivered. Codex runs a delivered tool call and
+// resends it with its output; that continuation is admitted. The marker stays
+// for any turn that branches from earlier history, which could repeat the call.
+// Complete arguments without the finished item, content staging cannot save,
+// a completed tool call among items not confirmed as delivered, or a failed
+// save leaves execution uncertain. The caller holds t.mu.
+func (t *conversationTurn) saveEndedHistory(targetID string, ended bool) error {
+	delivered, err := t.endedHistory(ended)
+	if err != nil {
+		return err
+	}
+	snapshot, err := t.historySnapshot(t.deliveredResponseID, t.deliveryInfo, delivered, false)
+	if err == nil {
+		err = t.store.saveDelivered(snapshot)
+	}
+	if errors.Is(err, errConversationHistoryStorage) || errors.Is(err, errConversationHistoryCapacity) || errors.Is(err, errConversationHistoryUncertain) {
+		t.blocked = true
+		t.h.logConversationRecovery(t.operation, "blocked", targetID, conversationFailureReason(err))
+		return conversationRequestError(err)
+	}
+	if err != nil {
+		return conversationRequestError(errConversationIncomplete)
+	}
+	t.pending = false
+	return nil
+}
+
+// saveEndedInertHistory saves the reasoning and messages an ended attempt
+// delivered, as after an interrupt, so a client that resends them, as Codex
+// does, continues from verified history. The save also clears the attempt
+// marker; when there is nothing to save or the save fails, the caller clears
+// it, since these items cannot run anything. A reused response ID keeps the
+// marker, like a completed turn does. The caller holds t.mu.
+func (t *conversationTurn) saveEndedInertHistory(ended bool) error {
+	delivered := t.deliveredOutput(ended)
+	if len(delivered.items) == 0 && len(delivered.anchors) == 0 || t.deliveredInvalid || !t.haveDeliveryInfo || t.deliveredResponseID == "" {
+		return nil
+	}
+	snapshot, err := t.historySnapshot(t.deliveredResponseID, t.deliveryInfo, delivered, false)
+	if err == nil {
+		err = t.store.save(snapshot)
+	}
+	if errors.Is(err, errConversationHistoryUncertain) {
+		return err
+	}
+	if err == nil {
+		t.pending = false
+	}
+	return nil
+}
+
+// endedHistory returns the delivered items saveEndedHistory saves, or an error
+// when execution stays uncertain. The caller holds t.mu.
+func (t *conversationTurn) endedHistory(ended bool) (conversationInput, error) {
+	if !ended {
+		// A completed tool call the conservative rule leaves out may still have
+		// reached the client; a snapshot without it could let a continuation
+		// repeat it.
+		for _, staged := range t.staged {
+			if staged.event <= t.deliveryEvents-2 {
+				continue
+			}
+			for _, item := range staged.output.items {
+				if !conversationItemInert(item) {
+					return conversationInput{}, conversationRequestError(errConversationIncomplete)
+				}
+			}
+		}
+	}
+	delivered := t.deliveredOutput(ended)
+	if t.unstaged || len(t.openItems) > 0 || t.deliveredInvalid || !t.haveDeliveryInfo || t.deliveredResponseID == "" ||
+		len(delivered.items) == 0 && len(delivered.anchors) == 0 {
+		return conversationInput{}, conversationRequestError(errConversationIncomplete)
+	}
+	return delivered, nil
 }
 
 func (t *conversationTurn) recoveryHeader() string {
@@ -827,7 +1152,7 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 		return data, nil
 	}
 	if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
-		if t.saved || t.failed {
+		if t.saved || t.failed || t.handoff {
 			return data, nil
 		}
 		return nil, conversationRequestError(errConversationIncomplete)
@@ -848,14 +1173,15 @@ func (t *conversationTurn) saveResponse(data []byte, info explicitRouteResponseI
 				return data, nil
 			case "response.queued", "response.created", "response.in_progress", "keepalive":
 				// Upstreams emit keepalives while a long generation is quiet.
+				// Output inside them is never staged.
 				if conversationEventHasExecutableOutput(envelope) {
-					t.executable = true
+					t.executable, t.unstaged = true, true
 				}
 			default:
 				// Unrecognized events count as executable so they cannot hide a
 				// tool call.
 				if !conversationEventInert(eventType, envelope) {
-					t.executable = true
+					t.trackExecutableItem(eventType, envelope)
 				}
 			}
 			t.observeDelivery(eventType, envelope, info)
@@ -969,6 +1295,9 @@ func (t *conversationTurn) observeDelivery(eventType string, envelope map[string
 		_ = json.Unmarshal(envelope["response"], &response)
 		if t.deliveredResponseID == "" {
 			t.deliveredResponseID = response.ID
+			if response.ID != "" {
+				t.store.markStreaming(t.root, t.store.responseKey(info.routeID, response.ID))
+			}
 		} else if response.ID != "" && response.ID != t.deliveredResponseID {
 			t.invalidateDelivery()
 		}
@@ -1013,11 +1342,12 @@ func (t *conversationTurn) invalidateDelivery() {
 }
 
 // deliveredOutput returns staged items whose event was followed by another
-// handed-off event, in output_index order. The caller holds t.mu.
-func (t *conversationTurn) deliveredOutput() conversationInput {
+// handed-off event, or every staged item once the upstream ended the stream,
+// in output_index order. The caller holds t.mu.
+func (t *conversationTurn) deliveredOutput(ended bool) conversationInput {
 	var delivered []conversationStagedItem
 	for _, staged := range t.staged {
-		if staged.event <= t.deliveryEvents-2 {
+		if ended || staged.event <= t.deliveryEvents-2 {
 			delivered = append(delivered, staged)
 		}
 	}
@@ -1038,7 +1368,7 @@ func (t *conversationTurn) deliveredOutput() conversationInput {
 // The caller holds t.mu.
 func (t *conversationTurn) releaseInterruptedAttempt() {
 	targetID := t.deliveryInfo.targetID
-	delivered := t.deliveredOutput()
+	delivered := t.deliveredOutput(false)
 	if (len(delivered.items) > 0 || len(delivered.anchors) > 0) && !t.deliveredInvalid && t.deliveredResponseID != "" && t.haveDeliveryInfo {
 		// Recover interrupted response-ID continuations from what the client
 		// received, not from an upstream copy that may have continued.
@@ -1120,19 +1450,33 @@ type conversationCompletionBody struct {
 }
 
 func (b *conversationCompletionBody) Read(p []byte) (int, error) {
+	if releaseErr := b.turn.streamReadStarting(); releaseErr != nil {
+		return 0, releaseErr
+	}
 	n, err := b.ReadCloser.Read(p)
+	b.turn.streamReadDone(n)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		b.turn.mu.Lock()
 		known := b.turn.saved || b.turn.unprotected || b.turn.failed
+		released := false
 		var releaseErr error
 		if !known && !b.turn.clientEnded() {
-			// An upstream that ended the stream itself before anything executable
-			// was handed off leaves a known outcome. Otherwise the stream ended
-			// without one while the client was still connected, and a later
-			// disconnect must not release it.
-			if b.upstreamEnd.endedBy(err) {
-				releaseErr = b.turn.releaseFailedAttempt(nil, b.targetID, "stream_ended")
-				known = releaseErr == nil
+			// The stream ended while the client was still connected, so it read
+			// past every handed-off event: the outcome is known. A block recorded
+			// earlier, such as a failed save, keeps execution uncertain, and a
+			// later disconnect must not release it.
+			if !b.turn.blocked {
+				reason := "proxy_ended"
+				if b.upstreamEnd.endedBy(err) {
+					reason = "stream_ended"
+				}
+				if b.turn.bridged {
+					// The bridge may still be writing what it read.
+					releaseErr = b.turn.deferEnd(b.targetID, reason, math.MaxInt64)
+				} else {
+					releaseErr = b.turn.releaseEndedAttempt(b.targetID, reason, true)
+				}
+				known, released = releaseErr == nil, releaseErr == nil
 			}
 			if !known {
 				b.turn.streamUncertain = true
@@ -1141,6 +1485,11 @@ func (b *conversationCompletionBody) Read(p []byte) (int, error) {
 		b.turn.mu.Unlock()
 		if releaseErr != nil {
 			return n, releaseErr
+		}
+		if released && providerRequestErrorCode(err) != "" {
+			// Report the failed stream, not the conversation error Vekil raised
+			// while it still looked uncertain.
+			return n, errConversationStreamEnded
 		}
 		_, _, storageFailure := durableStateFailureDetails(err)
 		if !known && !storageFailure && providerRequestErrorCode(err) == "" {

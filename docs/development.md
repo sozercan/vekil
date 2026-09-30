@@ -26,7 +26,7 @@ scripts/tests/live-smoke-reliability-test.sh  # deterministic mock-server/fake-C
 scripts/tests/live-chat-over-responses-smoke-test.sh  # deterministic Chat-over-Responses live-harness gates
 scripts/tests/live-policy-routing-smoke-test.sh  # deterministic semantic-policy process/cleanup gates
 scripts/tests/live-policy-routing-copilot-smoke-test.sh  # deterministic Copilot bridge/model-selection wrapper gate
-scripts/tests/live-policy-routing-smoke-test.sh omitted  # repeat the policy matrix without tier effort
+scripts/tests/live-policy-routing-smoke-test.sh omitted  # repeat without tier effort, plus the classifier's extra-tool-call deviation
 scripts/tests/live-policy-routing-responses-effort-smoke-test.sh  # deterministic Responses low/high routing gate
 ```
 
@@ -417,6 +417,8 @@ The common native-Chat live matrix covers:
 - representative local rejections with zero classifier and terminal sends; and
 - `/stats.json`, response, header, log, generation-hash, prompt/tool sentinel, upstream request-ID, and internal-topology redaction checks.
 
+Every classifier call must complete, with one exception. The parallel-tools task tells the terminal model to call `fetch_account` and `fetch_permissions`. The classifier model (Haiku in the Copilot matrix) sometimes follows that text too and returns both calls beside `emit_policy_signals`. Vekil rejects that response as `invalid_output` and uses the uncertain tier. The harness accepts that one outcome only when the control shim's record of the classifier response shows exactly one `emit_policy_signals` and extra calls only to `fetch_account` or `fetch_permissions`. The shim logs tool names from a fixed synthetic allowlist, never arguments.
+
 In the Copilot matrix, the powerful targets are distinct models but share one Copilot service and loopback bridge. That proves sealed tier selection, retry accounting, target switching, and public-identity behavior; it does **not** prove independent cross-provider availability.
 
 The focused Responses matrix uses public model `vekil-live-semantic-effort`. Both tiers use the same physical `gpt-5-mini` model with different profile-owned effort. Captured requests prove that prompt classification selects `low` versus `high` even when the client requests the opposite effort.
@@ -498,6 +500,7 @@ For each client/model attempt, a bounded raw chat-completions canary runs first:
 - Only upstream conditions evidenced by an HTTP response are skippable: an exact listed-model-unavailable HTTP 400, a promotion-ended, exact model-no-longer-supported, rate-limit, or temporary-capacity message on an eligible response, HTTP 408/425/429, or HTTP 5xx. Local curl transport failures and timeouts are hard failures because they can indicate a stuck Vekil handler. Other HTTP 400 responses and unknown statuses, including 404 and 405, are hard failures.
 - After a 200 canary, any CLI nonzero exit, timeout, empty result, or mismatched result gets one bounded second canary on that same model. A recognized transient skips the candidate; a still-reachable but incompatible candidate is recorded and the client must pass another candidate. The job fails if a client exhausts the reachable set without an exact pass.
 - A neutral exit 0 is allowed only when no model was reachable **before any client was exercised**. Once a reachable model has exercised a client, every installed client must pass.
+- Since September 2026, Zen answers anonymous free-tier requests from other clients with HTTP 403 `FreeTierError`: "OpenCode's free tier can only be used from within OpenCode". The first canary that receives this exact type and message ends the run with a neutral skip and a workflow warning before any client runs. Vekil does not impersonate the OpenCode client. While the restriction stands, this workflow provides no live coverage.
 
 OpenAI Codex CLI is intentionally excluded from this Zen harness because its native wire API requires `/responses`, while the shared Copilot/Claude/Gemini matrix deliberately tests `/chat/completions`. Codex can use a configured Zen free model that advertises native `/responses` (currently `muse-spark-1.2-contributor-free`), and Vekil forwards that request directly rather than using Responses-to-Chat translation. Codex remains covered by the Copilot smoke, where it works against the Copilot upstream.
 

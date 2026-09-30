@@ -128,6 +128,82 @@ func TestConversationHistoryStorageReopenRetainsCompleteSnapshots(t *testing.T) 
 	retained.release(first.Root)
 }
 
+func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t *testing.T) {
+	bindings, history, file := newConversationHistoryStorageFixture(t, ConversationMigrationConfig{})
+	now := time.Now()
+	parent := conversationHistoryStorageSnapshot(history, "response-parent", "delivered-root", now)
+	saveConversationHistoryStorageSnapshot(t, history, parent)
+	delivered := conversationHistoryStorageSnapshot(history, "response-delivered", parent.Root, now)
+	parentKey := history.responseKey(parent.RouteID, parent.ResponseID)
+	deliveredKey := history.responseKey(delivered.RouteID, delivered.ResponseID)
+	if err := history.beginAttemptFrom(parent.Root, "ended-operation", parentKey, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.saveDelivered(delivered); err != nil {
+		t.Fatal(err)
+	}
+	// The released marker survives a reopen and its integrity check.
+	closeDurableStoreFixture(t, bindings)
+	_, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
+	requireConversationHistoryStorageSnapshot(t, retained, delivered)
+	for _, source := range [][]byte{nil, parentKey} {
+		if _, err := retained.acquireFrom(parent.Root, source, false); !errors.Is(err, errConversationHistoryUncertain) {
+			t.Fatalf("branch from %x admitted: %v", source, err)
+		}
+	}
+	if overrode, err := retained.acquireFrom(parent.Root, deliveredKey, false); err != nil || overrode {
+		t.Fatalf("continuation admission = %t, %v", overrode, err)
+	}
+	retained.release(parent.Root)
+	if err := retained.beginAttemptFrom(parent.Root, "continuation-operation", deliveredKey, false); err != nil {
+		t.Fatalf("continuation attempt refused: %v", err)
+	}
+	if retained.counts.pending != 1 {
+		t.Fatalf("pending attempts = %d, want the continuation's alone", retained.counts.pending)
+	}
+	// The continuation now owns an ordinary marker, which only a trusted
+	// client passes and replaces.
+	if _, err := retained.acquireFrom(parent.Root, deliveredKey, false); !errors.Is(err, errConversationHistoryUncertain) {
+		t.Fatalf("continuation marker admitted another turn: %v", err)
+	}
+	if overrode, err := retained.acquireFrom(parent.Root, parentKey, true); err != nil || !overrode {
+		t.Fatalf("trusted admission = %t, %v", overrode, err)
+	}
+	retained.release(parent.Root)
+	if err := retained.beginAttemptFrom(parent.Root, "trusted-operation", parentKey, true); err != nil {
+		t.Fatalf("trusted attempt refused: %v", err)
+	}
+	if retained.counts.pending != 1 {
+		t.Fatalf("pending attempts = %d after a trusted replacement", retained.counts.pending)
+	}
+	retained.release(parent.Root)
+	// A damaged record that still names the delivered snapshot admits neither
+	// its continuation nor a trusted client.
+	redelivered := conversationHistoryStorageSnapshot(retained, "response-redelivered", parent.Root, now)
+	redeliveredKey := retained.responseKey(redelivered.RouteID, redelivered.ResponseID)
+	if err := retained.saveDelivered(redelivered); err != nil {
+		t.Fatal(err)
+	}
+	if err := retained.d.db.Update(func(tx *bolt.Tx) error {
+		pending := tx.Bucket(conversationPendingBucket)
+		key := retained.rootKey(parent.Root)
+		value := append([]byte(nil), pending.Get(key)...)
+		value[0] ^= 1
+		return pending.Put(key, value)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, trusted := range []bool{false, true} {
+		source := redeliveredKey
+		if trusted {
+			source = parentKey
+		}
+		if _, err := retained.acquireFrom(parent.Root, source, trusted); !errors.Is(err, errConversationHistoryStorage) {
+			t.Fatalf("damaged record admission (trusted=%t) = %v", trusted, err)
+		}
+	}
+}
+
 func TestConversationHistoryStorageCapacityNeverEvicts(t *testing.T) {
 	for _, bound := range []string{"snapshots", "total bytes", "history bytes"} {
 		t.Run(bound, func(t *testing.T) {
@@ -420,8 +496,10 @@ func TestConversationHistoryStorageAdmissionAndCancellation(t *testing.T) {
 		t.Fatalf("concurrent admissions = %d, want 1", acquired)
 	}
 	history.release("contended-root")
-	for _, dispatched := range []bool{false, true} {
-		root := fmt.Sprintf("cancelled-%t", dispatched)
+	// An attempt Vekil ends without delivering anything is settled; one it
+	// blocked as uncertain keeps its marker.
+	for _, state := range []string{"undispatched", "dispatched", "blocked"} {
+		root := "cancelled-" + state
 		if err := history.acquire(root); err != nil {
 			t.Fatal(err)
 		}
@@ -429,17 +507,18 @@ func TestConversationHistoryStorageAdmissionAndCancellation(t *testing.T) {
 		if err := turn.persistIntent(); err != nil {
 			t.Fatal(err)
 		}
-		if dispatched {
+		if state != "undispatched" {
 			turn.dispatching()
 		}
+		turn.blocked = state == "blocked"
 		turn.finish()
 		turn.finish()
 		if err := turn.persistIntent(); !errors.Is(err, context.Canceled) {
 			t.Fatalf("closed turn persisted another intent: %v", err)
 		}
 		err := history.acquire(root)
-		if dispatched && !errors.Is(err, errConversationHistoryUncertain) || !dispatched && err != nil {
-			t.Fatalf("cancelled dispatched=%t admission = %v", dispatched, err)
+		if state == "blocked" && !errors.Is(err, errConversationHistoryUncertain) || state != "blocked" && err != nil {
+			t.Fatalf("cancelled %s admission = %v", state, err)
 		}
 		history.release(root)
 	}

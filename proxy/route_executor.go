@@ -203,6 +203,9 @@ type routeOperation struct {
 	inbound      context.Context
 	chatPlan     *chatOperationPlan
 	conversation *conversationTurn
+	// clientUserAgent identifies the client for conversation recovery rules
+	// that depend on its verified behavior.
+	clientUserAgent string
 
 	remainingTargetAttempts int
 	remainingUpstreamSends  int

@@ -21,6 +21,7 @@ var (
 	errConversationHistoryPartial   = errors.New("input does not contain the complete saved conversation; send the full history or previous_response_id with only new input")
 	errConversationHistoryBusy      = errors.New("another turn of this conversation is active; wait for it to complete before continuing or branching")
 	errConversationHistoryUncertain = errors.New("an earlier attempt may have executed without a saved completion; automatic recovery is blocked to avoid duplicate work")
+	errConversationStreamEnded      = errors.New("the response stream ended before the response completed")
 )
 
 var (
@@ -59,6 +60,9 @@ type conversationHistoryStore struct {
 	config ConversationMigrationConfig
 	mu     sync.Mutex
 	active map[string]bool
+	// streaming maps the key of a response an active turn is streaming, and
+	// has not saved yet, to that turn's root.
+	streaming map[string]string
 	// The single writer rebuilds counts while validating records at startup.
 	// d.mu guards them, and updates publish only after the transaction commits.
 	counts conversationHistoryCounts
@@ -73,7 +77,7 @@ func newConversationHistoryStore(d *durableStateBindings, config ConversationMig
 	if d == nil {
 		return nil, configPathError("conversation_migration", "requires durable state_bindings, including process overrides")
 	}
-	s := &conversationHistoryStore{d: d, config: config.withDefaults(), active: make(map[string]bool)}
+	s := &conversationHistoryStore{d: d, config: config.withDefaults(), active: make(map[string]bool), streaming: make(map[string]string)}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.failed != nil || d.db == nil {
@@ -310,31 +314,88 @@ func (s *conversationHistoryStore) lookupIndexes(keys [][]byte) (*conversationSn
 	return snapshot, err
 }
 
+// pendingReleasedTo reports whether a pending record admits a turn that
+// continues from source. saveDelivered replaces the attempt digest with the key
+// of the snapshot it saved, so only continuations of those delivered items pass.
+func pendingReleasedTo(value, source []byte) bool {
+	return len(source) == 32 && len(value) == 72 && bytes.Equal(value[40:], source)
+}
+
 func (s *conversationHistoryStore) acquire(root string) error {
+	_, err := s.acquireFrom(root, nil, false)
+	return err
+}
+
+// acquireFrom admits a turn whose history continues from the snapshot keyed
+// source, or from no snapshot when source is nil. A pending record admits only
+// a continuation of the snapshot it was released to, unless trusted: the client
+// is known to resend everything it received, so a turn whose history validated
+// cannot hide delivered work. overrode reports that trust admitted the turn.
+func (s *conversationHistoryStore) acquireFrom(root string, source []byte, trusted bool) (overrode bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.active[root] {
-		return errConversationHistoryBusy
+		return false, errConversationHistoryBusy
 	}
 	if len(s.active) >= s.config.MaxSnapshots {
-		return errConversationHistoryCapacity
+		return false, errConversationHistoryCapacity
 	}
 	if err := s.view(func(tx *bolt.Tx) error {
-		if tx.Bucket(conversationPendingBucket).Get(s.rootKey(root)) != nil {
-			return errConversationHistoryUncertain
+		key := s.rootKey(root)
+		value := tx.Bucket(conversationPendingBucket).Get(key)
+		if value == nil {
+			return nil
+		}
+		// Neither the released pointer nor trust may read past a damaged record.
+		if _, err := s.pendingCreated(key, value); err != nil {
+			return err
+		}
+		if !pendingReleasedTo(value, source) {
+			if !trusted {
+				return errConversationHistoryUncertain
+			}
+			overrode = true
 		}
 		return nil
 	}); err != nil {
-		return err
+		return false, err
 	}
 	s.active[root] = true
-	return nil
+	return overrode, nil
 }
 
 func (s *conversationHistoryStore) release(root string) {
 	s.mu.Lock()
 	delete(s.active, root)
+	for key, streamingRoot := range s.streaming {
+		if streamingRoot == root {
+			delete(s.streaming, key)
+		}
+	}
 	s.mu.Unlock()
+}
+
+// markStreaming records that the active turn rooted at root streams the
+// response keyed key, until the turn is released.
+func (s *conversationHistoryStore) markStreaming(root string, key []byte) {
+	s.mu.Lock()
+	if s.active[root] {
+		s.streaming[string(key)] = root
+	}
+	s.mu.Unlock()
+}
+
+// turnActive reports whether a turn of the conversation rooted at root, or the
+// turn streaming the response keyed key, is still active. Its outcome, and
+// the history it saves, is not known yet.
+func (s *conversationHistoryStore) turnActive(root string, key []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if root != "" && s.active[root] {
+		return true
+	}
+	streamingRoot, ok := s.streaming[string(key)]
+	return ok && s.active[streamingRoot]
 }
 
 func (s *conversationHistoryStore) update(fn func(*bolt.Tx, *conversationHistoryCounts) error) error {
@@ -371,14 +432,24 @@ func (s *conversationHistoryStore) update(fn func(*bolt.Tx, *conversationHistory
 }
 
 func (s *conversationHistoryStore) beginAttempt(root, operationID string) error {
+	return s.beginAttemptFrom(root, operationID, nil, false)
+}
+
+// beginAttemptFrom records a turn's attempt. A pending record that admits the
+// turn, as acquireFrom decides, is replaced; any other pending record refuses it.
+func (s *conversationHistoryStore) beginAttemptFrom(root, operationID string, source []byte, trusted bool) error {
 	return s.update(func(tx *bolt.Tx, counts *conversationHistoryCounts) error {
 		pending, snapshots := tx.Bucket(conversationPendingBucket), tx.Bucket(conversationSnapshotsBucket)
 		key := s.rootKey(root)
-		if pending.Get(key) != nil {
-			return errConversationHistoryUncertain
+		added := 1
+		if existing := pending.Get(key); existing != nil {
+			if !trusted && !pendingReleasedTo(existing, source) {
+				return errConversationHistoryUncertain
+			}
+			added = 0
 		}
-		if counts.snapshots+counts.pending >= s.config.MaxSnapshots ||
-			snapshots.Sequence()+uint64((counts.pending+1)*conversationPendingBytes) > uint64(s.config.MaxTotalBytes) {
+		if counts.snapshots+counts.pending+added > s.config.MaxSnapshots ||
+			snapshots.Sequence()+uint64((counts.pending+added)*conversationPendingBytes) > uint64(s.config.MaxTotalBytes) {
 			return errConversationHistoryCapacity
 		}
 		value := make([]byte, 40)
@@ -389,7 +460,7 @@ func (s *conversationHistoryStore) beginAttempt(root, operationID string) error 
 		if err := pending.Put(key, append(mac[:], value...)); err != nil {
 			return err
 		}
-		counts.pending++
+		counts.pending += added
 		return nil
 	})
 }
@@ -408,7 +479,21 @@ func (s *conversationHistoryStore) clearAttempt(root string) error {
 	})
 }
 
+// save stores a completed turn's snapshot and clears its conversation's
+// attempt marker in the same transaction.
 func (s *conversationHistoryStore) save(snapshot *conversationSnapshot) error {
+	return s.saveSnapshot(snapshot, false)
+}
+
+// saveDelivered stores the items an attempt delivered before the upstream ended
+// it, and keeps the attempt marker pointed at that snapshot: only a turn that
+// continues from those items clears it, never one that branches from earlier
+// history and could repeat a delivered tool call.
+func (s *conversationHistoryStore) saveDelivered(snapshot *conversationSnapshot) error {
+	return s.saveSnapshot(snapshot, true)
+}
+
+func (s *conversationHistoryStore) saveSnapshot(snapshot *conversationSnapshot, delivered bool) error {
 	key := s.responseKey(snapshot.RouteID, snapshot.ResponseID)
 	value, err := s.encode(key, snapshot)
 	if err != nil {
@@ -425,8 +510,18 @@ func (s *conversationHistoryStore) save(snapshot *conversationSnapshot) error {
 			// does not make the shared database unusable.
 			return errConversationHistoryUncertain
 		}
+		rootKey := s.rootKey(snapshot.Root)
+		existing := pending.Get(rootKey)
+		if existing != nil && len(existing) != 72 {
+			return errConversationHistoryStorage
+		}
+		// Copy the attempt's timestamp before later writes in this transaction.
+		var created []byte
+		if existing != nil {
+			created = append([]byte(nil), existing[32:40]...)
+		}
 		pendingCount := counts.pending
-		if pending.Get(s.rootKey(snapshot.Root)) != nil {
+		if existing != nil && !delivered {
 			pendingCount--
 		}
 		if counts.snapshots+pendingCount+1 > s.config.MaxSnapshots ||
@@ -449,8 +544,18 @@ func (s *conversationHistoryStore) save(snapshot *conversationSnapshot) error {
 		if err := snapshots.SetSequence(snapshots.Sequence() + cost); err != nil {
 			return err
 		}
-		if err := pending.Delete(s.rootKey(snapshot.Root)); err != nil {
-			return err
+		switch {
+		case delivered && created != nil:
+			// Keep the attempt's timestamp for pruning; its digest becomes the key.
+			value := append(created, key...)
+			mac := s.d.digest("conversation-pending-record-v1", string(rootKey), string(value))
+			if err := pending.Put(rootKey, append(mac[:], value...)); err != nil {
+				return err
+			}
+		case !delivered:
+			if err := pending.Delete(rootKey); err != nil {
+				return err
+			}
 		}
 		counts.snapshots++
 		counts.pending = pendingCount

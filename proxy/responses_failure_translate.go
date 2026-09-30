@@ -1883,8 +1883,13 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 		if code := providerRequestErrorCode(err); strings.HasPrefix(code, "conversation_") {
 			observeResponseFailureStatus(ctx, upstreamStatusCode(err, http.StatusBadGateway))
 			if ctx.Err() == nil && !isClientWriteError(fw, err) {
-				data, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]string{"type": "server_error", "code": code, "message": err.Error()}})
-				_, _ = io.WriteString(fw, "event: error\ndata: "+string(data)+"\n\n")
+				// A terminal response.failed, not a bare error event: Codex ignores
+				// error events and would report only a closed stream.
+				data, _ := json.Marshal(map[string]any{"type": "response.failed", "response": map[string]any{
+					"object": "response", "status": "failed", "output": []any{},
+					"error": map[string]string{"code": code, "message": err.Error()},
+				}})
+				_, _ = io.WriteString(fw, "event: response.failed\ndata: "+string(data)+"\n\n")
 			}
 			return
 		}

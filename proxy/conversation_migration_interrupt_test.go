@@ -312,9 +312,9 @@ func TestConversationMigrationInterruptKeepsUncertainTurnsBlocked(t *testing.T) 
 				}
 				delta := conversationInterruptEvent(t, "response.output_text.delta", map[string]any{"item_id": "msg-1", "output_index": 1, "content_index": 0, "delta": "partial"})
 				if scenario == "upstream cut before client cancel" {
-					// The upstream ends after part of a tool call without a terminal
-					// event.
-					arguments := conversationInterruptEvent(t, "response.function_call_arguments.delta", map[string]any{"item_id": "fc-1", "output_index": 0, "delta": "{}"})
+					// The upstream ends after a tool call's complete arguments, but
+					// before its finished item, without a terminal event.
+					arguments := conversationInterruptEvent(t, "response.function_call_arguments.done", map[string]any{"item_id": "fc-1", "output_index": 0, "arguments": "{}"})
 					return conversationStreamResponse(req, nil, conversationLifecycleEvent(t, "response.created", "in_progress", 0), arguments), nil
 				}
 				// The interrupted response reuses the saved seed response ID.

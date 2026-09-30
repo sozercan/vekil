@@ -1797,6 +1797,10 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		routeOperation.setCommitment(downstreamCommitmentProtocolFrame)
 	}
 	streamResult, err := s.streamUpstreamResponseWithRequest(h, resp.Body, resp.Header, resp.Request, recordTurn)
+	if routeOperation != nil && !errors.Is(err, errResponsesWebSocketClientWrite) && (s.ctx == nil || s.ctx.Err() == nil) {
+		// The bridge wrote every output event it read, through the stream's end.
+		routeOperation.conversation.streamDelivered()
+	}
 	if err != nil {
 		// The native reader recognizes terminal framing before the shared parser
 		// validates its contents. An invalid terminal must retire the session even

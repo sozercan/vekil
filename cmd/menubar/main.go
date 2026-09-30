@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,6 +57,16 @@ var (
 )
 
 func main() {
+	// A menubar app's stderr goes nowhere, so keep its logs in a file too.
+	if path, err := menubarLogPath(); err != nil {
+		log.Warn("could not locate menubar log file", logger.Err(err))
+	} else if file, err := openRotatingLogFile(path, menubarLogMaxBytes); err != nil {
+		log.Warn("could not open menubar log file", logger.Err(err))
+	} else {
+		// MultiWriter stops at the first failing writer, so a closed stderr
+		// must come after the file.
+		log = logger.NewWithWriter(logger.ParseLevel("info"), io.MultiWriter(file, os.Stderr))
+	}
 	if err := initializeMenubarPATH(); err != nil {
 		log.Warn("could not fully recover menubar PATH", logger.Err(err))
 	}

@@ -278,7 +278,7 @@ func TestConversationMigrationFullHistoryAndIsolation(t *testing.T) {
 }
 
 func TestConversationMigrationBlocksUnsafeRequestsAndRetries(t *testing.T) {
-	for _, scenario := range []string{"unknown ID", "compaction", "unmatched result", "pending tool", "ambiguous write", "partial stream", "DONE without completion", "encrypted rejection"} {
+	for _, scenario := range []string{"unknown ID", "compaction", "unmatched result", "pending tool", "ambiguous write", "partial stream", "encrypted rejection"} {
 		t.Run(scenario, func(t *testing.T) {
 			var sends, west atomic.Int32
 			var fail atomic.Bool
@@ -298,10 +298,9 @@ func TestConversationMigrationBlocksUnsafeRequestsAndRetries(t *testing.T) {
 						}
 						return nil, io.ErrUnexpectedEOF
 					case "partial stream":
-						// A partial tool call may already be executable by the client.
-						return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, "data: "+`{"type":"response.function_call_arguments.delta","item_id":"fc-1","output_index":0,"delta":"{}"}`+"\n\n"), nil
-					case "DONE without completion":
-						return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, "data: "+`{"type":"response.output_text.delta","delta":"partial"}`+"\n\ndata: [DONE]\n\n"), nil
+						// Complete arguments may already be running on the client,
+						// but without the finished item Vekil cannot save them.
+						return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, "data: "+`{"type":"response.function_call_arguments.done","item_id":"fc-1","output_index":0,"arguments":"{}"}`+"\n\n"), nil
 					case "encrypted rejection":
 						return routeExecutorTestResponse(req, 400, nil, `{"error":{"message":"encrypted content could not be verified"},"usage":{"output_tokens":1}}`), nil
 					}
@@ -323,7 +322,7 @@ func TestConversationMigrationBlocksUnsafeRequestsAndRetries(t *testing.T) {
 				fields["input"] = []any{map[string]any{"type": "compaction", "encrypted_content": "opaque"}}
 			case "unmatched result":
 				fields["input"] = []any{map[string]any{"type": "function_call_output", "call_id": "unknown", "output": "done"}}
-			case "partial stream", "DONE without completion":
+			case "partial stream":
 				fields["stream"] = true
 			case "encrypted rejection":
 				delete(fields, "previous_response_id")
@@ -331,16 +330,16 @@ func TestConversationMigrationBlocksUnsafeRequestsAndRetries(t *testing.T) {
 			}
 			result := conversationPOST(t, h, fields, nil)
 			expectedSends := int32(1)
-			if scenario == "ambiguous write" || scenario == "partial stream" || scenario == "DONE without completion" || scenario == "encrypted rejection" {
+			if scenario == "ambiguous write" || scenario == "partial stream" || scenario == "encrypted rejection" {
 				expectedSends = 2
 			}
 			if sends.Load() != expectedSends || west.Load() != 0 {
 				t.Fatalf("unsafe retry: sends=%d west=%d response=%d %s", sends.Load(), west.Load(), result.Code, result.Body.String())
 			}
-			if scenario != "partial stream" && scenario != "DONE without completion" && result.Code < 400 {
+			if scenario != "partial stream" && result.Code < 400 {
 				t.Fatalf("unsafe turn accepted: %d %s", result.Code, result.Body.String())
 			}
-			if scenario == "ambiguous write" || scenario == "partial stream" || scenario == "DONE without completion" || scenario == "encrypted rejection" {
+			if scenario == "ambiguous write" || scenario == "partial stream" || scenario == "encrypted rejection" {
 				if !strings.Contains(result.Body.String(), "conversation_execution_uncertain") {
 					t.Fatalf("missing execution uncertainty diagnostic: %d %s", result.Code, result.Body.String())
 				}

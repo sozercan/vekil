@@ -174,7 +174,9 @@ changing the source GitHub credential does not.
 Older east IDs keep their original ownership and immutable history. Branching
 from one cannot acquire later west messages. Different conversations proceed
 independently; concurrent turns on one saved conversation return
-`conversation_turn_in_progress` rather than racing region changes.
+`conversation_turn_in_progress` rather than racing region changes. So does a
+turn that resumes from output an active turn has streamed but not saved yet,
+such as right after an interrupt, so the client can retry it.
 
 The proxy-owned WebSocket bridge follows the same rules. Reconnect by sending
 `response.create` with the saved `previous_response_id` and only new input, or
@@ -204,20 +206,58 @@ expires or evicts automatically. Capacity errors preserve existing snapshots.
 Before dispatch, Vekil commits an attempt marker. Before exposing a completed
 response, it atomically saves history and clears that marker. If a crash or
 incomplete stream leaves execution uncertain, later continuation is blocked to
-avoid duplicate work. An upstream failure is not uncertain when nothing
-executable reached the client: no tool call, hosted tool call or other item
-besides reasoning and assistant messages, either streamed before the failure or
-carried in it. A client can keep reasoning and messages but cannot run them.
-Vekil treats an event it does not recognize as executable. The failure can be a
-terminal event (`response.failed`, `error`, `response.incomplete` or
-`response.cancelled`), or the upstream closing or resetting the stream without
-one. A stream that Vekil itself ends, through a processing error, its streaming
-timeout or shutdown, stays uncertain. Before the stream is committed, a
-certified failure may instead [fail over](provider-routing.md) to another
-target. After commitment, Vekil clears the marker and forwards that failure
-unchanged, so the client can retry the turn. Output delivered before the
-failure is not saved, so the next turn continues from the previous response. A
-saved completion survives restart.
+avoid duplicate work. A stream that ends while the client stays connected is not
+uncertain: the client received exactly what Vekil handed off. That holds when
+the upstream ends it, with a terminal event (`response.failed`, `error`,
+`response.incomplete` or `response.cancelled`) or by closing or resetting the
+stream, and when Vekil ends it, through a processing error, its streaming
+deadline or a shutdown. Reasoning, assistant messages and tool calls that
+arrived only in part cannot run anything, so the next turn may continue from the
+previous response. Vekil saves the completed reasoning and messages it
+delivered, so a client that resends them, as Codex does, continues from verified
+history too. A completed tool call or hosted tool call may have run, so
+Vekil first saves every item it delivered as a snapshot of that response, as
+after a client interrupt. Codex runs a delivered call and resends it with its
+output, and that continuation matches the saved history. Only a turn that
+continues from those items is admitted; a turn that branches from the earlier
+history still gets the `409`, because it could repeat the call. After a
+completed tool call, Vekil settles a terminal event only once the client reads
+it, because the call may still be on its way to the client when the event
+arrives. A client that disconnects first owns the outcome, as after an
+interrupt. Execution stays
+uncertain when a tool call's complete arguments arrived without the finished
+call, when executable output arrived inside the failure event or a `keepalive`,
+when an event Vekil does not recognize was handed off, or when the delivered
+items cannot be saved. When Vekil ends the stream, it cannot tell whether the
+client received the last events it handed off, so a completed tool call among
+them also stays uncertain. It also stays uncertain after an ambiguous delivery
+before commitment, a failed save, a reused response ID or a crash. Before the
+stream is committed, a certified failure may instead
+[fail over](provider-routing.md) to another target. After commitment, Vekil
+forwards that failure unchanged, so the client can retry the turn. After only
+reasoning and messages, it clears the marker. After a completed tool call, it
+keeps the marker pointed at the saved items until a turn continues from them.
+A stream Vekil cannot settle ends with `response.failed` carrying
+`conversation_execution_uncertain`. A saved completion survives restart.
+
+Codex 0.157 and later record every item they complete, run a completed tool
+call even when its stream then fails, and resend both, with the tool's output,
+in their next request. A Codex request therefore carries every item it received
+from an earlier attempt, and the model sees each resent call's output, so it
+cannot repeat the call. Vekil admits such a request past an unresolved attempt
+and replaces that attempt's marker. This covers crashes, ambiguous deliveries,
+streams Vekil could not settle and markers written by earlier Vekil versions.
+History validation still requires the saved history as a prefix and a result
+for every call. After that prefix, Vekil accepts model output it never saved
+only from Codex. That output can come from such an attempt or from the last
+items of an interrupted stream, which Vekil could not confirm as delivered.
+Vekil recognizes Codex by a User-Agent that starts with
+`codex_cli_rs/`, `codex-tui/`, `codex_exec/` or `codex_vscode/` followed by a
+release version, such as `codex_exec/0.157.1 (...)`. Pre-release and
+development builds do not count. Other clients keep the marker. Probes of
+opencode 1.18.30 and GitHub Copilot CLI 1.0.81 found neither eligible. opencode
+runs a delivered tool call, then retries the original request without it.
+Copilot CLI sends the stock OpenAI SDK User-Agent, so Vekil cannot recognize it.
 
 A client that disconnects or cancels its own request, for example by
 interrupting an agent mid-turn, owns that turn's outcome. Vekil saves the
@@ -230,9 +270,9 @@ response is rebuilt from those items. Otherwise, continue from the previous
 response.
 Items the client did not receive from Vekil still fail as incomplete history.
 Unfinished messages that arrived only as deltas are not saved. Vekil does not
-repeat the request automatically. A shutdown or crash is not a client decision
-and still leaves execution uncertain, as does an upstream disconnect after a
-tool call.
+repeat the request automatically. A crash is not a client decision and leaves
+execution uncertain. A shutdown settles the turn like any stream Vekil ends,
+counting delivered items by the same rule as a disconnect.
 
 If an upstream reuses a saved response ID, Vekil withholds the new completion
 and leaves that turn uncertain. The collision does not disable the shared store.
@@ -244,10 +284,15 @@ completion contains `vekil: {"history":"saved","target":"west"}`, with
 `"migration":"completed"` only on the turn that switched; an unprotected
 completion has no `vekil` field. WebSocket completion objects carry the same
 fields. Fixed-content logs distinguish `attempted`, `completed`, `blocked`,
-`unprotected`, `failed` and `interrupted` recovery. `failed` records a released
-upstream failure, with reason `failure_event` for a terminal event or
-`stream_ended` for a stream the upstream ended without one. `interrupted` records a client disconnect and
-whether delivered history was saved. A `recording` header alone is not a saved completion.
+`unprotected`, `failed`, `interrupted` and `released` recovery. `failed` records
+a settled attempt, with reason `failure_event` for a terminal event,
+`stream_ended` for a stream the upstream ended without one, `proxy_ended` for a
+stream Vekil ended, or `delivered_history_saved` when a completed tool call was
+saved first. `interrupted` records a client disconnect and whether delivered
+history was saved. `released` with reason `client_resends_delivered` records a
+Codex request admitted past an unresolved attempt. A `recording` header alone
+is not a saved completion. The menubar app keeps these logs in a file; see
+[Menubar](menubar.md).
 
 Errors use `conversation_history_unavailable`, `conversation_history_incomplete`
 or `conversation_tools_pending` for invalid recovery input. Uncertain

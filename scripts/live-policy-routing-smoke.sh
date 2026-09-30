@@ -510,6 +510,8 @@ HOP_BY_HOP = {
 }
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+# Classifier tool-call names are logged only from this fixed synthetic set.
+LOGGED_TOOL_NAMES = {"emit_policy_signals", "fetch_account", "fetch_permissions", "lookup_symbol"}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -576,6 +578,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if isinstance(function, dict):
                 names.append(function.get("name"))
         return names == ["emit_policy_signals"]
+
+    @staticmethod
+    def _classifier_tool_calls(response_body):
+        try:
+            payload = json.loads(response_body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list):
+            return None
+        names = []
+        for choice in choices:
+            message = choice.get("message") if isinstance(choice, dict) else None
+            calls = message.get("tool_calls") if isinstance(message, dict) else None
+            for call in calls if isinstance(calls, list) else []:
+                function = call.get("function") if isinstance(call, dict) else None
+                name = function.get("name") if isinstance(function, dict) else None
+                names.append(name if isinstance(name, str) and name in LOGGED_TOOL_NAMES else "other")
+        return names
 
     @staticmethod
     def _classifier_choice_valid(body):
@@ -740,7 +761,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._log(inspection, mode, 502, response_oversized=True)
                 return
             self._write(status, response_body, response_headers)
-            self._log(inspection, mode, status)
+            extra = {}
+            if inspection["kind"] == "classifier" and 200 <= status < 300:
+                extra["classifier_tool_calls"] = self._classifier_tool_calls(response_body)
+            self._log(inspection, mode, status, **extra)
 
     def _handle(self):
         mode = self._control_mode()
@@ -1477,6 +1501,42 @@ assert_classifier_completion() {
   assert_delta "${label} classifier abstain" "$(profile_metric "${before}" '["totals","classifier","abstain"]')" "$(profile_metric "${after}" '["totals","classifier","abstain"]')" 0
 }
 
+# The parallel-tools task tells the model to call fetch_account and
+# fetch_permissions. The live classifier sometimes obeys that text and returns
+# those calls beside emit_policy_signals. Vekil correctly rejects the output as
+# invalid and routes to the uncertain tier. Accept only that deviation, proven by
+# the shim-recorded classifier response: one emit_policy_signals call and extra
+# calls only to the tools the prompt names. Any other outcome still fails.
+assert_parallel_tools_classifier_outcome() {
+  local before="$1"
+  local after="$2"
+  local completion_before completion_after
+  completion_before="$(profile_metric "${before}" '["totals","classifier","completion"]')"
+  completion_after="$(profile_metric "${after}" '["totals","classifier","completion"]')"
+  if [[ "$((completion_after - completion_before))" -eq 1 ]]; then
+    assert_classifier_completion "parallel tools" "${before}" "${after}"
+    return
+  fi
+  jq -R -s -e '
+    [split("\n")[] | fromjson? | select(.event == "request" and .request_kind == "classifier")]
+    | last
+    | .status == 200
+      and ((.classifier_tool_calls // []) as $calls
+        | ($calls | map(select(. == "emit_policy_signals")) | length) == 1
+          and ($calls | map(select(. != "emit_policy_signals"))) as $extra
+          | ($extra | length) > 0
+            and ($extra | all(. == "fetch_account" or . == "fetch_permissions")))
+  ' "${SHIM_LOG}" >/dev/null || \
+    die "parallel tools classifier completion delta=$((completion_after - completion_before)), want 1 (before=${completion_before}, after=${completion_after}), and the classifier response did not contain only the prompt's extra tool calls"
+  assert_delta "parallel tools classifier completion" "${completion_before}" "${completion_after}" 0
+  assert_delta "parallel tools classifier uncertain" "$(profile_metric "${before}" '["totals","classifier","uncertain"]')" "$(profile_metric "${after}" '["totals","classifier","uncertain"]')" 1
+  assert_delta "parallel tools classifier unavailable" "$(profile_metric "${before}" '["totals","classifier","unavailable"]')" "$(profile_metric "${after}" '["totals","classifier","unavailable"]')" 0
+  assert_delta "parallel tools classifier abstain" "$(profile_metric "${before}" '["totals","classifier","abstain"]')" "$(profile_metric "${after}" '["totals","classifier","abstain"]')" 0
+  assert_delta "parallel tools invalid classifier output" "$(profile_drop_reason "${before}" invalid_output)" "$(profile_drop_reason "${after}" invalid_output)" 1
+  assert_delta "parallel tools uncertain tier" "$(profile_metric "${before}" '["totals","actual_tiers","powerful"]')" "$(profile_metric "${after}" '["totals","actual_tiers","powerful"]')" 1
+  log "parallel tools classifier returned extra tool calls; Vekil rejected its output and used the uncertain tier"
+}
+
 powerful_test_prompt() {
   local prefix="$1"
   "$(python_command)" - "${prefix}" <<'PY_POWERFUL_PROMPT'
@@ -1502,6 +1562,15 @@ profile_metric() {
   jq -r --arg profile "${PUBLIC_MODEL}" --argjson metric_path "${metric_path}" '
     (first(.policy_routing.profiles[]? | select(.profile == $profile)) // {})
     | (getpath($metric_path) // 0)
+  ' "${path}"
+}
+
+profile_drop_reason() {
+  local path="$1"
+  local label="$2"
+  jq -r --arg profile "${PUBLIC_MODEL}" --arg label "${label}" '
+    (first(.policy_routing.profiles[]? | select(.profile == $profile)) // {})
+    | ([.totals.drop_reasons[]? | select(.label == $label) | .count] | add // 0)
   ' "${path}"
 }
 
@@ -1802,7 +1871,7 @@ run_parallel_tools() {
   assert_file_has_no_internal_identity "parallel tools response" "${response}"
   after="$(fetch_stats after-parallel-tools)"
   assert_delta "parallel tools classifier sends" "$(profile_metric "${before}" '["totals","physical_classifier_sends"]')" "$(profile_metric "${after}" '["totals","physical_classifier_sends"]')" 1
-  assert_classifier_completion "parallel tools" "${before}" "${after}"
+  assert_parallel_tools_classifier_outcome "${before}" "${after}"
   assert_delta "parallel tools terminal sends" "$(stats_counter "${before}" upstream_attempts)" "$(stats_counter "${after}" upstream_attempts)" 1
   printf 'PASS parallel-distinct-tools\n' >> "${SUMMARY_FILE}"
 }
