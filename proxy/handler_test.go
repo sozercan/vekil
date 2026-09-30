@@ -6570,6 +6570,27 @@ func TestSetCopilotHeadersWithConfig(t *testing.T) {
 	}
 }
 
+func TestSetCopilotHeadersUsesCredentialIntegrationDefault(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		token       string
+		integration string
+	}{
+		{"OAuth", "gho_test", "copilot-developer-cli"},
+		{"fine-grained PAT", "github_pat_test", "copilot-developer-cli"},
+		{"GitHub App", "ghu_test", "copilot-language-server"},
+		{"legacy", "legacy-test-token", "vscode-chat"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/test", nil)
+			setCopilotHeaders(req, tt.token)
+			if got := req.Header.Get("Copilot-Integration-Id"); got != tt.integration {
+				t.Fatalf("integration = %q, want %q", got, tt.integration)
+			}
+		})
+	}
+}
+
 func TestSetCopilotHeadersWithConfigUsesCredentialIntegrationDefault(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -6585,11 +6606,42 @@ func TestSetCopilotHeadersWithConfigUsesCredentialIntegrationDefault(t *testing.
 		{
 			name:        "OAuth credential",
 			token:       "gho_direct-credential",
+			integration: "copilot-developer-cli",
+		},
+		{
+			name:        "fine-grained PAT",
+			token:       "github_pat_direct-credential",
+			integration: "copilot-developer-cli",
+		},
+		{
+			name:        "whitespace-padded OAuth credential",
+			token:       " gho_direct-credential ",
+			integration: "copilot-developer-cli",
+		},
+		{
+			name:        "legacy credential",
+			token:       "legacy-credential",
 			integration: defaultCopilotIntegrationID,
 		},
 		{
 			name:  "explicit override",
 			token: "ghu_direct-credential",
+			config: CopilotHeaderConfig{
+				IntegrationID: "configured-integration",
+			},
+			integration: "configured-integration",
+		},
+		{
+			name:  "explicit OAuth override",
+			token: "gho_direct-credential",
+			config: CopilotHeaderConfig{
+				IntegrationID: "vscode-chat",
+			},
+			integration: "vscode-chat",
+		},
+		{
+			name:  "explicit PAT override",
+			token: "github_pat_direct-credential",
 			config: CopilotHeaderConfig{
 				IntegrationID: "configured-integration",
 			},
@@ -6869,6 +6921,116 @@ func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesEndpointCompatibleA
 				t.Fatalf("copilot-integration-id = %q, want %q", got, tt.wantIntegration)
 			}
 		})
+	}
+}
+
+func TestNewProviderJSONRequest_OAuthAndPATIntegrationDefaults(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "")
+	for _, credential := range []struct {
+		name  string
+		token string
+	}{
+		{"OAuth", "gho_test"},
+		{"fine-grained PAT", "github_pat_test"},
+	} {
+		for _, profile := range []struct {
+			name          string
+			global        CopilotHeaderConfig
+			provider      CopilotHeaderProfilesConfig
+			wantModels    string
+			wantChat      string
+			wantResponses string
+		}{
+			{
+				name:          "defaults",
+				wantModels:    "copilot-developer-cli",
+				wantChat:      "copilot-developer-cli",
+				wantResponses: "copilot-developer-cli",
+			},
+			{
+				name:   "unrelated header overrides",
+				global: CopilotHeaderConfig{EditorVersion: "configured-editor"},
+				provider: CopilotHeaderProfilesConfig{
+					Default:   CopilotHeaderConfig{UserAgent: "configured-agent"},
+					Responses: CopilotHeaderConfig{OpenAIIntent: "configured-intent"},
+				},
+				wantModels:    "copilot-developer-cli",
+				wantChat:      "copilot-developer-cli",
+				wantResponses: "copilot-developer-cli",
+			},
+			{
+				name:          "global integration override",
+				global:        CopilotHeaderConfig{IntegrationID: "vscode-chat"},
+				wantModels:    "vscode-chat",
+				wantChat:      "vscode-chat",
+				wantResponses: "vscode-chat",
+			},
+			{
+				name:   "provider integration override",
+				global: CopilotHeaderConfig{IntegrationID: "global-integration"},
+				provider: CopilotHeaderProfilesConfig{
+					Default: CopilotHeaderConfig{IntegrationID: "provider-integration"},
+				},
+				wantModels:    "provider-integration",
+				wantChat:      "provider-integration",
+				wantResponses: "provider-integration",
+			},
+			{
+				name:   "endpoint integration overrides",
+				global: CopilotHeaderConfig{IntegrationID: "global-integration"},
+				provider: CopilotHeaderProfilesConfig{
+					Default:         CopilotHeaderConfig{IntegrationID: "provider-integration"},
+					ChatCompletions: CopilotHeaderConfig{IntegrationID: "chat-integration"},
+					Responses:       CopilotHeaderConfig{IntegrationID: "responses-integration"},
+				},
+				wantModels:    "provider-integration",
+				wantChat:      "chat-integration",
+				wantResponses: "responses-integration",
+			},
+		} {
+			for _, endpoint := range []struct {
+				name   string
+				method string
+				path   string
+				want   string
+			}{
+				{"models", http.MethodGet, "/models", profile.wantModels},
+				{"chat", http.MethodPost, "/chat/completions", profile.wantChat},
+				{"responses", http.MethodPost, "/responses", profile.wantResponses},
+				{"websocket", http.MethodGet, "/responses", profile.wantResponses},
+			} {
+				t.Run(credential.name+"/"+profile.name+"/"+endpoint.name, func(t *testing.T) {
+					handler := &ProxyHandler{
+						auth:           auth.NewTestAuthenticator(credential.token),
+						copilotHeaders: profile.global,
+					}
+					provider := &providerRuntime{
+						id:             "copilot",
+						kind:           providerTypeCopilot,
+						baseURL:        "https://copilot.example.test",
+						headerProfiles: profile.provider,
+					}
+					headers := http.Header{"Copilot-Integration-Id": {"untrusted-client-integration"}}
+					req, err := handler.newProviderJSONRequest(context.Background(), provider, endpoint.method, endpoint.path, nil, headers, "")
+					if err != nil {
+						t.Fatal(err)
+					}
+					gotHeaders := req.Header
+					if endpoint.name == "websocket" {
+						_, _, gotHeaders, err = handler.prepareResponsesNativeDial(req)
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					if got := gotHeaders.Get("Copilot-Integration-Id"); got != endpoint.want {
+						t.Fatalf("integration = %q, want %q", got, endpoint.want)
+					}
+					if gotHeaders.Get("Authorization") != "Bearer "+credential.token {
+						t.Fatal("integration selection changed the direct bearer credential")
+					}
+				})
+			}
+		}
 	}
 }
 

@@ -514,7 +514,7 @@ The [`Live Copilot Direct Bearer Smoke`](../.github/workflows/live-copilot-direc
 
 The credentialed workflow runs only on its weekly Monday 09:17 UTC schedule from `main`. It has no push, pull-request, or ref-selectable manual trigger. Package initialization and `TestMain` therefore cannot expose the dedicated PAT to task-branch code through this workflow. Pull requests exercise credential classification, zero-request resolution, legacy fallback, and persistence rules through deterministic tests in `auth/authenticator_test.go`.
 
-Configure the repository secret `COPILOT_FINE_GRAINED_PAT` with a fine-grained personal access token for an account with Copilot access and the **Copilot Requests** permission. A missing secret is a hard workflow failure.
+Configure the repository secret `COPILOT_FINE_GRAINED_PAT` with a fine-grained personal access token for an account with Copilot access and the **Copilot Requests** permission. A missing secret is a hard workflow failure. The direct-bearer smoke uses `copilot-developer-cli`, matching Vekil's OAuth/PAT integration default and its Copilot CLI access-policy and billing requirements.
 
 Run the exact check locally without printing the credential:
 
