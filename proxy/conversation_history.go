@@ -28,11 +28,20 @@ var (
 	conversationSnapshotsBucket = []byte("conversation-snapshots-v1")
 	conversationIndexBucket     = []byte("conversation-index-v1")
 	conversationPendingBucket   = []byte("conversation-pending-v1")
+	conversationBlobsBucket     = []byte("conversation-blobs-v1")
 )
 
 const (
 	maxConversationHistoryItems = 16384
 	conversationPendingBytes    = 32 + 32 + 40 // key, MAC, timestamp and attempt digest
+
+	// Records written before blobs carry their content inline. A distinct
+	// integrity domain keeps those older versions from reading a newer record
+	// as a snapshot with no content.
+	conversationInlineRecordDomain = "conversation-record-v1"
+	conversationRecordDomain       = "conversation-record-v2"
+	conversationBlobDomain         = "conversation-blob-v1"
+	conversationBlobKeyBytes       = 32
 )
 
 // Each immutable snapshot contains all visible history for one completed
@@ -53,6 +62,31 @@ type conversationSnapshot struct {
 	Migrated        bool              `json:"migrated,omitempty"`
 	Stored          bool              `json:"stored"`
 	Indexes         [][]byte          `json:"indexes"`
+}
+
+// conversationSnapshotRecord is a snapshot's stored form. Successive snapshots
+// of a conversation repeat nearly all of its items and its whole tool catalog,
+// so each distinct value is stored once as a blob. These fields shadow the
+// snapshot's content fields in JSON and hold the keys of its blobs, in order.
+type conversationSnapshotRecord struct {
+	conversationSnapshot
+	Input           []byte `json:"input"`
+	Instructions    []byte `json:"instructions,omitempty"`
+	Tools           []byte `json:"tools,omitempty"`
+	AdditionalTools []byte `json:"additional_tools,omitempty"`
+
+	// inline marks a record written before blobs, which holds its own content.
+	inline bool
+}
+
+// encodedConversationSnapshot is a snapshot ready to store.
+type encodedConversationSnapshot struct {
+	value []byte
+	// blobs holds each distinct value the record references, by blob key.
+	blobs map[string][]byte
+	// historyBytes counts the record and every value at each reference: the
+	// size of the complete history the snapshot stands for.
+	historyBytes int
 }
 
 type conversationHistoryStore struct {
@@ -83,27 +117,32 @@ func newConversationHistoryStore(d *durableStateBindings, config ConversationMig
 	if d.failed != nil || d.db == nil {
 		return nil, errConversationHistoryStorage
 	}
-	created := false
+	buckets := [][]byte{conversationSnapshotsBucket, conversationIndexBucket, conversationPendingBucket}
+	create := false
 	err := d.db.View(func(tx *bolt.Tx) error {
 		present := 0
-		for _, name := range [][]byte{conversationSnapshotsBucket, conversationIndexBucket, conversationPendingBucket} {
+		for _, name := range buckets {
 			if tx.Bucket(name) != nil {
 				present++
 			}
 		}
+		// A store from before blobs gains the bucket at startup.
+		create = present == 0 || tx.Bucket(conversationBlobsBucket) == nil
 		if present == 0 {
-			created = true
+			if tx.Bucket(conversationBlobsBucket) != nil {
+				return errConversationHistoryStorage
+			}
 			return nil
 		}
-		if present != 3 {
+		if present != len(buckets) {
 			return errConversationHistoryStorage
 		}
 		return s.validate(tx, &s.counts)
 	})
-	if err == nil && created {
+	if err == nil && create {
 		err = d.db.Update(func(tx *bolt.Tx) error {
-			for _, name := range [][]byte{conversationSnapshotsBucket, conversationIndexBucket, conversationPendingBucket} {
-				if _, err := tx.CreateBucket(name); err != nil {
+			for _, name := range append(buckets, conversationBlobsBucket) {
+				if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 					return err
 				}
 			}
@@ -124,32 +163,56 @@ func (s *conversationHistoryStore) validate(tx *bolt.Tx, counts *conversationHis
 	snapshots := tx.Bucket(conversationSnapshotsBucket)
 	index := tx.Bucket(conversationIndexBucket)
 	pending := tx.Bucket(conversationPendingBucket)
+	blobs := tx.Bucket(conversationBlobsBucket)
 	*counts = conversationHistoryCounts{}
 	var total uint64
+	add := func(cost uint64) error {
+		if math.MaxUint64-total < cost {
+			return errConversationHistoryStorage
+		}
+		total += cost
+		return nil
+	}
 	err := snapshots.ForEach(func(key, value []byte) error {
-		snapshot, err := s.decode(key, value)
+		record, err := s.decodeRecord(key, value)
 		if err != nil {
 			return err
 		}
-		if len(value) > s.config.MaxHistoryBytes {
+		historyBytes := len(value)
+		if err := record.eachBlob(func(blobKey []byte) error {
+			content := blobGet(blobs, blobKey)
+			if content == nil {
+				return errConversationHistoryStorage
+			}
+			historyBytes += len(content)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if historyBytes > s.config.MaxHistoryBytes {
 			return errConversationHistoryCapacity
 		}
-		for _, anchor := range snapshot.Indexes {
+		for _, anchor := range record.Indexes {
 			ref := index.Get(anchor)
 			if !bytes.Equal(ref, key) && !bytes.Equal(ref, []byte{0}) {
 				return errConversationHistoryStorage
 			}
 		}
-		cost := conversationSnapshotCost(snapshot, value)
-		if math.MaxUint64-total < cost {
-			return errConversationHistoryStorage
-		}
-		total += cost
 		counts.snapshots++
-		return nil
+		return add(conversationSnapshotCost(&record.conversationSnapshot, value))
 	})
 	if err != nil {
 		return err
+	}
+	if blobs != nil {
+		if err := blobs.ForEach(func(key, content []byte) error {
+			if !s.blobValid(key, content) {
+				return errConversationHistoryStorage
+			}
+			return add(conversationBlobCost(content))
+		}); err != nil {
+			return err
+		}
 	}
 	if total != snapshots.Sequence() {
 		return errConversationHistoryStorage
@@ -159,8 +222,8 @@ func (s *conversationHistoryStore) validate(tx *bolt.Tx, counts *conversationHis
 			return errConversationHistoryStorage
 		}
 		if len(value) == 32 {
-			snapshot, err := s.decode(value, snapshots.Get(value))
-			if err != nil || !snapshot.hasIndex(key) {
+			record, err := s.decodeRecord(value, snapshots.Get(value))
+			if err != nil || !record.hasIndex(key) {
 				return errConversationHistoryStorage
 			}
 		}
@@ -220,26 +283,75 @@ func (s *conversationHistoryStore) pendingCreated(key, value []byte) (int64, err
 	return created, nil
 }
 
-func (s *conversationHistoryStore) encode(key []byte, snapshot *conversationSnapshot) ([]byte, error) {
-	raw, err := json.Marshal(snapshot)
+func (s *conversationHistoryStore) encode(key []byte, snapshot *conversationSnapshot) (*encodedConversationSnapshot, error) {
+	encoded := &encodedConversationSnapshot{blobs: make(map[string][]byte)}
+	blobKeys := func(values ...json.RawMessage) ([]byte, error) {
+		var keys []byte
+		for _, value := range values {
+			// Marshal validates and compacts each value, as the inline form did.
+			content, err := json.Marshal(value)
+			if err != nil {
+				return nil, errConversationHistoryStorage
+			}
+			blobKey := s.d.digest(conversationBlobDomain, string(content))
+			encoded.blobs[string(blobKey[:])] = content
+			encoded.historyBytes += len(content)
+			keys = append(keys, blobKey[:]...)
+		}
+		return keys, nil
+	}
+	record := conversationSnapshotRecord{conversationSnapshot: *snapshot}
+	var err error
+	if record.Input, err = blobKeys(snapshot.Input...); err != nil {
+		return nil, err
+	}
+	if record.AdditionalTools, err = blobKeys(snapshot.AdditionalTools...); err != nil {
+		return nil, err
+	}
+	if len(snapshot.Instructions) > 0 {
+		if record.Instructions, err = blobKeys(snapshot.Instructions); err != nil {
+			return nil, err
+		}
+	}
+	if len(snapshot.Tools) > 0 {
+		if record.Tools, err = blobKeys(snapshot.Tools); err != nil {
+			return nil, err
+		}
+	}
+	raw, err := json.Marshal(record)
 	if err != nil {
 		return nil, errConversationHistoryStorage
 	}
-	mac := s.d.digest("conversation-record-v1", string(key), string(raw))
-	return append(mac[:], raw...), nil
+	mac := s.d.digest(conversationRecordDomain, string(key), string(raw))
+	encoded.value = append(mac[:], raw...)
+	encoded.historyBytes += len(encoded.value)
+	return encoded, nil
 }
 
-func (s *conversationHistoryStore) decode(key, value []byte) (*conversationSnapshot, error) {
+// decodeRecord authenticates a stored snapshot without reading its blobs.
+func (s *conversationHistoryStore) decodeRecord(key, value []byte) (*conversationSnapshotRecord, error) {
 	if len(key) != 32 || len(value) <= 32 {
 		return nil, errConversationHistoryStorage
 	}
-	mac := s.d.digest("conversation-record-v1", string(key), string(value[32:]))
-	if !hmac.Equal(mac[:], value[:32]) {
+	record := &conversationSnapshotRecord{}
+	raw := string(value[32:])
+	if mac := s.d.digest(conversationRecordDomain, string(key), raw); hmac.Equal(mac[:], value[:32]) {
+		if json.Unmarshal(value[32:], record) != nil ||
+			len(record.Input)%conversationBlobKeyBytes != 0 || len(record.AdditionalTools)%conversationBlobKeyBytes != 0 ||
+			len(record.Instructions) != 0 && len(record.Instructions) != conversationBlobKeyBytes ||
+			len(record.Tools) != 0 && len(record.Tools) != conversationBlobKeyBytes {
+			return nil, errConversationHistoryStorage
+		}
+	} else if mac := s.d.digest(conversationInlineRecordDomain, string(key), raw); hmac.Equal(mac[:], value[:32]) {
+		if json.Unmarshal(value[32:], &record.conversationSnapshot) != nil {
+			return nil, errConversationHistoryStorage
+		}
+		record.inline = true
+	} else {
 		return nil, errConversationHistoryStorage
 	}
-	var snapshot conversationSnapshot
-	if err := json.Unmarshal(value[32:], &snapshot); err != nil || snapshot.Root == "" ||
-		snapshot.ResponseID == "" || snapshot.RouteID == "" || snapshot.TargetID == "" ||
+	snapshot := &record.conversationSnapshot
+	if snapshot.Root == "" || snapshot.ResponseID == "" || snapshot.RouteID == "" || snapshot.TargetID == "" ||
 		snapshot.Identity == [32]byte{} || snapshot.Created <= 0 ||
 		!bytes.Equal(s.responseKey(snapshot.RouteID, snapshot.ResponseID), key) {
 		return nil, errConversationHistoryStorage
@@ -249,13 +361,114 @@ func (s *conversationHistoryStore) decode(key, value []byte) (*conversationSnaps
 			return nil, errConversationHistoryStorage
 		}
 	}
+	return record, nil
+}
+
+// load returns a record's complete snapshot, reading every blob it references.
+func (s *conversationHistoryStore) load(blobs *bolt.Bucket, record *conversationSnapshotRecord) (*conversationSnapshot, error) {
+	snapshot := record.conversationSnapshot
+	if record.inline {
+		return &snapshot, nil
+	}
+	values := func(keys []byte) ([]json.RawMessage, error) {
+		if len(keys) == 0 {
+			return nil, nil
+		}
+		loaded := make([]json.RawMessage, 0, len(keys)/conversationBlobKeyBytes)
+		for offset := 0; offset < len(keys); offset += conversationBlobKeyBytes {
+			content := blobGet(blobs, keys[offset:offset+conversationBlobKeyBytes])
+			if content == nil || !s.blobValid(keys[offset:offset+conversationBlobKeyBytes], content) {
+				return nil, errConversationHistoryStorage
+			}
+			// bbolt values are valid only during the transaction.
+			loaded = append(loaded, bytes.Clone(content))
+		}
+		return loaded, nil
+	}
+	// decodeRecord admits at most one key for instructions and tools.
+	value := func(key []byte) (json.RawMessage, error) {
+		loaded, err := values(key)
+		if err != nil || len(loaded) == 0 {
+			return nil, err
+		}
+		return loaded[0], nil
+	}
+	var err error
+	if snapshot.Input, err = values(record.Input); err != nil {
+		return nil, err
+	}
+	if snapshot.AdditionalTools, err = values(record.AdditionalTools); err != nil {
+		return nil, err
+	}
+	if snapshot.Instructions, err = value(record.Instructions); err != nil {
+		return nil, err
+	}
+	if snapshot.Tools, err = value(record.Tools); err != nil {
+		return nil, err
+	}
 	return &snapshot, nil
+}
+
+func (s *conversationHistoryStore) decode(tx *bolt.Tx, key, value []byte) (*conversationSnapshot, error) {
+	record, err := s.decodeRecord(key, value)
+	if err != nil {
+		return nil, err
+	}
+	return s.load(tx.Bucket(conversationBlobsBucket), record)
+}
+
+// put writes a snapshot's record and any blobs not stored yet, and returns the
+// logical bytes they add. A failed capacity check after put rolls them back
+// with the transaction.
+func (s *conversationHistoryStore) put(tx *bolt.Tx, key []byte, snapshot *conversationSnapshot, encoded *encodedConversationSnapshot) (uint64, error) {
+	blobs := tx.Bucket(conversationBlobsBucket)
+	cost := conversationSnapshotCost(snapshot, encoded.value)
+	for blobKey, content := range encoded.blobs {
+		if blobs.Get([]byte(blobKey)) != nil {
+			continue
+		}
+		if err := blobs.Put([]byte(blobKey), content); err != nil {
+			return 0, err
+		}
+		cost += conversationBlobCost(content)
+	}
+	return cost, tx.Bucket(conversationSnapshotsBucket).Put(key, encoded.value)
+}
+
+// eachBlob calls fn with the key of every blob the record references, once
+// per reference.
+func (record *conversationSnapshotRecord) eachBlob(fn func([]byte) error) error {
+	for _, keys := range [][]byte{record.Input, record.AdditionalTools, record.Instructions, record.Tools} {
+		for offset := 0; offset < len(keys); offset += conversationBlobKeyBytes {
+			if err := fn(keys[offset : offset+conversationBlobKeyBytes]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *conversationHistoryStore) blobValid(key, content []byte) bool {
+	sum := s.d.digest(conversationBlobDomain, string(content))
+	return hmac.Equal(sum[:], key)
+}
+
+func blobGet(blobs *bolt.Bucket, key []byte) []byte {
+	if blobs == nil {
+		return nil
+	}
+	return blobs.Get(key)
 }
 
 func conversationSnapshotCost(snapshot *conversationSnapshot, encoded []byte) uint64 {
 	// Account conservatively for every index, including shared/colliding keys.
 	// These are logical bytes; bbolt pages and transaction overhead are extra.
 	return uint64(len(encoded)+32) + uint64(len(snapshot.Indexes))*64
+}
+
+// conversationBlobCost counts a blob once, however many snapshots share it.
+func conversationBlobCost(content []byte) uint64 {
+	return uint64(len(content) + conversationBlobKeyBytes)
 }
 
 func (s *conversationHistoryStore) view(fn func(*bolt.Tx) error) error {
@@ -284,7 +497,7 @@ func (s *conversationHistoryStore) lookupResponse(routeID, responseID string) (*
 			return errConversationHistoryMissing
 		}
 		var err error
-		snapshot, err = s.decode(key, value)
+		snapshot, err = s.decode(tx, key, value)
 		return err
 	})
 	return snapshot, err
@@ -294,12 +507,13 @@ func (s *conversationHistoryStore) lookupIndexes(keys [][]byte) (*conversationSn
 	var snapshot *conversationSnapshot
 	err := s.view(func(tx *bolt.Tx) error {
 		index, snapshots := tx.Bucket(conversationIndexBucket), tx.Bucket(conversationSnapshotsBucket)
+		var chosen *conversationSnapshotRecord
 		for _, key := range keys {
 			ref := index.Get(key)
 			if len(ref) != 32 {
 				continue
 			}
-			candidate, err := s.decode(ref, snapshots.Get(ref))
+			candidate, err := s.decodeRecord(ref, snapshots.Get(ref))
 			if err != nil {
 				return err
 			}
@@ -307,9 +521,14 @@ func (s *conversationHistoryStore) lookupIndexes(keys [][]byte) (*conversationSn
 				return errConversationHistoryStorage
 			}
 			// Input order, rather than issuance time, chooses the branch.
-			snapshot = candidate
+			chosen = candidate
 		}
-		return nil
+		if chosen == nil {
+			return nil
+		}
+		var err error
+		snapshot, err = s.load(tx.Bucket(conversationBlobsBucket), chosen)
+		return err
 	})
 	return snapshot, err
 }
@@ -495,12 +714,11 @@ func (s *conversationHistoryStore) saveDelivered(snapshot *conversationSnapshot)
 
 func (s *conversationHistoryStore) saveSnapshot(snapshot *conversationSnapshot, delivered bool) error {
 	key := s.responseKey(snapshot.RouteID, snapshot.ResponseID)
-	value, err := s.encode(key, snapshot)
+	encoded, err := s.encode(key, snapshot)
 	if err != nil {
 		return err
 	}
-	cost := conversationSnapshotCost(snapshot, value)
-	if len(value) > s.config.MaxHistoryBytes {
+	if encoded.historyBytes > s.config.MaxHistoryBytes {
 		return errConversationHistoryCapacity
 	}
 	return s.update(func(tx *bolt.Tx, counts *conversationHistoryCounts) error {
@@ -524,13 +742,14 @@ func (s *conversationHistoryStore) saveSnapshot(snapshot *conversationSnapshot, 
 		if existing != nil && !delivered {
 			pendingCount--
 		}
+		cost, err := s.put(tx, key, snapshot, encoded)
+		if err != nil {
+			return err
+		}
 		if counts.snapshots+pendingCount+1 > s.config.MaxSnapshots ||
 			cost > uint64(s.config.MaxTotalBytes) ||
 			snapshots.Sequence()+cost+uint64(pendingCount*conversationPendingBytes) > uint64(s.config.MaxTotalBytes) {
 			return errConversationHistoryCapacity
-		}
-		if err := snapshots.Put(key, value); err != nil {
-			return err
 		}
 		for _, anchor := range snapshot.Indexes {
 			ref := key
@@ -608,21 +827,37 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 			}
 		}
 		var total uint64
+		referenced := make(map[string]bool)
 		cursor = snapshots.Cursor()
 		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
-			snapshot, err := s.decode(key, value)
+			record, err := s.decodeRecord(key, value)
 			if err != nil {
 				return err
 			}
-			rootKey := s.rootKey(snapshot.Root)
-			if retiredRoots[string(rootKey)] || snapshot.Created < before.Unix() && pending.Get(rootKey) == nil {
+			rootKey := s.rootKey(record.Root)
+			if retiredRoots[string(rootKey)] || record.Created < before.Unix() && pending.Get(rootKey) == nil {
 				if err := cursor.Delete(); err != nil {
 					return err
 				}
 				counts.snapshots--
 				removed++
-			} else {
-				total += conversationSnapshotCost(snapshot, value)
+				continue
+			}
+			total += conversationSnapshotCost(&record.conversationSnapshot, value)
+			_ = record.eachBlob(func(blobKey []byte) error {
+				referenced[string(blobKey)] = true
+				return nil
+			})
+		}
+		// Blobs live as long as any remaining snapshot references them.
+		if blobs := tx.Bucket(conversationBlobsBucket); blobs != nil {
+			cursor = blobs.Cursor()
+			for key, content := cursor.First(); key != nil; key, content = cursor.Next() {
+				if referenced[string(key)] {
+					total += conversationBlobCost(content)
+				} else if err := cursor.Delete(); err != nil {
+					return err
+				}
 			}
 		}
 		if err := tx.DeleteBucket(conversationIndexBucket); err != nil {
@@ -633,7 +868,7 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 			return err
 		}
 		if err := snapshots.ForEach(func(key, value []byte) error {
-			snapshot, err := s.decode(key, value)
+			snapshot, err := s.decodeRecord(key, value)
 			if err != nil {
 				return err
 			}

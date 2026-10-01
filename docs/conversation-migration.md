@@ -196,12 +196,18 @@ apply. Integrity checks detect corruption; they are not encryption or protection
 against a writer with the service user's filesystem access. Logs and dashboard
 metrics contain no saved conversation text.
 
-Each snapshot contains the complete visible history through one response, so
-successive turns duplicate earlier text. History limits are separate from
-ownership `max_entries`. Per-snapshot bytes include serialized metadata and the
-integrity tag. Total logical bytes also count indexes and unresolved attempts.
-bbolt pages and transaction overhead require additional disk space. Nothing
-expires or evicts automatically. Capacity errors preserve existing snapshots.
+Each snapshot stands for the complete visible history through one response.
+Successive turns repeat the earlier items and the whole tool catalog, so Vekil
+stores each distinct item, instructions text and tool catalog once, and
+snapshots reference them. A turn adds its new items and a small record.
+Snapshots saved by earlier Vekil versions keep their own copies until pruned.
+Those versions refuse to start with a store that holds snapshots saved this way.
+History limits are separate from ownership `max_entries`. Per-snapshot bytes
+measure the complete history a snapshot stands for, including serialized
+metadata and the integrity tag. Total logical bytes count each stored value
+once, plus records, indexes and unresolved attempts. bbolt pages and
+transaction overhead require additional disk space. Nothing expires or evicts
+automatically. Capacity errors preserve existing snapshots.
 
 Before dispatch, Vekil commits an attempt marker. Before exposing a completed
 response, it atomically saves history and clears that marker. If a crash or
@@ -312,7 +318,8 @@ vekil state prune-history --file /path/to/private-state/bindings.db \
 
 This deletes snapshots older than the cutoff unless their conversation has an
 unresolved attempt at or after the cutoff. Older unresolved attempts are retired
-together with every snapshot of their conversation. Ownership records are
+together with every snapshot of their conversation. Stored values that no
+remaining snapshot references are deleted too. Ownership records are
 unchanged. Ordinary `state prune` deletes ownership proof separately and does
 not erase conversation text.
 Pruning breaks affected recovery. Freed pages are reusable, not securely erased,
