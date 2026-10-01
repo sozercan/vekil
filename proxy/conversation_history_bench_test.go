@@ -44,11 +44,12 @@ func BenchmarkConversationHistoryAdmission(b *testing.B) {
 					id := fmt.Sprintf("seed-%d", i)
 					snapshot := conversationHistoryStorageSnapshot(history, id, id, time.Now())
 					key := history.responseKey(snapshot.RouteID, snapshot.ResponseID)
-					value, err := history.encode(key, snapshot)
+					encoded, err := history.encode(key, snapshot)
 					if err != nil {
 						return err
 					}
-					if err := snapshots.Put(key, value); err != nil {
+					cost, err := history.put(tx, key, snapshot, encoded)
+					if err != nil {
 						return err
 					}
 					for _, anchor := range snapshot.Indexes {
@@ -56,7 +57,7 @@ func BenchmarkConversationHistoryAdmission(b *testing.B) {
 							return err
 						}
 					}
-					total += conversationSnapshotCost(snapshot, value)
+					total += cost
 				}
 				return snapshots.SetSequence(total)
 			})

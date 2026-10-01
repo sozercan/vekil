@@ -76,6 +76,20 @@ func saveConversationHistoryStorageSnapshot(t *testing.T, history *conversationH
 	}
 }
 
+// conversationHistoryStorageUsage returns the committed logical bytes and the
+// number of stored blobs.
+func conversationHistoryStorageUsage(t *testing.T, history *conversationHistoryStore) (total uint64, blobs int) {
+	t.Helper()
+	if err := history.d.db.View(func(tx *bolt.Tx) error {
+		total = tx.Bucket(conversationSnapshotsBucket).Sequence()
+		blobs = tx.Bucket(conversationBlobsBucket).Stats().KeyN
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return total, blobs
+}
+
 func requireConversationHistoryStorageSnapshot(t *testing.T, history *conversationHistoryStore, want *conversationSnapshot) {
 	t.Helper()
 	got, err := history.lookupResponse(want.RouteID, want.ResponseID)
@@ -126,6 +140,83 @@ func TestConversationHistoryStorageReopenRetainsCompleteSnapshots(t *testing.T) 
 		t.Fatalf("committed snapshot retained a pending attempt: %v", err)
 	}
 	retained.release(first.Root)
+}
+
+func TestConversationHistoryStorageStoresRepeatedContentOnce(t *testing.T) {
+	bindings, history, file := newConversationHistoryStorageFixture(t, ConversationMigrationConfig{})
+	now := time.Now()
+	first := conversationHistoryStorageSnapshot(history, "shared-first", "shared-root", now)
+	saveConversationHistoryStorageSnapshot(t, history, first)
+	afterFirst, firstBlobs := conversationHistoryStorageUsage(t, history)
+	if firstBlobs != 4 {
+		t.Fatalf("first snapshot stored %d blobs, want its two items, instructions and tools", firstBlobs)
+	}
+	// A later turn repeats the whole earlier history, instructions and tools.
+	second := conversationHistoryStorageSnapshot(history, "shared-second", first.Root, now)
+	second.Input = append(cloneRawMessages(first.Input), second.Input...)
+	saveConversationHistoryStorageSnapshot(t, history, second)
+	afterSecond, secondBlobs := conversationHistoryStorageUsage(t, history)
+	encoded, err := history.encode(history.responseKey(second.RouteID, second.ResponseID), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := second.Input[len(second.Input)-1]
+	if want := conversationSnapshotCost(second, encoded.value) + conversationBlobCost(reply); secondBlobs != firstBlobs+1 || afterSecond-afterFirst != want {
+		t.Fatalf("second snapshot added %d blobs and %d bytes, want only its reply: 1 blob and %d bytes", secondBlobs-firstBlobs, afterSecond-afterFirst, want)
+	}
+	closeDurableStoreFixture(t, bindings)
+	_, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
+	requireConversationHistoryStorageSnapshot(t, retained, first)
+	requireConversationHistoryStorageSnapshot(t, retained, second)
+}
+
+func TestConversationHistoryStorageReadsInlineSnapshots(t *testing.T) {
+	bindings, history, file := newConversationHistoryStorageFixture(t, ConversationMigrationConfig{})
+	cutoff := time.Date(2020, 1, 1, 0, 0, 1, 0, time.UTC)
+	// Earlier versions stored each snapshot's content inline, without blobs.
+	inline := conversationHistoryStorageSnapshot(history, "inline-first", "inline-root", cutoff.Add(-time.Second))
+	key := history.responseKey(inline.RouteID, inline.ResponseID)
+	raw, err := json.Marshal(inline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac := history.d.digest(conversationInlineRecordDomain, string(key), string(raw))
+	value := append(mac[:], raw...)
+	if err := bindings.durable.db.Update(func(tx *bolt.Tx) error {
+		snapshots, index := tx.Bucket(conversationSnapshotsBucket), tx.Bucket(conversationIndexBucket)
+		if err := snapshots.Put(key, value); err != nil {
+			return err
+		}
+		for _, anchor := range inline.Indexes {
+			if err := index.Put(anchor, key); err != nil {
+				return err
+			}
+		}
+		if err := snapshots.SetSequence(conversationSnapshotCost(inline, value)); err != nil {
+			return err
+		}
+		return tx.DeleteBucket(conversationBlobsBucket)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	closeDurableStoreFixture(t, bindings)
+	reopened, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
+	requireConversationHistoryStorageSnapshot(t, retained, inline)
+	if got, err := retained.lookupIndexes(inline.Indexes); err != nil || !reflect.DeepEqual(got, inline) {
+		t.Fatalf("inline index lookup = %+v, %v", got, err)
+	}
+	continuation := conversationHistoryStorageSnapshot(retained, "inline-continuation", inline.Root, cutoff)
+	continuation.Input = append(cloneRawMessages(inline.Input), continuation.Input...)
+	saveConversationHistoryStorageSnapshot(t, retained, continuation)
+	closeDurableStoreFixture(t, reopened)
+	if removed, err := PruneConversationHistory(file.Path, cutoff); removed != 1 || err != nil {
+		t.Fatalf("prune of the inline snapshot = %d, %v", removed, err)
+	}
+	_, pruned := reopenConversationHistoryStorageFixture(t, file, history.config)
+	if _, err := pruned.lookupResponse(inline.RouteID, inline.ResponseID); !errors.Is(err, errConversationHistoryMissing) {
+		t.Fatalf("pruned inline snapshot remained available: %v", err)
+	}
+	requireConversationHistoryStorageSnapshot(t, pruned, continuation)
 }
 
 func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t *testing.T) {
@@ -228,11 +319,8 @@ func TestConversationHistoryStorageCapacityNeverEvicts(t *testing.T) {
 				}
 				requireConversationHistoryStorageSnapshot(t, history, second)
 			case "total bytes":
-				encoded, err := history.encode(history.responseKey(first.RouteID, first.ResponseID), first)
-				if err != nil {
-					t.Fatal(err)
-				}
-				history.config.MaxTotalBytes = int64(conversationSnapshotCost(first, encoded) + conversationPendingBytes - 1)
+				used, _ := conversationHistoryStorageUsage(t, history)
+				history.config.MaxTotalBytes = int64(used + conversationPendingBytes - 1)
 				if err := history.beginAttempt(second.Root, "second-operation"); !errors.Is(err, errConversationHistoryCapacity) {
 					t.Fatalf("pending byte capacity = %v", err)
 				}
@@ -244,8 +332,8 @@ func TestConversationHistoryStorageCapacityNeverEvicts(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				history.config.MaxHistoryBytes = len(encoded)
-				second.Instructions, _ = json.Marshal(strings.Repeat("large instructions ", len(encoded)))
+				history.config.MaxHistoryBytes = encoded.historyBytes
+				second.Instructions, _ = json.Marshal(strings.Repeat("large instructions ", encoded.historyBytes))
 				if err := history.beginAttempt(second.Root, "second-operation"); err != nil {
 					t.Fatal(err)
 				}
@@ -399,7 +487,7 @@ func TestConversationHistoryStorageCountsFollowCommittedRecords(t *testing.T) {
 }
 
 func TestConversationHistoryStorageCorruptionIsPreserved(t *testing.T) {
-	for _, corruption := range []string{"MAC", "payload", "count", "index", "missing index", "pending", "pending timestamp", "pending key", "missing index bucket", "missing pending bucket"} {
+	for _, corruption := range []string{"MAC", "payload", "count", "index", "missing index", "pending", "pending timestamp", "pending key", "missing index bucket", "missing pending bucket", "blob", "missing blob"} {
 		t.Run(corruption, func(t *testing.T) {
 			bindings, history, file := newConversationHistoryStorageFixture(t, ConversationMigrationConfig{})
 			snapshot := conversationHistoryStorageSnapshot(history, "corruption-fixture", "corruption-root", time.Now())
@@ -432,6 +520,19 @@ func TestConversationHistoryStorageCorruptionIsPreserved(t *testing.T) {
 					return tx.DeleteBucket(conversationIndexBucket)
 				case "missing pending bucket":
 					return tx.DeleteBucket(conversationPendingBucket)
+				case "blob", "missing blob":
+					blobs := tx.Bucket(conversationBlobsBucket)
+					key, content := blobs.Cursor().First()
+					key, content = bytes.Clone(key), bytes.Clone(content)
+					if corruption == "blob" {
+						content[0] ^= 1
+						return blobs.Put(key, content)
+					}
+					// Keep the count consistent so only the missing blob is wrong.
+					if err := snapshots.SetSequence(snapshots.Sequence() - conversationBlobCost(content)); err != nil {
+						return err
+					}
+					return blobs.Delete(key)
 				default:
 					key := history.responseKey(snapshot.RouteID, snapshot.ResponseID)
 					value := append([]byte(nil), snapshots.Get(key)...)
@@ -556,11 +657,18 @@ func TestConversationHistoryStoragePrunePreservesOwnership(t *testing.T) {
 	if removed, err := PruneConversationHistory(file.Path, cutoff); removed != 0 || !errors.Is(err, errDurableStateLocked) {
 		t.Fatalf("prune while serving = %d, %v", removed, err)
 	}
+	if _, blobs := conversationHistoryStorageUsage(t, history); blobs != 7 {
+		t.Fatalf("stored %d blobs, want 3 shared and 4 replies", blobs)
+	}
 	closeDurableStoreFixture(t, bindings)
 	if removed, err := PruneConversationHistory(file.Path, cutoff); removed != 2 || err != nil {
 		t.Fatalf("offline prune = %d, %v", removed, err)
 	}
 	reopened, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
+	// Pruning keeps the shared blobs and the kept replies, not the pruned replies.
+	if _, blobs := conversationHistoryStorageUsage(t, retained); blobs != 5 {
+		t.Fatalf("prune kept %d blobs, want 5", blobs)
+	}
 	for _, snapshot := range snapshots {
 		if result := reopened.lookup(stateBindingTypeResponseID, snapshot.ResponseID); result.err != nil || result.outcome != stateBindingLookupKnown || result.owner != reopened.durable.encodeOwner(durableFixtureOwner()) {
 			t.Fatalf("history pruning changed ownership: %+v", result)
