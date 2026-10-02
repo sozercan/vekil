@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -93,7 +94,9 @@ type conversationHistoryStore struct {
 	d      *durableStateBindings
 	config ConversationMigrationConfig
 	mu     sync.Mutex
-	active map[string]bool
+	// active maps the root of each conversation with a turn in progress to
+	// the client thread that sent it.
+	active map[string]string
 	// streaming maps the key of a response an active turn is streaming, and
 	// has not saved yet, to that turn's root.
 	streaming map[string]string
@@ -111,7 +114,7 @@ func newConversationHistoryStore(d *durableStateBindings, config ConversationMig
 	if d == nil {
 		return nil, configPathError("conversation_migration", "requires durable state_bindings, including process overrides")
 	}
-	s := &conversationHistoryStore{d: d, config: config.withDefaults(), active: make(map[string]bool), streaming: make(map[string]string)}
+	s := &conversationHistoryStore{d: d, config: config.withDefaults(), active: make(map[string]string), streaming: make(map[string]string)}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.failed != nil || d.db == nil {
@@ -541,23 +544,34 @@ func pendingReleasedTo(value, source []byte) bool {
 }
 
 func (s *conversationHistoryStore) acquire(root string) error {
-	_, err := s.acquireFrom(root, nil, false)
+	_, _, err := s.acquireFrom(root, "", nil, false)
 	return err
 }
 
-// acquireFrom admits a turn whose history continues from the snapshot keyed
-// source, or from no snapshot when source is nil. A pending record admits only
-// a continuation of the snapshot it was released to, unless trusted: the client
-// is known to resend everything it received, so a turn whose history validated
-// cannot hide delivered work. overrode reports that trust admitted the turn.
-func (s *conversationHistoryStore) acquireFrom(root string, source []byte, trusted bool) (overrode bool, err error) {
+// acquireFrom admits a turn that client thread thread sends, whose history
+// continues from the snapshot keyed source, or from no snapshot when source is
+// nil. A pending record admits only a continuation of the snapshot it was
+// released to, unless trusted: the client is known to resend everything it
+// received, so a turn whose history validated cannot hide delivered work.
+// overrode reports that trust admitted the turn.
+//
+// One turn of a conversation runs at a time. While another client thread's
+// turn holds root, a trusted client's turn branches into a new root instead,
+// such as a Codex side conversation or subagent forked from a thread that is
+// still working. Its validated history cannot hide delivered work either, and
+// its own snapshots carry its lineage from there. admitted is the root the
+// turn holds.
+func (s *conversationHistoryStore) acquireFrom(root, thread string, source []byte, trusted bool) (admitted string, overrode bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.active[root] {
-		return false, errConversationHistoryBusy
+	if holder, busy := s.active[root]; busy {
+		if !trusted || thread == "" || holder == "" || holder == thread {
+			return "", false, errConversationHistoryBusy
+		}
+		root = uuid.NewString()
 	}
 	if len(s.active) >= s.config.MaxSnapshots {
-		return false, errConversationHistoryCapacity
+		return "", false, errConversationHistoryCapacity
 	}
 	if err := s.view(func(tx *bolt.Tx) error {
 		key := s.rootKey(root)
@@ -577,10 +591,10 @@ func (s *conversationHistoryStore) acquireFrom(root string, source []byte, trust
 		}
 		return nil
 	}); err != nil {
-		return false, err
+		return "", false, err
 	}
-	s.active[root] = true
-	return overrode, nil
+	s.active[root] = thread
+	return root, overrode, nil
 }
 
 func (s *conversationHistoryStore) release(root string) {
@@ -598,7 +612,7 @@ func (s *conversationHistoryStore) release(root string) {
 // response keyed key, until the turn is released.
 func (s *conversationHistoryStore) markStreaming(root string, key []byte) {
 	s.mu.Lock()
-	if s.active[root] {
+	if _, ok := s.active[root]; ok {
 		s.streaming[string(key)] = root
 	}
 	s.mu.Unlock()
@@ -610,11 +624,15 @@ func (s *conversationHistoryStore) markStreaming(root string, key []byte) {
 func (s *conversationHistoryStore) turnActive(root string, key []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if root != "" && s.active[root] {
+	if _, ok := s.active[root]; ok && root != "" {
 		return true
 	}
 	streamingRoot, ok := s.streaming[string(key)]
-	return ok && s.active[streamingRoot]
+	if !ok {
+		return false
+	}
+	_, ok = s.active[streamingRoot]
+	return ok
 }
 
 func (s *conversationHistoryStore) update(fn func(*bolt.Tx, *conversationHistoryCounts) error) error {

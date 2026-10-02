@@ -386,3 +386,72 @@ func TestConversationMigrationSerializesOneConversation(t *testing.T) {
 		t.Fatalf("same conversation raced: %d %s calls=%d", second.Code, second.Body.String(), calls.Load())
 	}
 }
+
+func TestConversationMigrationBranchesCodexSideThread(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/models") {
+			return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+		}
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		call := calls.Add(1)
+		if bytes.Contains(body, []byte("Main next.")) && !bytes.Contains(body, []byte("Main after.")) {
+			close(entered)
+			<-release
+		}
+		id := fmt.Sprintf("thread-%d", call)
+		return conversationResponse(t, req, id, map[string]any{
+			"type": "message", "id": "msg_" + id, "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "Answer " + id + "."}},
+		}), nil
+	})
+	h, _ := newConversationAPIHandler(t, transport, nil)
+	codex := func(thread string) http.Header {
+		return http.Header{"User-Agent": {"codex-tui/0.159.3"}, "Session-Id": {thread}, "Thread-Id": {thread}}
+	}
+	user := func(text string) map[string]any { return map[string]any{"role": "user", "content": text} }
+	answer := func(id string) map[string]any {
+		return map[string]any{"type": "message", "id": "msg_" + id, "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "Answer " + id + "."}}}
+	}
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, codex("main")), false)
+	seeded := []any{user("Seed."), answer("thread-1")}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result := conversationPOST(t, h, map[string]any{"input": append(append([]any{}, seeded...), user("Main next."))}, codex("main"))
+		if result.Code != 200 {
+			t.Errorf("main turn: %d %s", result.Code, result.Body.String())
+		}
+	}()
+	<-entered
+	// The main thread's own retry, and another thread of a client that may not
+	// resend what it received, still wait for the active turn.
+	for name, headers := range map[string]http.Header{"same thread": codex("main"), "unrecognized client": {"Session-Id": {"other"}, "Thread-Id": {"other"}}} {
+		result := conversationPOST(t, h, map[string]any{"input": append(append([]any{}, seeded...), user("Meanwhile."))}, headers)
+		if result.Code != 409 || !strings.Contains(result.Body.String(), "conversation_turn_in_progress") {
+			t.Errorf("%s raced the active turn: %d %s", name, result.Code, result.Body.String())
+		}
+	}
+	// A Codex side conversation forked from the working thread proceeds, and
+	// continues from its own saved history.
+	sideHistory := append(append([]any{}, seeded...), user("Side question."))
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": sideHistory}, codex("side")), false)
+	sideHistory = append(sideHistory, answer("thread-3"), user("Side follow-up."))
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": sideHistory}, codex("side")), false)
+	close(release)
+	wg.Wait()
+	if t.Failed() {
+		return
+	}
+	mainHistory := append(append([]any{}, seeded...), user("Main next."), answer("thread-2"), user("Main after."))
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": mainHistory}, codex("main")), false)
+	if calls.Load() != 5 {
+		t.Fatalf("upstream sends = %d, want 5", calls.Load())
+	}
+}

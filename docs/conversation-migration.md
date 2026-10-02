@@ -176,7 +176,11 @@ from one cannot acquire later west messages. Different conversations proceed
 independently; concurrent turns on one saved conversation return
 `conversation_turn_in_progress` rather than racing region changes. So does a
 turn that resumes from output an active turn has streamed but not saved yet,
-such as right after an interrupt, so the client can retry it.
+such as right after an interrupt, so the client can retry it. A Codex turn from
+another thread, such as a `/side` conversation or a subagent forked from a
+thread that is still working, starts its own conversation from the saved
+history instead of waiting. Vekil tells threads apart by Codex's `thread-id`
+header and applies this only to the Codex releases described below.
 
 The proxy-owned WebSocket bridge follows the same rules. Reconnect by sending
 `response.create` with the saved `previous_response_id` and only new input, or
@@ -290,13 +294,15 @@ completion contains `vekil: {"history":"saved","target":"west"}`, with
 `"migration":"completed"` only on the turn that switched; an unprotected
 completion has no `vekil` field. WebSocket completion objects carry the same
 fields. Fixed-content logs distinguish `attempted`, `completed`, `blocked`,
-`unprotected`, `failed`, `interrupted` and `released` recovery. `failed` records
-a settled attempt, with reason `failure_event` for a terminal event,
+`unprotected`, `failed`, `interrupted`, `released` and `branched` recovery.
+`failed` records a settled attempt, with reason `failure_event` for a terminal event,
 `stream_ended` for a stream the upstream ended without one, `proxy_ended` for a
 stream Vekil ended, or `delivered_history_saved` when a completed tool call was
 saved first. `interrupted` records a client disconnect and whether delivered
 history was saved. `released` with reason `client_resends_delivered` records a
-Codex request admitted past an unresolved attempt. A `recording` header alone
+Codex request admitted past an unresolved attempt. `branched` with reason
+`concurrent_turn` records a Codex turn from another thread that started its own
+conversation while the one it continues was busy. A `recording` header alone
 is not a saved completion. The menubar app keeps these logs in a file; see
 [Menubar](menubar.md).
 
