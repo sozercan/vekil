@@ -213,7 +213,10 @@ measure the complete history a snapshot stands for, including serialized
 metadata and the integrity tag. Total logical bytes count each stored value
 once, plus records, indexes and unresolved attempts. bbolt pages and
 transaction overhead require additional disk space. Nothing expires or evicts
-automatically. Capacity errors preserve existing snapshots.
+automatically. Capacity errors preserve existing snapshots. An unresolved
+attempt that no later turn continues also stays, for example after a first turn
+or a closed Codex `/side` thread ended with an uncertain outcome. Each one counts
+as one record toward `max_snapshots` until `prune-history` retires it.
 
 Before dispatch, Vekil commits an attempt marker. Before exposing a completed
 response, it atomically saves history and clears that marker. If a crash or
