@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math"
@@ -11,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -258,6 +258,12 @@ func (s *conversationHistoryStore) responseKey(routeID, responseID string) []byt
 func (s *conversationHistoryStore) indexKey(routeID, kind, value string) []byte {
 	key := s.d.digest("conversation-index-v1", routeID, kind, value)
 	return key[:]
+}
+
+// branchRoot names the conversation a client thread branches into from root.
+func (s *conversationHistoryStore) branchRoot(root, thread string) string {
+	digest := s.d.digest("conversation-branch-v1", root, thread)
+	return hex.EncodeToString(digest[:])
 }
 
 func (s *conversationHistoryStore) rootKey(root string) []byte {
@@ -548,7 +554,7 @@ func (s *conversationHistoryStore) acquire(root string) error {
 	return err
 }
 
-// acquireFrom admits a turn that client thread thread sends, whose history
+// acquireFrom admits a turn sent by the named client thread, whose history
 // continues from the snapshot keyed source, or from no snapshot when source is
 // nil. A pending record admits only a continuation of the snapshot it was
 // released to, unless trusted: the client is known to resend everything it
@@ -556,19 +562,28 @@ func (s *conversationHistoryStore) acquire(root string) error {
 // overrode reports that trust admitted the turn.
 //
 // One turn of a conversation runs at a time. While another client thread's
-// turn holds root, a trusted client's turn branches into a new root instead,
-// such as a Codex side conversation or subagent forked from a thread that is
-// still working. Its validated history cannot hide delivered work either, and
-// its own snapshots carry its lineage from there. admitted is the root the
-// turn holds.
+// turn holds root, a trusted client's turn branches into that thread's own
+// root instead, such as a Codex side conversation or subagent forked from a
+// thread that is still working. Its validated history cannot hide delivered
+// work either, and its own snapshots carry its lineage from there. A retry
+// from the thread before its branch saves history resolves to root again, and
+// reaches the same branch, which is busy or holds that turn's pending record.
+// admitted is the root the turn holds.
 func (s *conversationHistoryStore) acquireFrom(root, thread string, source []byte, trusted bool) (admitted string, overrode bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if holder, busy := s.active[root]; busy {
-		if !trusted || thread == "" || holder == "" || holder == thread {
+	if thread != "" {
+		branch := s.branchRoot(root, thread)
+		if _, busy := s.active[branch]; busy {
+			// The thread's own turn that branched from root is still active.
 			return "", false, errConversationHistoryBusy
 		}
-		root = uuid.NewString()
+		if holder, busy := s.active[root]; busy && trusted && holder != "" && holder != thread {
+			root = branch
+		}
+	}
+	if _, busy := s.active[root]; busy {
+		return "", false, errConversationHistoryBusy
 	}
 	if len(s.active) >= s.config.MaxSnapshots {
 		return "", false, errConversationHistoryCapacity

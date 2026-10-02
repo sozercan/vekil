@@ -179,8 +179,10 @@ turn that resumes from output an active turn has streamed but not saved yet,
 such as right after an interrupt, so the client can retry it. A Codex turn from
 another thread, such as a `/side` conversation or a subagent forked from a
 thread that is still working, starts its own conversation from the saved
-history instead of waiting. Vekil tells threads apart by Codex's `thread-id`
-header and applies this only to the Codex releases described below.
+history instead of waiting. A retry from that thread reaches the same branch,
+so it still waits for that thread's active turn. Vekil tells threads apart by
+Codex's `thread-id` header and applies this only to the Codex releases
+described below.
 
 The proxy-owned WebSocket bridge follows the same rules. Reconnect by sending
 `response.create` with the saved `previous_response_id` and only new input, or

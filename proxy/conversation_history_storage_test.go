@@ -644,11 +644,35 @@ func TestConversationHistoryStorageBranchesAnotherClientThread(t *testing.T) {
 		}
 	}
 	branch, overrode, err := history.acquireFrom("main-root", "side", nil, true)
-	if err != nil || overrode || branch == "main-root" || branch == "" {
+	if err != nil || overrode || branch != history.branchRoot("main-root", "side") {
 		t.Fatalf("side admission = %q, %v, %v", branch, overrode, err)
 	}
-	if _, _, err := history.acquireFrom(branch, "side", nil, true); !errors.Is(err, errConversationHistoryBusy) {
-		t.Fatalf("branch is not held: %v", err)
+	if other, _, err := history.acquireFrom("main-root", "other-side", nil, true); err != nil || other == branch || other == "main-root" {
+		t.Fatalf("second side admission = %q, %v", other, err)
+	} else {
+		history.release(other)
+	}
+	// A retry from the side thread resolves to the main conversation again. It
+	// waits for the side turn, including after the main turn ends.
+	for _, root := range []string{branch, "main-root"} {
+		if _, _, err := history.acquireFrom(root, "side", nil, true); !errors.Is(err, errConversationHistoryBusy) {
+			t.Fatalf("side retry on %q = %v, want busy", root, err)
+		}
+	}
+	history.release("main-root")
+	if _, _, err := history.acquireFrom("main-root", "side", nil, true); !errors.Is(err, errConversationHistoryBusy) {
+		t.Fatalf("side retry after the main turn = %v, want busy", err)
+	}
+	// The side turn's unresolved attempt stays reachable from a later retry.
+	if err := history.beginAttempt(branch, "side-operation"); err != nil {
+		t.Fatal(err)
+	}
+	history.release(branch)
+	if _, _, err := history.acquireFrom("main-root", "main", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if root, overrode, err := history.acquireFrom("main-root", "side", nil, true); err != nil || root != branch || !overrode {
+		t.Fatalf("side retry after an unresolved attempt = %q, %v, %v", root, overrode, err)
 	}
 	for _, root := range []string{"threadless-root", "main-root", branch} {
 		history.release(root)
