@@ -238,11 +238,11 @@ func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t 
 	_, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
 	requireConversationHistoryStorageSnapshot(t, retained, delivered)
 	for _, source := range [][]byte{nil, parentKey} {
-		if _, err := retained.acquireFrom(parent.Root, source, false); !errors.Is(err, errConversationHistoryUncertain) {
+		if _, _, err := retained.acquireFrom(parent.Root, "", source, false); !errors.Is(err, errConversationHistoryUncertain) {
 			t.Fatalf("branch from %x admitted: %v", source, err)
 		}
 	}
-	if overrode, err := retained.acquireFrom(parent.Root, deliveredKey, false); err != nil || overrode {
+	if _, overrode, err := retained.acquireFrom(parent.Root, "", deliveredKey, false); err != nil || overrode {
 		t.Fatalf("continuation admission = %t, %v", overrode, err)
 	}
 	retained.release(parent.Root)
@@ -254,10 +254,10 @@ func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t 
 	}
 	// The continuation now owns an ordinary marker, which only a trusted
 	// client passes and replaces.
-	if _, err := retained.acquireFrom(parent.Root, deliveredKey, false); !errors.Is(err, errConversationHistoryUncertain) {
+	if _, _, err := retained.acquireFrom(parent.Root, "", deliveredKey, false); !errors.Is(err, errConversationHistoryUncertain) {
 		t.Fatalf("continuation marker admitted another turn: %v", err)
 	}
-	if overrode, err := retained.acquireFrom(parent.Root, parentKey, true); err != nil || !overrode {
+	if _, overrode, err := retained.acquireFrom(parent.Root, "", parentKey, true); err != nil || !overrode {
 		t.Fatalf("trusted admission = %t, %v", overrode, err)
 	}
 	retained.release(parent.Root)
@@ -289,7 +289,7 @@ func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t 
 		if trusted {
 			source = parentKey
 		}
-		if _, err := retained.acquireFrom(parent.Root, source, trusted); !errors.Is(err, errConversationHistoryStorage) {
+		if _, _, err := retained.acquireFrom(parent.Root, "", source, trusted); !errors.Is(err, errConversationHistoryStorage) {
 			t.Fatalf("damaged record admission (trusted=%t) = %v", trusted, err)
 		}
 	}
@@ -623,6 +623,64 @@ func TestConversationHistoryStorageAdmissionAndCancellation(t *testing.T) {
 		}
 		history.release(root)
 	}
+}
+
+func TestConversationHistoryStorageBranchesAnotherClientThread(t *testing.T) {
+	_, history, _ := newConversationHistoryStorageFixture(t, ConversationMigrationConfig{})
+	if err := history.acquire("threadless-root"); err != nil {
+		t.Fatal(err)
+	}
+	if root, _, err := history.acquireFrom("main-root", "main", nil, true); err != nil || root != "main-root" {
+		t.Fatalf("first admission = %q, %v", root, err)
+	}
+	// The same thread, an unrecognized client, a turn without a thread and a
+	// turn of an unnamed holder all wait.
+	for _, attempt := range []struct {
+		root, thread string
+		trusted      bool
+	}{{"main-root", "main", true}, {"main-root", "side", false}, {"main-root", "", true}, {"threadless-root", "side", true}} {
+		if _, _, err := history.acquireFrom(attempt.root, attempt.thread, nil, attempt.trusted); !errors.Is(err, errConversationHistoryBusy) {
+			t.Fatalf("%+v admission = %v, want busy", attempt, err)
+		}
+	}
+	branch, overrode, err := history.acquireFrom("main-root", "side", nil, true)
+	if err != nil || overrode || branch != history.branchRoot("main-root", "side") {
+		t.Fatalf("side admission = %q, %v, %v", branch, overrode, err)
+	}
+	if other, _, err := history.acquireFrom("main-root", "other-side", nil, true); err != nil || other == branch || other == "main-root" {
+		t.Fatalf("second side admission = %q, %v", other, err)
+	} else {
+		history.release(other)
+	}
+	// A retry from the side thread resolves to the main conversation again. It
+	// waits for the side turn, including after the main turn ends.
+	for _, root := range []string{branch, "main-root"} {
+		if _, _, err := history.acquireFrom(root, "side", nil, true); !errors.Is(err, errConversationHistoryBusy) {
+			t.Fatalf("side retry on %q = %v, want busy", root, err)
+		}
+	}
+	history.release("main-root")
+	if _, _, err := history.acquireFrom("main-root", "side", nil, true); !errors.Is(err, errConversationHistoryBusy) {
+		t.Fatalf("side retry after the main turn = %v, want busy", err)
+	}
+	// The side turn's unresolved attempt stays reachable from a later retry.
+	if err := history.beginAttempt(branch, "side-operation"); err != nil {
+		t.Fatal(err)
+	}
+	history.release(branch)
+	if _, _, err := history.acquireFrom("main-root", "main", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if root, overrode, err := history.acquireFrom("main-root", "side", nil, true); err != nil || root != branch || !overrode {
+		t.Fatalf("side retry after an unresolved attempt = %q, %v, %v", root, overrode, err)
+	}
+	for _, root := range []string{"threadless-root", "main-root", branch} {
+		history.release(root)
+	}
+	if root, _, err := history.acquireFrom("main-root", "side", nil, true); err != nil || root != "main-root" {
+		t.Fatalf("idle conversation admission = %q, %v", root, err)
+	}
+	history.release("main-root")
 }
 
 func TestConversationHistoryStoragePrunePreservesOwnership(t *testing.T) {

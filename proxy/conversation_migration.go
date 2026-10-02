@@ -314,9 +314,13 @@ func (h *ProxyHandler) prepareConversationTurn(operation *routeOperation, body [
 	// it received is missing: an unresolved marker cannot hide a tool call the
 	// model might repeat.
 	turn.trustedClient = trusted
-	overrode, err := store.acquireFrom(turn.root, turn.sourceKey, turn.trustedClient)
+	root, overrode, err := store.acquireFrom(turn.root, headerGetCI(headers, "thread-id"), turn.sourceKey, turn.trustedClient)
 	if err != nil {
 		return fail(err)
+	}
+	if root != turn.root {
+		turn.root = root
+		h.logConversationRecovery(operation, "branched", "", "concurrent_turn")
 	}
 	if overrode {
 		h.logConversationRecovery(operation, "released", "", "client_resends_delivered")

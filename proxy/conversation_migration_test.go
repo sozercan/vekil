@@ -386,3 +386,109 @@ func TestConversationMigrationSerializesOneConversation(t *testing.T) {
 		t.Fatalf("same conversation raced: %d %s calls=%d", second.Code, second.Body.String(), calls.Load())
 	}
 }
+
+func TestConversationMigrationBranchesCodexSideThread(t *testing.T) {
+	type hold struct {
+		entered, release chan struct{}
+		sends            *atomic.Int32
+	}
+	mainTurn := hold{make(chan struct{}), make(chan struct{}), new(atomic.Int32)}
+	sideTurn := hold{make(chan struct{}), make(chan struct{}), new(atomic.Int32)}
+	var calls atomic.Int32
+	transport := routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/models") {
+			return routeExecutorTestResponse(req, 200, nil, `{"data":[]}`), nil
+		}
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		call := calls.Add(1)
+		if !bytes.Contains(body, []byte("Main after.")) && !bytes.Contains(body, []byte("Side follow-up.")) {
+			for marker, held := range map[string]hold{"Main next.": mainTurn, "Side question.": sideTurn} {
+				if !bytes.Contains(body, []byte(marker)) {
+					continue
+				}
+				if held.sends.Add(1) > 1 {
+					t.Errorf("turn %q sent upstream again while it was active", marker)
+					break
+				}
+				close(held.entered)
+				<-held.release
+			}
+		}
+		id := fmt.Sprintf("thread-%d", call)
+		return conversationResponse(t, req, id, map[string]any{
+			"type": "message", "id": "msg_" + id, "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "Answer " + id + "."}},
+		}), nil
+	})
+	h, _ := newConversationAPIHandler(t, transport, nil)
+	codex := func(thread string) http.Header {
+		return http.Header{"User-Agent": {"codex-tui/0.159.3"}, "Session-Id": {thread}, "Thread-Id": {thread}}
+	}
+	user := func(text string) map[string]any { return map[string]any{"role": "user", "content": text} }
+	answer := func(id string) map[string]any {
+		return map[string]any{"type": "message", "id": "msg_" + id, "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "Answer " + id + "."}}}
+	}
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, codex("main")), false)
+	seeded := []any{user("Seed."), answer("thread-1")}
+	inProgress := func(name string, result *httptest.ResponseRecorder) {
+		t.Helper()
+		if result.Code != 409 || !strings.Contains(result.Body.String(), "conversation_turn_in_progress") {
+			t.Errorf("%s raced an active turn: %d %s", name, result.Code, result.Body.String())
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		result := conversationPOST(t, h, map[string]any{"input": append(append([]any{}, seeded...), user("Main next."))}, codex("main"))
+		if result.Code != 200 {
+			t.Errorf("main turn: %d %s", result.Code, result.Body.String())
+		}
+	}()
+	<-mainTurn.entered
+	// The main thread's own retry, and another thread of a client that may not
+	// resend what it received, still wait for the active turn.
+	for name, headers := range map[string]http.Header{"same thread": codex("main"), "unrecognized client": {"Session-Id": {"other"}, "Thread-Id": {"other"}}} {
+		inProgress(name, conversationPOST(t, h, map[string]any{"input": append(append([]any{}, seeded...), user("Meanwhile."))}, headers))
+	}
+	// A Codex side conversation forked from the working thread proceeds.
+	sideHistory := append(append([]any{}, seeded...), user("Side question."))
+	go func() {
+		defer wg.Done()
+		result := conversationPOST(t, h, map[string]any{"input": sideHistory}, codex("side"))
+		if result.Code != 200 {
+			t.Errorf("side turn: %d %s", result.Code, result.Body.String())
+		}
+	}()
+	<-sideTurn.entered
+	// Its retry resolves to the main conversation again, and waits for the side
+	// turn rather than branching once more.
+	inProgress("side retry", conversationPOST(t, h, map[string]any{"input": sideHistory}, codex("side")))
+	close(sideTurn.release)
+	// The side conversation continues from its own saved history once its turn
+	// settles.
+	sideHistory = append(sideHistory, answer("thread-3"), user("Side follow-up."))
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		result := conversationPOST(t, h, map[string]any{"input": sideHistory}, codex("side"))
+		if result.Code == 409 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		conversationCompleted(t, result, false)
+		break
+	}
+	close(mainTurn.release)
+	wg.Wait()
+	if t.Failed() {
+		return
+	}
+	mainHistory := append(append([]any{}, seeded...), user("Main next."), answer("thread-2"), user("Main after."))
+	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": mainHistory}, codex("main")), false)
+	if calls.Load() != 5 {
+		t.Fatalf("upstream sends = %d, want 5", calls.Load())
+	}
+}
