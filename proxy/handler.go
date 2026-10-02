@@ -1252,7 +1252,7 @@ func (c CopilotHeaderConfig) withCredentialDefaults(token string) CopilotHeaderC
 	if c.IntegrationID == "" {
 		token = strings.TrimSpace(token)
 		switch {
-		case strings.HasPrefix(token, "gho_"), strings.HasPrefix(token, "github_pat_"):
+		case strings.HasPrefix(token, "gho_"), strings.HasPrefix(token, "github_pat_"), strings.HasPrefix(token, "ghs_"):
 			c.IntegrationID = directCopilotCLIIntegrationID
 		case strings.HasPrefix(token, "ghu_"):
 			c.IntegrationID = directGitHubAppIntegrationID

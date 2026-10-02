@@ -42,6 +42,7 @@ var (
 		"gho_",
 		"ghu_",
 		"github_pat_",
+		"ghs_",
 	}
 
 	githubCLITokenTimeout = 5 * time.Second

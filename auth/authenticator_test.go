@@ -198,8 +198,9 @@ func TestGetToken_FineGrainedPATUsesDirectBearer(t *testing.T) {
 
 func TestGetToken_SupportedEnvAccessTokensUseDirectBearer(t *testing.T) {
 	tests := map[string]string{
-		"oauth":    "gho_oauth-token",
-		"app-user": "ghu_user-token",
+		"oauth":         "gho_oauth-token",
+		"app-user":      "ghu_user-token",
+		"actions-token": "ghs_actions-token",
 	}
 	for name, accessToken := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -311,6 +312,7 @@ func TestGetResponsesToken_OtherSupportedCredentialsStayDirect(t *testing.T) {
 	for name, token := range map[string]string{
 		"oauth":            "gho_responses-direct",
 		"fine-grained PAT": "github_pat_responses-direct",
+		"Actions token":    "ghs_responses-direct",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("COPILOT_GITHUB_TOKEN", token)
@@ -626,7 +628,7 @@ func TestIsSupportedCopilotBearer(t *testing.T) {
 		"ghu_user":           true,
 		"github_pat_fine":    true,
 		"ghp_classic":        false,
-		"ghs_server":         false,
+		"ghs_actions":        true,
 		"legacy-token":       false,
 		"":                   false,
 		"GHU_not-normalized": false,

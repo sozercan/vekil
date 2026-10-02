@@ -6578,6 +6578,7 @@ func TestSetCopilotHeadersUsesCredentialIntegrationDefault(t *testing.T) {
 	}{
 		{"OAuth", "gho_test", "copilot-developer-cli"},
 		{"fine-grained PAT", "github_pat_test", "copilot-developer-cli"},
+		{"Actions token", "ghs_test", "copilot-developer-cli"},
 		{"GitHub App", "ghu_test", "copilot-language-server"},
 		{"legacy", "legacy-test-token", "vscode-chat"},
 	} {
@@ -6611,6 +6612,11 @@ func TestSetCopilotHeadersWithConfigUsesCredentialIntegrationDefault(t *testing.
 		{
 			name:        "fine-grained PAT",
 			token:       "github_pat_direct-credential",
+			integration: "copilot-developer-cli",
+		},
+		{
+			name:        "Actions token",
+			token:       "ghs_direct-credential",
 			integration: "copilot-developer-cli",
 		},
 		{
@@ -6932,6 +6938,7 @@ func TestNewProviderJSONRequest_OAuthAndPATIntegrationDefaults(t *testing.T) {
 	}{
 		{"OAuth", "gho_test"},
 		{"fine-grained PAT", "github_pat_test"},
+		{"Actions token", "ghs_test"},
 	} {
 		for _, profile := range []struct {
 			name          string
