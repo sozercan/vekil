@@ -77,11 +77,15 @@ parser.add_argument("--compact-status", type=int, default=200)
 parser.add_argument("--compact-code", default="")
 parser.add_argument("--replay-status", type=int, default=200)
 parser.add_argument("--replay-code", default="")
+parser.add_argument("--replay-output-sequence", default="")
 args = parser.parse_args()
 
 MODEL = "deepseek-v4-flash-free"
 CANARY_STATUSES = [int(value) for value in args.canary_status_sequence.split(",") if value] or [args.canary_status]
 canary_index = 0
+REPLAY_OUTPUTS = args.replay_output_sequence.split(",") if args.replay_output_sequence else ["VEKIL_COMPACTION_REPLAY_OK"]
+replay_index = 0
+stats_index = 0
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -116,6 +120,18 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": "claude-sonnet-5", "supported_endpoints": ["/chat/completions"]},
                 {"id": "claude-haiku-4.5", "supported_endpoints": ["/chat/completions"]},
             ]})
+            return
+        if self.path == "/stats.json":
+            global stats_index
+            stats_index += 1
+            self.send_json(200, {"task_usage": {"inflight": 0, "totals": {
+                "sends": stats_index,
+                "completed": stats_index,
+                "errors": 0,
+                "reported_usage_sends": stats_index,
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0, "reasoning_tokens": 0},
+                "copilot_usage": {"total_nano_aiu": 0, "compute_units": 0},
+            }}})
             return
         self.send_json(404, {"error": {"message": "not found"}})
 
@@ -159,7 +175,7 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 })
                 return
-            self.send_json(200, {"output": [{"type": "compaction", "encrypted_content": "opaque"}]})
+            self.send_json(200, {"output": [{"type": "compaction", "encrypted_content": "opaque"}], "usage": {"total_tokens": 2}})
             return
         if self.path == "/v1/responses":
             if args.replay_status != 200:
@@ -170,7 +186,10 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 })
                 return
-            self.send_json(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": "VEKIL_COMPACTION_REPLAY_OK"}]}]})
+            global replay_index
+            replay_text = REPLAY_OUTPUTS[min(replay_index, len(REPLAY_OUTPUTS) - 1)]
+            replay_index += 1
+            self.send_json(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": replay_text}]}], "usage": {"total_tokens": 2}})
             return
         self.send_json(404, {"error": {"message": "not found"}})
 
@@ -226,6 +245,7 @@ start_mock_server() {
   local compact_code="${8:-}"
   local replay_status="${9:-200}"
   local replay_code="${10:-}"
+  local replay_output_sequence="${11:-}"
   local port_file="${case_dir}/port"
   local args=(
     --port-file "${port_file}"
@@ -253,6 +273,9 @@ start_mock_server() {
   fi
   if [[ -n "${replay_code}" ]]; then
     args+=(--replay-code "${replay_code}")
+  fi
+  if [[ -n "${replay_output_sequence}" ]]; then
+    args+=(--replay-output-sequence "${replay_output_sequence}")
   fi
   mkdir -p "${case_dir}"
   python3 "${TMP_ROOT}/mock_server.py" "${args[@]}" \
@@ -372,6 +395,9 @@ PY_WRAPPED_OUTPUT
       exit 0
     fi
     printf '%s\n' "\${expected}"
+    ;;
+  always-wrong)
+    printf '%s\n' "\${left}"
     ;;
   exit-first-model)
     state_file="\$(dirname "\$0")/.\$(basename "\$0").first-model-seen"
@@ -1100,6 +1126,23 @@ expect_exit_code "compact replay keeps quota errors hard" 8 1 \
     LIVE_COMPACT_SMOKE_DIR="${replay_quota_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
 
+compact_output_retry_dir="${TMP_ROOT}/setup/compact-output-retry"
+start_mock_server "${compact_output_retry_dir}/server" 200 "" "" 0 0 200 "" 200 "" \
+  "transient model text,VEKIL_COMPACTION_REPLAY_OK"
+expect_success "compact output mismatch retries once after usage" 8 \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${compact_output_retry_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
+compact_output_failure_dir="${TMP_ROOT}/setup/compact-output-failure"
+start_mock_server "${compact_output_failure_dir}/server" 200 "" "" 0 0 200 "" 200 "" \
+  "first mismatch,second mismatch"
+expect_hard_failure_with_stderr "compact output mismatch reports both attempts" 8 \
+  'after 2 successful attempts' \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${compact_output_failure_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+
 mixed_raw_dir="${TMP_ROOT}/setup/mixed-log-raw-zen"
 write_healthy_proxy "${mixed_raw_dir}/healthy-proxy"
 if expect_success "raw Zen listener tolerates mixed JSON and plain-text logs" 10 \
@@ -1314,6 +1357,25 @@ run_zen_case_expect_failure "Gemini three-wrapper sequence is rejected" 200 pass
 run_zen_case_expect_failure "canary 200 plus CLI exit 42" 200 exit42 exit42 exit42
 run_zen_case_expect_failure "canary 404 is a hard failure" 404 pass pass pass
 run_zen_case_expect_failure "one client pass cannot mask another failure" 200 pass exit42 pass
+
+codex_output_retry_dir="${TMP_ROOT}/setup/copilot-codex-output-retry"
+start_mock_server "${codex_output_retry_dir}/server" 200
+write_fake_clients "${codex_output_retry_dir}/bin" fail-first-model pass pass
+expect_success "Copilot Codex output mismatch retries once after usage" 8 \
+  env PATH="${codex_output_retry_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=copilot START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" LIVE_CLI_SMOKE_DIR="${codex_output_retry_dir}/smoke" \
+    SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 \
+    SMOKE_CLI_TIMEOUT_SECONDS=2 "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+codex_output_failure_dir="${TMP_ROOT}/setup/copilot-codex-output-failure"
+start_mock_server "${codex_output_failure_dir}/server" 200
+write_fake_clients "${codex_output_failure_dir}/bin" always-wrong pass pass
+expect_hard_failure_with_stderr "Copilot Codex output mismatch stops after one retry" 8 \
+  'after 2 successful attempts' \
+  env PATH="${codex_output_failure_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=copilot START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" LIVE_CLI_SMOKE_DIR="${codex_output_failure_dir}/smoke" \
+    SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 \
+    SMOKE_CLI_TIMEOUT_SECONDS=2 "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
 # A listener that accepts TCP but never answers HTTP must hit the script's own
 # bounded startup deadline, not the outer test watchdog.
