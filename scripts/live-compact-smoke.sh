@@ -18,6 +18,7 @@ require_cmd() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ORIGINAL_HOME="${HOME}"
+source "${SCRIPT_DIR}/live-smoke-retry.sh"
 
 PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
@@ -379,6 +380,13 @@ post_json() {
   fi
 }
 
+assert_response_usage() {
+  local label="$1"
+  local response_file="$2"
+  jq -e '(.usage | type) == "object" and (.usage.total_tokens | type) == "number" and .usage.total_tokens >= 0' "${response_file}" >/dev/null || \
+    die "${label} response did not include usage"
+}
+
 assert_compact_response() {
   jq -e '
     ([.output[]? | select(.type == "compaction" and ((.encrypted_content // "") | length > 0))] | length > 0)
@@ -422,16 +430,36 @@ responses_output_text() {
   ' "$1"
 }
 
-assert_replay_response() {
+check_replay_response() {
   local replay_text
-  replay_text="$(responses_output_text "${REPLAY_RESPONSE_JSON}")"
+  jq -e '
+    (.output | type) == "array"
+    and all(.output[]; type == "object")
+    and all(.output[] | select(.type == "message");
+      (.content | type) == "array"
+      and all(.content[];
+        type == "object" and (.type | type) == "string"
+        and (if .type == "output_text" or .type == "text" then (.text | type) == "string" else true end)))
+    and ([.output[] | select(.type == "message") | .content[]
+      | select(.type == "output_text" or .type == "text")] | length) > 0
+  ' "${REPLAY_RESPONSE_JSON}" >/dev/null || die "replay response has malformed text output"
+  replay_text="$(responses_output_text "${REPLAY_RESPONSE_JSON}")" || die "replay response text could not be decoded"
 
   if [[ "${replay_text}" != "${REPLAY_MARKER}" ]]; then
     printf 'expected replay response to equal %s after trimming whitespace\n' "${REPLAY_MARKER}" >&2
     printf 'actual normalized replay response:\n%s\n' "${replay_text}" >&2
-    die "compaction replay output mismatch"
+    return "${SMOKE_OUTPUT_MISMATCH_STATUS}"
   fi
+}
 
+run_replay_attempt() {
+  local attempt="${SMOKE_RETRY_ATTEMPT}"
+  post_json "/v1/responses" "${REPLAY_REQUEST_JSON}" "${REPLAY_RESPONSE_JSON}"
+  cp "${REPLAY_RESPONSE_JSON}" "${REPLAY_RESPONSE_JSON}.attempt-${attempt}"
+  assert_response_usage "replay attempt ${attempt}" "${REPLAY_RESPONSE_JSON}"
+  if ! check_replay_response; then
+    return "${SMOKE_OUTPUT_MISMATCH_STATUS}"
+  fi
   if [[ "${START_PROXY}" == "1" ]] && [[ -f "${PROXY_LOG}" ]]; then
     grep -q 'rewrote compaction items' "${PROXY_LOG}" || die "proxy log did not show compaction item replay rewrite"
   fi
@@ -462,8 +490,14 @@ main() {
 
   log "Replaying returned compaction item through /v1/responses"
   write_replay_request "${COMPACT_MODEL}"
-  post_json "/v1/responses" "${REPLAY_REQUEST_JSON}" "${REPLAY_RESPONSE_JSON}"
-  assert_replay_response
+  local rc=0
+  retry_output_mismatch "compaction replay" 2 run_replay_attempt || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    if [[ "${rc}" -eq "${SMOKE_OUTPUT_MISMATCH_STATUS}" ]]; then
+      die "compaction replay output mismatch after 2 successful attempts"
+    fi
+    exit "${rc}"
+  fi
 
   log "Live compaction smoke check passed."
   log "Artifacts: ${SMOKE_DIR}"

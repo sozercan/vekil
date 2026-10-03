@@ -18,6 +18,7 @@ require_cmd() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ORIGINAL_HOME="${HOME}"
+source "${SCRIPT_DIR}/live-smoke-retry.sh"
 
 PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
@@ -352,11 +353,43 @@ assert_exact_output() {
   local expected="$2"
   local actual="$3"
 
+  if ! check_exact_output "${client}" "${expected}" "${actual}"; then
+    die "${client} smoke output mismatch"
+  fi
+}
+
+check_exact_output() {
+  local client="$1"
+  local expected="$2"
+  local actual="$3"
+
   if [[ "${actual}" != "${expected}" ]]; then
     printf 'expected %s output: %s\n' "${client}" "${expected}" >&2
     printf 'actual %s output:   %s\n' "${client}" "${actual}" >&2
-    die "${client} smoke output mismatch"
+    return "${SMOKE_OUTPUT_MISMATCH_STATUS}"
   fi
+}
+
+fetch_usage_stats() {
+  local output="$1"
+  curl --fail --silent --show-error \
+    --connect-timeout "${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS}" \
+    --max-time "${SMOKE_CURL_MAX_TIME_SECONDS}" \
+    "${PROXY_BASE_URL}/stats.json" > "${output}" \
+    || die "GET ${PROXY_BASE_URL}/stats.json failed while validating smoke usage"
+  chmod 600 "${output}"
+}
+
+assert_usage_reported() {
+  local before="$1"
+  local after="$2"
+  jq -e --slurpfile before "${before}" '
+    (.task_usage.totals.reported_usage_sends // 0) as $after_usage
+    | ($before[0].task_usage.totals.reported_usage_sends // 0) as $before_usage
+    | ($after_usage | type == "number")
+    and ($before_usage | type == "number")
+    and $after_usage > $before_usage
+  ' "${after}" >/dev/null || die "Codex response did not report upstream usage"
 }
 
 read_normalized_output() {
@@ -529,10 +562,14 @@ fetch_models() {
   jq -e '.data | length > 0' "${MODELS_JSON}" >/dev/null || die "no models returned by ${PROXY_BASE_URL}/v1/models"
 }
 
-run_codex_smoke() {
+run_codex_attempt() {
   local case_dir="${SMOKE_DIR}/cases/codex"
   local home_dir="${SMOKE_DIR}/homes/codex-home"
   local output_file="${SMOKE_DIR}/outputs/codex.txt"
+  local attempt="${SMOKE_RETRY_ATTEMPT:-1}"
+  local attempt_output="${output_file}.attempt-${attempt}"
+  local before_stats="${SMOKE_DIR}/codex-attempt-${attempt}-before.stats.json"
+  local after_stats="${SMOKE_DIR}/codex-attempt-${attempt}-after.stats.json"
   local expected
   local actual
 
@@ -540,7 +577,11 @@ run_codex_smoke() {
   mkdir -p "${home_dir}/.codex"
   printf 'model = "%s"\nopenai_base_url = "%s"\n' "${CODEX_MODEL}" "${PROXY_BASE_URL}/v1" > "${home_dir}/.codex/config.toml"
 
-  log "Running Codex smoke with model ${CODEX_MODEL}"
+  if [[ "${SMOKE_PROVIDER}" == "copilot" ]]; then
+    fetch_usage_stats "${before_stats}"
+  fi
+
+  log "Running Codex smoke with model ${CODEX_MODEL} (attempt ${attempt})"
   run_with_deadline "${SMOKE_CLI_TIMEOUT_SECONDS}" "Codex CLI" \
     env \
       HOME="${home_dir}" \
@@ -552,13 +593,34 @@ run_codex_smoke() {
         --dangerously-bypass-approvals-and-sandbox \
         -m "${CODEX_MODEL}" \
         --color never \
-        -o "${output_file}" \
+        -o "${attempt_output}" \
         "${PROMPT}" \
     || die "Codex CLI failed or timed out"
 
-  actual="$(read_normalized_output "${output_file}")"
-  assert_exact_output "codex" "${expected}" "${actual}"
+  if [[ "${SMOKE_PROVIDER}" == "copilot" ]]; then
+    fetch_usage_stats "${after_stats}"
+    assert_usage_reported "${before_stats}" "${after_stats}"
+  fi
+
+  actual="$(read_normalized_output "${attempt_output}")"
+  if ! check_exact_output "codex" "${expected}" "${actual}"; then
+    return "${SMOKE_OUTPUT_MISMATCH_STATUS}"
+  fi
   printf '%s' "${actual}" > "${output_file}"
+}
+
+run_codex_smoke() {
+  local max_attempts=1
+  local rc=0
+  [[ "${SMOKE_PROVIDER}" == "copilot" ]] && max_attempts=2
+
+  retry_output_mismatch "Codex" "${max_attempts}" run_codex_attempt || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    if [[ "${rc}" -eq "${SMOKE_OUTPUT_MISMATCH_STATUS}" ]]; then
+      die "codex smoke output mismatch after ${max_attempts} successful attempts"
+    fi
+    exit "${rc}"
+  fi
 }
 
 run_claude_command() {

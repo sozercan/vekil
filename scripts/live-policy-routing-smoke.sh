@@ -70,6 +70,7 @@ require_env() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/live-smoke-retry.sh"
 
 PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 PUBLIC_MODEL="${LIVE_POLICY_ROUTING_PUBLIC_MODEL:-vekil-live-semantic}"
@@ -1456,6 +1457,8 @@ assert_success_text_response() {
     .model == $model
     and (.choices | type == "array" and length > 0)
     and (.choices[0].message.content | type == "string" and length > 0)
+    and ((.usage | type) == "object")
+    and ((.usage.total_tokens | type) == "number" and .usage.total_tokens >= 0)
   ' "${response}" >/dev/null || die "${label} did not return canonical model identity and visible text"
   assert_file_has_no_internal_identity "${label} response" "${response}"
 }
@@ -1507,15 +1510,17 @@ assert_classifier_completion() {
 # invalid and routes to the uncertain tier. Accept only that deviation, proven by
 # the shim-recorded classifier response: one emit_policy_signals call and extra
 # calls only to the tools the prompt names. Any other outcome still fails.
-assert_parallel_tools_classifier_outcome() {
+parallel_tools_classifier_outcome_matches() {
   local before="$1"
   local after="$2"
   local completion_before completion_after
   completion_before="$(profile_metric "${before}" '["totals","classifier","completion"]')"
   completion_after="$(profile_metric "${after}" '["totals","classifier","completion"]')"
   if [[ "$((completion_after - completion_before))" -eq 1 ]]; then
-    assert_classifier_completion "parallel tools" "${before}" "${after}"
-    return
+    [[ "$(( $(profile_metric "${after}" '["totals","classifier","unavailable"]') - $(profile_metric "${before}" '["totals","classifier","unavailable"]') ))" -eq 0 ]] || return 1
+    [[ "$(( $(profile_metric "${after}" '["totals","classifier","uncertain"]') - $(profile_metric "${before}" '["totals","classifier","uncertain"]') ))" -eq 0 ]] || return 1
+    [[ "$(( $(profile_metric "${after}" '["totals","classifier","abstain"]') - $(profile_metric "${before}" '["totals","classifier","abstain"]') ))" -eq 0 ]] || return 1
+    return 0
   fi
   jq -R -s -e '
     [split("\n")[] | fromjson? | select(.event == "request" and .request_kind == "classifier")]
@@ -1526,14 +1531,13 @@ assert_parallel_tools_classifier_outcome() {
           and ($calls | map(select(. != "emit_policy_signals"))) as $extra
           | ($extra | length) > 0
             and ($extra | all(. == "fetch_account" or . == "fetch_permissions")))
-  ' "${SHIM_LOG}" >/dev/null || \
-    die "parallel tools classifier completion delta=$((completion_after - completion_before)), want 1 (before=${completion_before}, after=${completion_after}), and the classifier response did not contain only the prompt's extra tool calls"
-  assert_delta "parallel tools classifier completion" "${completion_before}" "${completion_after}" 0
-  assert_delta "parallel tools classifier uncertain" "$(profile_metric "${before}" '["totals","classifier","uncertain"]')" "$(profile_metric "${after}" '["totals","classifier","uncertain"]')" 1
-  assert_delta "parallel tools classifier unavailable" "$(profile_metric "${before}" '["totals","classifier","unavailable"]')" "$(profile_metric "${after}" '["totals","classifier","unavailable"]')" 0
-  assert_delta "parallel tools classifier abstain" "$(profile_metric "${before}" '["totals","classifier","abstain"]')" "$(profile_metric "${after}" '["totals","classifier","abstain"]')" 0
-  assert_delta "parallel tools invalid classifier output" "$(profile_drop_reason "${before}" invalid_output)" "$(profile_drop_reason "${after}" invalid_output)" 1
-  assert_delta "parallel tools uncertain tier" "$(profile_metric "${before}" '["totals","actual_tiers","powerful"]')" "$(profile_metric "${after}" '["totals","actual_tiers","powerful"]')" 1
+  ' "${SHIM_LOG}" >/dev/null || return 1
+  [[ "$((completion_after - completion_before))" -eq 0 ]] || return 1
+  [[ "$(( $(profile_metric "${after}" '["totals","classifier","uncertain"]') - $(profile_metric "${before}" '["totals","classifier","uncertain"]') ))" -eq 1 ]] || return 1
+  [[ "$(( $(profile_metric "${after}" '["totals","classifier","unavailable"]') - $(profile_metric "${before}" '["totals","classifier","unavailable"]') ))" -eq 0 ]] || return 1
+  [[ "$(( $(profile_metric "${after}" '["totals","classifier","abstain"]') - $(profile_metric "${before}" '["totals","classifier","abstain"]') ))" -eq 0 ]] || return 1
+  [[ "$(( $(profile_drop_reason "${after}" invalid_output) - $(profile_drop_reason "${before}" invalid_output) ))" -eq 1 ]] || return 1
+  [[ "$(( $(profile_metric "${after}" '["totals","actual_tiers","powerful"]') - $(profile_metric "${before}" '["totals","actual_tiers","powerful"]') ))" -eq 1 ]] || return 1
   log "parallel tools classifier returned extra tool calls; Vekil rejected its output and used the uncertain tier"
 }
 
@@ -1840,8 +1844,8 @@ run_forced_tool_and_continuation() {
 }
 
 run_parallel_tools() {
-  local before after request response headers status_file status
-  before="$(fetch_stats before-parallel-tools)"
+  local before after request response headers status_file status attempt max_attempts=1
+  [[ "${LIVE_POLICY_ROUTING_RETRY_OUTPUT_MISMATCH:-0}" == "1" ]] && max_attempts=2
   request="${mode_dir}/parallel-tools.request.json"
   response="${mode_dir}/parallel-tools.response.json"
   headers="${mode_dir}/parallel-tools.headers.txt"
@@ -1859,20 +1863,39 @@ run_parallel_tools() {
       tool_choice:"required"
     }
   ' > "${request}"
-  status="$(post_chat parallel-tools "${request}" "${response}" "${headers}" "${status_file}")"
-  [[ "${status}" == "200" ]] || die "parallel tools status=${status}, want 200"
-  jq -e --arg model "${PUBLIC_MODEL}" '
-    .model == $model
-    and ([.choices[0].message.tool_calls[]?.function.name] | sort) == ["fetch_account","fetch_permissions"]
-    and ([.choices[0].message.tool_calls[]?.id] | length) == 2
-    and ([.choices[0].message.tool_calls[]?.id] | unique | length) == 2
-  ' "${response}" >/dev/null || die "parallel tool response did not return both distinct calls"
-  assert_public_headers parallel-tools "${headers}"
-  assert_file_has_no_internal_identity "parallel tools response" "${response}"
-  after="$(fetch_stats after-parallel-tools)"
-  assert_delta "parallel tools classifier sends" "$(profile_metric "${before}" '["totals","physical_classifier_sends"]')" "$(profile_metric "${after}" '["totals","physical_classifier_sends"]')" 1
-  assert_parallel_tools_classifier_outcome "${before}" "${after}"
-  assert_delta "parallel tools terminal sends" "$(stats_counter "${before}" upstream_attempts)" "$(stats_counter "${after}" upstream_attempts)" 1
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    before="$(fetch_stats "before-parallel-tools-${attempt}")"
+    status="$(post_chat parallel-tools "${request}" "${response}" "${headers}" "${status_file}")"
+    [[ "${status}" == "200" ]] || die "parallel tools status=${status}, want 200"
+    cp "${response}" "${response}.attempt-${attempt}"
+    # Forced-stream aggregation synthesizes zero usage when upstream omits it.
+    # A tool-producing smoke needs positive token usage, not just that object.
+    jq -e '(.usage | type) == "object" and (.usage.total_tokens | type) == "number" and .usage.total_tokens > 0' "${response}" >/dev/null || \
+      die "parallel tools response did not include positive usage"
+    # Proxy identity, usage, and classifier health must hold on every attempt,
+    # including responses whose model-generated tool calls will be retried.
+    assert_public_headers parallel-tools "${headers}"
+    assert_file_has_no_internal_identity "parallel tools response" "${response}"
+    jq -e --arg model "${PUBLIC_MODEL}" '.model == $model' "${response}" >/dev/null || \
+      die "parallel tools response exposed a non-canonical model"
+    after="$(fetch_stats "after-parallel-tools-${attempt}")"
+    assert_delta "parallel tools classifier sends" "$(profile_metric "${before}" '["totals","physical_classifier_sends"]')" "$(profile_metric "${after}" '["totals","physical_classifier_sends"]')" 1
+    parallel_tools_classifier_outcome_matches "${before}" "${after}" || \
+      die "parallel tools classifier outcome was neither completed nor the verified extra-tool-call deviation"
+    assert_delta "parallel tools terminal sends" "$(stats_counter "${before}" upstream_attempts)" "$(stats_counter "${after}" upstream_attempts)" 1
+    if ! jq -e '
+      ([.choices[0].message.tool_calls[]?.function.name] | sort) == ["fetch_account","fetch_permissions"]
+      and ([.choices[0].message.tool_calls[]?.id] | length) == 2
+      and ([.choices[0].message.tool_calls[]?.id] | unique | length) == 2
+    ' "${response}" >/dev/null; then
+      if (( attempt < max_attempts )); then
+        log "parallel tools output mismatch on attempt ${attempt}; retrying once"
+        continue
+      fi
+      die "parallel tools output mismatch after ${max_attempts} successful attempts"
+    fi
+    break
+  done
   printf 'PASS parallel-distinct-tools\n' >> "${SUMMARY_FILE}"
 }
 
