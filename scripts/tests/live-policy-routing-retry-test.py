@@ -62,6 +62,7 @@ class ParallelToolsRetryTest(unittest.TestCase):
             "body-leak": (False, 1),
             "wrong-model": (False, 1),
             "missing-usage": (False, 1),
+            "synthesized-zero-usage": (False, 1),
             "http-error": (False, 1),
             "classifier-unavailable": (False, 1),
             "classifier-uncertain": (False, 1),
@@ -87,6 +88,8 @@ class ParallelToolsRetryTest(unittest.TestCase):
                         response["model"] = "not-the-public-model"
                     if attempt == 1 and case == "missing-usage":
                         del response["usage"]
+                    if attempt == 1 and case == "synthesized-zero-usage":
+                        response["usage"] = {"total_tokens": 0}
                     (root / f"response-{attempt}.json").write_text(json.dumps(response))
                 result = subprocess.run(
                     ["bash", "-c", script, "retry-test", directory],

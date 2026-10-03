@@ -79,6 +79,7 @@ parser.add_argument("--replay-status", type=int, default=200)
 parser.add_argument("--replay-code", default="")
 parser.add_argument("--replay-output-sequence", default="")
 parser.add_argument("--omit-replay-usage", action="store_true")
+parser.add_argument("--malformed-first-replay", default="")
 args = parser.parse_args()
 
 MODEL = "deepseek-v4-flash-free"
@@ -195,6 +196,15 @@ class Handler(BaseHTTPRequestHandler):
             replay_text = REPLAY_OUTPUTS[min(replay_index, len(REPLAY_OUTPUTS) - 1)]
             replay_index += 1
             payload = {"output": [{"type": "message", "content": [{"type": "output_text", "text": replay_text}]}]}
+            if replay_index == 1:
+                if args.malformed_first_replay == "missing-output":
+                    payload = {}
+                elif args.malformed_first_replay == "non-array-output":
+                    payload["output"] = {}
+                elif args.malformed_first_replay == "missing-content":
+                    payload["output"] = [{"type": "message"}]
+                elif args.malformed_first_replay == "non-string-text":
+                    payload["output"][0]["content"][0]["text"] = None
             if not args.omit_replay_usage:
                 payload["usage"] = {"total_tokens": 2}
             self.send_json(200, payload)
@@ -262,6 +272,7 @@ start_mock_server() {
     --replay-status "${replay_status}"
   )
   [[ "${MOCK_OMIT_REPLAY_USAGE:-0}" != "1" ]] || args+=(--omit-replay-usage)
+  [[ -z "${MOCK_MALFORMED_FIRST_REPLAY:-}" ]] || args+=(--malformed-first-replay "${MOCK_MALFORMED_FIRST_REPLAY}")
   if [[ -n "${sequence}" ]]; then
     args+=(--canary-status-sequence "${sequence}")
   fi
@@ -1229,6 +1240,20 @@ expect_hard_failure_with_stderr "compact replay missing usage never retries" 8 '
 if [[ "$(curl --fail --silent "http://127.0.0.1:${MOCK_SERVER_PORT}/stats.json" | jq '.task_usage.totals.sends')" != 1 ]]; then
   record_failure "compact replay missing usage never retries" "expected exactly one replay request"
 fi
+
+# HTTP 200 with usage is not enough: malformed replay output is not a
+# model-text mismatch, even when the next response would be well formed.
+for replay_shape in missing-output non-array-output missing-content non-string-text; do
+  case_dir="${TMP_ROOT}/setup/compact-${replay_shape}"
+  MOCK_MALFORMED_FIRST_REPLAY="${replay_shape}" start_mock_server "${case_dir}/server" 200
+  expect_hard_failure_with_stderr "compact ${replay_shape} never retries" 8 'malformed text output' \
+    env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+      LIVE_COMPACT_SMOKE_DIR="${case_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+      SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+  if [[ "$(curl --fail --silent "http://127.0.0.1:${MOCK_SERVER_PORT}/stats.json" | jq '.task_usage.totals.sends')" != 1 ]]; then
+    record_failure "compact ${replay_shape} never retries" "expected exactly one replay request"
+  fi
+done
 
 mixed_raw_dir="${TMP_ROOT}/setup/mixed-log-raw-zen"
 write_healthy_proxy "${mixed_raw_dir}/healthy-proxy"

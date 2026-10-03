@@ -1868,8 +1868,10 @@ run_parallel_tools() {
     status="$(post_chat parallel-tools "${request}" "${response}" "${headers}" "${status_file}")"
     [[ "${status}" == "200" ]] || die "parallel tools status=${status}, want 200"
     cp "${response}" "${response}.attempt-${attempt}"
-    jq -e '(.usage | type) == "object" and (.usage.total_tokens | type) == "number" and .usage.total_tokens >= 0' "${response}" >/dev/null || \
-      die "parallel tools response did not include usage"
+    # Forced-stream aggregation synthesizes zero usage when upstream omits it.
+    # A tool-producing smoke needs positive token usage, not just that object.
+    jq -e '(.usage | type) == "object" and (.usage.total_tokens | type) == "number" and .usage.total_tokens > 0' "${response}" >/dev/null || \
+      die "parallel tools response did not include positive usage"
     # Proxy identity, usage, and classifier health must hold on every attempt,
     # including responses whose model-generated tool calls will be retried.
     assert_public_headers parallel-tools "${headers}"

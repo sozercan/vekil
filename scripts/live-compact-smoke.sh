@@ -432,7 +432,18 @@ responses_output_text() {
 
 check_replay_response() {
   local replay_text
-  replay_text="$(responses_output_text "${REPLAY_RESPONSE_JSON}")"
+  jq -e '
+    (.output | type) == "array"
+    and all(.output[]; type == "object")
+    and all(.output[] | select(.type == "message");
+      (.content | type) == "array"
+      and all(.content[];
+        type == "object" and (.type | type) == "string"
+        and (if .type == "output_text" or .type == "text" then (.text | type) == "string" else true end)))
+    and ([.output[] | select(.type == "message") | .content[]
+      | select(.type == "output_text" or .type == "text")] | length) > 0
+  ' "${REPLAY_RESPONSE_JSON}" >/dev/null || die "replay response has malformed text output"
+  replay_text="$(responses_output_text "${REPLAY_RESPONSE_JSON}")" || die "replay response text could not be decoded"
 
   if [[ "${replay_text}" != "${REPLAY_MARKER}" ]]; then
     printf 'expected replay response to equal %s after trimming whitespace\n' "${REPLAY_MARKER}" >&2
