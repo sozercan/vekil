@@ -388,7 +388,6 @@ assert_response_usage() {
 }
 
 assert_compact_response() {
-  assert_response_usage "compact" "${COMPACT_RESPONSE_JSON}"
   jq -e '
     ([.output[]? | select(.type == "compaction" and ((.encrypted_content // "") | length > 0))] | length > 0)
   ' "${COMPACT_RESPONSE_JSON}" >/dev/null || die "compact response did not contain a non-empty compaction item"

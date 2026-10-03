@@ -1845,7 +1845,6 @@ run_forced_tool_and_continuation() {
 
 run_parallel_tools() {
   local before after request response headers status_file status attempt max_attempts=1
-  local completion_before completion_after
   [[ "${LIVE_POLICY_ROUTING_RETRY_OUTPUT_MISMATCH:-0}" == "1" ]] && max_attempts=2
   request="${mode_dir}/parallel-tools.request.json"
   response="${mode_dir}/parallel-tools.response.json"
@@ -1871,9 +1870,19 @@ run_parallel_tools() {
     cp "${response}" "${response}.attempt-${attempt}"
     jq -e '(.usage | type) == "object" and (.usage.total_tokens | type) == "number" and .usage.total_tokens >= 0' "${response}" >/dev/null || \
       die "parallel tools response did not include usage"
-    if ! jq -e --arg model "${PUBLIC_MODEL}" '
-      .model == $model
-      and ([.choices[0].message.tool_calls[]?.function.name] | sort) == ["fetch_account","fetch_permissions"]
+    # Proxy identity, usage, and classifier health must hold on every attempt,
+    # including responses whose model-generated tool calls will be retried.
+    assert_public_headers parallel-tools "${headers}"
+    assert_file_has_no_internal_identity "parallel tools response" "${response}"
+    jq -e --arg model "${PUBLIC_MODEL}" '.model == $model' "${response}" >/dev/null || \
+      die "parallel tools response exposed a non-canonical model"
+    after="$(fetch_stats "after-parallel-tools-${attempt}")"
+    assert_delta "parallel tools classifier sends" "$(profile_metric "${before}" '["totals","physical_classifier_sends"]')" "$(profile_metric "${after}" '["totals","physical_classifier_sends"]')" 1
+    parallel_tools_classifier_outcome_matches "${before}" "${after}" || \
+      die "parallel tools classifier outcome was neither completed nor the verified extra-tool-call deviation"
+    assert_delta "parallel tools terminal sends" "$(stats_counter "${before}" upstream_attempts)" "$(stats_counter "${after}" upstream_attempts)" 1
+    if ! jq -e '
+      ([.choices[0].message.tool_calls[]?.function.name] | sort) == ["fetch_account","fetch_permissions"]
       and ([.choices[0].message.tool_calls[]?.id] | length) == 2
       and ([.choices[0].message.tool_calls[]?.id] | unique | length) == 2
     ' "${response}" >/dev/null; then
@@ -1883,20 +1892,6 @@ run_parallel_tools() {
       fi
       die "parallel tools output mismatch after ${max_attempts} successful attempts"
     fi
-    assert_public_headers parallel-tools "${headers}"
-    assert_file_has_no_internal_identity "parallel tools response" "${response}"
-    after="$(fetch_stats "after-parallel-tools-${attempt}")"
-    completion_before="$(profile_metric "${before}" '["totals","classifier","completion"]')"
-    completion_after="$(profile_metric "${after}" '["totals","classifier","completion"]')"
-    assert_delta "parallel tools classifier sends" "$(profile_metric "${before}" '["totals","physical_classifier_sends"]')" "$(profile_metric "${after}" '["totals","physical_classifier_sends"]')" 1
-    if ! parallel_tools_classifier_outcome_matches "${before}" "${after}"; then
-      if (( attempt < max_attempts )); then
-        log "parallel tools classifier output mismatch on attempt ${attempt} (completion before=${completion_before}, after=${completion_after}); retrying once"
-        continue
-      fi
-      die "parallel tools classifier output mismatch after ${max_attempts} successful attempts (completion before=${completion_before:-unknown}, after=${completion_after:-unknown})"
-    fi
-    assert_delta "parallel tools terminal sends" "$(stats_counter "${before}" upstream_attempts)" "$(stats_counter "${after}" upstream_attempts)" 1
     break
   done
   printf 'PASS parallel-distinct-tools\n' >> "${SUMMARY_FILE}"

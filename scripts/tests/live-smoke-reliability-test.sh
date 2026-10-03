@@ -78,6 +78,7 @@ parser.add_argument("--compact-code", default="")
 parser.add_argument("--replay-status", type=int, default=200)
 parser.add_argument("--replay-code", default="")
 parser.add_argument("--replay-output-sequence", default="")
+parser.add_argument("--omit-replay-usage", action="store_true")
 args = parser.parse_args()
 
 MODEL = "deepseek-v4-flash-free"
@@ -85,7 +86,8 @@ CANARY_STATUSES = [int(value) for value in args.canary_status_sequence.split(","
 canary_index = 0
 REPLAY_OUTPUTS = args.replay_output_sequence.split(",") if args.replay_output_sequence else ["VEKIL_COMPACTION_REPLAY_OK"]
 replay_index = 0
-stats_index = 0
+inference_sends = 0
+reported_usage_sends = 0
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -94,6 +96,11 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def send_json(self, status, payload):
+        global inference_sends, reported_usage_sends
+        if self.path in {"/v1/chat/completions", "/v1/responses"}:
+            inference_sends += 1
+            if status == 200 and isinstance(payload.get("usage", {}).get("total_tokens"), int):
+                reported_usage_sends += 1
         data = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("content-type", "application/json")
@@ -122,13 +129,11 @@ class Handler(BaseHTTPRequestHandler):
             ]})
             return
         if self.path == "/stats.json":
-            global stats_index
-            stats_index += 1
             self.send_json(200, {"task_usage": {"inflight": 0, "totals": {
-                "sends": stats_index,
-                "completed": stats_index,
+                "sends": inference_sends,
+                "completed": inference_sends,
                 "errors": 0,
-                "reported_usage_sends": stats_index,
+                "reported_usage_sends": reported_usage_sends,
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cached_tokens": 0, "reasoning_tokens": 0},
                 "copilot_usage": {"total_nano_aiu": 0, "compute_units": 0},
             }}})
@@ -175,7 +180,7 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 })
                 return
-            self.send_json(200, {"output": [{"type": "compaction", "encrypted_content": "opaque"}], "usage": {"total_tokens": 2}})
+            self.send_json(200, {"output": [{"type": "compaction", "encrypted_content": "opaque"}]})
             return
         if self.path == "/v1/responses":
             if args.replay_status != 200:
@@ -189,7 +194,10 @@ class Handler(BaseHTTPRequestHandler):
             global replay_index
             replay_text = REPLAY_OUTPUTS[min(replay_index, len(REPLAY_OUTPUTS) - 1)]
             replay_index += 1
-            self.send_json(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": replay_text}]}], "usage": {"total_tokens": 2}})
+            payload = {"output": [{"type": "message", "content": [{"type": "output_text", "text": replay_text}]}]}
+            if not args.omit_replay_usage:
+                payload["usage"] = {"total_tokens": 2}
+            self.send_json(200, payload)
             return
         self.send_json(404, {"error": {"message": "not found"}})
 
@@ -253,6 +261,7 @@ start_mock_server() {
     --compact-status "${compact_status}"
     --replay-status "${replay_status}"
   )
+  [[ "${MOCK_OMIT_REPLAY_USAGE:-0}" != "1" ]] || args+=(--omit-replay-usage)
   if [[ -n "${sequence}" ]]; then
     args+=(--canary-status-sequence "${sequence}")
   fi
@@ -453,10 +462,14 @@ while [[ "\$#" -gt 0 ]]; do
   esac
 done
 [[ -n "\${case_dir}" && -n "\${output_file}" ]]
+if [[ "\${mode}" != "no-inference" ]]; then
+  curl --fail --silent --show-error --max-time 2 -H 'Content-Type: application/json' \
+    -d '{"model":"mock","input":"fixture"}' "\${OPENAI_BASE_URL}/responses" >/dev/null
+fi
 expected="\$(printf '%s|%s' "\$(cat "\${case_dir}/left.txt")" "\$(cat "\${case_dir}/right.txt")")"
 left="\${expected%%|*}"
 case "\${mode}" in
-  pass)
+  pass|no-inference)
     output="\${expected}"
     ;;
   fail-first-model)
@@ -506,6 +519,8 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 [[ -n "${case_dir}" && -n "${output_file}" ]]
+curl --fail --silent --show-error --max-time 2 -H 'Content-Type: application/json' \
+  -d '{"model":"mock","input":"fixture"}' "${OPENAI_BASE_URL}/responses" >/dev/null
 printf '%s|%s\n' "$(cat "${case_dir}/left.txt")" "$(cat "${case_dir}/right.txt")" > "${output_file}"
 EOF_CODEX
 
@@ -808,6 +823,7 @@ run_zen_classification_case() {
 }
 
 log "Running deterministic smoke reliability regressions"
+python3 "${SCRIPT_DIR}/live-policy-routing-retry-test.py"
 
 zen_parser_dir="${TMP_ROOT}/setup/zen-free-label-parser"
 mkdir -p "${zen_parser_dir}"
@@ -1202,6 +1218,18 @@ expect_hard_failure_with_stderr "compact output mismatch reports both attempts" 
     LIVE_COMPACT_SMOKE_DIR="${compact_output_failure_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
 
+# A successful compact response has no public usage field. Replay does, and
+# missing replay usage must fail before considering a second model-output try.
+compact_missing_usage_dir="${TMP_ROOT}/setup/compact-missing-usage"
+MOCK_OMIT_REPLAY_USAGE=1 start_mock_server "${compact_missing_usage_dir}/server" 200 "" "" 0 0 200 "" 200 "" "wrong,VEKIL_COMPACTION_REPLAY_OK"
+expect_hard_failure_with_stderr "compact replay missing usage never retries" 8 'response did not include usage' \
+  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
+    LIVE_COMPACT_SMOKE_DIR="${compact_missing_usage_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
+if [[ "$(curl --fail --silent "http://127.0.0.1:${MOCK_SERVER_PORT}/stats.json" | jq '.task_usage.totals.sends')" != 1 ]]; then
+  record_failure "compact replay missing usage never retries" "expected exactly one replay request"
+fi
+
 mixed_raw_dir="${TMP_ROOT}/setup/mixed-log-raw-zen"
 write_healthy_proxy "${mixed_raw_dir}/healthy-proxy"
 if expect_success "raw Zen listener tolerates mixed JSON and plain-text logs" 10 \
@@ -1435,6 +1463,39 @@ expect_hard_failure_with_stderr "Copilot Codex output mismatch stops after one r
     PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" LIVE_CLI_SMOKE_DIR="${codex_output_failure_dir}/smoke" \
     SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 \
     SMOKE_CLI_TIMEOUT_SECONDS=2 "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+
+# Usage reads cannot manufacture evidence. Missing usage, no inference, and
+# HTTP failure all remain hard failures, even when a later output could match.
+for failure_mode in missing-usage no-inference http-error; do
+  case_dir="${TMP_ROOT}/setup/copilot-codex-${failure_mode}"
+  expected_sends=1
+  codex_mode=fail-first-model
+  expected_error='did not report upstream usage'
+  case "${failure_mode}" in
+    missing-usage)
+      MOCK_OMIT_REPLAY_USAGE=1 start_mock_server "${case_dir}/server" 200
+      ;;
+    no-inference)
+      start_mock_server "${case_dir}/server" 200
+      codex_mode=no-inference
+      expected_sends=0
+      ;;
+    http-error)
+      start_mock_server "${case_dir}/server" 200 "" "" 0 0 200 "" 500
+      expected_error='Codex CLI failed or timed out'
+      ;;
+  esac
+  write_fake_clients "${case_dir}/bin" pass pass pass "${codex_mode}"
+  expect_hard_failure_with_stderr "Copilot Codex ${failure_mode} never retries" 8 "${expected_error}" \
+    env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=copilot START_PROXY=0 \
+      PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" \
+      SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 \
+      SMOKE_CLI_TIMEOUT_SECONDS=2 "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+  sends="$(curl --fail --silent "http://127.0.0.1:${MOCK_SERVER_PORT}/stats.json" | jq '.task_usage.totals.sends')"
+  if [[ "${sends}" != "${expected_sends}" ]]; then
+    record_failure "Copilot Codex ${failure_mode} request count" "sends=${sends}, want ${expected_sends}"
+  fi
+done
 
 # A listener that accepts TCP but never answers HTTP must hit the script's own
 # bounded startup deadline, not the outer test watchdog.
