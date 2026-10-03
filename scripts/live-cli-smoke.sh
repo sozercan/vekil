@@ -611,7 +611,7 @@ run_codex_attempt() {
 
 run_codex_smoke() {
   local max_attempts=1
-  local rc
+  local rc=0
   [[ "${SMOKE_PROVIDER}" == "copilot" ]] && max_attempts=2
 
   retry_output_mismatch "Codex" "${max_attempts}" run_codex_attempt || rc=$?

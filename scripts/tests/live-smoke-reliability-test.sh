@@ -297,11 +297,15 @@ write_fake_clients() {
   local copilot_mode="$2"
   local claude_mode="$3"
   local gemini_mode="$4"
+  local codex_mode="${5:-}"
   mkdir -p "${bin_dir}"
 
   write_fake_client "${bin_dir}/copilot" "${copilot_mode}"
   write_fake_client "${bin_dir}/claude" "${claude_mode}"
   write_fake_client "${bin_dir}/gemini" "${gemini_mode}"
+  if [[ -n "${codex_mode}" ]]; then
+    write_fake_codex_client "${bin_dir}/codex" "${codex_mode}"
+  fi
 }
 
 write_fake_client() {
@@ -419,6 +423,61 @@ PY_WRAPPED_OUTPUT
     ;;
 esac
 EOF_CLIENT
+  chmod +x "${path}"
+}
+
+write_fake_codex_client() {
+  local path="$1"
+  local mode="$2"
+  local mode_q
+  printf -v mode_q %q "${mode}"
+  cat > "${path}" <<EOF_CODEX
+#!/usr/bin/env bash
+set -euo pipefail
+mode=${mode_q}
+case_dir=""
+output_file=""
+while [[ "\$#" -gt 0 ]]; do
+  case "\$1" in
+    --cd)
+      case_dir="\$2"
+      shift 2
+      ;;
+    -o)
+      output_file="\$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+[[ -n "\${case_dir}" && -n "\${output_file}" ]]
+expected="\$(printf '%s|%s' "\$(cat "\${case_dir}/left.txt")" "\$(cat "\${case_dir}/right.txt")")"
+left="\${expected%%|*}"
+case "\${mode}" in
+  pass)
+    output="\${expected}"
+    ;;
+  fail-first-model)
+    state_file="\$(dirname "\$0")/.\$(basename "\$0").first-model-seen"
+    if [[ ! -e "\${state_file}" ]]; then
+      : > "\${state_file}"
+      output="\${left}"
+    else
+      output="\${expected}"
+    fi
+    ;;
+  always-wrong)
+    output="\${left}"
+    ;;
+  *)
+    printf 'unknown fake Codex mode: %s\n' "\${mode}" >&2
+    exit 99
+    ;;
+esac
+printf '%s\n' "\${output}" > "\${output_file}"
+EOF_CODEX
   chmod +x "${path}"
 }
 
@@ -1360,7 +1419,7 @@ run_zen_case_expect_failure "one client pass cannot mask another failure" 200 pa
 
 codex_output_retry_dir="${TMP_ROOT}/setup/copilot-codex-output-retry"
 start_mock_server "${codex_output_retry_dir}/server" 200
-write_fake_clients "${codex_output_retry_dir}/bin" fail-first-model pass pass
+write_fake_clients "${codex_output_retry_dir}/bin" fail-first-model pass pass fail-first-model
 expect_success "Copilot Codex output mismatch retries once after usage" 8 \
   env PATH="${codex_output_retry_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=copilot START_PROXY=0 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" LIVE_CLI_SMOKE_DIR="${codex_output_retry_dir}/smoke" \
@@ -1369,7 +1428,7 @@ expect_success "Copilot Codex output mismatch retries once after usage" 8 \
 
 codex_output_failure_dir="${TMP_ROOT}/setup/copilot-codex-output-failure"
 start_mock_server "${codex_output_failure_dir}/server" 200
-write_fake_clients "${codex_output_failure_dir}/bin" always-wrong pass pass
+write_fake_clients "${codex_output_failure_dir}/bin" always-wrong pass pass always-wrong
 expect_hard_failure_with_stderr "Copilot Codex output mismatch stops after one retry" 8 \
   'after 2 successful attempts' \
   env PATH="${codex_output_failure_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=copilot START_PROXY=0 \
