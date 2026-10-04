@@ -67,7 +67,7 @@ These overrides only affect Copilot-backed upstream requests. For provider-level
 | `--copilot-editor-version` | `COPILOT_EDITOR_VERSION` | `vscode/1.95.0` | Upstream `editor-version` header |
 | `--copilot-plugin-version` | `COPILOT_PLUGIN_VERSION` | `copilot-chat/0.26.7` | Upstream `editor-plugin-version` header |
 | `--copilot-user-agent` | `COPILOT_USER_AGENT` | `GitHubCopilotChat/0.26.7` | Upstream `user-agent` header |
-| `--copilot-integration-id` | `COPILOT_INTEGRATION_ID` | credential-aware | Upstream `copilot-integration-id` header; direct `gho_` OAuth and `github_pat_` credentials use `copilot-developer-cli`; direct `ghu_` catalog/Chat requests use `copilot-language-server`; exchanged/legacy tokens use `vscode-chat` |
+| `--copilot-integration-id` | `COPILOT_INTEGRATION_ID` | credential-aware | Upstream `copilot-integration-id` header; direct `gho_` OAuth, `github_pat_`, and `ghs_` Actions credentials use `copilot-developer-cli`; direct `ghu_` catalog/Chat requests use `copilot-language-server`; exchanged/legacy tokens use `vscode-chat` |
 | `--copilot-github-api-version` | `COPILOT_GITHUB_API_VERSION` | `2026-08-20` | Upstream `x-github-api-version` header |
 | `--copilot-openai-intent` | `COPILOT_OPENAI_INTENT` | unset (`conversation-panel` for chat/responses) | Upstream `openai-intent` header |
 
