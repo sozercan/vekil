@@ -372,6 +372,9 @@ func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Resp
 	// Responses passthrough and WebSockets already observe failures in their
 	// prepared stream. The typed Chat adapter needs observation at body reads.
 	responsesChat, _ := req.Context().Value(responsesChatStreamContextKey{}).(bool)
+	if !responsesChat {
+		normalizeCopilotResponsesItemIDs(resp, metadata.endpoint)
+	}
 	observeStream := (metadata.endpoint != providerEndpointResponses || responsesChat) && resp.StatusCode == http.StatusOK &&
 		strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
 	if observeStream && metadata.endpoint != providerEndpointResponses {
