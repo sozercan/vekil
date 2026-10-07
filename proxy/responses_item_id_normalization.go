@@ -28,6 +28,8 @@ func normalizeCopilotResponsesItemIDs(resp *http.Response, endpoint string) {
 		reader:     bufio.NewReaderSize(resp.Body, openAIStreamScannerInitialBuffer),
 		normalizer: responsesItemIDNormalizer{byOutputIndex: make(map[int]string)},
 	}
+	resp.Header.Del("Content-Length")
+	resp.ContentLength = -1
 }
 
 type responsesItemIDBody struct {
@@ -69,6 +71,21 @@ func (b *responsesItemIDBody) Close() error {
 		b.closeErr = b.source.Close()
 	})
 	return b.closeErr
+}
+
+func (b *responsesItemIDBody) routeAttemptTransportOwnership() *routeAttemptTransportOwner {
+	return routeAttemptTransportOwnership(b.source)
+}
+
+func (b *responsesItemIDBody) cancelRouteAttempt() {
+	cancelRouteAttemptBody(b.source)
+}
+
+func (b *responsesItemIDBody) canceledAtFailure() bool {
+	if observed, ok := b.source.(interface{ canceledAtFailure() bool }); ok {
+		return observed.canceledAtFailure()
+	}
+	return false
 }
 
 func (b *responsesItemIDBody) readNext() ([]byte, error) {
@@ -183,6 +200,10 @@ func rewriteResponsesItemIDSSEEvent(raw []byte, normalizer *responsesItemIDNorma
 }
 
 func (n *responsesItemIDNormalizer) rewrite(data []byte, eventName string) ([]byte, bool) {
+	// Preserve ambiguous bytes for the downstream durable state validator.
+	if validateUnambiguousResponsesJSON(data) != nil {
+		return data, false
+	}
 	var event map[string]json.RawMessage
 	if json.Unmarshal(data, &event) != nil || event == nil {
 		return data, false

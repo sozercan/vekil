@@ -73,6 +73,72 @@ func TestNormalizeCopilotResponsesItemIDsReasoningAndFunctionCall(t *testing.T) 
 	assertResponsesItemIDTestOutput(t, events[10], []string{"stable-reasoning", "stable-call"})
 }
 
+func TestNormalizeCopilotResponsesItemIDsPreservesRouteAttemptOwnership(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	owner := &routeAttemptTransportOwner{cancel: cancel}
+	resp := responsesItemIDTestResponse("")
+	resp.Body = &routeAttemptTransportBody{inner: resp.Body, owner: owner}
+	normalizeCopilotResponsesItemIDs(resp, providerEndpointResponses)
+	defer func() { _ = resp.Body.Close() }()
+
+	if got := routeAttemptTransportOwnership(resp.Body); got != owner {
+		t.Fatalf("routeAttemptTransportOwnership() = %p, want %p", got, owner)
+	}
+	if !cancelRouteAttemptBody(resp.Body) {
+		t.Fatal("cancelRouteAttemptBody() = false, want true")
+	}
+	if ctx.Err() != context.Canceled {
+		t.Fatalf("request context error = %v, want context.Canceled", ctx.Err())
+	}
+}
+
+func TestNormalizeCopilotResponsesItemIDsPreservesDuplicateKeys(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		event string
+	}{
+		{"event", `{"type":"response.output_text.delta","output_index":0,"item_id":"rotating","delta":"first","delta":"second"}`},
+		{"item", `{"type":"response.output_item.done","output_index":0,"item":{"id":"rotating","type":"reasoning","encrypted_content":"first","encrypted_content":"second"}}`},
+		{"response", `{"type":"response.completed","response":{"id":"first","id":"second","output":[{"id":"rotating","type":"reasoning"}]}}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stream := responsesItemIDTestStream(
+				`{"type":"response.output_item.added","output_index":0,"item":{"id":"stable","type":"reasoning"}}`,
+				tt.event,
+			)
+			resp := responsesItemIDTestResponse(stream)
+			normalizeCopilotResponsesItemIDs(resp, providerEndpointResponses)
+			defer func() { _ = resp.Body.Close() }()
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("ReadAll() error = %v", err)
+			}
+			if string(got) != stream {
+				t.Fatalf("ambiguous stream changed: got %q, want %q", got, stream)
+			}
+			if _, err := extractDurableResponsesOutputState([]byte(tt.event)); err == nil {
+				t.Fatal("durable state validator accepted duplicate keys")
+			}
+		})
+	}
+}
+
+func TestNormalizeCopilotResponsesItemIDsClearsContentLength(t *testing.T) {
+	resp := responsesItemIDTestResponse("data: [DONE]\n\n")
+	resp.Header.Set("Content-Length", "14")
+	resp.ContentLength = 14
+	normalizeCopilotResponsesItemIDs(resp, providerEndpointResponses)
+	defer func() { _ = resp.Body.Close() }()
+
+	if got := resp.Header.Get("Content-Length"); got != "" {
+		t.Fatalf("Content-Length header = %q, want empty", got)
+	}
+	if resp.ContentLength != -1 {
+		t.Fatalf("ContentLength = %d, want -1", resp.ContentLength)
+	}
+}
+
 func TestNormalizeCopilotResponsesItemIDsIsResponsesOnly(t *testing.T) {
 	const stream = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"first\"}}\n\n" +
 		"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"second\"}}\n\n"
