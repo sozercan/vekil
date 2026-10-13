@@ -14,6 +14,12 @@ retain `type: invalid_request_error`; WebSocket error frames carry the same code
 and `status_code: 400`. The compact and memory shims also report it when their
 state validation encounters a missing binding.
 
+Replayed reasoning alone does not produce this code. When reasoning items are
+the only state with no binding, Vekil removes them, forwards the rest, logs
+`dropped unbound reasoning`, and counts the request in
+`state_binding_reasoning_drops` on `/stats.json`. The model loses that earlier
+hidden reasoning; visible messages and tool history are unchanged.
+
 The code does not identify why proof is missing. A binding may never have been
 observed here, or may have been lost through expiry, eviction, restart, or sending
 the request to another process when using `mode: memory`.

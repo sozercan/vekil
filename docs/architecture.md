@@ -110,7 +110,7 @@ Only a definitely-not-delivered or adapter-certified explicit rejection, with pr
 
 Provider-issued continuation state is an exact ownership constraint, not a routing hint. Adapter-marked values such as `previous_response_id`, trusted `X-Codex-Turn-State`, non-proxy opaque `encrypted_content`, and other opaque reasoning/session artifacts are bound to `{route_id, target_id}` immediately before exposure.
 
-All state inputs on a request must resolve together to the same route and target. Known state pins the exact target and disables failover. Conflicting, malformed, cross-route, mixed known/unknown, or unknown state on an explicit route fails locally without an upstream call. If the same token is ever observed with different owners, the store records a conflict tombstone and continues to fail it closed rather than choosing one owner. An unavailable bound target also fails closed; Vekil does not guess another owner or migrate provider state.
+All state inputs on a request must resolve together to the same route and target. Known state pins the exact target and disables failover. Conflicting, malformed, cross-route, mixed known/unknown, or unknown state on an explicit route fails locally without an upstream call. When the only unknown state is replayed reasoning, Vekil removes those reasoning items instead and binds the rest. If the same token is ever observed with different owners, the store records a conflict tombstone and continues to fail it closed rather than choosing one owner. An unavailable bound target also fails closed; Vekil does not guess another owner or migrate provider state.
 
 Bindings use keyed digests. Schema-v2 explicit routes use durable storage by
 default, with an 8,388,608-record logical capacity and no full-capacity

@@ -370,7 +370,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			}
 			prepared.body = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(upstreamCtx, body, prepared.model, "responses", true, h.toolContexts, scope)
 		}
-		if err := h.applyExplicitRequestStateBinding(routeOperation, prepared.stateBindingBody, prepared.extraHeaders); err != nil {
+		if _, err := h.bindExplicitRequestState(routeOperation, &prepared.stateBindingBody, prepared.extraHeaders, &prepared.body); err != nil {
 			h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses_state_binding", err)
 			return
 		}
@@ -805,15 +805,18 @@ func (h *ProxyHandler) HandleCompact(w http.ResponseWriter, r *http.Request) {
 		}
 		if rewritten {
 			stateBindingBody, extraHeaders = ownedBody, ownedHeaders
+		}
+		dropped, err := h.bindExplicitRequestState(routeOperation, &stateBindingBody, extraHeaders)
+		if err != nil {
+			writeStateFailure(err)
+			return
+		}
+		if rewritten || dropped > 0 {
 			body = nil
 			if err := json.Unmarshal(h.rewriteResponsesRequestBody(stateBindingBody, "responses/compact", false), &body); err != nil {
 				writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 				return
 			}
-		}
-		if err := h.applyExplicitRequestStateBinding(routeOperation, stateBindingBody, extraHeaders); err != nil {
-			writeStateFailure(err)
-			return
 		}
 	}
 

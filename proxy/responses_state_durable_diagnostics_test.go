@@ -108,7 +108,9 @@ func TestDurableResponsesStateDiagnostics(t *testing.T) {
 				h, primary, secondary := newDurableDiagnosticHandler(t)
 				input := make([]any, 0, len(tc.tokens))
 				for _, token := range tc.tokens {
-					input = append(input, map[string]any{"type": "reasoning", "encrypted_content": token})
+					// Unbound reasoning alone is dropped, so a compaction item carries
+					// the unknown state these diagnostics need.
+					input = append(input, map[string]any{"type": "context_compaction", "encrypted_content": token})
 				}
 				var raw []byte
 				if surface == "websocket" {
@@ -162,7 +164,7 @@ func TestDurableResponsesStateDiagnosticsHeadersAndStorage(t *testing.T) {
 					defer func() { _ = conn.Close() }()
 					// Unknown websocket response IDs are rejected by connection
 					// replay validation before the provider-state store is reached.
-					request := newResponsesWebSocketCreateRequest([]any{map[string]any{"type": "reasoning", "encrypted_content": "opaque-missing"}})
+					request := newResponsesWebSocketCreateRequest([]any{map[string]any{"type": "context_compaction", "encrypted_content": "opaque-missing"}})
 					request["model"] = "public-ws-model"
 					if err := conn.WriteJSON(request); err != nil {
 						t.Fatal(err)
@@ -252,7 +254,7 @@ func TestDurableResponsesStateDiagnosticsPinnedWebSocket(t *testing.T) {
 				if reverse {
 					tokens[0], tokens[1] = tokens[1], tokens[0]
 				}
-				input := []any{map[string]any{"type": "reasoning", "encrypted_content": tokens[0]}, map[string]any{"type": "reasoning", "encrypted_content": tokens[1]}}
+				input := []any{map[string]any{"type": "context_compaction", "encrypted_content": tokens[0]}, map[string]any{"type": "context_compaction", "encrypted_content": tokens[1]}}
 				second := newResponsesWebSocketCreateRequest(input)
 				second["model"] = "public-ws-model"
 				if err := conn.WriteJSON(second); err != nil {

@@ -24,8 +24,9 @@ func TestExplicitResponsesStateLossRejectsContinuationBeforeDispatch(t *testing.
 		body      string
 		turnState bool
 	}{
+		// Reasoning alone is dropped after state loss; see
+		// TestExplicitResponsesUnboundReasoningIsDropped.
 		{"previous_response_id", `{"model":"public-model","previous_response_id":"resp-recovery-fixture","input":"continue"}`, false},
-		{"reasoning", `{"model":"public-model","store":false,"input":[{"type":"reasoning","encrypted_content":"reasoning-recovery-fixture","summary":[]},{"role":"user","content":"continue"}]}`, false},
 		{"compaction", `{"model":"public-model","input":[{"type":"compaction","encrypted_content":"compaction-recovery-fixture"},{"role":"user","content":"continue"}]}`, false},
 		{"context_compaction", `{"model":"public-model","input":[{"type":"context_compaction","encrypted_content":"context-recovery-fixture"},{"role":"user","content":"continue"}]}`, false},
 		{"turn_state", `{"model":"public-model","input":"continue"}`, true},

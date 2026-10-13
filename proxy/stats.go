@@ -202,6 +202,9 @@ type statsSnapshot struct {
 	StateBindingHits      int64 `json:"state_binding_hits"`
 	StateBindingMisses    int64 `json:"state_binding_misses"`
 	StateBindingEvictions int64 `json:"state_binding_evictions"`
+	// StateBindingReasoningDrops counts requests forwarded without replayed
+	// reasoning that had no ownership record.
+	StateBindingReasoningDrops int64 `json:"state_binding_reasoning_drops"`
 	// Storage gauges include recovered records and do not reset with traffic.
 	StateBindings stateBindingStatsSnapshot `json:"state_bindings"`
 	// Retries is the total upstream retry attempts and the breakdown by the
@@ -270,16 +273,17 @@ type statsCollector struct {
 	byRoute     map[string]*breakdownCounter
 	byTarget    map[string]*targetAttemptCounter
 
-	upstreamAttempts      int64
-	targetSwitches        int64
-	requestsWithFailover  int64
-	successfulFailovers   int64
-	routeExhaustions      int64
-	stateBindingHits      int64
-	stateBindingMisses    int64
-	stateBindingEvictions int64
-	physicalUsage         statsTokenUsage
-	wastedUsage           statsTokenUsage
+	upstreamAttempts           int64
+	targetSwitches             int64
+	requestsWithFailover       int64
+	successfulFailovers        int64
+	routeExhaustions           int64
+	stateBindingHits           int64
+	stateBindingMisses         int64
+	stateBindingEvictions      int64
+	stateBindingReasoningDrops int64
+	physicalUsage              statsTokenUsage
+	wastedUsage                statsTokenUsage
 
 	// retries counts upstream retry attempts the proxy made (transient 429/503,
 	// transport errors). These are usually invisible to clients because the
@@ -764,6 +768,14 @@ func (h *ProxyHandler) RecordStateBindingEviction() {
 	}
 }
 
+// RecordStateBindingReasoningDrop records one request forwarded without its
+// unbound replayed reasoning.
+func (h *ProxyHandler) RecordStateBindingReasoningDrop() {
+	if h != nil && h.stats != nil {
+		h.stats.recordStateBindingEvent(stateBindingReasoningDrop)
+	}
+}
+
 func (c *statsCollector) recordUpstreamAttempt(routeID, targetID, providerID, providerKind string) {
 	if c == nil {
 		return
@@ -840,6 +852,7 @@ const (
 	stateBindingHit stateBindingStatsEvent = iota + 1
 	stateBindingMiss
 	stateBindingEviction
+	stateBindingReasoningDrop
 )
 
 func (c *statsCollector) recordStateBindingEvent(event stateBindingStatsEvent) {
@@ -855,6 +868,8 @@ func (c *statsCollector) recordStateBindingEvent(event stateBindingStatsEvent) {
 		c.stateBindingMisses++
 	case stateBindingEviction:
 		c.stateBindingEvictions++
+	case stateBindingReasoningDrop:
+		c.stateBindingReasoningDrops++
 	}
 }
 
@@ -1145,33 +1160,34 @@ func (c *statsCollector) snapshot() statsSnapshot {
 	totals.LatencyP50, totals.LatencyP95, totals.LatencyP99 = c.latencyPercentiles()
 
 	return statsSnapshot{
-		TaskUsage:             c.taskUsage.snapshot(),
-		UptimeSeconds:         int64(now.Sub(c.start).Seconds()),
-		Inflight:              c.inflight.Load(),
-		Totals:                totals,
-		Status:                status,
-		StatusCodes:           topStatusCodes(c.statusCodes),
-		Errors:                topErrorTargets(c.errTargets),
-		Series:                series,
-		ByModel:               topBreakdowns(c.byModel, breakdownKindModel),
-		ByProvider:            topBreakdowns(c.byProvider, breakdownKindProvider),
-		ByAgent:               topBreakdowns(c.byAgent, breakdownKindAgent),
-		ByRoute:               topBreakdowns(c.byRoute, breakdownKindRoute),
-		ByTarget:              topTargetBreakdowns(c.byTarget),
-		PhysicalUsage:         c.physicalUsage,
-		WastedUsage:           c.wastedUsage,
-		UpstreamAttempts:      c.upstreamAttempts,
-		TargetSwitches:        c.targetSwitches,
-		RequestsWithFailover:  c.requestsWithFailover,
-		SuccessfulFailovers:   c.successfulFailovers,
-		RouteExhaustions:      c.routeExhaustions,
-		StateBindingHits:      c.stateBindingHits,
-		StateBindingMisses:    c.stateBindingMisses,
-		StateBindingEvictions: c.stateBindingEvictions,
-		Retries:               c.retries,
-		RetriesByCode:         retriesRows(c.retriesByCode),
-		Recent:                c.recentSnapshot(),
-		RecentAttempts:        c.recentAttemptsSnapshot(),
+		TaskUsage:                  c.taskUsage.snapshot(),
+		UptimeSeconds:              int64(now.Sub(c.start).Seconds()),
+		Inflight:                   c.inflight.Load(),
+		Totals:                     totals,
+		Status:                     status,
+		StatusCodes:                topStatusCodes(c.statusCodes),
+		Errors:                     topErrorTargets(c.errTargets),
+		Series:                     series,
+		ByModel:                    topBreakdowns(c.byModel, breakdownKindModel),
+		ByProvider:                 topBreakdowns(c.byProvider, breakdownKindProvider),
+		ByAgent:                    topBreakdowns(c.byAgent, breakdownKindAgent),
+		ByRoute:                    topBreakdowns(c.byRoute, breakdownKindRoute),
+		ByTarget:                   topTargetBreakdowns(c.byTarget),
+		PhysicalUsage:              c.physicalUsage,
+		WastedUsage:                c.wastedUsage,
+		UpstreamAttempts:           c.upstreamAttempts,
+		TargetSwitches:             c.targetSwitches,
+		RequestsWithFailover:       c.requestsWithFailover,
+		SuccessfulFailovers:        c.successfulFailovers,
+		RouteExhaustions:           c.routeExhaustions,
+		StateBindingHits:           c.stateBindingHits,
+		StateBindingMisses:         c.stateBindingMisses,
+		StateBindingEvictions:      c.stateBindingEvictions,
+		StateBindingReasoningDrops: c.stateBindingReasoningDrops,
+		Retries:                    c.retries,
+		RetriesByCode:              retriesRows(c.retriesByCode),
+		Recent:                     c.recentSnapshot(),
+		RecentAttempts:             c.recentAttemptsSnapshot(),
 	}
 }
 

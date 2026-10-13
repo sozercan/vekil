@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/sozercan/vekil/logger"
 )
 
 const stateBindingTypeConversationID stateBindingType = "conversation_id"
@@ -109,6 +111,122 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 		h.RecordStateBindingMiss()
 		return &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("conflicting provider-bound state for explicit model route")}
 	}
+}
+
+// bindExplicitRequestState applies exact state binding to body. When the only
+// unbound state is replayed reasoning, it removes those reasoning items from
+// body and from each forwarded body and binds the remainder. Reasoning is
+// optional model context, and a target cannot decrypt reasoning that another
+// issuer minted: a restored session, another Vekil, or a pruned store. Every
+// other unknown, conflicting or malformed state still fails closed. It returns
+// how many distinct reasoning values it removed.
+func (h *ProxyHandler) bindExplicitRequestState(operation *routeOperation, body *[]byte, headers http.Header, forwarded ...*[]byte) (int, error) {
+	err := h.applyExplicitRequestStateBinding(operation, *body, headers)
+	if providerRequestErrorCode(err) != "provider_state_unavailable" {
+		return 0, err
+	}
+	drop := h.unboundReasoning(*body, headers)
+	if len(drop) == 0 {
+		return 0, err
+	}
+	filtered, ok := withoutReasoning(*body, drop)
+	if !ok {
+		return 0, err
+	}
+	rewritten := make([][]byte, len(forwarded))
+	for i, target := range forwarded {
+		if rewritten[i], ok = withoutReasoning(*target, drop); !ok {
+			return 0, err
+		}
+	}
+	if err := h.applyExplicitRequestStateBinding(operation, filtered, headers); err != nil {
+		return 0, err
+	}
+	*body = filtered
+	for i, target := range forwarded {
+		*target = rewritten[i]
+	}
+	h.log.Info("dropped unbound reasoning",
+		logger.F("route", operation.route.public.routeID),
+		logger.F("request_id", operation.operationID()),
+		logger.F("items", len(drop)),
+	)
+	h.RecordStateBindingReasoningDrop()
+	return len(drop), nil
+}
+
+// unboundReasoning returns the encrypted content of replayed reasoning items
+// that has no ownership record, but only when every unbound state value in the
+// request is such reasoning.
+func (h *ProxyHandler) unboundReasoning(body []byte, headers http.Header) map[string]struct{} {
+	store, err := h.ensureStateBindingStore()
+	if err != nil {
+		return nil
+	}
+	tokens, err := extractResponsesRequestState(body, headers, store.durable != nil)
+	if err != nil {
+		return nil
+	}
+	reasoning := replayedReasoningContent(body)
+	drop := make(map[string]struct{})
+	for _, token := range tokens {
+		result := store.lookup(token.stateType, token.value)
+		if result.err != nil {
+			return nil
+		}
+		if result.outcome != stateBindingLookupUnknown {
+			continue
+		}
+		if _, ok := reasoning[token.value]; !ok || token.stateType != stateBindingTypeEncryptedContent {
+			return nil
+		}
+		drop[token.value] = struct{}{}
+	}
+	return drop
+}
+
+func replayedReasoningContent(body []byte) map[string]struct{} {
+	var fields map[string]json.RawMessage
+	var items []json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || json.Unmarshal(fields["input"], &items) != nil {
+		return nil
+	}
+	values := make(map[string]struct{})
+	for _, raw := range items {
+		var item map[string]json.RawMessage
+		if json.Unmarshal(raw, &item) == nil && rawJSONString(item["type"]) == "reasoning" {
+			if value := rawJSONString(item["encrypted_content"]); value != "" {
+				values[value] = struct{}{}
+			}
+		}
+	}
+	return values
+}
+
+// withoutReasoning removes the reasoning input items whose encrypted content
+// is in drop. It reports false when body is not a Responses request with an
+// input array.
+func withoutReasoning(body []byte, drop map[string]struct{}) ([]byte, bool) {
+	var fields map[string]json.RawMessage
+	var items []json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || json.Unmarshal(fields["input"], &items) != nil {
+		return nil, false
+	}
+	kept := make([]json.RawMessage, 0, len(items))
+	for _, raw := range items {
+		var item map[string]json.RawMessage
+		if json.Unmarshal(raw, &item) == nil && rawJSONString(item["type"]) == "reasoning" {
+			if _, ok := drop[rawJSONString(item["encrypted_content"])]; ok {
+				continue
+			}
+		}
+		kept = append(kept, raw)
+	}
+	filtered, err := json.Marshal(copyResponsesRequestFieldsWithInput(fields, kept))
+	if err != nil {
+		return nil, false
+	}
+	return filtered, true
 }
 
 // resolveOrBindConversationForRoute atomically resolves an existing conversation

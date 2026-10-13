@@ -29,7 +29,9 @@ func durableRequestStateAliasFixtures() []struct{ name, fields string } {
 		{"conversation-alias-last", `"conversation":"conv-durable-fixture","Conversation":"unknown-conversation"`},
 		{"conversation-id", `"conversation":{"ID":"unknown-conversation"}`},
 		{"conversation-id-alias-last", `"conversation":{"id":"conv-durable-fixture","ID":"unknown-conversation"}`},
-		{"input", `"Input":[{"type":"reasoning","encrypted_content":"unknown-reasoning"}]`},
+		// Unbound reasoning alone is dropped, so a compaction item carries the
+		// unknown state that must not reach the provider through an alias.
+		{"input", `"Input":[{"type":"context_compaction","encrypted_content":"unknown-compaction"}]`},
 		{"input-alias-last", `"input":[],"Input":[{"type":"reasoning","encrypted_content":"unknown-reasoning"}]`},
 		{"item-type", `"input":[{"Type":"reasoning","encrypted_content":"unknown-reasoning"}]`},
 		{"item-type-alias-last", `"input":[{"type":"message","Type":"reasoning","encrypted_content":"unknown-reasoning"}]`},

@@ -1473,9 +1473,11 @@ func TestHandleResponsesWebSocket_ExplicitRouteRejectsUnknownStateBeforeDispatch
 	conn := mustDialResponsesWebSocket(t, server, nil)
 	defer func() { _ = conn.Close() }()
 
+	// Unbound reasoning alone is dropped, so a compaction item carries the
+	// unknown state.
 	request := newResponsesWebSocketCreateRequest([]interface{}{
 		map[string]interface{}{
-			"type":              "reasoning",
+			"type":              "compaction",
 			"encrypted_content": "unknown-provider-state",
 		},
 	})

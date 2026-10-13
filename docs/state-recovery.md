@@ -267,7 +267,8 @@ opening the store. Records from the cutoff second are retained.
 Records first issued before it (or first marked conflicting before it) are
 deleted atomically. Repeated observations preserve the original issuance time;
 repeated collisions preserve a tombstone's first conflict time.
-Pruned opaque state becomes unknown. Conversation-
+Pruned opaque state becomes unknown. Later requests drop pruned reasoning items
+and fail closed on other pruned state. Conversation-
 only IDs retain their narrow deterministic first-use bootstrap rule, so pruning
 their proof removes Vekil's ability to distinguish old use from first use.
 No provider credentials are loaded and no inference is performed by pruning.

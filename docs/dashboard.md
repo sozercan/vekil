@@ -27,7 +27,7 @@ The dashboard polls `GET /stats.json` once per second and renders:
 
 **Upstream retries** retain their existing meaning: same-target retries performed by legacy provider routes on transient upstream failures. A version-2 route target switch is counted separately in `target_switches`; it does not redefine or inflate `retries`.
 
-Route/failover metrics are additive in `GET /stats.json`: `upstream_attempts`, `target_switches`, `requests_with_failover`, `successful_failovers`, `route_exhaustions`, `state_binding_hits`, `state_binding_misses`, and `state_binding_evictions`. `by_route` adds client-request aggregates plus failover counters; `by_target` reports physical send counts. The websocket bridge still records each provider-backed `response.create` once in client totals, but its route-level client row/recent-row enrichment is limited: websocket physical sends and switches appear in `upstream_attempts`, `target_switches`, and `by_target`, while `requests_with_failover`, `successful_failovers`, and `by_route` are populated from HTTP request summaries.
+Route/failover metrics are additive in `GET /stats.json`: `upstream_attempts`, `target_switches`, `requests_with_failover`, `successful_failovers`, `route_exhaustions`, `state_binding_hits`, `state_binding_misses`, `state_binding_evictions`, and `state_binding_reasoning_drops` (requests forwarded without reasoning that had no ownership record). `by_route` adds client-request aggregates plus failover counters; `by_target` reports physical send counts. The websocket bridge still records each provider-backed `response.create` once in client totals, but its route-level client row/recent-row enrichment is limited: websocket physical sends and switches appear in `upstream_attempts`, `target_switches`, and `by_target`, while `requests_with_failover`, `successful_failovers`, and `by_route` are populated from HTTP request summaries.
 
 ### Provider-state storage
 
@@ -190,6 +190,7 @@ Token usage is captured across all inference surfaces: OpenAI chat completions (
   "state_binding_hits": 120,
   "state_binding_misses": 3,
   "state_binding_evictions": 1,
+  "state_binding_reasoning_drops": 0,
   "state_bindings": {
     "mode": "durable", "status": "ready", "entries": 2048, "max_entries": 8388608,
     "database_bytes": 1048576, "capacity_usage_percent": 0.0244140625, "capacity_status": "ok"

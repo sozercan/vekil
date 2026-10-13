@@ -2089,7 +2089,7 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 		if err != nil {
 			return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 		}
-		if err := h.applyExplicitRequestStateBinding(operation, stateBindingBody, headers); err != nil {
+		if _, err := h.bindExplicitRequestState(operation, &stateBindingBody, headers, &bodyBytes); err != nil {
 			return nil, err
 		}
 		if operation.pinnedTarget() != "" {

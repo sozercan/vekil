@@ -123,6 +123,11 @@ func TestExplicitResponsesStateDiagnosticsHTTP(t *testing.T) {
 	for _, surface := range []string{"json", "stream", "compact"} {
 		for _, itemType := range []string{"reasoning", "context_compaction"} {
 			for _, tc := range responsesStateDiagnosticCases() {
+				if itemType == "reasoning" && tc.wantCode == "provider_state_unavailable" {
+					// Unbound reasoning alone is dropped, not rejected; see
+					// TestExplicitResponsesUnboundReasoningIsDropped.
+					continue
+				}
 				t.Run(surface+"/"+itemType+"/"+tc.name, func(t *testing.T) {
 					h, primary, secondary := newResponsesStateDiagnosticHandler(t)
 					var logs bytes.Buffer
@@ -165,7 +170,9 @@ func TestExplicitResponsesStateDiagnosticsWebSocket(t *testing.T) {
 			defer func() { _ = conn.Close() }()
 			input := make([]any, 0, len(tc.tokens))
 			for _, token := range tc.tokens {
-				input = append(input, map[string]any{"type": "reasoning", "encrypted_content": token})
+				// Unbound reasoning alone is dropped, so a compaction item carries
+				// the unknown state these diagnostics need.
+				input = append(input, map[string]any{"type": "context_compaction", "encrypted_content": token})
 			}
 			request := newResponsesWebSocketCreateRequest(input)
 			request["model"] = "public-ws-model"
@@ -236,7 +243,9 @@ func TestExplicitResponsesStateDiagnosticsPinnedWebSocket(t *testing.T) {
 
 			input := make([]any, 0, len(tc.tokens))
 			for _, token := range tc.tokens {
-				input = append(input, map[string]any{"type": "reasoning", "encrypted_content": token})
+				// Unbound reasoning alone is dropped, so a compaction item carries
+				// the unknown state these diagnostics need.
+				input = append(input, map[string]any{"type": "context_compaction", "encrypted_content": token})
 			}
 			// Omitting previous_response_id resets replay history, but the
 			// established WebSocket session remains pinned to primary.
