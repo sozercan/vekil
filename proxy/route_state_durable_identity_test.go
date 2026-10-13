@@ -264,8 +264,12 @@ func TestDurableResponsesCopilotSourceAndRefresh(t *testing.T) {
 
 func TestDurableResponsesCopilotLegacyIntegrationOverride(t *testing.T) {
 	t.Setenv("COPILOT_GITHUB_TOKEN", "")
-	for _, token := range []string{"gho_source", "github_pat_source"} {
-		t.Run(token, func(t *testing.T) {
+	for _, credential := range []struct{ source, responses string }{
+		{"gho_source", "gho_source"},
+		{"github_pat_source", "github_pat_source"},
+		{"ghu_source", "exchanged-source"},
+	} {
+		t.Run(credential.source, func(t *testing.T) {
 			var calls atomic.Int32
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
@@ -297,7 +301,7 @@ func TestDurableResponsesCopilotLegacyIntegrationOverride(t *testing.T) {
 				p.kind = providerTypeCopilot
 				p.headerProfiles.Default.IntegrationID = step.integration
 				h, _ := durableWireHandler(t, store, p)
-				h.auth = auth.NewTestAuthenticatorWithResponsesToken(token, token)
+				h.auth = auth.NewTestAuthenticatorWithResponsesToken(credential.source, credential.responses)
 				response := durableWireRequest(h, step.body, false, false)
 				if response.Code != step.status || calls.Load() != step.sends {
 					t.Fatalf("%s: status=%d sends=%d body=%s", step.name, response.Code, calls.Load(), response.Body.String())

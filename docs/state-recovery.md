@@ -183,16 +183,27 @@ store; durable ownership does not persist it or migrate state across targets.
 Migration-enabled Azure routes can instead reconnect using a locally saved
 response ID and new input, including when the upstream response used `store: false`.
 
-## Upgrading the Copilot OAuth/PAT integration default
+## Upgrading the Copilot integration default
 
-The OAuth/PAT default changes from `vscode-chat` to `copilot-developer-cli`.
+Every Copilot credential now defaults to `copilot-developer-cli`. Earlier
+releases used other defaults:
+
+- `gho_` OAuth, `github_pat_` and `ghs_` credentials used `vscode-chat` before
+  they moved to `copilot-developer-cli`.
+- `ghu_` GitHub App user tokens, including device-code logins, used
+  `copilot-language-server` for catalog and Chat, and `vscode-chat` for
+  Responses, which run on an exchanged token.
+- Exchanged and legacy Copilot tokens used `vscode-chat`.
+
 The integration ID is part of durable ownership, so the new default cannot
 continue state issued under the old one. Vekil does not migrate that ownership
 or retry retained state under another integration.
 
-Before upgrading an existing schema-v2 durable Copilot deployment, pin
-`vscode-chat` in each affected provider. Merge this into its existing `headers`
-block without changing provider, route or target IDs, credentials, or the store:
+Before upgrading an existing schema-v2 durable Copilot deployment, pin the
+integration that issued its state in each affected provider, using the earlier
+defaults above for the release you are upgrading from. Merge this into its
+existing `headers` block without changing provider, route or target IDs,
+credentials, or the store:
 
 ```yaml
 headers:

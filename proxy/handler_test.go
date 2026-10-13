@@ -6520,7 +6520,7 @@ func TestSetCopilotHeaders(t *testing.T) {
 		{"editor-version", "vscode/1.95.0"},
 		{"editor-plugin-version", "copilot-chat/0.26.7"},
 		{"user-agent", "GitHubCopilotChat/0.26.7"},
-		{"copilot-integration-id", "vscode-chat"},
+		{"copilot-integration-id", "copilot-developer-cli"},
 		{"x-github-api-version", "2026-08-20"},
 		{"openai-intent", "conversation-panel"},
 		{"Content-Type", "application/json"},
@@ -6570,7 +6570,7 @@ func TestSetCopilotHeadersWithConfig(t *testing.T) {
 	}
 }
 
-func TestSetCopilotHeadersUsesCredentialIntegrationDefault(t *testing.T) {
+func TestSetCopilotHeadersDefaultsEveryCredentialToCLIIntegration(t *testing.T) {
 	for _, tt := range []struct {
 		name        string
 		token       string
@@ -6579,8 +6579,8 @@ func TestSetCopilotHeadersUsesCredentialIntegrationDefault(t *testing.T) {
 		{"OAuth", "gho_test", "copilot-developer-cli"},
 		{"fine-grained PAT", "github_pat_test", "copilot-developer-cli"},
 		{"Actions token", "ghs_test", "copilot-developer-cli"},
-		{"GitHub App", "ghu_test", "copilot-language-server"},
-		{"legacy", "legacy-test-token", "vscode-chat"},
+		{"GitHub App", "ghu_test", "copilot-developer-cli"},
+		{"legacy", "legacy-test-token", "copilot-developer-cli"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/test", nil)
@@ -6592,7 +6592,7 @@ func TestSetCopilotHeadersUsesCredentialIntegrationDefault(t *testing.T) {
 	}
 }
 
-func TestSetCopilotHeadersWithConfigUsesCredentialIntegrationDefault(t *testing.T) {
+func TestSetCopilotHeadersWithConfigDefaultsToCLIIntegration(t *testing.T) {
 	tests := []struct {
 		name        string
 		token       string
@@ -6602,7 +6602,7 @@ func TestSetCopilotHeadersWithConfigUsesCredentialIntegrationDefault(t *testing.
 		{
 			name:        "direct GitHub App credential",
 			token:       "ghu_direct-credential",
-			integration: directGitHubAppIntegrationID,
+			integration: "copilot-developer-cli",
 		},
 		{
 			name:        "OAuth credential",
@@ -6867,7 +6867,7 @@ func TestNewProviderJSONRequest_CopilotModelsOmitsIntentAndContentTypeByDefault(
 	}
 }
 
-func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesEndpointCompatibleAuth(t *testing.T) {
+func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesCLIIntegration(t *testing.T) {
 	tests := []struct {
 		name            string
 		endpoint        string
@@ -6879,13 +6879,13 @@ func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesEndpointCompatibleA
 			name:            "models credential default",
 			endpoint:        "/models",
 			wantAuth:        "Bearer ghu_direct-credential",
-			wantIntegration: directGitHubAppIntegrationID,
+			wantIntegration: defaultCopilotIntegrationID,
 		},
 		{
 			name:            "chat credential default",
 			endpoint:        "/chat/completions",
 			wantAuth:        "Bearer ghu_direct-credential",
-			wantIntegration: directGitHubAppIntegrationID,
+			wantIntegration: defaultCopilotIntegrationID,
 		},
 		{
 			name:            "responses credential default",

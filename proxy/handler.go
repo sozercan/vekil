@@ -60,9 +60,7 @@ const (
 	defaultCopilotEditorVersion       = "vscode/1.95.0"
 	defaultCopilotEditorPluginVersion = "copilot-chat/0.26.7"
 	defaultCopilotUserAgent           = "GitHubCopilotChat/0.26.7"
-	defaultCopilotIntegrationID       = "vscode-chat"
-	directCopilotCLIIntegrationID     = "copilot-developer-cli"
-	directGitHubAppIntegrationID      = "copilot-language-server"
+	defaultCopilotIntegrationID       = "copilot-developer-cli"
 	defaultCopilotGitHubAPIVersion    = "2026-08-20"
 	defaultCopilotOpenAIIntent        = "conversation-panel"
 	defaultResponsesWSCompactMaxItems = 8
@@ -1236,7 +1234,7 @@ func setCopilotHeaders(req *http.Request, token string) {
 }
 
 func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHeaderConfig) {
-	cfg = cfg.withCredentialDefaults(token)
+	cfg = cfg.withDefaults()
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("editor-version", cfg.EditorVersion)
 	req.Header.Set("editor-plugin-version", cfg.EditorPluginVersion)
@@ -1246,19 +1244,6 @@ func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHea
 	req.Header.Set("x-request-id", uuid.New().String())
 	req.Header.Set("openai-intent", cfg.OpenAIIntent)
 	req.Header.Set("Content-Type", "application/json")
-}
-
-func (c CopilotHeaderConfig) withCredentialDefaults(token string) CopilotHeaderConfig {
-	if c.IntegrationID == "" {
-		token = strings.TrimSpace(token)
-		switch {
-		case strings.HasPrefix(token, "gho_"), strings.HasPrefix(token, "github_pat_"), strings.HasPrefix(token, "ghs_"):
-			c.IntegrationID = directCopilotCLIIntegrationID
-		case strings.HasPrefix(token, "ghu_"):
-			c.IntegrationID = directGitHubAppIntegrationID
-		}
-	}
-	return c.withDefaults()
 }
 
 func clearCopilotHeaders(headers http.Header) {
@@ -1290,7 +1275,7 @@ func copilotEndpointUsesDefaultOpenAIIntent(endpoint string) bool {
 
 func setCopilotHeadersForEndpoint(req *http.Request, token string, cfg CopilotHeaderConfig, endpoint string) {
 	explicitOpenAIIntent := cfg.OpenAIIntent != ""
-	cfg = cfg.withCredentialDefaults(token)
+	cfg = cfg.withDefaults()
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("editor-version", cfg.EditorVersion)
 	req.Header.Set("editor-plugin-version", cfg.EditorPluginVersion)
