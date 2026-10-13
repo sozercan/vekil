@@ -1614,6 +1614,7 @@ func TestStreamResponsesPipeFollowsTerminalErrorWithResponseFailed(t *testing.T)
 	})
 	copilotCyber := delta + "event: error\ndata: " + string(cyberEvent) + "\n\n"
 	filtered := delta + "event: error\ndata: {\"type\":\"error\",\"code\":\"content_filter\",\"message\":\"The response was filtered.\"}\n\n"
+	oversized := delta + "event: error\ndata: {\"type\":\"error\",\"code\":\"content_filter\",\"message\":\"" + strings.Repeat("x", openAIStreamScannerMaxBuffer+4096) + "\"}\n\n"
 
 	tests := []struct {
 		name string
@@ -1644,6 +1645,11 @@ func TestStreamResponsesPipeFollowsTerminalErrorWithResponseFailed(t *testing.T)
 			name: "unterminated upstream response.failed at EOF is not duplicated",
 			body: strings.NewReader(filtered + strings.TrimSuffix(responsesFailedTestEvent("content_filter", "The response was filtered."), "\n\n")),
 			want: filtered + strings.TrimSuffix(responsesFailedTestEvent("content_filter", "The response was filtered."), "\n\n"),
+		},
+		{
+			name: "oversized error event passes through without a failure built from fragments",
+			body: strings.NewReader(oversized),
+			want: oversized,
 		},
 		{
 			name: "unterminated upstream response.completed at EOF is not followed by a failure",
