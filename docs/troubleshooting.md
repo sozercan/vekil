@@ -207,6 +207,29 @@ the `X-Vekil-Request-ID` of the first failed turn. Record its status, delivery,
 log lines name each outcome and reason; the menubar app keeps them in
 `~/Library/Logs/vekil/menubar.log` on macOS (see [Menubar](menubar.md)).
 
+## `cyber_policy`: content flagged for possible cybersecurity risk
+
+Codex may report:
+
+```text
+This content was flagged for possible cybersecurity risk. If this seems wrong,
+try rephrasing your request.
+```
+
+The upstream model's safety check blocked the turn; Vekil only relays it.
+Copilot returns it as HTTP `422` before streaming starts, which Codex retries
+until its retry budget is spent. When the flag arrives mid-stream as an `error`
+event, Vekil follows it with a `response.failed` carrying `cyber_policy`, so Codex
+stops without retrying.
+
+The flagged content usually stays in the thread's history and blocks every later
+turn. Start a new thread, or step back to before the flagged turn and rephrase.
+Retrying the same thread does not clear it.
+
+To confirm, look for `responses stream reported failure after commit` with
+`error_code` `content_filter` in the proxy log, or `"status": 422` entries in
+`GET /stats.json` `recent` for that model.
+
 ## `408 user_request_timeout`: timed out reading request body
 
 ### Symptom

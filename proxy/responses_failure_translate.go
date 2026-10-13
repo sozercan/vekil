@@ -1883,13 +1883,7 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 		if code := providerRequestErrorCode(err); strings.HasPrefix(code, "conversation_") {
 			observeResponseFailureStatus(ctx, upstreamStatusCode(err, http.StatusBadGateway))
 			if ctx.Err() == nil && !isClientWriteError(fw, err) {
-				// A terminal response.failed, not a bare error event: Codex ignores
-				// error events and would report only a closed stream.
-				data, _ := json.Marshal(map[string]any{"type": "response.failed", "response": map[string]any{
-					"object": "response", "status": "failed", "output": []any{},
-					"error": map[string]string{"code": code, "message": err.Error()},
-				}})
-				_, _ = io.WriteString(fw, "event: response.failed\ndata: "+string(data)+"\n\n")
+				writeResponsesFailedEvent(fw, code, err.Error())
 			}
 			return
 		}
@@ -1901,6 +1895,9 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 			return
 		}
 		if tap.completedCleanly() {
+			if ctx.Err() == nil && !isClientWriteError(fw, err) {
+				tap.writeFailedAfterError(fw)
+			}
 			return
 		}
 		// The HTTP 200 was already committed, so the client receives a truncated
@@ -1922,6 +1919,9 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 		return
 	}
 	tap.finalizeEOF()
+	if ctx.Err() == nil {
+		tap.writeFailedAfterError(fw)
+	}
 
 	if ctx.Err() == nil && !tap.completedCleanly() {
 		if lifecycle.suppressTransportCancellation(true) {
@@ -1932,6 +1932,53 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 			h.log.Debug("responses stream ended before terminal event")
 		}
 	}
+}
+
+// writeResponsesFailedEvent ends a committed stream with a terminal
+// response.failed. Codex ignores top-level error events and would report only
+// a closed stream.
+func writeResponsesFailedEvent(w io.Writer, code, message string) {
+	data, _ := json.Marshal(map[string]any{"type": "response.failed", "response": map[string]any{
+		"object": "response", "status": "failed", "output": []any{},
+		"error": map[string]string{"code": code, "message": message},
+	}})
+	_, _ = io.WriteString(w, "event: response.failed\ndata: "+string(data)+"\n\n")
+}
+
+// writeFailedAfterError follows a forwarded terminal error event with a
+// response.failed carrying the same failure.
+func (t *responsesFailureTap) writeFailedAfterError(w io.Writer) {
+	if t == nil || t.terminalError == nil {
+		return
+	}
+	code, message := responsesFailedEventError(*t.terminalError)
+	t.terminalError = nil
+	writeResponsesFailedEvent(w, code, message)
+}
+
+// responsesFailedEventError returns the response.failed code and message for a
+// terminal error event. Copilot reports OpenAI's cybersecurity flag as
+// content_filter, which Codex retries; cyber_policy makes it terminal. Copilot
+// also wraps the upstream error JSON in its own error chain, so the inner
+// message is used when it decodes.
+func responsesFailedEventError(streamErr responsesWebSocketStreamError) (string, string) {
+	code, message := strings.TrimSpace(streamErr.Code), strings.TrimSpace(streamErr.Message)
+	if !strings.EqualFold(code, "content_filter") || !strings.Contains(strings.ToLower(message), "cybersecurity risk") {
+		return code, message
+	}
+	if i := strings.Index(message, `{"error":`); i >= 0 {
+		var wrapped struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.NewDecoder(strings.NewReader(message[i:])).Decode(&wrapped) == nil {
+			if inner := strings.TrimSpace(wrapped.Error.Message); inner != "" {
+				message = inner
+			}
+		}
+	}
+	return "cyber_policy", message
 }
 
 func parseResponsesStreamEvent(data string) (responsesWebSocketStreamEvent, error) {
@@ -2155,6 +2202,10 @@ type responsesFailureTap struct {
 	// before a terminal response means the committed stream was
 	// truncated and should not be counted as a successful 200.
 	terminalSeen bool
+	// terminalError holds the last terminal event's error when that event was a
+	// top-level `error`, so the committed pipe can follow it with
+	// response.failed. Any later terminal event clears it.
+	terminalError *responsesWebSocketStreamError
 }
 
 func newResponsesFailureTap(ctx context.Context, h *ProxyHandler, upstreamHeaders http.Header, store *ToolExecutionContextStore, scope string) *responsesFailureTap {
@@ -2343,8 +2394,10 @@ func (t *responsesFailureTap) finishOverflowEvent() {
 	switch t.overflowEvent.Type {
 	case "response.completed", "response.cancelled", "response.canceled":
 		t.terminalSeen = true
+		t.terminalError = nil
 	case "response.failed", "response.incomplete", "error":
 		t.terminalSeen = true
+		t.terminalError = nil
 		observeResponseFailureStatus(t.ctx, http.StatusBadGateway)
 	}
 	t.overflowed = false
@@ -2439,6 +2492,11 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 	}
 	if isResponsesTerminalType(eventName) {
 		t.terminalSeen = true
+		t.terminalError = nil
+		if eventName == "error" {
+			streamErr := responsesStreamEventError(event)
+			t.terminalError = &streamErr
+		}
 		// Record token usage from every terminal event. Failed and incomplete
 		// responses can still carry billable partial usage. This is best-effort: a
 		// response.completed larger than responsesFailureTapMaxBuffer is dropped

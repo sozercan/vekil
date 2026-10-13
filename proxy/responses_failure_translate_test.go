@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/sozercan/vekil/logger"
@@ -1575,8 +1576,8 @@ func TestStreamResponsesPipeClassifiesTopLevelErrorEvent(t *testing.T) {
 	if streamUsage.prompt != 11 || streamUsage.completion != 4 || streamUsage.total != 15 {
 		t.Fatalf("stream usage = prompt:%d completion:%d total:%d, want 11/4/15", streamUsage.prompt, streamUsage.completion, streamUsage.total)
 	}
-	if got := rec.Body.String(); got != sse {
-		t.Fatalf("stream body altered. got %q want %q", got, sse)
+	if got, want := rec.Body.String(), sse+responsesFailedTestEvent("no_capacity", "No capacity is available."); got != want {
+		t.Fatalf("stream body = %q, want %q", got, want)
 	}
 }
 
@@ -1590,8 +1591,64 @@ func TestStreamResponsesPipeNormalizesEventNameForUntypedNestedError(t *testing.
 	if got := summary.FailureStatus(); got != http.StatusTooManyRequests {
 		t.Fatalf("FailureStatus = %d, want 429", got)
 	}
-	if got := rec.Body.String(); got != sse {
-		t.Fatalf("stream body altered. got %q want %q", got, sse)
+	if got, want := rec.Body.String(), sse+responsesFailedTestEvent("no_capacity", "No capacity is available."); got != want {
+		t.Fatalf("stream body = %q, want %q", got, want)
+	}
+}
+
+func responsesFailedTestEvent(code, message string) string {
+	data, _ := json.Marshal(map[string]any{"type": "response.failed", "response": map[string]any{
+		"object": "response", "status": "failed", "output": []any{},
+		"error": map[string]string{"code": code, "message": message},
+	}})
+	return "event: response.failed\ndata: " + string(data) + "\n\n"
+}
+
+func TestStreamResponsesPipeFollowsTerminalErrorWithResponseFailed(t *testing.T) {
+	const delta = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+	const cyberMessage = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request."
+	cyberEvent, _ := json.Marshal(map[string]string{
+		"type":    "error",
+		"code":    "content_filter",
+		"message": `reading responses stream: reading SSE event: {"error":{"message":"` + cyberMessage + `"}}`,
+	})
+	copilotCyber := delta + "event: error\ndata: " + string(cyberEvent) + "\n\n"
+	filtered := delta + "event: error\ndata: {\"type\":\"error\",\"code\":\"content_filter\",\"message\":\"The response was filtered.\"}\n\n"
+
+	tests := []struct {
+		name string
+		body io.Reader
+		want string
+	}{
+		{
+			name: "copilot cybersecurity flag becomes cyber_policy",
+			body: strings.NewReader(copilotCyber),
+			want: copilotCyber + responsesFailedTestEvent("cyber_policy", cyberMessage),
+		},
+		{
+			name: "other content filters keep their code and message",
+			body: strings.NewReader(filtered),
+			want: filtered + responsesFailedTestEvent("content_filter", "The response was filtered."),
+		},
+		{
+			name: "transport reset after the error event",
+			body: io.MultiReader(strings.NewReader(filtered), iotest.ErrReader(errors.New("connection reset"))),
+			want: filtered + responsesFailedTestEvent("content_filter", "The response was filtered."),
+		},
+		{
+			name: "upstream response.failed after the error event is not duplicated",
+			body: strings.NewReader(filtered + responsesFailedTestEvent("content_filter", "The response was filtered.")),
+			want: filtered + responsesFailedTestEvent("content_filter", "The response was filtered."),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			streamResponsesPipeWithFailureLog(context.Background(), &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, rec, tt.body, nil, nil, "")
+			if got := rec.Body.String(); got != tt.want {
+				t.Fatalf("stream body = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
