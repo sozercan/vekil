@@ -3,6 +3,7 @@ package launch
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -59,7 +60,7 @@ func TestCodexAdapterPrepare(t *testing.T) {
 	if strings.Contains(joined, "test-token-placeholder") {
 		t.Fatal("Codex argv exposed the local proxy token")
 	}
-	providerID := codexProviderID("test-token-placeholder")
+	providerID := "vekil_launch"
 	for _, want := range []string{
 		`model_provider="` + providerID + `"`,
 		`model_providers.` + providerID + `.base_url="http://127.0.0.1:43210/v1"`,
@@ -144,7 +145,7 @@ func TestCodexAdapterPrepareWithoutModelUsesCodexDefault(t *testing.T) {
 		t.Fatalf("EnvSet[%q] = %q", codexLocalTokenEnv, got)
 	}
 
-	providerID := codexProviderID("test-token-placeholder")
+	providerID := "vekil_launch"
 	for _, want := range []string{
 		`model_provider="` + providerID + `"`,
 		`model_providers.` + providerID + `.name="Vekil"`,
@@ -338,7 +339,7 @@ func TestCodexAdapterPreservesForegroundContinuationArgs(t *testing.T) {
 			if !containsAdjacent(prepared.Args, "-m", "gpt-public") {
 				t.Fatalf("Codex args did not preserve the managed model: %#v", prepared.Args)
 			}
-			providerID := codexProviderID("test-token-placeholder")
+			providerID := "vekil_launch"
 			if !containsString(prepared.Args, `model_provider="`+providerID+`"`) {
 				t.Fatalf("Codex args did not preserve the managed provider: %#v", prepared.Args)
 			}
@@ -348,6 +349,127 @@ func TestCodexAdapterPreservesForegroundContinuationArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCodexAdapterProviderIDIsStableAcrossLaunches(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	launches := []struct {
+		baseURL string
+		token   string
+	}{
+		{baseURL: "http://127.0.0.1:43210", token: "first-launch-token"},
+		{baseURL: "http://127.0.0.1:54321", token: "second-launch-token"},
+	}
+	for _, launch := range launches {
+		prepared, err := (CodexAdapter{}).Prepare(PrepareInput{
+			BaseURL:       launch.baseURL,
+			Binary:        binary,
+			LocalToken:    launch.token,
+			ForwardedArgs: []string{"resume", "--last"},
+			DryRun:        true,
+		})
+		if err != nil {
+			t.Fatalf("Prepare(%s) error = %v", launch.baseURL, err)
+		}
+		// Codex filters `resume --last` and its picker by provider ID, so every
+		// launch must record and select threads under the same ID.
+		for _, want := range []string{
+			`model_provider="vekil_launch"`,
+			`model_providers.vekil_launch.base_url="` + launch.baseURL + `/v1"`,
+			`model_providers.vekil_launch.env_key="` + codexLocalTokenEnv + `"`,
+		} {
+			if !containsString(prepared.Args, want) {
+				t.Fatalf("Codex args missing %q: %#v", want, prepared.Args)
+			}
+		}
+		if strings.Contains(strings.Join(prepared.Args, "\n"), launch.token) {
+			t.Fatal("Codex argv exposed the local proxy token")
+		}
+		if got := prepared.EnvSet[codexLocalTokenEnv]; got != launch.token {
+			t.Fatalf("EnvSet[%q] = %q, want this launch's token", codexLocalTokenEnv, got)
+		}
+	}
+}
+
+func TestCodexAdapterRejectsSQLiteHomeOutsideCodexHomeForThreadSelection(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	codexHome := filepath.Join(root, "home")
+	otherHome := filepath.Join(root, "other")
+	siblingHome := filepath.Join(root, "home-other")
+	for _, dir := range []string{codexHome, otherHome, siblingHome} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const sessionID = "56d7498d-6b2e-47ca-92a6-92ddee84ab25"
+	resumeLast := []string{"resume", "--last"}
+	tests := []struct {
+		name       string
+		args       []string
+		env        []string
+		wantReject bool
+	}{
+		{name: "resume latest outside", args: resumeLast, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}, wantReject: true},
+		{name: "resume picker outside", args: []string{"resume"}, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}, wantReject: true},
+		{name: "resume by id outside", args: []string{"--sandbox", "read-only", "resume", sessionID}, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}, wantReject: true},
+		{name: "fork outside", args: []string{"fork", sessionID}, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}, wantReject: true},
+		{name: "exec resume outside", args: []string{"exec", "--skip-git-repo-check", "resume", "--last", "continue"}, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}, wantReject: true},
+		{name: "exec alias resume outside", args: []string{"e", "resume", sessionID}, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}, wantReject: true},
+		{name: "sibling with shared prefix", args: resumeLast, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + siblingHome}, wantReject: true},
+		{name: "parent of codex home", args: resumeLast, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + root}, wantReject: true},
+		{name: "sqlite home equals codex home", args: resumeLast, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + codexHome + string(filepath.Separator) + "."}},
+		{name: "sqlite home inside codex home", args: resumeLast, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + filepath.Join(codexHome, "state")}},
+		{name: "codex home unset", args: resumeLast, env: []string{"CODEX_SQLITE_HOME=" + otherHome}},
+		{name: "codex home empty", args: resumeLast, env: []string{"CODEX_HOME=", "CODEX_SQLITE_HOME=" + otherHome}},
+		{name: "sqlite home unset", args: resumeLast, env: []string{"CODEX_HOME=" + codexHome}},
+		{name: "sqlite home blank", args: resumeLast, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME= "}},
+		{name: "interactive session", env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}},
+		{name: "prompt", args: []string{"resume my work"}, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}},
+		{name: "exec prompt", args: []string{"exec", "--ephemeral", "hello"}, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}},
+		{name: "exec prompt after separator", args: []string{"exec", "--", "resume"}, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}},
+		{name: "review", args: []string{"review", "--uncommitted"}, env: []string{"CODEX_HOME=" + codexHome, "CODEX_SQLITE_HOME=" + otherHome}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (CodexAdapter{}).Prepare(PrepareInput{
+				BaseURL:       "http://127.0.0.1:43210",
+				Binary:        binary,
+				LocalToken:    "token",
+				ForwardedArgs: tc.args,
+				Environment:   tc.env,
+				DryRun:        true,
+			})
+			if !tc.wantReject {
+				if err != nil {
+					t.Fatalf("Prepare() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "unset CODEX_SQLITE_HOME or point it inside CODEX_HOME") {
+				t.Fatalf("Prepare() error = %v, want CODEX_SQLITE_HOME refusal", err)
+			}
+		})
+	}
+
+	t.Run("symlinked codex home", func(t *testing.T) {
+		link := filepath.Join(root, "home-link")
+		if err := os.Symlink(codexHome, link); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		if err := validateCodexStateHome(resumeLast, []string{
+			"CODEX_HOME=" + link,
+			"CODEX_SQLITE_HOME=" + codexHome,
+		}); err != nil {
+			t.Fatalf("validateCodexStateHome() error = %v, want nil for the same resolved home", err)
+		}
+	})
 }
 
 func TestDefaultReasoningEffort(t *testing.T) {

@@ -1,13 +1,18 @@
 package launch
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
 const codexLocalTokenEnv = "VEKIL_CODEX_API_KEY"
+
+// codexProviderID is stable across launches because Codex filters
+// `resume --last` and its resume picker by the recorded model provider ID.
+// The per-launch base URL and token travel in the provider overrides.
+const codexProviderID = "vekil_launch"
 
 var codexCredentialEnvironment = []string{
 	"AZURE_OPENAI_API_KEY",
@@ -66,6 +71,9 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	envUnset := mergeEnvironmentKeys(commonAgentCredentialEnvironment, codexCredentialEnvironment, input.SensitiveEnv)
 	envSet := map[string]string{codexLocalTokenEnv: localToken}
 	probeEnvironment := applyEnvironment(input.Environment, envUnset, nil)
+	if err := validateCodexStateHome(input.ForwardedArgs, probeEnvironment); err != nil {
+		return PreparedProcess{}, err
+	}
 	probeEnvironment = ensureLoopbackNoProxy(probeEnvironment, baseURL)
 	if !input.DryRun {
 		if err := validateExecutableVersion(executable, probeEnvironment, "Codex CLI", "codex-cli", minimumVersion{major: 0, minor: 137, patch: 0}); err != nil {
@@ -86,7 +94,7 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		}
 	}
 
-	providerID := codexProviderID(localToken)
+	providerID := codexProviderID
 	args := append([]string(nil), executable.prefixArgs...)
 	overrides := []string{
 		`model_provider=` + configString(providerID),
@@ -140,12 +148,36 @@ func configString(value string) string {
 	return string(body)
 }
 
-func codexProviderID(localToken string) string {
-	digest := sha256.Sum256([]byte(localToken))
-	return "vekil_launch_" + fmt.Sprintf("%x", digest[:6])
+func validateCodexForwardedArgs(args []string) error {
+	positionals, err := codexForwardedPositionals(args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) == 0 {
+		return nil
+	}
+	switch positionals[0] {
+	case "exec", "e":
+		// Normal exec and exec resume remain attached to the managed child.
+		return nil
+	case "resume", "fork":
+		// Interactive resume and fork remain attached to the managed child.
+		// Remote variants are rejected by codexForwardedPositionals.
+		return nil
+	case "review":
+		return nil
+	case "app-server", "remote-control", "cloud", "cloud-tasks", "responses-api-proxy", "stdio-to-uds", "exec-server", "mcp-server":
+		return fmt.Errorf("detached or server Codex modes are not supported by an ephemeral Vekil launcher")
+	case "agents", "login", "logout", "mcp", "plugin", "plugins", "app", "completion", "update", "doctor", "debug", "execpolicy", "apply", "a", "queue", "archive", "delete", "migrate-rollouts", "unarchive", "features", "sandbox", "help":
+		return fmt.Errorf("codex command %q is not an agent session", positionals[0])
+	default:
+		return nil
+	}
 }
 
-func validateCodexForwardedArgs(args []string) error {
+// codexForwardedPositionals rejects reserved forwarded options and returns the
+// positional arguments before any `--` separator.
+func codexForwardedPositionals(args []string) ([]string, error) {
 	var positionals []string
 	expectValue := false
 	for _, arg := range args {
@@ -162,10 +194,10 @@ func validateCodexForwardedArgs(args []string) error {
 				arg == "-c" || strings.HasPrefix(arg, "-c=") || (strings.HasPrefix(arg, "-c") && len(arg) > 2) || strings.HasPrefix(arg, "--config="), arg == "--config",
 				arg == "-p" || strings.HasPrefix(arg, "-p=") || (strings.HasPrefix(arg, "-p") && len(arg) > 2) || strings.HasPrefix(arg, "--profile="), arg == "--profile",
 				arg == "--oss", arg == "--local-provider" || strings.HasPrefix(arg, "--local-provider="):
-				return fmt.Errorf("codex model or provider overrides are not supported by the managed Vekil launcher")
+				return nil, fmt.Errorf("codex model or provider overrides are not supported by the managed Vekil launcher")
 			case arg == "--remote" || strings.HasPrefix(arg, "--remote="),
 				arg == "--remote-auth-token-env" || strings.HasPrefix(arg, "--remote-auth-token-env="):
-				return fmt.Errorf("remote Codex sessions are not supported by an ephemeral Vekil launcher")
+				return nil, fmt.Errorf("remote Codex sessions are not supported by an ephemeral Vekil launcher")
 			}
 			if codexOptionRequiresValue(arg) {
 				expectValue = true
@@ -175,28 +207,66 @@ func validateCodexForwardedArgs(args []string) error {
 		positionals = append(positionals, arg)
 	}
 	if expectValue {
-		return fmt.Errorf("codex option is missing its value")
+		return nil, fmt.Errorf("codex option is missing its value")
 	}
-	if len(positionals) == 0 {
-		return nil
+	return positionals, nil
+}
+
+// codexArgsSelectThread reports whether forwarded args resume or fork a thread
+// recorded in Codex's state database.
+func codexArgsSelectThread(args []string) bool {
+	positionals, err := codexForwardedPositionals(args)
+	if err != nil || len(positionals) == 0 {
+		return false
 	}
 	switch positionals[0] {
-	case "exec", "e":
-		// Normal exec and exec resume remain attached to the managed child.
-		return nil
 	case "resume", "fork":
-		// Interactive resume and fork remain attached to the managed child.
-		// Remote variants are rejected above.
-		return nil
-	case "review":
-		return nil
-	case "app-server", "remote-control", "cloud", "cloud-tasks", "responses-api-proxy", "stdio-to-uds", "exec-server", "mcp-server":
-		return fmt.Errorf("detached or server Codex modes are not supported by an ephemeral Vekil launcher")
-	case "agents", "login", "logout", "mcp", "plugin", "plugins", "app", "completion", "update", "doctor", "debug", "execpolicy", "apply", "a", "queue", "archive", "delete", "migrate-rollouts", "unarchive", "features", "sandbox", "help":
-		return fmt.Errorf("codex command %q is not an agent session", positionals[0])
+		return true
+	case "exec", "e":
+		return len(positionals) > 1 && positionals[1] == "resume"
 	default:
+		return false
+	}
+}
+
+// validateCodexStateHome rejects resume and fork when an explicit CODEX_HOME is
+// paired with a CODEX_SQLITE_HOME outside it. Codex resolves threads through
+// the SQLite state database, so that pairing can select another home's thread
+// and append to its rollout.
+func validateCodexStateHome(args, environment []string) error {
+	if !codexArgsSelectThread(args) {
 		return nil
 	}
+	codexHome := strings.TrimSpace(environmentValue(environment, "CODEX_HOME"))
+	sqliteHome := strings.TrimSpace(environmentValue(environment, "CODEX_SQLITE_HOME"))
+	if codexHome == "" || sqliteHome == "" || pathWithin(codexHome, sqliteHome) {
+		return nil
+	}
+	return fmt.Errorf(
+		"codex resume or fork with CODEX_SQLITE_HOME=%q outside CODEX_HOME=%q can select another Codex home's threads; unset CODEX_SQLITE_HOME or point it inside CODEX_HOME",
+		sqliteHome, codexHome,
+	)
+}
+
+// pathWithin reports whether path is root or inside it. It compares cleaned
+// absolute paths, then symlink-resolved paths when both exist.
+func pathWithin(root, path string) bool {
+	if lexicallyWithin(root, path) {
+		return true
+	}
+	resolvedRoot, rootErr := filepath.EvalSymlinks(root)
+	resolvedPath, pathErr := filepath.EvalSymlinks(path)
+	return rootErr == nil && pathErr == nil && lexicallyWithin(resolvedRoot, resolvedPath)
+}
+
+func lexicallyWithin(root, path string) bool {
+	root, rootErr := filepath.Abs(root)
+	path, pathErr := filepath.Abs(path)
+	if rootErr != nil || pathErr != nil {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func validatePolicyCodexForwardedArgs(args []string) error {

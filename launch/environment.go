@@ -33,6 +33,19 @@ func splitEnvironmentEntry(entry string) (string, string) {
 	return key, value
 }
 
+// environmentValue returns the last value of key in environment, or "" when it
+// is absent.
+func environmentValue(environment []string, key string) string {
+	canonical := canonicalEnvironmentKey(key)
+	value := ""
+	for _, raw := range environment {
+		if entryKey, entryValue := splitEnvironmentEntry(raw); canonicalEnvironmentKey(entryKey) == canonical {
+			value = entryValue
+		}
+	}
+	return value
+}
+
 func applyEnvironment(base []string, unset []string, set map[string]string) []string {
 	entries := make(map[string]environmentEntry, len(base)+len(set))
 	for _, raw := range base {

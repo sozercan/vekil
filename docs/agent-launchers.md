@@ -244,8 +244,10 @@ vekil launch codex --model gpt-5.4-mini -- \
 ```
 
 Codex's built-in OpenAI provider does not use a generic base-URL override for
-this flow. Vekil instead injects a transient, per-launch
-`model_providers.<random-id>` definition through Codex `-c` arguments:
+this flow. Vekil instead injects a `model_providers.vekil_launch` definition
+through Codex `-c` arguments. The provider ID is the same for every launch
+because Codex records it on each thread and filters `resume --last` and the
+interactive resume picker by it; the per-launch values travel in the definition:
 
 - `base_url` points to the ephemeral proxy's `/v1` root;
 - `wire_api="responses"` selects `POST /v1/responses`;
@@ -307,6 +309,13 @@ an unknown or incompatible default fails when Codex requests it rather than
 during launcher startup.
 
 Foreground `resume`, `fork`, and `exec resume` commands are forwarded.
+`--last` and the resume picker find threads recorded by earlier launches in the
+same Codex home (Codex's picker lists `exec` threads only with
+`--include-non-interactive`). Threads recorded by older Vekil versions under
+per-launch `vekil_launch_<hash>` provider IDs remain resumable by explicit thread
+ID but do not appear in the picker or `--last`. Codex resolves thread IDs through its SQLite state database, so when
+`CODEX_HOME` is set the launcher refuses these commands if `CODEX_SQLITE_HOME`
+points outside it; unset `CODEX_SQLITE_HOME` or point it inside `CODEX_HOME`.
 Forwarded `-m`/`--model`, `-c`/`--config`, profile, OSS/local-provider, remote,
 app-server, remote-control, cloud, and non-agent command modes remain rejected.
 For a pinned policy-owned model, forwarded `--search`, equivalent web-search
