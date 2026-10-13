@@ -1640,6 +1640,16 @@ func TestStreamResponsesPipeFollowsTerminalErrorWithResponseFailed(t *testing.T)
 			body: strings.NewReader(filtered + responsesFailedTestEvent("content_filter", "The response was filtered.")),
 			want: filtered + responsesFailedTestEvent("content_filter", "The response was filtered."),
 		},
+		{
+			name: "unterminated upstream response.failed at EOF is not duplicated",
+			body: strings.NewReader(filtered + strings.TrimSuffix(responsesFailedTestEvent("content_filter", "The response was filtered."), "\n\n")),
+			want: filtered + strings.TrimSuffix(responsesFailedTestEvent("content_filter", "The response was filtered."), "\n\n"),
+		},
+		{
+			name: "unterminated upstream response.completed at EOF is not followed by a failure",
+			body: strings.NewReader(filtered + `data: {"type":"response.completed","response":{"id":"resp_fake","status":"completed","output":[]}}`),
+			want: filtered + `data: {"type":"response.completed","response":{"id":"resp_fake","status":"completed","output":[]}}`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -2234,7 +2234,9 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 }
 
 func (t *responsesFailureTap) finalizeEOF() {
-	if t == nil || t.terminalSeen || t.overflowActive {
+	// A pending terminal error still finalizes, so an unterminated terminal
+	// event after it clears the error instead of getting a duplicate failure.
+	if t == nil || (t.terminalSeen && t.terminalError == nil) || t.overflowActive {
 		return
 	}
 	// A valid final SSE event is dispatched at EOF even when the provider omits
