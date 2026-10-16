@@ -246,10 +246,12 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 	}
 	result.Model = model
 	var webSearchMCPURL string
+	copilotAbsent := false
 	if consumer, ok := adapter.(webSearchMCPAdapter); ok && consumer.usesWebSearchMCP() {
-		probe, probeErr := runStartupOperation(startupCtx, proxy.Done(), func(ctx context.Context) (webSearchMCPProbe, error) {
-			url, err := probeWebSearchMCP(ctx, baseURL, localToken)
-			return webSearchMCPProbe{url: url, err: err}, nil
+		// Search is optional: probe under the run context with the probe's own
+		// timeout so a slow probe cannot spend the startup deadline.
+		probe, probeErr := runStartupOperation(runCtx, proxy.Done(), func(ctx context.Context) (webSearchMCPProbe, error) {
+			return probeWebSearchMCP(ctx, baseURL, localToken), nil
 		})
 		if probeErr != nil {
 			if runCtx.Err() != nil {
@@ -262,6 +264,15 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 			_, _ = fmt.Fprintf(opts.Stderr, "vekil: warning: web search unavailable: %v\n", probe.err)
 		}
 		webSearchMCPURL = probe.url
+		copilotAbsent = probe.copilotAbsent
+	}
+	var routesLikeModel func(string) bool
+	if resolver, ok := proxy.(messagesAliasProxy); ok && model.ID != "" {
+		routesLikeModel = func(alias string) bool {
+			ctx, cancel := context.WithTimeout(runCtx, modelRequestTimeout)
+			defer cancel()
+			return resolver.MessagesAliasResolvesTo(ctx, alias, model.ID)
+		}
 	}
 	startupCancel()
 
@@ -275,6 +286,8 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 		Environment:     opts.Environment,
 		NoProxy:         loopbackNoProxyValue(opts.Environment, baseURL),
 		WebSearchMCPURL: webSearchMCPURL,
+		CopilotAbsent:   copilotAbsent,
+		RoutesLikeModel: routesLikeModel,
 	})
 	if err != nil {
 		return result, err
@@ -539,34 +552,36 @@ func fetchModels(ctx context.Context, baseURL, localToken string) ([]ModelInfo, 
 
 type webSearchMCPProbe struct {
 	url string
-	err error
+	// copilotAbsent is set only when the proxy answered 404: no Copilot
+	// provider serves this session.
+	copilotAbsent bool
+	err           error
 }
 
-// probeWebSearchMCP returns the launch proxy's web search MCP URL when its
-// tools/list offers web_search. A 404 means the session does not use Copilot,
-// which is not an error.
-func probeWebSearchMCP(ctx context.Context, baseURL, localToken string) (string, error) {
+// probeWebSearchMCP asks the launch proxy's web search MCP endpoint for its
+// tools. The URL is set only when tools/list offers web_search.
+func probeWebSearchMCP(ctx context.Context, baseURL, localToken string) webSearchMCPProbe {
 	requestCtx, cancel := context.WithTimeout(ctx, webSearchProbeTimeout)
 	defer cancel()
 	url := baseURL + webSearchMCPPath
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
 	if err != nil {
-		return "", err
+		return webSearchMCPProbe{err: err}
 	}
 	req.Header.Set("Authorization", "Bearer "+localToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("probe web search: %w", err)
+		return webSearchMCPProbe{err: fmt.Errorf("probe web search: %w", err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
-		return "", nil
+		return webSearchMCPProbe{copilotAbsent: true}
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("probe web search: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return webSearchMCPProbe{err: fmt.Errorf("probe web search: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))}
 	}
 	var payload struct {
 		Result struct {
@@ -579,17 +594,17 @@ func probeWebSearchMCP(ctx context.Context, baseURL, localToken string) (string,
 		} `json:"error"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxLauncherResponseBody)).Decode(&payload); err != nil {
-		return "", fmt.Errorf("decode web search probe: %w", err)
+		return webSearchMCPProbe{err: fmt.Errorf("decode web search probe: %w", err)}
 	}
 	if payload.Error != nil {
-		return "", errors.New(payload.Error.Message)
+		return webSearchMCPProbe{err: errors.New(payload.Error.Message)}
 	}
 	for _, tool := range payload.Result.Tools {
 		if tool.Name == "web_search" {
-			return url, nil
+			return webSearchMCPProbe{url: url}
 		}
 	}
-	return "", nil
+	return webSearchMCPProbe{}
 }
 
 func selectModel(models []ModelInfo, id string) (ModelInfo, error) {

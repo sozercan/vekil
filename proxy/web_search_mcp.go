@@ -177,7 +177,7 @@ func writeMCPJSON(w http.ResponseWriter, status int, message mcpMessage) {
 // offers web_search to this credential; account plans and organization
 // policy can withhold it even when the credential authenticates.
 func (h *ProxyHandler) webSearchUpstreamAvailable(ctx context.Context) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, webSearchMCPUpstreamTimeout)
+	ctx, cancel := h.webSearchMCPContext(ctx)
 	defer cancel()
 	session, err := h.openWebSearchUpstream(ctx)
 	if err != nil {
@@ -204,7 +204,7 @@ func (h *ProxyHandler) webSearchUpstreamAvailable(ctx context.Context) (bool, er
 }
 
 func (h *ProxyHandler) callWebSearchUpstream(ctx context.Context, query string) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, webSearchMCPUpstreamTimeout)
+	ctx, cancel := h.webSearchMCPContext(ctx)
 	defer cancel()
 	session, err := h.openWebSearchUpstream(ctx)
 	if err != nil {
@@ -224,6 +224,17 @@ func (h *ProxyHandler) callWebSearchUpstream(ctx context.Context, query string) 
 		return nil, errors.New("GitHub MCP returned a tool result without content")
 	}
 	return raw, nil
+}
+
+// webSearchMCPContext ends upstream calls when the client goes away, the
+// upstream timeout passes, or the proxy begins shutdown, whichever is first.
+func (h *ProxyHandler) webSearchMCPContext(inbound context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(inbound, webSearchMCPUpstreamTimeout)
+	stop := context.AfterFunc(h.lifecycleContext(), cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 // webSearchUpstreamSession is one short-lived MCP session with GitHub's

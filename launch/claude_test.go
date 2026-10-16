@@ -399,18 +399,32 @@ func TestClaudeAdapterUsesAnthropicSpellingForDottedClaudeIDs(t *testing.T) {
 		t.Fatalf("os.Executable(): %v", err)
 	}
 	for _, tc := range []struct {
-		id      string
-		ownedBy string
-		want    string
+		name      string
+		id        string
+		ownedBy   string
+		noProxy   bool
+		conflict  bool
+		want      string
+		wantAsked string
 	}{
-		{id: "claude-opus-5.5", want: "claude-opus-5-5"},
-		{id: "claude-haiku-4.5", want: "claude-haiku-4-5"},
-		{id: "claude-sonnet-5", want: "claude-sonnet-5"},
-		{id: "claude-opus-4.6-1m", want: "claude-opus-4.6-1m"},
-		{id: "gpt-5.4", want: "gpt-5.4"},
-		{id: "claude-auto-1.0", ownedBy: PolicyModelOwner, want: "claude-auto-1.0"},
+		{name: "copilot dotted", id: "claude-opus-5.5", want: "claude-opus-5-5", wantAsked: "claude-opus-5-5"},
+		{name: "legacy alias", id: "claude-haiku-4.5", want: "claude-haiku-4-5", wantAsked: "claude-haiku-4-5"},
+		{name: "alias owned by another model", id: "claude-sonnet-4.5", conflict: true, want: "claude-sonnet-4.5", wantAsked: "claude-sonnet-4-5"},
+		{name: "no live proxy", id: "claude-opus-5.5", noProxy: true, want: "claude-opus-5.5"},
+		{name: "undotted", id: "claude-sonnet-5", want: "claude-sonnet-5"},
+		{name: "variant suffix", id: "claude-opus-4.6-1m", want: "claude-opus-4.6-1m"},
+		{name: "non-claude", id: "gpt-5.4", want: "gpt-5.4"},
+		{name: "policy", id: "claude-auto-1.0", ownedBy: PolicyModelOwner, want: "claude-auto-1.0"},
 	} {
-		t.Run(tc.id, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
+			var asked string
+			routesLikeModel := func(alias string) bool {
+				asked = alias
+				return !tc.conflict
+			}
+			if tc.noProxy {
+				routesLikeModel = nil
+			}
 			prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
 				BaseURL: "http://127.0.0.1:43210",
 				Model: ModelInfo{
@@ -419,9 +433,10 @@ func TestClaudeAdapterUsesAnthropicSpellingForDottedClaudeIDs(t *testing.T) {
 					OwnedBy:            tc.ownedBy,
 					SupportedEndpoints: []string{"/v1/messages"},
 				},
-				Binary:     binary,
-				LocalToken: "test-token-placeholder",
-				DryRun:     true,
+				Binary:          binary,
+				LocalToken:      "test-token-placeholder",
+				RoutesLikeModel: routesLikeModel,
+				DryRun:          true,
 			})
 			if err != nil {
 				t.Fatalf("Prepare() error = %v", err)
@@ -444,6 +459,9 @@ func TestClaudeAdapterUsesAnthropicSpellingForDottedClaudeIDs(t *testing.T) {
 			}
 			if got := prepared.EnvSet["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"]; got != "Display Name" {
 				t.Errorf("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = %q, want Display Name", got)
+			}
+			if asked != tc.wantAsked {
+				t.Errorf("proxy asked about alias %q, want %q", asked, tc.wantAsked)
 			}
 		})
 	}

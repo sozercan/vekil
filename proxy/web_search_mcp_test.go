@@ -1,13 +1,16 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
@@ -20,6 +23,9 @@ type fakeGitHubMCP struct {
 	tools      []string
 	initStatus int
 	callResult string
+	// callStarted, when set, is closed when tools/call arrives; the call then
+	// stalls until its request is canceled.
+	callStarted chan struct{}
 
 	mu       sync.Mutex
 	methods  []string
@@ -88,6 +94,11 @@ func (f *fakeGitHubMCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 		if message.Params.Name != "web_search" {
 			f.t.Errorf("tools/call name = %q", message.Params.Name)
+		}
+		if f.callStarted != nil {
+			close(f.callStarted)
+			<-r.Context().Done()
+			return
 		}
 		result = f.callResult
 	default:
@@ -240,6 +251,95 @@ func TestWebSearchMCPToolsCallErrors(t *testing.T) {
 			t.Fatalf("result = %s, upstream methods = %v", response.Result, upstream.methods)
 		}
 	})
+}
+
+func TestWebSearchMCPShutdownCancelsUpstreamSearch(t *testing.T) {
+	upstream := &fakeGitHubMCP{callStarted: make(chan struct{})}
+	h := newWebSearchMCPTestHandler(t, upstream)
+	done := make(chan mcpMessage, 1)
+	go func() {
+		_, response := postWebSearchMCP(t, h, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"q"}}}`)
+		done <- response
+	}()
+	select {
+	case <-upstream.callStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream tools/call never started")
+	}
+	h.BeginShutdown()
+	select {
+	case response := <-done:
+		if !strings.Contains(string(response.Result), `"isError":true`) {
+			t.Fatalf("result = %s, want a tool error after shutdown", response.Result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not cancel the in-flight search")
+	}
+}
+
+func TestMessagesAliasResolvesToCopilotCatalogModel(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == providerEndpointModels {
+			_, _ = io.WriteString(w, `{"data":[{"id":"claude-opus-5.5","supported_endpoints":["/v1/messages","/chat/completions"]},{"id":"claude-sonnet-5.5","supported_endpoints":["/v1/messages"]}]}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithCopilotBaseURL(upstream.URL), WithAllowedModels("claude-opus-5.5"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	ctx := context.Background()
+	if !h.MessagesAliasResolvesTo(ctx, "claude-opus-5-5", "claude-opus-5.5") {
+		t.Fatal("hyphenated alias of a discovered Copilot model was not confirmed")
+	}
+	if h.MessagesAliasResolvesTo(ctx, "claude-sonnet-5-5", "claude-opus-5.5") {
+		t.Fatal("alias of a different model was confirmed")
+	}
+}
+
+func TestMessagesAliasResolvesToRejectsRawOwnerOfAliasSpelling(t *testing.T) {
+	newHandler := func(t *testing.T, scoped bool) *ProxyHandler {
+		t.Helper()
+		options := []Option{WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{
+				ID: "normalized", Type: "anthropic-compatible", Default: true, BaseURL: "https://normalized.example.test", AuthType: "none",
+				Models: []ProviderModelConfig{
+					{PublicID: "claude-sonnet-4.5", Deployment: "normalized-sonnet", Endpoints: []string{"/v1/messages"}},
+					{PublicID: "claude-haiku-4.5", Deployment: "normalized-haiku", Endpoints: []string{"/v1/messages"}},
+				},
+			},
+			{
+				ID: "raw", Type: "anthropic-compatible", BaseURL: "https://raw.example.test", AuthType: "none",
+				Models: []ProviderModelConfig{{PublicID: "claude-sonnet-4-5", Deployment: "raw-sonnet", Endpoints: []string{"/v1/messages"}}},
+			},
+		}})}
+		if scoped {
+			options = append(options, WithAllowedModels("claude-sonnet-4.5", "claude-haiku-4.5"))
+		}
+		h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), options...)
+		if err != nil {
+			t.Fatalf("NewProxyHandler() error = %v", err)
+		}
+		t.Cleanup(h.BeginShutdown)
+		return h
+	}
+	for _, scoped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("scoped=%v", scoped), func(t *testing.T) {
+			h := newHandler(t, scoped)
+			ctx := context.Background()
+			if h.MessagesAliasResolvesTo(ctx, "claude-sonnet-4-5", "claude-sonnet-4.5") {
+				t.Fatal("alias owned by a different raw model was confirmed")
+			}
+			if !h.MessagesAliasResolvesTo(ctx, "claude-haiku-4-5", "claude-haiku-4.5") {
+				t.Fatal("unowned alias of a configured model was not confirmed")
+			}
+		})
+	}
 }
 
 func TestWebSearchMCPRejectsBrowserOrigins(t *testing.T) {

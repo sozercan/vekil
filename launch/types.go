@@ -64,6 +64,12 @@ type PrepareInput struct {
 	// WebSearchMCPURL is the launch proxy's web search MCP endpoint, set only
 	// when the proxy confirmed the tool is available.
 	WebSearchMCPURL string
+	// CopilotAbsent is set when the launch proxy confirmed that no Copilot
+	// provider serves the session.
+	CopilotAbsent bool
+	// RoutesLikeModel reports whether a Messages request naming alias reaches
+	// the selected model. It is nil when no live proxy can answer.
+	RoutesLikeModel func(alias string) bool
 	DryRun          bool
 }
 
@@ -71,6 +77,12 @@ type PrepareInput struct {
 // search MCP endpoint with their agent; the launcher probes it only for them.
 type webSearchMCPAdapter interface {
 	usesWebSearchMCP() bool
+}
+
+// messagesAliasProxy is implemented by launch proxies that can confirm an
+// alternate spelling of the pinned model is served like the model itself.
+type messagesAliasProxy interface {
+	MessagesAliasResolvesTo(ctx context.Context, alias, model string) bool
 }
 
 // PreparedProcess is an agent-specific process plan. EnvSet and EnvUnset are

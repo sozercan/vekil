@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -544,6 +545,30 @@ func (h *ProxyHandler) resolveModelRouteForRequest(model, endpoint string) (*mod
 	}
 
 	return nil, false
+}
+
+// MessagesAliasResolvesTo reports whether a Messages request naming alias is
+// admitted and served by the same public route as one naming model. Launchers
+// use it to confirm an agent-facing spelling of the pinned model, because a
+// raw model that owns the alias spelling takes precedence over normalization.
+func (h *ProxyHandler) MessagesAliasResolvesTo(ctx context.Context, alias, model string) bool {
+	alias, model = strings.TrimSpace(alias), strings.TrimSpace(model)
+	if h == nil || alias == "" || model == "" {
+		return false
+	}
+	// Match HandleAnthropicMessages, which discovers unknown dynamic models
+	// before routing.
+	if provider, _, known := h.resolveProviderModelForRequest(model, providerEndpointMessages); !known && providerUsesDynamicModels(provider) {
+		if err := h.refreshUnknownChatRouteProvider(ctx, provider); err != nil {
+			return false
+		}
+	}
+	if !h.modelAllowedForRequest(alias, providerEndpointMessages) {
+		return false
+	}
+	aliasRoute, aliasKnown := h.resolveModelRouteForRequest(alias, providerEndpointMessages)
+	route, known := h.resolveModelRouteForRequest(model, providerEndpointMessages)
+	return aliasKnown && known && aliasRoute.public.id == route.public.id && aliasRoute.public.routeID == route.public.routeID
 }
 
 func providerModelFromRouteTarget(route *modelRoute, target targetBinding) providerModel {

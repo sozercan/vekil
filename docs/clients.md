@@ -43,6 +43,14 @@ env ANTHROPIC_BASE_URL=http://localhost:1337 \
   claude --model claude-sonnet-5 --print --output-format text "Reply with exactly PROXY_OK"
 ```
 
+Name Copilot models with a dotted version in Anthropic's hyphenated spelling, for example `claude-opus-5-5` for `claude-opus-5.5`, including in `ANTHROPIC_DEFAULT_*_MODEL` overrides. Vekil's Messages endpoint resolves the alias to the same model. Claude Code shapes requests from the model ID and treats a dotted one as an older model, so side queries such as WebFetch send `thinking.type: disabled`, which adaptive-only models reject. The launcher does this for you, and checks the alias first.
+
+Copilot also rejects the hosted web search tool behind Claude Code's built-in WebSearch. Disable WebSearch with `--disallowed-tools WebSearch` and register Vekil's [web search MCP endpoint](api.md#post-mcpweb-search) instead. Add an `Authorization` header with `--header` if the proxy requires an inbound token:
+
+```bash
+claude mcp add --transport http vekil http://localhost:1337/mcp/web-search
+```
+
 When zero-config Copilot rejects `advisor-tool-2026-03-01` as an unsupported beta header, disable Claude Code's experimental Advisor Tool for that invocation:
 
 ```bash

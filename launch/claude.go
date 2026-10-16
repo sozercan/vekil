@@ -21,15 +21,18 @@ func (ClaudeAdapter) Name() string { return "claude" }
 // claudeCodeModelID returns the model ID Claude Code should send. Claude Code
 // shapes requests from Anthropic's model IDs and misreads dotted catalog IDs as
 // older models; for claude-opus-5.5 it then sends thinking.type "disabled" on
-// side queries, which the upstream rejects. Vekil's Messages surface resolves
-// the hyphenated alias back to the public ID. Policy IDs resolve only by exact
-// public ID, so they stay unchanged.
-func claudeCodeModelID(model ModelInfo) string {
-	id := strings.TrimSpace(model.ID)
-	if strings.TrimSpace(model.OwnedBy) == PolicyModelOwner {
+// side queries, which the upstream rejects. The hyphenated spelling is used
+// only when the launch proxy confirms it reaches the same model, because a raw
+// model can own that spelling. Policy IDs resolve only by exact public ID.
+func claudeCodeModelID(input PrepareInput) string {
+	id := strings.TrimSpace(input.Model.ID)
+	if strings.TrimSpace(input.Model.OwnedBy) == PolicyModelOwner || input.RoutesLikeModel == nil {
 		return id
 	}
-	return dottedClaudeModelIDRegex.ReplaceAllString(id, "${1}-${2}-${3}")
+	if alias := dottedClaudeModelIDRegex.ReplaceAllString(id, "${1}-${2}-${3}"); alias != id && input.RoutesLikeModel(alias) {
+		return alias
+	}
+	return id
 }
 
 func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
@@ -77,7 +80,7 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		if name == "" {
 			name = model
 		}
-		clientModel := claudeCodeModelID(input.Model)
+		clientModel := claudeCodeModelID(input)
 		for key, value := range map[string]string{
 			"ANTHROPIC_MODEL":                           clientModel,
 			"ANTHROPIC_DEFAULT_HAIKU_MODEL":             clientModel,
@@ -151,15 +154,19 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 			return PreparedProcess{}, err
 		}
 	}
-	settingsJSON, err := json.Marshal(map[string]interface{}{
+	settings := map[string]interface{}{
 		"env":                  settingsEnv,
 		"disableRemoteControl": true,
-		// Vekil's Claude routes do not serve Anthropic's hosted web_search
-		// tool (Copilot rejects it and Chat translation carries only function
-		// tools), so hide WebSearch instead of letting every call fail. Search
-		// comes from Vekil's web search MCP server when it is available.
-		"permissions": map[string][]string{"deny": {"WebSearch"}},
-	})
+	}
+	// Anthropic's hosted web_search tool survives only native Messages
+	// forwarding: Copilot rejects it and Chat translation carries only
+	// function tools. Hide WebSearch elsewhere instead of letting every call
+	// fail; search then comes from Vekil's web search MCP server when available.
+	nativeWebSearch := input.CopilotAbsent && (!hasModel || modelSupportsEndpoint(input.Model, "/v1/messages"))
+	if !nativeWebSearch {
+		settings["permissions"] = map[string][]string{"deny": {"WebSearch"}}
+	}
+	settingsJSON, err := json.Marshal(settings)
 	if err != nil {
 		return PreparedProcess{}, fmt.Errorf("build managed Claude settings: %w", err)
 	}

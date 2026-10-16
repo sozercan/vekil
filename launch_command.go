@@ -450,6 +450,15 @@ func (p *agentLaunchProxy) Done() <-chan error { return p.srv.Done() }
 
 func (p *agentLaunchProxy) Stop(ctx context.Context) error { return p.srv.Stop(ctx) }
 
+// MessagesAliasResolvesTo lets the launcher confirm an agent-facing spelling
+// of the pinned model before handing it to the agent.
+func (p *agentLaunchProxy) MessagesAliasResolvesTo(ctx context.Context, alias, model string) bool {
+	resolver, ok := p.srv.(interface {
+		MessagesAliasResolvesTo(context.Context, string, string) bool
+	})
+	return ok && resolver.MessagesAliasResolvesTo(ctx, alias, model)
+}
+
 func copilotHeaderConfigFromEnv() proxy.CopilotHeaderConfig {
 	return proxy.CopilotHeaderConfig{
 		EditorVersion:       getEnv("COPILOT_EDITOR_VERSION", ""),

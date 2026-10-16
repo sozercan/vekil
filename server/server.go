@@ -590,6 +590,12 @@ func (s *Server) UsesCopilot() bool {
 	return s != nil && s.proxyHandler != nil && s.proxyHandler.UsesCopilot()
 }
 
+// MessagesAliasResolvesTo reports whether a Messages request naming alias is
+// served like one naming model.
+func (s *Server) MessagesAliasResolvesTo(ctx context.Context, alias, model string) bool {
+	return s != nil && s.proxyHandler != nil && s.proxyHandler.MessagesAliasResolvesTo(ctx, alias, model)
+}
+
 // SetStartupAuthenticationPending gates non-health routes while startup auth is in progress.
 func (s *Server) SetStartupAuthenticationPending(pending bool) {
 	if s.proxyHandler != nil {
