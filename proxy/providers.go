@@ -827,6 +827,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 	ctx, cancel := context.WithTimeout(ctx, modelsUpstreamTimeout)
 	defer cancel()
 
+	catalogs := make(map[string][]providerModel)
 	for _, providerID := range providerOrder {
 		provider := providers[providerID]
 		if !providerUsesDynamicModels(provider) {
@@ -846,7 +847,15 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
 			return nil, err
 		}
-		if err := setup.addProviderModels(providerID, h.installedProviderModels(setup, providerID, result.models)); err != nil {
+		if err := setup.addProviderModels(providerID, h.filterAllowedModels(result.models)); err != nil {
+			return nil, err
+		}
+		catalogs[providerID] = result.models
+	}
+	// Auxiliary models join only after every catalog is registered, so a
+	// later provider's reservation makes them fall back instead of failing.
+	if len(h.auxiliaryModels) > 0 && len(catalogs) > 0 {
+		if err := h.replaceInstalledProviderModels(setup, catalogs); err != nil {
 			return nil, err
 		}
 	}
@@ -881,9 +890,9 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
 			return err
 		}
-		replacements[providerID] = h.installedProviderModels(setup, providerID, result.models)
+		replacements[providerID] = result.models
 	}
-	if err := setup.replaceProviderModelsBatch(replacements); err != nil {
+	if err := h.replaceInstalledProviderModels(setup, replacements); err != nil {
 		return err
 	}
 
@@ -1126,6 +1135,26 @@ func (h *ProxyHandler) installedProviderModels(setup *providerSetup, providerID 
 		installed = append(installed, model)
 	}
 	return installed
+}
+
+// replaceInstalledProviderModels replaces provider catalogs with their
+// auxiliary models. If those collide with any model, route, or alias
+// reservation, it retries without them: an auxiliary model must never fail
+// startup or a catalog refresh.
+func (h *ProxyHandler) replaceInstalledProviderModels(setup *providerSetup, catalogs map[string][]providerModel) error {
+	withAuxiliary := make(map[string][]providerModel, len(catalogs))
+	for providerID, models := range catalogs {
+		withAuxiliary[providerID] = h.installedProviderModels(setup, providerID, models)
+	}
+	err := setup.replaceProviderModelsBatch(withAuxiliary)
+	if err == nil || len(h.auxiliaryModels) == 0 {
+		return err
+	}
+	allowedOnly := make(map[string][]providerModel, len(catalogs))
+	for providerID, models := range catalogs {
+		allowedOnly[providerID] = h.filterAllowedModels(models)
+	}
+	return setup.replaceProviderModelsBatch(allowedOnly)
 }
 
 // allowedRouteTargetsProvider reports whether an allowed explicit route or

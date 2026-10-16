@@ -1891,7 +1891,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			}
 			allDynamicProvidersUnchanged = false
 			if canonicalRefresh {
-				refreshedDynamicModels[provider.id] = h.installedProviderModels(setup, provider.id, filterHiddenProviderModels(provider, filterProviderModels(provider, result.models)))
+				refreshedDynamicModels[provider.id] = filterHiddenProviderModels(provider, filterProviderModels(provider, result.models))
 			}
 			if result.etag != "" {
 				mergedETag = result.etag
@@ -1924,7 +1924,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		return cachedModelsResponse{}, false, err
 	}
 
-	if err := setup.replaceProviderModelsBatch(refreshedDynamicModels); err != nil {
+	if err := h.replaceInstalledProviderModels(setup, refreshedDynamicModels); err != nil {
 		return cachedModelsResponse{}, false, err
 	}
 

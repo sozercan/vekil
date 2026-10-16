@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -180,6 +181,36 @@ func TestAuxiliaryModelInstalledForPinnedExplicitRouteProvider(t *testing.T) {
 	}
 	if !h.modelAllowedForRequest("claude-sonnet-5", providerEndpointMessages) {
 		t.Fatal("classifier was not admitted through the provider serving the pinned route")
+	}
+}
+
+func TestAuxiliaryModelAliasReservedByDatedModelDoesNotFailStartup(t *testing.T) {
+	copilot := newAuxiliaryCopilotCatalog(t)
+	for _, deferred := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deferred=%v", deferred), func(t *testing.T) {
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithCopilotBaseURL(copilot.URL), WithDeferredDynamicProviderModelValidation(deferred),
+				WithStateBindingsConfig(StateBindingsConfig{Mode: "memory"}),
+				WithProvidersConfig(ProvidersConfig{
+					SchemaVersion: ProvidersConfigSchemaVersion2,
+					Providers: []ProviderConfig{
+						{ID: "copilot", Type: "copilot", Default: true},
+						{ID: "anthropic", Type: "anthropic-compatible", BaseURL: "https://anthropic.example.test", AuthType: "none",
+							Models: []ProviderModelConfig{{PublicID: "claude-sonnet-5-20260929", Deployment: "sonnet", Endpoints: []string{"/v1/messages"}}}},
+					},
+				}),
+				WithAllowedModels("claude-opus-5.5"), WithAuxiliaryModels("claude-sonnet-5"))
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v; a reserved auxiliary alias must not fail startup", err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			if err := h.ValidateDynamicProviderModels(context.Background()); err != nil {
+				t.Fatalf("ValidateDynamicProviderModels() error = %v", err)
+			}
+			if h.modelAllowedForRequest("claude-sonnet-5", providerEndpointMessages) {
+				t.Fatal("classifier was admitted through a dated model owned by an out-of-scope provider")
+			}
+		})
 	}
 }
 
