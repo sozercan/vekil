@@ -312,26 +312,30 @@ func validateClaudeForwardedArgs(args []string) error {
 func claudePermissionModeRequested(args []string) bool {
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
-		if arg == "--" {
-			return false
-		}
-		mode := ""
 		switch {
+		case arg == "--":
+			return false
 		case arg == "--dangerously-skip-permissions", arg == "--allow-dangerously-skip-permissions":
 			return true
-		case arg == "--permission-mode" && index+1 < len(args):
-			index++
-			mode = args[index]
 		case strings.HasPrefix(arg, "--permission-mode="):
-			mode = strings.TrimPrefix(arg, "--permission-mode=")
-		default:
-			continue
-		}
-		if mode = strings.TrimSpace(mode); mode != "manual" && mode != "default" {
-			return true
+			if claudeNonDefaultPermissionMode(strings.TrimPrefix(arg, "--permission-mode=")) {
+				return true
+			}
+		case claudeOptionRequiresValue(arg) && index+1 < len(args):
+			// Claude Code takes the next argument as this option's value even
+			// when it looks like a flag, so a prompt cannot request a mode.
+			index++
+			if arg == "--permission-mode" && claudeNonDefaultPermissionMode(args[index]) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+func claudeNonDefaultPermissionMode(mode string) bool {
+	mode = strings.TrimSpace(mode)
+	return mode != "manual" && mode != "default"
 }
 
 func claudeNonAgentCommand(command string) bool {

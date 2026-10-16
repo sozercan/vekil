@@ -846,7 +846,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
 			return nil, err
 		}
-		if err := setup.addProviderModels(providerID, h.filterAllowedModels(result.models)); err != nil {
+		if err := setup.addProviderModels(providerID, h.installedProviderModels(setup, providerID, result.models)); err != nil {
 			return nil, err
 		}
 	}
@@ -881,7 +881,7 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
 			return err
 		}
-		replacements[providerID] = h.filterAllowedModels(result.models)
+		replacements[providerID] = h.installedProviderModels(setup, providerID, result.models)
 	}
 	if err := setup.replaceProviderModelsBatch(replacements); err != nil {
 		return err
@@ -1067,21 +1067,61 @@ func (h *ProxyHandler) providerMayExposeAllowedModelForSetup(setup *providerSetu
 	return false
 }
 
-// auxiliaryModelAllowed admits an auxiliary model only when a provider already
-// in the allowed-model scope owns it. A model not yet discovered belongs to the
-// default provider when that provider discovers models dynamically, matching
-// how request routing resolves it before discovery.
-func (h *ProxyHandler) auxiliaryModelAllowed(setup *providerSetup, model string) bool {
-	if _, ok := h.auxiliaryModels[model]; !ok {
+// auxiliaryModelAllowed admits an auxiliary model only when every provider a
+// request for it can reach is already in the allowed-model scope. Ownership is
+// resolved the way dispatch resolves it: a public route first, with all of its
+// targets in scope, then a catalog model, then, for a model not yet
+// discovered, the default provider when it discovers models dynamically.
+func (h *ProxyHandler) auxiliaryModelAllowed(setup *providerSetup, model, endpoint string) bool {
+	if _, ok := h.auxiliaryModels[model]; !ok || len(h.allowedModels) == 0 {
 		return false
 	}
-	var provider *providerRuntime
-	if owner, ok := setup.lookupModel(model); ok {
-		provider = setup.providerByID(owner.providerID)
-	} else if defaultProvider := setup.defaultProvider(); providerUsesDynamicModels(defaultProvider) {
-		provider = defaultProvider
+	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+		return false
 	}
-	return provider != nil && h.providerWithinAllowedModelScope(provider)
+	if route, ok := h.resolveModelRouteForRequest(model, endpoint); ok {
+		if route == nil || len(route.targets) == 0 {
+			return false
+		}
+		for _, target := range route.targets {
+			if !h.providerWithinAllowedModelScope(target.provider) {
+				return false
+			}
+		}
+		return true
+	}
+	if owner, ok := setup.lookupModel(model); ok {
+		return h.providerWithinAllowedModelScope(setup.providerByID(owner.providerID))
+	}
+	defaultProvider := setup.defaultProvider()
+	return providerUsesDynamicModels(defaultProvider) && h.providerWithinAllowedModelScope(defaultProvider)
+}
+
+// installedProviderModels is the part of a provider catalog kept for routing:
+// the allowed models plus the auxiliary models this provider serves when it
+// also serves an allowed model and no other provider or route claims the
+// auxiliary ID. Public listings keep filtering by the allowed models alone.
+func (h *ProxyHandler) installedProviderModels(setup *providerSetup, providerID string, models []providerModel) []providerModel {
+	installed := h.filterAllowedModels(models)
+	if len(h.allowedModels) == 0 || len(h.auxiliaryModels) == 0 || len(installed) == 0 {
+		return installed
+	}
+	for _, model := range models {
+		if _, ok := h.auxiliaryModels[model.publicID]; !ok {
+			continue
+		}
+		if owner, ok := setup.lookupModel(model.publicID); ok && owner.providerID != providerID {
+			continue
+		}
+		if route, ok := setup.lookupRoute(model.publicID); ok && route != nil && !route.legacy {
+			continue
+		}
+		if entry, ok := setup.lookupPublicModelEntry(model.publicID); ok && entry != nil && entry.kind == publicEntryPolicy {
+			continue
+		}
+		installed = append(installed, model)
+	}
+	return installed
 }
 
 func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime) bool {
@@ -2060,7 +2100,7 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	if _, ok := h.allowedModels[model]; ok {
 		return true
 	}
-	if h.auxiliaryModelAllowed(setup, model) {
+	if h.auxiliaryModelAllowed(setup, model, endpoint) {
 		return true
 	}
 	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {

@@ -62,6 +62,118 @@ func TestAuxiliaryModelIsAdmittedThroughTheInScopeProvider(t *testing.T) {
 	}
 }
 
+func newAuxiliaryCopilotCatalog(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != providerEndpointModels {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":[{"id":"claude-opus-5.5","supported_endpoints":["/v1/messages"]},{"id":"claude-sonnet-5","supported_endpoints":["/v1/messages"]}]}`)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestAuxiliaryModelInstalledForNonDefaultCopilotProvider(t *testing.T) {
+	copilot := newAuxiliaryCopilotCatalog(t)
+	for _, tc := range []struct {
+		name         string
+		staticModels []string
+		wantAdmitted bool
+	}{
+		{name: "copilot serves the classifier", staticModels: []string{"anthropic-model"}, wantAdmitted: true},
+		{name: "another provider already claims the classifier", staticModels: []string{"anthropic-model", "claude-sonnet-5"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			static := make([]ProviderModelConfig, 0, len(tc.staticModels))
+			for _, model := range tc.staticModels {
+				static = append(static, ProviderModelConfig{PublicID: model, Deployment: model, Endpoints: []string{"/v1/messages"}})
+			}
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithCopilotBaseURL(copilot.URL), WithDeferredDynamicProviderModelValidation(true),
+				WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+					{ID: "anthropic", Type: "anthropic-compatible", Default: true, BaseURL: "https://anthropic.example.test", AuthType: "none", Models: static},
+					{ID: "copilot", Type: "copilot"},
+				}}),
+				WithAllowedModels("claude-opus-5.5"), WithAuxiliaryModels("claude-sonnet-5"))
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			if err := h.ValidateDynamicProviderModels(context.Background()); err != nil {
+				t.Fatalf("ValidateDynamicProviderModels() error = %v", err)
+			}
+			if got := h.modelAllowedForRequest("claude-sonnet-5", providerEndpointMessages); got != tc.wantAdmitted {
+				t.Fatalf("classifier admitted = %v, want %v", got, tc.wantAdmitted)
+			}
+			recorder := httptest.NewRecorder()
+			h.HandleModels(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+			var listing struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &listing); err != nil {
+				t.Fatalf("decode /v1/models %s: %v", recorder.Body.String(), err)
+			}
+			for _, model := range listing.Data {
+				if model.ID == "claude-sonnet-5" {
+					t.Fatalf("/v1/models listed the auxiliary model: %s", recorder.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestAuxiliaryModelRequiresEveryExplicitRouteTargetInScope(t *testing.T) {
+	copilot := newAuxiliaryCopilotCatalog(t)
+	for _, tc := range []struct {
+		name         string
+		targets      []ModelRouteTargetConfig
+		wantAdmitted bool
+	}{
+		{name: "same provider", targets: []ModelRouteTargetConfig{{ID: "copilot", Provider: "copilot", UpstreamModel: "claude-sonnet-5"}}, wantAdmitted: true},
+		{name: "other provider", targets: []ModelRouteTargetConfig{{ID: "other", Provider: "other", UpstreamModel: "sonnet"}}},
+		{name: "out-of-scope failover", targets: []ModelRouteTargetConfig{
+			{ID: "copilot", Provider: "copilot", UpstreamModel: "claude-sonnet-5"},
+			{ID: "other", Provider: "other", UpstreamModel: "sonnet"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithCopilotBaseURL(copilot.URL), WithDeferredDynamicProviderModelValidation(true),
+				WithStateBindingsConfig(StateBindingsConfig{Mode: "memory"}),
+				WithProvidersConfig(ProvidersConfig{
+					SchemaVersion: ProvidersConfigSchemaVersion2,
+					Providers: []ProviderConfig{
+						{ID: "copilot", Type: "copilot", Default: true},
+						{ID: "other", Type: "openai-compatible", BaseURL: "https://other.example.test/v1", AuthType: "none",
+							Models: []ProviderModelConfig{{PublicID: "other-model", Deployment: "other-model", Endpoints: []string{providerEndpointChatCompletions}}}},
+					},
+					ModelRoutes: []ModelRouteConfig{{
+						ID:        "classifier",
+						PublicID:  "claude-sonnet-5",
+						Endpoints: []string{providerEndpointChatCompletions},
+						Targets:   tc.targets,
+					}},
+				}),
+				WithAllowedModels("claude-opus-5.5"), WithAuxiliaryModels("claude-sonnet-5"))
+			if err != nil {
+				t.Fatalf("NewProxyHandler() error = %v", err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			if err := h.ValidateDynamicProviderModels(context.Background()); err != nil {
+				t.Fatalf("ValidateDynamicProviderModels() error = %v", err)
+			}
+			if got := h.modelAllowedForRequest("claude-sonnet-5", providerEndpointMessages); got != tc.wantAdmitted {
+				t.Fatalf("classifier admitted = %v, want %v", got, tc.wantAdmitted)
+			}
+		})
+	}
+}
+
 func TestAuxiliaryModelDoesNotWidenProviderScope(t *testing.T) {
 	copilot := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected Copilot request %s %s", r.Method, r.URL.Path)

@@ -655,6 +655,8 @@ func TestClaudeAdapterScrubsSubprocessesUnlessPermissionModeRequested(t *testing
 		{args: []string{"--permission-mode", "default", "--print", "hello"}, wantScrub: "1"},
 		{args: []string{"--permission-mode=default", "--print", "hello"}, wantScrub: "1"},
 		{args: []string{"--", "--dangerously-skip-permissions"}, wantScrub: "1"},
+		{args: []string{"--system-prompt", "--permission-mode=auto", "--print", "hello"}, wantScrub: "1"},
+		{args: []string{"--append-system-prompt", "--dangerously-skip-permissions", "--print", "hello"}, wantScrub: "1"},
 		{args: []string{"--permission-mode", "auto", "--print", "hello"}, wantScrub: "0"},
 		{args: []string{"--permission-mode=bypassPermissions"}, wantScrub: "0"},
 		{args: []string{"--permission-mode", "acceptEdits"}, wantScrub: "0"},
