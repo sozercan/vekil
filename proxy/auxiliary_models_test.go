@@ -70,7 +70,7 @@ func newAuxiliaryCopilotCatalog(t *testing.T) *httptest.Server {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = io.WriteString(w, `{"data":[{"id":"claude-opus-5.5","supported_endpoints":["/v1/messages"]},{"id":"claude-sonnet-5","supported_endpoints":["/v1/messages"]}]}`)
+		_, _ = io.WriteString(w, `{"data":[{"id":"claude-opus-5.5","supported_endpoints":["/v1/messages","/chat/completions"]},{"id":"claude-sonnet-5","supported_endpoints":["/v1/messages","/chat/completions"]}]}`)
 	}))
 	t.Cleanup(server.Close)
 	return server
@@ -124,6 +124,62 @@ func TestAuxiliaryModelInstalledForNonDefaultCopilotProvider(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestAuxiliaryModelThatIsAlsoPinnedIsInstalledOnce(t *testing.T) {
+	copilot := newAuxiliaryCopilotCatalog(t)
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithCopilotBaseURL(copilot.URL), WithDeferredDynamicProviderModelValidation(true),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{
+			{ID: "anthropic", Type: "anthropic-compatible", Default: true, BaseURL: "https://anthropic.example.test", AuthType: "none",
+				Models: []ProviderModelConfig{{PublicID: "anthropic-model", Deployment: "anthropic-model", Endpoints: []string{"/v1/messages"}}}},
+			{ID: "copilot", Type: "copilot"},
+		}}),
+		WithAllowedModels("claude-sonnet-5"), WithAuxiliaryModels("claude-sonnet-5"))
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if err := h.ValidateDynamicProviderModels(context.Background()); err != nil {
+		t.Fatalf("ValidateDynamicProviderModels() error = %v; pinning the auxiliary model must not duplicate it", err)
+	}
+	recorder := httptest.NewRecorder()
+	h.HandleModels(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusOK || strings.Count(recorder.Body.String(), `"id":"claude-sonnet-5"`) != 1 {
+		t.Fatalf("/v1/models status/body = %d/%s, want claude-sonnet-5 listed once", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestAuxiliaryModelInstalledForPinnedExplicitRouteProvider(t *testing.T) {
+	copilot := newAuxiliaryCopilotCatalog(t)
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithCopilotBaseURL(copilot.URL), WithDeferredDynamicProviderModelValidation(true),
+		WithStateBindingsConfig(StateBindingsConfig{Mode: "memory"}),
+		WithProvidersConfig(ProvidersConfig{
+			SchemaVersion: ProvidersConfigSchemaVersion2,
+			Providers: []ProviderConfig{
+				{ID: "anthropic", Type: "anthropic-compatible", Default: true, BaseURL: "https://anthropic.example.test", AuthType: "none",
+					Models: []ProviderModelConfig{{PublicID: "anthropic-model", Deployment: "anthropic-model", Endpoints: []string{"/v1/messages"}}}},
+				{ID: "copilot", Type: "copilot"},
+			},
+			ModelRoutes: []ModelRouteConfig{{
+				ID:        "my-opus",
+				PublicID:  "my-opus",
+				Endpoints: []string{providerEndpointChatCompletions},
+				Targets:   []ModelRouteTargetConfig{{ID: "copilot", Provider: "copilot", UpstreamModel: "claude-opus-5.5"}},
+			}},
+		}),
+		WithAllowedModels("my-opus"), WithAuxiliaryModels("claude-sonnet-5"))
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if err := h.ValidateDynamicProviderModels(context.Background()); err != nil {
+		t.Fatalf("ValidateDynamicProviderModels() error = %v", err)
+	}
+	if !h.modelAllowedForRequest("claude-sonnet-5", providerEndpointMessages) {
+		t.Fatal("classifier was not admitted through the provider serving the pinned route")
 	}
 }
 

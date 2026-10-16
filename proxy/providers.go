@@ -1103,12 +1103,16 @@ func (h *ProxyHandler) auxiliaryModelAllowed(setup *providerSetup, model, endpoi
 // auxiliary ID. Public listings keep filtering by the allowed models alone.
 func (h *ProxyHandler) installedProviderModels(setup *providerSetup, providerID string, models []providerModel) []providerModel {
 	installed := h.filterAllowedModels(models)
-	if len(h.allowedModels) == 0 || len(h.auxiliaryModels) == 0 || len(installed) == 0 {
+	if len(h.allowedModels) == 0 || len(h.auxiliaryModels) == 0 ||
+		(len(installed) == 0 && !h.allowedRouteTargetsProvider(setup, providerID)) {
 		return installed
 	}
 	for _, model := range models {
 		if _, ok := h.auxiliaryModels[model.publicID]; !ok {
 			continue
+		}
+		if _, allowed := h.allowedModels[model.publicID]; allowed {
+			continue // already installed as an allowed model
 		}
 		if owner, ok := setup.lookupModel(model.publicID); ok && owner.providerID != providerID {
 			continue
@@ -1122,6 +1126,32 @@ func (h *ProxyHandler) installedProviderModels(setup *providerSetup, providerID 
 		installed = append(installed, model)
 	}
 	return installed
+}
+
+// allowedRouteTargetsProvider reports whether an allowed explicit route or
+// policy profile in setup dispatches to providerID, whose catalog then holds
+// upstream models rather than the allowed public IDs.
+func (h *ProxyHandler) allowedRouteTargetsProvider(setup *providerSetup, providerID string) bool {
+	provider := setup.providerByID(providerID)
+	if provider == nil {
+		return false
+	}
+	for model := range h.allowedModels {
+		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			if h.policyEntryReferencesProviderForSetup(entry, provider, setup) {
+				return true
+			}
+			continue
+		}
+		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+			for _, target := range route.targets {
+				if target.provider != nil && target.provider.id == providerID {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime) bool {
