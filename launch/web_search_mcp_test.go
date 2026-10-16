@@ -125,14 +125,8 @@ func TestClaudeAdapterRegistersWebSearchMCPServer(t *testing.T) {
 		args[3] != "fix the bug" || args[4] != "--print" {
 		t.Fatalf("Args = %#v, want settings, single-value --mcp-config=, then forwarded args", args)
 	}
+	// writePrivateTempFile's platform-specific permission tests cover privacy.
 	settingsPath, mcpPath := args[1], strings.TrimPrefix(args[2], "--mcp-config=")
-	info, err := os.Stat(mcpPath)
-	if err != nil {
-		t.Fatalf("stat MCP config: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		t.Fatalf("MCP config mode = %v, want owner-only", perm)
-	}
 	body, err := os.ReadFile(mcpPath)
 	if err != nil {
 		t.Fatalf("read MCP config: %v", err)
