@@ -302,6 +302,7 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 			proxy.WithProvidersConfig(providersCfg),
 			proxy.WithStateBindingsConfig(opts.stateBindings),
 			proxy.WithAllowedModels(opts.model),
+			proxy.WithAuxiliaryModels(launch.AuxiliaryModels(target.adapter)...),
 			proxy.WithPolicyRoutingMode(opts.policyRoutingMode),
 			proxy.WithDeferredDynamicProviderModelValidation(true),
 		),

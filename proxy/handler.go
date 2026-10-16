@@ -255,6 +255,7 @@ type ProxyHandler struct {
 	azureTraffic                     azureTrafficController
 	providersConfig                  ProvidersConfig
 	allowedModels                    map[string]struct{}
+	auxiliaryModels                  map[string]struct{}
 	providersState                   *providerSetup
 	deferDynamicProviderModelRefresh bool
 	policyRoutingMode                PolicyRoutingMode
@@ -934,6 +935,23 @@ func WithAllowedModels(models ...string) Option {
 		for _, model := range models {
 			if model = strings.TrimSpace(model); model != "" {
 				h.allowedModels[model] = struct{}{}
+			}
+		}
+	}
+}
+
+// WithAuxiliaryModels admits models an agent needs beside the allowed ones,
+// such as Claude Code's auto-mode classifier. Each is admitted only when a
+// provider already serving an allowed model owns it, so auxiliary models never
+// widen provider discovery or credentials.
+func WithAuxiliaryModels(models ...string) Option {
+	return func(h *ProxyHandler) {
+		if h.auxiliaryModels == nil {
+			h.auxiliaryModels = make(map[string]struct{})
+		}
+		for _, model := range models {
+			if model = strings.TrimSpace(model); model != "" {
+				h.auxiliaryModels[model] = struct{}{}
 			}
 		}
 	}

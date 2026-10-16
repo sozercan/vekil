@@ -1067,6 +1067,23 @@ func (h *ProxyHandler) providerMayExposeAllowedModelForSetup(setup *providerSetu
 	return false
 }
 
+// auxiliaryModelAllowed admits an auxiliary model only when a provider already
+// in the allowed-model scope owns it. A model not yet discovered belongs to the
+// default provider when that provider discovers models dynamically, matching
+// how request routing resolves it before discovery.
+func (h *ProxyHandler) auxiliaryModelAllowed(setup *providerSetup, model string) bool {
+	if _, ok := h.auxiliaryModels[model]; !ok {
+		return false
+	}
+	var provider *providerRuntime
+	if owner, ok := setup.lookupModel(model); ok {
+		provider = setup.providerByID(owner.providerID)
+	} else if defaultProvider := setup.defaultProvider(); providerUsesDynamicModels(defaultProvider) {
+		provider = defaultProvider
+	}
+	return provider != nil && h.providerWithinAllowedModelScope(provider)
+}
+
 func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime) bool {
 	if provider == nil {
 		return false
@@ -2041,6 +2058,9 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 		return true
 	}
 	if _, ok := h.allowedModels[model]; ok {
+		return true
+	}
+	if h.auxiliaryModelAllowed(setup, model) {
 		return true
 	}
 	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {

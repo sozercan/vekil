@@ -12,6 +12,11 @@ import (
 // trailing version pair Anthropic spells with a hyphen (claude-opus-5-5).
 var dottedClaudeModelIDRegex = regexp.MustCompile(`^(claude(?:-[^-]+)*)-(\d+)\.(\d+)$`)
 
+// ClaudeAutoModeClassifierModel is the model Claude Code's auto mode uses to
+// approve actions. Claude Code refuses Opus 5.5, Sonnet 5.5 and Opus 5 for
+// that role, so a pinned launch keeps Claude Code's Sonnet 5 default.
+const ClaudeAutoModeClassifierModel = "claude-sonnet-5"
+
 // ClaudeAdapter prepares Claude Code to use Vekil's Anthropic-compatible
 // surface without modifying the user's Claude settings.
 type ClaudeAdapter struct{}
@@ -68,12 +73,19 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		return PreparedProcess{}, err
 	}
 
+	// Subprocess scrubbing keeps the local proxy token out of tool
+	// subprocesses, but Claude Code then forces the default permission mode.
+	// An explicitly requested mode turns scrubbing off so the mode applies.
+	subprocessScrub := "1"
+	if claudePermissionModeRequested(input.ForwardedArgs) {
+		subprocessScrub = "0"
+	}
 	envSet := map[string]string{
 		"ANTHROPIC_BASE_URL":                   baseURL,
 		"ANTHROPIC_AUTH_TOKEN":                 localToken,
 		"ANTHROPIC_API_KEY":                    "",
 		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "vekil",
-		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":     "1",
+		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":     subprocessScrub,
 	}
 	if hasModel {
 		name := strings.TrimSpace(input.Model.Name)
@@ -91,6 +103,7 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 			"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":        name,
 			"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed through Vekil",
 			"CLAUDE_CODE_SUBAGENT_MODEL":                clientModel,
+			"CLAUDE_CODE_AUTO_MODE_MODEL":               ClaudeAutoModeClassifierModel,
 		} {
 			envSet[key] = value
 		}
@@ -207,6 +220,8 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 
 func (ClaudeAdapter) usesWebSearchMCP() bool { return true }
 
+func (ClaudeAdapter) auxiliaryModels() []string { return []string{ClaudeAutoModeClassifierModel} }
+
 // writeClaudeWebSearchMCPConfig registers the launch proxy's web search MCP
 // server, authenticated with the local proxy token, so the GitHub credential
 // stays inside Vekil.
@@ -233,9 +248,6 @@ func validateClaudeVersion(executable resolvedExecutable, environment []string) 
 }
 
 func validateClaudeForwardedArgs(args []string) error {
-	if err := validateClaudePermissionArgs(args); err != nil {
-		return err
-	}
 	expectValue := false
 	seenPositional := false
 	printMode := false
@@ -295,40 +307,31 @@ func validateClaudeForwardedArgs(args []string) error {
 	return nil
 }
 
-func validateClaudePermissionArgs(args []string) error {
+// claudePermissionModeRequested reports whether args ask Claude Code for a
+// permission mode other than the default.
+func claudePermissionModeRequested(args []string) bool {
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		if arg == "--" {
-			return nil
+			return false
 		}
+		mode := ""
 		switch {
 		case arg == "--dangerously-skip-permissions", arg == "--allow-dangerously-skip-permissions":
-			return fmt.Errorf(
-				"claude permission bypass %q is not supported by the managed Vekil launcher; use explicit --allowed-tools/--disallowed-tools rules",
-				arg,
-			)
-		case arg == "--permission-mode":
-			if index+1 >= len(args) {
-				return nil
-			}
+			return true
+		case arg == "--permission-mode" && index+1 < len(args):
 			index++
-			if mode := strings.TrimSpace(args[index]); mode != "manual" && mode != "default" {
-				return unsupportedClaudePermissionMode(mode)
-			}
+			mode = args[index]
 		case strings.HasPrefix(arg, "--permission-mode="):
-			if mode := strings.TrimSpace(strings.TrimPrefix(arg, "--permission-mode=")); mode != "manual" && mode != "default" {
-				return unsupportedClaudePermissionMode(mode)
-			}
+			mode = strings.TrimPrefix(arg, "--permission-mode=")
+		default:
+			continue
+		}
+		if mode = strings.TrimSpace(mode); mode != "manual" && mode != "default" {
+			return true
 		}
 	}
-	return nil
-}
-
-func unsupportedClaudePermissionMode(mode string) error {
-	return fmt.Errorf(
-		"claude permission mode %q is not supported by the managed Vekil launcher while subprocess credential scrubbing is enabled; use default/manual mode with explicit --allowed-tools/--disallowed-tools rules",
-		mode,
-	)
+	return false
 }
 
 func claudeNonAgentCommand(command string) bool {

@@ -91,6 +91,7 @@ func TestClaudeAdapterPrepare(t *testing.T) {
 		"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":        "Claude Public",
 		"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed through Vekil",
 		"CLAUDE_CODE_SUBAGENT_MODEL":                "claude-public",
+		"CLAUDE_CODE_AUTO_MODE_MODEL":               "claude-sonnet-5",
 		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":      "vekil",
 		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":          "1",
 	} {
@@ -111,6 +112,7 @@ func TestClaudeAdapterPrepare(t *testing.T) {
 		"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":        "Claude Public",
 		"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed through Vekil",
 		"CLAUDE_CODE_SUBAGENT_MODEL":                "claude-public",
+		"CLAUDE_CODE_AUTO_MODE_MODEL":               "claude-sonnet-5",
 		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":      "vekil",
 		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":          "1",
 	} {
@@ -199,6 +201,7 @@ func TestClaudeAdapterPrepareWithoutModelUsesClaudeDefault(t *testing.T) {
 		"ANTHROPIC_SMALL_FAST_MODEL",
 		"ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
 		"CLAUDE_CODE_SUBAGENT_MODEL",
+		"CLAUDE_CODE_AUTO_MODE_MODEL",
 	}
 	for _, key := range modelKeys {
 		if _, ok := prepared.EnvSet[key]; ok {
@@ -505,13 +508,6 @@ func TestClaudeAdapterRejectsUnsupportedForwardedModes(t *testing.T) {
 		{name: "model", args: []string{"--model", "responses-only"}, want: "model or custom-agent overrides"},
 		{name: "model after prompt", args: []string{"--print", "hello", "--model", "responses-only"}, want: "model or custom-agent overrides"},
 		{name: "fallback model", args: []string{"--fallback-model", "other"}, want: "model or custom-agent overrides"},
-		{name: "dangerous permission bypass", args: []string{"--dangerously-skip-permissions"}, want: "permission bypass"},
-		{name: "enable dangerous permission bypass", args: []string{"--allow-dangerously-skip-permissions"}, want: "permission bypass"},
-		{name: "accept edits permission mode", args: []string{"--permission-mode", "acceptEdits"}, want: "permission mode"},
-		{name: "auto permission mode", args: []string{"--permission-mode=auto"}, want: "permission mode"},
-		{name: "bypass permission mode", args: []string{"--permission-mode", "bypassPermissions"}, want: "permission mode"},
-		{name: "dont ask permission mode", args: []string{"--permission-mode=dontAsk"}, want: "permission mode"},
-		{name: "plan permission mode", args: []string{"--permission-mode", "plan"}, want: "permission mode"},
 		{name: "custom agent", args: []string{"--agent", "reviewer"}, want: "model or custom-agent overrides"},
 		{name: "subcommand after option", args: []string{"--verbose", "remote-control"}, want: "agent-management commands"},
 		{name: "subcommand after max turns", args: []string{"--max-turns", "5", "agents"}, want: "agent-management commands"},
@@ -626,9 +622,6 @@ func TestClaudeAdapterRejectsUnsafeForegroundSessionCombinations(t *testing.T) {
 		{name: "model after resume", args: []string{"--resume", sessionID, "--model", "other"}, want: "model or custom-agent overrides"},
 		{name: "model before resume", args: []string{"--model", "other", "--resume", sessionID}, want: "model or custom-agent overrides"},
 		{name: "agent after continue", args: []string{"--continue", "--agent", "reviewer"}, want: "model or custom-agent overrides"},
-		{name: "permission bypass after resume", args: []string{"--resume", sessionID, "--dangerously-skip-permissions"}, want: "permission bypass"},
-		{name: "permission bypass before resume", args: []string{"--dangerously-skip-permissions", "--resume", sessionID}, want: "permission bypass"},
-		{name: "permission mode after resume", args: []string{"--resume", sessionID, "--permission-mode", "bypassPermissions"}, want: "permission mode"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -647,32 +640,45 @@ func TestClaudeAdapterRejectsUnsafeForegroundSessionCombinations(t *testing.T) {
 	}
 }
 
-func TestClaudeAdapterAllowsDefaultPermissionModes(t *testing.T) {
+func TestClaudeAdapterScrubsSubprocessesUnlessPermissionModeRequested(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable(): %v", err)
 	}
-	for _, args := range [][]string{
-		{"--permission-mode", "manual", "--print", "hello"},
-		{"--permission-mode=manual", "--print", "hello"},
-		{"--permission-mode", "default", "--print", "hello"},
-		{"--permission-mode=default", "--print", "hello"},
+	for _, tc := range []struct {
+		args      []string
+		wantScrub string
+	}{
+		{args: []string{"--print", "hello"}, wantScrub: "1"},
+		{args: []string{"--permission-mode", "manual", "--print", "hello"}, wantScrub: "1"},
+		{args: []string{"--permission-mode=manual", "--print", "hello"}, wantScrub: "1"},
+		{args: []string{"--permission-mode", "default", "--print", "hello"}, wantScrub: "1"},
+		{args: []string{"--permission-mode=default", "--print", "hello"}, wantScrub: "1"},
+		{args: []string{"--", "--dangerously-skip-permissions"}, wantScrub: "1"},
+		{args: []string{"--permission-mode", "auto", "--print", "hello"}, wantScrub: "0"},
+		{args: []string{"--permission-mode=bypassPermissions"}, wantScrub: "0"},
+		{args: []string{"--permission-mode", "acceptEdits"}, wantScrub: "0"},
+		{args: []string{"--resume", "56d7498d-6b2e-47ca-92a6-92ddee84ab25", "--dangerously-skip-permissions"}, wantScrub: "0"},
+		{args: []string{"--allow-dangerously-skip-permissions"}, wantScrub: "0"},
 	} {
 		prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
 			BaseURL:       "http://127.0.0.1:43210",
 			Model:         ModelInfo{ID: "claude-public", SupportedEndpoints: []string{"/chat/completions"}},
 			Binary:        binary,
 			LocalToken:    "test-token-placeholder",
-			ForwardedArgs: args,
+			ForwardedArgs: tc.args,
 		})
 		if err != nil {
-			t.Fatalf("Prepare(%#v) error = %v", args, err)
+			t.Fatalf("Prepare(%#v) error = %v", tc.args, err)
 		}
 		if prepared.Cleanup != nil {
 			defer func(cleanup func() error) { _ = cleanup() }(prepared.Cleanup)
 		}
-		if got := prepared.Args[len(prepared.Args)-len(args):]; !reflect.DeepEqual(got, args) {
-			t.Fatalf("forwarded args = %#v, want %#v", got, args)
+		if got := prepared.Args[len(prepared.Args)-len(tc.args):]; !reflect.DeepEqual(got, tc.args) {
+			t.Fatalf("forwarded args = %#v, want %#v", got, tc.args)
+		}
+		if got := prepared.EnvSet["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]; got != tc.wantScrub {
+			t.Fatalf("Prepare(%#v) CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = %q, want %q", tc.args, got, tc.wantScrub)
 		}
 	}
 }

@@ -201,17 +201,27 @@ the session starts without search.
 Provider-specific Bedrock, Vertex, Foundry, Mantle, AWS, OAuth, and custom-header
 values are removed from the child environment. Gateway catalog discovery is
 disabled. With `--model`, the proxy independently rejects requests for any model
-other than the selected public model. Without `--model`, Claude resolves its
-normal configured or built-in default and the proxy accepts requests across the
-global public model namespace.
+other than the selected public model and Claude Code's auto-mode classifier.
+Without `--model`, Claude resolves its normal configured or built-in default and
+the proxy accepts requests across the global public model namespace.
 
-Subprocess credential scrubbing keeps Claude in its default (`manual`)
-permission mode. Current Claude Code releases ignore other explicit permission
-modes when that hardening is enabled, so Vekil rejects
-`--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, and
-non-`manual` `--permission-mode` values instead of silently weakening or
-misrepresenting the requested policy. Use `--allowed-tools` and
-`--disallowed-tools` for managed non-interactive tool permissions.
+Auto mode asks a classifier model to approve each action, and Claude Code
+refuses Opus 5.5, Sonnet 5.5, and Opus 5 for that role. A pinned launch sets
+`CLAUDE_CODE_AUTO_MODE_MODEL=claude-sonnet-5`, Claude Code's own default. The
+proxy admits that model only when the provider serving the pinned model also
+owns it, so the classifier never adds providers or credentials. Otherwise auto
+mode cannot approve actions and blocks them. Classifier requests are billed by
+that provider like any other request.
+
+By default the launcher enables Claude Code's subprocess credential scrubbing,
+which keeps the local proxy token out of tool subprocesses. Claude Code then
+starts in its default (`manual`) permission mode whatever the settings say,
+although modes can still be switched inside the session. Passing a non-default
+`--permission-mode` (such as `auto`, `acceptEdits`, or `bypassPermissions`),
+`--dangerously-skip-permissions`, or `--allow-dangerously-skip-permissions`
+turns scrubbing off for that launch so the requested mode applies; tool
+subprocesses can then read the session's local proxy token from their
+environment.
 
 Policy-routing public model IDs (`owned_by: vekil-policy`) are supported in
 pinned mode. Vekil translates Claude's Messages and count-token requests to the
@@ -249,8 +259,8 @@ Responses-backed bridge are accepted only for a single-target baseline in
 launcher topology) or use sticky ingress to the replay-owning replica.
 
 Foreground conversation selection, continuation, and fork arguments are
-forwarded. Settings-source, detached or remote session, model/fallback,
-incompatible permission-mode, and custom-agent overrides remain rejected. Use
+forwarded. Settings-source, detached or remote session, model/fallback, and
+custom-agent overrides remain rejected. Use
 the launcher-level `--model` to pin a model; otherwise model selection remains
 delegated to Claude's normal default.
 

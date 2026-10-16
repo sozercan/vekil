@@ -79,6 +79,21 @@ type webSearchMCPAdapter interface {
 	usesWebSearchMCP() bool
 }
 
+// auxiliaryModelAdapter is implemented by adapters whose agent calls models
+// beside the pinned one, such as Claude Code's auto-mode classifier.
+type auxiliaryModelAdapter interface {
+	auxiliaryModels() []string
+}
+
+// AuxiliaryModels returns the models adapter's agent calls beside the pinned
+// model. A launch proxy admits them only through providers already in scope.
+func AuxiliaryModels(adapter Adapter) []string {
+	if auxiliary, ok := adapter.(auxiliaryModelAdapter); ok {
+		return auxiliary.auxiliaryModels()
+	}
+	return nil
+}
+
 // messagesAliasProxy is implemented by launch proxies that can confirm an
 // alternate spelling of the pinned model is served like the model itself.
 type messagesAliasProxy interface {
