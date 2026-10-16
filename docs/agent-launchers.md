@@ -173,7 +173,16 @@ cleanup. Its routing values include:
 - when pinned, `ANTHROPIC_MODEL`, the default Haiku, Sonnet, Opus, and Fable
   aliases, `CLAUDE_CODE_SUBAGENT_MODEL`, and the custom model-picker entry;
 - host-managed provider and subprocess-environment scrubbing flags;
+- a `WebSearch` deny rule, because no Vekil Claude route serves Anthropic's
+  hosted web search tool;
 - disabled background-task, agent-view, cron, agent-team, tmux, and remote-control surfaces.
+
+Pinned Claude IDs with a dotted version, such as Copilot's `claude-opus-5.5`,
+are given to Claude Code in Anthropic's hyphenated spelling (`claude-opus-5-5`);
+Vekil's Messages surface resolves that alias to the same public model. Claude
+Code shapes requests from the model ID and would otherwise send
+`thinking.type: disabled` on side queries such as WebFetch, which adaptive-only
+models reject. Policy model IDs are passed unchanged.
 
 Provider-specific Bedrock, Vertex, Foundry, Mantle, AWS, OAuth, and custom-header
 values are removed from the child environment. Gateway catalog discovery is

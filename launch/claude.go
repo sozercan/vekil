@@ -3,14 +3,33 @@ package launch
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// dottedClaudeModelIDRegex matches catalog IDs such as claude-opus-5.5 whose
+// trailing version pair Anthropic spells with a hyphen (claude-opus-5-5).
+var dottedClaudeModelIDRegex = regexp.MustCompile(`^(claude(?:-[^-]+)*)-(\d+)\.(\d+)$`)
 
 // ClaudeAdapter prepares Claude Code to use Vekil's Anthropic-compatible
 // surface without modifying the user's Claude settings.
 type ClaudeAdapter struct{}
 
 func (ClaudeAdapter) Name() string { return "claude" }
+
+// claudeCodeModelID returns the model ID Claude Code should send. Claude Code
+// shapes requests from Anthropic's model IDs and misreads dotted catalog IDs as
+// older models; for claude-opus-5.5 it then sends thinking.type "disabled" on
+// side queries, which the upstream rejects. Vekil's Messages surface resolves
+// the hyphenated alias back to the public ID. Policy IDs resolve only by exact
+// public ID, so they stay unchanged.
+func claudeCodeModelID(model ModelInfo) string {
+	id := strings.TrimSpace(model.ID)
+	if strings.TrimSpace(model.OwnedBy) == PolicyModelOwner {
+		return id
+	}
+	return dottedClaudeModelIDRegex.ReplaceAllString(id, "${1}-${2}-${3}")
+}
 
 func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	model := strings.TrimSpace(input.Model.ID)
@@ -57,16 +76,17 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		if name == "" {
 			name = model
 		}
+		clientModel := claudeCodeModelID(input.Model)
 		for key, value := range map[string]string{
-			"ANTHROPIC_MODEL":                           model,
-			"ANTHROPIC_DEFAULT_HAIKU_MODEL":             model,
-			"ANTHROPIC_DEFAULT_SONNET_MODEL":            model,
-			"ANTHROPIC_DEFAULT_OPUS_MODEL":              model,
-			"ANTHROPIC_DEFAULT_FABLE_MODEL":             model,
-			"ANTHROPIC_CUSTOM_MODEL_OPTION":             model,
+			"ANTHROPIC_MODEL":                           clientModel,
+			"ANTHROPIC_DEFAULT_HAIKU_MODEL":             clientModel,
+			"ANTHROPIC_DEFAULT_SONNET_MODEL":            clientModel,
+			"ANTHROPIC_DEFAULT_OPUS_MODEL":              clientModel,
+			"ANTHROPIC_DEFAULT_FABLE_MODEL":             clientModel,
+			"ANTHROPIC_CUSTOM_MODEL_OPTION":             clientModel,
 			"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":        name,
 			"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed through Vekil",
-			"CLAUDE_CODE_SUBAGENT_MODEL":                model,
+			"CLAUDE_CODE_SUBAGENT_MODEL":                clientModel,
 		} {
 			envSet[key] = value
 		}
@@ -133,6 +153,10 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	settingsJSON, err := json.Marshal(map[string]interface{}{
 		"env":                  settingsEnv,
 		"disableRemoteControl": true,
+		// Vekil's Claude routes do not serve Anthropic's hosted web_search
+		// tool (Copilot rejects it and Chat translation carries only function
+		// tools), so hide WebSearch instead of letting every call fail.
+		"permissions": map[string][]string{"deny": {"WebSearch"}},
 	})
 	if err != nil {
 		return PreparedProcess{}, fmt.Errorf("build managed Claude settings: %w", err)

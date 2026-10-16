@@ -52,9 +52,15 @@ func TestClaudeAdapterPrepare(t *testing.T) {
 	var managedSettings struct {
 		Env                  map[string]string `json:"env"`
 		DisableRemoteControl bool              `json:"disableRemoteControl"`
+		Permissions          struct {
+			Deny []string `json:"deny"`
+		} `json:"permissions"`
 	}
 	if err := json.Unmarshal(settingsBody, &managedSettings); err != nil {
 		t.Fatalf("decode managed settings: %v", err)
+	}
+	if !reflect.DeepEqual(managedSettings.Permissions.Deny, []string{"WebSearch"}) {
+		t.Fatalf("managed permissions.deny = %#v, want WebSearch", managedSettings.Permissions.Deny)
 	}
 	for _, key := range []string{"ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FOUNDRY_AUTH_TOKEN", "ANTHROPIC_AWS_API_KEY", "MY_PROVIDER_TOKEN"} {
 		if value, ok := managedSettings.Env[key]; !ok || value != "" {
@@ -384,6 +390,62 @@ func TestClaudeAdapterAcceptsPolicyOwnedChatModel(t *testing.T) {
 	}
 	if got := prepared.EnvSet["ANTHROPIC_MODEL"]; got != "policy-public" {
 		t.Fatalf("ANTHROPIC_MODEL = %q, want policy-public", got)
+	}
+}
+
+func TestClaudeAdapterUsesAnthropicSpellingForDottedClaudeIDs(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	for _, tc := range []struct {
+		id      string
+		ownedBy string
+		want    string
+	}{
+		{id: "claude-opus-5.5", want: "claude-opus-5-5"},
+		{id: "claude-haiku-4.5", want: "claude-haiku-4-5"},
+		{id: "claude-sonnet-5", want: "claude-sonnet-5"},
+		{id: "claude-opus-4.6-1m", want: "claude-opus-4.6-1m"},
+		{id: "gpt-5.4", want: "gpt-5.4"},
+		{id: "claude-auto-1.0", ownedBy: PolicyModelOwner, want: "claude-auto-1.0"},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			prepared, err := (ClaudeAdapter{}).Prepare(PrepareInput{
+				BaseURL: "http://127.0.0.1:43210",
+				Model: ModelInfo{
+					ID:                 tc.id,
+					Name:               "Display Name",
+					OwnedBy:            tc.ownedBy,
+					SupportedEndpoints: []string{"/v1/messages"},
+				},
+				Binary:     binary,
+				LocalToken: "test-token-placeholder",
+				DryRun:     true,
+			})
+			if err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			if prepared.Cleanup != nil {
+				t.Cleanup(func() { _ = prepared.Cleanup() })
+			}
+			for _, key := range []string{
+				"ANTHROPIC_MODEL",
+				"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+				"ANTHROPIC_DEFAULT_SONNET_MODEL",
+				"ANTHROPIC_DEFAULT_OPUS_MODEL",
+				"ANTHROPIC_DEFAULT_FABLE_MODEL",
+				"ANTHROPIC_CUSTOM_MODEL_OPTION",
+				"CLAUDE_CODE_SUBAGENT_MODEL",
+			} {
+				if got := prepared.EnvSet[key]; got != tc.want {
+					t.Errorf("EnvSet[%q] = %q, want %q", key, got, tc.want)
+				}
+			}
+			if got := prepared.EnvSet["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"]; got != "Display Name" {
+				t.Errorf("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = %q, want Display Name", got)
+			}
+		})
 	}
 }
 
