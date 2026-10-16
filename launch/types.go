@@ -61,7 +61,16 @@ type PrepareInput struct {
 	SensitiveEnv  []string
 	Environment   []string
 	NoProxy       string
-	DryRun        bool
+	// WebSearchMCPURL is the launch proxy's web search MCP endpoint, set only
+	// when the proxy confirmed the tool is available.
+	WebSearchMCPURL string
+	DryRun          bool
+}
+
+// webSearchMCPAdapter is implemented by adapters that register Vekil's web
+// search MCP endpoint with their agent; the launcher probes it only for them.
+type webSearchMCPAdapter interface {
+	usesWebSearchMCP() bool
 }
 
 // PreparedProcess is an agent-specific process plan. EnvSet and EnvUnset are

@@ -184,6 +184,17 @@ Code shapes requests from the model ID and would otherwise send
 `thinking.type: disabled` on side queries such as WebFetch, which adaptive-only
 models reject. Policy model IDs are passed unchanged.
 
+Web search comes from Copilot instead. When the launch proxy uses Copilot, the
+launcher probes Vekil's [`POST /mcp/web-search`](api.md#post-mcpweb-search)
+endpoint. If GitHub currently offers web search to the Copilot credential, the
+launcher registers that endpoint as the `vekil` MCP server through an
+owner-only temporary `--mcp-config` file authenticated with the local proxy
+token, so the GitHub credential stays in Vekil. The model sees
+`mcp__vekil__web_search`, an AI search agent's answer with cited sources. Like
+WebSearch, it asks for permission unless allowed, for example with
+`--allowed-tools mcp__vekil__web_search`. A failed probe prints a warning and
+the session starts without search.
+
 Provider-specific Bedrock, Vertex, Foundry, Mantle, AWS, OAuth, and custom-header
 values are removed from the child environment. Gateway catalog discovery is
 disabled. With `--model`, the proxy independently rejects requests for any model

@@ -2,6 +2,7 @@ package launch
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -155,7 +156,8 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		"disableRemoteControl": true,
 		// Vekil's Claude routes do not serve Anthropic's hosted web_search
 		// tool (Copilot rejects it and Chat translation carries only function
-		// tools), so hide WebSearch instead of letting every call fail.
+		// tools), so hide WebSearch instead of letting every call fail. Search
+		// comes from Vekil's web search MCP server when it is available.
 		"permissions": map[string][]string{"deny": {"WebSearch"}},
 	})
 	if err != nil {
@@ -167,6 +169,18 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	}
 	args := append([]string(nil), executable.prefixArgs...)
 	args = append(args, "--settings", settingsPath)
+	if webSearchURL := strings.TrimSpace(input.WebSearchMCPURL); webSearchURL != "" {
+		mcpPath, mcpCleanup, err := writeClaudeWebSearchMCPConfig(webSearchURL, localToken)
+		if err != nil {
+			_ = cleanup()
+			return PreparedProcess{}, err
+		}
+		settingsCleanup := cleanup
+		cleanup = func() error { return errors.Join(mcpCleanup(), settingsCleanup()) }
+		// The = form keeps a variadic --mcp-config from consuming forwarded
+		// positional arguments.
+		args = append(args, "--mcp-config="+mcpPath)
+	}
 	args = append(args, input.ForwardedArgs...)
 
 	prepared := PreparedProcess{
@@ -182,6 +196,29 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		)
 	}
 	return prepared, nil
+}
+
+func (ClaudeAdapter) usesWebSearchMCP() bool { return true }
+
+// writeClaudeWebSearchMCPConfig registers the launch proxy's web search MCP
+// server, authenticated with the local proxy token, so the GitHub credential
+// stays inside Vekil.
+func writeClaudeWebSearchMCPConfig(url, localToken string) (string, func() error, error) {
+	config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{
+		"vekil": map[string]any{
+			"type":    "http",
+			"url":     url,
+			"headers": map[string]string{"Authorization": "Bearer " + localToken},
+		},
+	}})
+	if err != nil {
+		return "", nil, fmt.Errorf("build Claude MCP config: %w", err)
+	}
+	path, cleanup, err := writePrivateTempFile("vekil-claude-mcp-", config)
+	if err != nil {
+		return "", nil, fmt.Errorf("write Claude MCP config: %w", err)
+	}
+	return path, cleanup, nil
 }
 
 func validateClaudeVersion(executable resolvedExecutable, environment []string) error {

@@ -433,6 +433,7 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
 	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
 	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
+	mux.HandleFunc("POST /mcp/web-search", handler.HandleWebSearchMCP)
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)

@@ -197,6 +197,15 @@ Responses requests are routed by public `model` ID. A version-2 `priority_failov
 
 See [OpenAI Responses Compatibility](responses.md) for compaction, oversized replay, transient streaming failure, websocket semantics, and the separation between native Responses and Chat-over-Responses compatibility. See [Responses WebSocket Bridge](responses-websocket.md) for websocket tuning flags.
 
+## `POST /mcp/web-search`
+
+A stateless, single-tool MCP server (Streamable HTTP with JSON responses) whose only tool, `web_search`, is backed by the `web_search` tool on GitHub's hosted MCP server (`https://api.githubcopilot.com/mcp/`). It exists only while Vekil uses a Copilot provider and returns `404` otherwise. Vekil calls GitHub with the Copilot provider's GitHub credential; clients authenticate to Vekil like any other route and never receive that credential. `GET` returns `405` because the server sends no unsolicited messages. Requests that carry an `Origin` header, which browsers always send, are rejected with `403` so web pages cannot spend the user's search.
+
+- `tools/list` offers `web_search` only while GitHub's server offers it to that credential; plan or organization policy can withhold it.
+- `tools/call` forwards only the `query` argument and returns GitHub's result unchanged: a search agent's Bing-grounded answer with cited sources, not page text. Upstream failures become tool results with `isError: true`; any other tool name is rejected.
+
+GitHub does not document this tool, so treat it as best-effort. Calls are not counted in traffic dashboard totals. `vekil launch claude` registers this endpoint automatically; see [Agent launchers](agent-launchers.md#claude-code).
+
 ## `GET /healthz`
 
 Returns `{"status":"ok"}` as soon as the HTTP listener is serving. This endpoint reports process liveness and does not wait for provider authentication.
