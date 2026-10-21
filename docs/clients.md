@@ -29,7 +29,7 @@ Tool continuations use one of two minted ID shapes, including Anthropic `tool_us
 
 Preserve the complete assistant tool-call list in its original order; tool-result messages for a complete parallel group may be returned in any order. When only a non-empty subset of results is available, Vekil replays only the matching calls because the verified upstream rejected a complete call group paired with partial outputs; missing calls may be reissued.
 
-Replay state is byte-bounded, process-local, and expires one hour after the tool-call response. It is lost on restart. If a continuation receives `responses_replay_state_missing`, restart that assistant tool-call turn rather than inventing or editing the call ID.
+Replay state is byte-bounded, process-local, and expires one hour after the tool-call response. It is lost on restart. If a continuation receives `responses_replay_state_missing`, restart that assistant tool-call turn rather than inventing or editing the call ID. Anthropic clients such as Claude Code can switch a session to a direct model ID without a `/responses` backend; the continuation keeps the IDs on native Chat, where Vekil cannot restore the earlier hidden reasoning.
 
 Claude Code and Gemini `countTokens` calls also use the selected model's native backend. Anthropic counting requires reported upstream usage; Gemini counting retains its existing cache and can use a local estimate for transient failures or missing usage.
 

@@ -80,7 +80,7 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
-	upstreamCtx, _, _, err = h.withChatExecutionRoute(upstreamCtx, r.Context(), translated.PublicModel, chatBody)
+	upstreamCtx, _, _, err = h.withChatExecutionRoute(upstreamCtx, r.Context(), translated.PublicModel, chatBody, false)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return

@@ -1026,37 +1026,46 @@ func explicitRouteHasChatBackend(route *modelRoute, endpoint string) bool {
 	return false
 }
 
-func explicitChatExecutionEndpoint(route *modelRoute, body []byte) (string, error) {
+// explicitChatExecutionEndpoint pins replay IDs to Responses, the only backend through which
+// this process can restore the hidden output behind them. A route with no Responses backend at
+// all, such as after a model switch onto a Chat-only target, cannot restore it here; with
+// degradeReplay the IDs then continue verbatim on native Chat and degraded reports that.
+func explicitChatExecutionEndpoint(route *modelRoute, body []byte, degradeReplay bool) (endpoint string, degraded bool, err error) {
 	if route == nil || route.legacy {
-		return "", nil
+		return "", false, nil
 	}
-	if chatRequestContainsResponsesReplayID(body) {
-		if explicitRouteHasChatBackend(route, providerEndpointResponses) {
-			return providerEndpointResponses, nil
-		}
-		return "", missingResponsesChatReplayError()
+	replay := chatRequestContainsResponsesReplayID(body)
+	hasResponses := explicitRouteHasChatBackend(route, providerEndpointResponses)
+	switch {
+	case replay && hasResponses:
+		return providerEndpointResponses, false, nil
+	case replay && !degradeReplay:
+		return "", false, missingResponsesChatReplayError()
+	case explicitRouteHasChatBackend(route, providerEndpointChatCompletions):
+		return providerEndpointChatCompletions, replay, nil
+	case hasResponses:
+		return providerEndpointResponses, false, nil
 	}
-	if explicitRouteHasChatBackend(route, providerEndpointChatCompletions) {
-		return providerEndpointChatCompletions, nil
-	}
-	if explicitRouteHasChatBackend(route, providerEndpointResponses) {
-		return providerEndpointResponses, nil
-	}
-	return "", &providerRequestError{
+	return "", false, &providerRequestError{
 		statusCode: http.StatusBadRequest,
 		err:        fmt.Errorf("model %q does not support %s", route.public.id, providerEndpointChatCompletions),
 	}
 }
 
-func policyAwareChatExecutionEndpoint(operation *routeOperation, body []byte) (string, error) {
+func policyAwareChatExecutionEndpoint(operation *routeOperation, body []byte, degradeReplay bool) (string, error) {
 	if operation == nil {
-		return explicitChatExecutionEndpoint(nil, body)
+		endpoint, _, err := explicitChatExecutionEndpoint(nil, body, degradeReplay)
+		return endpoint, err
 	}
-	if plan, planned := operation.policyPlan(); planned && chatRequestContainsResponsesReplayID(body) &&
+	plan, planned := operation.policyPlan()
+	if planned && chatRequestContainsResponsesReplayID(body) &&
 		plan.allowsResponsesReplayPassthrough() && explicitRouteHasChatBackend(operation.route, providerEndpointChatCompletions) {
 		return providerEndpointChatCompletions, nil
 	}
-	return explicitChatExecutionEndpoint(operation.route, body)
+	// The planner already bound or refused this replay by its recorded tier; a policy
+	// operation keeps that fail-closed binding rather than continuing without it.
+	endpoint, _, err := explicitChatExecutionEndpoint(operation.route, body, degradeReplay && !planned)
+	return endpoint, err
 }
 
 func explicitResolvedChatRouteForTarget(route *modelRoute, target targetBinding, endpoint string, backend chatBackend) resolvedChatRoute {
@@ -1150,10 +1159,15 @@ func withPlannedChatOperation(ctx, inbound context.Context, plan chatOperationPl
 	return withRouteOperation(ctx, operation), operation, nil
 }
 
-func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, model string, body []byte) (context.Context, *routeOperation, *modelRoute, error) {
+// anthropicDegradesUnrestorableReplay is Anthropic ingress's replay fallback switch, shared
+// by its Messages and count-token paths. Endpoint admission and execution must read the same
+// value, or one refuses a turn the other would have continued.
+const anthropicDegradesUnrestorableReplay = true
+
+func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, model string, body []byte, degradeReplay bool) (context.Context, *routeOperation, *modelRoute, error) {
 	if operation := routeOperationFromContext(ctx); operation != nil {
 		if _, planned := operation.policyPlan(); planned {
-			endpoint, err := policyAwareChatExecutionEndpoint(operation, body)
+			endpoint, err := policyAwareChatExecutionEndpoint(operation, body, degradeReplay)
 			if err != nil {
 				backend := chatBackendNativeChat
 				if endpoint == providerEndpointResponses || operation.route.supportsEndpoint(providerEndpointResponses) && !operation.route.supportsEndpoint(providerEndpointChatCompletions) {
@@ -1169,7 +1183,7 @@ func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, mode
 	if !known || route == nil || route.legacy {
 		return ctx, nil, route, nil
 	}
-	endpoint, err := explicitChatExecutionEndpoint(route, body)
+	endpoint, degraded, err := explicitChatExecutionEndpoint(route, body, degradeReplay)
 	if err != nil {
 		backend := chatBackendNativeChat
 		if endpoint == providerEndpointResponses || route.supportsEndpoint(providerEndpointResponses) && !route.supportsEndpoint(providerEndpointChatCompletions) {
@@ -1178,7 +1192,13 @@ func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, mode
 		attachExplicitChatExecutionErrorRoute(err, route, targetBinding{}, endpoint, backend)
 		return ctx, nil, route, err
 	}
-	return h.withExplicitRouteOperation(ctx, inbound, model, endpoint)
+	ctx, operation, admitted, err := h.withExplicitRouteOperation(ctx, inbound, model, endpoint)
+	if err == nil && degraded {
+		// Logged once per admitted request: execution can re-enter endpoint selection,
+		// as the count-token probe's protocol-recovery retry does.
+		h.logNativeChatReplayDegrade("", route.public.id, route.public.routeID)
+	}
+	return ctx, operation, admitted, err
 }
 
 func convertedExplicitChatSafeHeaders(resp *http.Response, publicModel string) http.Header {
@@ -1401,13 +1421,8 @@ func (h *ProxyHandler) executeChatCompletionsForRequestedModel(ctx context.Conte
 	if err != nil {
 		return chatExecutionResult{}, err
 	}
-	if chatRequestContainsResponsesReplayID(body) && route.backend != chatBackendResponses {
-		if !chatRouteAllowsEndpoint(route.provider, route.owner, route.known, providerEndpointResponses) {
-			replayErr := missingResponsesChatReplayError()
-			attachChatExecutionErrorRoute(replayErr, route)
-			return chatExecutionResult{}, replayErr
-		}
-		route = newResolvedChatRoute(route.provider, route.owner, route.known, requestedModel, providerEndpointResponses, chatBackendResponses)
+	if route, err = h.resolveReplayChatBackend(route, body, options.DegradeUnrestorableReplay); err != nil {
+		return chatExecutionResult{}, err
 	}
 
 	var result chatExecutionResult
@@ -1435,7 +1450,7 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 		}
 	}
 
-	endpoint, err := policyAwareChatExecutionEndpoint(operation, body)
+	endpoint, err := policyAwareChatExecutionEndpoint(operation, body, options.DegradeUnrestorableReplay)
 	if err != nil {
 		attachExplicitChatExecutionErrorRoute(err, operation.route, targetBinding{}, endpoint, chatBackendNativeChat)
 		return chatExecutionResult{}, err
@@ -2543,7 +2558,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	defer upstreamCancel()
 	upstreamCtx = withAnthropicChatCacheControl(upstreamCtx, &req)
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
-	upstreamCtx, routeOperation, route, err := h.withChatExecutionRoute(upstreamCtx, r.Context(), providerModel, oaiBody)
+	upstreamCtx, routeOperation, route, err := h.withChatExecutionRoute(upstreamCtx, r.Context(), providerModel, oaiBody, anthropicDegradesUnrestorableReplay)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -2579,7 +2594,7 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, oaiBody, mode, chatExecutionOptions{
 		CarriedReasoning:          carriedReasoning,
 		CarrierInbound:            inbound,
-		DegradeUnrestorableReplay: true,
+		DegradeUnrestorableReplay: anthropicDegradesUnrestorableReplay,
 	}, providerModel)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
@@ -2963,7 +2978,7 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	defer upstreamCancel()
 	upstreamCtx = withAnthropicChatCacheControl(upstreamCtx, &req)
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
-	upstreamCtx, routeOperation, _, err := h.withChatExecutionRoute(upstreamCtx, suppressRouteAttemptStats(r.Context()), providerModel, policyBody)
+	upstreamCtx, routeOperation, _, err := h.withChatExecutionRoute(upstreamCtx, suppressRouteAttemptStats(r.Context()), providerModel, policyBody, anthropicDegradesUnrestorableReplay)
 	if err != nil {
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
@@ -3074,7 +3089,7 @@ func (h *ProxyHandler) runAnthropicCountTokensProbeWithContext(upstreamCtx, obse
 		ResponsesDropSamplingParams:  true,
 		ResponsesUsageOnly:           true,
 		CarriedReasoning:             carried,
-		DegradeUnrestorableReplay:    true,
+		DegradeUnrestorableReplay:    anthropicDegradesUnrestorableReplay,
 	}
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, body, chatCompletionsMode{}, options, probeReq.Model)
 	if err != nil {
@@ -3471,7 +3486,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
-	upstreamCtx, routeOperation, route, err := h.withChatExecutionRoute(upstreamCtx, r.Context(), requestedModel, bodyBytes)
+	upstreamCtx, routeOperation, route, err := h.withChatExecutionRoute(upstreamCtx, r.Context(), requestedModel, bodyBytes, false)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return

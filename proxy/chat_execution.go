@@ -56,7 +56,8 @@ type chatExecutionOptions struct {
 	ResponsesUsageOnly           bool
 	CarriedReasoning             map[string]carriedReplay
 	CarrierInbound               carrierInbound
-	// Set by the Anthropic surfaces only. See responsesChatRequestOptions.
+	// Set by the Anthropic surfaces only. See responsesChatRequestOptions; it also lets
+	// replay IDs continue on native Chat when the target has no Responses backend.
 	DegradeUnrestorableReplay bool
 }
 
@@ -96,29 +97,47 @@ func (r chatExecutionResult) carrier() carriedTurn {
 }
 
 func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
-	model := extractRequestModel(chatBody)
-	route, err := h.resolveChatRoute(ctx, model)
-	if err != nil {
-		return chatExecutionResult{}, err
+	return h.executeChatCompletionsForRequestedModel(ctx, chatBody, options, extractRequestModel(chatBody))
+}
+
+// resolveReplayChatBackend pins replay IDs to Responses, the only backend through which this
+// process can restore the hidden output behind them. A known model whose catalog or
+// configuration offers no Responses backend never will; with degrade the IDs continue verbatim
+// on its native Chat backend instead, where only a downstream Vekil bridge that minted them
+// could restore them. An unknown model is no such proof: its catalog may only be unreachable.
+func (h *ProxyHandler) resolveReplayChatBackend(route resolvedChatRoute, chatBody []byte, degrade bool) (resolvedChatRoute, error) {
+	if route.backend == chatBackendResponses || !chatRequestContainsResponsesReplayID(chatBody) {
+		return route, nil
 	}
-	if chatRequestContainsResponsesReplayID(chatBody) && route.backend != chatBackendResponses {
-		if !chatRouteAllowsEndpoint(route.provider, route.owner, route.known, providerEndpointResponses) {
-			replayErr := missingResponsesChatReplayError()
-			attachChatExecutionErrorRoute(replayErr, route)
-			return chatExecutionResult{}, replayErr
-		}
-		route = newResolvedChatRoute(route.provider, route.owner, route.known, model, providerEndpointResponses, chatBackendResponses)
+	switch {
+	case chatRouteAllowsEndpoint(route.provider, route.owner, route.known, providerEndpointResponses):
+		return newResolvedChatRoute(route.provider, route.owner, route.known, route.publicModel, providerEndpointResponses, chatBackendResponses), nil
+	case degrade && route.known:
+		h.logNativeChatReplayDegrade(route.provider.id, route.publicModel, "")
+		return route, nil
+	default:
+		replayErr := missingResponsesChatReplayError()
+		attachChatExecutionErrorRoute(replayErr, route)
+		return route, replayErr
 	}
-	var result chatExecutionResult
-	if route.backend == chatBackendNativeChat {
-		result, err = h.executeResolvedNativeChat(ctx, route, chatBody)
-	} else {
-		result, err = h.executeResolvedResponsesChat(ctx, route, chatBody, options)
+}
+
+// This process cannot restore the hidden reasoning behind replay IDs it forwards to native
+// Chat, and nothing client-visible says so, so each continuation is logged. Route identity
+// only -- never call IDs or content.
+func (h *ProxyHandler) logNativeChatReplayDegrade(providerID, model, routeID string) {
+	if h == nil || h.log == nil {
+		return
 	}
-	if err != nil {
-		attachChatExecutionErrorRoute(err, route)
+	var fields []logger.Field
+	if providerID != "" {
+		fields = append(fields, logger.F("provider", providerID))
 	}
-	return result, err
+	fields = append(fields, logger.F("model", model))
+	if routeID != "" {
+		fields = append(fields, logger.F("route_id", routeID))
+	}
+	h.log.Info("forwarding responses replay IDs to native Chat without restoring their reasoning", fields...)
 }
 
 func rawJSONFieldsExactOrFold(object map[string]json.RawMessage, name string) []json.RawMessage {
