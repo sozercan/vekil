@@ -14,11 +14,29 @@ The native-Chat path supports the existing text/image/tool-use subset, system me
 
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
+Translated tool results may contain text and base64/URL images. Text stays in the
+`tool` message, with numbered slots marking the original image positions. Images
+become separate user-role attachments after the available contiguous tool-result
+run, including results split across consecutive source messages. Fixed numeric
+labels bind attachments to tool-result order without copying arbitrary tool text
+or client-chosen IDs into user-role instructions. This is an attachment lowering,
+not native tool-role multimodality; native Messages forwarding keeps its upstream
+content contract. It does not make incomplete native-Chat tool histories valid or
+change Responses-backed partial-result replay. Other nested content types and
+malformed image sources fail before a translated send. Policy-routed requests
+remain text/function-tool only.
+
+Tool-result URL sources require HTTP(S) with a host; scheme matching is
+case-insensitive. Original URL strings are preserved, including escaped path and
+query bytes. Base64 images use their separate source type; URL-typed data URLs
+remain rejected.
+
 Supported Anthropic cache hints map to Copilot message/tool
-`copilot_cache_control` only when the original cache boundary can be represented
-exactly. Unrepresentable boundaries fail explicitly. Tool-result images and other
-unsupported multimodal tool results also fail before a translated Chat send;
-native Messages forwarding retains its upstream content contract.
+`copilot_cache_control` only when the original source-prefix boundary can be
+represented exactly, including deferred images. Hints crossing reordered sibling
+results or real content fail explicitly rather than moving or dropping the
+boundary. Tool-output optimization retains its actual tool-role text; cache
+mapping does not reconstruct the original output.
 
 ## `POST /v1/messages/count_tokens` (Anthropic)
 

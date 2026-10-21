@@ -73,11 +73,11 @@ func completedResponsesChatPolicyReplayEnd(messages []json.RawMessage, resultInd
 		message.Role = strings.TrimSpace(message.Role)
 		switch message.Role {
 		case "user":
-			content, err := translateChatMessageContent(message.Content, "user", index)
+			content, err := decodePolicyFactTextContent(message.Content, "content")
 			if err != nil {
 				return 0
 			}
-			if strings.TrimSpace(assistantHistoryText(content)) != "" && allCallsHaveResults && lastReply >= 0 && lastToolResult < lastReply {
+			if strings.TrimSpace(content) != "" && allCallsHaveResults && lastReply >= 0 && lastToolResult < lastReply {
 				completedEnd = index
 			}
 		case "assistant":

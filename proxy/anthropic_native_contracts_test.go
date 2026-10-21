@@ -125,16 +125,50 @@ func TestHandleAnthropicNativeCountTokensKeepsAccessChecksAndStripsCarriers(t *t
 	}
 }
 
-func TestAnthropicToolResultImagesFailBeforeChatDispatch(t *testing.T) {
-	for _, content := range []string{
-		`[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]`,
-		`[{"type":"text","text":"screen capture"},{"type":"image","source":{"type":"url","url":"https://example.test/screen.png"}}]`,
+func TestAnthropicToolResultImagesLoweredToUserMessage(t *testing.T) {
+	for _, tc := range []struct {
+		content string
+		url     string
+		text    string
+	}{
+		{content: `[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]`, url: "data:image/png;base64,aW1hZ2U="},
+		{content: `[{"type":"text","text":"screen capture"},{"type":"image","source":{"type":"url","url":"https://example.test/screen.png"}}]`, url: "https://example.test/screen.png", text: "screen capture"},
 	} {
 		for _, count := range []bool{false, true} {
-			t.Run(content+map[bool]string{true: " count", false: " messages"}[count], func(t *testing.T) {
+			t.Run(tc.url+map[bool]string{true: " count", false: " messages"}[count], func(t *testing.T) {
 				var calls atomic.Int32
-				h := newTestProxyHandler(t, func(w http.ResponseWriter, _ *http.Request) { calls.Add(1); w.WriteHeader(http.StatusNoContent) })
-				body := `{"model":"chat-model","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_image","name":"capture","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_image","content":` + content + `}]}]}`
+				h := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					var request models.OpenAIRequest
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					if err := validateCompleteImageToolHistory(request.Messages); err != nil {
+						t.Error(err)
+					}
+					if len(request.Messages) != 3 || request.Messages[1].ToolCallID != "call_image" || request.Messages[2].Role != "user" {
+						t.Errorf("image projection = %+v", request.Messages)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					toolText := jsonRawString(request.Messages[1].Content)
+					if !strings.Contains(toolText, tc.text) || !strings.Contains(toolText, "[Tool result 1 image 1]") {
+						t.Errorf("tool text/slot = %q", toolText)
+					}
+					var parts []models.OpenAIContentPart
+					if err := json.Unmarshal(request.Messages[2].Content, &parts); err != nil || len(parts) != 2 || parts[1].ImageURL == nil || parts[1].ImageURL.URL != tc.url {
+						t.Errorf("image attachment = %s, error=%v", request.Messages[2].Content, err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					if strings.Contains(string(request.Messages[2].Content), "call_image") || tc.text != "" && strings.Contains(string(request.Messages[2].Content), tc.text) {
+						t.Errorf("tool-controlled text or ID was promoted into a user attachment: %s", request.Messages[2].Content)
+					}
+					writeToolImageContractChatReply(w, request)
+				})
+				body := `{"model":"chat-model","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_image","name":"capture","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_image","content":` + tc.content + `}]}]}`
 				recorder := httptest.NewRecorder()
 				req := httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(body))
 				if count {
@@ -142,7 +176,7 @@ func TestAnthropicToolResultImagesFailBeforeChatDispatch(t *testing.T) {
 				} else {
 					h.HandleAnthropicMessages(recorder, req)
 				}
-				if recorder.Code != http.StatusBadRequest || calls.Load() != 0 || !strings.Contains(recorder.Body.String(), "unsupported tool_result content block") {
+				if recorder.Code != http.StatusOK || calls.Load() != 1 {
 					t.Fatalf("status/calls = %d/%d: %s", recorder.Code, calls.Load(), recorder.Body.String())
 				}
 			})
