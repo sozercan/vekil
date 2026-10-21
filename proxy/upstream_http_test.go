@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -1692,5 +1693,262 @@ func TestWriteOpenAIPassthroughObservingUsage_Non200PlainCopy(t *testing.T) {
 	}
 	if summary.totalTokens != nil {
 		t.Fatal("usage should not be observed on a non-200 response")
+	}
+}
+
+func chatImagePart(n int) string {
+	return fmt.Sprintf(`{"type":"image_url","image_url":{"url":"data:image/png;base64,IMG%d"}}`, n)
+}
+
+// chatContentSummary flattens each message's content into its image URLs and text, in order.
+func chatContentSummary(t *testing.T, body []byte) [][]string {
+	t.Helper()
+	var payload struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode Chat body: %v: %s", err, body)
+	}
+	summary := make([][]string, 0, len(payload.Messages))
+	for _, message := range payload.Messages {
+		var text string
+		if json.Unmarshal(message.Content, &text) == nil {
+			summary = append(summary, []string{text})
+			continue
+		}
+		var flattened []string
+		for _, part := range decodeContentParts(t, message.Content) {
+			switch {
+			case part.Type == "image_url" && part.ImageURL != nil:
+				flattened = append(flattened, part.ImageURL.URL)
+			case part.Text != nil:
+				flattened = append(flattened, *part.Text)
+			}
+		}
+		summary = append(summary, flattened)
+	}
+	return summary
+}
+
+func TestOmitChatImagesBeyondOwnerLimit_KeepsNewestImages(t *testing.T) {
+	body := []byte(`{"model":"gemini-test","messages":[` +
+		`{"role":"user","content":[{"type":"text","text":"first <b>&</b>"},` + chatImagePart(1) + `]},` +
+		`{"role":"assistant","content":"looking"},` +
+		`{"role":"user","content":[` + chatImagePart(2) + `,` + chatImagePart(3) + `,{"type":"text","text":"latest"}]}],"stream":true}`)
+	owners := []providerModel{{maxPromptImages: 2}}
+
+	got, omitted := omitChatImagesBeyondOwnerLimit(body, providerEndpointChatCompletions, owners)
+	const placeholder = `{"type":"text","text":"[image omitted: the model accepts at most 2 images per request]"}`
+	want := [][]string{
+		{"first <b>&</b>", "[image omitted: the model accepts at most 2 images per request]"},
+		{"looking"},
+		{"data:image/png;base64,IMG2", "data:image/png;base64,IMG3", "latest"},
+	}
+	if summary := chatContentSummary(t, got); omitted != 1 || !reflect.DeepEqual(summary, want) {
+		t.Fatalf("content = %q omitted = %d, want the oldest image omitted and the newest two kept in order: %q", summary, omitted, want)
+	}
+	// Only the omitted part changes: key order, unescaped text and the rest of the body
+	// reach the upstream exactly as the client sent them.
+	if wantBytes := strings.Replace(string(body), chatImagePart(1), placeholder, 1); string(got) != wantBytes {
+		t.Fatalf("body = %s, want only the oldest image part replaced: %s", got, wantBytes)
+	}
+
+	for name, tc := range map[string]struct {
+		body   []byte
+		path   string
+		owners []providerModel
+	}{
+		"Responses":    {body, providerEndpointResponses, owners},
+		"no owner":     {body, providerEndpointChatCompletions, nil},
+		"no limit":     {body, providerEndpointChatCompletions, []providerModel{{}}},
+		"within limit": {body, providerEndpointChatCompletions, []providerModel{{maxPromptImages: 3}}},
+		"case-variant type key": {[]byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"keep me","Type":"image_url"},` +
+			chatImagePart(1) + `,` + chatImagePart(2) + `]}]}`), providerEndpointChatCompletions, owners},
+		"repeated content key": {[]byte(`{"messages":[{"role":"user","content":"shadow","content":[` +
+			chatImagePart(1) + `,` + chatImagePart(2) + `,` + chatImagePart(3) + `]}]}`), providerEndpointChatCompletions, owners},
+		"repeated messages key": {[]byte(`{"messages":[],"messages":[{"role":"user","content":[` +
+			chatImagePart(1) + `,` + chatImagePart(2) + `,` + chatImagePart(3) + `]}]}`), providerEndpointChatCompletions, owners},
+	} {
+		if unchanged, omitted := omitChatImagesBeyondOwnerLimit(tc.body, tc.path, tc.owners); omitted != 0 || string(unchanged) != string(tc.body) {
+			t.Fatalf("%s: body changed to %s (omitted %d), want original %s", name, unchanged, omitted, tc.body)
+		}
+	}
+}
+
+func TestProviderModelMaxPromptImagesFromRawHonorsOnlyGoogle(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{name: "Google", raw: `{"vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":10}}}}`, want: 10},
+		{name: "vendor case and spacing", raw: `{"vendor":" google ","capabilities":{"limits":{"vision":{"max_prompt_images":10}}}}`, want: 10},
+		{name: "integral float", raw: `{"vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":10.0}}}}`, want: 10},
+		{name: "integral exponent", raw: `{"vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":1e1}}}}`, want: 10},
+		{name: "OpenAI declares one", raw: `{"vendor":"OpenAI","capabilities":{"limits":{"vision":{"max_prompt_images":1}}}}`},
+		{name: "Anthropic declares five", raw: `{"vendor":"Anthropic","capabilities":{"limits":{"vision":{"max_prompt_images":5}}}}`},
+		{name: "Google without a vision limit", raw: `{"vendor":"Google","capabilities":{"limits":{"max_prompt_tokens":1000}}}`},
+		{name: "negative limit", raw: `{"vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":-3}}}}`},
+		{name: "fractional limit", raw: `{"vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":10.5}}}}`},
+		{name: "overflowing limit", raw: `{"vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":99999999999999999999}}}}`},
+		{name: "malformed limit", raw: `{"vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":"10"}}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := providerModelMaxPromptImagesFromRaw(json.RawMessage(tc.raw)); got != tc.want {
+				t.Fatalf("providerModelMaxPromptImagesFromRaw(%s) = %d, want %d", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// A catalog may list one ID more than once. The limit follows the entry whose metadata is
+// published, and still applies when only another entry for that ID declares it.
+func TestDecodeProviderModelsDuplicateGoogleEntriesKeepImageLimit(t *testing.T) {
+	provider := &providerRuntime{id: "copilot", kind: providerTypeCopilot, paths: providerEndpointPolicyFor(providerTypeCopilot).defaultEndpointPaths()}
+	entry := func(state string, limit string) json.RawMessage {
+		vision := ""
+		if limit != "" {
+			vision = `,"capabilities":{"limits":{"vision":{"max_prompt_images":` + limit + `}}}`
+		}
+		return json.RawMessage(`{"id":"gemini-dup","vendor":"Google","supported_endpoints":["/chat/completions"],"policy":{"state":"` + state + `"}` + vision + `}`)
+	}
+	for _, tc := range []struct {
+		name string
+		data []json.RawMessage
+		want int
+	}{
+		{name: "disabled first entry without a limit", data: []json.RawMessage{entry("disabled", ""), entry("enabled", "2")}, want: 2},
+		{name: "disabled first entry with another limit", data: []json.RawMessage{entry("disabled", "1"), entry("enabled", "10")}, want: 10},
+		{name: "only the later enabled entry declares it", data: []json.RawMessage{entry("enabled", ""), entry("enabled", "2")}, want: 2},
+		{name: "identical entries", data: []json.RawMessage{entry("enabled", "10"), entry("enabled", "10")}, want: 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{"data": tc.data})
+			if err != nil {
+				t.Fatal(err)
+			}
+			models, err := decodeProviderModelsFromBody(provider, body)
+			if err != nil {
+				t.Fatalf("decodeProviderModelsFromBody() error = %v", err)
+			}
+			if len(models) != 1 || models[0].disabled || models[0].maxPromptImages != tc.want {
+				t.Fatalf("decoded models = %+v, want one enabled model limited to %d images", models, tc.want)
+			}
+		})
+	}
+}
+
+// A static metadata overlay for a discovered model keeps the catalog's image limit.
+func TestMergeDiscoveredProviderModelsWithStaticConfigKeepsImageLimit(t *testing.T) {
+	provider := &providerRuntime{
+		id:            "relay",
+		kind:          providerTypeOpenAICompatible,
+		paths:         providerEndpointPolicyFor(providerTypeOpenAICompatible).defaultEndpointPaths(),
+		staticOrder:   []string{"gemini-test"},
+		staticConfigs: map[string]ProviderModelConfig{"gemini-test": {PublicID: "gemini-test"}},
+	}
+	discovered := []providerModel{{
+		publicID: "gemini-test", upstreamModel: "gemini-test", providerID: "relay", maxPromptImages: 2,
+		raw: json.RawMessage(`{"id":"gemini-test","vendor":"Google","capabilities":{"limits":{"vision":{"max_prompt_images":2}}}}`),
+	}}
+	merged := mergeDiscoveredProviderModelsWithStaticConfig(provider, discovered)
+	if len(merged) != 1 || merged[0].maxPromptImages != 2 {
+		t.Fatalf("merged models = %+v, want the overlay to keep the catalog limit of 2 images", merged)
+	}
+}
+
+// From the live catalog to the wire: a Google model's declared limit trims an Anthropic
+// transcript's oldest image, while another vendor's declared limit is ignored.
+// Claude Code marks cache breakpoints, and the one on the first user turn splits the message
+// that holds the omitted image, so the trim must run after the cache mapping: the mapping
+// projects the client's original content and refuses to split a message that has changed.
+func TestHandleAnthropicMessagesHonorsGoogleCatalogImageLimit(t *testing.T) {
+	var mu sync.Mutex
+	sent := map[string][]byte{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == providerEndpointModels:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"object":"list","data":[
+				{"id":"gemini-test","vendor":"Google","supported_endpoints":["/chat/completions"],"capabilities":{"limits":{"vision":{"max_prompt_images":2}}}},
+				{"id":"gpt-test","vendor":"OpenAI","supported_endpoints":["/chat/completions"],"capabilities":{"limits":{"vision":{"max_prompt_images":1}}}}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == providerEndpointChatCompletions:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			sent[extractRequestModel(body)] = body
+			mu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream")
+			for _, chunk := range []string{
+				`{"id":"chat","object":"chat.completion.chunk","created":1,"choices":[{"index":0,"delta":{"role":"assistant","content":"compared"},"finish_reason":null}]}`,
+				`{"id":"chat","object":"chat.completion.chunk","created":1,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+				`[DONE]`,
+			} {
+				_, _ = io.WriteString(w, "data: "+chunk+"\n\n")
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	logs := &conversationLogBuffer{}
+	h, err := NewProxyHandler(
+		auth.NewTestAuthenticator("test-token"),
+		logger.NewWithWriter(logger.LevelInfo, logs),
+		WithCopilotBaseURL(upstream.URL),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+	t.Cleanup(h.BeginShutdown)
+
+	image := func(n int) string {
+		return fmt.Sprintf(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMG%d"}}`, n)
+	}
+	for _, model := range []string{"gemini-test", "gpt-test"} {
+		body := `{"model":"` + model + `","max_tokens":64,
+			"system":[{"type":"text","text":"be brief","cache_control":{"type":"ephemeral"}}],
+			"messages":[
+			{"role":"user","content":[` + image(1) + `,{"type":"text","text":"first capture","cache_control":{"type":"ephemeral"}},{"type":"text","text":"keep it for later"}]},
+			{"role":"assistant","content":"noted"},
+			{"role":"user","content":[` + image(2) + `,{"type":"text","text":"second capture"}]},
+			{"role":"assistant","content":"noted"},
+			{"role":"user","content":[` + image(3) + `,{"type":"text","text":"compare them","cache_control":{"type":"ephemeral"}}]}]}`
+		rec := httptest.NewRecorder()
+		h.HandleAnthropicMessages(rec, httptest.NewRequest(http.MethodPost, providerEndpointMessages, strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d body = %s", model, rec.Code, rec.Body.String())
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	const placeholder = "[image omitted: the model accepts at most 2 images per request]"
+	img := func(n int) string { return fmt.Sprintf("data:image/png;base64,IMG%d", n) }
+	transcript := func(first string) [][]string {
+		return [][]string{
+			{"be brief"},
+			{first, "first capture"},
+			{"keep it for later"},
+			{"noted"},
+			{img(2), "second capture"},
+			{"noted"},
+			{img(3), "compare them"},
+		}
+	}
+	if got, want := chatContentSummary(t, sent["gemini-test"]), transcript(placeholder); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Google request = %q, want the oldest image replaced in place and the newest two kept: %q", got, want)
+	}
+	if got, want := chatContentSummary(t, sent["gpt-test"]), transcript(img(1)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("another vendor's declared limit changed its request = %q, want %q", got, want)
+	}
+	for model, body := range sent {
+		if count := strings.Count(string(body), `"copilot_cache_control"`); count != 3 {
+			t.Fatalf("%s carries %d cache breakpoints, want the client's 3: %s", model, count, body)
+		}
+	}
+	if count := strings.Count(logs.String(), "omitted images beyond the model's per-request limit"); count != 1 {
+		t.Fatalf("omission log entries = %d, want 1 for the Google request: %s", count, logs.String())
 	}
 }

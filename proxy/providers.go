@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"sync"
 
 	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 	"gopkg.in/yaml.v3"
 )
 
@@ -186,6 +188,7 @@ type providerModel struct {
 	dropSamplingParams     bool
 	dropStopSequences      bool
 	useMaxCompletionTokens bool
+	maxPromptImages        int
 	disabled               bool
 	endpointsAdvertised    bool
 	raw                    json.RawMessage
@@ -2859,6 +2862,21 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 	if err != nil {
 		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
+	// After the cache mapping: it projects the client's original content and refuses
+	// messages whose content no longer matches that projection.
+	body, omitted := omitChatImagesBeyondOwnerLimit(body, path, owners)
+	if omitted > 0 && h.log != nil {
+		providerID := ""
+		if provider != nil {
+			providerID = provider.id
+		}
+		h.log.Info("omitted images beyond the model's per-request limit",
+			logger.F("provider", providerID),
+			logger.F("model", owners[0].upstreamModel),
+			logger.F("limit", owners[0].maxPromptImages),
+			logger.F("omitted", omitted),
+		)
+	}
 	req, err := h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
 	if err == nil && req != nil {
 		// Inference retries reserve every physical send explicitly. Disable the
@@ -3381,6 +3399,13 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			if merged.disabled != models[index].disabled && !merged.disabled {
 				baseRaw = raw
 			}
+			// The image limit follows the published entry; when that entry declares none,
+			// a limit another entry for the same ID declares still applies.
+			if limit := providerModelMaxPromptImagesFromRaw(baseRaw); limit > 0 {
+				merged.maxPromptImages = limit
+			} else {
+				merged.maxPromptImages = max(merged.maxPromptImages, providerModelMaxPromptImagesFromRaw(raw))
+			}
 			merged.raw = mergeProviderModelRaw(baseRaw, merged.supportedEndpoints)
 			models[index] = merged
 			continue
@@ -3393,6 +3418,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			providerID:          provider.id,
 			supportedEndpoints:  supportedEndpoints,
 			parallelToolCalls:   providerModelParallelToolCallsFromRaw(raw),
+			maxPromptImages:     providerModelMaxPromptImagesFromRaw(raw),
 			disabled:            disabled,
 			endpointsAdvertised: endpointsAdvertised,
 			raw:                 mergeProviderModelRaw(raw, supportedEndpoints),
@@ -3414,6 +3440,32 @@ func providerModelParallelToolCallsFromRaw(raw json.RawMessage) *bool {
 		return nil
 	}
 	return cloneBoolPtr(parsed.Capabilities.Supports.ParallelToolCalls)
+}
+
+// providerModelMaxPromptImagesFromRaw honors the catalog image limit for Google models only.
+// Copilot enforces that limit for Gemini, while other vendors declare limits their endpoints
+// exceed in practice: GPT declares one image and has accepted eleven.
+func providerModelMaxPromptImagesFromRaw(raw json.RawMessage) int {
+	var parsed struct {
+		Vendor       string `json:"vendor"`
+		Capabilities struct {
+			Limits struct {
+				Vision struct {
+					MaxPromptImages json.RawMessage `json:"max_prompt_images"`
+				} `json:"vision"`
+			} `json:"limits"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil || !strings.EqualFold(strings.TrimSpace(parsed.Vendor), "Google") {
+		return 0
+	}
+	// Any integral JSON number counts, so 10, 10.0 and 1e1 all declare ten images. A
+	// string, fraction, nonpositive or out-of-range value declares no limit.
+	var limit float64
+	if json.Unmarshal(parsed.Capabilities.Limits.Vision.MaxPromptImages, &limit) != nil || limit < 1 || limit > math.MaxInt32 || limit != math.Trunc(limit) {
+		return 0
+	}
+	return int(limit)
 }
 
 func openRouterModelSupportsTools(supportedParams []string) bool {
@@ -3448,6 +3500,7 @@ func mergeDiscoveredProviderModelsWithStaticConfig(provider *providerRuntime, di
 				continue
 			}
 			staticModel.disabled = model.disabled
+			staticModel.maxPromptImages = model.maxPromptImages
 			staticModel.raw, err = mergeProviderModelMetadataOverlayRaw(staticModel.raw, model.raw, cfg)
 			if err != nil {
 				staticModel.raw = mergeProviderModelRaw(staticModel.raw, staticModel.supportedEndpoints)

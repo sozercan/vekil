@@ -317,6 +317,133 @@ func applyProviderModelRequestPolicy(body []byte, endpoint string, owner provide
 	return rewritten
 }
 
+// omitChatImagesBeyondOwnerLimit enforces the owner's per-request image limit on a native
+// Chat body that is otherwise final. The oldest image parts beyond the limit become a text
+// placeholder; only those parts are spliced, so every other byte is forwarded as it was. It
+// returns the body and the number of omitted images.
+func omitChatImagesBeyondOwnerLimit(body []byte, path string, owners []providerModel) ([]byte, int) {
+	if path != providerEndpointChatCompletions || len(owners) == 0 {
+		return body, 0
+	}
+	limit := owners[0].maxPromptImages
+	// A plainly spelled image part contains image_url twice, as its type and as its key, so a
+	// body with at most twice the limit cannot exceed it; an escaped spelling can at worst skip a trim.
+	if limit <= 0 || bytes.Count(body, []byte("image_url")) <= 2*limit {
+		return body, 0
+	}
+	images, ok := chatImagePartRanges(body)
+	if !ok || len(images) <= limit {
+		return body, 0
+	}
+	omit := len(images) - limit
+	placeholder := fmt.Appendf(nil, `{"type":"text","text":"[image omitted: the model accepts at most %d images per request]"}`, limit)
+	rewritten := make([]byte, 0, len(body))
+	next := 0
+	for _, image := range images[:omit] {
+		rewritten = append(rewritten, body[next:image.start]...)
+		rewritten = append(rewritten, placeholder...)
+		next = image.end
+	}
+	return append(rewritten, body[next:]...), omit
+}
+
+type chatImagePartRange struct {
+	start int
+	end   int
+}
+
+// chatImagePartRanges returns the byte ranges of a Chat body's image_url content parts in
+// message order. Keys match exactly, as the Chat wire format spells them. A body that repeats
+// messages, a message that repeats content or a part that repeats type is ambiguous to
+// upstream parsers, so it is reported unparsed rather than guessed at.
+func chatImagePartRanges(body []byte) ([]chatImagePartRange, bool) {
+	messagesStart, messagesEnd, found, ok := uniqueRawJSONObjectField(body, 0, len(body), "messages")
+	if !ok || !found {
+		return nil, false
+	}
+	messages, ok := newRawJSONArrayScanner(body[messagesStart:messagesEnd])
+	if !ok {
+		return nil, false
+	}
+	var images []chatImagePartRange
+	for {
+		messageStart, messageEnd, done, ok := messages.next()
+		if !ok {
+			return nil, false
+		}
+		if done {
+			return images, true
+		}
+		messageStart, messageEnd = messagesStart+messageStart, messagesStart+messageEnd
+		contentStart, contentEnd, found, ok := uniqueRawJSONObjectField(body, messageStart, messageEnd, "content")
+		if !ok {
+			return nil, false
+		}
+		if !found {
+			continue
+		}
+		parts, ok := newRawJSONArrayScanner(body[contentStart:contentEnd])
+		if !ok {
+			continue // string or null content carries no image parts
+		}
+		for {
+			partStart, partEnd, done, ok := parts.next()
+			if !ok {
+				return nil, false
+			}
+			if done {
+				break
+			}
+			partStart, partEnd = contentStart+partStart, contentStart+partEnd
+			typeStart, typeEnd, found, ok := uniqueRawJSONObjectField(body, partStart, partEnd, "type")
+			if !ok {
+				return nil, false
+			}
+			if found && rawJSONStringIs(body[typeStart:typeEnd], "image_url") {
+				images = append(images, chatImagePartRange{start: partStart, end: partEnd})
+			}
+		}
+	}
+}
+
+// uniqueRawJSONObjectField returns the absolute value range of key in the JSON object at
+// body[start:end]. found is false when the key is absent; ok is false when the value is not
+// an object or repeats the key.
+func uniqueRawJSONObjectField(body []byte, start, end int, key string) (valueStart, valueEnd int, found, ok bool) {
+	object, ok := newRawJSONObjectScanner(body[start:end])
+	if !ok {
+		return 0, 0, false, false
+	}
+	for {
+		name, fieldStart, fieldEnd, done, ok := object.next()
+		if !ok {
+			return 0, 0, false, false
+		}
+		if done {
+			return valueStart, valueEnd, found, true
+		}
+		if rawJSONKeyEqual(name, key) {
+			if found {
+				return 0, 0, false, false
+			}
+			valueStart, valueEnd, found = start+fieldStart, start+fieldEnd, true
+		}
+	}
+}
+
+// rawJSONStringIs reports whether raw is a JSON string equal to want, decoding escapes only
+// when they are present.
+func rawJSONStringIs(raw []byte, want string) bool {
+	if len(raw) == len(want)+2 && raw[0] == '"' && raw[len(raw)-1] == '"' && string(raw[1:len(raw)-1]) == want {
+		return true
+	}
+	if bytes.IndexByte(raw, '\\') < 0 {
+		return false
+	}
+	var value string
+	return json.Unmarshal(raw, &value) == nil && value == want
+}
+
 func (h *ProxyHandler) postResolvedProviderRequest(
 	ctx context.Context,
 	provider *providerRuntime,
