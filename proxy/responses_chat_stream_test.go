@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,313 @@ import (
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
+
+func rewriteResponsesChatStreamSequenceNumbers(t *testing.T, fixture []byte, number func(int) int64) []byte {
+	t.Helper()
+	index := 0
+	// Keep every semantic event and all other fixture bytes unchanged.
+	rewritten := regexp.MustCompile(`"sequence_number":-?[0-9]+`).ReplaceAllFunc(fixture, func([]byte) []byte {
+		sequence := number(index)
+		index++
+		return []byte(fmt.Sprintf(`"sequence_number":%d`, sequence))
+	})
+	if index == 0 {
+		t.Fatal("fixture has no numeric sequence metadata")
+	}
+	return rewritten
+}
+
+func responsesChatStreamSequenceFixtures(t *testing.T, fixture []byte) []struct {
+	name string
+	data []byte
+} {
+	t.Helper()
+	return []struct {
+		name string
+		data []byte
+	}{
+		{"contiguous", fixture},
+		{"forward gaps", rewriteResponsesChatStreamSequenceNumbers(t, fixture, func(index int) int64 { return int64(index * 13) })},
+		{"repeated", rewriteResponsesChatStreamSequenceNumbers(t, fixture, func(int) int64 { return 17 })},
+		{"backward", rewriteResponsesChatStreamSequenceNumbers(t, fixture, func(index int) int64 { return int64(100 - index) })},
+		{"reset", rewriteResponsesChatStreamSequenceNumbers(t, fixture, func(index int) int64 { return int64(index % 4) })},
+	}
+}
+
+func responsesChatStreamParallelToolFixtures(t *testing.T) []struct {
+	name string
+	data []byte
+} {
+	t.Helper()
+	fixture := readResponsesChatStreamFixture(t, "stream_parallel_interleaved_tool_calls.sse")
+	variants := responsesChatStreamSequenceFixtures(t, fixture)
+	frames := bytes.Split(fixture, []byte("\n\n"))
+	if len(frames) < 4 || !bytes.HasPrefix(frames[2], []byte("event: response.output_item.added\n")) || !bytes.HasPrefix(frames[3], []byte("event: response.output_item.added\n")) {
+		t.Fatal("parallel fixture does not have the expected tool announcements")
+	}
+	frames[2], frames[3] = frames[3], frames[2]
+	return append(variants, struct {
+		name string
+		data []byte
+	}{"swapped tool announcements", bytes.Join(frames, []byte("\n\n"))}, struct {
+		name string
+		data []byte
+	}{"numeric-only announcement step back", rewriteResponsesChatStreamSequenceNumbers(t, fixture, func(index int) int64 {
+		switch index {
+		case 2:
+			return 3
+		case 3:
+			return 2
+		default:
+			return int64(index)
+		}
+	})})
+}
+
+func TestResponsesChatStream_SequenceDiscontinuitiesPreserveText(t *testing.T) {
+	fixture := readResponsesChatStreamFixture(t, "stream_text.sse")
+	config := responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second}
+	baseline, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := collectResponsesChatStreamChunks(t, baseline)
+	variants := responsesChatStreamSequenceFixtures(t, fixture)
+	for _, gap := range []struct {
+		name  string
+		index int
+	}{
+		{"gap before first visible delta", 4},
+		{"gap after first visible delta", 5},
+		{"gap at terminal", 9},
+	} {
+		variants = append(variants, struct {
+			name string
+			data []byte
+		}{gap.name, rewriteResponsesChatStreamSequenceNumbers(t, fixture, func(index int) int64 {
+			if index >= gap.index {
+				return int64(index + 20)
+			}
+			return int64(index)
+		})})
+	}
+	for _, tt := range variants {
+		t.Run(tt.name, func(t *testing.T) {
+			stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(tt.data)), config)
+			if err != nil {
+				t.Fatalf("prepareResponsesChatStream() error = %v", err)
+			}
+			if got := collectResponsesChatStreamChunks(t, stream); !reflect.DeepEqual(got, want) {
+				t.Fatalf("chunks = %#v, want unchanged text, finish, and usage %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestResponsesChatStream_SequenceGapsRetainValidation(t *testing.T) {
+	gap := func(index int) int64 { return int64(index * 13) }
+	text := strings.Split(strings.TrimSpace(string(rewriteResponsesChatStreamSequenceNumbers(t,
+		readResponsesChatStreamFixture(t, "stream_text.sse"), gap))), "\n\n")
+	tools := strings.Split(strings.TrimSpace(string(rewriteResponsesChatStreamSequenceNumbers(t,
+		readResponsesChatStreamFixture(t, "stream_parallel_interleaved_tool_calls.sse"), gap))), "\n\n")
+	join := func(frames []string) string { return strings.Join(frames, "\n\n") + "\n\n" }
+	replace := func(frames []string, index int, old, replacement string) string {
+		t.Helper()
+		if !strings.Contains(frames[index], old) {
+			t.Fatalf("frame %d does not contain %q", index, old)
+		}
+		changed := append([]string(nil), frames...)
+		changed[index] = strings.Replace(changed[index], old, replacement, 1)
+		return join(changed)
+	}
+	duplicateItem := append([]string(nil), text[:3]...)
+	duplicateItem = append(duplicateItem, text[2:]...)
+	duplicateDelta := append([]string(nil), text[:5]...)
+	duplicateDelta = append(duplicateDelta, text[4:]...)
+	missingCompletion := append([]string(nil), text[:8]...)
+	missingCompletion = append(missingCompletion, text[9:]...)
+	terminalReordered := append([]string(nil), tools...)
+	_, terminalData, ok := strings.Cut(terminalReordered[len(terminalReordered)-1], "\ndata: ")
+	if !ok {
+		t.Fatal("parallel fixture has no terminal data")
+	}
+	var terminal map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(terminalData), &terminal); err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(terminal["response"], &response); err != nil {
+		t.Fatal(err)
+	}
+	var output []json.RawMessage
+	if err := json.Unmarshal(response["output"], &output); err != nil || len(output) != 2 {
+		t.Fatalf("parallel terminal output = %q, error = %v", response["output"], err)
+	}
+	output[0], output[1] = output[1], output[0]
+	response["output"], _ = json.Marshal(output)
+	terminal["response"], _ = json.Marshal(response)
+	reorderedData, err := json.Marshal(terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalReordered[len(terminalReordered)-1] = "event: response.completed\ndata: " + string(reorderedData)
+	tests := []struct {
+		name        string
+		fixture     string
+		code        string
+		message     string
+		committed   bool
+		usageTokens int
+	}{
+		{"duplicate semantic item", join(duplicateItem), "invalid_responses_stream", "duplicate Responses output index", false, 0},
+		{"uncorrelated output index", replace(text, 4, `"output_index":0`, `"output_index":9`), "invalid_responses_stream", "output text delta correlation is invalid", false, 0},
+		{"uncorrelated content index", replace(text, 4, `"content_index":0`, `"content_index":9`), "invalid_responses_stream", "output text delta correlation is invalid", false, 0},
+		{"authoritative text differs", replace(text, 6, "Synthetic fixture text response.", "different text"), "invalid_responses_stream", "output text completion does not match streamed deltas", true, 0},
+		{"duplicate semantic delta is not deduplicated", join(duplicateDelta), "invalid_responses_stream", "output text completion does not match streamed deltas", true, 0},
+		{"authoritative arguments differ", replace(tools, 7, "beta-fixture", "different-region"), "invalid_responses_stream", "completed function arguments diverge from streamed deltas", false, 0},
+		{"terminal arguments differ", replace(tools, 12, "alpha-fixture", "different-widget"), "unsupported_responses_output", "terminal function call does not match streamed arguments", false, 42},
+		{"terminal call order differs", join(terminalReordered), "unsupported_responses_output", "terminal function call does not match streamed arguments", false, 42},
+		{"terminal requires item completion", join(missingCompletion), "invalid_responses_stream", "response.completed arrived before output completion", true, 17},
+		{"unknown event", strings.ReplaceAll(join(text[:4]), "response.content_part.added", "response.future_event"), "unsupported_responses_event", `upstream Responses event "response.future_event" is not supported`, false, 0},
+		{"SSE name mismatch", replace(text, 3, "event: response.content_part.added", "event: response.output_item.added"), "invalid_responses_stream", "Responses SSE event name does not match its JSON type", false, 0},
+		{"string sequence", replace(text, 3, `"sequence_number":39`, `"sequence_number":"39"`), "invalid_responses_stream", "upstream returned malformed Responses stream JSON", false, 0},
+		{"fractional sequence", replace(text, 3, `"sequence_number":39`, `"sequence_number":39.5`), "invalid_responses_stream", "upstream returned malformed Responses stream JSON", false, 0},
+		{"overflowing sequence", replace(text, 3, `"sequence_number":39`, `"sequence_number":9223372036854775808`), "invalid_responses_stream", "upstream returned malformed Responses stream JSON", false, 0},
+		{"EOF before terminal", join(text[:6]), "responses_stream_truncated", "upstream Responses stream ended before a terminal event", true, 0},
+		{"truncated SSE frame", join(text[:5]) + "event: response.completed\ndata: {\"type\":\"response.completed\"", "invalid_responses_stream", "upstream returned truncated Responses SSE", true, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, chunks, err := runFailingResponsesChatStream(t, []byte(tt.fixture), tt.committed)
+			var executionErr *chatExecutionError
+			if !errors.As(err, &executionErr) || executionErr.StatusCode != http.StatusBadGateway || executionErr.Code != tt.code || executionErr.Message != tt.message {
+				t.Fatalf("error = %#v, want %s: %s", err, tt.code, tt.message)
+			}
+			if tt.usageTokens > 0 {
+				if executionErr.Usage == nil || executionErr.Usage.TotalTokens != tt.usageTokens {
+					t.Fatalf("error usage = %#v, want %d tokens", executionErr.Usage, tt.usageTokens)
+				}
+				if tt.committed && (len(chunks) == 0 || chunks[len(chunks)-1].Usage == nil || chunks[len(chunks)-1].Usage.TotalTokens != tt.usageTokens) {
+					t.Fatalf("terminal validation lost committed usage: %#v", chunks)
+				}
+			}
+			for _, chunk := range chunks {
+				for _, choice := range chunk.Choices {
+					if choice.FinishReason != nil || len(choice.Delta.ToolCalls) != 0 {
+						t.Fatalf("invalid stream exposed success or tool calls: %#v", chunk)
+					}
+				}
+			}
+			if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 {
+				t.Fatalf("invalid stream published replay: %#v", stats)
+			}
+		})
+	}
+}
+
+// A tolerated discontinuity is logged once per stream, so live traffic shows how
+// often upstream numbering skips without one line per event.
+func TestResponsesChatStream_SequenceDiscontinuityLoggedOncePerStream(t *testing.T) {
+	const message = "tolerated upstream Responses sequence discontinuity"
+	fixture := readResponsesChatStreamFixture(t, "stream_text.sse")
+	for _, tt := range responsesChatStreamSequenceFixtures(t, fixture) {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := &conversationLogBuffer{}
+			stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(tt.data)), responsesChatStreamConfig{
+				PublicModel: "gpt-public", PrecommitTimeout: time.Second,
+				Carrier: carrierEmit{Log: logger.NewWithWriter(logger.LevelInfo, logs)},
+			})
+			if err != nil {
+				t.Fatalf("prepareResponsesChatStream() error = %v", err)
+			}
+			collectResponsesChatStreamChunks(t, stream)
+			want := 1
+			if tt.name == "contiguous" {
+				want = 0
+			}
+			if got := strings.Count(logs.String(), message); got != want {
+				t.Fatalf("discontinuity log entries = %d, want %d: %s", got, want, logs.String())
+			}
+		})
+	}
+}
+
+func TestResponsesChatStream_SequenceGapsRejectEventsAfterTerminal(t *testing.T) {
+	fixture := readResponsesChatStreamFixture(t, "stream_text.sse")
+	fixture = append(bytes.TrimRight(fixture, "\r\n"), []byte("\n\nevent: keepalive\ndata: {\"type\":\"keepalive\",\"sequence_number\":10}\n\n")...)
+	fixture = rewriteResponsesChatStreamSequenceNumbers(t, fixture, func(index int) int64 { return int64(index * 13) })
+	state := newResponsesChatStreamState(responsesChatStreamConfig{PublicModel: "gpt-public", Now: time.Now})
+	decoder := newResponsesChatSSEDecoder(responsesChatMaxSSEEventBytes)
+	err := decoder.push(fixture, func(message responsesSSEMessage) error {
+		_, err := state.handleMessage(message)
+		return err
+	})
+	var executionErr *chatExecutionError
+	if !state.terminalSeen || !errors.As(err, &executionErr) || executionErr.Code != "invalid_responses_stream" || executionErr.Message != "upstream Responses stream continued after a terminal event" {
+		t.Fatalf("terminal state = %v, error = %#v", state.terminalSeen, err)
+	}
+}
+
+func TestResponsesChatStream_SequenceGapsPreserveUpstreamFailures(t *testing.T) {
+	text := strings.Split(strings.TrimSpace(string(readResponsesChatStreamFixture(t, "stream_text.sse"))), "\n\n")
+	pendingTool := "event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","sequence_number":5,"output_index":1,"item":{"type":"function_call","id":"fc_pending","call_id":"call_pending","name":"lookup_synthetic_widget","arguments":"","status":"in_progress"}}` + "\n\n" +
+		"event: response.function_call_arguments.delta\n" +
+		`data: {"type":"response.function_call_arguments.delta","sequence_number":6,"item_id":"fc_pending","output_index":1,"delta":"{\"widget\":"}` + "\n\n"
+	for _, failure := range []struct {
+		name  string
+		event string
+		usage *models.OpenAIUsage
+	}{
+		{"response.failed", "event: response.failed\n" + `data: {"type":"response.failed","sequence_number":7,"response":{"id":"resp_synth_text_stream_001","status":"failed","error":{"type":"rate_limit_error","code":"too_many_requests","message":"slow down","param":"model"},"output":[],"usage":{"input_tokens":9,"output_tokens":2,"total_tokens":11}}}` + "\n\n", &models.OpenAIUsage{PromptTokens: 9, CompletionTokens: 2, TotalTokens: 11}},
+		{"top-level error", "event: error\n" + `data: {"type":"error","sequence_number":7,"code":"too_many_requests","message":"slow down","param":"model"}` + "\n\n", nil},
+	} {
+		for _, committed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/committed=%t", failure.name, committed), func(t *testing.T) {
+				prefix := 4
+				if committed {
+					prefix = 5
+				}
+				fixture := []byte(strings.Join(text[:prefix], "\n\n") + "\n\n" + pendingTool + failure.event)
+				fixture = rewriteResponsesChatStreamSequenceNumbers(t, fixture, func(index int) int64 { return int64(index * 13) })
+				store, chunks, err := runFailingResponsesChatStream(t, fixture, committed)
+				var executionErr *chatExecutionError
+				if !errors.As(err, &executionErr) || executionErr.StatusCode != http.StatusTooManyRequests || executionErr.Type != "rate_limit_error" || executionErr.Code != "too_many_requests" || executionErr.Param != "model" || executionErr.Message != "slow down" || !executionErr.upstreamAuthored {
+					t.Fatalf("upstream classification = %#v", err)
+				}
+				if !reflect.DeepEqual(executionErr.Usage, failure.usage) {
+					t.Fatalf("error usage = %#v, want %#v", executionErr.Usage, failure.usage)
+				}
+				usageChunks := 0
+				for _, chunk := range chunks {
+					if chunk.Usage != nil {
+						usageChunks++
+						if !reflect.DeepEqual(chunk.Usage, failure.usage) {
+							t.Fatalf("usage chunk = %#v, want %#v", chunk.Usage, failure.usage)
+						}
+					}
+					for _, choice := range chunk.Choices {
+						if choice.FinishReason != nil || len(choice.Delta.ToolCalls) != 0 {
+							t.Fatalf("upstream failure exposed success or tool calls: %#v", chunk)
+						}
+					}
+				}
+				if committed {
+					wantChunks := 2
+					if failure.usage != nil {
+						wantChunks++
+					}
+					if len(chunks) != wantChunks || chunks[0].Choices[0].Delta.Role != "assistant" || streamChunkText(t, chunks[1]) != "Synthetic fixture " || (usageChunks == 1) != (failure.usage != nil) {
+						t.Fatalf("failure chunks = %#v", chunks)
+					}
+				}
+				if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 {
+					t.Fatalf("upstream failure published replay: %#v", stats)
+				}
+			})
+		}
+	}
+}
 
 func TestResponsesChatStream_TextFixture(t *testing.T) {
 	fixture := readResponsesChatStreamFixture(t, "stream_text.sse")
@@ -123,53 +431,156 @@ func streamChunkText(t *testing.T, chunk models.OpenAIStreamChunk) string {
 	return text
 }
 
-func TestResponsesChatStream_OneToolPublishesReplayBeforeProxyID(t *testing.T) {
-	fixture := readResponsesChatStreamFixture(t, "stream_one_tool_call.sse")
+func streamChunkVisibleValue(t *testing.T, chunk models.OpenAIStreamChunk) (string, string) {
+	t.Helper()
+	if len(chunk.Choices) != 1 {
+		t.Fatalf("choices = %d, want 1", len(chunk.Choices))
+	}
+	delta := chunk.Choices[0].Delta
+	kind, raw := "output_text", delta.Content
+	if len(delta.Refusal) > 0 {
+		if len(raw) > 0 {
+			t.Fatalf("chunk contains both text and refusal: %#v", chunk)
+		}
+		kind, raw = "refusal", delta.Refusal
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatalf("decode visible %s: %v", kind, err)
+	}
+	return kind, value
+}
+
+func responsesChatStreamVisiblePart(kind, value string) map[string]any {
+	if kind == "refusal" {
+		return map[string]any{"type": kind, "refusal": value}
+	}
+	return map[string]any{"type": kind, "text": value, "annotations": []any{}}
+}
+
+func responsesChatStreamVisibleKindPairs() [][2]string {
+	return [][2]string{
+		{"output_text", "output_text"},
+		{"output_text", "refusal"},
+		{"refusal", "output_text"},
+		{"refusal", "refusal"},
+	}
+}
+
+// runFailingResponsesChatStream runs a stream that must fail. A committed stream is consumed to
+// its error; an uncommitted one must not be exposed at all.
+func runFailingResponsesChatStream(t *testing.T, fixture []byte, committed bool) (*responsesChatReplayStore, []models.OpenAIStreamChunk, error) {
+	t.Helper()
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
-	route := responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
-
 	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{
-		PublicModel: "gpt-public",
-		ReplayStore: store,
-		ReplayRoute: route,
-		ReplayToolDefaults: responsesChatReplayToolDefaults{
-			"lookup_synthetic_widget": {"mode": json.RawMessage(`"standard"`)},
-		},
+		PublicModel: "gpt-public", ReplayStore: store,
+		ReplayRoute:      responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
 		PrecommitTimeout: time.Second,
 	})
-	if err != nil {
-		t.Fatalf("prepareResponsesChatStream() error = %v", err)
+	if !committed {
+		if stream != nil {
+			stream.stop(context.Canceled)
+			t.Fatalf("failing precommit stream was exposed (error %v)", err)
+		}
+		return store, nil, err
 	}
-	chunks := collectResponsesChatStreamChunks(t, stream)
-	if len(chunks) != 5 {
-		t.Fatalf("chunk count = %d, want 5: %#v", len(chunks), chunks)
+	if err != nil || stream == nil {
+		t.Fatalf("prepareResponsesChatStream() = %v, %v, want committed stream", stream, err)
 	}
-	start := chunks[1].Choices[0].Delta.ToolCalls
-	if len(start) != 1 || start[0].Index == nil || *start[0].Index != 0 || start[0].Function.Name != "lookup_synthetic_widget" || !strings.HasPrefix(start[0].ID, responsesChatReplayCallIDPrefix) || start[0].ID == "call_synth_lookup_stream_001" {
-		t.Fatalf("tool start = %#v", start)
+	var chunks []models.OpenAIStreamChunk
+	err = consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
+		chunks = append(chunks, chunk)
+		return nil
+	}, nil)
+	return store, chunks, err
+}
+
+func assertResponsesChatStreamOrderingFailure(t *testing.T, fixture []byte, wantVisible []string, wantMessage string) {
+	t.Helper()
+	store, chunks, err := runFailingResponsesChatStream(t, fixture, len(wantVisible) > 0)
+	var visible []string
+	var finish string
+	for _, chunk := range chunks {
+		for _, choice := range chunk.Choices {
+			if len(choice.Delta.Content) > 0 || len(choice.Delta.Refusal) > 0 {
+				kind, value := streamChunkVisibleValue(t, chunk)
+				visible = append(visible, kind+":"+value)
+			}
+			if choice.FinishReason != nil {
+				finish = *choice.FinishReason
+			}
+			if len(choice.Delta.ToolCalls) > 0 {
+				t.Fatalf("out-of-order stream exposed tool calls: %#v", chunk)
+			}
+		}
 	}
-	args := chunks[2].Choices[0].Delta.ToolCalls
-	if len(args) != 1 || args[0].Index == nil || *args[0].Index != 0 || args[0].Function.Arguments != `{"widget":"alpha-fixture"}` {
-		t.Fatalf("tool args = %#v", args)
+	if !reflect.DeepEqual(visible, wantVisible) || finish != "" {
+		t.Fatalf("out-of-order stream exposed %q, finish %q, error %v; want %q without success", visible, finish, err, wantVisible)
 	}
-	if got := chunks[3].Choices[0].FinishReason; got == nil || *got != "tool_calls" {
-		t.Fatalf("finish reason = %v", got)
+	var executionErr *chatExecutionError
+	if !errors.As(err, &executionErr) || executionErr.StatusCode != http.StatusBadGateway || executionErr.Code != "invalid_responses_stream" || executionErr.Message != wantMessage {
+		t.Fatalf("error = %#v, want semantic ordering failure: %s", err, wantMessage)
 	}
-	if stats := store.Stats(); stats.Groups != 1 || stats.Calls != 1 {
-		t.Fatalf("replay stats = %#v", stats)
+	if stats := store.Stats(); stats.Groups != 0 || stats.Calls != 0 {
+		t.Fatalf("out-of-order stream published replay: %#v", stats)
 	}
-	resolved, err := store.Resolve(route, responsesChatReplayAssistantProjection{
-		Content: json.RawMessage(`""`),
-		Calls: []responsesChatReplayProjectedCall{{
-			ID: start[0].ID, Name: start[0].Function.Name, Arguments: `{"widget":"alpha-fixture","mode":"standard"}`,
-		}},
-	})
-	if err != nil {
-		t.Fatalf("Resolve() error = %v", err)
-	}
-	if len(resolved.OutputItems) != 1 || !bytes.Contains(resolved.OutputItems[0], []byte(`"call_id":"call_synth_lookup_stream_001"`)) {
-		t.Fatalf("resolved replay = %#v", resolved)
+}
+
+func TestResponsesChatStream_OneToolPublishesReplayBeforeProxyID(t *testing.T) {
+	fixture := readResponsesChatStreamFixture(t, "stream_one_tool_call.sse")
+	for _, tt := range responsesChatStreamSequenceFixtures(t, fixture) {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newResponsesChatReplayStore()
+			t.Cleanup(func() { _ = store.Close() })
+			route := responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+
+			stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(tt.data)), responsesChatStreamConfig{
+				PublicModel: "gpt-public",
+				ReplayStore: store,
+				ReplayRoute: route,
+				ReplayToolDefaults: responsesChatReplayToolDefaults{
+					"lookup_synthetic_widget": {"mode": json.RawMessage(`"standard"`)},
+				},
+				PrecommitTimeout: time.Second,
+			})
+			if err != nil {
+				t.Fatalf("prepareResponsesChatStream() error = %v", err)
+			}
+			chunks := collectResponsesChatStreamChunks(t, stream)
+			if len(chunks) != 5 {
+				t.Fatalf("chunk count = %d, want 5: %#v", len(chunks), chunks)
+			}
+			start := chunks[1].Choices[0].Delta.ToolCalls
+			if len(start) != 1 || start[0].Index == nil || *start[0].Index != 0 || start[0].Function.Name != "lookup_synthetic_widget" {
+				t.Fatalf("tool start = %#v", start)
+			}
+			if upstreamID, ok := responsesChatReplayUpstreamCallID(start[0].ID); !ok || upstreamID != "call_synth_lookup_stream_001" {
+				t.Fatalf("self-describing proxy ID = %q, decoded %q, %v", start[0].ID, upstreamID, ok)
+			}
+			args := chunks[2].Choices[0].Delta.ToolCalls
+			if len(args) != 1 || args[0].Index == nil || *args[0].Index != 0 || args[0].Function.Arguments != `{"widget":"alpha-fixture"}` {
+				t.Fatalf("tool args = %#v", args)
+			}
+			if got := chunks[3].Choices[0].FinishReason; got == nil || *got != "tool_calls" {
+				t.Fatalf("finish reason = %v", got)
+			}
+			if stats := store.Stats(); stats.Groups != 1 || stats.Calls != 1 {
+				t.Fatalf("replay stats = %#v", stats)
+			}
+			resolved, err := store.Resolve(route, responsesChatReplayAssistantProjection{
+				Content: json.RawMessage(`""`),
+				Calls: []responsesChatReplayProjectedCall{{
+					ID: start[0].ID, Name: start[0].Function.Name, Arguments: `{"widget":"alpha-fixture","mode":"standard"}`,
+				}},
+			})
+			if err != nil {
+				t.Fatalf("Resolve() error = %v", err)
+			}
+			if len(resolved.OutputItems) != 1 || !bytes.Contains(resolved.OutputItems[0], []byte(`"call_id":"call_synth_lookup_stream_001"`)) {
+				t.Fatalf("resolved replay = %#v", resolved)
+			}
+		})
 	}
 }
 
@@ -225,34 +636,214 @@ func TestResponsesChatStream_ImmediateFailureBeforeCommit(t *testing.T) {
 	}
 }
 
-func TestResponsesChatStream_ParallelToolsUseDenseFirstSeenIndexes(t *testing.T) {
-	fixture := readResponsesChatStreamFixture(t, "stream_parallel_interleaved_tool_calls.sse")
-	store := newResponsesChatReplayStore()
-	t.Cleanup(func() { _ = store.Close() })
-	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{
-		PublicModel: "gpt-public", ReplayStore: store,
-		ReplayRoute:      responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"},
-		PrecommitTimeout: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
+func TestResponsesChatStream_ParallelToolsUseDenseOutputIndexes(t *testing.T) {
+	for _, tt := range responsesChatStreamParallelToolFixtures(t) {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newResponsesChatReplayStore()
+			t.Cleanup(func() { _ = store.Close() })
+			route := responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+			stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(tt.data)), responsesChatStreamConfig{
+				PublicModel: "gpt-public", ReplayStore: store, ReplayRoute: route,
+				PrecommitTimeout: time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var chunks []models.OpenAIStreamChunk
+			err = consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
+				for _, choice := range chunk.Choices {
+					for _, call := range choice.Delta.ToolCalls {
+						if call.ID != "" {
+							if stats := store.Stats(); stats.Groups != 1 || stats.Calls != 2 {
+								t.Fatalf("tool ID exposed before parallel replay publication: %#v", stats)
+							}
+						}
+					}
+				}
+				chunks = append(chunks, chunk)
+				return nil
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(chunks) != 7 {
+				t.Fatalf("chunk count = %d, want 7", len(chunks))
+			}
+			wantNames := []string{"lookup_synthetic_widget", "inspect_synthetic_region"}
+			wantArguments := []string{`{"widget":"alpha-fixture"}`, `{"region":"beta-fixture"}`}
+			wantUpstreamIDs := []string{"call_synth_parallel_alpha_stream_001", "call_synth_parallel_beta_stream_001"}
+			projection := responsesChatReplayAssistantProjection{Content: json.RawMessage(`""`)}
+			opaqueID := regexp.MustCompile(`^call_vekil_[A-Za-z0-9_-]{22}$`)
+			for i, chunkIndex := range []int{1, 3} {
+				call := chunks[chunkIndex].Choices[0].Delta.ToolCalls[0]
+				if call.Index == nil || *call.Index != i || call.Type != "function" || call.Function.Name != wantNames[i] || !opaqueID.MatchString(call.ID) {
+					t.Fatalf("tool start %d = %#v", i, call)
+				}
+				args := chunks[chunkIndex+1].Choices[0].Delta.ToolCalls[0]
+				if args.Index == nil || *args.Index != i || args.Function.Arguments != wantArguments[i] {
+					t.Fatalf("tool args %d = %#v", i, args)
+				}
+				projection.Calls = append(projection.Calls, responsesChatReplayProjectedCall{
+					ID: call.ID, Name: call.Function.Name, Arguments: args.Function.Arguments,
+				})
+			}
+			if projection.Calls[0].ID == projection.Calls[1].ID {
+				t.Fatal("parallel calls share a proxy ID")
+			}
+			if got := chunks[5].Choices[0].FinishReason; got == nil || *got != "tool_calls" {
+				t.Fatalf("finish reason = %v, want tool_calls", got)
+			}
+			if usage := chunks[6].Usage; usage == nil || usage.PromptTokens != 24 || usage.CompletionTokens != 18 || usage.TotalTokens != 42 {
+				t.Fatalf("terminal usage = %#v", usage)
+			}
+			resolved, err := store.Resolve(route, projection)
+			if err != nil || len(resolved.OutputItems) != 2 {
+				t.Fatalf("Resolve() = %#v, %v", resolved, err)
+			}
+			for i, raw := range resolved.OutputItems {
+				var call struct {
+					CallID    string `json:"call_id"`
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				}
+				if err := json.Unmarshal(raw, &call); err != nil {
+					t.Fatal(err)
+				}
+				if call.CallID != wantUpstreamIDs[i] || call.Name != wantNames[i] || call.Arguments != wantArguments[i] {
+					t.Fatalf("replayed call %d = %#v", i, call)
+				}
+			}
+		})
 	}
-	chunks := collectResponsesChatStreamChunks(t, stream)
-	if len(chunks) != 7 {
-		t.Fatalf("chunk count = %d, want 7", len(chunks))
+}
+
+func TestResponsesChatStream_ParallelToolsReplayActualAggregatedAssistant(t *testing.T) {
+	wantNames := []string{"lookup_synthetic_widget", "inspect_synthetic_region"}
+	wantArguments := []string{`{"widget":"alpha-fixture"}`, `{"region":"beta-fixture"}`}
+	wantUpstreamIDs := []string{"call_synth_parallel_alpha_stream_001", "call_synth_parallel_beta_stream_001"}
+	wantCalls := []map[string]any{
+		{"type": "function_call", "id": "fc_synth_parallel_alpha_stream_001", "call_id": wantUpstreamIDs[0], "name": wantNames[0], "arguments": wantArguments[0], "status": "completed"},
+		{"type": "function_call", "id": "fc_synth_parallel_beta_stream_001", "call_id": wantUpstreamIDs[1], "name": wantNames[1], "arguments": wantArguments[1], "status": "completed"},
 	}
-	for i, chunkIndex := range []int{1, 3} {
-		call := chunks[chunkIndex].Choices[0].Delta.ToolCalls[0]
-		if call.Index == nil || *call.Index != i || !strings.HasPrefix(call.ID, responsesChatReplayCallIDPrefix) {
-			t.Fatalf("tool start %d = %#v", i, call)
-		}
-		args := chunks[chunkIndex+1].Choices[0].Delta.ToolCalls[0]
-		if args.Index == nil || *args.Index != i || !json.Valid([]byte(args.Function.Arguments)) {
-			t.Fatalf("tool args %d = %#v", i, args)
-		}
-	}
-	if stats := store.Stats(); stats.Groups != 1 || stats.Calls != 2 {
-		t.Fatalf("stats = %#v", stats)
+	for _, tt := range responsesChatStreamParallelToolFixtures(t) {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newResponsesChatReplayStore()
+			t.Cleanup(func() { _ = store.Close() })
+			route := responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+			stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(tt.data)), responsesChatStreamConfig{
+				PublicModel: "gpt-public", ReplayStore: store, ReplayRoute: route, PrecommitTimeout: time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := aggregateChatStreamEvents(stream)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(response.Choices) != 1 || len(response.Choices[0].Message.ToolCalls) != 2 {
+				t.Fatalf("aggregated response = %#v", response)
+			}
+			assistant := response.Choices[0].Message
+			content, err := translateChatMessageContent(assistant.Content, assistant.Role, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			projectionContent, err := json.Marshal(assistantHistoryText(content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxyIDs := make(map[string]string, len(assistant.ToolCalls))
+			projection := responsesChatReplayAssistantProjection{Content: projectionContent}
+			for _, call := range assistant.ToolCalls {
+				proxyIDs[call.Function.Name] = call.ID
+				projection.Calls = append(projection.Calls, responsesChatReplayProjectedCall{
+					ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments,
+				})
+			}
+			if proxyIDs[wantNames[0]] == "" || proxyIDs[wantNames[1]] == "" {
+				t.Fatalf("aggregated tools = %#v", assistant.ToolCalls)
+			}
+			t.Run("canonical assistant order", func(t *testing.T) {
+				for index, call := range assistant.ToolCalls {
+					if call.Function.Name != wantNames[index] || call.Function.Arguments != wantArguments[index] {
+						t.Errorf("aggregated tool %d = %#v", index, call)
+					}
+				}
+			})
+			t.Run("actual replay projection", func(t *testing.T) {
+				resolved, err := store.Resolve(route, projection)
+				if err != nil {
+					t.Fatalf("Resolve(actual aggregated assistant) = %T: %v", err, err)
+				}
+				var calls []map[string]any
+				for _, raw := range resolved.OutputItems {
+					var call map[string]any
+					if err := json.Unmarshal(raw, &call); err != nil {
+						t.Fatal(err)
+					}
+					calls = append(calls, call)
+				}
+				if !reflect.DeepEqual(calls, wantCalls) {
+					t.Fatalf("replayed calls = %#v, want %#v", calls, wantCalls)
+				}
+			})
+			for _, continuation := range []struct {
+				name    string
+				results []map[string]any
+				want    []map[string]any
+			}{
+				{
+					name: "full reversed results",
+					results: []map[string]any{
+						{"role": "tool", "tool_call_id": proxyIDs[wantNames[1]], "content": "result beta"},
+						{"role": "tool", "tool_call_id": proxyIDs[wantNames[0]], "content": "result alpha"},
+					},
+					want: append(append([]map[string]any(nil), wantCalls...),
+						map[string]any{"type": "function_call_output", "call_id": wantUpstreamIDs[1], "output": "result beta"},
+						map[string]any{"type": "function_call_output", "call_id": wantUpstreamIDs[0], "output": "result alpha"}),
+				},
+				{
+					name: "partial beta result",
+					results: []map[string]any{
+						{"role": "tool", "tool_call_id": proxyIDs[wantNames[1]], "content": "result beta"},
+					},
+					want: []map[string]any{
+						wantCalls[1],
+						{"type": "function_call_output", "call_id": wantUpstreamIDs[1], "output": "result beta"},
+					},
+				},
+			} {
+				t.Run(continuation.name, func(t *testing.T) {
+					messages := []any{assistant}
+					for _, result := range continuation.results {
+						messages = append(messages, result)
+					}
+					request, err := json.Marshal(map[string]any{"model": "gpt-public", "messages": messages})
+					if err != nil {
+						t.Fatal(err)
+					}
+					plan, err := translateChatRequestToResponses(request, responsesChatRequestOptions{
+						UpstreamModel: "gpt-upstream", ReplayStore: store, ReplayRoute: route,
+					})
+					if err != nil {
+						var executionErr *chatExecutionError
+						if errors.As(err, &executionErr) {
+							t.Fatalf("unchanged assistant continuation: status=%d code=%s: %v", executionErr.StatusCode, executionErr.Code, err)
+						}
+						t.Fatal(err)
+					}
+					var upstream struct {
+						Input []map[string]any `json:"input"`
+					}
+					if err := json.Unmarshal(plan.Body, &upstream); err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(upstream.Input, continuation.want) {
+						t.Fatalf("continued input = %#v, want %#v", upstream.Input, continuation.want)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -434,20 +1025,20 @@ func TestResponsesChatStream_KeepaliveIsDroppedBetweenRealEvents(t *testing.T) {
 		`data: {"type":"response.output_item.done","sequence_number":8,"output_index":0,"item":{"type":"message","id":"msg_ka","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}` + "\n\n" +
 		"event: response.completed\n" +
 		`data: {"type":"response.completed","sequence_number":9,"response":{"id":"resp_ka","created_at":1700000003,"status":"completed","output":[{"type":"message","id":"msg_ka","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}` + "\n\n")
-	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(fixture)), responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second})
-	if err != nil {
-		t.Fatalf("prepareResponsesChatStream returned error: %v", err)
-	}
-	chunks := collectResponsesChatStreamChunks(t, stream)
-	var text string
-	for _, chunk := range chunks {
-		if len(chunk.Choices) == 0 || len(chunk.Choices[0].Delta.Content) == 0 {
-			continue
-		}
-		text += streamChunkText(t, chunk)
-	}
-	if text != "hello" {
-		t.Fatalf("assembled text = %q, want %q", text, "hello")
+	for _, tt := range responsesChatStreamSequenceFixtures(t, fixture) {
+		t.Run(tt.name, func(t *testing.T) {
+			stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(tt.data)), responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second})
+			if err != nil {
+				t.Fatalf("prepareResponsesChatStream returned error: %v", err)
+			}
+			chunks := collectResponsesChatStreamChunks(t, stream)
+			if len(chunks) != 3 || chunks[0].Choices[0].Delta.Role != "assistant" || streamChunkText(t, chunks[1]) != "hello" {
+				t.Fatalf("keepalive changed visible output: %#v", chunks)
+			}
+			if finish := chunks[2].Choices[0].FinishReason; finish == nil || *finish != "stop" {
+				t.Fatalf("finish reason = %v, want stop", finish)
+			}
+		})
 	}
 }
 
@@ -693,46 +1284,157 @@ func TestResponsesChatStream_EnforcesCumulativeReplayLimitsBeforeTerminal(t *tes
 	}
 }
 
-func TestResponsesChatStream_MultipleAssistantContentParts(t *testing.T) {
+func responsesChatStreamMultipleAssistantContentPartsFixture(t *testing.T, firstKind, secondKind string) []byte {
+	t.Helper()
+	firstValueKey, secondValueKey := "text", "text"
+	if firstKind == "refusal" {
+		firstValueKey = "refusal"
+	}
+	if secondKind == "refusal" {
+		secondValueKey = "refusal"
+	}
 	messageOutput := map[string]any{
 		"type": "message", "id": "terminal-message", "status": "completed", "role": "assistant", "phase": "final_answer",
-		"content": []any{
-			map[string]any{"type": "output_text", "text": "first", "annotations": []any{}},
-			map[string]any{"type": "output_text", "text": "second", "annotations": []any{}},
-		},
+		"content": []any{responsesChatStreamVisiblePart(firstKind, "first"), responsesChatStreamVisiblePart(secondKind, "second")},
 	}
 	events := []map[string]any{
 		{"type": "response.created", "sequence_number": 0, "response": map[string]any{"id": "resp-multipart", "created_at": 1700000000, "status": "in_progress"}},
 		{"type": "response.in_progress", "sequence_number": 1},
 		{"type": "response.output_item.added", "sequence_number": 2, "output_index": 0, "item": map[string]any{"type": "message", "id": "added-message", "role": "assistant", "status": "in_progress", "phase": "final_answer", "content": []any{}}},
-		{"type": "response.content_part.added", "sequence_number": 3, "item_id": "part-a", "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}},
-		{"type": "response.output_text.delta", "sequence_number": 4, "item_id": "delta-a", "output_index": 0, "content_index": 0, "delta": "first"},
-		{"type": "response.output_text.done", "sequence_number": 5, "item_id": "done-a", "output_index": 0, "content_index": 0, "text": "first"},
-		{"type": "response.content_part.done", "sequence_number": 6, "item_id": "part-done-a", "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "first", "annotations": []any{}}},
-		{"type": "response.content_part.added", "sequence_number": 7, "item_id": "part-b", "output_index": 0, "content_index": 1, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}},
-		{"type": "response.output_text.delta", "sequence_number": 8, "item_id": "delta-b", "output_index": 0, "content_index": 1, "delta": "second"},
-		{"type": "response.output_text.done", "sequence_number": 9, "item_id": "done-b", "output_index": 0, "content_index": 1, "text": "second"},
-		{"type": "response.content_part.done", "sequence_number": 10, "item_id": "part-done-b", "output_index": 0, "content_index": 1, "part": map[string]any{"type": "output_text", "text": "second", "annotations": []any{}}},
+		{"type": "response.content_part.added", "sequence_number": 3, "item_id": "part-a", "output_index": 0, "content_index": 0, "part": responsesChatStreamVisiblePart(firstKind, "")},
+		{"type": "response." + firstKind + ".delta", "sequence_number": 4, "item_id": "delta-a", "output_index": 0, "content_index": 0, "delta": "first"},
+		{"type": "response." + firstKind + ".done", "sequence_number": 5, "item_id": "done-a", "output_index": 0, "content_index": 0, firstValueKey: "first"},
+		{"type": "response.content_part.done", "sequence_number": 6, "item_id": "part-done-a", "output_index": 0, "content_index": 0, "part": responsesChatStreamVisiblePart(firstKind, "first")},
+		{"type": "response.content_part.added", "sequence_number": 7, "item_id": "part-b", "output_index": 0, "content_index": 1, "part": responsesChatStreamVisiblePart(secondKind, "")},
+		{"type": "response." + secondKind + ".delta", "sequence_number": 8, "item_id": "delta-b", "output_index": 0, "content_index": 1, "delta": "second"},
+		{"type": "response." + secondKind + ".done", "sequence_number": 9, "item_id": "done-b", "output_index": 0, "content_index": 1, secondValueKey: "second"},
+		{"type": "response.content_part.done", "sequence_number": 10, "item_id": "part-done-b", "output_index": 0, "content_index": 1, "part": responsesChatStreamVisiblePart(secondKind, "second")},
 		{"type": "response.output_item.done", "sequence_number": 11, "output_index": 0, "item": messageOutput},
 		{"type": "response.completed", "sequence_number": 12, "response": map[string]any{"id": "resp-multipart", "created_at": 1700000000, "status": "completed", "output": []any{messageOutput}}},
 	}
 	var fixture strings.Builder
 	for _, event := range events {
-		encoded, _ := json.Marshal(event)
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
 		fmt.Fprintf(&fixture, "event: %s\ndata: %s\n\n", event["type"], encoded)
 	}
-	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(strings.NewReader(fixture.String())), responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
+	return []byte(fixture.String())
+}
+
+func TestResponsesChatStream_MultipleAssistantContentParts(t *testing.T) {
+	for _, kinds := range responsesChatStreamVisibleKindPairs() {
+		t.Run(strings.Join(kinds[:], "/"), func(t *testing.T) {
+			fixture := responsesChatStreamMultipleAssistantContentPartsFixture(t, kinds[0], kinds[1])
+			frames := strings.Split(strings.TrimSpace(string(fixture)), "\n\n")
+			reorder := func(order ...int) []byte {
+				var rewritten strings.Builder
+				for _, index := range order {
+					fmt.Fprintf(&rewritten, "%s\n\n", frames[index])
+				}
+				return []byte(rewritten.String())
+			}
+			emptyProgress := bytes.Replace(reorder(0, 1, 2, 3, 7, 8, 4, 5, 6, 8, 9, 10, 11, 12), []byte(`"delta":"second"`), []byte(`"delta":""`), 1)
+			for _, input := range []struct {
+				name string
+				data []byte
+			}{
+				{"serial parts", fixture},
+				{"parts announced before text", reorder(0, 1, 2, 3, 7, 4, 5, 6, 8, 9, 10, 11, 12)},
+				{"part done after later text", reorder(0, 1, 2, 3, 4, 5, 7, 8, 9, 6, 10, 11, 12)},
+				{"empty later delta before earlier text", emptyProgress},
+			} {
+				t.Run(input.name, func(t *testing.T) {
+					normalized := rewriteResponsesChatStreamSequenceNumbers(t, input.data, func(index int) int64 { return int64(index) })
+					for _, tt := range responsesChatStreamSequenceFixtures(t, normalized) {
+						t.Run(tt.name, func(t *testing.T) {
+							stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(tt.data)), responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second})
+							if err != nil {
+								t.Fatal(err)
+							}
+							chunks := collectResponsesChatStreamChunks(t, stream)
+							if len(chunks) != 4 || chunks[3].Choices[0].FinishReason == nil || *chunks[3].Choices[0].FinishReason != "stop" {
+								t.Fatalf("chunks = %#v", chunks)
+							}
+							for index, want := range []string{"first", "second"} {
+								kind, value := streamChunkVisibleValue(t, chunks[index+1])
+								if kind != kinds[index] || value != want {
+									t.Fatalf("visible part %d = %s %q, want %s %q", index, kind, value, kinds[index], want)
+								}
+							}
+						})
+					}
+				})
+			}
+		})
 	}
-	chunks := collectResponsesChatStreamChunks(t, stream)
-	if len(chunks) != 4 || streamChunkText(t, chunks[1]) != "first" || streamChunkText(t, chunks[2]) != "second" || chunks[3].Choices[0].FinishReason == nil || *chunks[3].Choices[0].FinishReason != "stop" {
-		t.Fatalf("chunks = %#v", chunks)
+}
+
+func TestResponsesChatStream_RejectsOutOfOrderAssistantContentParts(t *testing.T) {
+	for _, kinds := range responsesChatStreamVisibleKindPairs() {
+		t.Run(strings.Join(kinds[:], "/"), func(t *testing.T) {
+			frames := strings.Split(strings.TrimSpace(string(responsesChatStreamMultipleAssistantContentPartsFixture(t, kinds[0], kinds[1]))), "\n\n")
+			for _, tt := range []struct {
+				name      string
+				order     []int
+				committed bool
+			}{
+				{name: "whole parts reversed", order: []int{0, 1, 2, 7, 8, 9, 10, 3, 4, 5, 6, 11, 12}},
+				{name: "parts announced before reversed text", order: []int{0, 1, 2, 3, 7, 8, 9, 10, 4, 5, 6, 11, 12}},
+				{name: "interleaved text after commit", order: []int{0, 1, 2, 3, 4, 7, 8, 9, 10, 4, 5, 6, 11, 12}, committed: true},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					var fixture strings.Builder
+					firstFragment := true
+					for _, index := range tt.order {
+						frame := frames[index]
+						if tt.committed && index == 4 {
+							fragment := "fi"
+							if !firstFragment {
+								fragment = "rst"
+							}
+							frame = strings.Replace(frame, `"delta":"first"`, fmt.Sprintf(`"delta":%q`, fragment), 1)
+							firstFragment = false
+						}
+						fmt.Fprintf(&fixture, "%s\n\n", frame)
+					}
+					var wantVisible []string
+					if tt.committed {
+						wantVisible = []string{kinds[0] + ":fi"}
+					}
+					assertResponsesChatStreamOrderingFailure(t, []byte(fixture.String()), wantVisible, "assistant content parts are out of order")
+				})
+			}
+		})
+	}
+}
+
+func TestResponsesChatStream_RejectsSparseVisibleIndexes(t *testing.T) {
+	for _, kind := range []string{"output_text", "refusal"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := responsesChatStreamMultipleAssistantContentPartsFixture(t, kind, kind)
+			for _, field := range []string{"content_index", "output_index"} {
+				for _, index := range []int{1, int(^uint(0) >> 1)} {
+					t.Run(fmt.Sprintf("%s=%d", field, index), func(t *testing.T) {
+						original := []byte(fmt.Sprintf(`"%s":0`, field))
+						if !bytes.Contains(fixture, original) {
+							t.Fatalf("fixture has no %s", original)
+						}
+						rewritten := bytes.ReplaceAll(fixture, original, []byte(fmt.Sprintf(`"%s":%d`, field, index)))
+						message := "assistant content parts are out of order"
+						if field == "output_index" {
+							message = "assistant output messages are out of order"
+						}
+						assertResponsesChatStreamOrderingFailure(t, rewritten, nil, message)
+					})
+				}
+			}
+		})
 	}
 }
 
 func TestResponsesChatStream_ValidatesAndIgnoresReasoningProgressEvents(t *testing.T) {
-	state := newResponsesChatStreamState(responsesChatStreamConfig{PublicModel: "gpt-public", Now: time.Now})
 	events := []string{
 		`{"type":"response.created","sequence_number":0,"response":{"id":"resp-reasoning","created_at":1700000000,"status":"in_progress"}}`,
 		`{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"reasoning","id":"reasoning-1","status":"in_progress"}}`,
@@ -743,18 +1445,36 @@ func TestResponsesChatStream_ValidatesAndIgnoresReasoningProgressEvents(t *testi
 		`{"type":"response.reasoning_text.delta","sequence_number":6,"item_id":"reasoning-text-delta","output_index":0,"content_index":0,"delta":"hidden"}`,
 		`{"type":"response.reasoning_text.done","sequence_number":7,"item_id":"reasoning-text-done","output_index":0,"content_index":0,"text":"hidden"}`,
 	}
+	var fixture strings.Builder
 	for _, raw := range events {
 		var header struct {
 			Type string `json:"type"`
 		}
-		_ = json.Unmarshal([]byte(raw), &header)
-		transition, err := state.handleMessage(responsesSSEMessage{event: header.Type, data: raw, semantic: true})
-		if err != nil {
-			t.Fatalf("event %s error = %v", header.Type, err)
+		if err := json.Unmarshal([]byte(raw), &header); err != nil {
+			t.Fatal(err)
 		}
-		if len(transition.chunks) != 0 || transition.terminal {
-			t.Fatalf("reasoning event %s produced Chat output: %#v", header.Type, transition)
-		}
+		fmt.Fprintf(&fixture, "event: %s\ndata: %s\n\n", header.Type, raw)
+	}
+	for _, tt := range responsesChatStreamSequenceFixtures(t, []byte(fixture.String())) {
+		t.Run(tt.name, func(t *testing.T) {
+			state := newResponsesChatStreamState(responsesChatStreamConfig{PublicModel: "gpt-public", Now: time.Now})
+			decoder := newResponsesChatSSEDecoder(responsesChatMaxSSEEventBytes)
+			processed := 0
+			err := decoder.push(tt.data, func(message responsesSSEMessage) error {
+				transition, err := state.handleMessage(message)
+				if err != nil {
+					return err
+				}
+				if len(transition.chunks) != 0 || transition.terminal {
+					t.Fatalf("reasoning event %s produced Chat output: %#v", message.event, transition)
+				}
+				processed++
+				return nil
+			})
+			if err != nil || processed != len(events) || decoder.hasPending() {
+				t.Fatalf("reasoning progress decoded %d events, pending = %v, error = %v", processed, decoder.hasPending(), err)
+			}
+		})
 	}
 }
 
@@ -909,39 +1629,248 @@ func TestResponsesChatStream_AcceptsCROnlySSELineEndings(t *testing.T) {
 	}
 }
 
-func TestResponsesChatStream_MultipleAssistantMessages(t *testing.T) {
-	message := func(id, text, phase string) map[string]any {
-		return map[string]any{"type": "message", "id": id, "status": "completed", "role": "assistant", "phase": phase, "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}
+func responsesChatStreamMultipleAssistantMessagesFixture(t *testing.T, firstKind, secondKind string) []byte {
+	t.Helper()
+	message := func(id, text, phase, kind string) map[string]any {
+		return map[string]any{"type": "message", "id": id, "status": "completed", "role": "assistant", "phase": phase, "content": []any{responsesChatStreamVisiblePart(kind, text)}}
 	}
-	first, second := message("terminal-first", "first ", "commentary"), message("terminal-second", "second", "final_answer")
+	first, second := message("terminal-first", "first ", "commentary", firstKind), message("terminal-second", "second", "final_answer", secondKind)
 	events := []map[string]any{{"type": "response.created", "sequence_number": 0, "response": map[string]any{"id": "resp-messages", "created_at": 1700000000, "status": "in_progress"}}}
 	sequence := 1
-	appendMessage := func(outputIndex int, addedID string, terminal map[string]any, text string, phase string) {
+	appendMessage := func(outputIndex int, addedID string, terminal map[string]any, text, phase, kind string) {
+		valueKey := "text"
+		if kind == "refusal" {
+			valueKey = "refusal"
+		}
 		events = append(events,
 			map[string]any{"type": "response.output_item.added", "sequence_number": sequence, "output_index": outputIndex, "item": map[string]any{"type": "message", "id": addedID, "status": "in_progress", "role": "assistant", "phase": phase, "content": []any{}}},
-			map[string]any{"type": "response.content_part.added", "sequence_number": sequence + 1, "item_id": addedID + "-part", "output_index": outputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}},
-			map[string]any{"type": "response.output_text.delta", "sequence_number": sequence + 2, "item_id": addedID + "-delta", "output_index": outputIndex, "content_index": 0, "delta": text},
-			map[string]any{"type": "response.output_text.done", "sequence_number": sequence + 3, "item_id": addedID + "-done", "output_index": outputIndex, "content_index": 0, "text": text},
-			map[string]any{"type": "response.content_part.done", "sequence_number": sequence + 4, "item_id": addedID + "-part-done", "output_index": outputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
+			map[string]any{"type": "response.content_part.added", "sequence_number": sequence + 1, "item_id": addedID + "-part", "output_index": outputIndex, "content_index": 0, "part": responsesChatStreamVisiblePart(kind, "")},
+			map[string]any{"type": "response." + kind + ".delta", "sequence_number": sequence + 2, "item_id": addedID + "-delta", "output_index": outputIndex, "content_index": 0, "delta": text},
+			map[string]any{"type": "response." + kind + ".done", "sequence_number": sequence + 3, "item_id": addedID + "-done", "output_index": outputIndex, "content_index": 0, valueKey: text},
+			map[string]any{"type": "response.content_part.done", "sequence_number": sequence + 4, "item_id": addedID + "-part-done", "output_index": outputIndex, "content_index": 0, "part": responsesChatStreamVisiblePart(kind, text)},
 			map[string]any{"type": "response.output_item.done", "sequence_number": sequence + 5, "output_index": outputIndex, "item": terminal},
 		)
 		sequence += 6
 	}
-	appendMessage(0, "added-first", first, "first ", "commentary")
-	appendMessage(1, "added-second", second, "second", "final_answer")
+	appendMessage(0, "added-first", first, "first ", "commentary", firstKind)
+	appendMessage(1, "added-second", second, "second", "final_answer", secondKind)
 	events = append(events, map[string]any{"type": "response.completed", "sequence_number": sequence, "response": map[string]any{"id": "resp-messages", "created_at": 1700000000, "status": "completed", "output": []any{first, second}}})
 	var fixture strings.Builder
 	for _, event := range events {
-		encoded, _ := json.Marshal(event)
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
 		fmt.Fprintf(&fixture, "event: %s\ndata: %s\n\n", event["type"], encoded)
 	}
-	stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(strings.NewReader(fixture.String())), responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
+	return []byte(fixture.String())
+}
+
+func TestResponsesChatStream_MultipleAssistantMessages(t *testing.T) {
+	for _, kinds := range responsesChatStreamVisibleKindPairs() {
+		t.Run(strings.Join(kinds[:], "/"), func(t *testing.T) {
+			fixture := responsesChatStreamMultipleAssistantMessagesFixture(t, kinds[0], kinds[1])
+			frames := strings.Split(strings.TrimSpace(string(fixture)), "\n\n")
+			var preannounced strings.Builder
+			for _, index := range []int{0, 1, 2, 7, 8, 3, 4, 5, 6, 9, 10, 11, 12, 13} {
+				fmt.Fprintf(&preannounced, "%s\n\n", frames[index])
+			}
+			for _, input := range []struct {
+				name string
+				data []byte
+			}{
+				{"serial messages", fixture},
+				{"messages announced before text", []byte(preannounced.String())},
+			} {
+				t.Run(input.name, func(t *testing.T) {
+					normalized := rewriteResponsesChatStreamSequenceNumbers(t, input.data, func(index int) int64 { return int64(index) })
+					for _, tt := range responsesChatStreamSequenceFixtures(t, normalized) {
+						t.Run(tt.name, func(t *testing.T) {
+							stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(tt.data)), responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Second})
+							if err != nil {
+								t.Fatal(err)
+							}
+							chunks := collectResponsesChatStreamChunks(t, stream)
+							if len(chunks) != 4 || chunks[3].Choices[0].FinishReason == nil || *chunks[3].Choices[0].FinishReason != "stop" {
+								t.Fatalf("chunks = %#v", chunks)
+							}
+							for index, want := range []string{"first ", "second"} {
+								kind, value := streamChunkVisibleValue(t, chunks[index+1])
+								if kind != kinds[index] || value != want {
+									t.Fatalf("visible message %d = %s %q, want %s %q", index, kind, value, kinds[index], want)
+								}
+							}
+						})
+					}
+				})
+			}
+		})
 	}
-	chunks := collectResponsesChatStreamChunks(t, stream)
-	if len(chunks) != 4 || streamChunkText(t, chunks[1])+streamChunkText(t, chunks[2]) != "first second" || chunks[3].Choices[0].FinishReason == nil || *chunks[3].Choices[0].FinishReason != "stop" {
-		t.Fatalf("chunks = %#v", chunks)
+}
+
+func TestResponsesChatStream_RejectsOutOfOrderAssistantMessages(t *testing.T) {
+	for _, kinds := range responsesChatStreamVisibleKindPairs() {
+		t.Run(strings.Join(kinds[:], "/"), func(t *testing.T) {
+			frames := strings.Split(strings.TrimSpace(string(responsesChatStreamMultipleAssistantMessagesFixture(t, kinds[0], kinds[1]))), "\n\n")
+			for _, tt := range []struct {
+				name      string
+				order     []int
+				committed bool
+			}{
+				{name: "completed message groups reversed", order: []int{0, 7, 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 13}},
+				{name: "messages announced before reversed text", order: []int{0, 1, 2, 7, 8, 9, 10, 11, 12, 3, 4, 5, 6, 13}},
+				{name: "interleaved message text after commit", order: []int{0, 1, 2, 3, 7, 8, 9, 10, 11, 12, 3, 4, 5, 6, 13}, committed: true},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					var fixture strings.Builder
+					firstFragment := true
+					for _, index := range tt.order {
+						frame := frames[index]
+						if tt.committed && index == 3 {
+							fragment := "fi"
+							if !firstFragment {
+								fragment = "rst "
+							}
+							frame = strings.Replace(frame, `"delta":"first "`, fmt.Sprintf(`"delta":%q`, fragment), 1)
+							firstFragment = false
+						}
+						fmt.Fprintf(&fixture, "%s\n\n", frame)
+					}
+					var wantVisible []string
+					if tt.committed {
+						wantVisible = []string{kinds[0] + ":fi"}
+					}
+					assertResponsesChatStreamOrderingFailure(t, []byte(fixture.String()), wantVisible, "assistant output messages are out of order")
+				})
+			}
+		})
+	}
+}
+
+func TestResponsesChatStream_VisibleOrderAllowsUnfinishedNonvisibleItems(t *testing.T) {
+	frames := strings.Split(strings.TrimSpace(string(responsesChatStreamMultipleAssistantMessagesFixture(t, "output_text", "output_text"))), "\n\n")
+	frameEvent := func(index int) map[string]any {
+		t.Helper()
+		_, data, ok := strings.Cut(frames[index], "\ndata: ")
+		if !ok {
+			t.Fatalf("frame %d has no data", index)
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			t.Fatal(err)
+		}
+		if outputIndex, ok := event["output_index"].(float64); ok {
+			event["output_index"] = int(outputIndex) + 4
+		}
+		return event
+	}
+	toolNames := []string{"lookup_synthetic_widget", "inspect_synthetic_region"}
+	upstreamIDs := []string{"call_synth_parallel_alpha_stream_001", "call_synth_parallel_beta_stream_001"}
+	arguments := []string{`{"widget":"alpha-fixture"}`, `{"region":"beta-fixture"}`}
+	toolItem := func(index int, args, status string) map[string]any {
+		return map[string]any{"type": "function_call", "id": fmt.Sprintf("fc-%d", index), "call_id": upstreamIDs[index], "name": toolNames[index], "arguments": args, "status": status}
+	}
+	reasoningItem := func(id, status string) map[string]any {
+		return map[string]any{"type": "reasoning", "id": id, "status": status}
+	}
+	events := []map[string]any{
+		frameEvent(0),
+		{"type": "response.output_item.added", "output_index": 2, "item": reasoningItem("reasoning-b", "in_progress")},
+		{"type": "response.output_item.added", "output_index": 1, "item": toolItem(0, "", "in_progress")},
+		{"type": "response.output_item.added", "output_index": 0, "item": reasoningItem("reasoning-a", "in_progress")},
+		{"type": "response.output_item.added", "output_index": 3, "item": toolItem(1, "", "in_progress")},
+		frameEvent(1), frameEvent(2), frameEvent(3),
+	}
+	prefixCount := len(events)
+	events = append(events,
+		map[string]any{"type": "response.function_call_arguments.delta", "item_id": "fc-0", "output_index": 1, "delta": `{"widget":"`},
+		map[string]any{"type": "response.reasoning_text.delta", "item_id": "reasoning-a", "output_index": 0, "content_index": 0, "delta": "hidden"},
+		frameEvent(4), frameEvent(5), frameEvent(6),
+		frameEvent(7), frameEvent(8), frameEvent(9),
+		map[string]any{"type": "response.function_call_arguments.delta", "item_id": "fc-1", "output_index": 3, "delta": `{"region":"`},
+		map[string]any{"type": "response.reasoning_text.delta", "item_id": "reasoning-b", "output_index": 2, "content_index": 0, "delta": "hidden"},
+		frameEvent(10), frameEvent(11), frameEvent(12),
+		map[string]any{"type": "response.function_call_arguments.delta", "item_id": "fc-1", "output_index": 3, "delta": `beta-fixture"}`},
+		map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc-1", "output_index": 3, "arguments": arguments[1]},
+		map[string]any{"type": "response.output_item.done", "output_index": 3, "item": toolItem(1, arguments[1], "completed")},
+		map[string]any{"type": "response.function_call_arguments.delta", "item_id": "fc-0", "output_index": 1, "delta": `alpha-fixture"}`},
+		map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc-0", "output_index": 1, "arguments": arguments[0]},
+		map[string]any{"type": "response.output_item.done", "output_index": 1, "item": toolItem(0, arguments[0], "completed")},
+		map[string]any{"type": "response.output_item.done", "output_index": 2, "item": reasoningItem("reasoning-b", "completed")},
+		map[string]any{"type": "response.output_item.done", "output_index": 0, "item": reasoningItem("reasoning-a", "completed")},
+	)
+	terminal := frameEvent(13)
+	response := terminal["response"].(map[string]any)
+	response["output"] = append([]any{reasoningItem("reasoning-a", "completed"), toolItem(0, arguments[0], "completed"), reasoningItem("reasoning-b", "completed"), toolItem(1, arguments[1], "completed")}, response["output"].([]any)...)
+	response["usage"] = map[string]any{"input_tokens": 24, "output_tokens": 18, "total_tokens": 42}
+	events = append(events, terminal)
+	render := func(count int) []byte {
+		t.Helper()
+		var fixture strings.Builder
+		for index, event := range events[:count] {
+			event["sequence_number"] = index
+			encoded, err := json.Marshal(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fmt.Fprintf(&fixture, "event: %s\ndata: %s\n\n", event["type"], encoded)
+		}
+		return []byte(fixture.String())
+	}
+	prefixes := responsesChatStreamSequenceFixtures(t, render(prefixCount))
+	for variant, tt := range responsesChatStreamSequenceFixtures(t, render(len(events))) {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			body := newResponsesChatBlockingBody(prefixes[variant].data)
+			prefix, err := prepareResponsesChatStream(ctx, body, responsesChatStreamConfig{PublicModel: "gpt-public", PrecommitTimeout: time.Hour})
+			if err != nil {
+				t.Fatalf("unfinished nonvisible items blocked visible output: %v", err)
+			}
+			defer prefix.stop(context.Canceled)
+			role, err := prefix.next()
+			if err != nil || role.kind != chatStreamEventChunk || role.chunk.Choices[0].Delta.Role != "assistant" {
+				t.Fatalf("role event = %#v, error = %v", role, err)
+			}
+			text, err := prefix.next()
+			if err != nil || text.kind != chatStreamEventChunk || streamChunkText(t, text.chunk) != "first " {
+				t.Fatalf("visible event = %#v, error = %v", text, err)
+			}
+			prefix.stop(context.Canceled)
+			cancel()
+
+			store := newResponsesChatReplayStore()
+			t.Cleanup(func() { _ = store.Close() })
+			route := responsesChatReplayRoute{ProviderID: "provider", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
+			stream, err := prepareResponsesChatStream(context.Background(), io.NopCloser(bytes.NewReader(tt.data)), responsesChatStreamConfig{
+				PublicModel: "gpt-public", ReplayStore: store, ReplayRoute: route, PrecommitTimeout: time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			chunks := collectResponsesChatStreamChunks(t, stream)
+			if len(chunks) != 9 || streamChunkText(t, chunks[1]) != "first " || streamChunkText(t, chunks[2]) != "second" || chunks[7].Choices[0].FinishReason == nil || *chunks[7].Choices[0].FinishReason != "tool_calls" || chunks[8].Usage == nil || chunks[8].Usage.TotalTokens != 42 {
+				t.Fatalf("chunks = %#v", chunks)
+			}
+			projection := responsesChatReplayAssistantProjection{Content: json.RawMessage(`"first second"`)}
+			for index, chunkIndex := range []int{3, 5} {
+				call := chunks[chunkIndex].Choices[0].Delta.ToolCalls[0]
+				args := chunks[chunkIndex+1].Choices[0].Delta.ToolCalls[0]
+				if call.Index == nil || *call.Index != index || args.Index == nil || *args.Index != index || call.Function.Name != toolNames[index] || args.Function.Arguments != arguments[index] {
+					t.Fatalf("dense tool %d = %#v, %#v", index, call, args)
+				}
+				projection.Calls = append(projection.Calls, responsesChatReplayProjectedCall{ID: call.ID, Name: call.Function.Name, Arguments: args.Function.Arguments})
+			}
+			resolved, err := store.Resolve(route, projection)
+			if err != nil || len(resolved.OutputItems) != 6 || len(resolved.Calls) != 2 {
+				t.Fatalf("Resolve() = %#v, %v", resolved, err)
+			}
+			for index, call := range resolved.Calls {
+				if call.UpstreamCallID != upstreamIDs[index] || call.OutputItemIndex != 2*index+1 {
+					t.Fatalf("resolved call %d = %#v", index, call)
+				}
+			}
+		})
 	}
 }
 
