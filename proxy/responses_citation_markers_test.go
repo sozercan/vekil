@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,7 @@ var citationTestLinks = map[string]citationLink{
 	"turn1view0":        {title: "Wait (command)", url: "https://en.wikipedia.org/wiki/Wait_(command)"},
 	"turn2view0":        {url: "https://raw.githubusercontent.com/org/repo/main/README.md"},
 	"turn670467view1":   {title: "Code mode result", url: "https://example.com/code-mode"},
+	"turn3view0":        {title: "Escaped result", url: "https://example.com/escaped"},
 }
 
 func citationTestLookup(ref string) (citationLink, bool) {
@@ -48,6 +50,12 @@ func citationTestRequestBody(t *testing.T) []byte {
 	if err != nil {
 		t.Fatalf("Marshal() error = %v", err)
 	}
+	// Serializers such as Python's json.dumps escape the brackets as \u3010.
+	escapedResult := `{"content":[{"type":"text","text":` +
+		strconv.QuoteToASCII("Escaped result (https://example.com/escaped)\n【turn3view0】 Total lines: 1\n") + `}]}`
+	if strings.ContainsRune(escapedResult, '【') {
+		t.Fatalf("escaped result has a literal bracket: %s", escapedResult)
+	}
 	body, err := json.Marshal(map[string]any{
 		"model":  "gpt-test",
 		"stream": true,
@@ -62,6 +70,7 @@ func citationTestRequestBody(t *testing.T) []byte {
 				map[string]any{"type": "input_text", "text": "Script completed\nWall time 1.3 seconds\nOutput:\n"},
 				map[string]any{"type": "input_text", "text": string(codeModeResult)},
 			}},
+			map[string]any{"type": "custom_tool_call_output", "call_id": "call-4", "output": escapedResult},
 		},
 	})
 	if err != nil {
@@ -86,14 +95,14 @@ func TestRewriteCitationMarkers(t *testing.T) {
 		{"other marker kept", "visualize{\"path\":\"/tmp/chart.html\"}", "visualize{\"path\":\"/tmp/chart.html\"}"},
 		{"empty ref kept", "cite", "cite"},
 		{"no ref kept", "cite", "cite"},
-		{"unterminated kept", "end citeturn295586view1", "end citeturn295586view1"},
+		{"unterminated removed", "end citeturn295586view1", "end "},
 		{"invalid ref kept", "citeturn 1", "citeturn 1"},
 		{"start before marker", "citeturn2view0", "[raw.githubusercontent.com](https://raw.githubusercontent.com/org/repo/main/README.md)"},
 		{"oversized kept", "cite" + strings.Repeat("a", citationMarkerMaxBytes) + "", "cite" + strings.Repeat("a", citationMarkerMaxBytes) + ""},
 		{"plain", "no markers", "no markers"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, held := rewriteCitationMarkers(tt.text, true, citationTestLookup)
+			got, held, _ := rewriteCitationMarkers(tt.text, true, citationTestLookup)
 			if got != tt.want || held != "" {
 				t.Fatalf("rewriteCitationMarkers() = %q, held %q; want %q", got, held, tt.want)
 			}
@@ -103,12 +112,12 @@ func TestRewriteCitationMarkers(t *testing.T) {
 
 func TestRewriteCitationMarkersHoldsPartialMarker(t *testing.T) {
 	for _, partial := range []string{"", "ci", "cite", "citeturn29", "citeturn295586view1"} {
-		got, held := rewriteCitationMarkers("text "+partial, false, citationTestLookup)
+		got, held, _ := rewriteCitationMarkers("text "+partial, false, citationTestLookup)
 		if got != "text " || held != partial {
 			t.Fatalf("rewriteCitationMarkers(%q) = %q, held %q; want %q, held %q", partial, got, held, "text ", partial)
 		}
 	}
-	got, held := rewriteCitationMarkers("visualize", false, citationTestLookup)
+	got, held, _ := rewriteCitationMarkers("visualize", false, citationTestLookup)
 	if got != "visualize" || held != "" {
 		t.Fatalf("non-cite prefix = %q, held %q; want it emitted", got, held)
 	}
@@ -117,7 +126,7 @@ func TestRewriteCitationMarkersHoldsPartialMarker(t *testing.T) {
 func TestRewriteCitationMarkersStreamingMatchesFinal(t *testing.T) {
 	text := "Spec. " + citationTestSpec + " Draft " + citationTestPR + "\n" +
 		"visualize{} lost citeturn0search9 citebad ref tail citeturn2view0"
-	want, _ := rewriteCitationMarkers(text, true, citationTestLookup)
+	want, _, _ := rewriteCitationMarkers(text, true, citationTestLookup)
 	var boundaries []int
 	for i := range text {
 		boundaries = append(boundaries, i)
@@ -127,11 +136,11 @@ func TestRewriteCitationMarkersStreamingMatchesFinal(t *testing.T) {
 		var out, held string
 		for _, chunk := range chunks {
 			var emitted string
-			emitted, held = rewriteCitationMarkers(held+chunk, false, citationTestLookup)
+			emitted, held, _ = rewriteCitationMarkers(held+chunk, false, citationTestLookup)
 			out += emitted
 		}
-		flushed, _ := rewriteCitationMarkers(held, true, citationTestLookup)
-		return out + flushed
+		// The text ends inside a marker, which the final text drops.
+		return out
 	}
 	for _, split := range boundaries {
 		if got := stream([]string{text[:split], text[split:]}); got != want {
@@ -154,6 +163,7 @@ func TestParseResponsesCitationSources(t *testing.T) {
 		"turn295586view1":   citationTestLinks["turn295586view1"],
 		"turn2view0":        citationTestLinks["turn2view0"],
 		"turn670467view1":   citationTestLinks["turn670467view1"],
+		"turn3view0":        citationTestLinks["turn3view0"],
 	}
 	if len(links) != len(want) {
 		t.Fatalf("parseResponsesCitationSources() = %#v, want %#v", links, want)
@@ -189,6 +199,16 @@ func citationTestEvents(t *testing.T, req *http.Request, resp *http.Response) []
 
 func citationTestEventField(t *testing.T, event sseEvent, path ...string) string {
 	t.Helper()
+	value := citationTestEventValue(t, event, path...)
+	text, ok := value.(string)
+	if !ok {
+		t.Fatalf("event %q path %v = %#v, want string", event.Event, path, value)
+	}
+	return text
+}
+
+func citationTestEventValue(t *testing.T, event sseEvent, path ...string) any {
+	t.Helper()
 	var value any
 	if err := json.Unmarshal([]byte(event.Data), &value); err != nil {
 		t.Fatalf("event %q data is invalid JSON: %v", event.Event, err)
@@ -207,11 +227,7 @@ func citationTestEventField(t *testing.T, event sseEvent, path ...string) string
 			t.Fatalf("event %q path %v: missing %q", event.Event, path, key)
 		}
 	}
-	text, ok := value.(string)
-	if !ok {
-		t.Fatalf("event %q path %v = %#v, want string", event.Event, path, value)
-	}
-	return text
+	return value
 }
 
 func citationTestDelta(text string) string {
@@ -271,32 +287,122 @@ func TestNormalizeResponsesCitationMarkersStream(t *testing.T) {
 	}
 }
 
-func TestNormalizeResponsesCitationMarkersFlushesTrailingPartialMarker(t *testing.T) {
-	full := "Cut off citeturn2"
+func TestNormalizeResponsesCitationMarkersDropsTrailingPartialMarker(t *testing.T) {
+	full := "Cut off \ue200cite\ue202turn2"
 	encodedFull, _ := json.Marshal(full)
 	stream := responsesItemIDTestStream(
-		citationTestDelta("Cut off ci"),
-		citationTestDelta("teturn2"),
+		citationTestDelta("Cut off \ue200ci"),
+		citationTestDelta("te\ue202turn2"),
 		`{"type":"response.output_text.done","item_id":"msg-1","output_index":1,"content_index":0,"text":`+string(encodedFull)+`}`,
 	)
 
 	req, resp := citationTestResponse(t, stream)
 	events := citationTestEvents(t, req, resp)
-	if len(events) != 4 {
-		t.Fatalf("events = %d, want 4 (flush delta before done): %#v", len(events), events)
+	if len(events) != 3 {
+		t.Fatalf("events = %d, want 3 (no synthesized event): %#v", len(events), events)
 	}
-	var streamed string
-	for _, event := range events[:3] {
-		if event.Event != "response.output_text.delta" {
-			t.Fatalf("event %q, want response.output_text.delta", event.Event)
+	streamed := citationTestEventField(t, events[0], "delta") + citationTestEventField(t, events[1], "delta")
+	if done := citationTestEventField(t, events[2], "text"); streamed != "Cut off " || done != "Cut off " {
+		t.Fatalf("streamed %q, done %q; want both %q", streamed, done, "Cut off ")
+	}
+}
+
+func TestMapCitationOffset(t *testing.T) {
+	// Runes 2-4 became one rune and rune 8 became three.
+	edits := []citationEdit{{start: 2, end: 5, length: 1}, {start: 8, end: 9, length: 3}}
+	for _, tt := range []struct {
+		offset, wantStart, wantEnd int
+	}{
+		{0, 0, 0},
+		{2, 2, 2},
+		{3, 2, 3},
+		{5, 3, 3},
+		{6, 4, 4},
+		{8, 6, 6},
+		{9, 9, 9},
+		{12, 12, 12},
+	} {
+		if got := mapCitationOffset(tt.offset, edits, false); got != tt.wantStart {
+			t.Fatalf("mapCitationOffset(%d, start) = %d, want %d", tt.offset, got, tt.wantStart)
 		}
-		streamed += citationTestEventField(t, event, "delta")
+		if got := mapCitationOffset(tt.offset, edits, true); got != tt.wantEnd {
+			t.Fatalf("mapCitationOffset(%d, end) = %d, want %d", tt.offset, got, tt.wantEnd)
+		}
 	}
-	if streamed != full || citationTestEventField(t, events[3], "text") != full {
-		t.Fatalf("streamed %q, done %q; want both %q", streamed, citationTestEventField(t, events[3], "text"), full)
+}
+
+func citationTestRange(t *testing.T, event sseEvent, path ...string) [2]int {
+	t.Helper()
+	annotation, ok := citationTestEventValue(t, event, path...).(map[string]any)
+	if !ok {
+		t.Fatalf("event %q path %v is not an annotation", event.Event, path)
 	}
-	if got := citationTestEventField(t, events[2], "item_id"); got != "msg-1" {
-		t.Fatalf("flush delta item_id = %q, want msg-1", got)
+	start, _ := annotation["start_index"].(float64)
+	end, _ := annotation["end_index"].(float64)
+	return [2]int{int(start), int(end)}
+}
+
+func TestNormalizeResponsesCitationMarkersRemapsAnnotations(t *testing.T) {
+	marker := "citeturn0search9" // unresolved, so removed
+	link := "[docs](https://docs.example)"
+	full := "Intró " + marker + " see " + link + " end"
+	want := "Intró  see " + link + " end"
+	encodedFull, _ := json.Marshal(full)
+	annotation := func(start, end int) string {
+		return fmt.Sprintf(`{"type":"url_citation","url":"https://docs.example","title":"docs","start_index":%d,"end_index":%d}`, start, end)
+	}
+	linkStart := utf8.RuneCountInString("Intró " + marker + " see ")
+	intro := annotation(0, utf8.RuneCountInString("Intró"))
+	docs := annotation(linkStart, linkStart+utf8.RuneCountInString(link))
+	part := `{"type":"output_text","annotations":[` + intro + `,` + docs + `],"text":` + string(encodedFull) + `}`
+	item := `{"id":"msg-1","type":"message","role":"assistant","content":[` + part + `]}`
+	annotationAdded := func(index int, annotation string) string {
+		return fmt.Sprintf(`{"type":"response.output_text.annotation.added","item_id":"msg-1","output_index":1,"content_index":0,"annotation_index":%d,"annotation":%s}`, index, annotation)
+	}
+	splitMarker := strings.Index(full, "cite")
+	splitLink := strings.Index(full, link)
+	stream := responsesItemIDTestStream(
+		citationTestDelta(full[:splitMarker]),
+		annotationAdded(0, intro),
+		citationTestDelta(full[splitMarker:splitLink]),
+		citationTestDelta(full[splitLink:]),
+		annotationAdded(1, docs),
+		`{"type":"response.output_text.done","item_id":"msg-1","output_index":1,"content_index":0,"text":`+string(encodedFull)+`}`,
+		`{"type":"response.content_part.done","item_id":"msg-1","output_index":1,"content_index":0,"part":`+part+`}`,
+		`{"type":"response.completed","response":{"id":"resp-1","output":[`+item+`]}}`,
+	)
+
+	req, resp := citationTestResponse(t, stream)
+	events := citationTestEvents(t, req, resp)
+	if len(events) != 8 {
+		t.Fatalf("events = %d, want 8", len(events))
+	}
+	streamed := citationTestEventField(t, events[0], "delta") + citationTestEventField(t, events[2], "delta") + citationTestEventField(t, events[3], "delta")
+	if streamed != want {
+		t.Fatalf("streamed %q, want %q", streamed, want)
+	}
+	if events[1].Data != annotationAdded(0, intro) {
+		t.Fatalf("annotation before the marker changed: %s", events[1].Data)
+	}
+	wantIntro := [2]int{0, utf8.RuneCountInString("Intró")}
+	wantDocs := [2]int{utf8.RuneCountInString("Intró  see "), utf8.RuneCountInString("Intró  see " + link)}
+	if got := string([]rune(want)[wantDocs[0]:wantDocs[1]]); got != link {
+		t.Fatalf("remapped range covers %q, want %q", got, link)
+	}
+	for _, tt := range []struct {
+		name  string
+		event sseEvent
+		path  []string
+		want  [2]int
+	}{
+		{"annotation.added", events[4], []string{"annotation"}, wantDocs},
+		{"content_part.done before marker", events[6], []string{"part", "annotations", "0"}, wantIntro},
+		{"content_part.done after marker", events[6], []string{"part", "annotations", "1"}, wantDocs},
+		{"response.completed after marker", events[7], []string{"response", "output", "0", "content", "0", "annotations", "1"}, wantDocs},
+	} {
+		if got := citationTestRange(t, tt.event, tt.path...); got != tt.want {
+			t.Fatalf("%s range = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 

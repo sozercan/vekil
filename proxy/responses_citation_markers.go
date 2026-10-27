@@ -69,7 +69,7 @@ func normalizeResponsesCitationMarkers(req *http.Request, resp *http.Response) {
 	if responsesChat, _ := req.Context().Value(responsesChatStreamContextKey{}).(bool); responsesChat {
 		return
 	}
-	rewriter := &responsesCitationRewriter{sources: sources, held: make(map[citationTextKey]string)}
+	rewriter := &responsesCitationRewriter{sources: sources, texts: make(map[citationTextKey]*citationTextState)}
 	wrapResponsesSSEBody(resp, rewriter.rewriteEvent)
 }
 
@@ -132,9 +132,10 @@ func citationToolOutputTexts(raw json.RawMessage) []string {
 }
 
 // appendCitationTexts adds text plus any browsing results JSON-encoded in it.
-// Codex code mode returns MCP results as serialized CallToolResult JSON.
+// Codex code mode returns MCP results as serialized CallToolResult JSON, and
+// other serializers may escape the brackets as \u3010.
 func appendCitationTexts(texts []string, text string) []string {
-	if !strings.Contains(text, "【turn") {
+	if !strings.Contains(text, "【turn") && !strings.Contains(text, `\u3010turn`) {
 		return texts
 	}
 	texts = append(texts, text)
@@ -167,33 +168,51 @@ func appendCitationTexts(texts []string, text string) []string {
 	return texts
 }
 
-// rewriteCitationMarkers replaces complete cite markers in text. Unless final,
-// a trailing partial marker is returned separately so a stream can hold it
-// until the next delta; holding never changes the concatenated result.
-func rewriteCitationMarkers(text string, final bool, lookup func(string) (citationLink, bool)) (string, string) {
+// citationEdit records that runes [start, end) of the original text became
+// length runes of rewritten text.
+type citationEdit struct {
+	start, end, length int
+}
+
+// rewriteCitationMarkers replaces complete cite markers in text and reports
+// each replacement. Unless final, a trailing partial marker is returned
+// separately so a stream can hold it until the next delta. A final text drops
+// it like an unresolved marker, so holding never changes the result.
+func rewriteCitationMarkers(text string, final bool, lookup func(string) (citationLink, bool)) (string, string, []citationEdit) {
 	if !strings.Contains(text, citationMarkerStart) {
-		return text, ""
+		return text, "", nil
 	}
 	var out strings.Builder
+	var edits []citationEdit
+	offset := 0
 	for {
 		i := strings.Index(text, citationMarkerStart)
 		if i < 0 {
 			out.WriteString(text)
-			return out.String(), ""
+			return out.String(), "", edits
 		}
 		out.WriteString(text[:i])
+		offset += utf8.RuneCountInString(text[:i])
 		text = text[i:]
 		refs, n, complete := parseCitationMarker(text)
-		if complete {
-			out.WriteString(formatCitationLinks(refs, lookup))
+		switch {
+		case complete:
+			links := formatCitationLinks(refs, lookup)
+			out.WriteString(links)
+			length := utf8.RuneCountInString(text[:n])
+			edits = append(edits, citationEdit{start: offset, end: offset + length, length: utf8.RuneCountInString(links)})
+			offset += length
 			text = text[n:]
-			continue
+		case n > 0 && final:
+			edits = append(edits, citationEdit{start: offset, end: offset + utf8.RuneCountInString(text)})
+			return out.String(), "", edits
+		case n > 0:
+			return out.String(), text, edits
+		default:
+			out.WriteString(citationMarkerStart)
+			offset++
+			text = text[len(citationMarkerStart):]
 		}
-		if n > 0 && !final {
-			return out.String(), text
-		}
-		out.WriteString(citationMarkerStart)
-		text = text[len(citationMarkerStart):]
 	}
 }
 
@@ -265,28 +284,104 @@ func formatCitationLinks(refs []string, lookup func(string) (citationLink, bool)
 	return strings.Join(links, ", ")
 }
 
+// mapCitationOffset moves a rune offset in the original text to the rewritten
+// text. An offset inside a replaced marker moves to the replacement's end if
+// it ends a range, else to its start.
+func mapCitationOffset(offset int, edits []citationEdit, rangeEnd bool) int {
+	shift := 0
+	for _, edit := range edits {
+		if offset <= edit.start {
+			break
+		}
+		if offset < edit.end {
+			if rangeEnd {
+				return edit.start + shift + edit.length
+			}
+			return edit.start + shift
+		}
+		shift += edit.length - (edit.end - edit.start)
+	}
+	return offset + shift
+}
+
+// remapCitationAnnotation keeps an annotation's range, such as a url_citation's
+// start_index and end_index, on the same text after markers are rewritten.
+// Offsets are counted in code points.
+func remapCitationAnnotation(raw json.RawMessage, edits []citationEdit) (json.RawMessage, bool) {
+	var annotation map[string]json.RawMessage
+	if len(edits) == 0 || json.Unmarshal(raw, &annotation) != nil || annotation == nil {
+		return raw, false
+	}
+	changed := false
+	for _, field := range []struct {
+		name     string
+		rangeEnd bool
+	}{{"start_index", false}, {"end_index", true}} {
+		var offset int
+		if json.Unmarshal(annotation[field.name], &offset) != nil {
+			continue
+		}
+		if mapped := mapCitationOffset(offset, edits, field.rangeEnd); mapped != offset {
+			annotation[field.name], _ = json.Marshal(mapped)
+			changed = true
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+	rewritten, err := json.Marshal(annotation)
+	if err != nil {
+		return raw, false
+	}
+	return rewritten, true
+}
+
+func remapCitationAnnotations(raw json.RawMessage, edits []citationEdit) (json.RawMessage, bool) {
+	var annotations []json.RawMessage
+	if len(edits) == 0 || json.Unmarshal(raw, &annotations) != nil {
+		return raw, false
+	}
+	changed := false
+	for i, annotation := range annotations {
+		if rewritten, annotationChanged := remapCitationAnnotation(annotation, edits); annotationChanged {
+			annotations[i] = rewritten
+			changed = true
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+	rewritten, err := json.Marshal(annotations)
+	if err != nil {
+		return raw, false
+	}
+	return rewritten, true
+}
+
 type citationTextKey struct {
 	outputIndex  int
 	contentIndex int
 }
 
+// citationTextState tracks one streamed output text. consumed counts the
+// original runes before held, and edits use original-text offsets.
+type citationTextState struct {
+	held     string
+	consumed int
+	edits    []citationEdit
+}
+
 type responsesCitationRewriter struct {
 	sources *responsesCitationSources
-	held    map[citationTextKey]string
-	flush   []byte
+	texts   map[citationTextKey]*citationTextState
 }
 
 func (r *responsesCitationRewriter) rewriteEvent(raw []byte) ([]byte, bool) {
-	if len(r.held) == 0 && !containsCitationMarkerStart(raw) {
+	// Text events always pass so streamed annotation offsets can be remapped.
+	if !containsCitationMarkerStart(raw) && !bytes.Contains(raw, []byte("response.output_text.")) {
 		return raw, false
 	}
-	rewritten, changed := rewriteResponsesSSEEventData(raw, r.rewrite)
-	if r.flush == nil {
-		return rewritten, changed
-	}
-	out := append(r.flush, rewritten...)
-	r.flush = nil
-	return out, true
+	return rewriteResponsesSSEEventData(raw, r.rewrite)
 }
 
 func containsCitationMarkerStart(raw []byte) bool {
@@ -311,8 +406,13 @@ func (r *responsesCitationRewriter) rewrite(data []byte, eventName string) ([]by
 	case "response.output_text.delta":
 		changed = r.rewriteDelta(event)
 	case "response.output_text.done":
-		r.flushHeld(event)
-		changed = rewriteCitationJSONString(event, "text", r.sources.lookup)
+		if state := r.textState(event); state != nil {
+			// The final text drops a held partial marker too.
+			state.held = ""
+		}
+		_, changed = rewriteCitationJSONString(event, "text", r.sources.lookup)
+	case "response.output_text.annotation.added":
+		changed = r.remapStreamedAnnotation(event)
 	}
 	for _, field := range []struct {
 		name    string
@@ -351,22 +451,35 @@ func citationEventTextKey(event map[string]json.RawMessage) (citationTextKey, bo
 	return citationTextKey{outputIndex: outputIndex, contentIndex: contentIndex}, true
 }
 
-func (r *responsesCitationRewriter) rewriteDelta(event map[string]json.RawMessage) bool {
+func (r *responsesCitationRewriter) textState(event map[string]json.RawMessage) *citationTextState {
 	key, ok := citationEventTextKey(event)
 	if !ok {
-		return false
+		return nil
 	}
+	state := r.texts[key]
+	if state == nil {
+		state = &citationTextState{}
+		r.texts[key] = state
+	}
+	return state
+}
+
+func (r *responsesCitationRewriter) rewriteDelta(event map[string]json.RawMessage) bool {
+	state := r.textState(event)
 	var delta string
-	if json.Unmarshal(event["delta"], &delta) != nil {
+	if state == nil || json.Unmarshal(event["delta"], &delta) != nil {
 		return false
 	}
-	held := r.held[key]
-	out, nextHeld := rewriteCitationMarkers(held+delta, false, r.sources.lookup)
-	if nextHeld == "" {
-		delete(r.held, key)
-	} else {
-		r.held[key] = nextHeld
+	held := state.held
+	text := held + delta
+	out, nextHeld, edits := rewriteCitationMarkers(text, false, r.sources.lookup)
+	for _, edit := range edits {
+		edit.start += state.consumed
+		edit.end += state.consumed
+		state.edits = append(state.edits, edit)
 	}
+	state.consumed += utf8.RuneCountInString(text) - utf8.RuneCountInString(nextHeld)
+	state.held = nextHeld
 	if held == "" && out == delta {
 		return false
 	}
@@ -374,43 +487,31 @@ func (r *responsesCitationRewriter) rewriteDelta(event map[string]json.RawMessag
 	return true
 }
 
-// flushHeld emits a partial marker that the text ended with as one more delta
-// before the done event, so deltas still add up to the final text.
-func (r *responsesCitationRewriter) flushHeld(event map[string]json.RawMessage) {
-	key, ok := citationEventTextKey(event)
-	if !ok || r.held[key] == "" {
-		return
+// remapStreamedAnnotation remaps an annotation with the edits made so far to
+// its output text.
+func (r *responsesCitationRewriter) remapStreamedAnnotation(event map[string]json.RawMessage) bool {
+	state := r.textState(event)
+	if state == nil {
+		return false
 	}
-	out, _ := rewriteCitationMarkers(r.held[key], true, r.sources.lookup)
-	delete(r.held, key)
-	delta := make(map[string]json.RawMessage, len(event))
-	for _, name := range []string{"item_id", "output_index", "content_index"} {
-		if raw, present := event[name]; present {
-			delta[name] = raw
-		}
+	annotation, changed := remapCitationAnnotation(event["annotation"], state.edits)
+	if changed {
+		event["annotation"] = annotation
 	}
-	delta["type"], _ = json.Marshal("response.output_text.delta")
-	delta["delta"], _ = json.Marshal(out)
-	encoded, err := json.Marshal(delta)
-	if err != nil {
-		return
-	}
-	r.flush = append(r.flush, "event: response.output_text.delta\ndata: "...)
-	r.flush = append(r.flush, encoded...)
-	r.flush = append(r.flush, "\n\n"...)
+	return changed
 }
 
-func rewriteCitationJSONString(object map[string]json.RawMessage, field string, lookup func(string) (citationLink, bool)) bool {
+func rewriteCitationJSONString(object map[string]json.RawMessage, field string, lookup func(string) (citationLink, bool)) ([]citationEdit, bool) {
 	var text string
 	if json.Unmarshal(object[field], &text) != nil {
-		return false
+		return nil, false
 	}
-	rewritten, _ := rewriteCitationMarkers(text, true, lookup)
+	rewritten, _, edits := rewriteCitationMarkers(text, true, lookup)
 	if rewritten == text {
-		return false
+		return nil, false
 	}
 	object[field], _ = json.Marshal(rewritten)
-	return true
+	return edits, true
 }
 
 func rewriteCitationOutputTextPart(raw json.RawMessage, lookup func(string) (citationLink, bool)) (json.RawMessage, bool) {
@@ -418,8 +519,12 @@ func rewriteCitationOutputTextPart(raw json.RawMessage, lookup func(string) (cit
 	if json.Unmarshal(raw, &part) != nil || rawJSONString(part["type"]) != "output_text" {
 		return raw, false
 	}
-	if !rewriteCitationJSONString(part, "text", lookup) {
+	edits, changed := rewriteCitationJSONString(part, "text", lookup)
+	if !changed {
 		return raw, false
+	}
+	if annotations, annotationsChanged := remapCitationAnnotations(part["annotations"], edits); annotationsChanged {
+		part["annotations"] = annotations
 	}
 	rewritten, err := json.Marshal(part)
 	if err != nil {
