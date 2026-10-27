@@ -16,35 +16,47 @@ type responsesItemIDNormalizer struct {
 }
 
 func normalizeCopilotResponsesItemIDs(resp *http.Response, endpoint string) {
-	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK || endpoint != providerEndpointResponses {
+	if endpoint != providerEndpointResponses {
+		return
+	}
+	normalizer := responsesItemIDNormalizer{byOutputIndex: make(map[int]string)}
+	wrapResponsesSSEBody(resp, func(raw []byte) ([]byte, bool) {
+		return rewriteResponsesSSEEventData(raw, normalizer.rewrite)
+	})
+}
+
+// wrapResponsesSSEBody rewrites each successful Responses SSE event in place.
+// Oversized events and lines pass through unchanged.
+func wrapResponsesSSEBody(resp *http.Response, rewriteEvent func([]byte) ([]byte, bool)) {
+	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
 		return
 	}
 	contentType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
 	if !strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream") {
 		return
 	}
-	resp.Body = &responsesItemIDBody{
-		source:     resp.Body,
-		reader:     bufio.NewReaderSize(resp.Body, openAIStreamScannerInitialBuffer),
-		normalizer: responsesItemIDNormalizer{byOutputIndex: make(map[int]string)},
+	resp.Body = &responsesSSERewriteBody{
+		source:       resp.Body,
+		reader:       bufio.NewReaderSize(resp.Body, openAIStreamScannerInitialBuffer),
+		rewriteEvent: rewriteEvent,
 	}
 	resp.Header.Del("Content-Length")
 	resp.ContentLength = -1
 }
 
-type responsesItemIDBody struct {
-	source      io.ReadCloser
-	reader      *bufio.Reader
-	normalizer  responsesItemIDNormalizer
-	pending     []byte
-	pendingErr  error
-	rawEvent    bool
-	passthrough bool
-	closeOnce   sync.Once
-	closeErr    error
+type responsesSSERewriteBody struct {
+	source       io.ReadCloser
+	reader       *bufio.Reader
+	rewriteEvent func([]byte) ([]byte, bool)
+	pending      []byte
+	pendingErr   error
+	rawEvent     bool
+	passthrough  bool
+	closeOnce    sync.Once
+	closeErr     error
 }
 
-func (b *responsesItemIDBody) Read(p []byte) (int, error) {
+func (b *responsesSSERewriteBody) Read(p []byte) (int, error) {
 	for len(b.pending) == 0 {
 		if b.pendingErr != nil {
 			err := b.pendingErr
@@ -66,29 +78,29 @@ func (b *responsesItemIDBody) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (b *responsesItemIDBody) Close() error {
+func (b *responsesSSERewriteBody) Close() error {
 	b.closeOnce.Do(func() {
 		b.closeErr = b.source.Close()
 	})
 	return b.closeErr
 }
 
-func (b *responsesItemIDBody) routeAttemptTransportOwnership() *routeAttemptTransportOwner {
+func (b *responsesSSERewriteBody) routeAttemptTransportOwnership() *routeAttemptTransportOwner {
 	return routeAttemptTransportOwnership(b.source)
 }
 
-func (b *responsesItemIDBody) cancelRouteAttempt() {
+func (b *responsesSSERewriteBody) cancelRouteAttempt() {
 	cancelRouteAttemptBody(b.source)
 }
 
-func (b *responsesItemIDBody) canceledAtFailure() bool {
+func (b *responsesSSERewriteBody) canceledAtFailure() bool {
 	if observed, ok := b.source.(interface{ canceledAtFailure() bool }); ok {
 		return observed.canceledAtFailure()
 	}
 	return false
 }
 
-func (b *responsesItemIDBody) readNext() ([]byte, error) {
+func (b *responsesSSERewriteBody) readNext() ([]byte, error) {
 	if b.rawEvent {
 		line, err := readOpenAISSELine(b.reader)
 		if strings.TrimRight(line, "\r\n") == "" {
@@ -116,7 +128,7 @@ func (b *responsesItemIDBody) readNext() ([]byte, error) {
 				return event.Bytes(), err
 			}
 			if boundary {
-				rewritten, changed := rewriteResponsesItemIDSSEEvent(event.Bytes(), &b.normalizer)
+				rewritten, changed := b.rewriteEvent(event.Bytes())
 				if changed {
 					return rewritten, err
 				}
@@ -128,7 +140,7 @@ func (b *responsesItemIDBody) readNext() ([]byte, error) {
 				if event.Len() == 0 {
 					return nil, io.EOF
 				}
-				rewritten, changed := rewriteResponsesItemIDSSEEvent(event.Bytes(), &b.normalizer)
+				rewritten, changed := b.rewriteEvent(event.Bytes())
 				if changed {
 					return rewritten, io.EOF
 				}
@@ -143,7 +155,7 @@ func (b *responsesItemIDBody) readNext() ([]byte, error) {
 	}
 }
 
-func rewriteResponsesItemIDSSEEvent(raw []byte, normalizer *responsesItemIDNormalizer) ([]byte, bool) {
+func rewriteResponsesSSEEventData(raw []byte, rewrite func(data []byte, eventName string) ([]byte, bool)) ([]byte, bool) {
 	lines := splitSSEEventLines(raw)
 	if len(lines) == 0 {
 		return raw, false
@@ -170,7 +182,7 @@ func rewriteResponsesItemIDSSEEvent(raw []byte, normalizer *responsesItemIDNorma
 	if strings.TrimSpace(data) == "[DONE]" {
 		return raw, false
 	}
-	rewritten, changed := normalizer.rewrite([]byte(data), eventName)
+	rewritten, changed := rewrite([]byte(data), eventName)
 	if !changed {
 		return raw, false
 	}

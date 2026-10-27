@@ -2892,6 +2892,7 @@ func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, prov
 		}
 		req = withCopilotInferenceRequest(req, provider, path, body, owners...)
 		req = withTaskInferenceRequest(req, path)
+		req = withResponsesCitationSources(req, path, body)
 	}
 	return req, err
 }

@@ -283,6 +283,9 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 		}
 		resp, err := h.sendRetryRequest(req, inference)
 		h.finishCopilotInference(req, resp, err, permit)
+		if err == nil {
+			normalizeResponsesCitationMarkers(req, resp)
+		}
 		lifecyclePreempted := errors.Is(context.Cause(req.Context()), errProxyLifecycleShutdown) &&
 			contextTerminationMatches(req.Context(), err)
 		if pending != nil && !lifecyclePreempted {
