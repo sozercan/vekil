@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -50,30 +51,38 @@ type responsesCitationSources struct {
 }
 
 func withResponsesCitationSources(req *http.Request, path string, body []byte) *http.Request {
-	if req == nil || path != providerEndpointResponses || responsesRequestsJSONText(body) {
+	if req == nil || path != providerEndpointResponses || responsesOutputTextMustStayExact(body) {
 		return req
 	}
 	sources := &responsesCitationSources{body: body}
 	return req.WithContext(context.WithValue(req.Context(), responsesCitationSourcesContextKey{}, sources))
 }
 
-// responsesRequestsJSONText reports structured output, which a Markdown link
-// could make invalid JSON.
-func responsesRequestsJSONText(body []byte) bool {
-	if !bytes.Contains(body, []byte("json_schema")) && !bytes.Contains(body, []byte("json_object")) {
+// responsesOutputTextMustStayExact reports structured output, which a Markdown
+// link could make invalid JSON, and output logprobs, which describe the
+// original tokens. The byte check keeps large replays from being decoded.
+func responsesOutputTextMustStayExact(body []byte) bool {
+	if !bytes.Contains(body, []byte("json_schema")) && !bytes.Contains(body, []byte("json_object")) &&
+		!bytes.Contains(body, []byte("message.output_text.logprobs")) {
 		return false
 	}
 	var request struct {
-		Text struct {
-			Format struct {
-				Type string `json:"type"`
-			} `json:"format"`
-		} `json:"text"`
+		Text    json.RawMessage `json:"text"`
+		Include json.RawMessage `json:"include"`
 	}
 	if json.Unmarshal(body, &request) != nil {
 		return false
 	}
-	return request.Text.Format.Type == "json_schema" || request.Text.Format.Type == "json_object"
+	var text struct {
+		Format struct {
+			Type string `json:"type"`
+		} `json:"format"`
+	}
+	if json.Unmarshal(request.Text, &text) == nil && (text.Format.Type == "json_schema" || text.Format.Type == "json_object") {
+		return true
+	}
+	var include []string
+	return json.Unmarshal(request.Include, &include) == nil && slices.Contains(include, "message.output_text.logprobs")
 }
 
 // normalizeResponsesCitationMarkers rewrites cite markers in a successful

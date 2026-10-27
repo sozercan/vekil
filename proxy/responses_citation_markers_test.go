@@ -408,19 +408,22 @@ func TestNormalizeResponsesCitationMarkersRemapsAnnotations(t *testing.T) {
 	}
 }
 
-func TestResponsesRequestsJSONText(t *testing.T) {
+func TestResponsesOutputTextMustStayExact(t *testing.T) {
 	for _, tt := range []struct {
 		body string
 		want bool
 	}{
 		{`{"text":{"format":{"type":"json_schema","name":"answer","schema":{}}}}`, true},
 		{`{"text":{"format":{"type":"json_object"}}}`, true},
-		{`{"text":{"format":{"type":"text"}},"instructions":"Never use json_schema."}`, false},
+		{`{"include":["reasoning.encrypted_content","message.output_text.logprobs"]}`, true},
+		{`{"text":"bad","include":["message.output_text.logprobs"]}`, true},
+		{`{"text":{"format":{"type":"text"}},"instructions":"Never use json_schema or message.output_text.logprobs."}`, false},
 		{`{"text":"json_object"}`, false},
+		{`{"include":["reasoning.encrypted_content"]}`, false},
 		{`{"input":"plain"}`, false},
 	} {
-		if got := responsesRequestsJSONText([]byte(tt.body)); got != tt.want {
-			t.Fatalf("responsesRequestsJSONText(%s) = %v, want %v", tt.body, got, tt.want)
+		if got := responsesOutputTextMustStayExact([]byte(tt.body)); got != tt.want {
+			t.Fatalf("responsesOutputTextMustStayExact(%s) = %v, want %v", tt.body, got, tt.want)
 		}
 	}
 }
@@ -444,6 +447,10 @@ func TestNormalizeResponsesCitationMarkersLeavesOtherStreamsUntouched(t *testing
 		{"structured output", func(*http.Request) *http.Request {
 			req := httptest.NewRequest(http.MethodPost, "https://upstream.example/responses", nil)
 			return withResponsesCitationSources(req, providerEndpointResponses, []byte(`{"text":{"format":{"type":"json_schema","name":"answer","schema":{}}}}`))
+		}},
+		{"output logprobs", func(*http.Request) *http.Request {
+			req := httptest.NewRequest(http.MethodPost, "https://upstream.example/responses", nil)
+			return withResponsesCitationSources(req, providerEndpointResponses, []byte(`{"include":["message.output_text.logprobs"]}`))
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
