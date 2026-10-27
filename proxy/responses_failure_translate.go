@@ -890,10 +890,13 @@ func newResponsesPreparedStreamConfigured(resp *http.Response, maxPeekBytes int,
 		observeOnlyOnce.Do(func() { close(observeOnlyCh) })
 	}
 
+	// The pump keeps classifying events after the decision while callers add
+	// headers to resp, so it reads its own copy.
+	headers := resp.Header.Clone()
 	doneCh := make(chan struct{})
 	go func() {
 		defer close(doneCh)
-		runResponsesPeekPump(upstreamBody, pw, resp.Header, peekDone, peekState, commitCh, abortCh, observeOnlyCh, maxPeekBytes)
+		runResponsesPeekPump(upstreamBody, pw, headers, peekDone, peekState, commitCh, abortCh, observeOnlyCh, maxPeekBytes)
 	}()
 
 	return &responsesPreparedStream{

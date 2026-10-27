@@ -27,9 +27,12 @@ const (
 // by Codex's codex_apps web_run tool: "Title (URL)" followed by "【turnNviewN】".
 var citationSourceHeader = regexp.MustCompile(`(?m)^([^\n]*) \((https?://[^\s]+)\)\n【(turn\d+[a-z_]+\d+)】`)
 
-// citationTitleEscaper keeps titles from closing the link text or splitting a
-// Markdown table cell.
-var citationTitleEscaper = strings.NewReplacer(`\`, `\\`, "[", `\[`, "]", `\]`, "|", `\|`)
+// citationTitleEscaper and citationURLEscaper keep links intact and from
+// splitting a Markdown table cell.
+var (
+	citationTitleEscaper = strings.NewReplacer(`\`, `\\`, "[", `\[`, "]", `\]`, "|", `\|`)
+	citationURLEscaper   = strings.NewReplacer("(", "%28", ")", "%29", "|", "%7C")
+)
 
 type responsesCitationSourcesContextKey struct{}
 
@@ -47,11 +50,30 @@ type responsesCitationSources struct {
 }
 
 func withResponsesCitationSources(req *http.Request, path string, body []byte) *http.Request {
-	if req == nil || path != providerEndpointResponses {
+	if req == nil || path != providerEndpointResponses || responsesRequestsJSONText(body) {
 		return req
 	}
 	sources := &responsesCitationSources{body: body}
 	return req.WithContext(context.WithValue(req.Context(), responsesCitationSourcesContextKey{}, sources))
+}
+
+// responsesRequestsJSONText reports structured output, which a Markdown link
+// could make invalid JSON.
+func responsesRequestsJSONText(body []byte) bool {
+	if !bytes.Contains(body, []byte("json_schema")) && !bytes.Contains(body, []byte("json_object")) {
+		return false
+	}
+	var request struct {
+		Text struct {
+			Format struct {
+				Type string `json:"type"`
+			} `json:"format"`
+		} `json:"text"`
+	}
+	if json.Unmarshal(body, &request) != nil {
+		return false
+	}
+	return request.Text.Format.Type == "json_schema" || request.Text.Format.Type == "json_object"
 }
 
 // normalizeResponsesCitationMarkers rewrites cite markers in a successful
@@ -278,8 +300,7 @@ func formatCitationLinks(refs []string, lookup func(string) (citationLink, bool)
 			}
 		}
 		title = citationTitleEscaper.Replace(title)
-		destination := strings.NewReplacer("(", "%28", ")", "%29").Replace(link.url)
-		links = append(links, fmt.Sprintf("[%s](%s)", title, destination))
+		links = append(links, fmt.Sprintf("[%s](%s)", title, citationURLEscaper.Replace(link.url)))
 	}
 	return strings.Join(links, ", ")
 }

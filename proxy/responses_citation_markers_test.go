@@ -26,6 +26,7 @@ var citationTestLinks = map[string]citationLink{
 	"turn2view0":        {url: "https://raw.githubusercontent.com/org/repo/main/README.md"},
 	"turn670467view1":   {title: "Code mode result", url: "https://example.com/code-mode"},
 	"turn3view0":        {title: "Escaped result", url: "https://example.com/escaped"},
+	"turn4view0":        {title: "Search", url: "https://example.com/search?filter=a|b"},
 }
 
 func citationTestLookup(ref string) (citationLink, bool) {
@@ -100,6 +101,7 @@ func TestRewriteCitationMarkers(t *testing.T) {
 		{"start before marker", "citeturn2view0", "[raw.githubusercontent.com](https://raw.githubusercontent.com/org/repo/main/README.md)"},
 		{"oversized kept", "cite" + strings.Repeat("a", citationMarkerMaxBytes) + "", "cite" + strings.Repeat("a", citationMarkerMaxBytes) + ""},
 		{"plain", "no markers", "no markers"},
+		{"pipe in URL", "| citeturn4view0 |", "| [Search](https://example.com/search?filter=a%7Cb) |"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got, held, _ := rewriteCitationMarkers(tt.text, true, citationTestLookup)
@@ -406,6 +408,23 @@ func TestNormalizeResponsesCitationMarkersRemapsAnnotations(t *testing.T) {
 	}
 }
 
+func TestResponsesRequestsJSONText(t *testing.T) {
+	for _, tt := range []struct {
+		body string
+		want bool
+	}{
+		{`{"text":{"format":{"type":"json_schema","name":"answer","schema":{}}}}`, true},
+		{`{"text":{"format":{"type":"json_object"}}}`, true},
+		{`{"text":{"format":{"type":"text"}},"instructions":"Never use json_schema."}`, false},
+		{`{"text":"json_object"}`, false},
+		{`{"input":"plain"}`, false},
+	} {
+		if got := responsesRequestsJSONText([]byte(tt.body)); got != tt.want {
+			t.Fatalf("responsesRequestsJSONText(%s) = %v, want %v", tt.body, got, tt.want)
+		}
+	}
+}
+
 func TestNormalizeResponsesCitationMarkersLeavesOtherStreamsUntouched(t *testing.T) {
 	stream := responsesItemIDTestStream(citationTestDelta("x " + citationTestPR))
 	for _, tt := range []struct {
@@ -421,6 +440,10 @@ func TestNormalizeResponsesCitationMarkersLeavesOtherStreamsUntouched(t *testing
 		}},
 		{"typed chat stream", func(req *http.Request) *http.Request {
 			return req.WithContext(context.WithValue(req.Context(), responsesChatStreamContextKey{}, true))
+		}},
+		{"structured output", func(*http.Request) *http.Request {
+			req := httptest.NewRequest(http.MethodPost, "https://upstream.example/responses", nil)
+			return withResponsesCitationSources(req, providerEndpointResponses, []byte(`{"text":{"format":{"type":"json_schema","name":"answer","schema":{}}}}`))
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
