@@ -683,15 +683,25 @@ func (e *upstreamError) Error() string {
 // sleeping through Retry-After or replacing it with a synthetic retry error.
 func restoreFreeUsageLimitResponse(resp *http.Response, capture responseBodyCapture) bool {
 	body := capture.body
-	if !capture.complete || capture.err != nil || resp.StatusCode != http.StatusTooManyRequests || len(body) >= upstreamErrorDetailMaxBodyBytes ||
-		(resp.ContentLength > 0 && resp.ContentLength != int64(len(body))) {
+	if !capture.complete || capture.err != nil ||
+		(resp.ContentLength > 0 && resp.ContentLength != int64(len(body))) ||
+		!isFreeUsageLimitResponse(resp.StatusCode, resp.Header, body) {
+		return false
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return true
+}
+
+// Callers must establish complete capture before using this terminal classification.
+func isFreeUsageLimitResponse(statusCode int, header http.Header, body []byte) bool {
+	if statusCode != http.StatusTooManyRequests || len(body) >= upstreamErrorDetailMaxBodyBytes {
 		return false
 	}
 	// Inspect only an in-memory, bounded decoded copy. In particular, an
 	// operator-supplied Accept-Encoding disables net/http's automatic gzip
 	// decoding; passthrough must retain those original bytes and headers.
 	decoded := body
-	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
+	switch strings.ToLower(strings.TrimSpace(header.Get("Content-Encoding"))) {
 	case "", "identity":
 	case "gzip":
 		reader, err := gzip.NewReader(bytes.NewReader(body))
@@ -711,11 +721,7 @@ func restoreFreeUsageLimitResponse(resp *http.Response, capture responseBodyCapt
 			Type string `json:"type"`
 		} `json:"error"`
 	}
-	if json.Unmarshal(decoded, &envelope) != nil || envelope.Error.Type != "FreeUsageLimitError" {
-		return false
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	return true
+	return json.Unmarshal(decoded, &envelope) == nil && envelope.Error.Type == "FreeUsageLimitError"
 }
 
 func readRetryableUpstreamErrorBody(body io.ReadCloser) []byte {

@@ -678,7 +678,8 @@ EOF
 #   - every installed client must pass independently on at least one candidate;
 #   - neutral exit 0 is allowed only if no model was reachable before any client
 #     was exercised, or if the first canary gets Zen's exact HTTP 403
-#     FreeTierError refusing non-OpenCode clients.
+#     FreeTierError refusing non-OpenCode clients, or a terminal HTTP 429
+#     FreeUsageLimitError. Strict CI fails these conditions without probing more models.
 # Zen's configured free models advertise text Chat support, not reliable coding
 # tool use, so these client checks use a direct exact-text prompt. The
 # credentialed Copilot-mode checks above retain their file-reading fixture.
@@ -701,6 +702,7 @@ ATTEMPT_STATUS=""
 ATTEMPT_DETAIL=""
 ZEN_ANY_CLIENT_EXERCISED=0
 ZEN_CLIENT_RESTRICTION=""
+ZEN_ALLOWANCE_REFUSAL=""
 
 validate_zen_free_models_file() {
   [[ -n "${ZEN_FREE_MODELS_FILE}" ]] || return 0
@@ -765,7 +767,7 @@ zen_error_is_client_restricted() {
 
 # zen_canary <model> [artifact-tag] -> echoes:
 #   OK <detail> | TRANSIENT <recognized-reason> | RESTRICTED <policy-message> |
-#   FAIL <reason>
+#   EXHAUSTED <allowance-message> | FAIL <reason>
 zen_canary() {
   local model="$1"
   local tag="${2:-initial}"
@@ -802,6 +804,7 @@ zen_canary() {
   fi
 
   errmsg="$(jq -r '.error.message? // empty' "${body}" 2>/dev/null || true)"
+  errtype="$(jq -r '.error.type? // empty' "${body}" 2>/dev/null || true)"
 
   # Status and successful-response shape are authoritative. In particular, a
   # hard 404/405 or malformed 200 cannot be softened by transient-looking text.
@@ -824,7 +827,9 @@ zen_canary() {
       printf 'FAIL http-%s:%s\n' "${code}" "${errmsg:0:80}"
       ;;
     408|425|429|5??)
-      if printf '%s' "${errmsg}" | grep -qiE 'does not support /|unknown model|no upstream'; then
+      if [[ "${code}" == "429" && "${errtype}" == "FreeUsageLimitError" ]]; then
+        printf 'EXHAUSTED http-429:%s\n' "${errmsg:0:200}"
+      elif printf '%s' "${errmsg}" | grep -qiE 'does not support /|unknown model|no upstream'; then
         printf 'FAIL proxy:%s\n' "${errmsg:0:80}"
       else
         printf 'TRANSIENT http-%s\n' "${code}"
@@ -852,7 +857,8 @@ zen_canary() {
 # run_harness_iterated <client> <model>... ->
 #   0 pass, 2 no initial reachability, 3 reachable candidates all incompatible,
 #   4 the provider refused the free tier to non-OpenCode clients (the policy
-#   applies to every free model, so remaining candidates are not probed).
+#   applies to every free model, so remaining candidates are not probed),
+#   5 exhausted free allowance (do not probe another model).
 run_harness_iterated() {
   local client="$1"
   shift
@@ -866,6 +872,11 @@ run_harness_iterated() {
       TRANSIENT)
         log "[${client}] skip ${model} before CLI (${verdict#* })"
         continue
+        ;;
+      EXHAUSTED)
+        ZEN_ALLOWANCE_REFUSAL="${verdict#* }"
+        log "[${client}] ${model} exhausted the free allowance (${ZEN_ALLOWANCE_REFUSAL}); stopping probes"
+        return 5
         ;;
       RESTRICTED)
         ZEN_CLIENT_RESTRICTION="${verdict#* }"
@@ -915,7 +926,7 @@ run_harness_iterated() {
         fi
         die "[${client}] ${model} remained reachable after CLI ${ATTEMPT_DETAIL}; refusing candidate fallback for client failure"
         ;;
-      FAIL|RESTRICTED)
+      FAIL|RESTRICTED|EXHAUSTED)
         die "[${client}] ${model} CLI ${ATTEMPT_DETAIL}; second canary failed: ${second_verdict#* }"
         ;;
       *)
@@ -1172,6 +1183,13 @@ main_zen() {
         ;;
       3)
         die "[${client}] no reachable Zen model produced the exact expected output"
+        ;;
+      5)
+        if [[ "${ZEN_REQUIRE_LIVE}" == "1" || "${ZEN_ANY_CLIENT_EXERCISED}" == "1" ]]; then
+          die "Zen live completion required: exhausted free allowance (${ZEN_ALLOWANCE_REFUSAL}); no more models will be probed"
+        fi
+        log "Zen smoke NEUTRAL SKIP: exhausted free allowance (${ZEN_ALLOWANCE_REFUSAL}); no client was exercised."
+        return 0
         ;;
       4)
         if [[ "${ZEN_ANY_CLIENT_EXERCISED}" == "0" ]]; then

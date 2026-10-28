@@ -9,7 +9,7 @@ const temporary = () => { const path = mkdtempSync(join(tmpdir(), "zen-control-t
 afterAll(() => { for (const path of directories) rmSync(path, { recursive: true, force: true }) })
 const usage = { prompt_tokens: 10, completion_tokens: 4, cost: 0, opencode: { billing_source: "free" } }
 const completion = (content = EXPECTED, extra: Record<string, unknown> = {}) =>
-  `data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: "stop" }], ...extra })}\n\n` +
+  `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: "stop" }], ...extra })}\n\n` +
   `data: ${JSON.stringify({ choices: [], usage })}\n\ndata: [DONE]\n\n`
 
 // These are offline checks. The integration cases launch the real built Vekil
@@ -21,6 +21,10 @@ test("requires an exact completed answer and explicit free usage", () => {
 
 for (const [name, text] of [
   ["wrong answer", completion("wrong")],
+  ["nonzero choice", completion().replace('"index":0', '"index":1')],
+  ["missing choice index", completion().replace('"index":0,', '')],
+  ["split choices", `data: {"choices":[{"index":0,"delta":{"content":"ZEN_CONTROL_OK"}}]}\n\ndata: {"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}\n\ndata: {"choices":[],"usage":${JSON.stringify(usage)}}\n\ndata: [DONE]\n\n`],
+  ["multiple choices", completion().replace('"choices":[{', '"choices":[{"index":1,"delta":{},"finish_reason":"stop"},{')],
   ["missing DONE", completion().replace("data: [DONE]\n\n", "")],
   ["unterminated frame", completion().trimEnd()],
   ["missing stop", completion().replace('"finish_reason":"stop"', '"finish_reason":null')],
@@ -86,7 +90,7 @@ for (const scenario of ["pass", "quota", "wrong-answer"] as const) {
       expect(requests[0].body.parallel_tool_calls).toBeUndefined()
       expect(requests[1].body.parallel_tool_calls).toBe(true)
       expect(requests[2].body.parallel_tool_calls).toBe(true)
-      expect(results[0].relay_requests).toBe(1)
+      expect(results[0].relay_requests).toBeUndefined()
       expect(results[1].relay_requests).toBe(1)
     } finally { server.stop(true) }
   }, 15_000)

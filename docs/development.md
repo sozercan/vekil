@@ -505,13 +505,15 @@ For each client/model attempt, a bounded raw chat-completions canary runs first:
 - Only upstream conditions evidenced by an HTTP response are skippable: an exact listed-model-unavailable HTTP 400, a promotion-ended, exact model-no-longer-supported, rate-limit, or temporary-capacity message on an eligible response, HTTP 408/425/429, or HTTP 5xx. Local curl transport failures and timeouts are hard failures because they can indicate a stuck Vekil handler. Other HTTP 400 responses and unknown statuses, including 404 and 405, are hard failures.
 - After a 200 canary, any CLI nonzero exit, timeout, empty result, or mismatched result gets one bounded second canary on that same model. A recognized transient skips the candidate; a still-reachable but incompatible candidate is recorded and the client must pass another candidate. The job fails if a client exhausts the reachable set without an exact pass.
 - Without `ZEN_REQUIRE_LIVE=1`, a neutral exit 0 is allowed only when no model was reachable **before any client was exercised**. CI and the local invocation below enable this flag and fail instead. Once a reachable model has exercised a client, every installed client must pass regardless of the flag.
-- Since September 2026, Zen answers anonymous free-tier requests from other clients with HTTP 403 `FreeTierError`: "OpenCode's free tier can only be used from within OpenCode". The first canary that receives this exact type and message ends the run before any client runs: it is a hard failure with `ZEN_REQUIRE_LIVE=1`, or a neutral skip with a warning in optional/manual harness runs without the flag. The experimental profile does not override this restriction, and adding a paid API key does not unlock free chat models. Anonymous allowance exhaustion can instead return HTTP 429 `FreeUsageLimitError`. While either condition prevents all canaries from succeeding, there is no live coverage; a skipped run is not an actual CLI pass.
+- Since September 2026, Zen answers anonymous free-tier requests from other clients with HTTP 403 `FreeTierError`: "OpenCode's free tier can only be used from within OpenCode". The first canary that receives this exact type and message ends the run before any client runs: it is a hard failure with `ZEN_REQUIRE_LIVE=1`, or a neutral skip with a warning in optional/manual harness runs without the flag. The experimental profile does not override this restriction, and adding a paid API key does not unlock free chat models. Anonymous allowance exhaustion can instead return HTTP 429 `FreeUsageLimitError`. That exact type stops the whole candidate list after the first refusal, rather than trying another model; strict CI fails and optional runs can neutral-skip only before any client was exercised. Ordinary transient 429s remain eligible for another candidate. While either refusal prevents canaries from succeeding, there is no live coverage; a skipped run is not an actual CLI pass.
 
 Typed free-allowance refusals are returned without retry only when a bounded
 capture proves the complete response reached EOF without a read error. A bounded
 gzip copy may be decoded for classification while preserving the original encoded
 body and headers for passthrough. A timed-out or failed JSON prefix is not restored
-as a complete response.
+as a complete response. The same typed classification suppresses explicit-route
+priority failover; ordinary authoritative 429 rejections still permit configured
+failover.
 
 OpenAI Codex CLI is intentionally excluded from this Zen harness because its native wire API requires `/responses`, while the shared Copilot/Claude/Gemini matrix deliberately tests `/chat/completions`. If a permitted configured Zen model advertises native `/responses`, Vekil forwards it directly rather than using Responses-to-Chat translation; do not retain retired model names or infer Responses support from Chat compatibility. Codex remains covered by the Copilot smoke, where it works against the Copilot upstream.
 
@@ -540,12 +542,12 @@ The same workflow has a separate `opencode-shaped-control` job. This is **not a
 coding-client smoke or proof of general free-tier access**. It replays a frozen
 OpenCode 2.1.2 request through three independently reported paths:
 
-1. Bun fetch directly to Zen, as the reference.
+1. Bun fetch directly to Zen, without the loopback relay, as the reference.
 2. Vekil's generic provider routing through a loopback, test-only Bun fetch relay.
 3. Vekil directly to Zen with its normal Go HTTP transport.
 
 Every path must return HTTP 200, the exact `ZEN_CONTROL_OK` completion, a normal
-stop and completed SSE stream, positive token counts, and explicit zero-cost
+stop and completed SSE stream from choice index 0 only, positive token counts, and explicit zero-cost
 `free` billing. HTTP refusals, empty/malformed/truncated output, tool calls,
 missing billing proof, and unavailable models fail rather than skip. All three
 paths run even when an earlier one fails, and **any failed path fails the job**.

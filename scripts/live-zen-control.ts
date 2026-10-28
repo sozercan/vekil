@@ -22,7 +22,7 @@ const HOP_HEADERS = ["host", "connection", "content-length", "content-encoding",
 const children = new Set<ReturnType<typeof Bun.spawn>>()
 
 type Mode = (typeof MODES)[number]
-type Result = { mode: Mode; passed: boolean; http_status?: number; error?: string; relay_requests?: number; log_id?: string }
+type Result = { mode: Mode; passed: boolean; client_request_sha256: string; http_status?: number; error?: string; relay_requests?: number; log_id?: string }
 type Options = { proxyBin: string; modelsFile: string; outputDir: string; upstream?: string }
 
 export function sessionID(now = Date.now()) {
@@ -58,8 +58,9 @@ export function validateCompletion(text: string) {
     if (done) throw new Error("SSE data after [DONE]")
     if (data === "[DONE]") { done = true; continue }
     const chunk = JSON.parse(data)
-    if (chunk.error || !Array.isArray(chunk.choices)) throw new Error("invalid Chat SSE chunk")
+    if (chunk.error || !Array.isArray(chunk.choices) || chunk.choices.length > 1) throw new Error("invalid Chat SSE chunk")
     for (const choice of chunk.choices) {
+      if (choice.index !== 0) throw new Error("unexpected completion choice index")
       const calls = choice.delta?.tool_calls
       if ((calls != null && (!Array.isArray(calls) || calls.length > 0)) || choice.delta?.function_call || (choice.finish_reason && choice.finish_reason !== "stop")) {
         throw new Error("unexpected tool call or incomplete completion")
@@ -111,12 +112,12 @@ const delay = (ms: number) => new Promise((ok) => setTimeout(ok, ms))
 async function runCase(mode: Mode, options: Options, body: string, metadata: Record<string, string>): Promise<Result> {
   const directory = join(options.outputDir, mode)
   mkdirSync(directory)
-  const result: Result = { mode, passed: false }
+  const result: Result = { mode, passed: false, client_request_sha256: createHash("sha256").update(body).digest("hex") }
   let relay: ReturnType<typeof Bun.serve> | undefined, child: ReturnType<typeof Bun.spawn> | undefined, log: number | undefined
   let relayRequests = 0
   try {
     let upstreamBase = "https://opencode.ai/inference/openai/v1"
-    if (mode !== "vekil-direct") {
+    if (mode === "vekil-bun-relay") {
       relay = Bun.serve({ hostname: "127.0.0.1", port: 0, maxRequestBodySize: 128 * 1024, async fetch(request) {
         if (request.method !== "POST" || new URL(request.url).pathname !== ROUTE) return new Response("unexpected route", { status: 404 })
         if (++relayRequests !== 1) return new Response("diagnostic dispatch limit", { status: 403 })

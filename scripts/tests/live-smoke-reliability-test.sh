@@ -100,6 +100,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path == "/canary-count":
+            self.send_json(200, {"count": canary_index})
+            return
         if self.path == "/healthz":
             self.send_json(200, {"status": "ok"})
             return
@@ -1397,6 +1400,42 @@ expect_hard_failure "Zen strict mode rejects exact FreeTierError before any CLI"
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 run_zen_case_expect_failure "Zen free-tier text without FreeTierError type is hard" 403 pass pass pass \
   "${free_tier_message}"
+
+# A typed exhausted allowance is terminal for the whole candidate list, unlike
+# ordinary 429 throttling. Prove the request count, not just the final exit code.
+quota_dir="${TMP_ROOT}/setup/zen-exhausted-allowance"
+MOCK_CANARY_ERROR_TYPE=FreeUsageLimitError start_mock_server "${quota_dir}/server" 429 "" "Free usage limit reached"
+quota_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${quota_dir}/bin" exit42 exit42 exit42
+expect_hard_failure_with_stderr "Zen strict quota stops before another model or CLI" 8 'exhausted free allowance' \
+  env PATH="${quota_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen ZEN_REQUIRE_LIVE=1 START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${quota_port}" LIVE_CLI_SMOKE_DIR="${quota_dir}/strict" \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+if [[ "$(curl --fail --silent --connect-timeout 1 --max-time 2 "http://127.0.0.1:${quota_port}/canary-count" | jq -r .count)" == "1" ]]; then
+  record_success "Zen typed quota makes exactly one strict canary request"
+else
+  record_failure "Zen typed quota makes exactly one strict canary request" "extra model probes after exhausted allowance"
+fi
+expect_success "Zen optional quota run terminates before any CLI" 8 \
+  env PATH="${quota_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${quota_port}" LIVE_CLI_SMOKE_DIR="${quota_dir}/optional" \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+if [[ "$(curl --fail --silent --connect-timeout 1 --max-time 2 "http://127.0.0.1:${quota_port}/canary-count" | jq -r .count)" == "2" ]]; then
+  record_success "Zen optional quota also makes only one canary request"
+else
+  record_failure "Zen optional quota also makes only one canary request" "extra optional model probes"
+fi
+throttle_dir="${TMP_ROOT}/setup/zen-ordinary-throttle"
+start_mock_server "${throttle_dir}/server" 200 "429,200"
+throttle_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${throttle_dir}/bin" pass pass pass
+expect_success "Zen ordinary 429 still allows another candidate" 8 \
+  env PATH="${throttle_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen ZEN_REQUIRE_LIVE=1 START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${throttle_port}" LIVE_CLI_SMOKE_DIR="${throttle_dir}/smoke" \
+    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
 hanging_chat_dir="${TMP_ROOT}/setup/hanging-chat-canary"
 start_mock_server "${hanging_chat_dir}/server" 200 "" "" 0 1

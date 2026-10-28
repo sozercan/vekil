@@ -3,10 +3,12 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -137,5 +139,55 @@ func TestDoWithRetry_FreeUsageLimitGzipPreservesEncoding(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestExplicitRouteFreeUsageLimitStopsTargetFailover(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("terminal=%t", terminal), func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				w.Header().Set("Content-Type", "application/json")
+				if body["model"] == "deployment-a" {
+					w.Header().Set("Retry-After", "60")
+					w.WriteHeader(http.StatusTooManyRequests)
+					if terminal {
+						_, _ = io.WriteString(w, quotaBodyFixture)
+					} else {
+						_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"retry another target"}}`)
+					}
+					return
+				}
+				_, _ = io.WriteString(w, `{"id":"second","choices":[{"message":{"role":"assistant","content":"pong"},"finish_reason":"stop","index":0}]}`)
+			}))
+			defer server.Close()
+			primary := explicitRouteTestProvider("zen", server.URL, "public")
+			primary.kind = providerTypeOpenAICompatible
+			h, route := explicitRouteTestHandler(t, server.Client(), routeModePriorityFailover, 2, 2, primary, explicitRouteTestProvider("alias", server.URL, "public"))
+			// Two model targets share the same configured provider and allowance.
+			route.targets[1].provider = primary
+			operation := newRouteOperation(route, context.Background())
+			ctx := withRouteOperation(context.Background(), operation)
+			response, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointChatCompletions, []byte(`{"model":"public-model","messages":[{"role":"user","content":"ping"}]}`), nil, "public-model", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = response.Body.Close() }()
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sends, switches, _ := operation.snapshot()
+			if terminal {
+				if response.StatusCode != 429 || string(body) != quotaBodyFixture || calls.Load() != 1 || sends != 1 || switches != 0 {
+					t.Fatalf("quota refusal failed over: status=%d body=%s calls=%d sends=%d switches=%d", response.StatusCode, body, calls.Load(), sends, switches)
+				}
+			} else if response.StatusCode != 200 || calls.Load() != 2 || sends != 2 || switches != 1 {
+				t.Fatalf("ordinary 429 lost failover: status=%d calls=%d sends=%d switches=%d", response.StatusCode, calls.Load(), sends, switches)
+			}
+		})
 	}
 }

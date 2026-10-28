@@ -106,6 +106,10 @@ func (h *ProxyHandler) explicitRouteCredentialFailureDecision(ctx context.Contex
 }
 
 func (h *ProxyHandler) explicitRouteRejectionDecision(ctx context.Context, operation *routeOperation, target targetBinding, endpoint string, kind routeAttemptKind, failure routeAttemptFailure, traffic azureRouteTraffic) routeRetryDecision {
+	if response := failure.response; response != nil && !response.bodyIncomplete &&
+		isFreeUsageLimitResponse(response.statusCode, response.header, response.body) {
+		return routeRetrySuppressedNonretryable
+	}
 	delay, validReset := parseRetryAfter(failure.retryAfter)
 	azureRecovery := target.provider.kind == providerTypeAzureOpenAI && failure.statusCode == http.StatusTooManyRequests && validReset
 	decision := routeRetrySuppressedMode
