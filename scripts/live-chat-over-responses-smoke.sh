@@ -316,16 +316,16 @@ fetch_models() {
 }
 
 pick_responses_only_model() {
-  # Luna must satisfy the same native endpoint and tool contract as the old
-  # Sol preference. Never fall back to an unpriced catalog entry.
+  # Luna utility must satisfy the same native endpoint and tool contract as the old
+  # Sol preference. Never fall back to another catalog entry.
   jq -e '
     .data[]?
-    | select(.id == "gpt-5.6-luna")
+    | select(.id == "gpt-5.6-luna-utility")
     | ((.supported_endpoints // []) | index("/responses")) != null
       and ((.supported_endpoints // []) | index("/chat/completions")) == null
       and (.capabilities.supports.tool_calls // false) == true
-  ' "${MODELS_JSON}" >/dev/null || die "approved model gpt-5.6-luna must advertise /responses only and tool_calls"
-  printf '%s\n' gpt-5.6-luna
+  ' "${MODELS_JSON}" >/dev/null || die "approved model gpt-5.6-luna-utility must advertise /responses only and tool_calls"
+  printf '%s\n' gpt-5.6-luna-utility
 }
 
 post_chat() {

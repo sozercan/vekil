@@ -3359,6 +3359,9 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		operation.conversation.dispatching()
 		resp, sendErr := h.singleInferenceSend(req, observation)
 		h.finishCopilotInference(req, resp, sendErr, permit)
+		if sendErr == nil {
+			normalizeResponsesCitationMarkers(req, resp)
+		}
 		if resp != nil {
 			sanitizeExplicitRouteResponseHeaders(resp.Header)
 		}

@@ -295,7 +295,9 @@ model_supports_endpoint() {
     .data[]?
     | select(.id == $model)
     | (.supported_endpoints // [])
-    | index($endpoint)
+    # Legacy Copilot Chat models list no endpoints; Vekil treats them as
+    # supporting every endpoint.
+    | (length == 0 or index($endpoint) != null)
   ' "${MODELS_JSON}" >/dev/null
 }
 
@@ -327,7 +329,7 @@ pick_optional_gemini_model() {
     fi
   done
 
-  log "Skipping Gemini smoke: no approved Flash model with /chat/completions support is listed by ${PROXY_BASE_URL}/v1/models."
+  log "Skipping Gemini smoke: no approved model with /chat/completions support is listed by ${PROXY_BASE_URL}/v1/models."
   return 0
 }
 
@@ -569,8 +571,12 @@ run_claude_command() {
   cd "${case_dir}"
   # This baseline compatibility smoke does not exercise Claude's experimental
   # Advisor Tool, whose beta header is not accepted by the Copilot endpoint.
-  # Use Anthropic's version spelling so Claude recognizes Haiku's capabilities;
-  # Vekil normalizes it back to the Copilot catalog ID. File reads need no thinking.
+  # Use Anthropic's version spelling for Claude models so Claude recognizes
+  # their capabilities; Vekil normalizes it back to the Copilot catalog ID.
+  # Other models keep their catalog ID. File reads need no thinking.
+  if [[ "${model}" == claude-* ]]; then
+    model="${model//./-}"
+  fi
   HOME="${home_dir}" \
   ANTHROPIC_BASE_URL="${PROXY_BASE_URL}" \
   ANTHROPIC_API_KEY=dummy \
@@ -580,7 +586,7 @@ run_claude_command() {
     --dangerously-skip-permissions \
     --print \
     --output-format text \
-    --model "${model//./-}" \
+    --model "${model}" \
     "${PROMPT}" \
     > "${output_file}" < /dev/null
 }
@@ -1213,9 +1219,9 @@ main() {
   fetch_models
 
   # Deliberate allowlists: catalog changes must not silently increase spend.
-  CODEX_MODEL="$(pick_model "Codex/OpenAI" /responses gpt-5-mini)"
-  CLAUDE_MODEL="$(pick_model "Claude" /chat/completions claude-haiku-4.5)"
-  GEMINI_MODEL="$(pick_optional_gemini_model gemini-3.8-flash gemini-3.7-flash gemini-3.6-flash)"
+  CODEX_MODEL="$(pick_model "Codex/OpenAI" /responses gpt-5.6-luna-utility)"
+  CLAUDE_MODEL="$(pick_model "Claude" /chat/completions claude-haiku-5.5)"
+  GEMINI_MODEL="$(pick_optional_gemini_model gpt-4.1 gpt-4o)"
 
   if [[ -n "${GEMINI_MODEL}" ]]; then
     require_cmd gemini
