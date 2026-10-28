@@ -1,8 +1,9 @@
-import { afterAll, expect, test } from "bun:test"
+import { afterAll, expect, spyOn, test } from "bun:test"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
-import { checkFreeModel, EXPECTED, FIXTURE, MODEL, runControls, sessionID, validateCompletion } from "../live-zen-control"
+import { compatibilityHeaders } from "../opencode-zen-metadata.mjs"
+import { checkFreeModel, EXPECTED, FIXTURE, MODEL, runControlCase, runControls, UPSTREAM, sessionID, validateCompletion } from "../live-zen-control"
 
 const directories: string[] = []
 const temporary = () => { const path = mkdtempSync(join(tmpdir(), "zen-control-test-")); directories.push(path); return path }
@@ -113,3 +114,43 @@ for (const scenario of ["pass", "quota", "wrong-answer", "post-stop"] as const) 
 test("rejects remote overrides before starting any control", async () => {
   await expect(runControls({ proxyBin: "unused", modelsFile: "unused", outputDir: "unused", upstream: "https://example.com/paid" })).rejects.toThrow("loopback mock")
 })
+
+
+for (const mode of ["bun-reference", "vekil-bun-relay", "vekil-direct"] as const) for (const upstream of [undefined, UPSTREAM]) {
+  test(`live ${mode} rejects official identity before dispatch: ${upstream ? "explicit" : "default"} URL`, async () => {
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(() => { throw new Error("must not dispatch") })
+    try {
+      for (const metadata of [
+        { "X-OpenCode-Client": "cli", "User-Agent": "opencode/latest/2.1.2/cli" },
+        { "X-OpenCode-Client": "vekil", "User-Agent": "opencode/latest/2.1.2/cli" },
+        { "X-OpenCode-Client": "cli", "User-Agent": "opencode/compat/2.1.2/vekil" },
+      ]) {
+        const result = await runControlCase(mode, { proxyBin: "must-not-run", modelsFile: "unused", outputDir: temporary(), upstream }, JSON.stringify({ model: MODEL }), metadata)
+        expect(result.passed).toBe(false)
+        expect(result.error).toContain("native identity replay requires a loopback mock")
+        expect(result.http_status).toBeUndefined()
+        expect(result.relay_requests).toBeUndefined()
+      }
+      expect(fetchSpy).not.toHaveBeenCalled()
+    } finally { fetchSpy.mockRestore() }
+  })
+}
+
+
+for (const upstream of [undefined, UPSTREAM]) {
+  test(`live identity guard retains the Vekil-identified control: ${upstream ? "explicit" : "default"} URL`, async () => {
+    const metadata = compatibilityHeaders()
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      expect(url).toBe(UPSTREAM)
+      expect(new Headers(init?.headers).get("x-opencode-client")).toBe("vekil")
+      expect(new Headers(init?.headers).get("user-agent")).toBe(metadata["user-agent"])
+      return new Response(completion(), { headers: { "content-type": "text/event-stream" } })
+    })
+    try {
+      const result = await runControlCase("bun-reference", { proxyBin: "must-not-run", modelsFile: "unused", outputDir: temporary(), upstream }, JSON.stringify({ model: MODEL }), metadata)
+      expect(result.passed).toBe(true)
+      expect(result.http_status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    } finally { fetchSpy.mockRestore() }
+  })
+}

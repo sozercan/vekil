@@ -115,6 +115,14 @@ export async function runControlCase(mode: Mode, options: Options, body: string,
   let relay: ReturnType<typeof Bun.serve> | undefined, child: ReturnType<typeof Bun.spawn> | undefined, log: number | undefined
   let relayRequests = 0
   try {
+    const upstream = options.upstream ?? UPSTREAM
+    checkUpstream(upstream)
+    if (upstream === UPSTREAM) {
+      const identity = new Headers(metadata), expected = compatibilityHeaders("")
+      if (identity.get("x-opencode-client") !== expected["x-opencode-client"] || identity.get("user-agent") !== expected["user-agent"]) {
+        throw new Error("live controls must identify as Vekil; native identity replay requires a loopback mock")
+      }
+    }
     let upstreamBase = "https://opencode.ai/inference/openai/v1"
     if (mode === "vekil-bun-relay") {
       relay = Bun.serve({ hostname: "127.0.0.1", port: 0, maxRequestBodySize: 128 * 1024, async fetch(request) {

@@ -1,5 +1,5 @@
-// Test-only observation of the actual OpenCode CLI. It records the native
-// request for a separate, redirect-rejecting Vekil replay, not an upstream relay.
+// Test-only observation of the actual OpenCode CLI, not an upstream relay.
+// Live runs retain only request hashes/metadata; raw capture is for mock replay.
 import { createHash } from "node:crypto"
 import { writeFileSync } from "node:fs"
 import { join } from "node:path"
@@ -53,7 +53,7 @@ export async function setupObserver(ctx) {
       const value = event.request.headers.get(name)
       return value === null ? [] : [[name, value]]
     }))
-    writeFileSync(requestFile, raw, { mode: 0o600 })
+    if (requestFile) writeFileSync(requestFile, raw, { mode: 0o600 })
     writeFileSync(join(directory, "request.json"), JSON.stringify({ model: MODEL, body_sha256: createHash("sha256").update(raw).digest("hex"), headers }, null, 2))
   })
   await ctx.session.hook("http.response", async (event) => {

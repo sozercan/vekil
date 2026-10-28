@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 
-// Run the actual pinned OpenCode CLI, then replay its exact captured request
-// through Vekil on the same runner. The native CLI is an availability baseline,
-// never a substitute for the separately validated proxy response.
+// Run the actual pinned OpenCode CLI as a live availability baseline. Replaying
+// its native identity through Vekil is restricted to loopback mocks; the live
+// Vekil diagnostics must identify themselves as Vekil and pass independently.
 import { spawn, type ChildProcess } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
 import { createHash, randomBytes } from "node:crypto"
@@ -90,7 +90,7 @@ async function runDirectCase(options: Options, binary: string, workspace: string
   try {
     const baseURL = upstream.slice(0, -"/chat/completions".length)
     const config = {
-      plugins: [{ package: join(ROOT, "scripts/zen-native-observer"), options: { directory, upstream, requestFile: join(options.outputDir, "_private", "request.txt") } }],
+      plugins: [{ package: join(ROOT, "scripts/zen-native-observer"), options: { directory, upstream, ...(upstream !== UPSTREAM ? { requestFile: join(options.outputDir, "_private", "request.txt") } : {}) } }],
       providers: { opencode: { settings: { apiKey: "public", baseURL }, models: { [MODEL]: { settings: { baseURL } } } } },
     }
     const env = { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: home, XDG_CONFIG_HOME: join(home, "config"), XDG_DATA_HOME: join(home, "data"), XDG_CACHE_HOME: join(home, "cache"), XDG_STATE_HOME: join(home, "state"), OPENCODE_CONFIG_CONTENT: JSON.stringify(config), NO_COLOR: "1", TERM: "dumb" }
@@ -115,7 +115,9 @@ async function runDirectCase(options: Options, binary: string, workspace: string
   return result
 }
 
-export function readNativeReplay(outputDir: string) {
+export function readNativeReplay(outputDir: string, upstream: string) {
+  checkUpstream(upstream)
+  if (upstream === UPSTREAM) throw new Error("native identity replay requires a loopback mock; live Zen is baseline-only")
   const body = readFileSync(join(outputDir, "_private", "request.txt"), "utf8")
   const receipt = JSON.parse(readFileSync(join(outputDir, "opencode-direct", "request.json"), "utf8"))
   if (Buffer.byteLength(body) > 128 * 1024 || JSON.parse(body).model !== MODEL || receipt.model !== MODEL || createHash("sha256").update(body).digest("hex") !== receipt.body_sha256) throw new Error("invalid native request capture")
@@ -125,7 +127,8 @@ export function readNativeReplay(outputDir: string) {
 }
 
 export async function runNativeControls(options: Options) {
-  checkUpstream(options.upstream ?? UPSTREAM)
+  const upstream = options.upstream ?? UPSTREAM
+  checkUpstream(upstream)
   checkFreeModel(readFileSync(options.modelsFile, "utf8"))
   const binary = Bun.which(options.opencodeBin)
   if (!binary) throw new Error("pinned OpenCode CLI is required")
@@ -137,8 +140,11 @@ export async function runNativeControls(options: Options) {
   if (version.code !== 0 || version.stdout.trim() !== `opencode v${OPENCODE_VERSION}`) throw new Error(`expected OpenCode ${OPENCODE_VERSION}, got ${version.stdout.trim()}`)
   const results: Result[] = [await runDirectCase(options, binary, workspace, sessionID())]
   writeFileSync(join(options.outputDir, "results.json"), JSON.stringify(results, null, 2))
+  // Free Zen does not permit proxy access. Never replay native identity live,
+  // even when a native request succeeded or left capture files after a refusal.
+  if (upstream === UPSTREAM) return results
   try {
-    const { body, headers } = readNativeReplay(options.outputDir)
+    const { body, headers } = readNativeReplay(options.outputDir, upstream)
     results.push({ ...await runControlCase("vekil-direct", options, body, headers), mode: "vekil-direct" })
   } catch (error) {
     const result: Result = { mode: "vekil-direct", passed: false, error: error instanceof Error ? error.message : String(error) }
@@ -156,7 +162,7 @@ if (import.meta.main) {
     if (!process.env.ZEN_FREE_MODELS_FILE) throw new Error("ZEN_FREE_MODELS_FILE is required")
     const outputDir = resolve(process.env.ZEN_NATIVE_DIR ?? join(tmpdir(), `vekil-zen-native-${randomBytes(8).toString("hex")}`))
     const results = await runNativeControls({ opencodeBin: process.env.OPENCODE_BIN ?? "opencode", proxyBin: process.env.PROXY_BIN ?? join(ROOT, "vekil"), modelsFile: process.env.ZEN_FREE_MODELS_FILE, outputDir })
-    const summary = "## Actual OpenCode CLI and native-request replay\n\n| Path | Exact completion and free billing | HTTP |\n|---|---|---|\n" + results.map((r) => `| ${r.mode} | ${r.passed ? "PASS" : "FAIL"} | ${r.http_status ?? "not reached"} |`).join("\n") + "\n\nOpenCode builds the native request. Its exact bytes and native metadata are then replayed through Vekil with redirects rejected. The native CLI retains its own HTTP behavior; its success cannot substitute for a successful Vekil response. All paths are required.\n"
+    const summary = "## Actual OpenCode CLI availability baseline\n\n| Path | Exact completion and free billing | HTTP |\n|---|---|---|\n" + results.map((r) => `| ${r.mode} | ${r.passed ? "PASS" : "FAIL"} | ${r.http_status ?? "not reached"} |`).join("\n") + "\n\nOnly the actual OpenCode CLI contacts live Zen in this baseline. Its native identity is never replayed through Vekil live; exact native-request replay is restricted to loopback tests. A passing baseline cannot substitute for the separately required Vekil-identified controls and generic-client smoke.\n"
     writeFileSync(join(outputDir, "summary.md"), summary)
     if (process.env.GITHUB_STEP_SUMMARY) writeFileSync(process.env.GITHUB_STEP_SUMMARY, summary, { flag: "a" })
     console.log(summary)

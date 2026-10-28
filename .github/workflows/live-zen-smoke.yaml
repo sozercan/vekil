@@ -113,7 +113,7 @@ jobs:
           fi
 
   opencode-shaped-control:
-    name: OpenCode native and shaped controls
+    name: OpenCode native baseline and shaped controls
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -148,13 +148,13 @@ jobs:
           scripts/parse-opencode-zen-free-models.sh "$RUNNER_TEMP/zen-control-models.mdx" \
             > "$RUNNER_TEMP/zen-control-models.tsv"
 
-      - name: Run actual OpenCode CLI and replay its request through Vekil
+      - name: Run actual OpenCode CLI baseline (no proxy replay)
         env:
           ZEN_FREE_MODELS_FILE: ${{ runner.temp }}/zen-control-models.tsv
           ZEN_NATIVE_DIR: ${{ runner.temp }}/zen-native
         run: bun --no-env-file scripts/live-zen-native.ts
 
-      # Run the separate request-replay diagnostic even when native admission
+      # Run the separate Vekil-identified diagnostic even when native admission
       # failed. Neither diagnostic replaces the generic-client smoke above.
       - name: Compare Bun reference, Vekil with Bun relay, and native Vekil
         if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.catalog.outcome == 'success' }}

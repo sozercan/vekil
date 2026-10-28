@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { createHash } from "node:crypto"
-import { EXPECTED, MODEL } from "../live-zen-control"
+import { EXPECTED, MODEL, UPSTREAM } from "../live-zen-control"
 import { OPENCODE_VERSION } from "../opencode-zen-metadata.mjs"
 import { readNativeReplay, runCLI, runNativeControls, validateNativeEvidence, validateNativeOutput } from "../live-zen-native"
 import { setupObserver } from "../zen-native-observer/index.js"
@@ -49,10 +49,10 @@ test("native success requires matching HTTP, CLI, usage, and observer evidence",
   expect(() => validateNativeEvidence(directory, cliText(), 0)).toThrow()
 })
 
-async function installObserver(directory: string) {
+async function installObserver(directory: string, upstream = "http://127.0.0.1:1234/inference/openai/v1/chat/completions", capture = true) {
   const hooks: Record<string, (event: any) => any> = {}
   const tool = { execute: async () => { throw new Error("original tool must never run") } }
-  await setupObserver({ options: { directory, requestFile: join(directory, "native-request.txt"), upstream: "http://127.0.0.1:1234/inference/openai/v1/chat/completions" }, app: { name: "cli", version: OPENCODE_VERSION },
+  await setupObserver({ options: { directory, upstream, ...(capture ? { requestFile: join(directory, "native-request.txt") } : {}) }, app: { name: "cli", version: OPENCODE_VERSION },
     session: { hook: async (name: string, callback: any) => { hooks[name] = callback } },
     permission: { hook: async (_name: string, callback: any) => { hooks.permission = callback } },
     tool: { transform: async (callback: any) => callback({ list: () => [{ id: "blocked" }], update: (_id: string, update: any) => update(tool) }) },
@@ -180,7 +180,60 @@ test("native request replay rejects altered captures and unexpected metadata", (
   const body = JSON.stringify({ model: MODEL })
   writeFileSync(join(root, "_private", "request.txt"), body)
   writeFileSync(join(root, "opencode-direct", "request.json"), JSON.stringify({ model: MODEL, body_sha256: "wrong", headers: { "x-opencode-client": "cli" } }))
-  expect(() => readNativeReplay(root)).toThrow("invalid native request capture")
+  expect(() => readNativeReplay(root, "http://127.0.0.1:1234/inference/openai/v1/chat/completions")).toThrow("invalid native request capture")
   writeFileSync(join(root, "opencode-direct", "request.json"), JSON.stringify({ model: MODEL, body_sha256: createHash("sha256").update(body).digest("hex"), headers: { "x-opencode-client": "cli", authorization: "Bearer other" } }))
-  expect(() => readNativeReplay(root)).toThrow("invalid native request metadata")
+  expect(() => readNativeReplay(root, "http://127.0.0.1:1234/inference/openai/v1/chat/completions")).toThrow("invalid native request metadata")
 })
+
+
+test("live observer records request evidence without saving raw replay data", async () => {
+  const directory = temporary(), { hooks } = await installObserver(directory, UPSTREAM, false)
+  const body = JSON.stringify({ model: MODEL, messages: [{ role: "user", content: EXPECTED }] })
+  await hooks["http.request"]({ kind: "primary", request: new Request(UPSTREAM, {
+    method: "POST", headers: { authorization: "Bearer public", "x-opencode-client": "cli" }, body,
+  }) })
+  expect(existsSync(join(directory, "native-request.txt"))).toBe(false)
+  const receipt = JSON.parse(readFileSync(join(directory, "request.json"), "utf8"))
+  expect(receipt.body_sha256).toBe(createHash("sha256").update(body).digest("hex"))
+  expect(receipt.headers["x-opencode-client"]).toBe("cli")
+})
+
+for (const upstream of [UPSTREAM, "https://example.com/inference/openai/v1/chat/completions", "http://localhost:1234/inference/openai/v1/chat/completions", "http://127.0.0.1:1234/inference/openai/v1/chat/completions?upstream=live", "http://127.0.0.1:1234/inference/openai/v1/chat/completions#live", "http://public@127.0.0.1:1234/inference/openai/v1/chat/completions", "https://127.0.0.1:1234/inference/openai/v1/chat/completions"]) {
+  test(`native replay rejects unsafe destination before reading any capture: ${upstream}`, () => {
+    expect(() => readNativeReplay("must-not-be-read", upstream)).toThrow("loopback mock")
+  })
+}
+
+for (const upstream of [undefined, UPSTREAM]) for (const status of [200, 429]) {
+  test(`live baseline never dispatches native identity through Vekil: ${status}, ${upstream ? "explicit" : "default"} URL`, async () => {
+    const root = temporary(), outputDir = join(root, "results"), modelsFile = join(root, "models.tsv"), binary = join(root, "fake-opencode")
+    const proxyMarker = join(root, "proxy-started"), configFile = join(root, "observed-options.json")
+    writeFileSync(modelsFile, `${MODEL}\tFree\t/chat/completions\n`)
+    // Fake only the native CLI: no external request is made. Leave a valid
+    // capture behind to prove neither success nor refusal can trigger replay.
+    const body = JSON.stringify({ model: MODEL }), headers = { "x-opencode-client": "cli", "user-agent": `opencode/latest/${OPENCODE_VERSION}/cli` }
+    const receipt = { model: MODEL, body_sha256: createHash("sha256").update(body).digest("hex"), headers }
+    writeFileSync(binary, `#!${process.execPath}
+const { writeFileSync } = require("node:fs"), { join } = require("node:path");
+if (process.argv.includes("--version")) { console.log("opencode v${OPENCODE_VERSION}"); process.exit(0) }
+if (!process.env.OPENCODE_CONFIG_CONTENT) { writeFileSync(${JSON.stringify(proxyMarker)}, "started"); process.exit(1) }
+const options = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT).plugins[0].options;
+writeFileSync(${JSON.stringify(configFile)}, JSON.stringify(options));
+writeFileSync(join(options.directory, "observer.json"), ${JSON.stringify(JSON.stringify({ app: { name: "cli", version: OPENCODE_VERSION }, requests: 1, responses: 1, violations: [] }))});
+writeFileSync(join(options.directory, "request.json"), ${JSON.stringify(JSON.stringify(receipt))});
+writeFileSync(join(options.directory, "response.json"), ${JSON.stringify(JSON.stringify({ status, content_type: status === 200 ? "text/event-stream" : "application/json" }))});
+writeFileSync(join(options.directory, "response.txt"), ${JSON.stringify(status === 200 ? completion() : '{"error":{"type":"FreeUsageLimitError"}}')});
+writeFileSync(${JSON.stringify(join(outputDir, "_private", "request.txt"))}, ${JSON.stringify(body)});
+process.stdout.write(${JSON.stringify(cliText())});
+`, { mode: 0o700 })
+    const results = await runNativeControls({ opencodeBin: binary, proxyBin: binary, modelsFile, outputDir, upstream })
+    expect(results).toHaveLength(1)
+    expect(results[0].mode).toBe("opencode-direct")
+    expect(results[0].passed).toBe(status === 200)
+    expect(results[0].http_status).toBe(status)
+    expect(JSON.parse(readFileSync(configFile, "utf8")).requestFile).toBeUndefined()
+    expect(existsSync(proxyMarker)).toBe(false)
+    expect(existsSync(join(outputDir, "vekil-direct"))).toBe(false)
+    expect(JSON.parse(readFileSync(join(outputDir, "results.json"), "utf8"))).toEqual(results)
+  })
+}

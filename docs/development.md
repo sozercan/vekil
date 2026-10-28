@@ -544,15 +544,19 @@ Run it locally after `make build` (requires GitHub Copilot CLI; installed Claude
 )
 ```
 
-### Actual OpenCode CLI baseline and request-replay diagnostic
+### Actual OpenCode CLI baseline and loopback request replay
 
 The same workflow has an `opencode-shaped-control` job that runs both an actual
 OpenCode CLI baseline and a separate frozen-request diagnostic. Neither can
 replace the generic Copilot/Claude/Gemini smoke or prove general free-tier access.
 
 `scripts/live-zen-native.ts` first runs pinned `@opencode/cli@2.1.2` directly to
-Zen. It then replays that actual native client's captured request bytes and
-metadata through the real built Vekil on the same runner. The CLI version is taken
+Zen, without replaying its native identity through a live proxy. The upstream
+[free-tier notice](https://github.com/anomalyco/opencode/issues/59387) excludes
+proxies; matching official CLI headers does not authorize proxy access. Exact
+native-request replay through the built Vekil is restricted to validated
+loopback inference mocks in offline tests, regardless of whether the native
+request succeeded or was refused. The CLI version is taken
 from `scripts/opencode-zen-metadata.mjs` and checked before any inference. On
 October 28, 2026, 2.1.2 was the published npm version; the 2.1.4 version mentioned
 in the upstream issue notice was not available from that package registry.
@@ -566,20 +570,22 @@ auxiliary request-hook invocations, and denies all tool execution without
 substituting native prompts or tool definitions. The CLI baseline intentionally
 retains OpenCode's native transport, including its redirect behavior; its hook
 counts are application-level observations, not physical network-send counts.
-A native CLI success alone can never pass the Vekil test: the separate replay uses
-the existing redirect-rejecting proxy harness and must independently return a
-successful proxy response. The replay's input hash must match the captured
-native request. A redirect, error, or truncated proxy response fails even if the
-native CLI completed. There is no Bun upstream relay in this Vekil replay.
+A native CLI success alone can never pass the live Vekil test: the separate
+Vekil-identified controls and generic-client smoke still require successful
+proxy responses. In offline tests, the replay uses the existing redirect-rejecting
+proxy harness and its input hash must match the captured native request. A
+redirect, error, or truncated proxy response fails even if the native CLI
+completed. There is no Bun upstream relay in this loopback replay.
 
-Both paths require the exact completion, normal-stop SSE, positive token usage,
-and explicit zero-cost `free` billing; the native baseline additionally requires
+The live baseline and both offline paths require the exact completion,
+normal-stop SSE, positive token usage, and explicit zero-cost `free` billing; the native baseline additionally requires
 successful CLI exit and exact CLI text. A CLI exit code or zero cost alone cannot
 pass. Refusals, tool calls, timeouts, missing observer evidence, unexpected initial
 credentials/models/destinations, or extra native model requests fail. Owned CLI
 process groups and proxy processes are cleaned up on completion, timeout, and
 interruption. Only bounded evidence is uploaded in `zen-native-cli-control`;
-raw native request bodies and HOME/configuration/database files are excluded.
+live native request bodies are not saved, and HOME/configuration/database files
+are excluded. Raw request capture exists only for loopback replay tests.
 
 The frozen-request diagnostic runs even if the native live step fails, so a failed
 baseline does not erase the other evidence. It replays an OpenCode 2.1.2 request
