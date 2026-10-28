@@ -80,11 +80,11 @@ parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--port", type=int, default=0)
 parser.add_argument("--port-file", required=True)
 parser.add_argument("--state-file", required=True)
-parser.add_argument("--scenario", choices=("success", "no-model", "no-tools", "hybrid-luna", "redaction"), default="success")
+parser.add_argument("--scenario", choices=("success", "no-model", "no-tools", "hybrid-luna-utility", "redaction"), default="success")
 parser.add_argument("--secret", default="")
 args = parser.parse_args()
 
-MODEL = "gpt-5.6-luna"
+MODEL = "gpt-5.6-luna-utility"
 TEXT_MARKER = "VEKIL_CHAT_OVER_RESPONSES_TEXT_OK"
 STREAM_MARKER = "VEKIL_CHAT_OVER_RESPONSES_STREAM_OK"
 SINGLE_MARKER = "VEKIL_CHAT_OVER_RESPONSES_SINGLE_OK"
@@ -187,7 +187,7 @@ class Handler(BaseHTTPRequestHandler):
                 ]
             if args.scenario == "no-tools":
                 next(item for item in data if item["id"] == MODEL)["capabilities"]["supports"]["tool_calls"] = False
-            if args.scenario == "hybrid-luna":
+            if args.scenario == "hybrid-luna-utility":
                 next(item for item in data if item["id"] == MODEL)["supported_endpoints"].append("/chat/completions")
             self.send_json(200, {"object": "list", "data": data})
             return
@@ -522,9 +522,9 @@ if expect_success "full mock behavior and preferred model selection" 15 \
     LIVE_CHAT_OVER_RESPONSES_SMOKE_DIR="${success_dir}/smoke" \
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=3 \
     "${SMOKE_SCRIPT}"; then
-  if [[ "$(cat "${success_dir}/smoke/selected-model.txt" 2>/dev/null || true)" != "gpt-5.6-luna" ]]; then
-    record_failure "preferred model selection" "gpt-5.6-luna was not selected"
-  elif ! jq -e '.errors == [] and (.requests | length) == 8 and all(.requests[]; .model == "gpt-5.6-luna")' \
+  if [[ "$(cat "${success_dir}/smoke/selected-model.txt" 2>/dev/null || true)" != "gpt-5.6-luna-utility" ]]; then
+    record_failure "preferred model selection" "gpt-5.6-luna-utility was not selected"
+  elif ! jq -e '.errors == [] and (.requests | length) == 8 and all(.requests[]; .model == "gpt-5.6-luna-utility")' \
       "${success_dir}/server/state.json" >/dev/null; then
     record_failure "full mock behavior" "mock server did not observe the eight expected requests"
     cat "${success_dir}/server/state.json" >&2 || true
@@ -552,22 +552,22 @@ fi
 no_model_dir="${TMP_ROOT}/no-model"
 start_mock_server "${no_model_dir}/server" no-model
 expect_failure_matching "no Responses-only model is a hard failure" 8 \
-  'approved model gpt-5.6-luna must advertise /responses only and tool_calls' \
+  'approved model gpt-5.6-luna-utility must advertise /responses only and tool_calls' \
   env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
     LIVE_CHAT_OVER_RESPONSES_SMOKE_DIR="${no_model_dir}/smoke" \
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 \
     "${SMOKE_SCRIPT}"
 
-for scenario in no-tools hybrid-luna; do
+for scenario in no-tools hybrid-luna-utility; do
   model_contract_dir="${TMP_ROOT}/${scenario}"
   start_mock_server "${model_contract_dir}/server" "${scenario}"
-  expect_failure_matching "Luna ${scenario} is rejected before inference" 8 \
-    'approved model gpt-5.6-luna must advertise /responses only and tool_calls' \
+  expect_failure_matching "Luna utility ${scenario} is rejected before inference" 8 \
+    'approved model gpt-5.6-luna-utility must advertise /responses only and tool_calls' \
     env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
       LIVE_CHAT_OVER_RESPONSES_SMOKE_DIR="${model_contract_dir}/smoke" \
       "${SMOKE_SCRIPT}"
   if ! jq -e '.requests == []' "${model_contract_dir}/server/state.json" >/dev/null; then
-    record_failure "Luna ${scenario} rejection" "rejected catalog produced an inference request"
+    record_failure "Luna utility ${scenario} rejection" "rejected catalog produced an inference request"
   fi
 done
 
