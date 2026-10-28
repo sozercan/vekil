@@ -475,13 +475,15 @@ The [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workfl
 Before starting Vekil, the workflow fetches OpenCode's published Zen documentation and uses [`scripts/parse-opencode-zen-free-models.sh`](../scripts/parse-opencode-zen-free-models.sh) to join the endpoint and pricing tables by display label. Only rows whose input and output prices are both labeled `Free` are eligible for the smoke. The harness intersects that parsed set with the checked-in static example, so aliases such as Ox Alpha's `x-preview-f-free` do not depend on an ID suffix and models that lose their free label are not exercised anonymously.
 
 The example explicitly opts into experimental OpenCode-compatible metadata through
-`extra_headers`: `User-Agent: opencode/compat/0.0.0/vekil`,
+`extra_headers`: `User-Agent: opencode/compat/2.1.2/vekil`,
 `x-opencode-client: vekil`, and `x-opencode-project: vekil`. This identifies Vekil,
 not an official OpenCode release, and changes no other provider's headers. CI copies
 the example into a temporary config and extends its final `extra_headers` mapping
-with a fresh `ses_<64 hex characters>` value in `x-opencode-session`,
-`x-opencode-session-id`, `x-session-affinity`, and `X-Session-Id`. That value is
-stable only within the smoke run. The generated config is validated offline before
+with one fresh native-shaped session ID from
+`scripts/opencode-zen-metadata.mjs`: `ses_` plus a 12-character descending timestamp
+and 14 base-62 characters. The same value is used in `x-opencode-session`,
+`x-opencode-session-id`, `x-session-affinity`, and `X-Session-Id`, and is stable only
+within the smoke run. The helper also pins the compatibility/CLI version. The generated config is validated offline before
 the proxy starts. Compatibility metadata does not grant free-tier access.
 
 The separate [`Update OpenCode Zen Free Models`](../.github/workflows/update-opencode-zen-free.yaml) workflow runs daily on trusted `main` code. It resolves OpenCode's mutable `dev` branch to an exact commit, downloads only that revision's `services/www/src/docs/content/console/models.mdx`, and runs [`scripts/update-opencode-zen-free-config.sh`](../scripts/update-opencode-zen-free-config.sh) to replace the marked model block in the example. The renderer sorts IDs, preserves the rest of the file, rejects duplicates, bounds the catalog, and accepts only `/chat/completions` and `/responses`. It skips `/systemone` classifier rows and refuses an update containing no Chat or Responses models. Free `/messages` models require a provider-design change before they can be emitted under `openai-compatible`. Changed output is validated offline and proposed in a signed PR rather than written directly to `main`.
@@ -530,17 +532,58 @@ Run it locally after `make build` (requires GitHub Copilot CLI; installed Claude
     > "$zen_smoke_dir/models.mdx"
   scripts/parse-opencode-zen-free-models.sh "$zen_smoke_dir/models.mdx" \
     > "$zen_smoke_dir/free-models.tsv"
-  SMOKE_PROVIDER=zen ZEN_REQUIRE_LIVE=1 PROVIDERS_CONFIG=examples/opencode-zen-free.yaml \
+  cp examples/opencode-zen-free.yaml "$zen_smoke_dir/providers.yaml"
+  zen_session_id="$(node scripts/opencode-zen-metadata.mjs --session-id)"
+  for header in x-opencode-session x-opencode-session-id x-session-affinity X-Session-Id; do
+    printf '      %s: "%s"\n' "$header" "$zen_session_id" >> "$zen_smoke_dir/providers.yaml"
+  done
+  ./vekil config validate --providers-config "$zen_smoke_dir/providers.yaml"
+  SMOKE_PROVIDER=zen ZEN_REQUIRE_LIVE=1 PROVIDERS_CONFIG="$zen_smoke_dir/providers.yaml" \
     ZEN_FREE_MODELS_FILE="$zen_smoke_dir/free-models.tsv" \
     scripts/live-cli-smoke.sh
 )
 ```
 
-### OpenCode-shaped positive-control diagnostic
+### Actual OpenCode CLI baseline and request-replay diagnostic
 
-The same workflow has a separate `opencode-shaped-control` job. This is **not a
-coding-client smoke or proof of general free-tier access**. It replays a frozen
-OpenCode 2.1.2 request through three independently reported paths:
+The same workflow has an `opencode-shaped-control` job that runs both an actual
+OpenCode CLI baseline and a separate frozen-request diagnostic. Neither can
+replace the generic Copilot/Claude/Gemini smoke or prove general free-tier access.
+
+`scripts/live-zen-native.ts` first runs pinned `@opencode/cli@2.1.2` directly to
+Zen. It then replays that actual native client's captured request bytes and
+metadata through the real built Vekil on the same runner. The CLI version is taken
+from `scripts/opencode-zen-metadata.mjs` and checked before any inference. On
+October 28, 2026, 2.1.2 was the published npm version; the 2.1.4 version mentioned
+in the upstream issue notice was not available from that package registry.
+The CLI uses an empty workspace and isolated HOME/XDG directories with no
+inherited provider credentials. A fixed title avoids auxiliary title generation.
+The artifact directory must be empty; stale receipts are rejected.
+
+The test-only observer plugin records native request metadata/body hashes and
+bounded HTTP responses, disables native turn retries, rejects additional or
+auxiliary request-hook invocations, and denies all tool execution without
+substituting native prompts or tool definitions. The CLI baseline intentionally
+retains OpenCode's native transport, including its redirect behavior; its hook
+counts are application-level observations, not physical network-send counts.
+A native CLI success alone can never pass the Vekil test: the separate replay uses
+the existing redirect-rejecting proxy harness and must independently return a
+successful proxy response. The replay's input hash must match the captured
+native request. A redirect, error, or truncated proxy response fails even if the
+native CLI completed. There is no Bun upstream relay in this Vekil replay.
+
+Both paths require the exact completion, normal-stop SSE, positive token usage,
+and explicit zero-cost `free` billing; the native baseline additionally requires
+successful CLI exit and exact CLI text. A CLI exit code or zero cost alone cannot
+pass. Refusals, tool calls, timeouts, missing observer evidence, unexpected initial
+credentials/models/destinations, or extra native model requests fail. Owned CLI
+process groups and proxy processes are cleaned up on completion, timeout, and
+interruption. Only bounded evidence is uploaded in `zen-native-cli-control`;
+raw native request bodies and HOME/configuration/database files are excluded.
+
+The frozen-request diagnostic runs even if the native live step fails, so a failed
+baseline does not erase the other evidence. It replays an OpenCode 2.1.2 request
+through three independently reported paths:
 
 1. Bun fetch directly to Zen, without the loopback relay, as the reference.
 2. Vekil's generic provider routing through a loopback, test-only Bun fetch relay.
@@ -577,13 +620,16 @@ On October 28, 2026, the reference and relay-assisted paths completed both local
 and on GitHub's Ubuntu runner, while direct Vekil returned 429 in both environments. This remains a failing diagnostic, not functioning
 third-party free-model support; upstream's OpenCode-only restriction still applies.
 
-CI pins Bun 1.4.2, runs offline regression tests against a loopback mock and the
-real built Vekil, then records live results in the job summary and the
-`zen-opencode-shaped-control` artifact. To run locally after `make build`:
+CI pins Bun 1.4.2 and OpenCode, runs offline regression tests with loopback
+inference mocks and the real CLI/proxy binaries, then records live results in the
+job summary and the two evidence artifacts. To run locally after `make build`
+with the pinned OpenCode CLI on `PATH`:
 
 ```bash
-bun --no-env-file test scripts/tests/live-zen-control.test.ts
+bun --no-env-file test scripts/tests/opencode-zen-metadata.test.ts scripts/tests/live-zen-control.test.ts scripts/tests/live-zen-native.test.ts
 # Use the freshly fetched/parsed free-model TSV from the invocation above:
+ZEN_FREE_MODELS_FILE=/path/to/free-models.tsv \
+  bun --no-env-file scripts/live-zen-native.ts
 ZEN_FREE_MODELS_FILE=/path/to/free-models.tsv \
   bun --no-env-file scripts/live-zen-control.ts
 ```

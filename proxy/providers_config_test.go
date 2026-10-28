@@ -567,7 +567,7 @@ func TestLoadProvidersConfigFileOpenCodeZenExample(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const sessionID = "ses_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const sessionID = "ses_0123456789ab0123456789ABCD"
 	for _, tc := range []struct {
 		name          string
 		endpoint      string
@@ -606,7 +606,7 @@ func TestLoadProvidersConfigFileOpenCodeZenExample(t *testing.T) {
 			expectedHeaders := map[string]string{
 				"Authorization":         "Bearer public",
 				"Content-Type":          "application/json",
-				"User-Agent":            "opencode/compat/0.0.0/vekil",
+				"User-Agent":            "opencode/compat/2.1.2/vekil",
 				"X-Opencode-Client":     "vekil",
 				"X-Opencode-Project":    "vekil",
 				"X-Opencode-Session":    "",

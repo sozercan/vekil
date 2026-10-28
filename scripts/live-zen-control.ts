@@ -4,10 +4,12 @@
 // workaround. All three paths must complete; a Bun-assisted pass cannot mask a
 // failure of Vekil's normal Go transport. The relay exists only in this process.
 import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from "node:fs"
-import { createHash, randomBytes } from "node:crypto"
+import { createHash } from "node:crypto"
 import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
+import { compatibilityHeaders, sessionID } from "./opencode-zen-metadata.mjs"
+export { sessionID } from "./opencode-zen-metadata.mjs"
 
 const ROOT = resolve(import.meta.dir, "..")
 export const FIXTURE = join(ROOT, "scripts/tests/fixtures/opencode-zen-control.json")
@@ -20,17 +22,13 @@ const MAX_BYTES = 1024 * 1024
 const TIMEOUT_MS = 25_000
 const HOP_HEADERS = ["host", "connection", "content-length", "content-encoding", "transfer-encoding"]
 const children = new Set<ReturnType<typeof Bun.spawn>>()
+export function stopControlChildren() {
+  for (const child of children) if (child.exitCode === null) child.kill("SIGKILL")
+}
 
 type Mode = (typeof MODES)[number]
 type Result = { mode: Mode; passed: boolean; client_request_sha256: string; http_status?: number; error?: string; relay_requests?: number; log_id?: string }
 type Options = { proxyBin: string; modelsFile: string; outputDir: string; upstream?: string }
-
-export function sessionID(now = Date.now()) {
-  // OpenCode's descending 48-bit timestamp/counter, then 14 base-62 characters.
-  const timestamp = (~(BigInt(now) * 4096n + 1n) & ((1n << 48n) - 1n)).toString(16).padStart(12, "0")
-  const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-  return "ses_" + timestamp + Array.from(randomBytes(14), (b) => alphabet[b % alphabet.length]).join("")
-}
 
 export function checkFreeModel(tsv: string) {
   if (!tsv.split(/\r?\n/).some((line) => {
@@ -39,7 +37,7 @@ export function checkFreeModel(tsv: string) {
   })) throw new Error(`${MODEL} is not in the supplied current free Chat catalog; refusing inference`)
 }
 
-function checkUpstream(value: string) {
+export function checkUpstream(value: string) {
   if (value === UPSTREAM) return
   const url = new URL(value)
   // The only override is a loopback mock, never another live/paid provider.
@@ -100,7 +98,7 @@ async function readBounded(response: Response) {
   return Buffer.concat(chunks).toString("utf8")
 }
 
-async function unusedPort(): Promise<number> {
+export async function unusedPort(): Promise<number> {
   const socket = createServer()
   await new Promise<void>((ok, fail) => { socket.once("error", fail); socket.listen(0, "127.0.0.1", ok) })
   const port = (socket.address() as { port: number }).port
@@ -110,7 +108,7 @@ async function unusedPort(): Promise<number> {
 
 const delay = (ms: number) => new Promise((ok) => setTimeout(ok, ms))
 
-async function runCase(mode: Mode, options: Options, body: string, metadata: Record<string, string>): Promise<Result> {
+export async function runControlCase(mode: Mode, options: Options, body: string, metadata: Record<string, string>): Promise<Result> {
   const directory = join(options.outputDir, mode)
   mkdirSync(directory)
   const result: Result = { mode, passed: false, client_request_sha256: createHash("sha256").update(body).digest("hex") }
@@ -199,10 +197,10 @@ export async function runControls(options: Options) {
   if (JSON.parse(body).model !== MODEL) throw new Error("unexpected fixture model")
   mkdirSync(options.outputDir, { recursive: true })
   const session = sessionID()
-  const metadata = { "user-agent": "opencode/compat/2.1.2/vekil", "x-opencode-client": "vekil", "x-opencode-project": "vekil", "x-opencode-session": session, "x-opencode-session-id": session, "x-session-affinity": session, "x-session-id": session }
+  const metadata = compatibilityHeaders(session)
   const results: Result[] = []
   for (const mode of MODES) {
-    results.push(await runCase(mode, options, body, metadata))
+    results.push(await runControlCase(mode, options, body, metadata))
     writeFileSync(join(options.outputDir, "results.json"), JSON.stringify(results, null, 2))
   }
   return results
@@ -213,7 +211,7 @@ if (import.meta.main) {
   // its listener behind when a local run or CI job is interrupted.
   for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
     process.once(signal, () => {
-      for (const child of children) child.kill("SIGKILL")
+      stopControlChildren()
       process.exit(code)
     })
   }

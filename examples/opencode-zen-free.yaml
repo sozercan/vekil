@@ -61,6 +61,6 @@ providers:
     # END GENERATED: OpenCode Zen free models
     # Keep this mapping last: the live smoke appends fresh per-run affinity.
     extra_headers:
-      User-Agent: opencode/compat/0.0.0/vekil
+      User-Agent: opencode/compat/2.1.2/vekil
       x-opencode-client: vekil
       x-opencode-project: vekil

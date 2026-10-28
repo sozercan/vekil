@@ -92,7 +92,7 @@ jobs:
           SMOKE_CURL_MAX_TIME_SECONDS: "45"
         run: |
           zen_smoke_config="$RUNNER_TEMP/opencode-zen-smoke.yaml"
-          zen_smoke_session_id="$(python3 -c 'import secrets; print("ses_" + secrets.token_hex(32))')"
+          zen_smoke_session_id="$(node scripts/opencode-zen-metadata.mjs --session-id)"
           cp "$PROVIDERS_CONFIG" "$zen_smoke_config"
           cat >> "$zen_smoke_config" <<EOF
                 x-opencode-session: "$zen_smoke_session_id"
@@ -113,7 +113,7 @@ jobs:
           fi
 
   opencode-shaped-control:
-    name: OpenCode-shaped control (not a CLI smoke)
+    name: OpenCode native and shaped controls
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -127,15 +127,19 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install pinned diagnostic runtime
-        run: npm install -g bun@1.4.2
+      - name: Install pinned diagnostic runtimes
+        run: |
+          npm install -g bun@1.4.2 "@opencode/cli@$(node scripts/opencode-zen-metadata.mjs --version)"
+          opencode --version
 
-      - name: Build Vekil and test the control offline
+      - name: Build Vekil and test the controls offline
+        id: build
         run: |
           make build
-          bun --no-env-file test scripts/tests/live-zen-control.test.ts
+          bun --no-env-file test scripts/tests/opencode-zen-metadata.test.ts scripts/tests/live-zen-control.test.ts scripts/tests/live-zen-native.test.ts
 
       - name: Parse current free labels
+        id: catalog
         run: |
           curl --fail --silent --show-error --location --retry 3 \
             --connect-timeout 10 --max-time 60 \
@@ -144,9 +148,16 @@ jobs:
           scripts/parse-opencode-zen-free-models.sh "$RUNNER_TEMP/zen-control-models.mdx" \
             > "$RUNNER_TEMP/zen-control-models.tsv"
 
-      # This cannot replace the real-client smoke above. The relay is local to
-      # the diagnostic; all three paths, including native Go, must complete.
+      - name: Run actual OpenCode CLI and replay its request through Vekil
+        env:
+          ZEN_FREE_MODELS_FILE: ${{ runner.temp }}/zen-control-models.tsv
+          ZEN_NATIVE_DIR: ${{ runner.temp }}/zen-native
+        run: bun --no-env-file scripts/live-zen-native.ts
+
+      # Run the separate request-replay diagnostic even when native admission
+      # failed. Neither diagnostic replaces the generic-client smoke above.
       - name: Compare Bun reference, Vekil with Bun relay, and native Vekil
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.catalog.outcome == 'success' }}
         env:
           ZEN_FREE_MODELS_FILE: ${{ runner.temp }}/zen-control-models.tsv
           ZEN_CONTROL_DIR: ${{ runner.temp }}/zen-control
@@ -167,3 +178,23 @@ jobs:
             ${{ runner.temp }}/zen-control/*/response.txt
             ${{ runner.temp }}/zen-control/*/usage.json
             ${{ runner.temp }}/zen-control/*/proxy.log
+
+      - name: Save actual OpenCode CLI evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zen-native-cli-control
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/zen-native/results.json
+            ${{ runner.temp }}/zen-native/summary.md
+            ${{ runner.temp }}/zen-native/*/result.json
+            ${{ runner.temp }}/zen-native/*/observer.json
+            ${{ runner.temp }}/zen-native/*/request.json
+            ${{ runner.temp }}/zen-native/*/response.json
+            ${{ runner.temp }}/zen-native/*/response.txt
+            ${{ runner.temp }}/zen-native/*/usage.json
+            ${{ runner.temp }}/zen-native/*/cli.stdout.jsonl
+            ${{ runner.temp }}/zen-native/*/cli.stderr.txt
+            ${{ runner.temp }}/zen-native/*/proxy.log
