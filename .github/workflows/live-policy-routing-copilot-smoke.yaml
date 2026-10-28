@@ -4,7 +4,7 @@ name: Live Copilot Semantic Policy Routing Smoke
 # The wrapper starts a private zero-config Vekil bridge using the repository's
 # existing Copilot token, discovers native-Chat models for the broad policy
 # matrix, and presents them as controllable static loopback targets. It then
-# runs a focused GPT-5-mini Responses check proving prompt-selected low/high
+# runs a focused GPT-5.4 nano Responses check proving prompt-selected low/high
 # effort overrides conflicting client values, with Haiku handling classification.
 
 on:

@@ -1213,7 +1213,7 @@ main() {
   fetch_models
 
   # Deliberate allowlists: catalog changes must not silently increase spend.
-  CODEX_MODEL="$(pick_model "Codex/OpenAI" /responses gpt-5-mini)"
+  CODEX_MODEL="$(pick_model "Codex/OpenAI" /responses gpt-5.4-nano)"
   CLAUDE_MODEL="$(pick_model "Claude" /chat/completions claude-haiku-4.5)"
   GEMINI_MODEL="$(pick_optional_gemini_model gemini-3.8-flash gemini-3.7-flash gemini-3.6-flash)"
 

@@ -110,8 +110,8 @@ pathlib.Path(os.environ["FAKE_BRIDGE_CHILD_PID_FILE"]).write_text(str(child.pid)
 
 models = [
     {"id": "claude-haiku-4.5", "supported_endpoints": ["/chat/completions"]},
-    {"id": "gpt-5-mini", "supported_endpoints": ["/chat/completions", "/responses"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
-    {"id": "gpt-5.4-mini", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low"]}}},
+    {"id": "gpt-5.4-nano", "supported_endpoints": ["/responses"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
+    {"id": "claude-haiku-5.5", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
     {"id": "gpt-5.4", "supported_endpoints": ["/chat/completions", "/responses"], "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}},
     {"id": "gemini-3.1-pro-preview", "supported_endpoints": ["/chat/completions"], "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}}},
     {"id": "gpt-4.1", "supported_endpoints": ["/chat/completions"]},
@@ -120,8 +120,8 @@ models = [
     {"id": "responses-only", "supported_endpoints": ["/responses"]},
 ]
 catalog_case = os.environ.get("FAKE_BRIDGE_CATALOG_CASE", "")
-if catalog_case == "missing-mini":
-    models = [model for model in models if model["id"] != "gpt-5-mini"]
+if catalog_case == "missing-nano":
+    models = [model for model in models if model["id"] != "gpt-5.4-nano"]
 elif catalog_case == "missing-haiku":
     models = [model for model in models if model["id"] != "claude-haiku-4.5"]
 elif catalog_case == "missing-responses":
@@ -188,9 +188,9 @@ set -euo pipefail
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL}" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL}" ]]
 [[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL}" == http://127.0.0.1:*/v1 ]]
-[[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" == "gpt-5-mini" ]]
+[[ "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL}" == "claude-haiku-5.5" ]]
 [[ "${LIVE_POLICY_ROUTING_CLASSIFIER_MODEL}" == "claude-haiku-4.5" ]]
-[[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "gpt-5-mini" ]]
+[[ "${LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL}" == "claude-haiku-5.5" ]]
 [[ "${LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL}" == "claude-haiku-4.5" ]]
 [[ -z "${LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT+x}" ]]
 [[ -z "${LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT+x}" ]]
@@ -237,7 +237,7 @@ set -euo pipefail
 }
 [[ "${PROXY_BIN}" == "/usr/bin/true" ]]
 [[ "${LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL}" == http://127.0.0.1:* ]]
-[[ "${LIVE_POLICY_ROUTING_RESPONSES_MODEL}" == "gpt-5-mini" ]]
+[[ "${LIVE_POLICY_ROUTING_RESPONSES_MODEL}" == "gpt-5.4-nano" ]]
 [[ "${LIVE_POLICY_ROUTING_RESPONSES_CLASSIFIER_MODEL}" == "claude-haiku-4.5" ]]
 [[ "${LIVE_POLICY_ROUTING_RESPONSES_PUBLIC_MODEL}" == "vekil-live-semantic-effort" ]]
 [[ "${LIVE_POLICY_ROUTING_RESPONSES_SMOKE_DIR}" == */responses-effort ]]
@@ -287,9 +287,9 @@ main() {
   [[ -s "${RECORD}" ]] || fail "fake harness did not record selected Copilot topology"
   [[ -s "${RESPONSES_RECORD}" ]] || fail "fake Responses effort harness did not record its bridge topology"
   jq -e '
-    .lightweight == "gpt-5-mini"
+    .lightweight == "claude-haiku-5.5"
     and .classifier == "claude-haiku-4.5"
-    and .primary == "gpt-5-mini"
+    and .primary == "claude-haiku-5.5"
     and .secondary == "claude-haiku-4.5"
   ' "${RECORD}" >/dev/null || fail "wrapper selected unexpected Copilot models"
 
@@ -297,7 +297,7 @@ main() {
   base="$(jq -r '.base' "${RECORD}")"
   jq -e --arg base "${base%/v1}" '
     .base == $base
-    and .model == "gpt-5-mini"
+    and .model == "gpt-5.4-nano"
     and .classifier == "claude-haiku-4.5"
     and .public_model == "vekil-live-semantic-effort"
   ' "${RESPONSES_RECORD}" >/dev/null || fail "wrapper supplied unexpected Responses effort harness configuration"
@@ -327,11 +327,11 @@ PY
 
   log "Rejecting missing required models or capabilities before either inference harness runs"
   local denied_rc catalog_case expected_error case_dir
-  for catalog_case in missing-mini missing-responses missing-high-effort missing-haiku; do
+  for catalog_case in missing-nano missing-responses missing-high-effort missing-haiku; do
     case_dir="${TMP_ROOT}/${catalog_case}"
     mkdir -p "${case_dir}"
     denied_rc=0
-    expected_error='must advertise gpt-5-mini with /responses plus low and high reasoning effort before inference'
+    expected_error='must advertise gpt-5.4-nano with /responses plus low and high reasoning effort before inference'
     if [[ "${catalog_case}" == missing-haiku ]]; then
       expected_error='no approved classifier model'
     fi

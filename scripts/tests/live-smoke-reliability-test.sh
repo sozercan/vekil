@@ -110,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": "mimo-v2.5-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "hy3-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
-                {"id": "gpt-5-mini", "supported_endpoints": ["/responses"]},
+                {"id": "gpt-5.4-nano", "supported_endpoints": ["/responses"]},
                 {"id": "muse-spark-1.2-contributor-free", "supported_endpoints": ["/responses"]},
                 {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
                 {"id": "claude-sonnet-5", "supported_endpoints": ["/chat/completions"]},

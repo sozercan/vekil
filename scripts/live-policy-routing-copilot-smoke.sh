@@ -7,7 +7,7 @@
 # harness needs independently controllable static targets, fault injection, and
 # metadata-only capture. It selects live Chat-capable models from the Copilot
 # catalog, presents the bridge to scripts/live-policy-routing-smoke.sh as static
-# targets, then reuses it for Responses-native GPT-5-mini low/high effort
+# targets, then reuses it for Responses-native GPT-5.4 nano low/high effort
 # validation.
 #
 # Required environment:
@@ -55,7 +55,7 @@ POLICY_PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 COPILOT_BRIDGE_BIN="${LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN:-${POLICY_PROXY_BIN}}"
 POLICY_HARNESS="${LIVE_POLICY_ROUTING_HARNESS:-${SCRIPT_DIR}/live-policy-routing-smoke.sh}"
 RESPONSES_EFFORT_HARNESS="${LIVE_POLICY_ROUTING_RESPONSES_EFFORT_HARNESS:-${SCRIPT_DIR}/live-policy-routing-responses-effort-smoke.sh}"
-RESPONSES_MODEL="gpt-5-mini"
+RESPONSES_MODEL="gpt-5.4-nano"
 SMOKE_STARTUP_TIMEOUT_SECONDS="${SMOKE_STARTUP_TIMEOUT_SECONDS:-90}"
 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS="${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS:-5}"
 SMOKE_CURL_MAX_TIME_SECONDS="${SMOKE_CURL_MAX_TIME_SECONDS:-180}"
@@ -380,7 +380,7 @@ select_copilot_models() {
   selected_lightweight="$(pick_copilot_model \
     lightweight \
     "${LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL:-}" \
-    "" gpt-5-mini gpt-5.4-mini)"
+    "" claude-haiku-5.5)"
   # The bounded classifier must emit its function call within 256 tokens.
   # GPT-5-mini consumed that budget in reasoning during live validation.
   selected_classifier="$(pick_copilot_model \
@@ -390,7 +390,7 @@ select_copilot_models() {
   selected_primary="$(pick_copilot_model \
     powerful-primary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL:-}" \
-    "" gpt-5-mini gpt-5.4-mini)"
+    "" claude-haiku-5.5)"
   selected_secondary="$(pick_copilot_model \
     powerful-secondary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL:-}" \
