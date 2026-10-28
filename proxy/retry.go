@@ -350,8 +350,8 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 			// a response we would otherwise drain and retry; keep budget-limited
 			// passthrough responses untouched.
 			if resp.StatusCode == http.StatusTooManyRequests {
-				body := readRetryableUpstreamErrorBody(resp.Body)
-				if restoreFreeUsageLimitResponse(resp, body) {
+				capture := captureAndDrainResponseBody(resp.Body, upstreamErrorDetailMaxBodyBytes, upstreamErrorDetailDrainBytes)
+				if restoreFreeUsageLimitResponse(resp, capture) {
 					return resp, nil
 				}
 			} else {
@@ -376,8 +376,9 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 				requestCtx:  req.Context(),
 			}
 		} else {
-			upstreamErr.body = readRetryableUpstreamErrorBody(resp.Body)
-			if restoreFreeUsageLimitResponse(resp, upstreamErr.body) {
+			capture := captureAndDrainResponseBody(resp.Body, upstreamErrorDetailMaxBodyBytes, upstreamErrorDetailDrainBytes)
+			upstreamErr.body = capture.body
+			if restoreFreeUsageLimitResponse(resp, capture) {
 				return resp, nil
 			}
 		}
@@ -680,9 +681,29 @@ func (e *upstreamError) Error() string {
 
 // Preserve a complete, small typed quota refusal for the caller instead of
 // sleeping through Retry-After or replacing it with a synthetic retry error.
-func restoreFreeUsageLimitResponse(resp *http.Response, body []byte) bool {
-	if resp.StatusCode != http.StatusTooManyRequests || len(body) >= upstreamErrorDetailMaxBodyBytes ||
+func restoreFreeUsageLimitResponse(resp *http.Response, capture responseBodyCapture) bool {
+	body := capture.body
+	if !capture.complete || capture.err != nil || resp.StatusCode != http.StatusTooManyRequests || len(body) >= upstreamErrorDetailMaxBodyBytes ||
 		(resp.ContentLength > 0 && resp.ContentLength != int64(len(body))) {
+		return false
+	}
+	// Inspect only an in-memory, bounded decoded copy. In particular, an
+	// operator-supplied Accept-Encoding disables net/http's automatic gzip
+	// decoding; passthrough must retain those original bytes and headers.
+	decoded := body
+	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
+	case "", "identity":
+	case "gzip":
+		reader, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return false
+		}
+		decoded, err = io.ReadAll(io.LimitReader(reader, upstreamErrorDetailMaxBodyBytes))
+		_ = reader.Close()
+		if err != nil || len(decoded) >= upstreamErrorDetailMaxBodyBytes {
+			return false
+		}
+	default:
 		return false
 	}
 	var envelope struct {
@@ -690,7 +711,7 @@ func restoreFreeUsageLimitResponse(resp *http.Response, body []byte) bool {
 			Type string `json:"type"`
 		} `json:"error"`
 	}
-	if json.Unmarshal(body, &envelope) != nil || envelope.Error.Type != "FreeUsageLimitError" {
+	if json.Unmarshal(decoded, &envelope) != nil || envelope.Error.Type != "FreeUsageLimitError" {
 		return false
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -698,12 +719,20 @@ func restoreFreeUsageLimitResponse(resp *http.Response, body []byte) bool {
 }
 
 func readRetryableUpstreamErrorBody(body io.ReadCloser) []byte {
-	return captureAndDrainResponseBody(body, upstreamErrorDetailMaxBodyBytes, upstreamErrorDetailDrainBytes)
+	return captureAndDrainResponseBody(body, upstreamErrorDetailMaxBodyBytes, upstreamErrorDetailDrainBytes).body
+}
+
+type responseBodyCapture struct {
+	body     []byte
+	complete bool // true only after an unambiguous EOF before the deadline
+	err      error
 }
 
 type responseBodyReadProgress struct {
 	captured        []byte
-	captureComplete bool
+	captureComplete bool // capture budget reached or the reader terminated
+	bodyComplete    bool // the reader terminated with EOF, not another error
+	readErr         error
 }
 
 // captureAndDrainResponseBody captures up to captureBytes and then drains up to
@@ -712,14 +741,15 @@ type responseBodyReadProgress struct {
 // continues asynchronously so normal short responses can still leave their
 // connection reusable. Progress is sent as owned byte slices so a timed-out
 // caller can safely return the short prefix already received while Close
-// interrupts a stalled Read.
-func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes int) []byte {
+// interrupts a stalled Read. A captured prefix is complete only after EOF; a
+// timeout, other read error, or exhausted capture budget never proves completion.
+func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes int) responseBodyCapture {
 	if body == nil {
-		return nil
+		return responseBodyCapture{}
 	}
 	if captureBytes <= 0 {
 		_ = body.Close()
-		return nil
+		return responseBodyCapture{}
 	}
 	if drainBytes < 0 {
 		drainBytes = 0
@@ -753,9 +783,9 @@ func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes in
 		buf := make([]byte, min(totalRemaining, 32*1024))
 		captureComplete := false
 
-		sendProgress := func(captured []byte, complete bool) {
+		sendProgress := func(captured []byte, complete, bodyComplete bool, readErr error) {
 			select {
-			case progress <- responseBodyReadProgress{captured: captured, captureComplete: complete}:
+			case progress <- responseBodyReadProgress{captured: captured, captureComplete: complete, bodyComplete: bodyComplete, readErr: readErr}:
 			case <-callerDone:
 			}
 		}
@@ -780,7 +810,7 @@ func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes in
 					closeBody()
 				}
 				if captureCount > 0 || (complete && !captureComplete) {
-					sendProgress(captured, complete)
+					sendProgress(captured, complete, false, nil)
 				}
 				captureComplete = complete
 			}
@@ -788,7 +818,11 @@ func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes in
 			if err != nil {
 				closeBody()
 				if !captureComplete {
-					sendProgress(nil, true)
+					if err == io.EOF {
+						sendProgress(nil, true, true, nil)
+					} else {
+						sendProgress(nil, true, false, err)
+					}
 				}
 				return
 			}
@@ -796,7 +830,7 @@ func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes in
 
 		if !captureComplete {
 			closeBody()
-			sendProgress(nil, true)
+			sendProgress(nil, true, false, nil)
 		}
 	}()
 
@@ -806,10 +840,15 @@ func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes in
 		case update := <-progress:
 			captured = append(captured, update.captured...)
 			if update.captureComplete {
-				return captured
+				select {
+				case <-timedOut:
+					return responseBodyCapture{body: captured, err: context.DeadlineExceeded}
+				default:
+					return responseBodyCapture{body: captured, complete: update.bodyComplete, err: update.readErr}
+				}
 			}
 		case <-timedOut:
-			return captured
+			return responseBodyCapture{body: captured, err: context.DeadlineExceeded}
 		}
 	}
 }

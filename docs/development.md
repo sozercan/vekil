@@ -507,6 +507,12 @@ For each client/model attempt, a bounded raw chat-completions canary runs first:
 - Without `ZEN_REQUIRE_LIVE=1`, a neutral exit 0 is allowed only when no model was reachable **before any client was exercised**. CI and the local invocation below enable this flag and fail instead. Once a reachable model has exercised a client, every installed client must pass regardless of the flag.
 - Since September 2026, Zen answers anonymous free-tier requests from other clients with HTTP 403 `FreeTierError`: "OpenCode's free tier can only be used from within OpenCode". The first canary that receives this exact type and message ends the run before any client runs: it is a hard failure with `ZEN_REQUIRE_LIVE=1`, or a neutral skip with a warning in optional/manual harness runs without the flag. The experimental profile does not override this restriction, and adding a paid API key does not unlock free chat models. Anonymous allowance exhaustion can instead return HTTP 429 `FreeUsageLimitError`. While either condition prevents all canaries from succeeding, there is no live coverage; a skipped run is not an actual CLI pass.
 
+Typed free-allowance refusals are returned without retry only when a bounded
+capture proves the complete response reached EOF without a read error. A bounded
+gzip copy may be decoded for classification while preserving the original encoded
+body and headers for passthrough. A timed-out or failed JSON prefix is not restored
+as a complete response.
+
 OpenAI Codex CLI is intentionally excluded from this Zen harness because its native wire API requires `/responses`, while the shared Copilot/Claude/Gemini matrix deliberately tests `/chat/completions`. If a permitted configured Zen model advertises native `/responses`, Vekil forwards it directly rather than using Responses-to-Chat translation; do not retain retired model names or infer Responses support from Chat compatibility. Codex remains covered by the Copilot smoke, where it works against the Copilot upstream.
 
 Run it locally after `make build` (requires GitHub Copilot CLI; installed Claude/Gemini CLIs are also enforced). Fetch current free labels so configured Chat models outside the preference list are included; a fetch or parse failure stops before the harness runs:
@@ -563,8 +569,8 @@ request per path, and the relay permits one upstream application dispatch. The
 native Go path retains Vekil's normal transient retry policy; typed free-allowance
 refusals are not retried. The relay only exists inside the test process and is not
 a production dependency.
-On October 28, 2026, the reference and relay-assisted paths completed locally,
-while direct Vekil returned 429. This remains a failing diagnostic, not functioning
+On October 28, 2026, the reference and relay-assisted paths completed both locally
+and on GitHub's Ubuntu runner, while direct Vekil returned 429 in both environments. This remains a failing diagnostic, not functioning
 third-party free-model support; upstream's OpenCode-only restriction still applies.
 
 CI pins Bun 1.4.2, runs offline regression tests against a loopback mock and the

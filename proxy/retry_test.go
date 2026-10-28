@@ -589,22 +589,21 @@ func TestDoWithRetry_FreeUsageLimitBodyReadIsBounded(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusTooManyRequests, Request: req,
 				Header: http.Header{"Retry-After": {"60"}}, Body: body}, nil
 		})},
-		log: logger.New(logger.LevelError), maxRetries: 3, retryBaseDelay: time.Nanosecond,
+		log: logger.New(logger.LevelError), maxRetries: 1, retryBaseDelay: time.Nanosecond,
 	}
 	started := time.Now()
 	resp, err := h.doWithRetry(func() (*http.Request, error) {
 		return http.NewRequestWithContext(ctx, http.MethodPost, "http://upstream.test/zen", nil)
 	})
-	if err != nil {
-		t.Fatal(err)
+	var upstreamErr *upstreamError
+	if resp != nil || !errors.As(err, &upstreamErr) {
+		t.Fatalf("incomplete quota capture returned a clean response: response=%v error=%v", resp, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
 	if time.Since(started) >= time.Second || calls.Load() != 1 {
 		t.Fatalf("typed quota inspection exceeded its bound or retried: sends=%d", calls.Load())
 	}
-	actual, err := io.ReadAll(resp.Body)
-	if err != nil || string(actual) != payload {
-		t.Fatalf("body = %q, error = %v", actual, err)
+	if string(upstreamErr.body) != payload {
+		t.Fatalf("diagnostic prefix = %q, want %q", upstreamErr.body, payload)
 	}
 	waitForRetryBodyClose(t, body.closed)
 }
