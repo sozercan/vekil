@@ -452,7 +452,7 @@ main() {
 
   fetch_models
 
-  COMPACT_MODEL="$(pick_model "Codex/OpenAI" gpt-5.4-nano)"
+  COMPACT_MODEL="$(pick_model "Codex/OpenAI" gpt-5.6-luna-utility)"
   log "Selected compact model: ${COMPACT_MODEL}"
 
   log "Posting live compact request"

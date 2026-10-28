@@ -7,7 +7,7 @@
 # harness needs independently controllable static targets, fault injection, and
 # metadata-only capture. It selects live Chat-capable models from the Copilot
 # catalog, presents the bridge to scripts/live-policy-routing-smoke.sh as static
-# targets, then reuses it for Responses-native GPT-5.4 nano low/high effort
+# targets, then reuses it for Responses-native GPT-5.6 Luna utility low/high effort
 # validation.
 #
 # Required environment:
@@ -55,7 +55,7 @@ POLICY_PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 COPILOT_BRIDGE_BIN="${LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN:-${POLICY_PROXY_BIN}}"
 POLICY_HARNESS="${LIVE_POLICY_ROUTING_HARNESS:-${SCRIPT_DIR}/live-policy-routing-smoke.sh}"
 RESPONSES_EFFORT_HARNESS="${LIVE_POLICY_ROUTING_RESPONSES_EFFORT_HARNESS:-${SCRIPT_DIR}/live-policy-routing-responses-effort-smoke.sh}"
-RESPONSES_MODEL="gpt-5.4-nano"
+RESPONSES_MODEL="gpt-5.6-luna-utility"
 SMOKE_STARTUP_TIMEOUT_SECONDS="${SMOKE_STARTUP_TIMEOUT_SECONDS:-90}"
 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS="${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS:-5}"
 SMOKE_CURL_MAX_TIME_SECONDS="${SMOKE_CURL_MAX_TIME_SECONDS:-180}"
@@ -328,7 +328,7 @@ fetch_copilot_models() {
     || die "GET ${bridge_base_url}/v1/models failed"
   chmod 600 "${BRIDGE_MODELS}"
   jq -e '
-    [.data[]? | select(((.supported_endpoints // []) | index("/chat/completions")) != null)]
+    [.data[]? | select((.supported_endpoints // []) | length == 0 or index("/chat/completions") != null)]
     | length >= 2
   ' "${BRIDGE_MODELS}" >/dev/null || die "Copilot bridge must advertise two native-Chat models for failover"
   # Validate the focused check before the broad matrix sends paid requests.
@@ -347,7 +347,9 @@ model_supports_chat() {
   jq -e --arg model "${model}" '
     .data[]?
     | select(.id == $model)
-    | (((.supported_endpoints // []) | index("/chat/completions")) != null)
+    # Legacy Copilot Chat models list no endpoints; Vekil treats them as
+    # supporting every endpoint.
+    | (.supported_endpoints // []) | length == 0 or index("/chat/completions") != null
   ' "${BRIDGE_MODELS}" >/dev/null
 }
 
@@ -380,21 +382,21 @@ select_copilot_models() {
   selected_lightweight="$(pick_copilot_model \
     lightweight \
     "${LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL:-}" \
-    "" claude-haiku-5.5)"
+    "" gpt-4.1)"
   # The bounded classifier must emit its function call within 256 tokens.
-  # GPT-5-mini consumed that budget in reasoning during live validation.
+  # GPT-5-mini consumed that budget in reasoning; GPT-4.1 does not reason.
   selected_classifier="$(pick_copilot_model \
     classifier \
     "${LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL:-}" \
-    "" claude-haiku-4.5)"
+    "" gpt-4.1)"
   selected_primary="$(pick_copilot_model \
     powerful-primary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL:-}" \
-    "" claude-haiku-5.5)"
+    "" gpt-4.1)"
   selected_secondary="$(pick_copilot_model \
     powerful-secondary \
     "${LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL:-}" \
-    "${selected_primary}" claude-haiku-4.5)"
+    "${selected_primary}" gpt-4o)"
 
   jq -n \
     --arg lightweight "${selected_lightweight}" \

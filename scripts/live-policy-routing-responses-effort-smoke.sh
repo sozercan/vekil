@@ -4,7 +4,7 @@
 #
 # The caller supplies an already-authenticated loopback Vekil bridge. This
 # harness inserts a metadata-only capture shim, runs one policy proxy whose two
-# terminal tiers both target GPT-5.4 nano, and proves prompt-selected low/high
+# terminal tiers both target GPT-5.6 Luna utility, and proves prompt-selected low/high
 # effort overrides conflicting public Responses values. Haiku classifies each
 # prompt through native Chat without reasoning effort or a no-store guarantee.
 # Request content is never logged.
@@ -14,7 +14,7 @@
 #
 # Optional environment:
 #   PROXY_BIN                                 default: ./vekil
-#   LIVE_POLICY_ROUTING_RESPONSES_MODEL             default: gpt-5.4-nano
+#   LIVE_POLICY_ROUTING_RESPONSES_MODEL             default: gpt-5.6-luna-utility
 #   LIVE_POLICY_ROUTING_RESPONSES_CLASSIFIER_MODEL  default: claude-haiku-4.5
 #   LIVE_POLICY_ROUTING_RESPONSES_PUBLIC_MODEL      default: vekil-live-semantic-effort
 #   LIVE_POLICY_ROUTING_RESPONSES_SMOKE_DIR         explicit artifact directory
@@ -45,7 +45,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROXY_BIN="${PROXY_BIN:-${REPO_ROOT}/vekil}"
 BRIDGE_BASE_URL="${LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL:-}"
-TERMINAL_MODEL="${LIVE_POLICY_ROUTING_RESPONSES_MODEL:-gpt-5.4-nano}"
+TERMINAL_MODEL="${LIVE_POLICY_ROUTING_RESPONSES_MODEL:-gpt-5.6-luna-utility}"
 CLASSIFIER_MODEL="${LIVE_POLICY_ROUTING_RESPONSES_CLASSIFIER_MODEL:-claude-haiku-4.5}"
 PUBLIC_MODEL="${LIVE_POLICY_ROUTING_RESPONSES_PUBLIC_MODEL:-vekil-live-semantic-effort}"
 SMOKE_STARTUP_TIMEOUT_SECONDS="${SMOKE_STARTUP_TIMEOUT_SECONDS:-120}"
@@ -627,7 +627,7 @@ main() {
   write_policy_config
   start_policy_proxy
   run_requests
-  log "Live GPT-5.4 nano semantic low/high effort smoke passed."
+  log "Live GPT-5.6 Luna utility semantic low/high effort smoke passed."
 }
 
 main "$@"

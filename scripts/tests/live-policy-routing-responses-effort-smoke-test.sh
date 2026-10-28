@@ -105,7 +105,7 @@ class Handler(BaseHTTPRequestHandler):
                 "object": "list",
                 "data": [
                     {
-                        "id": "gpt-5.4-nano",
+                        "id": "gpt-5.6-luna-utility",
                         "supported_endpoints": ["/responses"],
                         "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}},
                     },
@@ -133,7 +133,7 @@ class Handler(BaseHTTPRequestHandler):
         reasoning = body.get("reasoning") if isinstance(body, dict) else None
         effort = reasoning.get("effort") if isinstance(reasoning, dict) else body.get("reasoning_effort")
         errors = []
-        expected_model = "claude-haiku-4.5" if is_classifier else "gpt-5.4-nano"
+        expected_model = "claude-haiku-4.5" if is_classifier else "gpt-5.6-luna-utility"
         expected_path = "/v1/chat/completions" if is_classifier else "/v1/responses"
         if body.get("model") != expected_model:
             errors.append("model_invalid")
@@ -194,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
             "id": "resp-terminal",
             "object": "response",
             "status": "completed",
-            "model": "gpt-5.4-nano",
+            "model": "gpt-5.6-luna-utility",
             "output": [{
                 "type": "message",
                 "id": "msg-terminal",
@@ -256,7 +256,7 @@ main() {
     and ([.requests[] | select(.kind == "classifier")] | length) == 3
     and ([.requests[] | select(.kind == "classifier" and (.path != "/v1/chat/completions" or .model != "claude-haiku-4.5"))] | length) == 0
     and ([.requests[] | select(.kind == "terminal") | .effort] | sort) == ["high", "low"]
-    and ([.requests[] | select(.kind == "terminal" and (.path != "/v1/responses" or .model != "gpt-5.4-nano" or .store != false))] | length) == 0
+    and ([.requests[] | select(.kind == "terminal" and (.path != "/v1/responses" or .model != "gpt-5.6-luna-utility" or .store != false))] | length) == 0
   ' "${BRIDGE_STATE}" >/dev/null || {
     cat "${BRIDGE_STATE}" >&2
     fail "fake bridge observed invalid classifier or terminal requests"
@@ -264,7 +264,7 @@ main() {
 
   grep -Fq 'PASS responses-simple-conflicting-high-routed-low' "${SMOKE_DIR}/summary.txt" || fail "missing lightweight override marker"
   grep -Fq 'PASS responses-complex-conflicting-low-routed-high' "${SMOKE_DIR}/summary.txt" || fail "missing powerful override marker"
-  grep -Fq 'Live GPT-5.4 nano semantic low/high effort smoke passed.' "${STDERR_FILE}" || fail "missing success marker"
+  grep -Fq 'Live GPT-5.6 Luna utility semantic low/high effort smoke passed.' "${STDERR_FILE}" || fail "missing success marker"
   log "Deterministic Responses semantic effort smoke passed"
 }
 
