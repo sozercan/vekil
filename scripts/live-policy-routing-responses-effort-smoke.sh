@@ -231,7 +231,9 @@ fetch_and_validate_bridge_models() {
   jq -e --arg model "${CLASSIFIER_MODEL}" '
     [.data[]?
       | select(.id == $model)
-      | select(((.supported_endpoints // []) | index("/chat/completions")) != null)
+      # Legacy Copilot Chat models list no endpoints; Vekil treats them as
+      # supporting every endpoint.
+      | select((.supported_endpoints // []) | length == 0 or index("/chat/completions") != null)
     ] | length == 1
   ' "${MODELS_JSON}" >/dev/null || die "bridge must advertise ${CLASSIFIER_MODEL} with native /chat/completions"
 }
