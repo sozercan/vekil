@@ -111,3 +111,59 @@ jobs:
             echo "--- $log ---"
             sed -E 's/(Authorization: (Bearer|token) )[[:graph:]]+/\1[REDACTED]/g' "$log"
           fi
+
+  opencode-shaped-control:
+    name: OpenCode-shaped control (not a CLI smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Install pinned diagnostic runtime
+        run: npm install -g bun@1.4.2
+
+      - name: Build Vekil and test the control offline
+        run: |
+          make build
+          bun --no-env-file test scripts/tests/live-zen-control.test.ts
+
+      - name: Parse current free labels
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            --connect-timeout 10 --max-time 60 \
+            https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/models.mdx \
+            > "$RUNNER_TEMP/zen-control-models.mdx"
+          scripts/parse-opencode-zen-free-models.sh "$RUNNER_TEMP/zen-control-models.mdx" \
+            > "$RUNNER_TEMP/zen-control-models.tsv"
+
+      # This cannot replace the real-client smoke above. The relay is local to
+      # the diagnostic; all three paths, including native Go, must complete.
+      - name: Compare Bun reference, Vekil with Bun relay, and native Vekil
+        env:
+          ZEN_FREE_MODELS_FILE: ${{ runner.temp }}/zen-control-models.tsv
+          ZEN_CONTROL_DIR: ${{ runner.temp }}/zen-control
+        run: bun --no-env-file scripts/live-zen-control.ts
+
+      - name: Save diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zen-opencode-shaped-control
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/zen-control/results.json
+            ${{ runner.temp }}/zen-control/summary.md
+            ${{ runner.temp }}/zen-control/*/result.json
+            ${{ runner.temp }}/zen-control/*/relay-receipt.json
+            ${{ runner.temp }}/zen-control/*/response.txt
+            ${{ runner.temp }}/zen-control/*/usage.json
+            ${{ runner.temp }}/zen-control/*/proxy.log

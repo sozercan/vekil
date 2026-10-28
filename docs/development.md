@@ -528,6 +528,56 @@ Run it locally after `make build` (requires GitHub Copilot CLI; installed Claude
 )
 ```
 
+### OpenCode-shaped positive-control diagnostic
+
+The same workflow has a separate `opencode-shaped-control` job. This is **not a
+coding-client smoke or proof of general free-tier access**. It replays a frozen
+OpenCode 2.1.2 request through three independently reported paths:
+
+1. Bun fetch directly to Zen, as the reference.
+2. Vekil's generic provider routing through a loopback, test-only Bun fetch relay.
+3. Vekil directly to Zen with its normal Go HTTP transport.
+
+Every path must return HTTP 200, the exact `ZEN_CONTROL_OK` completion, a normal
+stop and completed SSE stream, positive token counts, and explicit zero-cost
+`free` billing. HTTP refusals, empty/malformed/truncated output, tool calls,
+missing billing proof, and unavailable models fail rather than skip. All three
+paths run even when an earlier one fails, and **any failed path fails the job**.
+A passing Bun reference or relay-assisted request cannot conceal native Vekil
+failure, nor replace the separate Copilot/Claude/Gemini smoke.
+
+The fixture at `scripts/tests/fixtures/opencode-zen-control.json` was captured
+from OpenCode 2.1.2 at upstream revision
+`950111ff2ad0a324db7950f172c84760bc962469`. It contains OpenCode's system prompt
+and 12 function schemas, not another client's prompt/tools. Captured local paths
+were replaced with `/workspace/zen-control` and `/tmp/opencode`; there are no
+captured credentials, account names, or session IDs. The adjacent `.LICENSE`
+preserves the upstream MIT notice. The fixture is static test data: no tools or
+OpenCode code are executed.
+
+The diagnostic checks its pinned `glm-5.3-flash-free` model against freshly
+parsed Free Chat labels before sending anything. It identifies itself as Vekil,
+advertises compatibility with 2.1.2, and holds one native-shaped session ID
+constant across the three paths. It has no paid fallback. The harness submits one
+request per path, and the relay permits one upstream application dispatch. The
+native Go path retains Vekil's normal transient retry policy; typed free-allowance
+refusals are not retried. The relay only exists inside the test process and is not
+a production dependency.
+On October 28, 2026, the reference and relay-assisted paths completed locally,
+while direct Vekil returned 429. This remains a failing diagnostic, not functioning
+third-party free-model support; upstream's OpenCode-only restriction still applies.
+
+CI pins Bun 1.4.2, runs offline regression tests against a loopback mock and the
+real built Vekil, then records live results in the job summary and the
+`zen-opencode-shaped-control` artifact. To run locally after `make build`:
+
+```bash
+bun --no-env-file test scripts/tests/live-zen-control.test.ts
+# Use the freshly fetched/parsed free-model TSV from the invocation above:
+ZEN_FREE_MODELS_FILE=/path/to/free-models.tsv \
+  bun --no-env-file scripts/live-zen-control.ts
+```
+
 ## Live Copilot Direct-Bearer Smoke Workflow
 
 The [`Live Copilot Direct Bearer Smoke`](../.github/workflows/live-copilot-direct-bearer-smoke.yaml) workflow is focused credentialed coverage for direct `COPILOT_GITHUB_TOKEN` authentication. It uses a dedicated fine-grained PAT to verify that Vekil returns the original environment token from `GetToken` without contacting `api.github.com`, a second call uses the in-memory cache, and `GetResponsesToken` preserves the same direct bearer. The test then reads Copilot's live `/models` catalog, selects an advertised `/responses` model from the explicit `gpt-5.6-luna`, `gpt-5-mini`, `gpt-5.4-mini` allowlist, and requires one bounded `store: false` inference to return a completed response with non-empty output text. It records exactly those two successful upstream requests and verifies that neither `access-token` nor `api-key.json` is written.
