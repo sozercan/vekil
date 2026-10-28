@@ -513,6 +513,160 @@ func TestDoWithRetry_CancelledDuringBackoff(t *testing.T) {
 	}
 }
 
+func TestDoWithRetry_FreeUsageLimitErrorIsTerminal(t *testing.T) {
+	const body = `{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached"}}`
+	for _, inference := range []bool{false, true} {
+		for _, attempts := range []int{1, 3} {
+			t.Run(fmt.Sprintf("inference=%t/attempts=%d", inference, attempts), func(t *testing.T) {
+				var calls atomic.Int32
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				h := &ProxyHandler{
+					client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						calls.Add(1)
+						return &http.Response{StatusCode: http.StatusTooManyRequests, Request: req,
+							Header:        http.Header{"Retry-After": {"60"}, "Content-Type": {"application/json"}},
+							ContentLength: int64(len(body)), Body: io.NopCloser(strings.NewReader(body))}, nil
+					})},
+					log: logger.New(logger.LevelError), maxRetries: attempts, retryBaseDelay: time.Nanosecond,
+				}
+				type result struct {
+					resp *http.Response
+					err  error
+				}
+				finished := make(chan result, 1)
+				go func() {
+					resp, err := h.doWithRetryMode(func() (*http.Request, error) {
+						return http.NewRequestWithContext(ctx, http.MethodPost, "http://upstream.test/zen", nil)
+					}, inference)
+					finished <- result{resp, err}
+				}()
+				var got result
+				select {
+				case got = <-finished:
+				case <-time.After(time.Second):
+					cancel()
+					select {
+					case got = <-finished:
+					case <-time.After(time.Second):
+					}
+					if got.resp != nil {
+						_ = got.resp.Body.Close()
+					}
+					t.Fatal("typed free-usage refusal waited for Retry-After instead of returning promptly")
+				}
+				if got.err != nil || got.resp == nil {
+					t.Fatalf("response = %v, error = %v", got.resp, got.err)
+				}
+				defer func() { _ = got.resp.Body.Close() }()
+				if got.resp.StatusCode != http.StatusTooManyRequests || got.resp.Header.Get("Retry-After") != "60" {
+					t.Fatalf("response metadata = %d %v", got.resp.StatusCode, got.resp.Header)
+				}
+				actual, err := io.ReadAll(got.resp.Body)
+				if err != nil || string(actual) != body {
+					t.Fatalf("body = %q, error = %v", actual, err)
+				}
+				if calls.Load() != 1 {
+					t.Fatalf("upstream sends = %d, want 1", calls.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestDoWithRetry_FreeUsageLimitBodyReadIsBounded(t *testing.T) {
+	const payload = `{"error":{"type":"FreeUsageLimitError","message":"Free usage limit reached"}}`
+	body := newBlockingRetryBodyReadCloserWithBody(payload)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer func() { _ = body.Close() }()
+	deadline := time.AfterFunc(time.Second, func() { cancel(); _ = body.Close() })
+	defer deadline.Stop()
+	var calls atomic.Int32
+	h := &ProxyHandler{
+		client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Request: req,
+				Header: http.Header{"Retry-After": {"60"}}, Body: body}, nil
+		})},
+		log: logger.New(logger.LevelError), maxRetries: 3, retryBaseDelay: time.Nanosecond,
+	}
+	started := time.Now()
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodPost, "http://upstream.test/zen", nil)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if time.Since(started) >= time.Second || calls.Load() != 1 {
+		t.Fatalf("typed quota inspection exceeded its bound or retried: sends=%d", calls.Load())
+	}
+	actual, err := io.ReadAll(resp.Body)
+	if err != nil || string(actual) != payload {
+		t.Fatalf("body = %q, error = %v", actual, err)
+	}
+	waitForRetryBodyClose(t, body.closed)
+}
+
+func TestDoWithRetry_FreeUsageLimitLeavesBudgetLimitedResponseUntouched(t *testing.T) {
+	const payload = `{"error":{"type":"FreeUsageLimitError","message":"Free usage limit reached"}}`
+	body := newRetryBodyReadCloser(payload)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	h := &ProxyHandler{client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Request: req,
+			Header: http.Header{"Retry-After": {"60"}}, Body: body}, nil
+	})}, maxRetries: 3, retryBaseDelay: time.Nanosecond}
+	resp, err := h.doWithRetry(func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodPost, "http://upstream.test/zen", nil)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.Body != body || body.Len() != len(payload) {
+		t.Fatal("budget-limited passthrough body was consumed or replaced")
+	}
+}
+
+func TestDoWithRetry_FreeUsageLimitClassificationStaysNarrow(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"transient", 429, `{"error":{"type":"rate_limit_error","message":"slow down"}}`},
+		{"message-only", 429, `{"error":{"message":"FreeUsageLimitError"}}`},
+		{"wrong-case", 429, `{"error":{"type":"freeusagelimiterror"}}`},
+		{"wrong-envelope", 429, `{"type":"FreeUsageLimitError"}`},
+		{"malformed", 429, `{"error":{"type":"FreeUsageLimitError"`},
+		{"oversized", 429, `{"error":{"type":"FreeUsageLimitError"}}` + strings.Repeat(" ", upstreamErrorDetailMaxBodyBytes)},
+		{"server-error", 503, `{"error":{"type":"FreeUsageLimitError"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			h := &ProxyHandler{client: &http.Client{Transport: retryRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if calls.Add(1) == 1 {
+					return &http.Response{StatusCode: tc.status, Request: req, Header: make(http.Header),
+						ContentLength: int64(len(tc.body)), Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+				}
+				return &http.Response{StatusCode: 200, Request: req, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("OK"))}, nil
+			})}, log: logger.New(logger.LevelError), maxRetries: 2, retryBaseDelay: time.Nanosecond}
+			resp, err := h.doWithRetry(func() (*http.Request, error) {
+				return http.NewRequest(http.MethodPost, "http://upstream.test/zen", nil)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != 200 || calls.Load() != 2 {
+				t.Fatalf("status = %d, sends = %d; want 200 after one retry", resp.StatusCode, calls.Load())
+			}
+		})
+	}
+}
+
 func TestDoWithRetry_RespectsRetryAfter(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

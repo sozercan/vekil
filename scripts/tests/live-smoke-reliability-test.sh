@@ -4,6 +4,8 @@ set -euo pipefail
 
 # Mock upstream usage must not appear as real live usage in the CI summary.
 unset GITHUB_STEP_SUMMARY
+# Each case selects strict or optional mode explicitly, independent of the shell.
+unset ZEN_REQUIRE_LIVE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -107,6 +109,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             self.send_json(200, {"data": [
                 {"id": MODEL, "supported_endpoints": ["/chat/completions", "/responses"]},
+                {"id": "beam-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "mimo-v2.5-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "hy3-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
@@ -1216,28 +1219,35 @@ expect_success "neutral skip only before any client is exercised" 8 \
     SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+expect_hard_failure "Zen strict mode rejects all-unavailable canaries before any CLI" 8 \
+  env PATH="${neutral_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen ZEN_REQUIRE_LIVE=1 START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${neutral_port}" LIVE_CLI_SMOKE_DIR="${neutral_dir}/strict-smoke" \
+    SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
 free_filter_dir="${TMP_ROOT}/setup/free-label-filter"
 start_mock_server "${free_filter_dir}/server" 200
 free_filter_port="${MOCK_SERVER_PORT}"
 write_fake_clients "${free_filter_dir}/bin" pass pass pass
 printf '%s\n' \
-  $'mimo-v2.5-free\tMiMo V2.5 Free\t/chat/completions' \
+  $'beam-free\tBeam Free\t/chat/completions' \
   $'muse-spark-1.2-contributor-free\tMuse Spark Free\t/responses' \
   $'jev-1.13-free\tJev 1.13 Free\t/systemone' \
   > "${free_filter_dir}/free-models.tsv"
-free_filter_name="Zen candidates honor parsed free labels"
+free_filter_name="Zen candidates include parsed non-preferred free Chat models"
 if expect_success "${free_filter_name}" 8 \
-  env PATH="${free_filter_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+  env PATH="${free_filter_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen ZEN_REQUIRE_LIVE=1 START_PROXY=0 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${free_filter_port}" \
     LIVE_CLI_SMOKE_DIR="${free_filter_dir}/smoke" \
     ZEN_FREE_MODELS_FILE="${free_filter_dir}/free-models.tsv" \
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
   free_filter_stderr="${TMP_ROOT}/cases/${free_filter_name//[^a-zA-Z0-9_.-]/_}/stderr"
-  if grep -q '^==> Zen candidate models: mimo-v2\.5-free$' "${free_filter_stderr}" \
-    && ! grep -q '^==> Zen candidate models: .*hy3-free' "${free_filter_stderr}" \
-    && ! grep -q '^==> Zen candidate models: .*muse-spark' "${free_filter_stderr}"; then
+  if grep -q '^==> Zen candidate models: beam-free$' "${free_filter_stderr}" \
+    && grep -q '^==> \[copilot\] PASS beam-free$' "${free_filter_stderr}" \
+    && grep -q '^==> \[claude\] PASS beam-free$' "${free_filter_stderr}" \
+    && grep -q '^==> \[gemini\] PASS beam-free$' "${free_filter_stderr}"; then
     record_success "Zen candidate filtering requires current Free and Chat labels"
   else
     record_failure "Zen candidate filtering requires current Free and Chat labels" \
@@ -1379,6 +1389,12 @@ if expect_success "${free_tier_case}" 8 \
     cat "${free_tier_stderr}" >&2 || true
   fi
 fi
+expect_hard_failure "Zen strict mode rejects exact FreeTierError before any CLI" 8 \
+  env PATH="${free_tier_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen ZEN_REQUIRE_LIVE=1 START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${free_tier_port}" \
+    LIVE_CLI_SMOKE_DIR="${free_tier_dir}/strict-cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 run_zen_case_expect_failure "Zen free-tier text without FreeTierError type is hard" 403 pass pass pass \
   "${free_tier_message}"
 

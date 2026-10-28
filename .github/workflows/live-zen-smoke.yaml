@@ -6,11 +6,10 @@ name: Live OpenCode Zen Smoke
 # openai-compatible provider routing through an explicit experimental client
 # compatibility profile, when the upstream admits anonymous inference.
 #
-# The Zen free tier rotates and is rate-limited per IP. The script neutral-skips
-# only when no model is reachable before any CLI is exercised, including Zen's
-# HTTP 403 FreeTierError that limits the free tier to the OpenCode client; once a
-# canary reaches a model, every installed CLI is an independent hard gate. See
-# docs/development.md.
+# The Zen free tier rotates and is rate-limited per IP. Require real client
+# completions: unavailable canaries or a free-tier refusal must fail CI rather
+# than produce a successful neutral skip. Every installed CLI is an independent
+# hard gate. See docs/development.md.
 
 on:
   workflow_dispatch:
@@ -86,6 +85,7 @@ jobs:
       - name: Run live OpenCode Zen CLI smoke
         env:
           SMOKE_PROVIDER: zen
+          ZEN_REQUIRE_LIVE: "1"
           PROVIDERS_CONFIG: examples/opencode-zen-free.yaml
           LIVE_CLI_SMOKE_DIR: ${{ runner.temp }}/live-zen-cli-smoke
           SMOKE_CLI_TIMEOUT_SECONDS: "120"

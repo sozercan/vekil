@@ -470,7 +470,7 @@ For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../s
 
 ## Live OpenCode Zen CLI Smoke Workflow
 
-The [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow runs the **same** `scripts/live-cli-smoke.sh` harness as the Copilot smoke, but in `SMOKE_PROVIDER=zen` mode: it starts vekil with `examples/opencode-zen-free.yaml` (no credentials) and drives real coding-agent CLIs against the OpenCode Zen free tier. Because it needs no secrets, it runs on **every** pull request, **including external-contributor forks**. Paid Copilot checks run separately on same-repository pull requests, weekly schedules, and manual dispatch. It attempts live end-to-end coverage of Vekil's generic `openai-compatible` provider routing (config loading, anonymous bearer auth, static model catalog, and per-model endpoint allowlists); a neutral skip provides no live compatibility coverage.
+The [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow runs the **same** `scripts/live-cli-smoke.sh` harness as the Copilot smoke, but in `SMOKE_PROVIDER=zen` mode: it starts vekil with `examples/opencode-zen-free.yaml` (no credentials) and drives real coding-agent CLIs against the OpenCode Zen free tier. Because it needs no secrets, it runs on **every** pull request, **including external-contributor forks**. Paid Copilot checks run separately on same-repository pull requests, weekly schedules, and manual dispatch. It requires live end-to-end coverage of Vekil's generic `openai-compatible` provider routing (config loading, anonymous bearer auth, static model catalog, and per-model endpoint allowlists). CI sets `ZEN_REQUIRE_LIVE=1`, so all-model unavailability or a provider access restriction fails the job rather than succeeding without a CLI pass.
 
 Before starting Vekil, the workflow fetches OpenCode's published Zen documentation and uses [`scripts/parse-opencode-zen-free-models.sh`](../scripts/parse-opencode-zen-free-models.sh) to join the endpoint and pricing tables by display label. Only rows whose input and output prices are both labeled `Free` are eligible for the smoke. The harness intersects that parsed set with the checked-in static example, so aliases such as Ox Alpha's `x-preview-f-free` do not depend on an ID suffix and models that lose their free label are not exercised anonymously.
 
@@ -504,16 +504,28 @@ For each client/model attempt, a bounded raw chat-completions canary runs first:
 
 - Only upstream conditions evidenced by an HTTP response are skippable: an exact listed-model-unavailable HTTP 400, a promotion-ended, exact model-no-longer-supported, rate-limit, or temporary-capacity message on an eligible response, HTTP 408/425/429, or HTTP 5xx. Local curl transport failures and timeouts are hard failures because they can indicate a stuck Vekil handler. Other HTTP 400 responses and unknown statuses, including 404 and 405, are hard failures.
 - After a 200 canary, any CLI nonzero exit, timeout, empty result, or mismatched result gets one bounded second canary on that same model. A recognized transient skips the candidate; a still-reachable but incompatible candidate is recorded and the client must pass another candidate. The job fails if a client exhausts the reachable set without an exact pass.
-- A neutral exit 0 is allowed only when no model was reachable **before any client was exercised**. Once a reachable model has exercised a client, every installed client must pass.
-- Since September 2026, Zen answers anonymous free-tier requests from other clients with HTTP 403 `FreeTierError`: "OpenCode's free tier can only be used from within OpenCode". The first canary that receives this exact type and message ends the run with a neutral skip and a workflow warning before any client runs. The experimental profile does not override this restriction, and adding a paid API key does not unlock free chat models. Anonymous allowance exhaustion can instead return HTTP 429 `FreeUsageLimitError`. While either condition prevents all canaries from succeeding, this workflow provides no live coverage.
+- Without `ZEN_REQUIRE_LIVE=1`, a neutral exit 0 is allowed only when no model was reachable **before any client was exercised**. CI and the local invocation below enable this flag and fail instead. Once a reachable model has exercised a client, every installed client must pass regardless of the flag.
+- Since September 2026, Zen answers anonymous free-tier requests from other clients with HTTP 403 `FreeTierError`: "OpenCode's free tier can only be used from within OpenCode". The first canary that receives this exact type and message ends the run before any client runs: it is a hard failure with `ZEN_REQUIRE_LIVE=1`, or a neutral skip with a warning in optional/manual harness runs without the flag. The experimental profile does not override this restriction, and adding a paid API key does not unlock free chat models. Anonymous allowance exhaustion can instead return HTTP 429 `FreeUsageLimitError`. While either condition prevents all canaries from succeeding, there is no live coverage; a skipped run is not an actual CLI pass.
 
 OpenAI Codex CLI is intentionally excluded from this Zen harness because its native wire API requires `/responses`, while the shared Copilot/Claude/Gemini matrix deliberately tests `/chat/completions`. If a permitted configured Zen model advertises native `/responses`, Vekil forwards it directly rather than using Responses-to-Chat translation; do not retain retired model names or infer Responses support from Chat compatibility. Codex remains covered by the Copilot smoke, where it works against the Copilot upstream.
 
-Run it locally after `make build` (requires GitHub Copilot CLI; installed Claude/Gemini CLIs are also enforced):
+Run it locally after `make build` (requires GitHub Copilot CLI; installed Claude/Gemini CLIs are also enforced). Fetch current free labels so configured Chat models outside the preference list are included; a fetch or parse failure stops before the harness runs:
 
 ```bash
-SMOKE_PROVIDER=zen PROVIDERS_CONFIG=examples/opencode-zen-free.yaml \
-  scripts/live-cli-smoke.sh
+(
+  set -euo pipefail
+  zen_smoke_dir="$(mktemp -d)"
+  trap 'rm -rf "$zen_smoke_dir"' EXIT
+  curl --fail --silent --show-error --location --retry 3 \
+    --connect-timeout 10 --max-time 60 \
+    https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/models.mdx \
+    > "$zen_smoke_dir/models.mdx"
+  scripts/parse-opencode-zen-free-models.sh "$zen_smoke_dir/models.mdx" \
+    > "$zen_smoke_dir/free-models.tsv"
+  SMOKE_PROVIDER=zen ZEN_REQUIRE_LIVE=1 PROVIDERS_CONFIG=examples/opencode-zen-free.yaml \
+    ZEN_FREE_MODELS_FILE="$zen_smoke_dir/free-models.tsv" \
+    scripts/live-cli-smoke.sh
+)
 ```
 
 ## Live Copilot Direct-Bearer Smoke Workflow

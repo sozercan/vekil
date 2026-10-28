@@ -568,14 +568,19 @@ func TestLoadProvidersConfigFileOpenCodeZenExample(t *testing.T) {
 		t.Fatal(err)
 	}
 	const sessionID = "ses_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	for _, smokeAffinity := range []bool{false, true} {
-		name := "example"
-		if smokeAffinity {
-			name = "smoke-affinity"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		endpoint      string
+		smokeAffinity bool
+	}{
+		{name: "chat", endpoint: providerEndpointChatCompletions},
+		{name: "chat-smoke-affinity", endpoint: providerEndpointChatCompletions, smokeAffinity: true},
+		{name: "responses-only", endpoint: providerEndpointResponses},
+		{name: "responses-only-smoke-affinity", endpoint: providerEndpointResponses, smokeAffinity: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			contents := string(example)
-			if smokeAffinity {
+			if tc.smokeAffinity {
 				// The workflow extends the example's final extra_headers mapping.
 				for _, header := range []string{"x-opencode-session", "x-opencode-session-id", "x-session-affinity", "X-Session-Id"} {
 					contents += "      " + header + ": " + sessionID + "\n"
@@ -609,14 +614,18 @@ func TestLoadProvidersConfigFileOpenCodeZenExample(t *testing.T) {
 				"X-Session-Affinity":    "",
 				"X-Session-Id":          "",
 			}
-			if smokeAffinity {
+			if tc.smokeAffinity {
 				for _, header := range []string{"X-Opencode-Session", "X-Opencode-Session-Id", "X-Session-Affinity", "X-Session-Id"} {
 					expectedHeaders[header] = sessionID
 				}
 			}
+			// Request construction must not depend on the rotating generated catalog.
+			// Both Chat-only and Responses-only refreshes are valid inputs.
+			const modelID = "zen-request-shape-test"
+			cfg.Providers[0].Models = []ProviderModelConfig{{PublicID: modelID, Endpoints: []string{tc.endpoint}}}
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodPost || r.URL.Path != "/inference/openai/v1/chat/completions" {
-					t.Errorf("upstream request = %s %s, want POST current Chat endpoint", r.Method, r.URL.Path)
+				if r.Method != http.MethodPost || r.URL.Path != "/inference/openai/v1"+tc.endpoint {
+					t.Errorf("upstream request = %s %s, want POST configured inference endpoint", r.Method, r.URL.Path)
 				}
 				for header, want := range expectedHeaders {
 					if got := r.Header.Get(header); got != want {
@@ -636,29 +645,17 @@ func TestLoadProvidersConfigFileOpenCodeZenExample(t *testing.T) {
 			if provider == nil {
 				t.Fatal("expected configured OpenCode provider")
 			}
-			modelID := ""
-			for id, model := range provider.staticModels {
-				for _, endpoint := range model.supportedEndpoints {
-					if endpoint == providerEndpointChatCompletions {
-						modelID = id
-						break
-					}
-				}
-				if modelID != "" {
-					break
-				}
+			requestBody := map[string]any{"model": modelID}
+			if tc.endpoint == providerEndpointResponses {
+				requestBody["input"] = "OK"
+			} else {
+				requestBody["messages"] = []map[string]string{{"role": "user", "content": "OK"}}
 			}
-			if modelID == "" {
-				t.Fatal("expected a generated anonymous Chat model")
-			}
-			body, err := json.Marshal(map[string]any{
-				"model":    modelID,
-				"messages": []map[string]string{{"role": "user", "content": "OK"}},
-			})
+			body, err := json.Marshal(requestBody)
 			if err != nil {
 				t.Fatal(err)
 			}
-			req, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+			req, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, tc.endpoint, body, nil, "")
 			if err != nil {
 				t.Fatal(err)
 			}

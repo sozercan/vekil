@@ -37,6 +37,7 @@ SMOKE_CLI_TIMEOUT_SECONDS="${SMOKE_CLI_TIMEOUT_SECONDS:-240}"
 SMOKE_PROCESS_TERM_GRACE_SECONDS="${SMOKE_PROCESS_TERM_GRACE_SECONDS:-5}"
 SMOKE_PORT_RELEASE_TIMEOUT_SECONDS="${SMOKE_PORT_RELEASE_TIMEOUT_SECONDS:-5}"
 ZEN_FREE_MODELS_FILE="${ZEN_FREE_MODELS_FILE:-}"
+ZEN_REQUIRE_LIVE="${ZEN_REQUIRE_LIVE:-0}"
 
 python_command() {
   if command -v python3 >/dev/null 2>&1; then
@@ -1078,6 +1079,8 @@ EOF
 }
 
 main_zen() {
+  [[ "${ZEN_REQUIRE_LIVE}" == "0" || "${ZEN_REQUIRE_LIVE}" == "1" ]] \
+    || die "ZEN_REQUIRE_LIVE must be 0 or 1"
   require_cmd curl
   require_cmd jq
   require_cmd copilot
@@ -1157,6 +1160,9 @@ main_zen() {
         ;;
       2)
         if [[ "${ZEN_ANY_CLIENT_EXERCISED}" == "0" ]]; then
+          if [[ "${ZEN_REQUIRE_LIVE}" == "1" ]]; then
+            die "Zen live completion required: no free model was reachable; no client was exercised"
+          fi
           log "Zen smoke NEUTRAL SKIP: no free model was reachable before any client was exercised."
           log "This is not a proxy failure; re-check the live free set with:"
           log "  curl --connect-timeout 10 --max-time 30 -s https://opencode.ai/inference/v1/models"
@@ -1169,6 +1175,9 @@ main_zen() {
         ;;
       4)
         if [[ "${ZEN_ANY_CLIENT_EXERCISED}" == "0" ]]; then
+          if [[ "${ZEN_REQUIRE_LIVE}" == "1" ]]; then
+            die "Zen live completion required: OpenCode refused free-tier access (${ZEN_CLIENT_RESTRICTION}); no client was exercised"
+          fi
           log "Zen smoke NEUTRAL SKIP: OpenCode Zen restricts its free tier to the OpenCode client (${ZEN_CLIENT_RESTRICTION})."
           log "Vekil compatibility metadata does not grant free-tier access; live coverage needs a model that OpenCode permits for API use."
           if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then

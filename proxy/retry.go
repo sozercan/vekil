@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -344,8 +346,18 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 			if !retryDelayFitsBudget(req.Context(), delay) {
 				return resp, nil
 			}
-			// Drain and close body before retry to allow connection reuse.
-			drainAndClose(resp.Body)
+			// An exhausted free allowance is not transient throttling. Inspect only
+			// a response we would otherwise drain and retry; keep budget-limited
+			// passthrough responses untouched.
+			if resp.StatusCode == http.StatusTooManyRequests {
+				body := readRetryableUpstreamErrorBody(resp.Body)
+				if restoreFreeUsageLimitResponse(resp, body) {
+					return resp, nil
+				}
+			} else {
+				// Drain and close body before retry to allow connection reuse.
+				drainAndClose(resp.Body)
+			}
 			if req.Context().Err() != nil {
 				return nil, upstreamErr
 			}
@@ -365,6 +377,9 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 			}
 		} else {
 			upstreamErr.body = readRetryableUpstreamErrorBody(resp.Body)
+			if restoreFreeUsageLimitResponse(resp, upstreamErr.body) {
+				return resp, nil
+			}
 		}
 	}
 	return nil, lastErr
@@ -661,6 +676,25 @@ func (e *upstreamError) Error() string {
 		return ""
 	}
 	return formatUpstreamErrorMessage(e.statusCode, e.body)
+}
+
+// Preserve a complete, small typed quota refusal for the caller instead of
+// sleeping through Retry-After or replacing it with a synthetic retry error.
+func restoreFreeUsageLimitResponse(resp *http.Response, body []byte) bool {
+	if resp.StatusCode != http.StatusTooManyRequests || len(body) >= upstreamErrorDetailMaxBodyBytes ||
+		(resp.ContentLength > 0 && resp.ContentLength != int64(len(body))) {
+		return false
+	}
+	var envelope struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil || envelope.Error.Type != "FreeUsageLimitError" {
+		return false
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return true
 }
 
 func readRetryableUpstreamErrorBody(body io.ReadCloser) []byte {
