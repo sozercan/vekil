@@ -2,12 +2,16 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
@@ -315,5 +319,92 @@ func TestHandleMemorySummarize_BoundsSuccessfulSummaryResponse(t *testing.T) {
 	}
 	if !upstreamBody.closed {
 		t.Fatal("expected oversized memory response body to be closed")
+	}
+}
+
+func TestHandleSummaryQuotaErrorPassthrough(t *testing.T) {
+	for _, endpoint := range []struct {
+		name, path, body string
+		handle           func(*ProxyHandler) http.HandlerFunc
+	}{
+		{"compact", "/v1/responses/compact", `{"model":"quota-model","input":"history"}`, func(h *ProxyHandler) http.HandlerFunc { return h.HandleCompact }},
+		{"memory", "/v1/memories/trace_summarize", `{"model":"quota-model","traces":[{"id":"trace-1","items":[]}]}`, func(h *ProxyHandler) http.HandlerFunc { return h.HandleMemorySummarize }},
+	} {
+		for _, encoding := range []string{"identity", "gzip"} {
+			t.Run(endpoint.name+"/"+encoding, func(t *testing.T) {
+				payload := []byte(quotaBodyFixture)
+				if encoding == "gzip" {
+					payload = gzipTestPayload(t, payload)
+				}
+				var calls atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					if r.URL.Path != "/responses" || r.Header.Get("Accept-Encoding") != encoding {
+						t.Errorf("upstream path=%q Accept-Encoding=%q, want /responses and %q", r.URL.Path, r.Header.Get("Accept-Encoding"), encoding)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("Retry-After", "60")
+					w.Header().Set("Connection", "X-Upstream-Hop")
+					w.Header().Set("X-Upstream-Hop", "must-not-forward")
+					if encoding == "gzip" {
+						w.Header().Set("Content-Encoding", "gzip")
+					}
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write(payload)
+				}))
+				defer upstream.Close()
+				h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
+					Providers: []ProviderConfig{{
+						ID: "quota", Type: "openai-compatible", BaseURL: upstream.URL, AuthType: "none", ModelDiscovery: "static",
+						ExtraHeaders: map[string]string{"Accept-Encoding": encoding},
+						Models:       []ProviderModelConfig{{PublicID: "quota-model", Endpoints: []string{"/responses"}}},
+					}},
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				h.maxRetries = 3
+				h.retryBaseDelay = time.Nanosecond
+				req := httptest.NewRequest(http.MethodPost, endpoint.path, strings.NewReader(endpoint.body))
+				req.Header.Set("Content-Type", "application/json")
+				ctx, cancel := context.WithTimeout(req.Context(), time.Second)
+				defer cancel()
+				// Shim inference is lifecycle-rooted, so bound that context too if
+				// the terminal-quota retry suppression ever regresses.
+				h.lifecycleCtx = ctx
+				w := httptest.NewRecorder()
+				endpoint.handle(h)(w, req.WithContext(ctx))
+				resp := w.Result()
+				defer func() { _ = resp.Body.Close() }()
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if resp.StatusCode != http.StatusTooManyRequests || calls.Load() != 1 || !bytes.Equal(body, payload) {
+					t.Fatalf("status=%d sends=%d unchanged-body=%t, want 429, 1, true", resp.StatusCode, calls.Load(), bytes.Equal(body, payload))
+				}
+				wantEncoding := ""
+				if encoding == "gzip" {
+					wantEncoding = "gzip"
+				}
+				if resp.Header.Get("Content-Type") != "application/json" || resp.Header.Get("Content-Encoding") != wantEncoding || resp.Header.Get("Retry-After") != "60" {
+					t.Errorf("passthrough headers lost: %v", resp.Header)
+				}
+				if resp.Header.Get("Connection") != "" || resp.Header.Get("X-Upstream-Hop") != "" {
+					t.Errorf("hop-by-hop headers leaked: %v", resp.Header)
+				}
+				if encoding == "gzip" {
+					decoded, err := gzip.NewReader(bytes.NewReader(body))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = decoded.Close() }()
+					plain, err := io.ReadAll(decoded)
+					if err != nil || string(plain) != quotaBodyFixture {
+						t.Fatalf("decoded quota body=%q error=%v", plain, err)
+					}
+				}
+			})
+		}
 	}
 }
