@@ -752,10 +752,9 @@ zen_error_is_transient() {
     'promotion (has )?ended|free promotion[^[:alnum:]]+ended|^model [[:alnum:]_.:/-]+ is not supported$|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'
 }
 
-# Since 2026-09-17 OpenCode Zen answers anonymous free-tier requests from other
-# clients with HTTP 403 FreeTierError "OpenCode's free tier can only be used
-# from within OpenCode". That is a provider usage policy, not an outage. Vekil
-# must not impersonate the OpenCode client to get around it.
+# OpenCode can refuse anonymous free-tier requests with HTTP 403 FreeTierError.
+# Compatibility metadata is not authorization: keep this provider-policy refusal
+# terminal rather than retrying it with a different client identity.
 zen_error_is_client_restricted() {
   local type="$1"
   local message="$2"
@@ -1160,7 +1159,7 @@ main_zen() {
         if [[ "${ZEN_ANY_CLIENT_EXERCISED}" == "0" ]]; then
           log "Zen smoke NEUTRAL SKIP: no free model was reachable before any client was exercised."
           log "This is not a proxy failure; re-check the live free set with:"
-          log "  curl --connect-timeout 10 --max-time 30 -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'"
+          log "  curl --connect-timeout 10 --max-time 30 -s https://opencode.ai/inference/v1/models"
           return 0
         fi
         die "[${client}] did not pass after the smoke had already exercised a reachable model"
@@ -1171,7 +1170,7 @@ main_zen() {
       4)
         if [[ "${ZEN_ANY_CLIENT_EXERCISED}" == "0" ]]; then
           log "Zen smoke NEUTRAL SKIP: OpenCode Zen restricts its free tier to the OpenCode client (${ZEN_CLIENT_RESTRICTION})."
-          log "Vekil does not impersonate OpenCode; live Zen coverage needs a credential or model that OpenCode permits for API use."
+          log "Vekil compatibility metadata does not grant free-tier access; live coverage needs a model that OpenCode permits for API use."
           if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
             printf '::warning title=OpenCode Zen smoke skipped::%s\n' \
               "OpenCode Zen refused the anonymous free tier to non-OpenCode clients (HTTP 403 FreeTierError); no client was exercised."

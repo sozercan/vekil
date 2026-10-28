@@ -768,6 +768,101 @@ else
     "$(diff -u "${zen_parser_dir}/expected.tsv" "${zen_parser_dir}/actual.tsv" 2>&1 || true)"
 fi
 
+cat > "${zen_parser_dir}/models.mdx" <<'EOF_ZEN_INFERENCE_DOC'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Paid Model | paid-model-free | `https://opencode.ai/inference/openai/v1/responses` | `@ai-sdk/openai` |
+| Input Free Only | input-free-only | `https://opencode.ai/inference/openai/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+| Output Free Only | output-free-only | `https://opencode.ai/inference/openai/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+| Big Pickle | big-pickle | `https://opencode.ai/inference/openai/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+| Ox Alpha Free | x-preview-f-free | `https://opencode.ai/inference/openai/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+| Muse Spark Free | muse-spark-free | `https://opencode.ai/inference/openai/v1/responses` | `@ai-sdk/openai` |
+| Claude Free | claude-free | `https://opencode.ai/inference/anthropic/v1/messages` | `@ai-sdk/anthropic` |
+| Jev Free | jev-free | `https://opencode.ai/inference/systemone/v1/systemone` | - |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Paid Model | $1.00 | $2.00 | - | - |
+| Input Free Only | Free | $2.00 | - | - |
+| Output Free Only | $1.00 | Free | - | - |
+| Big Pickle | Free | Free | Free | - |
+| Ox Alpha Free | Free | Free | Free | - |
+| Muse Spark Free | Free | Free | Free | - |
+| Claude Free | Free | Free | Free | - |
+| Jev Free | Free | Free | - | - |
+EOF_ZEN_INFERENCE_DOC
+cat > "${zen_parser_dir}/inference-expected.tsv" <<'EOF_ZEN_INFERENCE_EXPECTED'
+big-pickle	Big Pickle	/chat/completions
+x-preview-f-free	Ox Alpha Free	/chat/completions
+muse-spark-free	Muse Spark Free	/responses
+claude-free	Claude Free	/messages
+jev-free	Jev Free	/systemone
+EOF_ZEN_INFERENCE_EXPECTED
+sed -E 's@https://opencode\.ai/inference/(openai|anthropic|systemone)/v1@@g' \
+  "${zen_parser_dir}/models.mdx" > "${zen_parser_dir}/relative-models.mdx"
+for source_doc in models relative-models; do
+  if "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+    "${zen_parser_dir}/${source_doc}.mdx" > "${zen_parser_dir}/${source_doc}-actual.tsv" \
+    && cmp -s "${zen_parser_dir}/inference-expected.tsv" "${zen_parser_dir}/${source_doc}-actual.tsv"; then
+    record_success "Zen free-label parser maps native families and excludes nonfree rows (${source_doc})"
+  else
+    record_failure "Zen free-label parser maps native families and excludes nonfree rows (${source_doc})" \
+      "$(diff -u "${zen_parser_dir}/inference-expected.tsv" "${zen_parser_dir}/${source_doc}-actual.tsv" 2>&1 || true)"
+  fi
+done
+
+sed 's@| Free | Free |@| $1.00 | $2.00 |@g' "${zen_parser_dir}/models.mdx" \
+  > "${zen_parser_dir}/no-free-models.mdx"
+expect_hard_failure_with_stderr "Zen free-label parser rejects a nonfree inference catalog" 4 \
+  'no models with Free input and output labels were found' \
+  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/no-free-models.mdx"
+
+while IFS=$'\t' read -r endpoint_case endpoint_url; do
+  cat > "${zen_parser_dir}/rejected-endpoint.mdx" <<EOF_ZEN_REJECTED_DOC
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Free Model | free-model | \`${endpoint_url}\` | - |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Free Model | Free | Free | - | - |
+EOF_ZEN_REJECTED_DOC
+  expect_hard_failure_with_stderr "Zen free-label parser rejects ${endpoint_case}" 4 \
+    '^error: unsupported endpoint for Free Model: ' \
+    "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+    "${zen_parser_dir}/rejected-endpoint.mdx"
+done <<'EOF_ZEN_REJECTED_ENDPOINTS'
+OpenAI messages	https://opencode.ai/inference/openai/v1/messages
+OpenAI SystemOne	https://opencode.ai/inference/openai/v1/systemone
+Anthropic Chat	https://opencode.ai/inference/anthropic/v1/chat/completions
+Anthropic Responses	https://opencode.ai/inference/anthropic/v1/responses
+Anthropic SystemOne	https://opencode.ai/inference/anthropic/v1/systemone
+SystemOne Chat	https://opencode.ai/inference/systemone/v1/chat/completions
+SystemOne Responses	https://opencode.ai/inference/systemone/v1/responses
+SystemOne messages	https://opencode.ai/inference/systemone/v1/messages
+foreign inference host	https://example.com/inference/openai/v1/chat/completions
+foreign legacy host	https://example.com/zen/v1/chat/completions
+host suffix	https://opencode.ai.example.com/inference/openai/v1/chat/completions
+userinfo host	https://opencode.ai@example.com/inference/openai/v1/chat/completions
+HTTP inference URL	http://opencode.ai/inference/openai/v1/chat/completions
+unknown inference family	https://opencode.ai/inference/unknown/v1/chat/completions
+unknown inference endpoint	https://opencode.ai/inference/openai/v1/unknown
+unknown relative endpoint	/unknown
+relative inference prefix	/inference/openai/v1/chat/completions
+inference path suffix	https://opencode.ai/inference/openai/v1/chat/completions/extra
+inference URL query	https://opencode.ai/inference/openai/v1/responses?model=free
+inference URL fragment	https://opencode.ai/inference/anthropic/v1/messages#free
+EOF_ZEN_REJECTED_ENDPOINTS
+
 cat > "${zen_parser_dir}/missing-endpoint.mdx" <<'EOF_ZEN_MISSING'
 ## Endpoints
 

@@ -3,7 +3,8 @@ name: Live OpenCode Zen Smoke
 # Credential-free live smoke for the OpenCode Zen free tier. Unlike the Live
 # Copilot Smoke workflow, this needs no secrets, so it runs on EVERY pull
 # request including external-contributor forks. It exercises vekil's generic
-# openai-compatible provider routing end to end through real coding-agent CLIs.
+# openai-compatible provider routing through an explicit experimental client
+# compatibility profile, when the upstream admits anonymous inference.
 #
 # The Zen free tier rotates and is rate-limited per IP. The script neutral-skips
 # only when no model is reachable before any CLI is exercised, including Zen's
@@ -42,7 +43,7 @@ jobs:
 
       - name: Parse current OpenCode Zen free labels
         env:
-          OPENCODE_ZEN_DOC_URL: https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx
+          OPENCODE_ZEN_DOC_URL: https://raw.githubusercontent.com/anomalyco/opencode/dev/services/www/src/docs/content/console/models.mdx
         run: |
           doc="$RUNNER_TEMP/opencode-zen.mdx"
           models="$RUNNER_TEMP/opencode-zen-free-models.tsv"
@@ -91,12 +92,13 @@ jobs:
           SMOKE_CURL_MAX_TIME_SECONDS: "45"
         run: |
           zen_smoke_config="$RUNNER_TEMP/opencode-zen-smoke.yaml"
-          zen_smoke_session_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          zen_smoke_session_id="$(python3 -c 'import secrets; print("ses_" + secrets.token_hex(32))')"
           cp "$PROVIDERS_CONFIG" "$zen_smoke_config"
           cat >> "$zen_smoke_config" <<EOF
-              extra_headers:
-                User-Agent: vekil-live-smoke/1
                 x-opencode-session: "$zen_smoke_session_id"
+                x-opencode-session-id: "$zen_smoke_session_id"
+                x-session-affinity: "$zen_smoke_session_id"
+                X-Session-Id: "$zen_smoke_session_id"
           EOF
           ./vekil config validate --providers-config "$zen_smoke_config"
           PROVIDERS_CONFIG="$zen_smoke_config" scripts/live-cli-smoke.sh

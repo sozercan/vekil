@@ -430,7 +430,7 @@ main() {
     die "${failed} model(s) failed through the proxy (see ${SMOKE_DIR})."
   fi
   if [[ "${ok}" -lt 1 ]]; then
-    die "no free model returned a completion; the free set may have fully rotated. Re-check: curl --connect-timeout 10 --max-time 30 -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'"
+    die "no free model returned a completion; the free set may have fully rotated. Re-check: curl --connect-timeout 10 --max-time 30 -s https://opencode.ai/inference/v1/models"
   fi
 
   log "OpenCode Zen free-tier smoke passed."

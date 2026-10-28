@@ -35,7 +35,7 @@ jobs:
             exit 1
           }
 
-          source_url="https://raw.githubusercontent.com/anomalyco/opencode/${source_sha}/packages/web/src/content/docs/zen.mdx"
+          source_url="https://raw.githubusercontent.com/anomalyco/opencode/${source_sha}/services/www/src/docs/content/console/models.mdx"
           source_doc="$RUNNER_TEMP/opencode-zen-${source_sha}.mdx"
           curl --fail --silent --show-error --location --retry 3 \
             --connect-timeout 10 --max-time 60 --max-filesize 2097152 \
@@ -76,7 +76,7 @@ jobs:
           cat > "$body_file" <<EOF_BODY
           ## Summary
           - refresh the generated OpenCode Zen free-model list and native endpoint allowlists
-          - source [OpenCode Zen documentation at ${OPENCODE_ZEN_SOURCE_SHA}](https://github.com/anomalyco/opencode/blob/${OPENCODE_ZEN_SOURCE_SHA}/packages/web/src/content/docs/zen.mdx)
+          - source [OpenCode Zen documentation at ${OPENCODE_ZEN_SOURCE_SHA}](https://github.com/anomalyco/opencode/blob/${OPENCODE_ZEN_SOURCE_SHA}/services/www/src/docs/content/console/models.mdx)
 
           ## Validation
           - \`bash -n scripts/parse-opencode-zen-free-models.sh scripts/update-opencode-zen-free-config.sh\`

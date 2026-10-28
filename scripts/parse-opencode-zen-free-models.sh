@@ -121,7 +121,16 @@ END {
     }
 
     endpoint = endpoint_url_by_label[label]
-    sub(/^https:\/\/opencode\.ai\/zen\/v1/, "", endpoint)
+    # Each inference family supports only its own native endpoint paths.
+    if (endpoint ~ /^https:\/\/opencode\.ai\/inference\/openai\/v1\/(chat\/completions|responses)$/) {
+      sub(/^https:\/\/opencode\.ai\/inference\/openai\/v1/, "", endpoint)
+    } else if (endpoint == "https://opencode.ai/inference/anthropic/v1/messages") {
+      endpoint = "/messages"
+    } else if (endpoint == "https://opencode.ai/inference/systemone/v1/systemone") {
+      endpoint = "/systemone"
+    } else {
+      sub(/^https:\/\/opencode\.ai\/zen\/v1/, "", endpoint)
+    }
     if (endpoint != "/chat/completions" && endpoint != "/responses" && endpoint != "/messages" && endpoint != "/systemone") {
       fail("unsupported endpoint for " label ": " endpoint_url_by_label[label])
       continue

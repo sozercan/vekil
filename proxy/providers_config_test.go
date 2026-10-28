@@ -560,6 +560,120 @@ func TestLoadProvidersConfigFileCopilotHeaderProfiles(t *testing.T) {
 	}
 }
 
+func TestLoadProvidersConfigFileOpenCodeZenExample(t *testing.T) {
+	t.Parallel()
+
+	example, err := os.ReadFile(filepath.Join("..", "examples", "opencode-zen-free.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "ses_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for _, smokeAffinity := range []bool{false, true} {
+		name := "example"
+		if smokeAffinity {
+			name = "smoke-affinity"
+		}
+		t.Run(name, func(t *testing.T) {
+			contents := string(example)
+			if smokeAffinity {
+				// The workflow extends the example's final extra_headers mapping.
+				for _, header := range []string{"x-opencode-session", "x-opencode-session-id", "x-session-affinity", "X-Session-Id"} {
+					contents += "      " + header + ": " + sessionID + "\n"
+				}
+			}
+			path := filepath.Join(t.TempDir(), "zen.yaml")
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadProvidersConfigFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(cfg.Providers) != 1 {
+				t.Fatalf("providers = %d, want one explicit provider", len(cfg.Providers))
+			}
+			if got := cfg.Providers[0].BaseURL; got != "https://opencode.ai/inference/openai/v1" {
+				t.Fatalf("base_url = %q, want current OpenAI inference endpoint", got)
+			}
+			if cfg.Providers[0].Default || cfg.Providers[0].ModelDiscovery != "static" {
+				t.Fatal("experimental anonymous provider must remain static and not a default catch-all")
+			}
+			expectedHeaders := map[string]string{
+				"Authorization":         "Bearer public",
+				"Content-Type":          "application/json",
+				"User-Agent":            "opencode/compat/0.0.0/vekil",
+				"X-Opencode-Client":     "vekil",
+				"X-Opencode-Project":    "vekil",
+				"X-Opencode-Session":    "",
+				"X-Opencode-Session-Id": "",
+				"X-Session-Affinity":    "",
+				"X-Session-Id":          "",
+			}
+			if smokeAffinity {
+				for _, header := range []string{"X-Opencode-Session", "X-Opencode-Session-Id", "X-Session-Affinity", "X-Session-Id"} {
+					expectedHeaders[header] = sessionID
+				}
+			}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/inference/openai/v1/chat/completions" {
+					t.Errorf("upstream request = %s %s, want POST current Chat endpoint", r.Method, r.URL.Path)
+				}
+				for header, want := range expectedHeaders {
+					if got := r.Header.Get(header); got != want {
+						t.Errorf("upstream %s = %q, want %q", header, got, want)
+					}
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+			cfg.Providers[0].BaseURL = upstream.URL + "/inference/openai/v1"
+			handler := &ProxyHandler{copilotURL: "https://copilot.example.com", client: upstream.Client()}
+			providers, _, _, err := handler.buildProviders(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider := providers["opencode-zen"]
+			if provider == nil {
+				t.Fatal("expected configured OpenCode provider")
+			}
+			modelID := ""
+			for id, model := range provider.staticModels {
+				for _, endpoint := range model.supportedEndpoints {
+					if endpoint == providerEndpointChatCompletions {
+						modelID = id
+						break
+					}
+				}
+				if modelID != "" {
+					break
+				}
+			}
+			if modelID == "" {
+				t.Fatal("expected a generated anonymous Chat model")
+			}
+			body, err := json.Marshal(map[string]any{
+				"model":    modelID,
+				"messages": []map[string]string{{"role": "user", "content": "OK"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := handler.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := upstream.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("upstream response = %d, want 204", resp.StatusCode)
+			}
+		})
+	}
+}
+
 func TestBuildProvidersGenericOpenAICompatibleConfig(t *testing.T) {
 	t.Setenv("TEST_GENERIC_API_KEY", "generic-key")
 
