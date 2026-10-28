@@ -60,6 +60,7 @@ export function validateCompletion(text: string) {
     const chunk = JSON.parse(data)
     if (chunk.error || !Array.isArray(chunk.choices) || chunk.choices.length > 1) throw new Error("invalid Chat SSE chunk")
     for (const choice of chunk.choices) {
+      if (stopped) throw new Error("completion choice after terminal stop")
       if (choice.index !== 0) throw new Error("unexpected completion choice index")
       const calls = choice.delta?.tool_calls
       if ((calls != null && (!Array.isArray(calls) || calls.length > 0)) || choice.delta?.function_call || (choice.finish_reason && choice.finish_reason !== "stop")) {

@@ -19,6 +19,13 @@ test("requires an exact completed answer and explicit free usage", () => {
   expect(validateCompletion(completion().replaceAll("\n", "\r\n"))).toEqual(usage)
 })
 
+test("accepts text deltas before a separate stop and usage-only trailer", () => {
+  const text = `data: {"choices":[{"index":0,"delta":{"content":"ZEN_CONTROL_"},"finish_reason":null}]}\n\n` +
+    `data: {"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}\n\n` +
+    completion("")
+  expect(validateCompletion(text)).toEqual(usage)
+})
+
 for (const [name, text] of [
   ["wrong answer", completion("wrong")],
   ["nonzero choice", completion().replace('"index":0', '"index":1')],
@@ -28,6 +35,10 @@ for (const [name, text] of [
   ["missing DONE", completion().replace("data: [DONE]\n\n", "")],
   ["unterminated frame", completion().trimEnd()],
   ["missing stop", completion().replace('"finish_reason":"stop"', '"finish_reason":null')],
+  ["text after stop", `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n` + completion().replace('"finish_reason":"stop"', '"finish_reason":null')],
+  ["answer completed after stop", completion("ZEN_CONTROL_").replace("data: [DONE]\n\n", `data: {"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}\n\ndata: [DONE]\n\n`)],
+  ["duplicate stop", completion().replace("data: [DONE]\n\n", `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n`)],
+  ["choice after stop", completion().replace("data: [DONE]\n\n", `data: {"choices":[{"index":0,"delta":{},"finish_reason":null}]}\n\ndata: [DONE]\n\n`)],
   ["truncation", completion().replace('"finish_reason":"stop"', '"finish_reason":"length"')],
   ["tool call", completion().replace('"content":"ZEN_CONTROL_OK"', '"content":"ZEN_CONTROL_OK","tool_calls":[{"id":"call_fake"}]')],
   ["malformed tool calls", completion().replace('"content":"ZEN_CONTROL_OK"', '"content":"ZEN_CONTROL_OK","tool_calls":{}')],
@@ -59,13 +70,16 @@ test("fixture is fixed free-model data with no captured local identity", () => {
   for (const value of ["/private/", "/Users/", "sozercan", "ses_", "Bearer "]) expect(raw).not.toContain(value)
 })
 
-for (const scenario of ["pass", "quota", "wrong-answer"] as const) {
+for (const scenario of ["pass", "quota", "wrong-answer", "post-stop"] as const) {
   test(`real Vekil and relay: ${scenario}; no skips or hidden retries`, async () => {
     const directory = temporary(), requests: { body: any; headers: Headers }[] = []
     const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
       requests.push({ body: await request.json(), headers: new Headers(request.headers) })
       if (scenario === "quota") return Response.json({ error: { type: "FreeUsageLimitError", message: "Free usage limit reached" } }, { status: 429, headers: { "retry-after": "60" } })
-      return new Response(completion(scenario === "pass" ? EXPECTED : "wrong"), { headers: { "content-type": "text/event-stream" } })
+      const text = scenario === "post-stop"
+        ? completion("").replace("data: [DONE]\n\n", `data: {"choices":[{"index":0,"delta":{"content":"${EXPECTED}"},"finish_reason":null}]}\n\ndata: [DONE]\n\n`)
+        : completion(scenario === "pass" ? EXPECTED : "wrong")
+      return new Response(text, { headers: { "content-type": "text/event-stream" } })
     } })
     const modelsFile = join(directory, "models.tsv")
     writeFileSync(modelsFile, `${MODEL}\tFree\t/chat/completions\n`)

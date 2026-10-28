@@ -548,7 +548,9 @@ OpenCode 2.1.2 request through three independently reported paths:
 
 Every path must return HTTP 200, the exact `ZEN_CONTROL_OK` completion, a normal
 stop and completed SSE stream from choice index 0 only, positive token counts, and explicit zero-cost
-`free` billing. HTTP refusals, empty/malformed/truncated output, tool calls,
+`free` billing. The stop terminates the only choice: any later choice chunk,
+including text or another stop, fails; a usage-only trailer before `[DONE]` is
+allowed. HTTP refusals, empty/malformed/truncated output, tool calls,
 missing billing proof, and unavailable models fail rather than skip. All three
 paths run even when an earlier one fails, and **any failed path fails the job**.
 A passing Bun reference or relay-assisted request cannot conceal native Vekil
