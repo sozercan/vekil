@@ -80,7 +80,7 @@ vekil service uninstall
 | OS | Registers | Starts | Logs |
 |----|-----------|--------|------|
 | Linux | systemd user unit `~/.config/systemd/user/vekil.service` | at boot (with lingering), restarted after failures | `journalctl --user -u vekil -f` |
-| macOS | launch agent `~/Library/LaunchAgents/com.vekil.proxy.plist` | at login, restarted after failures | `~/Library/Logs/vekil/vekil.log` |
+| macOS | launch agent `~/Library/LaunchAgents/com.sertacozercan.vekil.plist` | at login, restarted after failures | `~/Library/Logs/vekil/vekil.log` |
 | Windows | scheduled task `Vekil` | at logon | `%LocalAppData%\vekil\logs\vekil.log` |
 
 Every platform runs Vekil as you, without administrator rights, so it reuses your saved GitHub login, Azure CLI session, and Codex auth file. Run `install` without `sudo`; on macOS it refuses to run as root. Without a saved login, a Copilot-backed service writes the GitHub device code to its logs; finish sign-in there, or run `vekil login` and `vekil service restart`.

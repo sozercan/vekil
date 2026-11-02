@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	launchdServiceLabel = "com.vekil.proxy"
+	launchdServiceLabel = "com.sertacozercan.vekil"
 	// The tray app's Launch at Login agent; see cmd/menubar/launchagent_darwin.go.
 	launchdTrayLabel = "com.vekil.menubar"
 )
