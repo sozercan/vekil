@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"unicode/utf16"
@@ -136,7 +137,7 @@ func TestServiceInstallSystemd(t *testing.T) {
 	}
 	unit := readFile(t, env.unitPath())
 	for _, want := range []string{
-		`ExecStart="/opt/vekil dir/vekil" "--copilot-user-agent=a\"b$$c%%d\\e" "--port=8080" "--providers-config=` + wantSource + `" "--env-file=` + env.envFilePath() + `"`,
+		`ExecStart="/opt/vekil dir/vekil" "--copilot-user-agent=a\"b$$c%%d\\e" "--port=8080" ` + systemdQuoteExecArg("--providers-config="+wantSource) + " " + systemdQuoteExecArg("--env-file="+env.envFilePath()),
 		`Environment="PATH=/usr/bin:/opt/50%%"`,
 		"Restart=on-failure",
 		"WantedBy=default.target",
@@ -158,7 +159,7 @@ func TestServiceInstallSystemd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("env file mode = %v, want 0600", info.Mode().Perm())
 	}
 	for _, want := range []string{"Installed and started", "journalctl --user -u vekil -f"} {
@@ -186,7 +187,7 @@ func TestServiceInstallPreservesEnvFileOnUpdate(t *testing.T) {
 		t.Fatalf("env file overwritten: %q", got)
 	}
 	unit := readFile(t, env.unitPath())
-	if !strings.Contains(unit, `ExecStart="/opt/vekil dir/vekil" "--env-file=`+env.envFilePath()+`"`+"\n") {
+	if !strings.Contains(unit, `ExecStart="/opt/vekil dir/vekil" `+systemdQuoteExecArg("--env-file="+env.envFilePath())+"\n") {
 		t.Fatalf("unexpected ExecStart:\n%s", unit)
 	}
 	if !strings.Contains(env.stdout.String(), "Updated and started") {
@@ -218,7 +219,7 @@ func TestServiceInstallExplicitFiles(t *testing.T) {
 	if _, err := os.Stat(env.envFilePath()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("default env file created despite --env-file: %v", err)
 	}
-	if !strings.Contains(env.stdout.String(), "tail -f "+logFile) {
+	if !strings.Contains(env.stdout.String(), "tail -f "+shellQuoteIfNeeded(logFile)) {
 		t.Fatalf("stdout = %s", env.stdout)
 	}
 }
