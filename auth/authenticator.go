@@ -105,6 +105,10 @@ type Authenticator struct {
 	// are expected to drive the flow themselves via RequestDeviceCode /
 	// PollForAuthorization.
 	DisableAutoDeviceFlow bool
+
+	// DeviceCodePrompt, when set, replaces the stderr prompt shown by the
+	// automatic device-code flow, for example to write it to a log file.
+	DeviceCodePrompt func(verificationURI, userCode string)
 }
 
 type authTokenCall struct {
@@ -1007,7 +1011,11 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
+	if a.DeviceCodePrompt != nil {
+		a.DeviceCodePrompt(dcResp.VerificationURI, dcResp.UserCode)
+	} else {
+		_, _ = fmt.Fprintf(os.Stderr, "Please visit %s and enter code: %s\n", dcResp.VerificationURI, dcResp.UserCode)
+	}
 
 	return a.pollForAuthorization(ctx, dcResp)
 }

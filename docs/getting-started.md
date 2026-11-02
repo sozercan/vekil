@@ -65,6 +65,38 @@ workflow is intended for the native Vekil binary. See [Agent
 Launchers](agent-launchers.md) for supported versions, required model endpoints,
 argument forwarding, logs, and process-containment details.
 
+## Run As A Background Service
+
+`vekil service install` keeps the proxy running in the background for your account, similar to `cloudflared service install`:
+
+```bash
+vekil login                     # only for Copilot; the service cannot finish an interactive sign-in
+vekil service install --providers-config /path/to/providers.yaml --port 1337
+vekil service status
+vekil service restart           # after editing service.env
+vekil service uninstall
+```
+
+| OS | Registers | Starts | Logs |
+|----|-----------|--------|------|
+| Linux | systemd user unit `~/.config/systemd/user/vekil.service` | at boot (with lingering), restarted after failures | `journalctl --user -u vekil -f` |
+| macOS | launch agent `~/Library/LaunchAgents/com.sertacozercan.vekil.plist` | at login, restarted after failures | `~/Library/Logs/vekil/vekil.log` |
+| Windows | scheduled task `Vekil-<your account SID>` | at logon | `%LocalAppData%\vekil\logs\vekil.log` |
+
+Every platform runs Vekil as you, without administrator rights, so it reuses your saved GitHub login, Azure CLI session, and Codex auth file. Run `install` without `sudo`; on macOS it refuses to run as root. Without a saved login, a Copilot-backed service writes the GitHub device code to its logs; finish sign-in there, or run `vekil login` and `vekil service restart`.
+
+`install` accepts the same flags as the server. It validates them and the providers config, with the env file described below applied, then saves the current binary path and only the flags you passed. Relative `--providers-config`, `--token-dir`, `--env-file`, and `--log-file` paths become absolute. Re-run `install` to change flags or after moving the binary; it replaces the existing registration and restarts the service. On Linux and macOS it also saves your current `PATH`, so tools such as `az` or `gh` stay reachable.
+
+Environment variables from your shell are not captured. Put settings and secrets such as `COPILOT_GITHUB_TOKEN` or provider `api_key_env` values in `~/.config/vekil/service.env`, which `install` creates with mode `0600` and never overwrites. The service loads it with `--env-file`, and its values override the inherited environment, including `PATH`. Pass `--env-file` to `install` to use a different file. On macOS and Windows the service writes a rotating `--log-file` (16 MiB plus one `.1` backup); pass `--log-file` to choose another path, including on Linux.
+
+`uninstall` stops and removes the registration and keeps `service.env` and logs. The service uses Vekil's normal state file, so stop it before running a second proxy or `vekil state prune` against the same state.
+
+Platform notes:
+
+- **Linux:** `install` runs `loginctl enable-linger` so the service starts at boot without a login session (skip with `--no-linger`; if your system denies it, ask an administrator to run `sudo loginctl enable-linger $USER`). Run it from a direct login as the target user, not through `sudo` or `su`, because `systemctl --user` needs that user's systemd session.
+- **macOS:** the agent starts when you log in, not at boot. Use either this service or the tray app's Launch at Login, not both; they compete for the same port and state, and `install` warns when the tray's login item exists. If macOS blocks a downloaded binary, run `xattr -d com.apple.quarantine "$(command -v vekil)"` first. Output from before the log file opens, such as crashes, goes to `~/Library/Logs/vekil/launchd.log`.
+- **Windows:** the task starts at your logon and stops when you sign out. A console window can flash briefly at logon. Task Scheduler does not restart Vekil after a crash; run `vekil service restart`. Flag values cannot contain `%`, because Task Scheduler expands `%VAR%`.
+
 ## Docker
 
 Base run:

@@ -30,6 +30,7 @@ const (
 	cliCommandLaunch
 	cliCommandConfig
 	cliCommandState
+	cliCommandService
 )
 
 func main() {
@@ -52,6 +53,9 @@ func main() {
 			os.Exit(code)
 		}
 		return
+	case cliCommandService:
+		runService(os.Args[2:])
+		return
 	}
 
 	runServe()
@@ -73,6 +77,8 @@ func commandFromArgs(args []string) cliCommand {
 		return cliCommandConfig
 	case "state":
 		return cliCommandState
+	case "service":
+		return cliCommandService
 	default:
 		return cliCommandServe
 	}
@@ -382,6 +388,8 @@ type serveFlags struct {
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	envFile                         *string
+	logFile                         *string
 	policyRoutingMode               *string
 	policyRoutingAllowRemote        *bool
 	logLevel                        *string
@@ -411,6 +419,8 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             registerProvidersConfigFlag(fs, getEnv("PROVIDERS_CONFIG", "")),
+		envFile:                         fs.String(serveEnvFileFlag, "", "Load KEY=value environment variables from this file before reading other settings; file values override the process environment"),
+		logFile:                         fs.String(serveLogFileFlag, "", "Write logs to this private file instead of stderr, rotating at 16 MiB with one .1 backup"),
 		policyRoutingMode:               fs.String("policy-routing", getPolicyRoutingModeEnv(), "Policy routing mode: config (follow providers YAML), off, observe, or enforce"),
 		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
@@ -662,10 +672,15 @@ func stopServeServer(srv serveLifecycleServer, log *logger.Logger) error {
 func runServe() {
 	configureServeGC()
 
+	logWriter, err := prepareServeFiles(os.Args[1:])
+	if err != nil {
+		logger.NewWithWriter(logger.LevelInfo, logWriter).Fatal("failed to prepare serve files", logger.Err(err))
+	}
+
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	log := logger.NewWithWriter(logger.ParseLevel(*serve.logLevel), logWriter)
 
 	policyRoutingMode, err := serve.parsedPolicyRoutingMode()
 	if err != nil {
@@ -679,6 +694,13 @@ func runServe() {
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
 		log.Fatal("failed to initialize authenticator", logger.Err(err))
+	}
+	if logWriter != nil {
+		// Error level keeps this actionable prompt visible at every log level.
+		authenticator.DeviceCodePrompt = func(verificationURI, userCode string) {
+			log.Error("GitHub sign-in required: visit the URL and enter the code, or run `vekil login` and restart",
+				logger.F("url", verificationURI), logger.F("code", userCode))
+		}
 	}
 
 	providersCfg, err := proxy.LoadProvidersConfigFile(*serve.providersConfigPath)

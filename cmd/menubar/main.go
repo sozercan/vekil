@@ -60,7 +60,7 @@ func main() {
 	// A menubar app's stderr goes nowhere, so keep its logs in a file too.
 	if path, err := menubarLogPath(); err != nil {
 		log.Warn("could not locate menubar log file", logger.Err(err))
-	} else if file, err := openRotatingLogFile(path, menubarLogMaxBytes); err != nil {
+	} else if file, err := logger.OpenRotatingFile(path, menubarLogMaxBytes); err != nil {
 		log.Warn("could not open menubar log file", logger.Err(err))
 	} else {
 		// MultiWriter stops at the first failing writer, so a closed stderr

@@ -6,7 +6,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 
 | File | Scope | Update When |
 |------|-------|-------------|
-| [`getting-started.md`](getting-started.md) | install, run, first authentication, deployment entry points | startup flow or distribution changes |
+| [`getting-started.md`](getting-started.md) | install, run, `vekil service` background service (systemd, launchd, Task Scheduler), first authentication, deployment entry points | startup flow, `vekil service`, or distribution changes |
 | [`configuration.md`](configuration.md) | configuration map, generic CLI flags/env vars, policy-routing runtime ceiling, and Copilot header overrides | generic flags, env vars, or Copilot header defaults change |
 | [`provider-routing.md`](provider-routing.md) | provider auth, schema-v2 model routes and policies, state-storage configuration, ordered priority failover, route exposure, model ownership, native endpoint allowlists | providers, routing behavior, failover safety, auth, or model metadata changes |
 | [`state-recovery.md`](state-recovery.md) | default durable ownership for schema-v2 routes, shared providers configuration, macOS/Linux local storage, capacity, pruning, and recovery limits | persisted ownership, storage defaults/format, supported filesystems, retention, or recovery behavior changes |
