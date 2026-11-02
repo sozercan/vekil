@@ -912,6 +912,11 @@ func TestCommandFromArgs(t *testing.T) {
 			want: cliCommandConfig,
 		},
 		{
+			name: "service subcommand dispatches without serving",
+			args: []string{"placeholder", "service", "install"},
+			want: cliCommandService,
+		},
+		{
 			name: "unknown subcommand falls back to serve",
 			args: []string{"placeholder", "serve"},
 			want: cliCommandServe,

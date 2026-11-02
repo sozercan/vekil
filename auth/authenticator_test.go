@@ -1812,6 +1812,48 @@ func TestRefreshTokenNonInteractive_PreservesTransientExchangeError(t *testing.T
 	}
 }
 
+func TestDeviceCodeFlowUsesDeviceCodePrompt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/device/code":
+			_ = json.NewEncoder(w).Encode(DeviceCodeResponse{
+				DeviceCode:      "dc_prompt",
+				UserCode:        "LOGS-1234",
+				VerificationURI: "https://github.com/login/device",
+				ExpiresIn:       60,
+				Interval:        1,
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(AccessTokenResponse{Error: "authorization_pending"})
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var gotURI, gotCode string
+	a := &Authenticator{
+		client:   server.Client(),
+		tokenDir: t.TempDir(),
+		DeviceCodePrompt: func(verificationURI, userCode string) {
+			gotURI, gotCode = verificationURI, userCode
+			cancel()
+		},
+	}
+	a.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		rewritten, _ := url.Parse(server.URL + req.URL.Path)
+		req.URL = rewritten
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	if err := a.deviceCodeFlow(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("deviceCodeFlow error = %v, want context.Canceled", err)
+	}
+	if gotURI != "https://github.com/login/device" || gotCode != "LOGS-1234" {
+		t.Fatalf("prompt got (%q, %q)", gotURI, gotCode)
+	}
+}
+
 func TestRefreshToken_AutoDeviceFlowReturnsTransientRefreshError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)

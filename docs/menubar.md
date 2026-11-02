@@ -40,7 +40,7 @@ Release asset and updater-secret details live in [Development](development.md#re
 - choose and persist a providers config file
 - return to default Copilot routing
 - GitHub auth actions: sign in, use GitHub CLI account, sign out
-- optional launch-at-login integration
+- optional launch-at-login integration (for a headless alternative without the tray, use [`vekil service install`](getting-started.md#run-as-a-background-service); do not enable both)
 - Sparkle `Check for Updates…` in packaged macOS builds
 
 ## Authentication And Providers

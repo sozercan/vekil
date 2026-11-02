@@ -1,4 +1,4 @@
-package main
+package logger
 
 import (
 	"os"
@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestRotatingLogFileKeepsOneBackup(t *testing.T) {
+func TestRotatingFileKeepsOneBackup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "logs", "menubar.log")
 	// An existing readable file becomes private when it is opened.
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -15,7 +15,7 @@ func TestRotatingLogFileKeepsOneBackup(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	w, err := openRotatingLogFile(path, 16)
+	w, err := OpenRotatingFile(path, 16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestRotatingLogFileKeepsOneBackup(t *testing.T) {
 		t.Fatalf("log file mode = %v, %v", info.Mode().Perm(), err)
 	}
 	// Reopening appends and continues counting from the existing size.
-	reopened, err := openRotatingLogFile(path, 16)
+	reopened, err := OpenRotatingFile(path, 16)
 	if err != nil {
 		t.Fatal(err)
 	}

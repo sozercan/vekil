@@ -127,7 +127,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 
 |                                                              |                                     |
 | ------------------------------------------------------------ | ----------------------------------- |
-| [Getting Started](docs/getting-started.md)                   | Install, run, first auth            |
+| [Getting Started](docs/getting-started.md)                   | Install, run, service, auth         |
 | [Configuration](docs/configuration.md)                       | Config map and generic flags        |
 | [Provider Routing](docs/provider-routing.md)                 | Provider auth and route failover    |
 | [Semantic Policy Routing](docs/policy-routing.md)            | Schema-v2 policy selection and gates |
