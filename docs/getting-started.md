@@ -81,11 +81,11 @@ vekil service uninstall
 |----|-----------|--------|------|
 | Linux | systemd user unit `~/.config/systemd/user/vekil.service` | at boot (with lingering), restarted after failures | `journalctl --user -u vekil -f` |
 | macOS | launch agent `~/Library/LaunchAgents/com.sertacozercan.vekil.plist` | at login, restarted after failures | `~/Library/Logs/vekil/vekil.log` |
-| Windows | scheduled task `Vekil` | at logon | `%LocalAppData%\vekil\logs\vekil.log` |
+| Windows | scheduled task `Vekil-<your account SID>` | at logon | `%LocalAppData%\vekil\logs\vekil.log` |
 
 Every platform runs Vekil as you, without administrator rights, so it reuses your saved GitHub login, Azure CLI session, and Codex auth file. Run `install` without `sudo`; on macOS it refuses to run as root. Without a saved login, a Copilot-backed service writes the GitHub device code to its logs; finish sign-in there, or run `vekil login` and `vekil service restart`.
 
-`install` accepts the same flags as the server. It validates them and the providers config, then saves the current binary path and only the flags you passed. Relative `--providers-config`, `--token-dir`, `--env-file`, and `--log-file` paths become absolute. Re-run `install` to change flags or after moving the binary; it replaces the existing registration and restarts the service. On Linux and macOS it also saves your current `PATH`, so tools such as `az` or `gh` stay reachable.
+`install` accepts the same flags as the server. It validates them and the providers config, with the env file described below applied, then saves the current binary path and only the flags you passed. Relative `--providers-config`, `--token-dir`, `--env-file`, and `--log-file` paths become absolute. Re-run `install` to change flags or after moving the binary; it replaces the existing registration and restarts the service. On Linux and macOS it also saves your current `PATH`, so tools such as `az` or `gh` stay reachable.
 
 Environment variables from your shell are not captured. Put settings and secrets such as `COPILOT_GITHUB_TOKEN` or provider `api_key_env` values in `~/.config/vekil/service.env`, which `install` creates with mode `0600` and never overwrites. The service loads it with `--env-file`, and its values override the inherited environment, including `PATH`. Pass `--env-file` to `install` to use a different file. On macOS and Windows the service writes a rotating `--log-file` (16 MiB plus one `.1` backup); pass `--log-file` to choose another path, including on Linux.
 

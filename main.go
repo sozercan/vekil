@@ -696,8 +696,9 @@ func runServe() {
 		log.Fatal("failed to initialize authenticator", logger.Err(err))
 	}
 	if logWriter != nil {
+		// Error level keeps this actionable prompt visible at every log level.
 		authenticator.DeviceCodePrompt = func(verificationURI, userCode string) {
-			log.Warn("GitHub sign-in required: visit the URL and enter the code, or run `vekil login` and restart",
+			log.Error("GitHub sign-in required: visit the URL and enter the code, or run `vekil login` and restart",
 				logger.F("url", verificationURI), logger.F("code", userCode))
 		}
 	}

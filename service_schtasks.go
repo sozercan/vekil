@@ -12,12 +12,33 @@ import (
 	"unicode/utf16"
 )
 
-const scheduledTaskName = "Vekil"
+const scheduledTaskNamePrefix = "Vekil-"
 
 // scheduledTaskServiceBackend registers a logon task that runs as the current
 // user, so Vekil keeps that user's GitHub, Azure CLI, and Codex logins without
 // administrator rights or a stored password.
 type scheduledTaskServiceBackend struct{}
+
+// scheduledTaskName is per user because Task Scheduler names are machine-wide.
+// The account SID stays stable across user renames.
+func scheduledTaskName(deps serviceDeps) (string, error) {
+	sid, err := deps.userID()
+	if err != nil {
+		return "", fmt.Errorf("resolve current user SID: %w", err)
+	}
+	if sid == "" || strings.ContainsAny(sid, `\/:*?"<>|`) || validateServiceValue(sid) != nil {
+		return "", fmt.Errorf("current user SID %q cannot be used in a task name", sid)
+	}
+	return scheduledTaskNamePrefix + sid, nil
+}
+
+func (scheduledTaskServiceBackend) schtasks(deps serviceDeps, stdout, stderr io.Writer, verb string, extra ...string) error {
+	name, err := scheduledTaskName(deps)
+	if err != nil {
+		return err
+	}
+	return deps.run(stdout, stderr, "schtasks", append([]string{verb, "/TN", name}, extra...)...)
+}
 
 func (scheduledTaskServiceBackend) tool() string { return "schtasks" }
 
@@ -33,15 +54,22 @@ func (scheduledTaskServiceBackend) defaultLogFile(deps serviceDeps) (string, err
 	return filepath.Join(cache, "vekil", "logs", "vekil.log"), nil
 }
 
-func (scheduledTaskServiceBackend) location(serviceDeps) (string, error) {
-	return "scheduled task " + scheduledTaskName, nil
+func (scheduledTaskServiceBackend) location(deps serviceDeps) (string, error) {
+	name, err := scheduledTaskName(deps)
+	if err != nil {
+		return "", err
+	}
+	return "scheduled task " + name, nil
 }
 
-func (scheduledTaskServiceBackend) installed(deps serviceDeps) (bool, error) {
-	return deps.run(io.Discard, io.Discard, "schtasks", "/Query", "/TN", scheduledTaskName) == nil, nil
+func (b scheduledTaskServiceBackend) installed(deps serviceDeps) (bool, error) {
+	if _, err := scheduledTaskName(deps); err != nil {
+		return false, err
+	}
+	return b.schtasks(deps, io.Discard, io.Discard, "/Query") == nil, nil
 }
 
-func (scheduledTaskServiceBackend) register(deps serviceDeps, spec serviceSpec) error {
+func (b scheduledTaskServiceBackend) register(deps serviceDeps, spec serviceSpec) error {
 	username, err := deps.username()
 	if err != nil {
 		return fmt.Errorf("resolve current user: %w", err)
@@ -59,31 +87,31 @@ func (scheduledTaskServiceBackend) register(deps serviceDeps, spec serviceSpec) 
 	if err := errors.Join(writeErr, file.Close()); err != nil {
 		return fmt.Errorf("write task definition: %w", err)
 	}
-	if err := deps.run(deps.stderr, deps.stderr, "schtasks", "/Create", "/TN", scheduledTaskName, "/XML", file.Name(), "/F"); err != nil {
+	if err := b.schtasks(deps, deps.stderr, deps.stderr, "/Create", "/XML", file.Name(), "/F"); err != nil {
 		return fmt.Errorf("schtasks /Create failed: %w", err)
 	}
 	return nil
 }
 
-func (scheduledTaskServiceBackend) restart(deps serviceDeps) error {
+func (b scheduledTaskServiceBackend) restart(deps serviceDeps) error {
 	// Ending fails when the task is not running, which is fine.
-	_ = deps.run(io.Discard, io.Discard, "schtasks", "/End", "/TN", scheduledTaskName)
-	if err := deps.run(deps.stderr, deps.stderr, "schtasks", "/Run", "/TN", scheduledTaskName); err != nil {
+	_ = b.schtasks(deps, io.Discard, io.Discard, "/End")
+	if err := b.schtasks(deps, deps.stderr, deps.stderr, "/Run"); err != nil {
 		return fmt.Errorf("schtasks /Run failed: %w", err)
 	}
 	return nil
 }
 
-func (scheduledTaskServiceBackend) remove(deps serviceDeps) error {
-	_ = deps.run(io.Discard, io.Discard, "schtasks", "/End", "/TN", scheduledTaskName)
-	if err := deps.run(deps.stderr, deps.stderr, "schtasks", "/Delete", "/TN", scheduledTaskName, "/F"); err != nil {
+func (b scheduledTaskServiceBackend) remove(deps serviceDeps) error {
+	_ = b.schtasks(deps, io.Discard, io.Discard, "/End")
+	if err := b.schtasks(deps, deps.stderr, deps.stderr, "/Delete", "/F"); err != nil {
 		return fmt.Errorf("schtasks /Delete failed: %w", err)
 	}
 	return nil
 }
 
-func (scheduledTaskServiceBackend) status(deps serviceDeps) error {
-	return deps.run(deps.stdout, deps.stderr, "schtasks", "/Query", "/TN", scheduledTaskName, "/V", "/FO", "LIST")
+func (b scheduledTaskServiceBackend) status(deps serviceDeps) error {
+	return b.schtasks(deps, deps.stdout, deps.stderr, "/Query", "/V", "/FO", "LIST")
 }
 
 func (scheduledTaskServiceBackend) logsHint(logFile string) string {

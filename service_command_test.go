@@ -16,6 +16,11 @@ import (
 	"github.com/sozercan/vekil/proxy"
 )
 
+const (
+	testUserSID  = "S-1-5-21-1-1001"
+	testTaskName = scheduledTaskNamePrefix + testUserSID
+)
+
 type fakeServiceEnv struct {
 	deps      serviceDeps
 	stdout    *bytes.Buffer
@@ -28,6 +33,7 @@ type fakeServiceEnv struct {
 	gotSource string
 	status    auth.AuthStatus
 	taskXML   string
+	setVars   map[string]string
 }
 
 func newFakeServiceEnv(t *testing.T, goos string) *fakeServiceEnv {
@@ -37,6 +43,7 @@ func newFakeServiceEnv(t *testing.T, goos string) *fakeServiceEnv {
 		stdout:    &bytes.Buffer{},
 		stderr:    &bytes.Buffer{},
 		failOn:    map[string]bool{},
+		setVars:   map[string]string{},
 		configDir: filepath.Join(root, "xdg"),
 		cacheDir:  filepath.Join(root, "cache"),
 		home:      filepath.Join(root, "home"),
@@ -53,7 +60,12 @@ func newFakeServiceEnv(t *testing.T, goos string) *fakeServiceEnv {
 		userCacheDir:  func() (string, error) { return env.cacheDir, nil },
 		userHomeDir:   func() (string, error) { return env.home, nil },
 		username:      func() (string, error) { return `CORP\ada`, nil },
-		lookPath:      func(name string) (string, error) { return "/usr/bin/" + name, nil },
+		userID:        func() (string, error) { return testUserSID, nil },
+		setenv: func(key, value string) error {
+			env.setVars[key] = value
+			return nil
+		},
+		lookPath: func(name string) (string, error) { return "/usr/bin/" + name, nil },
 		run: func(_, _ io.Writer, name string, args ...string) error {
 			command := strings.Join(append([]string{name}, args...), " ")
 			env.commands = append(env.commands, command)
@@ -294,14 +306,14 @@ func TestServiceInstallLaunchdChecks(t *testing.T) {
 
 func TestServiceInstallScheduledTask(t *testing.T) {
 	env := newFakeServiceEnv(t, "windows")
-	env.failOn["schtasks /Query /TN Vekil"] = true
+	env.failOn["schtasks /Query /TN "+testTaskName] = true
 	if code := runServiceWithDeps([]string{"install", "--copilot-user-agent", `say "hi" & go`}, env.deps); code != 0 {
 		t.Fatalf("install exit = %d, stderr = %s", code, env.stderr)
 	}
-	if len(env.commands) != 4 || !strings.HasPrefix(env.commands[1], "schtasks /Create /TN Vekil /XML ") || !strings.HasSuffix(env.commands[1], " /F") {
+	if len(env.commands) != 4 || !strings.HasPrefix(env.commands[1], "schtasks /Create /TN "+testTaskName+" /XML ") || !strings.HasSuffix(env.commands[1], " /F") {
 		t.Fatalf("commands = %q", env.commands)
 	}
-	if env.commands[2] != "schtasks /End /TN Vekil" || env.commands[3] != "schtasks /Run /TN Vekil" {
+	if env.commands[2] != "schtasks /End /TN "+testTaskName || env.commands[3] != "schtasks /Run /TN "+testTaskName {
 		t.Fatalf("commands = %q", env.commands)
 	}
 	if _, err := os.Stat(strings.Fields(env.commands[1])[4]); !errors.Is(err, os.ErrNotExist) {
@@ -438,17 +450,22 @@ func TestServiceInstallFailures(t *testing.T) {
 
 func TestServiceInstallWarnsWithoutSavedCopilotLogin(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		status auth.AuthStatus
-		warn   bool
+		name    string
+		status  auth.AuthStatus
+		envFile string
+		warn    bool
 	}{
 		{name: "saved login", status: auth.AuthStatus{HasVekilAccessToken: true}},
 		{name: "github cli opt-in", status: auth.AuthStatus{GitHubCLIAutoSignIn: true}},
+		{name: "env file token", envFile: "COPILOT_GITHUB_TOKEN=gho_x\n"},
 		{name: "shell env token only", status: auth.AuthStatus{SignedIn: true, Source: auth.AuthSourceEnv}, warn: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := newFakeServiceEnv(t, "linux")
 			env.status = tc.status
+			if tc.envFile != "" {
+				writeTestEnvFile(t, env.envFilePath(), tc.envFile)
+			}
 			if code := runServiceWithDeps([]string{"install"}, env.deps); code != 0 {
 				t.Fatalf("exit = %d, stderr = %s", code, env.stderr)
 			}
@@ -495,5 +512,46 @@ func TestServiceLifecycleSystemd(t *testing.T) {
 	}
 	if _, err := os.Stat(env.envFilePath()); err != nil {
 		t.Fatalf("env file removed: %v", err)
+	}
+}
+
+func writeTestEnvFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServiceInstallValidatesWithEnvFile(t *testing.T) {
+	env := newFakeServiceEnv(t, "linux")
+	writeTestEnvFile(t, env.envFilePath(), "PROVIDER_KEY=secret\n")
+	env.deps.loadProvidersConfig = func(string) (proxy.ProvidersConfig, error) {
+		if env.setVars["PROVIDER_KEY"] != "secret" {
+			return proxy.ProvidersConfig{}, errors.New("PROVIDER_KEY is not set")
+		}
+		return proxy.ProvidersConfig{}, nil
+	}
+	if code := runServiceWithDeps([]string{"install"}, env.deps); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, env.stderr)
+	}
+	if unit := readFile(t, env.unitPath()); strings.Contains(unit, "secret") {
+		t.Fatalf("env file value leaked into unit:\n%s", unit)
+	}
+}
+
+func TestScheduledTaskNameIsPerUser(t *testing.T) {
+	env := newFakeServiceEnv(t, "windows")
+	for _, sid := range []string{"S-1-5-21-1-1001", "S-1-5-21-1-1002"} {
+		env.deps.userID = func() (string, error) { return sid, nil }
+		if got, err := scheduledTaskName(env.deps); err != nil || got != "Vekil-"+sid {
+			t.Fatalf("scheduledTaskName(%q) = %q, %v", sid, got, err)
+		}
+	}
+	env.deps.userID = func() (string, error) { return `..\Vekil`, nil }
+	if _, err := scheduledTaskName(env.deps); err == nil {
+		t.Fatal("expected an error for a SID with a path separator")
 	}
 }
