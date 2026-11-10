@@ -1,0 +1,67 @@
+{
+  "uptime_seconds": 1234,
+  "inflight": 3,
+  "totals": {
+    "requests": 5000,
+    "errors": 12,
+    "prompt_tokens": 1000000,
+    "completion_tokens": 500000,
+    "total_tokens": 1500000,
+    "cached_tokens": 300000,
+    "reasoning_tokens": 80000,
+    "latency_p50_ms": 240,
+    "latency_p95_ms": 1300,
+    "latency_p99_ms": 2100
+  },
+  "status": {"2xx": 4988, "4xx": 8, "5xx": 4},
+  "status_codes": [{"label": "429", "count": 6}, {"label": "400", "count": 2}],
+  "errors": [{"label": "copilot / gpt-5.4", "count": 8}],
+  "series": [
+    {"t": 1718899999, "req": 1, "err": 0, "prompt": 400, "completion": 200},
+    {"t": 1718900000, "req": 2, "err": 0, "prompt": 1500, "completion": 800}
+  ],
+  "by_model": [{"model": "gpt-5.4", "requests": 200, "tokens": 500000, "errors": 3, "avg_ms": 320}],
+  "by_provider": [{"provider": "azure-east", "kind": "azure-openai", "requests": 4000, "tokens": 1200000, "errors": 9, "avg_ms": 300}],
+  "by_agent": [{"agent": "Codex CLI", "requests": 3200, "tokens": 900000, "errors": 2, "avg_ms": 310}],
+  "by_route": [{"route": "gpt-5-4-route", "requests": 200, "tokens": 80000, "errors": 2, "avg_ms": 410, "target_switches": 0, "requests_with_failover": 0, "successful_failovers": 0, "route_exhaustions": 0}],
+  "by_target": [{"route": "gpt-5-4-route", "target": "primary", "provider": "azure-east", "kind": "azure-openai", "attempts": 200, "physical_usage": {"prompt_tokens": 100000, "completion_tokens": 50000, "total_tokens": 150000, "cached_tokens": 20000, "reasoning_tokens": 5000}, "wasted_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0, "reasoning_tokens": 0}}],
+  "physical_usage": {"prompt_tokens": 1012000, "completion_tokens": 504000, "total_tokens": 1516000, "cached_tokens": 301000, "reasoning_tokens": 81000},
+  "wasted_usage": {"prompt_tokens": 12000, "completion_tokens": 4000, "total_tokens": 16000, "cached_tokens": 1000, "reasoning_tokens": 1000},
+  "upstream_attempts": 5012,
+  "target_switches": 12,
+  "requests_with_failover": 10,
+  "successful_failovers": 8,
+  "route_exhaustions": 2,
+  "state_binding_hits": 120,
+  "state_binding_misses": 3,
+  "state_binding_evictions": 1,
+  "retries": 14,
+  "retries_by_code": [{"label": "429", "count": 12}, {"label": "transport", "count": 2}],
+  "recent": [{"t": 1718900000, "endpoint": "openai_chat", "model": "gpt-5.4", "operation_id": "op-normal", "route_id": "gpt-5-4-route", "final_target": "primary", "provider": "azure-east", "agent": "Codex CLI", "status": 200, "dur_ms": 1234, "total_tokens": 900, "upstream_sends": 1, "target_switches": 0, "upstream_request_id": "req-abc"}],
+  "recent_attempts": [{"t": 1718900000, "operation_id": "op-normal", "route_id": "gpt-5-4-route", "target_id": "primary", "provider_id": "azure-east", "provider_kind": "azure-openai", "sequence": 1, "attempt_kind": "normal", "status": "200", "status_code": 200, "outcome": "succeeded", "delivery": "delivered_or_ambiguous", "semantic_progress": "terminal_success", "downstream_commitment": "committed", "retry_decision": "accepted", "ttft_ms": 42, "retry_after_seconds": 7, "upstream_request_id": "req-abc", "cleanup_complete": true, "reported_usage": {"prompt_tokens": 500, "completion_tokens": 400, "total_tokens": 900, "cached_tokens": 25, "reasoning_tokens": 40}}],
+  "insights_enabled": true,
+  "policy_routing": {
+    "totals": {
+      "eligible": 100,
+      "sampled": 98,
+      "admitted": 96,
+      "drop_reasons": [{"label": "capacity", "count": 2}],
+      "classifier": {"completion": 94, "unavailable": 1, "uncertain": 1, "abstain": 1},
+      "actual_tiers": {"lightweight": 40, "powerful": 54, "unknown": 2},
+      "shadow_tiers": {"lightweight": 42, "powerful": 52, "unknown": 2},
+      "classifier_latency": {"count": 96, "recent_samples": 96, "avg_ms": 31, "min_ms": 8, "max_ms": 120, "p50_ms": 28, "p95_ms": 70, "p99_ms": 110},
+      "classifier_usage": {"input_tokens": 10000, "output_tokens": 1500, "total_tokens": 11500, "cached_input_tokens": 1000, "reasoning_tokens": 200},
+      "physical_classifier_sends": 97
+    },
+    "profiles": [{
+      "profile": "coding-economy",
+      "effective_mode": "observe",
+      "preflight_state": "ready",
+      "breaker_state": "closed",
+      "generation_hashes": {"config_generation": "aaaaaaaa", "profile_generation": "bbbbbbbb", "classifier_generation": "cccccccc", "binary_generation": "dddddddd"},
+      "totals": {"eligible": 100, "sampled": 98, "admitted": 96, "drop_reasons": [], "classifier": {"completion": 94, "unavailable": 1, "uncertain": 1, "abstain": 1}, "actual_tiers": {"lightweight": 40, "powerful": 54, "unknown": 2}, "shadow_tiers": {"lightweight": 42, "powerful": 52, "unknown": 2}, "classifier_latency": {"count": 96, "recent_samples": 96, "avg_ms": 31, "min_ms": 8, "max_ms": 120, "p50_ms": 28, "p95_ms": 70, "p99_ms": 110}, "classifier_usage": {"input_tokens": 10000, "output_tokens": 1500, "total_tokens": 11500, "cached_input_tokens": 1000, "reasoning_tokens": 200}, "physical_classifier_sends": 97},
+      "traffic_buckets": [{"traffic_bucket": "small/no-tools", "metrics": {"eligible": 60, "sampled": 60, "admitted": 59, "drop_reasons": [], "classifier": {"completion": 58, "unavailable": 0, "uncertain": 1, "abstain": 1}, "actual_tiers": {"lightweight": 30, "powerful": 28, "unknown": 1}, "shadow_tiers": {"lightweight": 31, "powerful": 27, "unknown": 1}, "classifier_latency": {"count": 59, "recent_samples": 59, "avg_ms": 25, "min_ms": 8, "max_ms": 80, "p50_ms": 22, "p95_ms": 55, "p99_ms": 75}, "classifier_usage": {"input_tokens": 6000, "output_tokens": 900, "total_tokens": 6900, "cached_input_tokens": 600, "reasoning_tokens": 100}, "physical_classifier_sends": 59}}]
+    }]
+  },
+  "future_additive_field": {"ignored": true}
+}

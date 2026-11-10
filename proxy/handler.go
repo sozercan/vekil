@@ -254,6 +254,7 @@ type ProxyHandler struct {
 	copilotTraffic                   copilotTrafficController
 	azureTraffic                     azureTrafficController
 	providersConfig                  ProvidersConfig
+	providerSecretResolver           ProviderSecretResolver
 	allowedModels                    map[string]struct{}
 	auxiliaryModels                  map[string]struct{}
 	providersState                   *providerSetup
@@ -992,6 +993,17 @@ func WithDeferredDynamicProviderModelValidation(deferValidation bool) Option {
 	}
 }
 
+// WithProviderSecretResolver installs a provider-scoped secret resolver for
+// api_key_env references. When set, provider construction never falls back to
+// the process environment for those references. This lets app-controlled
+// runtimes keep managed provider secrets in an immutable in-memory projection
+// instead of placing them in os.Environ.
+func WithProviderSecretResolver(resolver ProviderSecretResolver) Option {
+	return func(h *ProxyHandler) {
+		h.providerSecretResolver = resolver
+	}
+}
+
 // WithCopilotBaseURL overrides the legacy single-upstream Copilot base URL.
 // It is primarily useful for local contract tests and diagnostic harnesses.
 func WithCopilotBaseURL(baseURL string) Option {
@@ -1098,7 +1110,22 @@ func newInferenceTransport() *http.Transport {
 }
 
 // NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
+// It preserves the historical non-cancelable construction behavior. App-owned
+// lifecycles should use NewProxyHandlerContext so provider initialization can be
+// canceled.
 func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) (*ProxyHandler, error) {
+	return NewProxyHandlerContext(context.Background(), a, log, opts...)
+}
+
+// NewProxyHandlerContext creates a ProxyHandler while honoring ctx during
+// provider initialization and any non-deferred dynamic provider discovery.
+func NewProxyHandlerContext(ctx context.Context, a *auth.Authenticator, log *logger.Logger, opts ...Option) (*ProxyHandler, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	h := &ProxyHandler{
 		auth: a,
 		client: &http.Client{
@@ -1139,7 +1166,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		return nil, err
 	}
 	h.initializeToolOptimizers()
-	if err := h.initializeProviders(); err != nil {
+	if err := h.initializeProvidersContext(ctx); err != nil {
 		h.BeginShutdown()
 		return nil, err
 	}

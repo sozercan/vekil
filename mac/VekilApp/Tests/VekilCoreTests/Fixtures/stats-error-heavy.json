@@ -1,0 +1,164 @@
+{
+  "uptime_seconds": 87,
+  "inflight": 0,
+  "totals": {
+    "requests": 8,
+    "errors": 6,
+    "prompt_tokens": 800,
+    "completion_tokens": 120,
+    "total_tokens": 920,
+    "cached_tokens": 0,
+    "reasoning_tokens": 0,
+    "latency_p50_ms": 80,
+    "latency_p95_ms": 900,
+    "latency_p99_ms": 1200
+  },
+  "status": {
+    "2xx": 2,
+    "4xx": 4,
+    "5xx": 2
+  },
+  "status_codes": [
+    {
+      "label": "429",
+      "count": 3
+    },
+    {
+      "label": "503",
+      "count": 2
+    },
+    {
+      "label": "400",
+      "count": 1
+    }
+  ],
+  "errors": [
+    {
+      "label": "azure-west / gpt-5.4",
+      "count": 5
+    },
+    {
+      "label": "unrouted",
+      "count": 1
+    }
+  ],
+  "series": [],
+  "by_model": [],
+  "by_provider": [],
+  "by_agent": [],
+  "by_route": [],
+  "by_target": [],
+  "physical_usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "cached_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "wasted_usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "cached_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "upstream_attempts": 0,
+  "target_switches": 0,
+  "requests_with_failover": 0,
+  "successful_failovers": 0,
+  "route_exhaustions": 0,
+  "state_binding_hits": 0,
+  "state_binding_misses": 0,
+  "state_binding_evictions": 0,
+  "retries": 0,
+  "retries_by_code": [],
+  "recent": [
+    {
+      "t": 1718900103,
+      "endpoint": "openai_chat",
+      "model": "gpt-5.4",
+      "provider": "azure-west",
+      "agent": "Codex CLI",
+      "status": 503,
+      "dur_ms": 900,
+      "total_tokens": 0,
+      "upstream_request_id": "req-503"
+    },
+    {
+      "t": 1718900102,
+      "endpoint": "anthropic",
+      "model": "claude-sonnet-4.5",
+      "provider": "copilot",
+      "agent": "Claude Code",
+      "status": 429,
+      "dur_ms": 120,
+      "total_tokens": 20,
+      "upstream_request_id": "req-429"
+    },
+    {
+      "t": 1718900101,
+      "endpoint": "gemini",
+      "model": "gemini-2.5-pro",
+      "provider": "google",
+      "agent": "Gemini CLI",
+      "status": 400,
+      "dur_ms": 12,
+      "total_tokens": 0
+    },
+    {
+      "t": 1718900100,
+      "endpoint": "openai_chat",
+      "model": "gpt-5.4",
+      "provider": "azure-west",
+      "agent": "curl",
+      "status": 200,
+      "dur_ms": 80,
+      "total_tokens": 100
+    }
+  ],
+  "recent_attempts": [],
+  "insights_enabled": false,
+  "policy_routing": {
+    "totals": {
+      "eligible": 0,
+      "sampled": 0,
+      "admitted": 0,
+      "drop_reasons": [],
+      "classifier": {
+        "completion": 0,
+        "unavailable": 0,
+        "uncertain": 0,
+        "abstain": 0
+      },
+      "actual_tiers": {
+        "lightweight": 0,
+        "powerful": 0,
+        "unknown": 0
+      },
+      "shadow_tiers": {
+        "lightweight": 0,
+        "powerful": 0,
+        "unknown": 0
+      },
+      "classifier_latency": {
+        "count": 0,
+        "recent_samples": 0,
+        "avg_ms": 0,
+        "min_ms": 0,
+        "max_ms": 0,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0
+      },
+      "classifier_usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "physical_classifier_sends": 0
+    },
+    "profiles": []
+  }
+}

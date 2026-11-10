@@ -1,0 +1,196 @@
+{
+  "uptime_seconds": 120,
+  "inflight": 0,
+  "totals": {
+    "requests": 4,
+    "errors": 1,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 40,
+    "cached_tokens": 0,
+    "reasoning_tokens": 0,
+    "latency_p50_ms": 0,
+    "latency_p95_ms": 0,
+    "latency_p99_ms": 0
+  },
+  "status": {
+    "2xx": 3,
+    "5xx": 1
+  },
+  "status_codes": [],
+  "errors": [],
+  "series": [],
+  "by_model": [],
+  "by_provider": [],
+  "by_agent": [],
+  "by_route": [],
+  "by_target": [],
+  "physical_usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "cached_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "wasted_usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "cached_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "upstream_attempts": 0,
+  "target_switches": 0,
+  "requests_with_failover": 0,
+  "successful_failovers": 0,
+  "route_exhaustions": 0,
+  "state_binding_hits": 0,
+  "state_binding_misses": 0,
+  "state_binding_evictions": 0,
+  "retries": 0,
+  "retries_by_code": [],
+  "recent": [
+    {
+      "t": 1718900304,
+      "endpoint": "openai_chat",
+      "model": "missing",
+      "operation_id": "op-absent",
+      "route_id": "route-a",
+      "final_target": "secondary",
+      "provider": "provider-a",
+      "agent": "Codex CLI",
+      "status": 503,
+      "dur_ms": 20,
+      "total_tokens": 0,
+      "upstream_sends": 2,
+      "target_switches": 1
+    },
+    {
+      "t": 1718900303,
+      "endpoint": "openai_chat",
+      "model": "fewer",
+      "operation_id": "op-fewer",
+      "route_id": "route-b",
+      "final_target": "third",
+      "provider": "provider-b",
+      "agent": "Codex CLI",
+      "status": 200,
+      "dur_ms": 30,
+      "total_tokens": 10,
+      "upstream_sends": 3,
+      "target_switches": 2
+    },
+    {
+      "t": 1718900302,
+      "endpoint": "openai_chat",
+      "model": "policy-public",
+      "operation_id": "op-redacted",
+      "route_id": "policy-public",
+      "final_target": "policy-public",
+      "agent": "Claude Code",
+      "status": 200,
+      "dur_ms": 40,
+      "total_tokens": 20,
+      "upstream_sends": 1,
+      "target_switches": 0
+    },
+    {
+      "t": 1718900301,
+      "endpoint": "responses_ws",
+      "model": "gpt-ws",
+      "operation_id": "op-ws",
+      "provider": "provider-ws",
+      "agent": "Codex CLI",
+      "status": 200,
+      "dur_ms": 0,
+      "total_tokens": 10
+    }
+  ],
+  "recent_attempts": [
+    {
+      "t": 1718900303,
+      "operation_id": "op-fewer",
+      "route_id": "route-b",
+      "target_id": "first",
+      "provider_id": "provider-b",
+      "provider_kind": "openai-compatible",
+      "sequence": 1,
+      "attempt_kind": "normal",
+      "status": "429",
+      "status_code": 429,
+      "outcome": "rejected",
+      "cleanup_complete": true
+    },
+    {
+      "t": 1718900302,
+      "operation_id": "op-redacted",
+      "route_id": "policy-public",
+      "target_id": "policy-public",
+      "sequence": 1,
+      "attempt_kind": "normal",
+      "status": "200",
+      "status_code": 200,
+      "outcome": "succeeded",
+      "cleanup_complete": true
+    },
+    {
+      "t": 1718900301,
+      "operation_id": "op-ws",
+      "route_id": "route-ws",
+      "target_id": "primary",
+      "provider_id": "provider-ws",
+      "provider_kind": "openai-compatible",
+      "sequence": 1,
+      "attempt_kind": "normal",
+      "status": "200",
+      "status_code": 200,
+      "outcome": "succeeded",
+      "upstream_request_id": "req-ws",
+      "cleanup_complete": true
+    }
+  ],
+  "insights_enabled": false,
+  "policy_routing": {
+    "totals": {
+      "eligible": 0,
+      "sampled": 0,
+      "admitted": 0,
+      "drop_reasons": [],
+      "classifier": {
+        "completion": 0,
+        "unavailable": 0,
+        "uncertain": 0,
+        "abstain": 0
+      },
+      "actual_tiers": {
+        "lightweight": 0,
+        "powerful": 0,
+        "unknown": 0
+      },
+      "shadow_tiers": {
+        "lightweight": 0,
+        "powerful": 0,
+        "unknown": 0
+      },
+      "classifier_latency": {
+        "count": 0,
+        "recent_samples": 0,
+        "avg_ms": 0,
+        "min_ms": 0,
+        "max_ms": 0,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0
+      },
+      "classifier_usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "physical_classifier_sends": 0
+    },
+    "profiles": []
+  }
+}

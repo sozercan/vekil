@@ -30,6 +30,39 @@
 
 Chat-compatible ingress converges before provider I/O: public OpenAI Chat, translated Anthropic Messages, translated Gemini generation, their count-token probes, dashboard insights, and bounded policy Responses input all submit canonical Chat requests to the same execution layer. Schema-v2 policy resolution is entered by OpenAI Chat, translated Anthropic Messages/counting, and stateless policy Responses; Gemini and ordinary direct Responses remain outside policy selection. Direct `anthropic-compatible` forwarding and non-policy `/v1/responses` remain separate paths.
 
+## Native macOS Application Boundary
+
+The current source implements this native boundary:
+
+```text
+Vekil.app
+├── Contents/MacOS/Vekil                 AppKit + SwiftUI shell
+├── Contents/Helpers/vekil-runtime       headless Go helper
+└── Contents/Frameworks/Sparkle.framework
+
+Swift RuntimeController
+    │ versioned JSON Lines over stdin/stdout
+    ▼
+cmd/macos-runtime → internal/macosruntime → internal/appcontrol
+                                             │
+                                             ▼
+                              auth + server + proxy packages
+```
+
+The Swift app owns AppKit/SwiftUI presentation, singleton/window behavior, one helper process and both pipes, request correlation, helper-epoch/state-revision filtering, bounded diagnostics/restarts, preferences, Keychain, Sparkle, and analytics presentation. `internal/appcontrol` owns serialized lifecycle operations, cancellation, runtime generations, startup phases, readiness, and current-generation listener monitoring. `internal/macosruntime` owns strict JSONL framing/protocol, sanitized state/errors, parent/EOF/shutdown cleanup, external/managed configuration, secret projections, and apply-journal recovery. Go remains authoritative for provider validation/serialization, authentication, routing, and the HTTP server.
+
+The app owns proxy lifetime; this is not a persistent daemon. Quit, helper shutdown, stdin EOF, or parent loss cancels work and stops the listener. The Linux `cmd/menubar` target remains separate and does not depend on Swift or macOS runtime packages.
+
+### Protocol and state invariants
+
+`hello` is the first helper frame and carries protocol/build identity plus a per-process helper epoch. State revisions increase within an epoch; runtime generations identify newly allocated servers; configuration and secret generations bind one validated snapshot to one complete in-memory secret projection. Swift ignores stale epochs/revisions and does not infer lifecycle from HTTP polling.
+
+At most one mutating operation is active. Long operations return an operation ID; cancellation targets that exact operation and does not release admission until cleanup/terminal completion. Request IDs are idempotency keys within a helper epoch, and mutations are not silently replayed after restart. Frames are UTF-8 JSONL bounded to 1 MiB; malformed UTF-8, duplicate fields, and oversized frames terminate the helper. One Go writer owns stdout, critical responses/terminal events are never dropped, and replaceable state can coalesce under bounded backpressure. Secret-bearing payloads are write-only and excluded from state, errors, logs, and diagnostics.
+
+### Source versus release status
+
+The Go helper/control plane, managed configuration transaction, Swift runtime/app state/Keychain/analytics services, native UI, and universal native bundle pipeline all have source and tests in this tree. `make build-app` now assembles the Swift executable, universal helper, and checksum-verified Sparkle 2.9.4; `make smoke-app` executes both slices and verifies singleton/helper ownership. The currently published release remains the legacy Go shell until the production promotion gates pass. Developer ID signing, notarization, real N-1 replacement, cross-version Keychain continuity, exact-artifact Homebrew installation, and forward-revert evidence are external release facts, not properties that local source tests can establish. See [Development](development.md#native-macos-shell-and-release-gates).
+
 ## Package Responsibilities
 
 | Package | Responsibility |
@@ -41,7 +74,11 @@ Chat-compatible ingress converges before provider I/O: public OpenAI Chat, trans
 | `models/` | Request and response type definitions only |
 | `logger/` | Structured JSON logging |
 | `server/` | Reusable HTTP server lifecycle |
-| `cmd/menubar/` | macOS/Linux tray app |
+| `internal/appcontrol/` | platform-neutral app-owned proxy lifecycle, operations, cancellation, revisions, generations, and readiness |
+| `internal/macosruntime/` | macOS helper protocol, managed/external configuration, secret projection, apply recovery, and runtime adapters |
+| `cmd/macos-runtime/` | thin headless helper entry point |
+| `mac/VekilApp/` | native AppKit/SwiftUI shell, runtime controller, Keychain/preferences services, analytics, and Sparkle integration |
+| `cmd/menubar/` | currently published macOS Go shell and retained Linux tray app |
 
 ## Public Entry and Terminal Route Registries
 

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "application": {
+    "name": "Vekil",
+    "bundle_name": "Vekil.app",
+    "bundle_identifier": "com.vekil.menubar",
+    "executable": "Vekil",
+    "helper_executable": "vekil-runtime",
+    "minimum_system_version": "13.0",
+    "icon_path": "assets/macos/Vekil.icns",
+    "swift_package_path": "mac/VekilApp",
+    "swift_product": "Vekil",
+    "go_helper_package": "./cmd/macos-runtime",
+    "artifact_name": "vekil-macos-universal.zip",
+    "release_manifest_name": "vekil-macos-release.json"
+  },
+  "sparkle": {
+    "version": "2.9.4",
+    "archive_name": "Sparkle-2.9.4.tar.xz",
+    "archive_url": "https://github.com/sparkle-project/Sparkle/releases/download/2.9.4/Sparkle-2.9.4.tar.xz",
+    "archive_sha256": "ce89daf967db1e1893ed3ebd67575ed82d3902563e3191ca92aaec9164fbdef9",
+    "framework_path": "Sparkle.framework",
+    "generate_appcast_path": "bin/generate_appcast",
+    "feed_url": "https://github.com/sozercan/vekil/releases/latest/download/appcast.xml",
+    "public_ed_key": "dbkwR4X/S+kOAN/kLRAUbcG+ldz/50COLOlBeD3+APg=",
+    "swift_package_revision": "b6496a74a087257ef5e6da1c5b29a447a60f5bd7"
+  },
+  "legacy_shell": {
+    "minimum_system_version": "10.13",
+    "last_compatible_marketing_version": "0.14.1",
+    "last_compatible_bundle_version": "0.14.1",
+    "last_compatible_artifact_url": "https://github.com/sozercan/vekil/releases/download/v0.14.1/vekil-macos-arm64.zip",
+    "last_compatible_artifact_sha256": "79fedc6b9037ebbd3e302f0c1f5e3faae7ad6463c6fd316c05ccfd81e732103f",
+    "last_compatible_appcast_url": "https://github.com/sozercan/vekil/releases/download/v0.14.1/appcast.xml"
+  }
+}
