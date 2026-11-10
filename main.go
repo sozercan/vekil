@@ -713,6 +713,8 @@ func runServe() {
 		log,
 		*serve.host,
 		*serve.port,
+		// Read after prepareServeFiles so --env-file overrides the inherited value.
+		server.WithInboundAuthToken(os.Getenv("INBOUND_AUTH_TOKEN")),
 		server.WithStreamingUpstreamTimeout(*serve.streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(serve.copilotHeaderConfig()),
 		server.WithResponsesWebSocketConfig(serve.responsesWebSocketConfig()),

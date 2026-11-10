@@ -1831,6 +1831,7 @@ func TestRunLaunchClaudeEndToEndWithStaticProvider(t *testing.T) {
 	t.Setenv("MAIN_LAUNCH_HELPER_TARGET", "claude")
 	t.Setenv("TEST_LAUNCH_PROVIDER_SECRET", "redacted")
 	t.Setenv("PROVIDERS_CONFIG", "https://config.example/providers.yaml?signature=launch-secret")
+	t.Setenv("INBOUND_AUTH_TOKEN", "synthetic-inbound-secret")
 
 	var stderr bytes.Buffer
 	code := runLaunchClaude([]string{
@@ -1860,6 +1861,9 @@ func TestRunLaunchClaudeEndToEndWithStaticProvider(t *testing.T) {
 	}
 	if capture["removed_value"] != "" {
 		t.Fatalf("provider secret leaked to child: %q", capture["removed_value"])
+	}
+	if capture["inbound_auth"] != "" || capture["auth_value"] == "synthetic-inbound-secret" {
+		t.Fatalf("inherited inbound auth leaked or replaced launch token: %#v", capture)
 	}
 	if capture["providers_config"] != "" {
 		t.Fatalf("providers config source leaked to child: %q", capture["providers_config"])
@@ -2283,6 +2287,7 @@ func TestMainLaunchHelperProcess(t *testing.T) {
 		"github_token":     os.Getenv("GITHUB_TOKEN"),
 		"removed_value":    os.Getenv("TEST_LAUNCH_PROVIDER_SECRET"),
 		"providers_config": os.Getenv("PROVIDERS_CONFIG"),
+		"inbound_auth":     os.Getenv("INBOUND_AUTH_TOKEN"),
 	}
 	body, err := json.Marshal(capture)
 	if err != nil {
