@@ -36,6 +36,7 @@ var commonAgentCredentialEnvironment = []string{
 	"GH_TOKEN",
 	"GITHUB_ENTERPRISE_TOKEN",
 	"GITHUB_TOKEN",
+	"INBOUND_AUTH_TOKEN",
 	"IDENTITY_HEADER",
 	"MSI_SECRET",
 	"OPENAI_ACCOUNT_ID",

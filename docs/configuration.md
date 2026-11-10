@@ -41,6 +41,7 @@ configuration block, default application-data paths, retention, and pruning.
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error` |
 | `--log-file` | — | stderr | Write logs only to this private file, rotating at 16 MiB with one `.1` backup |
 | `--env-file` | — | unset | Load `KEY=value` lines (`#` comments, optional `export ` and quotes) before reading other settings; file values override the process environment. Used by [`vekil service`](getting-started.md#run-as-a-background-service) |
+| — | `INBOUND_AUTH_TOKEN` | unset | Shared caller token; see [Caller authentication](#caller-authentication). Environment or `--env-file` only, there is no flag |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
 Native CLI and tray-app runs default to `127.0.0.1`. Container deployments that publish the proxy port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path.
@@ -59,6 +60,12 @@ values are treated as unset. Set a standard non-whitespace value, including
 `GOGC=off`, to override the default with the requested Go runtime behavior.
 
 Policy `observe` and `enforce` are a v1 single-tenant feature. Loopback is the default supported topology. A non-loopback bind requires the explicit remote-single-tenant acknowledgement above, but that acknowledgement does not protect the proxy; put remote deployments behind a trusted external authentication and network boundary.
+
+## Caller authentication
+
+For the command-line proxy, set `INBOUND_AUTH_TOKEN` to require a shared token on every route except `/healthz` and `/readyz`. The tray app does not read this setting. Clients send `Authorization: Bearer <token>` or `x-api-key: <token>`; missing or wrong tokens get `401` before any provider call. The value is read from the environment at startup, and an `--env-file` value overrides an inherited one. There is deliberately no flag, so the token never appears in command lines or help. Unset, empty, and whitespace-only values leave the proxy unauthenticated, as before. Agent launches remove the variable from child processes; managed `vekil launch` sessions still use their own per-launch token.
+
+The browser dashboard (`/dashboard`, `/stats.json`) is also protected and cannot be opened normally in a browser while a token is set, because browsers do not send these headers. This is one shared secret, not per-user authorization. Use TLS or a trusted network if the proxy is reachable beyond loopback. `vekil service install` does not persist your shell environment; put the setting in the service env file.
 
 ## Copilot Header Overrides
 

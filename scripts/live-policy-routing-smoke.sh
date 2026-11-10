@@ -1523,9 +1523,9 @@ assert_parallel_tools_classifier_outcome() {
     | .status == 200
       and ((.classifier_tool_calls // []) as $calls
         | ($calls | map(select(. == "emit_policy_signals")) | length) == 1
-          and ($calls | map(select(. != "emit_policy_signals"))) as $extra
-          | ($extra | length) > 0
-            and ($extra | all(. == "fetch_account" or . == "fetch_permissions")))
+          and (($calls | map(select(. != "emit_policy_signals"))) as $extra
+            | ($extra | length) > 0
+              and ($extra | all(. == "fetch_account" or . == "fetch_permissions"))))
   ' "${SHIM_LOG}" >/dev/null || \
     die "parallel tools classifier completion delta=$((completion_after - completion_before)), want 1 (before=${completion_before}, after=${completion_after}), and the classifier response did not contain only the prompt's extra tool calls"
   assert_delta "parallel tools classifier completion" "${completion_before}" "${completion_after}" 0
