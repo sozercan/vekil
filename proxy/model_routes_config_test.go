@@ -212,7 +212,7 @@ func TestSchemaV2RouteOnlyMultipleProvidersMayOmitDefaultWithoutLegacyCatalog(t 
 		}},
 	}
 
-	h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg))
+	h, err := NewProxyHandler(nil, nil, WithProvidersConfig(cfg), WithStateBindingsConfig(StateBindingsConfig{Mode: "memory"}))
 	if err != nil {
 		t.Fatalf("NewProxyHandler() error = %v", err)
 	}

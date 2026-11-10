@@ -97,7 +97,9 @@ MODELS_JSON="${SMOKE_DIR}/models.json"
 SELECTED_MODEL_FILE="${SMOKE_DIR}/selected-model.txt"
 SUMMARY_FILE="${SMOKE_DIR}/summary.txt"
 PROXY_TOKEN_DIR="${PROXY_TOKEN_DIR:-${SMOKE_DIR}/token}"
-CALL_ID_PATTERN='^call_vekil_[A-Za-z0-9_-]{22}$'
+# Two minted shapes: the opaque random suffix, and the versioned/checksummed
+# form that embeds Copilot's own call ID within Anthropic's 64-character cap.
+CALL_ID_PATTERN='^call_vekil_([A-Za-z0-9_-]{22}|v1_[A-Za-z0-9_-]{15}_call_[A-Za-z0-9_-]{1,24}_[A-Za-z0-9_-]{4})$'
 
 TEXT_MARKER="VEKIL_CHAT_OVER_RESPONSES_TEXT_OK"
 STREAM_MARKER="VEKIL_CHAT_OVER_RESPONSES_STREAM_OK"
@@ -200,6 +202,15 @@ dump_proxy_log() {
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
+  if [[ "${proxy_listen_confirmed}" == "1" && -s "${MODELS_JSON}" ]]; then
+    local usage_url=""
+    if [[ -n "${proxy_pid}" ]] && process_is_running "${proxy_pid}"; then
+      usage_url="${PROXY_BASE_URL}"
+    fi
+    "$(python_command)" "${SCRIPT_DIR}/live-smoke-usage.py" \
+      --url "${usage_url}" --label "Chat over Responses" --output "${SMOKE_DIR}/usage.json" \
+      || log "Unable to publish smoke usage"
+  fi
   if [[ -n "${proxy_pgid}" ]]; then
     terminate_process_group "${proxy_pid}" "${proxy_pgid}"
     proxy_pid=""
@@ -305,21 +316,16 @@ fetch_models() {
 }
 
 pick_responses_only_model() {
-  local selected
-  selected="$(jq -r '
-    def responses_only:
-      ((.supported_endpoints // []) | index("/responses")) != null
-      and ((.supported_endpoints // []) | index("/chat/completions")) == null;
-    ([.data[]? | select((.id | type) == "string") | select(responses_only) | .id] as $models
-      | if ($models | index("gpt-5.6-sol")) != null then "gpt-5.6-sol"
-        elif ($models | length) > 0 then $models[0]
-        else ""
-        end)
-  ' "${MODELS_JSON}")"
-  if [[ -z "${selected}" ]]; then
-    die "no model advertises /responses while excluding /chat/completions"
-  fi
-  printf '%s\n' "${selected}"
+  # Luna utility must satisfy the same native endpoint and tool contract as the old
+  # Sol preference. Never fall back to another catalog entry.
+  jq -e '
+    .data[]?
+    | select(.id == "gpt-5.6-luna-utility")
+    | ((.supported_endpoints // []) | index("/responses")) != null
+      and ((.supported_endpoints // []) | index("/chat/completions")) == null
+      and (.capabilities.supports.tool_calls // false) == true
+  ' "${MODELS_JSON}" >/dev/null || die "approved model gpt-5.6-luna-utility must advertise /responses only and tool_calls"
+  printf '%s\n' gpt-5.6-luna-utility
 }
 
 post_chat() {

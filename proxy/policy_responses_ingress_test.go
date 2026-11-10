@@ -141,12 +141,14 @@ func TestPolicyResponsesIngressAllowsResolvedPolicyAliasWithinLaunchScope(t *tes
 	}
 
 	recorder := httptest.NewRecorder()
-	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+	ctx, summary := WithRequestSummary(t.Context())
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
 		"model":"coding-economy-20260717",
 		"input":"say ok",
 		"store":false,
 		"stream":false
-	}`)))
+	}`)).WithContext(ctx)
+	h.HandleResponses(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -158,6 +160,12 @@ func TestPolicyResponsesIngressAllowsResolvedPolicyAliasWithinLaunchScope(t *tes
 	}
 	if response.Model != "coding-economy-20260717" {
 		t.Fatalf("response model=%q, want canonical policy id", response.Model)
+	}
+	summary.mu.Lock()
+	upstreamRequestID := summary.upstreamRequestID
+	summary.mu.Unlock()
+	if upstreamRequestID != "terminal-provider-region-request" {
+		t.Fatalf("upstream request ID = %q, want terminal-provider-region-request", upstreamRequestID)
 	}
 }
 

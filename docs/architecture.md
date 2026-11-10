@@ -149,7 +149,30 @@ Provider-issued continuation state is an exact ownership constraint, not a routi
 
 All state inputs on a request must resolve together to the same route and target. Known state pins the exact target and disables failover. Conflicting, malformed, cross-route, mixed known/unknown, or unknown state on an explicit route fails locally without an upstream call. If the same token is ever observed with different owners, the store records a conflict tombstone and continues to fail it closed rather than choosing one owner. An unavailable bound target also fails closed; Vekil does not guess another owner or migrate provider state.
 
-Bindings use keyed digests and live in a process-local index capped at 262,144 entries with a 24-hour absolute TTL. Raw state is not used as a log field or metrics label. Expiry, eviction, process restart, or routing a continuation to another Vekil process turns the binding into unknown state. Stateful multi-target routes therefore require a single Vekil process or sticky ingress to the process that owns the binding map. Durable/shared bindings and cross-target replay or session migration are not implemented.
+Bindings use keyed digests. Schema-v2 explicit routes use durable storage by
+default, with an 8,388,608-record logical capacity and no full-capacity
+preallocation. `state_binding_config.go` resolves the providers file's
+`state_bindings` block and optional process overrides. The CLI, managed
+launchers, and menubar use that shared initialization. `mode: memory` retains
+the process-local index with its default 262,144-entry capacity, 24-hour absolute
+TTL, and LRU eviction; legacy and zero-config defaults are unchanged.
+
+`state_binding_durable*` uses synchronous bbolt transactions, a persistent digest
+key, and a single-writer file lock. Linux and macOS share descriptor-based file
+validation and recovery; macOS requires local APFS, rejects extended ACLs, and
+uses `F_FULLFSYNC` barriers. The default application-data directory is created
+privately and its creation is synced. `route_state_durable_identity.go`
+fingerprints the authenticated request before dispatch; exposure hooks commit
+records before publishing state. Durable records do not expire or evict, and
+I/O uncertainty freezes the store until reopen. Concurrent clients share one
+proxy's writer; another process cannot acquire the same file until shutdown
+has drained handlers and workers.
+
+The dashboard reads committed count and file-size gauges without scanning all
+records. Raw state is not a log field or metric label. See
+[state recovery](state-recovery.md) for capacity, pruning, lifecycle, and
+supported-platform limits. Shared storage and cross-target replay/session
+migration remain unsupported.
 
 ## Key Decisions
 
@@ -164,7 +187,7 @@ Bindings use keyed digests and live in a process-local index capped at 262,144 e
 - OpenAI Chat Completions is near-zero-copy when the selected model has native Chat support. Responses-native models use an explicit conversion path; unsupported input is rejected rather than silently dropped.
 - OpenAI Responses compatibility is partly proxy-owned, especially for Codex compaction and optional websocket bridging.
 - Ordinary HTTP inference plus proxy-owned internal and model-catalog calls use timeout-bounded contexts detached from the inbound request, so inbound cancellation alone does not abort pre-header upstream work. `Server.Stop` first closes admission: new non-health requests receive a local `503` and are excluded from provider traffic stats, while `/healthz` remains available until the listener closes. It then cancels the `ProxyHandler` lifecycle before websocket draining and `http.Server.Shutdown`, promptly stopping active work and making later upstream contexts immediately canceled. Admitted requests still blocked on incomplete inbound bodies have their client connection closed, detached dashboard-insight workers are joined, websocket drain failures are propagated, and idle upstream transports are closed. Requests terminated specifically by lifecycle transport cancellation are excluded from provider accounting; buffered semantic upstream failures still retain their classified status, and provider turns that completed before shutdown remain counted. Readiness probes remain request-bound, while constructor-time and deferred startup provider validation retain their existing context roots.
-- The Codex websocket bridge is transport adaptation over upstream HTTP `/responses`, not a claim that the selected provider has native websocket or realtime support; it is disabled by default and must be enabled explicitly.
+- The Codex websocket bridge is disabled by default and uses upstream HTTP `/responses` when enabled. A separate experimental native-upstream option reuses a Copilot Responses websocket while preserving target binding and forbidding resend after dispatch. Other providers keep the HTTP transport.
 - Tool optimizers are opt-in and fail-open. They must remain disabled by default and must not change default passthrough behavior when unconfigured or when an external optimizer fails.
 - Azure OpenAI support is implemented as an OpenAI-compatible provider behind the existing proxy surface; Azure deployment names are internal to provider config.
 - Generic provider support is config-driven. `openai-compatible` providers use OpenAI Chat Completions and optional Responses paths, while `anthropic-compatible` providers directly forward native Anthropic Messages requests.
@@ -205,8 +228,10 @@ replay output items per group: 256
 replay function calls per group: 128
 ```
 
-Replay-backed function calls expose only opaque `call_vekil_<22-character-base64url>` IDs. Resolution is bound to the captured provider, public model, upstream model, complete assistant content, and complete ordered tool-call projection. The assistant call array cannot be shortened or reordered, but a complete set of tool-result messages may arrive in any order. For a non-empty partial result set, the adapter restores only the matching prior function calls and outputs; this is an empirical compatibility requirement because replaying the complete parallel call group with only partial outputs was rejected upstream. Missing calls may be reissued.
+Replay-backed function calls prefer a self-describing `call_vekil_v1_<15-character-nonce>_<upstream-call-id>_<4-character-checksum>` ID. When that form would exceed Anthropic's 64-character limit or the upstream ID is not embeddable, Vekil mints the opaque `call_vekil_<22-character-base64url>` fallback. Clients must return either ID unchanged. The nonce separates groups that reuse one upstream call ID; the checksum provides integrity, not authorization. An Anthropic reasoning carrier contains encrypted reasoning, ordering placeholders, projection bindings, and public IDs, but no separate provider-owned call ID.
 
-Replay state is process-local and expires one hour after capture; reads do not extend that deadline. It is also bounded by group count, per-group bytes, total bytes, item count, and call count, with LRU eviction under pressure. A restart, expiry, eviction, forged ID, or route mismatch produces the deterministic `responses_replay_state_missing` client error instead of attempting to reconstruct hidden reasoning. Raw replay content is never logged.
+Resolution is bound to the captured provider, public model, upstream model, complete assistant content, and complete ordered tool-call projection. The assistant call array cannot be shortened or reordered, but a complete set of tool-result messages may arrive in any order. For a non-empty partial result set, the adapter restores only the matching prior function calls and outputs; this is an empirical compatibility requirement because replaying the complete parallel call group with only partial outputs was rejected upstream. Missing calls may be reissued.
+
+Replay state is process-local and expires one hour after capture; reads do not extend that deadline. It is also bounded by group count, per-group bytes, total bytes, item count, and call count, with LRU eviction under pressure. A restart, expiry, eviction, forged ID, or route mismatch produces the deterministic `responses_replay_state_missing` client error rather than attempting to reconstruct hidden reasoning. The exception is Anthropic ingress **on a direct route**, which opts into rebuilding the turn, immediately on a single-target route and only once every candidate target has already refused it on a multi-target one. A valid reasoning carrier restores hidden reasoning. A self-describing ID restores the original upstream call mapping whether or not the carrier survived; an opaque ID rebuilds the call and output under the proxy ID. Client-held carrier signatures have a 2 MiB cumulative wire-byte ceiling; Vekil emits no new carrier when the existing transcript is at the ceiling or the next signature would cross it. When the direct route or a cataloged model has no Responses backend at all, as after a session switches to a Chat-only model, Vekil can restore nothing there, so the same ingress continues on native Chat with the replay IDs unchanged and logs that it forwarded them without their reasoning; a Vekil-compatible bridge behind the route restores only the IDs it minted itself. A model the provider catalog does not list is not known to be Chat-only and never takes that continuation. Native `/v1/chat/completions` takes none of these paths and keeps the deterministic error, and `/v1/responses` rejects a model without a Responses backend before any replay lookup. A policy profile also fails after a process change because its tier comes from a carrier tag keyed per process, so trial resolution fails in the planner before Anthropic fallback. A policy plan never takes the logged native-Chat continuation either; only an `off` or `observe` single-target baseline forwards replay IDs unchanged to a downstream Chat bridge. Raw replay content is never logged.
 
 Synthetic fixtures and the final `MAP` / `LOCAL` / `REJECT` request matrix live in [`../proxy/testdata/chat_over_responses/README.md`](../proxy/testdata/chat_over_responses/README.md). Raw live traces remain outside the repository with owner-only permissions.

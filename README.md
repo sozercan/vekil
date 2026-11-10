@@ -127,7 +127,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 
 |                                                    |                                      |
 | -------------------------------------------------- | ------------------------------------ |
-| [Getting Started](docs/getting-started.md)         | Install, run, first auth             |
+| [Getting Started](docs/getting-started.md)         | Install, run, service, first auth    |
 | [Configuration](docs/configuration.md)             | Config map and ownership             |
 | [Provider Routing](docs/provider-routing.md)       | Provider auth and route failover     |
 | [Semantic Policy Routing](docs/policy-routing.md)  | Schema-v2 policy selection and gates |
@@ -136,6 +136,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | [Responses WebSocket](docs/responses-websocket.md) | Websocket bridge tuning              |
 | [Client Examples](docs/clients.md)                 | Copy-paste snippets per client       |
 | [Agent Launchers](docs/agent-launchers.md)         | One-command coding-agent sessions    |
+| [Troubleshooting](docs/troubleshooting.md)         | Recovery for client-visible errors   |
 | [API Reference](docs/api.md)                       | Endpoint behavior and compatibility  |
 | [Architecture](docs/architecture.md)               | Package layout and native boundary   |
 | [Traffic Dashboard](docs/dashboard.md)             | Browser/native analytics status      |

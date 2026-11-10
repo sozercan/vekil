@@ -23,7 +23,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.11.2
+          version: v2.13.1
           only-new-issues: true
 
   test:
@@ -38,7 +38,8 @@ jobs:
 
       - name: Shell smoke reliability tests
         run: |
-          bash -n scripts/parse-opencode-zen-free-models.sh scripts/update-opencode-zen-free-config.sh scripts/live-cli-smoke.sh scripts/live-zen-smoke.sh scripts/live-compact-smoke.sh scripts/live-chat-over-responses-smoke.sh scripts/live-provider-routing-smoke.sh scripts/live-policy-routing-smoke.sh scripts/live-policy-routing-copilot-smoke.sh scripts/live-policy-routing-sol-effort-smoke.sh scripts/k8s-kind-smoke.sh scripts/tests/live-smoke-reliability-test.sh scripts/tests/live-chat-over-responses-smoke-test.sh scripts/tests/live-provider-routing-smoke-test.sh scripts/tests/live-policy-routing-smoke-test.sh scripts/tests/live-policy-routing-copilot-smoke-test.sh scripts/tests/live-policy-routing-sol-effort-smoke-test.sh
+          bash -n scripts/parse-opencode-zen-free-models.sh scripts/update-opencode-zen-free-config.sh scripts/live-cli-smoke.sh scripts/live-zen-smoke.sh scripts/live-compact-smoke.sh scripts/live-chat-over-responses-smoke.sh scripts/live-claude-reasoning-carrier-smoke.sh scripts/live-provider-routing-smoke.sh scripts/live-policy-routing-smoke.sh scripts/live-policy-routing-copilot-smoke.sh scripts/live-policy-routing-responses-effort-smoke.sh scripts/k8s-kind-smoke.sh scripts/tests/live-smoke-reliability-test.sh scripts/tests/live-chat-over-responses-smoke-test.sh scripts/tests/live-provider-routing-smoke-test.sh scripts/tests/live-policy-routing-smoke-test.sh scripts/tests/live-policy-routing-copilot-smoke-test.sh scripts/tests/live-policy-routing-responses-effort-smoke-test.sh
+          python3 scripts/tests/live-smoke-usage-test.py
           scripts/tests/live-smoke-reliability-test.sh
           scripts/tests/live-chat-over-responses-smoke-test.sh
 
@@ -49,13 +50,15 @@ jobs:
         run: scripts/tests/live-provider-routing-smoke-test.sh
 
       - name: Semantic policy routing process smoke
-        run: scripts/tests/live-policy-routing-smoke-test.sh
+        run: |
+          scripts/tests/live-policy-routing-smoke-test.sh
+          scripts/tests/live-policy-routing-smoke-test.sh omitted
 
       - name: Copilot semantic policy wrapper process smoke
         run: scripts/tests/live-policy-routing-copilot-smoke-test.sh
 
-      - name: Sol semantic effort process smoke
-        run: scripts/tests/live-policy-routing-sol-effort-smoke-test.sh
+      - name: Responses semantic effort process smoke
+        run: scripts/tests/live-policy-routing-responses-effort-smoke-test.sh
 
       - name: Test
         run: make test
@@ -101,6 +104,14 @@ jobs:
 
       - name: Test Darwin launcher lifecycle
         run: go test . ./launch -count=1
+
+      - name: Test Darwin durable storage and shared configuration
+        run: go test ./proxy ./server ./cmd/menubar -run '^Test(Durable|StateBindings|StateBindingStats|Conversation|LoadProvidersConfigFile(StateBindings|ConversationMigration))' -count=1
+
+      - name: Test legacy JSON response validation
+        env:
+          GOEXPERIMENT: nojsonv2
+        run: go test ./proxy -run '^TestDurableResponses(JSONDepthLimit|StateFieldAliases|IDAliasesExposureAndContinuation|RequestStateAliases)' -count=1
 
   build:
     runs-on: ubuntu-latest

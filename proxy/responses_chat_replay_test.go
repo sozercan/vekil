@@ -833,6 +833,55 @@ func TestResponsesChatReplayRetriesStoredAndInFlightIDCollisions(t *testing.T) {
 	}
 }
 
+func TestResponsesChatReplayReusedUpstreamIDCannotResolveToNewerGroup(t *testing.T) {
+	now := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
+	randomBytes := append(
+		bytes.Repeat([]byte{1}, responsesChatReplayRandomBytes),
+		bytes.Repeat([]byte{2}, responsesChatReplayRandomBytes)...,
+	)
+	store := newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{
+		TTL:    time.Second,
+		Now:    func() time.Time { return now },
+		Random: bytes.NewReader(randomBytes),
+	})
+	defer func() { _ = store.Close() }()
+
+	request := newResponsesChatReplayTestRequest("reused", replayTestCallSpec{
+		upstreamID: "call_REUSEDaaaaaaaaaaaaaaaa",
+		name:       "lookup",
+		visible:    `{"q":"same-visible-projection"}`,
+	})
+	request.OutputItems[0] = json.RawMessage(`{"type":"reasoning","id":"reasoning_old","encrypted_content":"OLD_HIDDEN_STATE"}`)
+	first, err := store.Publish(request)
+	if err != nil {
+		t.Fatalf("first Publish() error = %v", err)
+	}
+
+	now = now.Add(2 * time.Second)
+	request.OutputItems[0] = json.RawMessage(`{"type":"reasoning","id":"reasoning_new","encrypted_content":"NEW_HIDDEN_STATE"}`)
+	second, err := store.Publish(request)
+	if err != nil {
+		t.Fatalf("second Publish() error = %v", err)
+	}
+
+	firstID := first.Projection.Calls[0].ID
+	secondID := second.Projection.Calls[0].ID
+	if firstID == secondID {
+		t.Fatalf("reused upstream ID minted the same public ID after expiry: %q", firstID)
+	}
+	assertResponsesChatReplayMissing(t, func() error {
+		_, resolveErr := store.Resolve(request.Route, first.Projection)
+		return resolveErr
+	}())
+	resolved, err := store.Resolve(request.Route, second.Projection)
+	if err != nil {
+		t.Fatalf("new group Resolve() error = %v", err)
+	}
+	if !bytes.Contains(resolved.OutputItems[0], []byte("NEW_HIDDEN_STATE")) {
+		t.Fatalf("new group resolved unexpected hidden state: %s", resolved.OutputItems[0])
+	}
+}
+
 func TestResponsesChatReplayPublishIsAtomicWhenIDGenerationFails(t *testing.T) {
 	store := newResponsesChatReplayStoreWithOptions(responsesChatReplayStoreOptions{
 		Random: bytes.NewReader(bytes.Repeat([]byte{7}, responsesChatReplayRandomBytes)),

@@ -27,10 +27,21 @@ type Server struct {
 	running      atomic.Bool
 	boundAddr    atomic.Pointer[string]
 	dynamicAddr  bool
+	// stopMu owns the one-shot listener claim and the shutdown claim. Do not
+	// hold it across Listen, logging, or drain waits: Stop keeps its deadline.
 	stopMu       sync.Mutex
 	stopDone     chan struct{}
 	stopErr      error
+	listenerDone chan struct{}
+	cancelListen context.CancelFunc
 	serveDone    chan error
+	listen       func(context.Context, string, string) (net.Listener, error)
+	// A force-closed net/http connection may outlive Shutdown in its handler.
+	// Gate registration before Wait so such handlers (including hijacked ones)
+	// retain generation-owned stores until their actual return.
+	requestHandlersMu       sync.Mutex
+	requestHandlers         sync.WaitGroup
+	requestHandlersDraining bool
 }
 
 type options struct {
@@ -107,28 +118,90 @@ func WithCompactUpstreamMaxAttempts(max int) Option {
 
 type responseRecorder struct {
 	http.ResponseWriter
-	status int
-	bytes  int64
+	status                int
+	bytes                 int64
+	trustedBrowserContent bool
+}
+
+var responseRecorderPool = sync.Pool{
+	New: func() any { return new(responseRecorder) },
+}
+
+func acquireResponseRecorder(w http.ResponseWriter, trustedBrowserContent bool) *responseRecorder {
+	recorder := responseRecorderPool.Get().(*responseRecorder)
+	recorder.ResponseWriter = w
+	recorder.trustedBrowserContent = trustedBrowserContent
+	return recorder
+}
+
+func releaseResponseRecorder(recorder *responseRecorder) {
+	if recorder == nil {
+		return
+	}
+	recorder.ResponseWriter = nil
+	recorder.status = 0
+	recorder.bytes = 0
+	recorder.trustedBrowserContent = false
+	responseRecorderPool.Put(recorder)
+}
+
+func (r *responseRecorder) prepareHeaders() {
+	header := r.Header()
+	header.Set("X-Content-Type-Options", "nosniff")
+	if r.trustedBrowserContent {
+		return
+	}
+	header.Set("Content-Type", safeAPIResponseContentType(header.Get("Content-Type")))
+}
+
+func safeAPIResponseContentType(contentType string) string {
+	contentType = strings.TrimSpace(contentType)
+	mediaType := contentType
+	if separator := strings.IndexByte(mediaType, ';'); separator >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:separator])
+	}
+	if strings.EqualFold(mediaType, "text/event-stream") {
+		return "text/event-stream"
+	}
+	if strings.EqualFold(mediaType, "text/plain") {
+		return contentType
+	}
+	return "application/json"
 }
 
 func (r *responseRecorder) WriteHeader(status int) {
 	if r.status != 0 {
 		return
 	}
+	r.prepareHeaders()
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
 }
 
 func (r *responseRecorder) Write(p []byte) (int, error) {
+	writer := r.ResponseWriter
 	if r.status == 0 {
+		header := writer.Header()
+		header.Set("X-Content-Type-Options", "nosniff")
+		if !r.trustedBrowserContent {
+			header.Set("Content-Type", safeAPIResponseContentType(header.Get("Content-Type")))
+		}
 		r.status = http.StatusOK
 	}
-	n, err := r.ResponseWriter.Write(p)
+	n, err := writer.Write(p)
 	r.bytes += int64(n)
 	return n, err
 }
 
+func statusIsSuccess(status int) bool {
+	return status == http.StatusSwitchingProtocols || (status >= 200 && status < 300)
+}
+
 func (r *responseRecorder) Flush() {
+	if r.status == 0 {
+		r.prepareHeaders()
+		r.status = http.StatusOK
+	}
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -166,19 +239,13 @@ func withInboundAuth(next http.Handler, token string) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		provided := strings.TrimSpace(r.Header.Get("x-api-key"))
-		if provided == "" {
-			authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-			if len(authorization) > len("Bearer ") && strings.EqualFold(authorization[:len("Bearer ")], "Bearer ") {
-				provided = strings.TrimSpace(authorization[len("Bearer "):])
-			}
-		}
-		if len(provided) != len(token) || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+		if !requestPassesInboundAuth(r, token) {
+			// Auth sits inside withRequestLog so the rejection is logged, but no inference
+			// handler ran: counting it would let an unauthenticated caller move request-rate,
+			// latency and error dashboards.
+			proxy.RequestSummaryFromContext(r.Context()).SuppressStats()
 			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = io.WriteString(w, `{"error":{"message":"unauthorized"}}`)
@@ -186,6 +253,20 @@ func withInboundAuth(next http.Handler, token string) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func requestPassesInboundAuth(r *http.Request, token string) bool {
+	if token == "" || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+		return true
+	}
+	provided := strings.TrimSpace(r.Header.Get("x-api-key"))
+	if provided == "" {
+		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+		if len(authorization) > len("Bearer ") && strings.EqualFold(authorization[:len("Bearer ")], "Bearer ") {
+			provided = strings.TrimSpace(authorization[len("Bearer "):])
+		}
+	}
+	return len(provided) == len(token) && subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
 }
 
 func withProviderValidationGate(next http.Handler, handler startupReadinessGate) http.Handler {
@@ -213,14 +294,20 @@ func withProviderValidationGate(next http.Handler, handler startupReadinessGate)
 	})
 }
 
-func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyHandler) http.Handler {
+func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyHandler, inboundAuthToken string) http.Handler {
+	inboundAuthToken = strings.TrimSpace(inboundAuthToken)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		recorder := &responseRecorder{ResponseWriter: w}
-		ctx, summary := proxy.WithRequestSummary(r.Context())
+		recorder := acquireResponseRecorder(w, servesTrustedBrowserContent(r))
+		defer releaseResponseRecorder(recorder)
+		ctx, summary, ownsSummary := proxy.AcquireRequestSummary(r.Context())
+		if ownsSummary {
+			defer proxy.ReleaseRequestSummary(summary)
+		}
 
 		admitted := handler == nil || !handler.ShuttingDown() || r.URL.Path == "/healthz"
-		tracked := admitted && handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
+		authenticated := requestPassesInboundAuth(r, inboundAuthToken)
+		tracked := admitted && authenticated && handler != nil && handler.TracksRequest(r.Method, r.URL.Path)
 		if tracked {
 			handler.IncInflight()
 			defer handler.DecInflight()
@@ -231,19 +318,19 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		// (not derived inside the upstream call) because newInferenceUpstreamContext
 		// rebuilds the upstream context from the detached proxy lifecycle root;
 		// only an explicitly propagated positive marker survives.
-		if handler != nil && admitted {
+		if handler != nil && admitted && authenticated {
 			ctx = handler.MarkRetryStatsTrackedIfInference(ctx, r.Method, r.URL.Path)
 		}
 
 		r = r.WithContext(ctx)
-		var releaseRequestBody func()
+		var requestBodyBinding proxy.RequestBodyLifecycleBinding
 		if admitted && handler != nil {
-			var forceClose func()
+			var forceClose io.Closer
 			if conn, ok := r.Context().Value(serverConnContextKey{}).(net.Conn); ok && conn != nil {
-				forceClose = func() { _ = conn.Close() }
+				forceClose = conn
 			}
-			releaseRequestBody = handler.BindRequestBodyToLifecycle(r, forceClose)
-			defer releaseRequestBody()
+			requestBodyBinding = handler.BindRequestBodyToLifecycle(r, forceClose)
+			defer requestBodyBinding.ReleaseAndRecycle(r)
 		}
 		if admitted {
 			next.ServeHTTP(recorder, r)
@@ -266,7 +353,7 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		if tracked && !summary.StatsSuppressed() {
 			handler.RecordRequest(summary, statsStatus, r.Header.Get("User-Agent"), elapsed)
 		}
-		if log != nil {
+		if log != nil && log.Enabled(logger.LevelWarn) {
 			fields := []logger.Field{
 				logger.F("method", r.Method),
 				logger.F("path", r.URL.Path),
@@ -288,9 +375,31 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 				}
 			}
 			fields = append(fields, summary.LoggerFields()...)
-			log.Info("request completed", fields...)
+			if statsStatus != status {
+				fields = append(fields, logger.F("stats_status", statsStatus))
+			}
+			switch {
+			case statusIsSuccess(status) && statsStatus == status:
+				log.Info("request completed", fields...)
+			case statsStatus != status:
+				log.Warn("request failed after response headers were committed", fields...)
+			default:
+				log.Warn("request completed", fields...)
+			}
 		}
 	})
+}
+
+func servesTrustedBrowserContent(r *http.Request) bool {
+	if r == nil || r.URL == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+		return false
+	}
+	switch r.URL.Path {
+	case "/dashboard", "/dashboard/uPlot.min.js", "/dashboard/uPlot.min.css":
+		return true
+	default:
+		return false
+	}
 }
 
 // New creates a Server with routes and timeouts configured. It preserves the
@@ -321,7 +430,10 @@ func NewContext(ctx context.Context, authenticator *auth.Authenticator, log *log
 		return nil, err
 	}
 	if err := validatePolicyRoutingListenHost(host, handler.PolicyRoutingActive(), cfg.policyRoutingAllowRemoteSingleTenant); err != nil {
-		return nil, err
+		// Nothing has been served yet, but construction may already own durable
+		// storage and lifecycle resources. Drain before releasing the store lock.
+		handler.BeginShutdown()
+		return nil, errors.Join(err, handler.WaitLifecycleWorkers(context.Background()))
 	}
 
 	mux := http.NewServeMux()
@@ -335,6 +447,7 @@ func NewContext(ctx context.Context, authenticator *auth.Authenticator, log *log
 	mux.HandleFunc("POST /v1/responses", handler.HandleResponses)
 	mux.HandleFunc("GET /v1/responses", handler.HandleResponsesWebSocket)
 	mux.HandleFunc("POST /v1/memories/trace_summarize", handler.HandleMemorySummarize)
+	mux.HandleFunc("POST /mcp/web-search", handler.HandleWebSearchMCP)
 	mux.HandleFunc("GET /healthz", handler.HandleHealthz)
 	mux.HandleFunc("GET /readyz", handler.HandleReadyz)
 	mux.HandleFunc("GET /v1/models", handler.HandleModels)
@@ -345,9 +458,8 @@ func NewContext(ctx context.Context, authenticator *auth.Authenticator, log *log
 	mux.HandleFunc("GET /favicon.ico", handler.HandleFavicon)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
-	httpHandler := withRequestLog(withProviderValidationGate(mux, handler), log, handler)
-	httpHandler = withInboundAuth(httpHandler, cfg.inboundAuthToken)
-	return &Server{
+	httpHandler := withRequestLog(withInboundAuth(withProviderValidationGate(mux, handler), cfg.inboundAuthToken), log, handler, cfg.inboundAuthToken)
+	srv := &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
 			Handler:      httpHandler,
@@ -362,7 +474,27 @@ func NewContext(ctx context.Context, authenticator *auth.Authenticator, log *log
 		log:          log,
 		dynamicAddr:  strings.TrimSpace(port) == "0",
 		serveDone:    make(chan error, 1),
-	}, nil
+	}
+	srv.httpServer.Handler = srv.withRequestHandlerDrain(httpHandler)
+	return srv, nil
+}
+
+func (s *Server) withRequestHandlerDrain(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.requestHandlersMu.Lock()
+		tracked := !s.requestHandlersDraining
+		if tracked {
+			s.requestHandlers.Add(1)
+		}
+		s.requestHandlersMu.Unlock()
+		if tracked {
+			defer s.requestHandlers.Done()
+		}
+		// BeginShutdown runs before registration closes. Late requests therefore
+		// reach only withRequestLog's shutdown rejection (or the health probe),
+		// neither of which can access generation-owned continuation stores.
+		next.ServeHTTP(w, r)
+	})
 }
 
 func validatePolicyRoutingListenHost(host string, policyActive, allowRemoteSingleTenant bool) error {
@@ -384,19 +516,57 @@ func isLoopbackListenHost(host string) bool {
 }
 
 // Start begins listening in a goroutine. It returns an error if the listener
-// cannot be established.
+// cannot be established and shuts down that generation. A concurrent Stop
+// retains its deadline and background-finalization semantics. Create a new
+// Server to retry after a failed start or shutdown.
 func (s *Server) Start() error {
-	ln, err := net.Listen("tcp", s.httpServer.Addr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", s.httpServer.Addr, err)
+	s.stopMu.Lock()
+	if s.stopDone != nil || (s.proxyHandler != nil && s.proxyHandler.ShuttingDown()) {
+		s.stopMu.Unlock()
+		return errors.New("server is shut down")
+	}
+	if s.listenerDone != nil {
+		s.stopMu.Unlock()
+		return errors.New("server has already started")
+	}
+	listenCtx, cancelListen := context.WithCancel(context.Background())
+	listenerDone := make(chan struct{})
+	s.listenerDone = listenerDone
+	s.cancelListen = cancelListen
+	s.stopMu.Unlock()
+	defer cancelListen()
+
+	listen := s.listen
+	if listen == nil {
+		listen = (&net.ListenConfig{}).Listen
+	}
+	ln, err := listen(listenCtx, "tcp", s.httpServer.Addr)
+	s.stopMu.Lock()
+	stopping := s.stopDone != nil
+	if err != nil || stopping {
+		s.stopMu.Unlock()
+		if ln != nil {
+			err = errors.Join(err, ln.Close())
+		}
+		close(listenerDone)
+		if err != nil {
+			err = fmt.Errorf("listen on %s: %w", s.httpServer.Addr, err)
+		} else {
+			err = errors.New("server shut down during startup")
+		}
+		if stopping {
+			// Stop already owns finalization and may have returned its deadline.
+			// Closing listenerDone lets that same finalizer finish safely.
+			return err
+		}
+		return errors.Join(err, s.Stop(context.Background()))
 	}
 
 	boundAddr := ln.Addr().String()
 	s.boundAddr.Store(&boundAddr)
 	s.running.Store(true)
-	s.log.Info("vekil listening", logger.F("addr", s.listenerLogAddr(boundAddr)))
-
 	go func() {
+		defer close(listenerDone)
 		defer s.running.Store(false)
 		err := s.httpServer.Serve(ln)
 		if errors.Is(err, http.ErrServerClosed) {
@@ -408,6 +578,8 @@ func (s *Server) Start() error {
 		s.serveDone <- err
 		close(s.serveDone)
 	}()
+	s.stopMu.Unlock()
+	s.log.Info("vekil listening", logger.F("addr", s.listenerLogAddr(boundAddr)))
 
 	return nil
 }
@@ -430,6 +602,12 @@ func (s *Server) ModelUsesCopilot(model string) bool {
 // UsesCopilot reports whether the active serve scope needs Copilot auth.
 func (s *Server) UsesCopilot() bool {
 	return s != nil && s.proxyHandler != nil && s.proxyHandler.UsesCopilot()
+}
+
+// MessagesAliasResolvesTo reports whether a Messages request naming alias is
+// served like one naming model.
+func (s *Server) MessagesAliasResolvesTo(ctx context.Context, alias, model string) bool {
+	return s != nil && s.proxyHandler != nil && s.proxyHandler.MessagesAliasResolvesTo(ctx, alias, model)
 }
 
 // SetStartupAuthenticationPending gates non-health routes while startup auth is in progress.
@@ -497,9 +675,14 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	done := make(chan struct{})
 	s.stopDone = done
+	cancelListen := s.cancelListen
+	listenerDone := s.listenerDone
 	s.stopMu.Unlock()
+	if cancelListen != nil {
+		cancelListen()
+	}
 
-	err := s.stop(ctx)
+	err := s.stop(ctx, listenerDone)
 	s.stopMu.Lock()
 	s.stopErr = err
 	close(done)
@@ -507,13 +690,18 @@ func (s *Server) Stop(ctx context.Context) error {
 	return err
 }
 
-func (s *Server) stop(ctx context.Context) error {
+func (s *Server) stop(ctx context.Context, listenerDone <-chan struct{}) error {
 	var websocketErr error
 	var workerErr error
 	var forceCloseErr error
 	if s.proxyHandler != nil {
 		s.proxyHandler.BeginShutdown()
 		s.proxyHandler.SetStartupAuthenticationPending(false)
+	}
+	s.requestHandlersMu.Lock()
+	s.requestHandlersDraining = true
+	s.requestHandlersMu.Unlock()
+	if s.proxyHandler != nil {
 		websocketErr = s.proxyHandler.ShutdownWebSocketSessions(ctx)
 	}
 	shutdownErr := s.httpServer.Shutdown(ctx)
@@ -526,8 +714,30 @@ func (s *Server) stop(ctx context.Context) error {
 			forceCloseErr = nil
 		}
 	}
-	if s.proxyHandler != nil {
-		workerErr = s.proxyHandler.WaitLifecycleWorkers(ctx)
+	// Stop has one owner and caches its result. Keep a single finalizer alive
+	// beyond that caller's deadline: Close does not wait for HTTP handlers, and
+	// a deadline must not leak the store lock once all real work has finished.
+	finalized := make(chan error, 1)
+	go func() {
+		if listenerDone != nil {
+			// Also fence a late Listen result or a Serve goroutine not yet
+			// registered with net/http when Shutdown began.
+			<-listenerDone
+		}
+		s.requestHandlers.Wait()
+		var err error
+		if s.proxyHandler != nil {
+			err = s.proxyHandler.WaitLifecycleWorkers(context.Background())
+		}
+		if err != nil && s.log != nil {
+			s.log.Error("server resource finalization failed", logger.Err(err))
+		}
+		finalized <- err
+	}()
+	select {
+	case workerErr = <-finalized:
+	case <-ctx.Done():
+		workerErr = ctx.Err()
 	}
 	s.running.Store(false)
 	return errors.Join(websocketErr, shutdownErr, forceCloseErr, workerErr)

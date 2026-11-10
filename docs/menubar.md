@@ -53,7 +53,7 @@ MACOS_SMOKE_ARCHES="arm64 x86_64" make smoke-app
 - choose and persist a providers config file
 - return to default Copilot routing
 - GitHub auth actions: sign in, use GitHub CLI account, sign out
-- optional launch-at-login integration
+- optional launch-at-login integration (for a headless alternative without the tray, use [`vekil service install`](getting-started.md#run-as-a-background-service); do not enable both)
 - Sparkle `Check for Updates…` in packaged macOS builds
 
 ## Authentication And Providers
@@ -66,9 +66,27 @@ The `GitHub Auth` submenu exposes the same auth choices as the CLI:
 
 Copilot-backed configs require GitHub auth or `COPILOT_GITHUB_TOKEN`. Provider-only configs that omit Copilot do not require GitHub auth and can keep running after sign-out. See [Provider Routing](provider-routing.md) for provider-specific auth details.
 
+On macOS, the app adds directories from your interactive login shell's `PATH` at launch. This lets Azure CLI authentication and other configured commands work when the app starts through Finder or at login. The lookup imports only `PATH` and has a five-second timeout.
+
+If shell startup fails or times out, the app appends `/opt/homebrew/bin` and `/usr/local/bin` as fallbacks and still logs the lookup warning. Shell recovery and fallback keep inherited directories first and only append missing absolute directories, never empty or relative entries. The app does not retry the shell lookup.
+
+The app writes its logs, including the proxy's, to `~/Library/Logs/vekil/menubar.log` on macOS and to `vekil/logs/menubar.log` under the user cache directory elsewhere. A file that reaches 16 MiB moves to `menubar.log.1`, so at most two files are kept. The files are private to your user. Look there for `conversation recovery` lines when a conversation is blocked.
+
 Use `Choose Providers Config…` to select the same JSON/YAML file you would pass with `--providers-config`. The app saves the selected path for future launches and launch-at-login starts. `Use Default Copilot Routing` clears the saved path.
 
-Startup authentication and semantic-policy classifier preflight run in a cancellable worker. Provider-config and authentication actions are temporarily disabled while that worker is active, while Quit and the other tray events remain responsive. Use **Cancel Starting Vekil** to abort startup; Vekil closes any listener opened by the canceled attempt before an automatic config restart can begin.
+Every **Start Vekil** reads the saved path and the providers file again, and fetches a remote URL again. To apply an edited file, choose **Stop Vekil** and then **Start Vekil**. You don't need to quit the app. If the edited file is invalid, Start shows the error and stays enabled, so you can fix the file and start again.
+
+The top-level `state_bindings` configuration applies to both the CLI and tray
+app. Schema-v2 explicit routes default to durable ownership with capacity
+8,388,608; `mode: memory` opts out. The same private OS application-data file is
+used when `file` is omitted, so a drained CLI can hand ownership recovery to the
+tray and vice versa. No separate tray setting is needed. Concurrent clients can
+share one running proxy. A second proxy cannot open its locked store; use a
+distinct configured file for a separate instance. The dashboard shows retained
+entries, capacity, database size, and capacity warnings. See
+[State Recovery](state-recovery.md) for macOS/Linux storage and recovery details.
+
+Providers-config loading, startup authentication, and semantic-policy classifier preflight run in a cancellable worker. Provider-config and authentication actions are temporarily disabled while that worker is active, while Quit and the other tray events remain responsive. Use **Cancel Starting Vekil** to abort startup; Vekil closes any listener opened by the canceled attempt before an automatic config restart can begin.
 
 ## Native Setup Assistant
 

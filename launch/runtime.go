@@ -24,6 +24,8 @@ const (
 	statsSettleTimeout      = 2 * time.Second
 	statsSettlePollInterval = 25 * time.Millisecond
 	maxLauncherResponseBody = 8 << 20
+	webSearchProbeTimeout   = 30 * time.Second
+	webSearchMCPPath        = "/mcp/web-search"
 )
 
 type modelsResponse struct {
@@ -48,10 +50,37 @@ type statsBreakdown struct {
 }
 
 type statsSnapshot struct {
-	Inflight   int64            `json:"inflight"`
-	Totals     statsTotals      `json:"totals"`
-	ByModel    []statsBreakdown `json:"by_model"`
-	ByProvider []statsBreakdown `json:"by_provider"`
+	Inflight          int64            `json:"inflight"`
+	AuxiliaryInflight int64            `json:"auxiliary_inflight"`
+	Totals            statsTotals      `json:"totals"`
+	ByModel           []statsBreakdown `json:"by_model"`
+	ByProvider        []statsBreakdown `json:"by_provider"`
+	TaskUsage         taskUsageStats   `json:"task_usage"`
+}
+
+type taskUsageTotals struct {
+	Sends     int64 `json:"sends"`
+	Errors    int64 `json:"errors"`
+	Throttled int64 `json:"throttled"`
+	Usage     struct {
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+		CachedTokens     int64 `json:"cached_tokens"`
+		ReasoningTokens  int64 `json:"reasoning_tokens"`
+	} `json:"usage"`
+	CopilotUsage struct {
+		TotalNanoAIU int64 `json:"total_nano_aiu"`
+		ComputeUnits int64 `json:"compute_units"`
+	} `json:"copilot_usage"`
+}
+
+type taskUsageStats struct {
+	Inflight int64           `json:"inflight"`
+	Totals   taskUsageTotals `json:"totals"`
+	ByKind   []struct {
+		Kind string `json:"kind"`
+		taskUsageTotals
+	} `json:"by_kind"`
 }
 
 type commandOutcome struct {
@@ -216,17 +245,49 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 		}
 	}
 	result.Model = model
+	var webSearchMCPURL string
+	copilotAbsent := false
+	if consumer, ok := adapter.(webSearchMCPAdapter); ok && consumer.usesWebSearchMCP() {
+		// Search is optional: probe under the run context with the probe's own
+		// timeout so a slow probe cannot spend the startup deadline.
+		probe, probeErr := runStartupOperation(runCtx, proxy.Done(), func(ctx context.Context) (webSearchMCPProbe, error) {
+			return probeWebSearchMCP(ctx, baseURL, localToken), nil
+		})
+		if probeErr != nil {
+			if runCtx.Err() != nil {
+				result.ExitCode = cancellationExitCode(runCtx)
+				return result, nil
+			}
+			return result, probeErr
+		}
+		if probe.err != nil {
+			_, _ = fmt.Fprintf(opts.Stderr, "vekil: warning: web search unavailable: %v\n", probe.err)
+		}
+		webSearchMCPURL = probe.url
+		copilotAbsent = probe.copilotAbsent
+	}
+	var routesLikeModel func(string) bool
+	if resolver, ok := proxy.(messagesAliasProxy); ok && model.ID != "" {
+		routesLikeModel = func(alias string) bool {
+			ctx, cancel := context.WithTimeout(runCtx, modelRequestTimeout)
+			defer cancel()
+			return resolver.MessagesAliasResolvesTo(ctx, alias, model.ID)
+		}
+	}
 	startupCancel()
 
 	prepared, err := adapter.Prepare(PrepareInput{
-		BaseURL:       baseURL,
-		Model:         model,
-		Binary:        opts.Binary,
-		ForwardedArgs: opts.ForwardedArgs,
-		LocalToken:    localToken,
-		SensitiveEnv:  opts.SensitiveEnv,
-		Environment:   opts.Environment,
-		NoProxy:       loopbackNoProxyValue(opts.Environment, baseURL),
+		BaseURL:         baseURL,
+		Model:           model,
+		Binary:          opts.Binary,
+		ForwardedArgs:   opts.ForwardedArgs,
+		LocalToken:      localToken,
+		SensitiveEnv:    opts.SensitiveEnv,
+		Environment:     opts.Environment,
+		NoProxy:         loopbackNoProxyValue(opts.Environment, baseURL),
+		WebSearchMCPURL: webSearchMCPURL,
+		CopilotAbsent:   copilotAbsent,
+		RoutesLikeModel: routesLikeModel,
 	})
 	if err != nil {
 		return result, err
@@ -489,6 +550,63 @@ func fetchModels(ctx context.Context, baseURL, localToken string) ([]ModelInfo, 
 	return payload.Data, nil
 }
 
+type webSearchMCPProbe struct {
+	url string
+	// copilotAbsent is set only when the proxy answered 404: no Copilot
+	// provider serves this session.
+	copilotAbsent bool
+	err           error
+}
+
+// probeWebSearchMCP asks the launch proxy's web search MCP endpoint for its
+// tools. The URL is set only when tools/list offers web_search.
+func probeWebSearchMCP(ctx context.Context, baseURL, localToken string) webSearchMCPProbe {
+	requestCtx, cancel := context.WithTimeout(ctx, webSearchProbeTimeout)
+	defer cancel()
+	url := baseURL + webSearchMCPPath
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	if err != nil {
+		return webSearchMCPProbe{err: err}
+	}
+	req.Header.Set("Authorization", "Bearer "+localToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return webSearchMCPProbe{err: fmt.Errorf("probe web search: %w", err)}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return webSearchMCPProbe{copilotAbsent: true}
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return webSearchMCPProbe{err: fmt.Errorf("probe web search: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))}
+	}
+	var payload struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxLauncherResponseBody)).Decode(&payload); err != nil {
+		return webSearchMCPProbe{err: fmt.Errorf("decode web search probe: %w", err)}
+	}
+	if payload.Error != nil {
+		return webSearchMCPProbe{err: errors.New(payload.Error.Message)}
+	}
+	for _, tool := range payload.Result.Tools {
+		if tool.Name == "web_search" {
+			return webSearchMCPProbe{url: url}
+		}
+	}
+	return webSearchMCPProbe{}
+}
+
 func selectModel(models []ModelInfo, id string) (ModelInfo, error) {
 	for _, model := range models {
 		if model.ID == id {
@@ -685,7 +803,7 @@ func fetchSettledStats(ctx context.Context, baseURL, localToken string) (statsSn
 		if err != nil {
 			return statsSnapshot{}, err
 		}
-		if snapshot.Inflight <= 0 {
+		if snapshot.Inflight <= 0 && snapshot.AuxiliaryInflight <= 0 && snapshot.TaskUsage.Inflight <= 0 {
 			return snapshot, nil
 		}
 
@@ -702,7 +820,7 @@ func fetchSettledStats(ctx context.Context, baseURL, localToken string) (statsSn
 }
 
 func printSessionSummary(w io.Writer, snapshot statsSnapshot) {
-	if snapshot.Totals.Requests == 0 {
+	if snapshot.Totals.Requests == 0 && snapshot.TaskUsage.Totals.Sends == 0 {
 		return
 	}
 	_, _ = fmt.Fprintln(w)
@@ -734,5 +852,18 @@ func printSessionSummary(w io.Writer, snapshot statsSnapshot) {
 			_, _ = fmt.Fprintf(w, ", %d errors", row.Errors)
 		}
 		_, _ = fmt.Fprintln(w, ")")
+	}
+	if totals := snapshot.TaskUsage.Totals; totals.Sends > 0 {
+		_, _ = fmt.Fprintf(w, "  upstream: %d sends, %d errors, %d throttled\n", totals.Sends, totals.Errors, totals.Throttled)
+		_, _ = fmt.Fprintf(w, "  spent:    %d in, %d out, %d cached, %d reasoning\n", totals.Usage.PromptTokens, totals.Usage.CompletionTokens, totals.Usage.CachedTokens, totals.Usage.ReasoningTokens)
+		for _, row := range snapshot.TaskUsage.ByKind {
+			if row.Kind == "inference" || row.Sends == 0 {
+				continue
+			}
+			_, _ = fmt.Fprintf(w, "  auxiliary %s: %d sends, %d in, %d out\n", row.Kind, row.Sends, row.Usage.PromptTokens, row.Usage.CompletionTokens)
+		}
+		if usage := totals.CopilotUsage; usage.TotalNanoAIU > 0 || usage.ComputeUnits > 0 {
+			_, _ = fmt.Fprintf(w, "  accounting: %d nano-AIU, %d compute units\n", usage.TotalNanoAIU, usage.ComputeUnits)
+		}
 	}
 }

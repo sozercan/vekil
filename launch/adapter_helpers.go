@@ -36,6 +36,7 @@ var commonAgentCredentialEnvironment = []string{
 	"GH_TOKEN",
 	"GITHUB_ENTERPRISE_TOKEN",
 	"GITHUB_TOKEN",
+	"INBOUND_AUTH_TOKEN",
 	"IDENTITY_HEADER",
 	"MSI_SECRET",
 	"OPENAI_ACCOUNT_ID",
@@ -87,8 +88,12 @@ func modelContextWindow(model ModelInfo) int64 {
 	if model.ContextWindow != nil && *model.ContextWindow > 0 {
 		return *model.ContextWindow
 	}
-	if model.Capabilities.Limits.MaxContextWindowTokens > 0 {
-		return model.Capabilities.Limits.MaxContextWindowTokens
+	limits := model.Capabilities.Limits
+	for _, value := range []int64{limits.MaxPromptTokens, limits.MaxPrompt, limits.MaxInputTokens,
+		limits.MaxContextWindowTokens, limits.ContextWindow, limits.ContextWindowTokens} {
+		if value > 0 {
+			return value
+		}
 	}
 	if model.MaxContextWindow != nil && *model.MaxContextWindow > 0 {
 		return *model.MaxContextWindow
@@ -100,8 +105,11 @@ func modelMaxContextWindow(model ModelInfo) int64 {
 	if model.MaxContextWindow != nil && *model.MaxContextWindow > 0 {
 		return *model.MaxContextWindow
 	}
-	if model.Capabilities.Limits.MaxContextWindowTokens > 0 {
-		return model.Capabilities.Limits.MaxContextWindowTokens
+	limits := model.Capabilities.Limits
+	for _, value := range []int64{limits.MaxContextWindowTokens, limits.ContextWindow, limits.ContextWindowTokens} {
+		if value > 0 {
+			return value
+		}
 	}
 	return modelContextWindow(model)
 }

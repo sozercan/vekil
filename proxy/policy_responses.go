@@ -80,7 +80,7 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), mode.clientRequestedStream || mode.forceUpstreamStream)
 	defer upstreamCancel()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
-	upstreamCtx, _, _, err = h.withChatExecutionRoute(upstreamCtx, r.Context(), translated.PublicModel, chatBody)
+	upstreamCtx, _, _, err = h.withChatExecutionRoute(upstreamCtx, r.Context(), translated.PublicModel, chatBody, false)
 	if err != nil {
 		if h.handleShutdownError(w, r, upstreamCtx, err) {
 			return
@@ -110,9 +110,11 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 		writePolicyResponsesExecutionError(w, err, publicModel)
 		return
 	}
-	observeUpstreamHeaders(r.Context(), result.Headers)
+	upstreamHeaders := chatExecutionUpstreamHeaders(result)
+	observeUpstreamHeaders(r.Context(), upstreamHeaders)
 	completion.Model = publicModel
 	observeOpenAIUsage(r.Context(), completion.Usage)
+	observeCopilotUsage(r.Context(), completion.CopilotUsage)
 	h.maybeRewriteOrCaptureOpenAIChatToolCommands(r.Context(), completion, h.toolContexts, toolScope, false)
 	markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
 	response, err := buildPolicyResponsesResponse(completion, publicModel, translated.CallableTools, translated.Response)
@@ -120,7 +122,7 @@ func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadGateway, "failed to translate policy response", "server_error")
 		return
 	}
-	if safeHeaders := policyChatSafeHeaders(result.Headers, publicModel); len(safeHeaders) > 0 {
+	if safeHeaders := policyChatSafeHeaders(upstreamHeaders, publicModel); len(safeHeaders) > 0 {
 		mergeHeaderValues(w.Header(), safeHeaders)
 	}
 	if err := writePolicyResponsesResult(w, response, translated.Stream); err != nil && h.log != nil {

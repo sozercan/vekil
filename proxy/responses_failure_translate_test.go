@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/sozercan/vekil/logger"
@@ -1575,8 +1576,8 @@ func TestStreamResponsesPipeClassifiesTopLevelErrorEvent(t *testing.T) {
 	if streamUsage.prompt != 11 || streamUsage.completion != 4 || streamUsage.total != 15 {
 		t.Fatalf("stream usage = prompt:%d completion:%d total:%d, want 11/4/15", streamUsage.prompt, streamUsage.completion, streamUsage.total)
 	}
-	if got := rec.Body.String(); got != sse {
-		t.Fatalf("stream body altered. got %q want %q", got, sse)
+	if got, want := rec.Body.String(), sse+responsesFailedTestEvent("no_capacity", "No capacity is available."); got != want {
+		t.Fatalf("stream body = %q, want %q", got, want)
 	}
 }
 
@@ -1590,8 +1591,80 @@ func TestStreamResponsesPipeNormalizesEventNameForUntypedNestedError(t *testing.
 	if got := summary.FailureStatus(); got != http.StatusTooManyRequests {
 		t.Fatalf("FailureStatus = %d, want 429", got)
 	}
-	if got := rec.Body.String(); got != sse {
-		t.Fatalf("stream body altered. got %q want %q", got, sse)
+	if got, want := rec.Body.String(), sse+responsesFailedTestEvent("no_capacity", "No capacity is available."); got != want {
+		t.Fatalf("stream body = %q, want %q", got, want)
+	}
+}
+
+func responsesFailedTestEvent(code, message string) string {
+	data, _ := json.Marshal(map[string]any{"type": "response.failed", "response": map[string]any{
+		"object": "response", "status": "failed", "output": []any{},
+		"error": map[string]string{"code": code, "message": message},
+	}})
+	return "event: response.failed\ndata: " + string(data) + "\n\n"
+}
+
+func TestStreamResponsesPipeFollowsTerminalErrorWithResponseFailed(t *testing.T) {
+	const delta = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+	const cyberMessage = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request."
+	cyberEvent, _ := json.Marshal(map[string]string{
+		"type":    "error",
+		"code":    "content_filter",
+		"message": `reading responses stream: reading SSE event: {"error":{"message":"` + cyberMessage + `"}}`,
+	})
+	copilotCyber := delta + "event: error\ndata: " + string(cyberEvent) + "\n\n"
+	filtered := delta + "event: error\ndata: {\"type\":\"error\",\"code\":\"content_filter\",\"message\":\"The response was filtered.\"}\n\n"
+	oversized := delta + "event: error\ndata: {\"type\":\"error\",\"code\":\"content_filter\",\"message\":\"" + strings.Repeat("x", openAIStreamScannerMaxBuffer+4096) + "\"}\n\n"
+
+	tests := []struct {
+		name string
+		body io.Reader
+		want string
+	}{
+		{
+			name: "copilot cybersecurity flag becomes cyber_policy",
+			body: strings.NewReader(copilotCyber),
+			want: copilotCyber + responsesFailedTestEvent("cyber_policy", cyberMessage),
+		},
+		{
+			name: "other content filters keep their code and message",
+			body: strings.NewReader(filtered),
+			want: filtered + responsesFailedTestEvent("content_filter", "The response was filtered."),
+		},
+		{
+			name: "transport reset after the error event",
+			body: io.MultiReader(strings.NewReader(filtered), iotest.ErrReader(errors.New("connection reset"))),
+			want: filtered + responsesFailedTestEvent("content_filter", "The response was filtered."),
+		},
+		{
+			name: "upstream response.failed after the error event is not duplicated",
+			body: strings.NewReader(filtered + responsesFailedTestEvent("content_filter", "The response was filtered.")),
+			want: filtered + responsesFailedTestEvent("content_filter", "The response was filtered."),
+		},
+		{
+			name: "unterminated upstream response.failed at EOF is not duplicated",
+			body: strings.NewReader(filtered + strings.TrimSuffix(responsesFailedTestEvent("content_filter", "The response was filtered."), "\n\n")),
+			want: filtered + strings.TrimSuffix(responsesFailedTestEvent("content_filter", "The response was filtered."), "\n\n"),
+		},
+		{
+			name: "oversized error event passes through without a failure built from fragments",
+			body: strings.NewReader(oversized),
+			want: oversized,
+		},
+		{
+			name: "unterminated upstream response.completed at EOF is not followed by a failure",
+			body: strings.NewReader(filtered + `data: {"type":"response.completed","response":{"id":"resp_fake","status":"completed","output":[]}}`),
+			want: filtered + `data: {"type":"response.completed","response":{"id":"resp_fake","status":"completed","output":[]}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			streamResponsesPipeWithFailureLog(context.Background(), &ProxyHandler{log: logger.NewWithWriter(logger.LevelError, io.Discard)}, rec, tt.body, nil, nil, "")
+			if got := rec.Body.String(); got != tt.want {
+				t.Fatalf("stream body = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -2257,7 +2330,7 @@ func TestPrepareResponsesStreamPreservesTerminalWhenInboundCancellationWins(t *t
 	for i := 0; i < 20; i++ {
 		waitCtx, cancelWait := context.WithCancel(context.Background())
 		cancelWait()
-		resp, result, _, err := prepareResponsesStreamAttemptWithGrace(waitCtx, context.Background(), 100*time.Millisecond, func() (*http.Response, error) {
+		resp, result, _, err := prepareResponsesStreamAttemptWithGrace(nil, waitCtx, context.Background(), 100*time.Millisecond, func() (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -2518,7 +2591,7 @@ func TestPrepareResponsesStreamAttemptCommitsUpstreamCanceledTerminal(t *testing
 	streamCtx, cancelStream := context.WithCancel(context.Background())
 	cancelStream()
 	stream := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-upstream-cancel\",\"output\":[{\"type\":\"message\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
-	resp, result, _, err := prepareResponsesStreamAttemptWithGrace(context.Background(), streamCtx, 100*time.Millisecond, func() (*http.Response, error) {
+	resp, result, _, err := prepareResponsesStreamAttemptWithGrace(nil, context.Background(), streamCtx, 100*time.Millisecond, func() (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},

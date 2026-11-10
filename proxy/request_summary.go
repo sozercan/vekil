@@ -5,12 +5,17 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
 type requestSummaryContextKey struct{}
+
+var requestSummaryPool = sync.Pool{New: func() any {
+	return &RequestSummary{}
+}}
 
 // RequestSummary is a mutable per-request summary populated by handlers and
 // emitted by the server-level request logging middleware.
@@ -48,11 +53,21 @@ type RequestSummary struct {
 	streamSet                 bool
 	stream                    bool
 	upstreamRequestID         string
+	errorType                 string
+	errorCode                 string
+	errorParam                string
+	errorMessage              string
 	promptTokens              *int
 	completionTokens          *int
 	totalTokens               *int
 	cachedTokens              *int
 	reasoningTokens           *int
+	promptTokensValue         int
+	completionTokensValue     int
+	totalTokensValue          int
+	cachedTokensValue         int
+	reasoningTokensValue      int
+	copilotUsage              copilotUsageTotals
 	// extraPromptTokens / extraCompletionTokens accumulate out-of-band token
 	// spend that is separate from the turn's own reported usage — e.g. an
 	// internal /responses compaction call made while serving a 413 oversized-
@@ -70,7 +85,8 @@ type RequestSummary struct {
 	// statsSuppressed excludes local shutdown rejections and lifecycle-canceled
 	// in-flight work from provider traffic accounting. A semantic provider failure
 	// already recorded in failureStatus wins and cannot be suppressed afterward.
-	statsSuppressed bool
+	statsSuppressed   bool
+	retryStatsTracked atomic.Bool
 }
 
 // WithRequestSummary attaches a mutable request summary to ctx and returns both
@@ -85,6 +101,30 @@ func WithRequestSummary(ctx context.Context) (context.Context, *RequestSummary) 
 	}
 	summary := &RequestSummary{}
 	return context.WithValue(ctx, requestSummaryContextKey{}, summary), summary
+}
+
+// AcquireRequestSummary attaches a pooled summary when ctx does not already
+// carry one. Server middleware must call ReleaseRequestSummary only when owned
+// is true and only after handler, stats, and logging work has completed.
+func AcquireRequestSummary(ctx context.Context) (context.Context, *RequestSummary, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if existing := RequestSummaryFromContext(ctx); existing != nil {
+		return ctx, existing, false
+	}
+	summary := requestSummaryPool.Get().(*RequestSummary)
+	*summary = RequestSummary{}
+	return context.WithValue(ctx, requestSummaryContextKey{}, summary), summary, true
+}
+
+// ReleaseRequestSummary returns a server-owned summary to the pool.
+func ReleaseRequestSummary(summary *RequestSummary) {
+	if summary == nil {
+		return
+	}
+	*summary = RequestSummary{}
+	requestSummaryPool.Put(summary)
 }
 
 // RequestSummaryFromContext returns the mutable request summary attached to ctx,
@@ -498,18 +538,34 @@ func (s *RequestSummary) setOpenAIUsage(usage *models.OpenAIUsage) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.promptTokens = summaryIntPtr(usage.PromptTokens)
-	s.completionTokens = summaryIntPtr(usage.CompletionTokens)
-	s.totalTokens = summaryIntPtr(usage.TotalTokens)
+	s.promptTokensValue = usage.PromptTokens
+	s.completionTokensValue = usage.CompletionTokens
+	s.totalTokensValue = usage.TotalTokens
+	s.promptTokens = &s.promptTokensValue
+	s.completionTokens = &s.completionTokensValue
+	s.totalTokens = &s.totalTokensValue
 	if usage.PromptTokensDetails != nil {
-		s.cachedTokens = summaryIntPtr(usage.PromptTokensDetails.CachedTokens)
+		s.cachedTokensValue = usage.PromptTokensDetails.CachedTokens
+		s.cachedTokens = &s.cachedTokensValue
 	}
-	if usage.CompletionTokensDetails != nil {
-		s.reasoningTokens = summaryIntPtr(usage.CompletionTokensDetails.ReasoningTokens)
+	s.reasoningTokensValue = usage.ReasoningTokens
+	if usage.CompletionTokensDetails != nil && usage.CompletionTokensDetails.ReasoningTokens > 0 {
+		s.reasoningTokensValue = usage.CompletionTokensDetails.ReasoningTokens
 	}
+	s.reasoningTokens = &s.reasoningTokensValue
 }
 
-func summaryIntPtr(v int) *int { return &v }
+func (s *RequestSummary) setErrorDetail(errType, code, param, message string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.errorType != "" || s.errorCode != "" || s.errorParam != "" || s.errorMessage != "" {
+		return
+	}
+	s.errorType, s.errorCode, s.errorParam, s.errorMessage = errType, code, param, message
+}
 
 // setFailureStatus records an out-of-band failure status (first one wins) for a
 // request whose HTTP status was already committed before the failure was known.
@@ -670,8 +726,32 @@ func (s *RequestSummary) LoggerFields() []logger.Field {
 	if s.totalTokens != nil {
 		fields = append(fields, logger.F("total_tokens", *s.totalTokens))
 	}
+	if s.cachedTokens != nil {
+		fields = append(fields, logger.F("cached_tokens", *s.cachedTokens))
+	}
+	if s.reasoningTokens != nil {
+		fields = append(fields, logger.F("reasoning_tokens", *s.reasoningTokens))
+	}
+	if s.copilotUsage.TotalNanoAIU > 0 {
+		fields = append(fields, logger.F("total_nano_aiu", s.copilotUsage.TotalNanoAIU))
+	}
+	if s.copilotUsage.ComputeUnits > 0 {
+		fields = append(fields, logger.F("compute_units", s.copilotUsage.ComputeUnits))
+	}
 	if s.statsSuppressed {
 		fields = append(fields, logger.F("stats_suppressed", true))
+	}
+	if s.errorType != "" {
+		fields = append(fields, logger.F("error_type", s.errorType))
+	}
+	if s.errorCode != "" {
+		fields = append(fields, logger.F("error_code", s.errorCode))
+	}
+	if s.errorParam != "" {
+		fields = append(fields, logger.F("error_param", s.errorParam))
+	}
+	if s.errorMessage != "" {
+		fields = append(fields, logger.F("error_message", s.errorMessage))
 	}
 	return fields
 }
@@ -771,5 +851,229 @@ func observeChatExecutionError(ctx context.Context, executionErr *chatExecutionE
 		if len(executionErr.Headers) > 0 {
 			summary.setUpstreamRequestID(UpstreamRequestID(executionErr.Headers))
 		}
+		// Closed by default. Only a message a constructor declared constant is vekil's own
+		// words; anything else either quotes the request back or interpolates a client value
+		// into vekil's prose, and both are request content.
+		message := ""
+		if executionErr.staticMessage {
+			message = executionErr.Message
+		}
+		errorType, code, param := executionErr.Type, executionErr.Code, executionErr.Param
+		if !executionErr.upstreamAuthored {
+			// Local paths are gated too. They are vekil's prose, but not every segment in
+			// them is vekil's: the JSON walker reports the client's own key.
+			param = safeLocalClassifierParam(param)
+		}
+		if executionErr.upstreamAuthored {
+			// Same grammar gate as observeUpstreamErrorDetail. Hardening one of the two
+			// paths and not the other is how the prose gets in.
+			errorType = safeUpstreamClassifierCode(errorType)
+			code = safeUpstreamClassifierCode(code)
+			param = safeUpstreamClassifierParam(param)
+		}
+		if executionErr.clientDerived {
+			// Record only the parent path vekil built -- never a substring of the joined one,
+			// because the client's field name may contain dots and would survive the split.
+			param = safeLocalClassifierParam(executionErr.safeParam)
+		}
+		summary.setErrorDetail(errorType, code, param, message)
 	}
+}
+
+// Classifiers only. The parsed message is deliberately dropped: upstream 400s quote the
+// rejected value back, so the prose is request content and the summary is not the place.
+const maxUpstreamClassifierBytes = 128
+
+// upstreamErrorClassifiers is an upstream error envelope reduced to the fields that match
+// their grammar. The message is deliberately absent: an upstream 400 quotes the rejected
+// value back, so it is client content and must neither travel nor be logged.
+type upstreamErrorClassifiers struct {
+	errorType string
+	code      string
+	param     string
+}
+
+func (c upstreamErrorClassifiers) empty() bool {
+	return c.errorType == "" && c.code == "" && c.param == ""
+}
+
+// safeUpstreamErrorClassifiers reduces the body at the boundary that reads it, so the prose
+// is dropped there rather than carried further and trimmed later.
+func safeUpstreamErrorClassifiers(status int, body []byte) upstreamErrorClassifiers {
+	if len(body) == 0 {
+		return upstreamErrorClassifiers{}
+	}
+	details := parseResponsesChatErrorDetails(status, body)
+	code, _ := details.code.(string)
+	param, _ := details.param.(string)
+	return upstreamErrorClassifiers{
+		errorType: safeUpstreamClassifierCode(details.errorType),
+		code:      safeUpstreamClassifierCode(code),
+		param:     safeUpstreamClassifierParam(param),
+	}
+}
+
+func observeUpstreamErrorDetail(ctx context.Context, status int, body []byte) {
+	observeUpstreamErrorClassifiers(ctx, safeUpstreamErrorClassifiers(status, body))
+}
+
+// observeUpstreamErrorClassifiers records classifiers already reduced elsewhere. The Chat
+// surfaces need the split because the boundary that reads the body runs on the
+// lifecycle-rooted upstream context, which carries no request summary by design.
+func observeUpstreamErrorClassifiers(ctx context.Context, classifiers upstreamErrorClassifiers) {
+	summary := RequestSummaryFromContext(ctx)
+	if summary == nil || classifiers.empty() {
+		return
+	}
+	summary.setErrorDetail(classifiers.errorType, classifiers.code, classifiers.param, "")
+}
+
+// An upstream classifier is a lowercase identifier (`invalid_request_body`) and a param is
+// a JSON path (`tools[0].input_schema`). Character shape alone is not proof -- `SSN_123-45`
+// is all "safe" characters -- so these match the grammars, and anything else is dropped.
+func safeUpstreamClassifierCode(value string) string {
+	if value == "" || len(value) > maxUpstreamClassifierBytes {
+		return ""
+	}
+	for i, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9', r == '_':
+			if i == 0 {
+				return ""
+			}
+		default:
+			return ""
+		}
+	}
+	return value
+}
+
+// Top-level request fields across the Chat, Responses and Anthropic shapes vekil sends. A
+// closed set on purpose: it is what makes an upstream param safe to log, and it changes only
+// when an API grows a top-level field.
+var upstreamClassifierParamRoots = map[string]struct{}{
+	"audio": {}, "background": {}, "conversation": {}, "frequency_penalty": {},
+	"include": {}, "input": {}, "instructions": {}, "logit_bias": {}, "logprobs": {},
+	"max_completion_tokens": {}, "max_output_tokens": {}, "max_tokens": {}, "messages": {},
+	"metadata": {}, "modalities": {}, "model": {}, "n": {}, "parallel_tool_calls": {},
+	"prediction": {}, "presence_penalty": {}, "previous_response_id": {}, "prompt": {},
+	"reasoning": {}, "reasoning_effort": {}, "response_format": {}, "safety_identifier": {},
+	"seed": {}, "service_tier": {}, "stop": {}, "stop_sequences": {}, "store": {},
+	"stream": {}, "stream_options": {}, "system": {}, "temperature": {}, "text": {},
+	"thinking": {}, "tool_choice": {}, "tools": {}, "top_k": {}, "top_logprobs": {},
+	"top_p": {}, "truncation": {}, "user": {},
+}
+
+// safeUpstreamClassifierParam keeps an upstream param's ROOT segment and nothing below it.
+//
+// Grammar alone does not make an upstream param safe: upstream quotes the request back, and
+// a client-chosen key is often a plain lower-snake identifier. "metadata.customer_ssn" and a
+// bare "customer_ssn" both pass an identifier check untouched, and the local-error path in
+// this same file goes to the trouble of stripping exactly that. Client-chosen names only
+// ever appear below the root -- map keys under metadata, property names under a tool's JSON
+// schema -- or as a root that is not a request field at all, so keeping a recognised root
+// and dropping the rest admits neither.
+//
+// The cost is precision: "tools[0].input_schema" logs as "tools". An unrecognised root
+// drops the param entirely rather than logging a name vekil cannot vouch for.
+func safeUpstreamClassifierParam(value string) string {
+	if value == "" || len(value) > maxUpstreamClassifierBytes {
+		return ""
+	}
+	root, _, _ := strings.Cut(value, ".")
+	name, index, bracketed := strings.Cut(root, "[")
+	if _, known := upstreamClassifierParamRoots[name]; !known {
+		return ""
+	}
+	if !bracketed {
+		return name
+	}
+	digits, ok := strings.CutSuffix(index, "]")
+	if !ok || digits == "" {
+		return ""
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return name
+}
+
+// Nested field names vekil's own request validators enumerate, derived from the field lists
+// passed to validateChatRawObjectFields and validatePolicyResponsesObjectFields. With
+// upstreamClassifierParamRoots these are the segments vekil OWNS; a segment outside both sets
+// came from the request, whatever built the path.
+var localClassifierParamSegments = map[string]struct{}{
+	"arguments": {}, "call_id": {}, "content": {}, "custom": {}, "defer_loading": {},
+	"description": {}, "detail": {}, "effort": {}, "format": {}, "function": {}, "id": {},
+	"image_url": {}, "input": {}, "json_schema": {}, "name": {}, "namespace": {},
+	"output": {}, "parameters": {}, "phase": {}, "reasoning": {}, "refusal": {},
+	"response_format": {}, "role": {}, "schema": {}, "status": {}, "strict": {},
+	"summary": {}, "text": {}, "tool_call_id": {}, "tool_calls": {}, "tool_choice": {},
+	"tools": {}, "type": {}, "url": {},
+}
+
+// ownedParamSegment reports whether one path segment is a name vekil owns, with an optional
+// numeric index. Indices are vekil's own; a quoted or non-numeric subscript is not.
+func ownedParamSegment(segment string) bool {
+	name, index, bracketed := strings.Cut(segment, "[")
+	if name == "" || !isLowerSnakeIdentifier(name) {
+		return false
+	}
+	if _, root := upstreamClassifierParamRoots[name]; !root {
+		if _, field := localClassifierParamSegments[name]; !field {
+			return false
+		}
+	}
+	if !bracketed {
+		return true
+	}
+	digits, ok := strings.CutSuffix(index, "]")
+	if !ok || digits == "" {
+		return false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// safeLocalClassifierParam keeps a param path only as far as vekil can vouch for it, cutting
+// at the first segment that is not a name it owns.
+//
+// Closed by construction rather than by discipline. newChatInvalidRequest takes its param as
+// an argument, so it cannot vouch for what it was handed, and a generic path builder joins
+// the CLIENT's object keys into the path it reports: walkPolicyResponsesJSON put
+// "metadata.customer_ssn.value" one call away from the request log. Cutting on an unknown
+// segment covers every such builder, including ones not written yet, without asking 194 call
+// sites to stay careful. An unrecognised schema field costs precision, never correctness.
+func safeLocalClassifierParam(value string) string {
+	if value == "" || len(value) > maxUpstreamClassifierBytes {
+		return ""
+	}
+	segments := strings.Split(value, ".")
+	kept := 0
+	for kept < len(segments) && ownedParamSegment(segments[kept]) {
+		kept++
+	}
+	return strings.Join(segments[:kept], ".")
+}
+
+func isLowerSnakeIdentifier(value string) bool {
+	for i, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9', r == '_':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return value != ""
 }

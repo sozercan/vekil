@@ -71,6 +71,7 @@ func TestValidateAnthropicOutputConfigEffort(t *testing.T) {
 		{name: "null", body: `{"output_config":{"effort":null}}`},
 		{name: "empty", body: `{"output_config":{"effort":""}}`},
 		{name: "whitespace", body: `{"output_config":{"effort":" \t\n "}}`},
+		{name: "duplicate ending in null", body: `{"output_config":{"effort":"high","effort":null}}`},
 	} {
 		t.Run("rejects "+tc.name, func(t *testing.T) {
 			err := validateAnthropicOutputConfigEffort([]byte(tc.body))
@@ -900,6 +901,107 @@ func TestMapStopReason(t *testing.T) {
 			got := MapStopReason(tt.input)
 			if got != tt.expect {
 				t.Errorf("MapStopReason(%v) = %q, want %q", tt.input, got, tt.expect)
+			}
+		})
+	}
+}
+
+// Claude Code sends several system blocks, so this is the normal shape. Raw
+// concatenation welds a heading onto the previous sentence and stops it being one.
+func TestParseSystemMessageJoinsBlocksWithoutWeldingThem(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"text","text":"You are Claude Code, Anthropic's official CLI."},
+		{"type":"text","text":"# Tone\nBe concise.","cache_control":{"type":"ephemeral"}},
+		{"type":"text","text":"# Memory\nUser prefers pytest -x."}
+	]`)
+	msg, err := parseSystemMessage(raw)
+	if err != nil {
+		t.Fatalf("parseSystemMessage: %v", err)
+	}
+	var got string
+	if err := json.Unmarshal(msg.Content, &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, welded := range []string{".# Tone", ".# Memory"} {
+		if strings.Contains(got, welded) {
+			t.Fatalf("blocks welded at %q:\n%s", welded, got)
+		}
+	}
+	for _, heading := range []string{"\n# Tone", "\n# Memory"} {
+		if !strings.Contains(got, heading) {
+			t.Fatalf("heading %q lost its line start:\n%s", heading, got)
+		}
+	}
+	for _, frag := range []string{"official CLI.", "Be concise.", "pytest -x."} {
+		if !strings.Contains(got, frag) {
+			t.Fatalf("content %q missing:\n%s", frag, got)
+		}
+	}
+}
+
+func TestParseSystemMessageSkipsEmptyBlocks(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"text","text":"first"},{"type":"text","text":""},{"type":"text","text":"second"}]`)
+	msg, err := parseSystemMessage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	_ = json.Unmarshal(msg.Content, &got)
+	if got != "first\nsecond" {
+		t.Fatalf("got %q, want %q", got, "first\nsecond")
+	}
+}
+
+// A second newline at a boundary that already has one invents a paragraph break.
+func TestParseSystemMessageDoesNotDoubleExistingNewlines(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"previous block ends in a newline", `[{"type":"text","text":"first\n"},{"type":"text","text":"second"}]`, "first\nsecond"},
+		{"next block begins with a newline", `[{"type":"text","text":"first"},{"type":"text","text":"\nsecond"}]`, "first\nsecond"},
+		{"previous block ends in CRLF", `[{"type":"text","text":"first\r\n"},{"type":"text","text":"second"}]`, "first\r\nsecond"},
+		{"next block begins with CRLF", `[{"type":"text","text":"first"},{"type":"text","text":"\r\nsecond"}]`, "first\r\nsecond"},
+		{"previous block ends in bare CR", `[{"type":"text","text":"first\r"},{"type":"text","text":"second"}]`, "first\rsecond"},
+		{"next block begins with bare CR", `[{"type":"text","text":"first"},{"type":"text","text":"\rsecond"}]`, "first\rsecond"},
+		{"neither boundary supplies one", `[{"type":"text","text":"first"},{"type":"text","text":"second"}]`, "first\nsecond"},
+		{"a deliberate blank line is preserved", `[{"type":"text","text":"first\n\n"},{"type":"text","text":"second"}]`, "first\n\nsecond"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, err := parseSystemMessage(json.RawMessage(tc.raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got string
+			_ = json.Unmarshal(msg.Content, &got)
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+
+			var blocks []models.ContentBlock
+			if err := json.Unmarshal([]byte(tc.raw), &blocks); err != nil {
+				t.Fatal(err)
+			}
+			blocks[0].CacheControl = json.RawMessage(`{"type":"ephemeral"}`)
+			cachedRaw, err := json.Marshal(blocks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cached, err := nativeChatSystemCacheMessages(cachedRaw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var joined strings.Builder
+			for _, message := range cached {
+				var text string
+				if err := json.Unmarshal(message.Content, &text); err != nil {
+					t.Fatal(err)
+				}
+				joined.WriteString(text)
+			}
+			if joined.String() != tc.want {
+				t.Fatalf("cached system text = %q, want %q", joined.String(), tc.want)
 			}
 		})
 	}

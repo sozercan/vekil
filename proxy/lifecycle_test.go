@@ -28,11 +28,126 @@ func TestNewProxyHandlerInitializesLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProxyHandler() error = %v", err)
 	}
-	if handler.lifecycleCtx == nil || handler.lifecycleCancel == nil {
+	if handler.lifecycleCtx == nil || handler.retryTrackedLifecycleCtx == nil || handler.lifecycleCancel == nil {
 		t.Fatal("NewProxyHandler() did not initialize the lifecycle context")
 	}
 	if err := handler.lifecycleCtx.Err(); err != nil {
 		t.Fatalf("new lifecycle context error = %v, want active context", err)
+	}
+	if !isRetryStatsTracked(handler.retryTrackedLifecycleCtx) {
+		t.Fatal("tracked lifecycle context is missing its retry-stats marker")
+	}
+}
+
+func TestRequestBodyLifecycleBindingPreservesFirstCause(t *testing.T) {
+	t.Run("client cancellation before shutdown", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+		req.Body = &fixedErrorReadCloser{err: context.Canceled}
+		binding := handler.BindRequestBodyToLifecycle(req, nil)
+		defer binding.Release()
+
+		cancel()
+		handler.BeginShutdown()
+		_, err := req.Body.Read(make([]byte, 1))
+		if !errors.Is(err, context.Canceled) || errors.Is(err, errProxyLifecycleShutdown) {
+			t.Fatalf("Read() error = %v, want client context cancellation", err)
+		}
+	})
+
+	t.Run("shutdown before client cancellation", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+		req.Body = &fixedErrorReadCloser{err: context.Canceled}
+		binding := handler.BindRequestBodyToLifecycle(req, nil)
+		defer binding.Release()
+
+		handler.BeginShutdown()
+		cancel()
+		_, err := req.Body.Read(make([]byte, 1))
+		if !errors.Is(err, errProxyLifecycleShutdown) {
+			t.Fatalf("Read() error = %v, want lifecycle shutdown cause", err)
+		}
+	})
+
+	t.Run("completed binding before shutdown", func(t *testing.T) {
+		handler := &ProxyHandler{}
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Body = &fixedErrorReadCloser{err: context.Canceled}
+		binding := handler.BindRequestBodyToLifecycle(req, nil)
+		binding.Release()
+
+		handler.BeginShutdown()
+		_, err := req.Body.Read(make([]byte, 1))
+		if !errors.Is(err, context.Canceled) || errors.Is(err, errProxyLifecycleShutdown) {
+			t.Fatalf("Read() error = %v, want completed binding to retain original error", err)
+		}
+	})
+}
+
+func TestRequestBodyLifecycleBindingReleaseAndRecycleRestoresOriginalBody(t *testing.T) {
+	handler := &ProxyHandler{}
+	original := io.NopCloser(strings.NewReader("request body"))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = original
+	binding := handler.BindRequestBodyToLifecycle(req, nil)
+	if req.Body == original {
+		t.Fatal("BindRequestBodyToLifecycle() did not install a wrapper")
+	}
+
+	binding.ReleaseAndRecycle(req)
+	if req.Body != original {
+		t.Fatal("ReleaseAndRecycle() did not restore the original request body")
+	}
+}
+
+func TestRequestBodyLifecycleBindingReleaseAndRecycleIsLeaseScoped(t *testing.T) {
+	handler := &ProxyHandler{}
+	firstOriginal := io.NopCloser(strings.NewReader("first request"))
+	firstRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	firstRequest.Body = firstOriginal
+	firstBinding := handler.BindRequestBodyToLifecycle(firstRequest, nil)
+	staleBinding := firstBinding
+	body := firstBinding.body
+
+	recycled := 0
+	recycle := func(*lifecycleRequestBody) { recycled++ }
+	firstBinding.releaseAndRecycle(firstRequest, recycle)
+	staleBinding.releaseAndRecycle(firstRequest, recycle)
+	if recycled != 1 {
+		t.Fatalf("recycle calls = %d, want 1 after duplicate release", recycled)
+	}
+	if firstRequest.Body != firstOriginal {
+		t.Fatal("duplicate release changed the restored first request body")
+	}
+
+	secondOriginal := io.NopCloser(strings.NewReader("second request"))
+	secondRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	secondRequest.Body = secondOriginal
+	secondLease := body.beginLease(secondOriginal, secondRequest.Context(), handler, nil)
+	secondRequest.Body = body
+	if !handler.registerLifecycleRequestBody(body) {
+		t.Fatal("registerLifecycleRequestBody() = false for reused wrapper")
+	}
+	secondBinding := RequestBodyLifecycleBinding{body: body, lease: secondLease}
+
+	staleBinding.releaseAndRecycle(firstRequest, recycle)
+	if body.released.Load() {
+		t.Fatal("stale binding released a reused request body")
+	}
+	if secondRequest.Body != body {
+		t.Fatal("stale binding replaced the reused request body")
+	}
+
+	secondBinding.releaseAndRecycle(secondRequest, recycle)
+	if recycled != 2 {
+		t.Fatalf("recycle calls = %d, want 2 after current lease release", recycled)
+	}
+	if secondRequest.Body != secondOriginal {
+		t.Fatal("current lease release did not restore the second request body")
 	}
 }
 

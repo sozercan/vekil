@@ -21,7 +21,7 @@ import (
 
 const (
 	liveCopilotBaseURL       = "https://api.githubcopilot.com"
-	liveCopilotIntegrationID = "vscode-chat"
+	liveCopilotIntegrationID = "copilot-developer-cli"
 )
 
 type liveCopilotAuthObservation struct {
@@ -147,7 +147,7 @@ func TestLiveEnvAccessTokenDirectBearer(t *testing.T) {
 	}
 	model := selectLiveCopilotResponsesModel(modelsResponse.Data)
 	if model == "" {
-		t.Fatal("live Copilot catalog did not advertise a /responses model")
+		t.Fatal("live Copilot catalog did not advertise an approved lightweight /responses model")
 	}
 
 	responsesToken, err := a.GetResponsesToken(ctx)
@@ -241,20 +241,19 @@ func TestSelectLiveCopilotResponsesModel(t *testing.T) {
 			want: "gpt-5.6-luna",
 		},
 		{
-			name: "falls back to advertised model",
+			name: "rejects unapproved fallback",
 			models: []liveCopilotModel{
 				{ID: "gpt-5.6-luna", SupportedEndpoints: []string{"/responses"}, ModelPickerEnabled: &disabled},
 				{ID: "future-responses-model", SupportedEndpoints: []string{"/responses"}},
 			},
-			want: "future-responses-model",
 		},
 		{
 			name: "skips policy-disabled model",
 			models: []liveCopilotModel{
 				liveCopilotModelWithPolicyState("gpt-5.6-luna", "disabled"),
-				{ID: "future-responses-model", SupportedEndpoints: []string{"/responses"}},
+				{ID: "gpt-5-mini", SupportedEndpoints: []string{"/responses"}},
 			},
-			want: "future-responses-model",
+			want: "gpt-5-mini",
 		},
 		{
 			name: "rejects missing responses support",
@@ -269,6 +268,21 @@ func TestSelectLiveCopilotResponsesModel(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := selectLiveCopilotResponsesModel(tt.models); got != tt.want {
 				t.Fatalf("selectLiveCopilotResponsesModel() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSetLiveCopilotRequestHeadersUsesCLIIntegration(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		t.Run(method, func(t *testing.T) {
+			req, err := http.NewRequest(method, liveCopilotBaseURL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			setLiveCopilotRequestHeaders(req, "github_pat_test")
+			if got := req.Header.Get("Copilot-Integration-Id"); got != "copilot-developer-cli" {
+				t.Fatalf("integration = %q, want copilot-developer-cli", got)
 			}
 		})
 	}
@@ -309,9 +323,8 @@ func decodeLiveCopilotJSONResponse(resp *http.Response, target any) error {
 
 func selectLiveCopilotResponsesModel(models []liveCopilotModel) string {
 	const responsesEndpoint = "/responses"
-	preferred := []string{"gpt-5.6-luna", "gpt-5.4-mini", "gpt-5-mini"}
+	preferred := []string{"gpt-5.6-luna", "gpt-5-mini", "gpt-5.4-mini"}
 	available := make(map[string]struct{}, len(models))
-	fallback := ""
 	for _, model := range models {
 		id := strings.TrimSpace(model.ID)
 		if id == "" || (model.ModelPickerEnabled != nil && !*model.ModelPickerEnabled) ||
@@ -320,16 +333,13 @@ func selectLiveCopilotResponsesModel(models []liveCopilotModel) string {
 			continue
 		}
 		available[id] = struct{}{}
-		if fallback == "" {
-			fallback = id
-		}
 	}
 	for _, model := range preferred {
 		if _, ok := available[model]; ok {
 			return model
 		}
 	}
-	return fallback
+	return ""
 }
 
 func liveCopilotModelWithPolicyState(id, state string) liveCopilotModel {

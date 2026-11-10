@@ -132,6 +132,20 @@
     color: var(--muted); margin: 0 0 6px;
   }
   .desc { color: var(--muted); font-size: 12px; margin: 0 0 12px; line-height: 1.4; }
+  .state-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+  .state-heading h2 { margin: 0; }
+  .state-health { color: var(--accent-2); font-size: 12px; font-weight: 600; }
+  .state-message { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+  .state-capacity { display: flex; align-items: center; gap: 12px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+  .state-capacity progress { flex: 1; min-width: 0; height: 8px; accent-color: var(--accent-2); }
+  .state-capacity[hidden] { display: none; }
+  #stateBindings .uval { font-size: 20px; }
+  .state-warning { border-color: var(--warn); }
+  .state-warning .state-health, .state-warning .state-message { color: var(--warn); }
+  .state-warning progress { accent-color: var(--warn); }
+  .state-critical { border-color: var(--err); }
+  .state-critical .state-health, .state-critical .state-message { color: var(--err); }
+  .state-critical progress { accent-color: var(--err); }
   .narrative {
     background: linear-gradient(90deg, rgba(88,166,255,.10), rgba(63,185,80,.05));
     border: 1px solid var(--border);
@@ -238,6 +252,24 @@
     <div class="card"><div class="label">Upstream retries</div><div id="retries" class="value">0</div><div id="retriesSub" class="card-sub"></div></div>
     <div class="card"><div class="label">Total tokens</div><div id="tottok" class="value">0</div></div>
   </div>
+
+  <section id="stateBindings" class="panel" aria-labelledby="stateTitle" hidden>
+    <div class="state-heading">
+      <h2 id="stateTitle">Provider state</h2>
+      <span id="stateHealth" class="state-health" role="status"></span>
+    </div>
+    <div class="usage-grid">
+      <div class="usage"><div class="label">Storage</div><div id="stateMode" class="uval"></div></div>
+      <div class="usage"><div class="label">Entries</div><div id="stateEntries" class="uval"></div><div class="usub">includes conflict tombstones</div></div>
+      <div class="usage"><div class="label">Capacity</div><div id="stateMax" class="uval"></div><div class="usub">maximum entries</div></div>
+      <div class="usage"><div class="label">Database size</div><div id="stateBytes" class="uval"></div><div id="stateBytesDetail" class="usub"></div></div>
+    </div>
+    <div id="stateCapacity" class="state-capacity">
+      <progress id="stateProgress" max="100" value="0" aria-label="Provider state capacity used"></progress>
+      <span id="statePercent"></span>
+    </div>
+    <p id="stateMessage" class="state-message"></p>
+  </section>
 
   <div class="panel">
     <h2>Requests / second</h2>
@@ -525,6 +557,65 @@
     d.className = "dot" + (state ? " " + state : "");
   }
 
+  function renderStateBindings(state) {
+    var panel = document.getElementById("stateBindings");
+    panel.hidden = !state || !state.mode;
+    if (panel.hidden) return;
+    var durable = state.mode === "durable";
+    var status = state.status || "unavailable";
+    var capacity = state.capacity_status || "unknown";
+    var level = "", health = "Ready";
+    var message = durable
+      ? "Entries stay until explicit offline pruning. Capacity does not reserve disk space."
+      : "Ownership is held in this process. Entries expire or evict at capacity and are lost on restart.";
+    if (capacity === "warning" || capacity === "critical") {
+      level = capacity === "critical" ? "state-critical" : "state-warning";
+      health = capacity === "critical" ? "Nearly full" : "Capacity warning";
+      message = durable
+        ? "Increase max_entries and restart, or stop the proxy and explicitly prune old entries before capacity is reached. Pruning breaks affected continuations."
+        : "Memory capacity is running low. New entries will evict older ownership at capacity, breaking affected continuations.";
+    } else if (capacity === "exhausted") {
+      level = "state-critical";
+      health = "At capacity";
+      message = durable
+        ? "New provider state cannot be committed. Increase max_entries and restart, or stop the proxy and explicitly prune old entries. Existing records stay in place."
+        : "New entries evict older ownership, breaking affected continuations. Restarting clears all in-memory ownership.";
+    }
+    if (status === "frozen") {
+      level = "state-critical";
+      health = "Storage frozen";
+      message = "Storage failed and provider state is blocked. Preserve the database, resolve the storage failure, and restart the proxy.";
+    } else if (status === "closed") {
+      level = "state-warning";
+      health = "Storage closed";
+      message = "The proxy has closed its provider-state database. Counts and size are unavailable.";
+    } else if (status !== "ready") {
+      level = "state-warning";
+      health = "Storage metrics unavailable";
+      message = "The proxy could not read all storage metrics. Check the proxy logs and storage before relying on the capacity display.";
+    }
+    panel.className = "panel" + (level ? " " + level : "");
+    document.getElementById("stateHealth").textContent = health;
+    document.getElementById("stateMode").textContent = durable ? "Durable" : "Memory";
+    document.getElementById("stateEntries").textContent = state.entries == null ? "Unavailable" : state.entries.toLocaleString("en-US");
+    document.getElementById("stateMax").textContent = state.max_entries ? state.max_entries.toLocaleString("en-US") : "Unavailable";
+    var bytes = state.database_bytes;
+    var size = "Unavailable";
+    if (!durable) size = "No database";
+    else if (bytes != null) {
+      var units = ["B", "KiB", "MiB", "GiB", "TiB"], unit = 0, value = bytes;
+      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+      size = value.toFixed(unit ? 1 : 0) + " " + units[unit];
+    }
+    document.getElementById("stateBytes").textContent = size;
+    document.getElementById("stateBytesDetail").textContent = durable && bytes != null ? bytes.toLocaleString("en-US") + " bytes in file" : "";
+    var percent = state.capacity_usage_percent;
+    document.getElementById("stateCapacity").hidden = percent == null;
+    document.getElementById("stateProgress").value = percent == null ? 0 : Math.min(percent, 100);
+    document.getElementById("statePercent").textContent = percent == null ? "" : percent.toFixed(1) + "% used";
+    document.getElementById("stateMessage").textContent = message;
+  }
+
   function render(s) {
     var series = s.series || [];
     var reqps = recentRate(series, "req", 5);
@@ -561,6 +652,7 @@
     document.getElementById("uErrPct").textContent = t.requests ? errRate.toFixed(errRate < 10 ? 1 : 0) + "% rate" : "";
 
     lastSnapshot = s;
+    renderStateBindings(s.state_bindings);
     applyBreakdowns();
     renderStatus(s.status);
     renderErrorBars("statusCodes", s.status_codes, "No errors");

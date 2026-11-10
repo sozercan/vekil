@@ -35,6 +35,13 @@ vekil launch codex \
 Arguments after `--` are forwarded to the selected agent:
 
 ```bash
+vekil launch claude --model claude-opus-5 -- \
+  --resume 56d7498d-6b2e-47ca-92a6-92ddee84ab25
+
+vekil launch codex -- resume --last
+
+vekil launch copilot --model gpt-5.4-mini -- --continue
+
 vekil launch codex -- \
   exec --ephemeral --skip-git-repo-check "Review this workspace"
 
@@ -42,10 +49,24 @@ vekil launch copilot --model gpt-5.4-mini -- \
   --allow-all-tools -p "Review this workspace" -s
 ```
 
-Each launcher reserves model, provider, remote-session, resume, and other
-arguments that could replace the validated routing layer or leave work running
-outside the ephemeral proxy lifecycle. To pin Claude Code or Codex CLI, use the
-launcher's `--model` before `--`; forwarded model overrides remain rejected.
+Foreground resume and fork arguments remain attached to the supervised child
+process and are forwarded. Each launcher still reserves model, provider,
+remote-session, background, server, and other arguments that could replace the
+validated routing layer or leave work running outside the ephemeral proxy
+lifecycle. To pin Claude Code or Codex CLI, use the launcher's `--model` before
+`--`; forwarded model overrides remain rejected.
+
+The proxy and its local credential are ephemeral. Agent-owned conversation
+history can persist across launches, and a resumed conversation uses the new
+launch's provider routing and optional model pin.
+
+Schema-v2 explicit routes retain durable provider-state ownership across launches
+using the same `state_bindings` block and default file as the normal CLI and tray
+app. Each file has one writer. Separate simultaneous launches need distinct
+files, or `--state-bindings-mode memory` for intentionally temporary ownership.
+Multiple clients sharing one running proxy remain supported. Websocket history
+and Responses-backed Chat replay remain process-local; see
+[State Recovery](state-recovery.md) for reconnect and retention limits.
 
 ## Model selection modes
 
@@ -101,6 +122,9 @@ normal global policy-controller startup behavior.
 |------|---------|
 | `--model ID` | Public Vekil model ID to validate, scope, and pin. Optional for Claude Code and Codex CLI; required for GitHub Copilot CLI. |
 | `--providers-config SOURCE` | Local path or HTTP(S) URL to JSON or YAML provider configuration. |
+| `--state-bindings-mode config\|durable\|memory` | Optional override of the shared providers-file state mode. |
+| `--state-bindings-file PATH` | Optional distinct durable file in an existing private directory. |
+| `--state-bindings-max-entries COUNT` | Optional logical-record capacity override; zero follows the providers file. |
 | `--token-dir PATH` | Copilot token storage directory used by Vekil. |
 | `--port PORT` | Local proxy port. Default `0` lets the OS allocate one. |
 | `--binary PATH` | Agent executable override. |
@@ -131,6 +155,9 @@ settings are printed as `unresolved` instead of being guessed.
 ```bash
 vekil launch claude -- --allowed-tools Read
 
+vekil launch claude --model claude-opus-5 -- \
+  --resume 56d7498d-6b2e-47ca-92a6-92ddee84ab25
+
 vekil launch claude --model claude-sonnet-4.5 -- \
   --allowed-tools "Read,Bash(git status:*)"
 ```
@@ -146,22 +173,55 @@ cleanup. Its routing values include:
 - when pinned, `ANTHROPIC_MODEL`, the default Haiku, Sonnet, Opus, and Fable
   aliases, `CLAUDE_CODE_SUBAGENT_MODEL`, and the custom model-picker entry;
 - host-managed provider and subprocess-environment scrubbing flags;
+- a `WebSearch` deny rule, unless the session uses no Copilot provider and the
+  pinned model, if any, is served through native `/v1/messages`. Copilot
+  rejects Anthropic's hosted web search tool and Chat translation cannot carry
+  it, while native `anthropic-compatible` forwarding passes it to the upstream;
 - disabled background-task, agent-view, cron, agent-team, tmux, and remote-control surfaces.
+
+Pinned Claude IDs with a dotted version, such as Copilot's `claude-opus-5.5`,
+are given to Claude Code in Anthropic's hyphenated spelling (`claude-opus-5-5`)
+when the launch proxy confirms that the hyphenated alias reaches the same public
+model. A configured model that owns the hyphenated spelling keeps the dotted ID.
+Claude Code shapes requests from the model ID and would otherwise send
+`thinking.type: disabled` on side queries such as WebFetch, which adaptive-only
+models reject. Policy model IDs are passed unchanged.
+
+Web search comes from Copilot instead. When the launch proxy uses Copilot, the
+launcher probes Vekil's [`POST /mcp/web-search`](api.md#post-mcpweb-search)
+endpoint. If GitHub currently offers web search to the Copilot credential, the
+launcher registers that endpoint as the `vekil` MCP server through an
+owner-only temporary `--mcp-config` file authenticated with the local proxy
+token, so the GitHub credential stays in Vekil. The model sees
+`mcp__vekil__web_search`, an AI search agent's answer with cited sources. Like
+WebSearch, it asks for permission unless allowed, for example with
+`--allowed-tools mcp__vekil__web_search`. A failed probe prints a warning and
+the session starts without search.
 
 Provider-specific Bedrock, Vertex, Foundry, Mantle, AWS, OAuth, and custom-header
 values are removed from the child environment. Gateway catalog discovery is
 disabled. With `--model`, the proxy independently rejects requests for any model
-other than the selected public model. Without `--model`, Claude resolves its
-normal configured or built-in default and the proxy accepts requests across the
-global public model namespace.
+other than the selected public model and Claude Code's auto-mode classifier.
+Without `--model`, Claude resolves its normal configured or built-in default and
+the proxy accepts requests across the global public model namespace.
 
-Subprocess credential scrubbing keeps Claude in its default (`manual`)
-permission mode. Current Claude Code releases ignore other explicit permission
-modes when that hardening is enabled, so Vekil rejects
-`--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, and
-non-`manual` `--permission-mode` values instead of silently weakening or
-misrepresenting the requested policy. Use `--allowed-tools` and
-`--disallowed-tools` for managed non-interactive tool permissions.
+Auto mode asks a classifier model to approve each action, and Claude Code
+refuses Opus 5.5, Sonnet 5.5, and Opus 5 for that role. A pinned launch sets
+`CLAUDE_CODE_AUTO_MODE_MODEL=claude-sonnet-5`, Claude Code's own default. The
+proxy admits that model only when the provider serving the pinned model also
+owns it, so the classifier never adds providers or credentials. Otherwise auto
+mode cannot approve actions and blocks them. Classifier requests are billed by
+that provider like any other request.
+
+By default the launcher enables Claude Code's subprocess credential scrubbing,
+which keeps the local proxy token out of tool subprocesses. Claude Code then
+starts in its default (`manual`) permission mode whatever the settings say,
+although modes can still be switched inside the session. Passing a non-default
+`--permission-mode` (such as `auto`, `acceptEdits`, or `bypassPermissions`),
+`--dangerously-skip-permissions`, or `--allow-dangerously-skip-permissions`
+turns scrubbing off for that launch so the requested mode applies; tool
+subprocesses can then read the session's local proxy token from their
+environment.
 
 Policy-routing public model IDs (`owned_by: vekil-policy`) are supported in
 pinned mode. Vekil translates Claude's Messages and count-token requests to the
@@ -189,20 +249,26 @@ required.
 
 The default policy mode follows the profile's YAML `mode`; an explicit
 `--policy-routing off|observe|enforce` value can still lower the process-wide
-ceiling. Locally owned `call_vekil_*` continuations retain their originating
-route and tier, including in `enforce`. Opaque continuations from a downstream
+ceiling. Active, locally owned `call_vekil_*` continuations retain their originating
+route and tier, including in `enforce`. Completed tool history permits a later
+user task to select a new effort when both tiers use the same single upstream
+target, as described in [Policy routing](policy-routing.md#locked-v1-scope).
+Opaque continuations from a downstream
 Responses-backed bridge are accepted only for a single-target baseline in
 `off` or `observe`, and that bridge must be one process (the normal loopback
 launcher topology) or use sticky ingress to the replay-owning replica.
 
-Forwarded settings-source, detached-session, resume, model/fallback, incompatible
-permission-mode, and custom-agent overrides are rejected. Use the
-launcher-level `--model` to pin a model; otherwise model selection remains
+Foreground conversation selection, continuation, and fork arguments are
+forwarded. Settings-source, detached or remote session, model/fallback, and
+custom-agent overrides remain rejected. Use
+the launcher-level `--model` to pin a model; otherwise model selection remains
 delegated to Claude's normal default.
 
 ## OpenAI Codex CLI
 
 ```bash
+vekil launch codex -- resume --last
+
 vekil launch codex -- \
   exec --ephemeral --skip-git-repo-check "Reply with exactly OK"
 
@@ -219,6 +285,8 @@ this flow. Vekil instead injects a transient, per-launch
 - `env_key="VEKIL_CODEX_API_KEY"` reads the random local bearer token;
 - `requires_openai_auth=false` prevents Codex/ChatGPT login fallback;
 - `supports_websockets=false` keeps the launcher on deterministic HTTP Responses;
+- generated context budgets prefer the model's prompt/input limit over its
+  total context window, while preserving explicit public catalog overrides;
 - for a policy-owned Chat model, Vekil disables hosted web search, remote
   compaction, Responses Lite, and code-only tool modes; removes Codex's freeform `apply_patch` declaration; and translates
   stateless Responses messages, bounded `text.format` structured-output schemas,
@@ -251,6 +319,12 @@ it. If both tiers omit effort, a valid present value is rejected as unsupported
 and an unset value remains unset. Malformed or blank effort fails locally before
 policy execution.
 
+Semantic routing classifies the latest user task. Long Codex setup instructions
+and completed tool history do not by themselves force `powerful`. With low/max
+tiers on the same single provider/model target, an active tool continuation
+keeps its effort and the next user turn can select a different effort after
+the assistant finishes. See [Policy replay rules](policy-routing.md#locked-v1-scope).
+
 With `--model`, a private temporary one-model Codex catalog is generated from
 the installed CLI's bundled catalog, with Vekil model context, reasoning,
 vision, and tool metadata overlaid when advertised by `/v1/models`. This keeps
@@ -265,18 +339,20 @@ support `/responses`. Because the launcher cannot know the choice in advance,
 an unknown or incompatible default fails when Codex requests it rather than
 during launcher startup.
 
+Foreground `resume`, `fork`, and `exec resume` commands are forwarded.
 Forwarded `-m`/`--model`, `-c`/`--config`, profile, OSS/local-provider, remote,
-resume/fork, app-server, remote-control, cloud, and non-agent command modes are
-rejected. For a pinned policy-owned model, forwarded `--search`, equivalent
-web-search feature toggles, and attempts to re-enable `code_mode`,
-`code_mode_only`, or `remote_compaction_v2` are also rejected so the
-compatibility safeguards remain authoritative. Use the launcher-level
-`--model` to pin a model; otherwise selection remains delegated to Codex's
-normal default.
+app-server, remote-control, cloud, and non-agent command modes remain rejected.
+For a pinned policy-owned model, forwarded `--search`, equivalent web-search
+feature toggles, and attempts to re-enable `code_mode`, `code_mode_only`, or
+`remote_compaction_v2` are also rejected so the compatibility safeguards remain
+authoritative. Use the launcher-level `--model` to pin a model; otherwise
+selection remains delegated to Codex's normal default.
 
 ## GitHub Copilot CLI
 
 ```bash
+vekil launch copilot --model gpt-5.4-mini -- --continue
+
 vekil launch copilot --model gpt-5.4-mini -- \
   --allow-all-tools -p "Reply with exactly OK" -s
 ```
@@ -301,8 +377,10 @@ MCPs. `--secret-env-vars` removes the local token plus provider and GitHub
 credential names from shell and MCP subprocesses. Inherited GitHub, OpenAI,
 Anthropic, Azure, provider, and telemetry-header credentials are removed.
 
-Forwarded model, custom-agent, secret-environment, connect/resume/session,
-remote/export/share, ACP-server, and non-agent subcommands are rejected.
+Foreground local resume and continue arguments are forwarded. Forwarded model,
+custom-agent, connect/session-ID, remote/export/share, ACP-server, and non-agent
+subcommands remain rejected. Copilot's offline launch mode cannot resume remote
+task IDs even though `--resume` accepts task IDs as well as local session IDs.
 
 ## Logs and statistics
 
@@ -316,6 +394,21 @@ The startup banner prints the exact proxy URL and log path. Routes other than
 `/healthz` and `/readyz` require the random session token, so the ordinary
 browser dashboard is not exposed. The end-of-session summary is written to
 stderr so non-interactive agent output on stdout remains pipeline-safe.
+
+The summary includes upstream sends, throttles, reported tokens, and numeric
+provider accounting across the full session. Auxiliary rows identify token
+probes, compaction, memory summaries, classifier calls, and dashboard insights.
+Retries contribute their own reported usage. Native token-count results are
+sizing information and do not become spent inference tokens. The launcher waits
+up to two seconds for client requests, registered background workers, and
+upstream sends to settle before printing these totals. This includes classifiers
+that have been scheduled but have not dispatched yet. If work remains active at
+the deadline, the summary is omitted. See [task usage](dashboard.md#task-usage)
+for reporting limits.
+
+If Codex reports an upstream `408 user_request_timeout`, see
+[Troubleshooting](troubleshooting.md#408-user_request_timeout-timed-out-reading-request-body)
+for retry and diagnosis guidance.
 
 ## Credential and process isolation
 

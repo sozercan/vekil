@@ -249,6 +249,15 @@ cleanup() {
     active_pid=""
     active_pgid=""
   fi
+  if [[ "${proxy_listen_confirmed}" == "1" && -s "${MODELS_JSON}" ]]; then
+    local usage_url=""
+    if [[ -n "${proxy_pid}" ]] && process_is_running "${proxy_pid}"; then
+      usage_url="${PROXY_BASE_URL}"
+    fi
+    "$(python_command)" "${SCRIPT_DIR}/live-smoke-usage.py" \
+      --url "${usage_url}" --label "CLI smoke" --output "${SMOKE_DIR}/usage.json" \
+      || log "Unable to publish smoke usage"
+  fi
   if [[ -n "${proxy_pgid}" ]]; then
     terminate_process_group "${proxy_pid}" "${proxy_pgid}"
     proxy_pid=""
@@ -286,17 +295,20 @@ model_supports_endpoint() {
     .data[]?
     | select(.id == $model)
     | (.supported_endpoints // [])
-    | index($endpoint)
+    # Legacy Copilot Chat models list no endpoints; Vekil treats them as
+    # supporting every endpoint.
+    | (length == 0 or index($endpoint) != null)
   ' "${MODELS_JSON}" >/dev/null
 }
 
 pick_model() {
   local family="$1"
-  shift
+  local endpoint="$2"
+  shift 2
 
   local candidate
   for candidate in "$@"; do
-    if model_exists "${candidate}"; then
+    if model_supports_endpoint "${candidate}" "${endpoint}"; then
       printf '%s\n' "${candidate}"
       return 0
     fi
@@ -304,7 +316,7 @@ pick_model() {
 
   log "Available models from ${PROXY_BASE_URL}/v1/models:"
   jq -r '.data[].id' "${MODELS_JSON}" >&2
-  die "unable to find a ${family} model from preferred list: $*"
+  die "no approved ${family} model supports ${endpoint}; allowed models: $*"
 }
 
 pick_optional_gemini_model() {
@@ -317,24 +329,7 @@ pick_optional_gemini_model() {
     fi
   done
 
-  # The Gemini CLI hits Gemini-native proxy routes, but Vekil translates
-  # those requests to upstream OpenAI chat completions internally, so the
-  # selected model must advertise /chat/completions support.
-  candidate="$(jq -r '
-    [
-      .data[]?
-      | select((.id | type) == "string")
-      | select(.id | startswith("gemini-"))
-      | select((.supported_endpoints // []) | index("/chat/completions"))
-      | .id
-    ][0] // ""
-  ' "${MODELS_JSON}")"
-  if [[ -n "${candidate}" ]]; then
-    printf '%s\n' "${candidate}"
-    return 0
-  fi
-
-  log "Skipping Gemini smoke: no Gemini model with /chat/completions support is listed by ${PROXY_BASE_URL}/v1/models."
+  log "Skipping Gemini smoke: no approved model with /chat/completions support is listed by ${PROXY_BASE_URL}/v1/models."
   return 0
 }
 
@@ -576,10 +571,17 @@ run_claude_command() {
   cd "${case_dir}"
   # This baseline compatibility smoke does not exercise Claude's experimental
   # Advisor Tool, whose beta header is not accepted by the Copilot endpoint.
+  # Use Anthropic's version spelling for Claude models so Claude recognizes
+  # their capabilities; Vekil normalizes it back to the Copilot catalog ID.
+  # Other models keep their catalog ID. File reads need no thinking.
+  if [[ "${model}" == claude-* ]]; then
+    model="${model//./-}"
+  fi
   HOME="${home_dir}" \
   ANTHROPIC_BASE_URL="${PROXY_BASE_URL}" \
   ANTHROPIC_API_KEY=dummy \
   CLAUDE_CODE_DISABLE_ADVISOR_TOOL="${CLAUDE_CODE_DISABLE_ADVISOR_TOOL:-1}" \
+  MAX_THINKING_TOKENS=0 \
   claude \
     --dangerously-skip-permissions \
     --print \
@@ -680,7 +682,8 @@ EOF
 #     client must pass another candidate;
 #   - every installed client must pass independently on at least one candidate;
 #   - neutral exit 0 is allowed only if no model was reachable before any client
-#     was exercised.
+#     was exercised, or if the first canary gets Zen's exact HTTP 403
+#     FreeTierError refusing non-OpenCode clients.
 # Zen's configured free models advertise text Chat support, not reliable coding
 # tool use, so these client checks use a direct exact-text prompt. The
 # credentialed Copilot-mode checks above retain their file-reading fixture.
@@ -703,6 +706,7 @@ ZEN_MODEL_PREFS=(
 ATTEMPT_STATUS=""
 ATTEMPT_DETAIL=""
 ZEN_ANY_CLIENT_EXERCISED=0
+ZEN_CLIENT_RESTRICTION=""
 
 validate_zen_free_models_file() {
   [[ -n "${ZEN_FREE_MODELS_FILE}" ]] || return 0
@@ -713,7 +717,7 @@ validate_zen_free_models_file() {
     length($1) > 128 ||
     $1 !~ /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/ ||
     $2 == "" ||
-    ($3 != "/chat/completions" && $3 != "/responses" && $3 != "/messages") ||
+    ($3 != "/chat/completions" && $3 != "/responses" && $3 != "/messages" && $3 != "/systemone") ||
     seen[$1]++ {
       exit 1
     }
@@ -755,8 +759,20 @@ zen_error_is_transient() {
     'promotion (has )?ended|free promotion[^[:alnum:]]+ended|^model [[:alnum:]_.:/-]+ is not supported$|rate[ -]?limit|too many requests|temporar(il)?y unavailable|service unavailable|overload(ed)?|over capacity|capacity (has been )?exceeded|upstream[^[:alnum:]]+(timeout|unavailable)|gateway timeout'
 }
 
+# Since 2026-09-17 OpenCode Zen answers anonymous free-tier requests from other
+# clients with HTTP 403 FreeTierError "OpenCode's free tier can only be used
+# from within OpenCode". That is a provider usage policy, not an outage. Vekil
+# must not impersonate the OpenCode client to get around it.
+zen_error_is_client_restricted() {
+  local type="$1"
+  local message="$2"
+  [[ "${type}" == "FreeTierError" ]] || return 1
+  printf '%s' "${message}" | grep -qiE 'free tier can only be used from within opencode'
+}
+
 # zen_canary <model> [artifact-tag] -> echoes:
-#   OK <detail> | TRANSIENT <recognized-reason> | FAIL <reason>
+#   OK <detail> | TRANSIENT <recognized-reason> | RESTRICTED <policy-message> |
+#   FAIL <reason>
 zen_canary() {
   local model="$1"
   local tag="${2:-initial}"
@@ -764,7 +780,7 @@ zen_canary() {
   local body="${SMOKE_DIR}/canary-${safe}.json"
   local request="${SMOKE_DIR}/canary-req-${safe}.json"
   local curl_error="${SMOKE_DIR}/canary-${safe}.curl.err"
-  local code errmsg curl_rc
+  local code errmsg errtype curl_rc
 
   jq -n --arg model "${model}" \
     '{model: $model, max_tokens: 16, messages: [{role: "user", content: "ping"}]}' \
@@ -824,6 +840,10 @@ zen_canary() {
     401|403)
       if printf '%s' "${errmsg}" | grep -qiE 'does not support /|unknown model|no upstream'; then
         printf 'FAIL proxy:%s\n' "${errmsg:0:80}"
+      elif [[ "${code}" == "403" ]] \
+        && errtype="$(jq -r '.error.type? // empty' "${body}" 2>/dev/null)" \
+        && zen_error_is_client_restricted "${errtype}" "${errmsg}"; then
+        printf 'RESTRICTED http-403:%s\n' "${errmsg:0:200}"
       elif zen_error_is_transient "${errmsg}"; then
         printf 'TRANSIENT message:%s\n' "${errmsg:0:80}"
       else
@@ -837,7 +857,9 @@ zen_canary() {
 }
 
 # run_harness_iterated <client> <model>... ->
-#   0 pass, 2 no initial reachability, 3 reachable candidates all incompatible.
+#   0 pass, 2 no initial reachability, 3 reachable candidates all incompatible,
+#   4 the provider refused the free tier to non-OpenCode clients (the policy
+#   applies to every free model, so remaining candidates are not probed).
 run_harness_iterated() {
   local client="$1"
   shift
@@ -851,6 +873,11 @@ run_harness_iterated() {
       TRANSIENT)
         log "[${client}] skip ${model} before CLI (${verdict#* })"
         continue
+        ;;
+      RESTRICTED)
+        ZEN_CLIENT_RESTRICTION="${verdict#* }"
+        log "[${client}] ${model} refused by provider policy (${ZEN_CLIENT_RESTRICTION})"
+        return 4
         ;;
       FAIL)
         die "[${client}] canary failed for ${model}: ${verdict#* }"
@@ -895,7 +922,7 @@ run_harness_iterated() {
         fi
         die "[${client}] ${model} remained reachable after CLI ${ATTEMPT_DETAIL}; refusing candidate fallback for client failure"
         ;;
-      FAIL)
+      FAIL|RESTRICTED)
         die "[${client}] ${model} CLI ${ATTEMPT_DETAIL}; second canary failed: ${second_verdict#* }"
         ;;
       *)
@@ -1148,6 +1175,18 @@ main_zen() {
       3)
         die "[${client}] no reachable Zen model produced the exact expected output"
         ;;
+      4)
+        if [[ "${ZEN_ANY_CLIENT_EXERCISED}" == "0" ]]; then
+          log "Zen smoke NEUTRAL SKIP: OpenCode Zen restricts its free tier to the OpenCode client (${ZEN_CLIENT_RESTRICTION})."
+          log "Vekil does not impersonate OpenCode; live Zen coverage needs a credential or model that OpenCode permits for API use."
+          if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+            printf '::warning title=OpenCode Zen smoke skipped::%s\n' \
+              "OpenCode Zen refused the anonymous free tier to non-OpenCode clients (HTTP 403 FreeTierError); no client was exercised."
+          fi
+          return 0
+        fi
+        die "[${client}] provider refused the free tier after the smoke had already exercised a reachable model"
+        ;;
       *)
         die "[${client}] harness returned unexpected status ${rc}"
         ;;
@@ -1180,9 +1219,10 @@ main() {
 
   fetch_models
 
-  CODEX_MODEL="$(pick_model "Codex/OpenAI" gpt-5.4 gpt-5.3-codex gpt-5.2-codex gpt-5.1-codex gpt-5.1 gpt-5-mini gpt-4.1 gpt-4o)"
-  CLAUDE_MODEL="$(pick_model "Claude" claude-sonnet-5 claude-opus-4.8 claude-opus-4.7 claude-opus-4.6 claude-sonnet-4.6 claude-sonnet-4.5 claude-haiku-4.5 claude-sonnet-4)"
-  GEMINI_MODEL="$(pick_optional_gemini_model gemini-3.1-pro-preview gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview)"
+  # Deliberate allowlists: catalog changes must not silently increase spend.
+  CODEX_MODEL="$(pick_model "Codex/OpenAI" /responses gpt-5.6-luna-utility)"
+  CLAUDE_MODEL="$(pick_model "Claude" /chat/completions claude-haiku-5.5)"
+  GEMINI_MODEL="$(pick_optional_gemini_model gpt-4.1 gpt-4o)"
 
   if [[ -n "${GEMINI_MODEL}" ]]; then
     require_cmd gemini

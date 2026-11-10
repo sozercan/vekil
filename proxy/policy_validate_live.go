@@ -22,6 +22,9 @@ func ValidateProvidersConfigFileLive(ctx context.Context, path string) error {
 	}
 	h, err := NewProxyHandler(authenticator, nil,
 		WithProvidersConfig(cfg),
+		// A classifier preflight neither issues nor resumes provider state and
+		// must be able to run while the serving proxy holds its durable lock.
+		WithStateBindingsConfig(StateBindingsConfig{Mode: "memory"}),
 		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
 		// Live validation is deliberately limited to classifier protocol
 		// preflight; unrelated dynamic provider catalogs remain offline.

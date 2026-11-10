@@ -247,6 +247,7 @@ func newChatRouteBenchmarkHandler(b *testing.B, explicit bool, modes ...routeMod
 		auth.NewTestAuthenticator("benchmark-copilot-token"),
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(cfg),
+		WithStateBindingsConfig(StateBindingsConfig{Mode: "memory"}),
 	)
 	if err != nil {
 		b.Fatalf("create chat route benchmark handler: %v", err)

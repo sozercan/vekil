@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func validSchemaV2PolicyYAML() string {
@@ -254,6 +256,83 @@ func TestPolicyTierReasoningEffortValidatesTerminalAllowlists(t *testing.T) {
 				t.Fatalf("LoadProvidersConfigFile() error = %v, want path %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestPolicyClassifierReasoningEffortConfig(t *testing.T) {
+	for _, format := range []struct {
+		name    string
+		marshal func(any) ([]byte, error)
+	}{
+		{name: "json", marshal: json.Marshal},
+		{name: "yaml", marshal: yaml.Marshal},
+	} {
+		for _, tc := range []struct {
+			name        string
+			effort      any
+			omit        bool
+			noAllowlist bool
+			want        string
+			wantError   bool
+		}{
+			{name: "omitted", omit: true},
+			{name: "omitted without allowlist", omit: true, noAllowlist: true},
+			{name: "explicit low", effort: "low", want: "low"},
+			{name: "normalized low", effort: " low ", want: "low"},
+			{name: "null", effort: nil, wantError: true},
+			{name: "empty", effort: "", wantError: true},
+			{name: "whitespace", effort: " \t\n ", wantError: true},
+			{name: "outside allowlist", effort: "max", wantError: true},
+			{name: "missing allowlist", effort: "low", noAllowlist: true, wantError: true},
+		} {
+			t.Run(format.name+"/"+tc.name, func(t *testing.T) {
+				cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+				if !tc.noAllowlist {
+					cfg.ModelRoutes[2].ReasoningEffort = []string{"low", "medium"}
+				}
+				body, err := json.Marshal(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var document map[string]any
+				if err := json.Unmarshal(body, &document); err != nil {
+					t.Fatal(err)
+				}
+				profile := document["policy_profiles"].([]any)[0].(map[string]any)
+				if !tc.omit {
+					profile["classifier"].(map[string]any)["reasoning_effort"] = tc.effort
+				}
+				body, err = format.marshal(document)
+				if err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(t.TempDir(), "providers."+format.name)
+				if err := os.WriteFile(path, body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				loaded, err := LoadProvidersConfigFile(path)
+				if tc.wantError {
+					if err == nil || !strings.Contains(err.Error(), "policy_profiles[0].classifier.reasoning_effort") {
+						t.Fatalf("LoadProvidersConfigFile() error = %v, want classifier reasoning_effort path", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := loaded.PolicyProfiles[0].Classifier.ReasoningEffort; got != tc.want {
+					t.Fatalf("classifier reasoning_effort = %q, want %q", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestProgrammaticPolicyClassifierReasoningEffortRejectsWhitespaceOnly(t *testing.T) {
+	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeOff)
+	cfg.PolicyProfiles[0].Classifier.ReasoningEffort = " \t\n "
+	if _, err := validateAndNormalizeProvidersConfig(cfg); err == nil || !strings.Contains(err.Error(), "policy_profiles[0].classifier.reasoning_effort") {
+		t.Fatalf("validateAndNormalizeProvidersConfig() error = %v, want classifier reasoning_effort path", err)
 	}
 }
 
@@ -538,14 +617,37 @@ func TestProgrammaticPolicyClassifierZeroSettersPreserveExplicitValues(t *testin
 }
 
 func TestSharedClassifierRouteRequiresMatchingPreflightContract(t *testing.T) {
-	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeObserve)
-	second := clonePolicyProfileConfig(cfg.PolicyProfiles[0])
-	second.ID = "coding-policy-two"
-	second.PublicID = "coding-economy-two"
-	second.Classifier.TimeoutMS++
-	cfg.PolicyProfiles = append(cfg.PolicyProfiles, second)
-	if _, err := validateAndNormalizeProvidersConfig(cfg); err == nil || !strings.Contains(err.Error(), "same timeout_ms and max_completion_tokens") {
-		t.Fatalf("validateAndNormalizeProvidersConfig() error = %v", err)
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*PolicyClassifierConfig)
+		wantError bool
+	}{
+		{name: "matching normalized effort", mutate: func(c *PolicyClassifierConfig) { c.ReasoningEffort = " low " }},
+		{name: "timeout mismatch", mutate: func(c *PolicyClassifierConfig) { c.TimeoutMS++ }, wantError: true},
+		{name: "token limit mismatch", mutate: func(c *PolicyClassifierConfig) { c.MaxCompletionTokens++ }, wantError: true},
+		{name: "effort mismatch", mutate: func(c *PolicyClassifierConfig) { c.ReasoningEffort = "max" }, wantError: true},
+		{name: "omitted effort mismatch", mutate: func(c *PolicyClassifierConfig) { c.ReasoningEffort = "" }, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeObserve)
+			cfg.ModelRoutes[2].ReasoningEffort = []string{"low", "max"}
+			cfg.PolicyProfiles[0].Classifier.ReasoningEffort = "low"
+			second := clonePolicyProfileConfig(cfg.PolicyProfiles[0])
+			second.ID = "coding-policy-two"
+			second.PublicID = "coding-economy-two"
+			tc.mutate(&second.Classifier)
+			cfg.PolicyProfiles = append(cfg.PolicyProfiles, second)
+			_, err := validateAndNormalizeProvidersConfig(cfg)
+			if !tc.wantError {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "policy_profiles[1].classifier: must use the same timeout_ms, max_completion_tokens, and reasoning_effort") {
+				t.Fatalf("validateAndNormalizeProvidersConfig() error = %v", err)
+			}
+		})
 	}
 }
 

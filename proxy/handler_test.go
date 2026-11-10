@@ -40,6 +40,149 @@ func newTestProxyHandler(t testing.TB, backend http.HandlerFunc) *ProxyHandler {
 	return h
 }
 
+type handlerTestRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f handlerTestRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestCopyPassthroughHeadersBorrowsImmutableValues(t *testing.T) {
+	src := http.Header{
+		"Connection":   []string{"X-Hop"},
+		"Content-Type": []string{"application/json"},
+		"X-Hop":        []string{"secret"},
+		"X-Multi":      []string{"one", "two"},
+	}
+	dst := http.Header{
+		"X-Local": []string{"keep"},
+		"X-Multi": []string{"stale"},
+	}
+
+	copyPassthroughHeaders(dst, src)
+	if got := dst.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if got := dst.Get("X-Hop"); got != "" {
+		t.Fatalf("hop-by-hop nominated header leaked: %q", got)
+	}
+	if got := dst.Get("X-Local"); got != "keep" {
+		t.Fatalf("proxy-owned header = %q, want keep", got)
+	}
+	dst.Add("X-Multi", "three")
+	if got := src.Values("X-Multi"); !reflect.DeepEqual(got, []string{"one", "two"}) {
+		t.Fatalf("adding a downstream value mutated upstream headers: %v", got)
+	}
+	dst.Set("Content-Type", "text/plain")
+	if got := src.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("setting a downstream value mutated upstream headers: %q", got)
+	}
+}
+
+func TestReadBodyBorrowedUsesSmallKnownLengthBuffer(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","messages":[]}`))
+	body, pooled, err := readBodyBorrowed(req)
+	if err != nil {
+		t.Fatalf("readBodyBorrowed() error = %v", err)
+	}
+	if pooled == nil {
+		t.Fatal("readBodyBorrowed() did not borrow a small known-length buffer")
+	}
+	defer releaseSmallRequestBodyBuffer(pooled)
+	if got, want := cap(*pooled), tinyRequestBodyBufferSize; got != want {
+		t.Fatalf("pooled buffer capacity = %d, want tiny tier %d", got, want)
+	}
+	if got, want := string(body), `{"model":"test","messages":[]}`; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
+func TestReadBodyBorrowedUsesFourKiBTier(t *testing.T) {
+	bodyText := strings.Repeat("x", tinyRequestBodyBufferSize)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(bodyText))
+	body, pooled, err := readBodyBorrowed(req)
+	if err != nil {
+		t.Fatalf("readBodyBorrowed() error = %v", err)
+	}
+	if pooled == nil {
+		t.Fatal("readBodyBorrowed() did not borrow a small known-length buffer")
+	}
+	defer releaseSmallRequestBodyBuffer(pooled)
+	if got, want := cap(*pooled), smallRequestBodyBufferSize; got != want {
+		t.Fatalf("pooled buffer capacity = %d, want small tier %d", got, want)
+	}
+	if got := string(body); got != bodyText {
+		t.Fatalf("body length = %d, want %d", len(got), len(bodyText))
+	}
+}
+
+func TestReadBodyBorrowedFallsBackForUnknownLengthAndCompression(t *testing.T) {
+	t.Run("unknown-length", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test"}`))
+		req.ContentLength = -1
+		body, pooled, err := readBodyBorrowed(req)
+		if err != nil {
+			t.Fatalf("readBodyBorrowed() error = %v", err)
+		}
+		if pooled != nil {
+			t.Fatal("unknown-length body unexpectedly used the small buffer pool")
+		}
+		if got, want := string(body), `{"model":"test"}`; got != want {
+			t.Fatalf("body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("compressed", func(t *testing.T) {
+		var compressed bytes.Buffer
+		writer := gzip.NewWriter(&compressed)
+		_, _ = writer.Write([]byte(`{"model":"test"}`))
+		_ = writer.Close()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", &compressed)
+		req.Header.Set("Content-Encoding", "gzip")
+		body, pooled, err := readBodyBorrowed(req)
+		if err != nil {
+			t.Fatalf("readBodyBorrowed() error = %v", err)
+		}
+		if pooled != nil {
+			t.Fatal("compressed body unexpectedly used the small buffer pool")
+		}
+		if got, want := string(body), `{"model":"test"}`; got != want {
+			t.Fatalf("body = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestReadBodyBorrowedDoesNotTrustShortContentLength(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = io.NopCloser(strings.NewReader("abcdef"))
+	req.ContentLength = 3
+	body, pooled, err := readBodyBorrowed(req)
+	if pooled != nil {
+		defer releaseSmallRequestBodyBuffer(pooled)
+	}
+	if err != nil {
+		t.Fatalf("readBodyBorrowed() error = %v", err)
+	}
+	if got, want := string(body), "abcdef"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
+func TestReadBodyBorrowedRejectsTruncatedDeclaredLength(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-4"}`))
+	req.ContentLength = 100
+	body, pooled, err := readBodyBorrowed(req)
+	if pooled != nil {
+		defer releaseSmallRequestBodyBuffer(pooled)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("readBodyBorrowed() error = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if body != nil {
+		t.Fatalf("readBodyBorrowed() body = %q, want nil", body)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -663,6 +806,12 @@ func TestHandleAnthropicMessagesCountTokensFallbacksToMaxTokens(t *testing.T) {
 
 func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProvider(t *testing.T) {
 	const upstreamBody = "{\n  \"input_tokens\": 42\n}\n"
+	carrier, err := encodeReasoningCarrier(carriedTurn{Items: []json.RawMessage{
+		json.RawMessage(`{"type":"reasoning","id":"rs_direct","encrypted_content":"OPAQUE"}`),
+	}})
+	if err != nil {
+		t.Fatalf("encode carrier: %v", err)
+	}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Path; got != "/native/messages/count_tokens" {
 			t.Fatalf("expected native count_tokens path /native/messages/count_tokens, got %s", got)
@@ -677,8 +826,15 @@ func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProv
 			t.Fatalf("expected client Authorization stripped, got %q", got)
 		}
 
+		requestBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream request: %v", err)
+		}
+		if strings.Contains(string(requestBytes), reasoningCarrierPrefix) {
+			t.Fatalf("vekil carrier reached direct Anthropic count_tokens: %s", requestBytes)
+		}
 		var upstreamReq models.AnthropicRequest
-		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+		if err := json.Unmarshal(requestBytes, &upstreamReq); err != nil {
 			t.Fatalf("decode upstream request: %v", err)
 		}
 		if upstreamReq.Model != "claude-upstream" {
@@ -716,16 +872,39 @@ func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProv
 		t.Fatalf("NewProxyHandler returned error: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{
+	carrierJSON, err := json.Marshal(carrier)
+	if err != nil {
+		t.Fatalf("marshal carrier signature: %v", err)
+	}
+	requestBody := []byte(fmt.Sprintf(`{
 		"model": "claude-public",
-		"messages": [{"role": "user", "content": "Count this"}]
-	}`))
+		"Messages": [
+			{"role": "user", "content": "Count this"},
+			{"Role": "assistant", "Content": [
+				{"type": "thinking", "Type": "text", "thinking": "", "signature": %s, "Signature": "anthropic-native-sig"},
+				{"type": "text", "text": "Keep this"}
+			]}
+		]
+	}`, carrierJSON))
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", bytes.NewReader(requestBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer client-token")
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	w := httptest.NewRecorder()
 
+	// A valid carrier reaches the per-process key during decode. Direct passthrough must
+	// strip it without entering that path, which also avoids attacker-controlled inflate.
+	var carrierDecoded atomic.Bool
+	restoredCarrierKey := reasoningCarrierKey
+	reasoningCarrierKey = func() []byte {
+		carrierDecoded.Store(true)
+		return restoredCarrierKey()
+	}
+	defer func() { reasoningCarrierKey = restoredCarrierKey }()
 	handler.HandleAnthropicMessagesCountTokens(w, req)
+	if carrierDecoded.Load() {
+		t.Fatal("direct Anthropic count_tokens decoded a carrier before forwarding")
+	}
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusOK {
@@ -1387,6 +1566,39 @@ func TestHandleResponses(t *testing.T) {
 	}
 	if result["id"] != "resp-123" {
 		t.Errorf("expected id resp-123, got %v", result["id"])
+	}
+}
+
+func TestHandleResponsesDetachesBorrowedBodyBeforeUpstream(t *testing.T) {
+	const responseBody = `{"id":"resp-native","object":"response","status":"completed","model":"gpt-4","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`
+	capturedBody := make(chan io.ReadCloser, 1)
+	h := newRoundTripTestProxyHandler(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		capturedBody <- req.Body
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			Body:          io.NopCloser(strings.NewReader(responseBody)),
+			ContentLength: int64(len(responseBody)),
+			Request:       req,
+		}, nil
+	}))
+
+	reqBody := `{"model":"gpt-4","input":"` + strings.Repeat("x", 1024) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+	h.HandleResponses(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	upstreamBody := <-capturedBody
+	defer func() { _ = upstreamBody.Close() }()
+	gotBody, err := io.ReadAll(upstreamBody)
+	if err != nil {
+		t.Fatalf("read asynchronously retained upstream body: %v", err)
+	}
+	if string(gotBody) != reqBody {
+		t.Fatalf("upstream body was recycled before asynchronous close: got %q, want %q", gotBody, reqBody)
 	}
 }
 
@@ -4387,6 +4599,74 @@ func TestHandleResponses_RewritesSyntheticCompaction(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_RewritesSyntheticCompactionWithUntypedUserMessage(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content string
+	}{
+		{"text", `"Review the new request instead."`},
+		{"content blocks", `[{"type":"input_text","text":"Review the new request instead."}]`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			userMessage := json.RawMessage(`{"role":"user","content":` + tt.content + `}`)
+			upstreamRequests := make(chan []json.RawMessage, 1)
+			handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Input []json.RawMessage `json:"input"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("decode upstream request: %v", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				upstreamRequests <- req.Input
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"resp-synth","object":"response","status":"completed"}`))
+			})
+
+			reqBody, err := json.Marshal(map[string]interface{}{
+				"model": "gpt-5.4",
+				"input": []interface{}{
+					map[string]interface{}{
+						"type":              "compaction",
+						"encrypted_content": encodeSyntheticCompaction("Checkpoint summary"),
+					},
+					userMessage,
+				},
+			})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(reqBody))
+			w := httptest.NewRecorder()
+			handler.HandleResponses(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+			}
+			var upstreamInput []json.RawMessage
+			select {
+			case upstreamInput = <-upstreamRequests:
+			default:
+				t.Fatal("expected an upstream request")
+			}
+			if len(upstreamInput) != 2 {
+				t.Fatalf("expected checkpoint and original user message, got %s", upstreamInput)
+			}
+			var got, want interface{}
+			if err := json.Unmarshal(upstreamInput[1], &got); err != nil {
+				t.Fatalf("decode forwarded user message: %v", err)
+			}
+			if err := json.Unmarshal(userMessage, &want); err != nil {
+				t.Fatalf("decode original user message: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("user message changed: got %s, want %s", upstreamInput[1], userMessage)
+			}
+		})
+	}
+}
+
 func TestHandleResponses_RewritesSyntheticCompaction_StripsInlineRenderMarkers(t *testing.T) {
 	summary := "Synthetic compacted summary. citeturn5view1turn9view0"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -6114,30 +6394,46 @@ func TestInjectSyntheticCompactionResumePrompt_IgnoresHistoricalUserMessagesBefo
 	}
 }
 
-func TestInjectSyntheticCompactionResumePrompt_SkipsWhenUserMessageExists(t *testing.T) {
-	reqBody, err := json.Marshal(map[string]interface{}{
-		"model": "gpt-5.4",
-		"input": []interface{}{
-			proxyCompactionContextMessage("Checkpoint summary"),
-			map[string]interface{}{
-				"type": "message",
-				"role": "user",
-				"content": []map[string]string{
-					{"type": "input_text", "text": "continue"},
-				},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("failed to marshal request body: %v", err)
-	}
+func TestInjectSyntheticCompactionResumePrompt_RecognizesUserMessages(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		message     string
+		userMessage bool
+	}{
+		{"explicit type", `{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}`, true},
+		{"omitted type with text", `{"role":"user","content":"continue"}`, true},
+		{"omitted type with content blocks", `{"role":"user","content":[{"type":"input_text","text":"continue"}]}`, true},
+		{"assistant message", `{"role":"assistant","content":"done"}`, false},
+		{"other item type", `{"type":"function_call_output","role":"user","content":"continue"}`, false},
+		{"null type", `{"type":null,"role":"user","content":"continue"}`, false},
+		{"empty type", `{"type":"","role":"user","content":"continue"}`, false},
+		{"non-string type", `{"type":7,"role":"user","content":"continue"}`, false},
+		{"role without content", `{"role":"user"}`, false},
+	} {
+		for _, position := range []string{"after checkpoint", "before checkpoint", "without checkpoint"} {
+			t.Run(tt.name+"/"+position, func(t *testing.T) {
+				input := []interface{}{json.RawMessage(tt.message)}
+				switch position {
+				case "after checkpoint":
+					input = append([]interface{}{proxyCompactionContextMessage("Checkpoint summary")}, input...)
+				case "before checkpoint":
+					input = append(input, proxyCompactionContextMessage("Checkpoint summary"))
+				}
+				reqBody, err := json.Marshal(map[string]interface{}{"model": "gpt-5.4", "input": input})
+				if err != nil {
+					t.Fatalf("marshal request: %v", err)
+				}
 
-	rewritten, injected := injectSyntheticCompactionResumePrompt(reqBody)
-	if injected {
-		t.Fatal("expected resume prompt injection to be skipped")
-	}
-	if !bytes.Equal(rewritten, reqBody) {
-		t.Fatal("expected request body to remain unchanged when user message exists")
+				rewritten, injected := injectSyntheticCompactionResumePrompt(reqBody)
+				wantInjected := !tt.userMessage || position == "before checkpoint"
+				if injected != wantInjected {
+					t.Fatalf("resume prompt injected = %t, want %t", injected, wantInjected)
+				}
+				if !injected && !bytes.Equal(rewritten, reqBody) {
+					t.Fatal("expected request body to remain unchanged when user message exists")
+				}
+			})
+		}
 	}
 }
 
@@ -6224,8 +6520,8 @@ func TestSetCopilotHeaders(t *testing.T) {
 		{"editor-version", "vscode/1.95.0"},
 		{"editor-plugin-version", "copilot-chat/0.26.7"},
 		{"user-agent", "GitHubCopilotChat/0.26.7"},
-		{"copilot-integration-id", "vscode-chat"},
-		{"x-github-api-version", "2025-05-01"},
+		{"copilot-integration-id", "copilot-developer-cli"},
+		{"x-github-api-version", "2026-08-20"},
 		{"openai-intent", "conversation-panel"},
 		{"Content-Type", "application/json"},
 	}
@@ -6274,7 +6570,29 @@ func TestSetCopilotHeadersWithConfig(t *testing.T) {
 	}
 }
 
-func TestSetCopilotHeadersWithConfigUsesCredentialIntegrationDefault(t *testing.T) {
+func TestSetCopilotHeadersDefaultsEveryCredentialToCLIIntegration(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		token       string
+		integration string
+	}{
+		{"OAuth", "gho_test", "copilot-developer-cli"},
+		{"fine-grained PAT", "github_pat_test", "copilot-developer-cli"},
+		{"Actions token", "ghs_test", "copilot-developer-cli"},
+		{"GitHub App", "ghu_test", "copilot-developer-cli"},
+		{"legacy", "legacy-test-token", "copilot-developer-cli"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/test", nil)
+			setCopilotHeaders(req, tt.token)
+			if got := req.Header.Get("Copilot-Integration-Id"); got != tt.integration {
+				t.Fatalf("integration = %q, want %q", got, tt.integration)
+			}
+		})
+	}
+}
+
+func TestSetCopilotHeadersWithConfigDefaultsToCLIIntegration(t *testing.T) {
 	tests := []struct {
 		name        string
 		token       string
@@ -6284,16 +6602,52 @@ func TestSetCopilotHeadersWithConfigUsesCredentialIntegrationDefault(t *testing.
 		{
 			name:        "direct GitHub App credential",
 			token:       "ghu_direct-credential",
-			integration: directGitHubAppIntegrationID,
+			integration: "copilot-developer-cli",
 		},
 		{
 			name:        "OAuth credential",
 			token:       "gho_direct-credential",
+			integration: "copilot-developer-cli",
+		},
+		{
+			name:        "fine-grained PAT",
+			token:       "github_pat_direct-credential",
+			integration: "copilot-developer-cli",
+		},
+		{
+			name:        "Actions token",
+			token:       "ghs_direct-credential",
+			integration: "copilot-developer-cli",
+		},
+		{
+			name:        "whitespace-padded OAuth credential",
+			token:       " gho_direct-credential ",
+			integration: "copilot-developer-cli",
+		},
+		{
+			name:        "legacy credential",
+			token:       "legacy-credential",
 			integration: defaultCopilotIntegrationID,
 		},
 		{
 			name:  "explicit override",
 			token: "ghu_direct-credential",
+			config: CopilotHeaderConfig{
+				IntegrationID: "configured-integration",
+			},
+			integration: "configured-integration",
+		},
+		{
+			name:  "explicit OAuth override",
+			token: "gho_direct-credential",
+			config: CopilotHeaderConfig{
+				IntegrationID: "vscode-chat",
+			},
+			integration: "vscode-chat",
+		},
+		{
+			name:  "explicit PAT override",
+			token: "github_pat_direct-credential",
 			config: CopilotHeaderConfig{
 				IntegrationID: "configured-integration",
 			},
@@ -6513,7 +6867,7 @@ func TestNewProviderJSONRequest_CopilotModelsOmitsIntentAndContentTypeByDefault(
 	}
 }
 
-func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesEndpointCompatibleAuth(t *testing.T) {
+func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesCLIIntegration(t *testing.T) {
 	tests := []struct {
 		name            string
 		endpoint        string
@@ -6525,13 +6879,13 @@ func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesEndpointCompatibleA
 			name:            "models credential default",
 			endpoint:        "/models",
 			wantAuth:        "Bearer ghu_direct-credential",
-			wantIntegration: directGitHubAppIntegrationID,
+			wantIntegration: defaultCopilotIntegrationID,
 		},
 		{
 			name:            "chat credential default",
 			endpoint:        "/chat/completions",
 			wantAuth:        "Bearer ghu_direct-credential",
-			wantIntegration: directGitHubAppIntegrationID,
+			wantIntegration: defaultCopilotIntegrationID,
 		},
 		{
 			name:            "responses credential default",
@@ -6573,6 +6927,117 @@ func TestNewProviderJSONRequest_DirectGitHubAppCredentialUsesEndpointCompatibleA
 				t.Fatalf("copilot-integration-id = %q, want %q", got, tt.wantIntegration)
 			}
 		})
+	}
+}
+
+func TestNewProviderJSONRequest_OAuthAndPATIntegrationDefaults(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "")
+	for _, credential := range []struct {
+		name  string
+		token string
+	}{
+		{"OAuth", "gho_test"},
+		{"fine-grained PAT", "github_pat_test"},
+		{"Actions token", "ghs_test"},
+	} {
+		for _, profile := range []struct {
+			name          string
+			global        CopilotHeaderConfig
+			provider      CopilotHeaderProfilesConfig
+			wantModels    string
+			wantChat      string
+			wantResponses string
+		}{
+			{
+				name:          "defaults",
+				wantModels:    "copilot-developer-cli",
+				wantChat:      "copilot-developer-cli",
+				wantResponses: "copilot-developer-cli",
+			},
+			{
+				name:   "unrelated header overrides",
+				global: CopilotHeaderConfig{EditorVersion: "configured-editor"},
+				provider: CopilotHeaderProfilesConfig{
+					Default:   CopilotHeaderConfig{UserAgent: "configured-agent"},
+					Responses: CopilotHeaderConfig{OpenAIIntent: "configured-intent"},
+				},
+				wantModels:    "copilot-developer-cli",
+				wantChat:      "copilot-developer-cli",
+				wantResponses: "copilot-developer-cli",
+			},
+			{
+				name:          "global integration override",
+				global:        CopilotHeaderConfig{IntegrationID: "vscode-chat"},
+				wantModels:    "vscode-chat",
+				wantChat:      "vscode-chat",
+				wantResponses: "vscode-chat",
+			},
+			{
+				name:   "provider integration override",
+				global: CopilotHeaderConfig{IntegrationID: "global-integration"},
+				provider: CopilotHeaderProfilesConfig{
+					Default: CopilotHeaderConfig{IntegrationID: "provider-integration"},
+				},
+				wantModels:    "provider-integration",
+				wantChat:      "provider-integration",
+				wantResponses: "provider-integration",
+			},
+			{
+				name:   "endpoint integration overrides",
+				global: CopilotHeaderConfig{IntegrationID: "global-integration"},
+				provider: CopilotHeaderProfilesConfig{
+					Default:         CopilotHeaderConfig{IntegrationID: "provider-integration"},
+					ChatCompletions: CopilotHeaderConfig{IntegrationID: "chat-integration"},
+					Responses:       CopilotHeaderConfig{IntegrationID: "responses-integration"},
+				},
+				wantModels:    "provider-integration",
+				wantChat:      "chat-integration",
+				wantResponses: "responses-integration",
+			},
+		} {
+			for _, endpoint := range []struct {
+				name   string
+				method string
+				path   string
+				want   string
+			}{
+				{"models", http.MethodGet, "/models", profile.wantModels},
+				{"chat", http.MethodPost, "/chat/completions", profile.wantChat},
+				{"responses", http.MethodPost, "/responses", profile.wantResponses},
+				{"websocket", http.MethodGet, "/responses", profile.wantResponses},
+			} {
+				t.Run(credential.name+"/"+profile.name+"/"+endpoint.name, func(t *testing.T) {
+					handler := &ProxyHandler{
+						auth:           auth.NewTestAuthenticator(credential.token),
+						copilotHeaders: profile.global,
+					}
+					provider := &providerRuntime{
+						id:             "copilot",
+						kind:           providerTypeCopilot,
+						baseURL:        "https://copilot.example.test",
+						headerProfiles: profile.provider,
+					}
+					headers := http.Header{"Copilot-Integration-Id": {"untrusted-client-integration"}}
+					req, err := handler.newProviderJSONRequest(context.Background(), provider, endpoint.method, endpoint.path, nil, headers, "")
+					if err != nil {
+						t.Fatal(err)
+					}
+					gotHeaders := req.Header
+					if endpoint.name == "websocket" {
+						_, _, gotHeaders, err = handler.prepareResponsesNativeDial(req)
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					if got := gotHeaders.Get("Copilot-Integration-Id"); got != endpoint.want {
+						t.Fatalf("integration = %q, want %q", got, endpoint.want)
+					}
+					if gotHeaders.Get("Authorization") != "Bearer "+credential.token {
+						t.Fatal("integration selection changed the direct bearer credential")
+					}
+				})
+			}
+		}
 	}
 }
 
@@ -6785,6 +7250,44 @@ func TestHandleOpenAIChatCompletions_RetriesWithoutInjectedStreamOptions(t *test
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("upstream calls = %d want 2", calls.Load())
+	}
+}
+
+func TestHandleOpenAIChatCompletionsDetachesBorrowedBodyBeforeUpstream(t *testing.T) {
+	const responseBody = `{"id":"chatcmpl-native","object":"chat.completion","created":1,"model":"gpt-upstream","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+	capturedBody := make(chan io.ReadCloser, 1)
+	h := newChatExecutionTestHandler(t, "http://upstream.example", []string{providerEndpointChatCompletions})
+	h.client = &http.Client{Transport: handlerTestRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		capturedBody <- req.Body
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			Body:          io.NopCloser(strings.NewReader(responseBody)),
+			ContentLength: int64(len(responseBody)),
+			Request:       req,
+		}, nil
+	})}
+
+	reqBody := `{"model":"gpt-public","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	upstreamBody := <-capturedBody
+	defer func() { _ = upstreamBody.Close() }()
+	gotBody, err := io.ReadAll(upstreamBody)
+	if err != nil {
+		t.Fatalf("read asynchronously retained upstream body: %v", err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("upstream body was recycled before asynchronous close: %q: %v", gotBody, err)
+	}
+	if got := rawJSONString(payload["model"]); got != "gpt-upstream" {
+		t.Fatalf("upstream model = %q, want gpt-upstream; body=%s", got, gotBody)
 	}
 }
 
@@ -9635,6 +10138,7 @@ func TestHandleModelsFiltersExplicitRoutesByAllowedModels(t *testing.T) {
 		WithAllowedModels("selected-model"),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{{
 				ID:             "local",
 				Type:           string(providerTypeOpenAICompatible),
@@ -9732,6 +10236,7 @@ func TestHandleModels_QueryVariantRejectsExplicitRouteAliasCollisions(t *testing
 				WithDeferredDynamicProviderModelValidation(true),
 				WithProvidersConfig(ProvidersConfig{
 					SchemaVersion: ProvidersConfigSchemaVersion2,
+					StateBindings: &StateBindingsConfig{Mode: "memory"},
 					Providers: []ProviderConfig{
 						{ID: "dynamic", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: dynamic.URL, AuthType: "none", ModelDiscovery: string(providerModelDiscoveryOpenAI)},
 						{ID: "explicit", Type: string(providerTypeOpenAICompatible), BaseURL: explicit.URL, AuthType: "none"},
@@ -12742,6 +13247,34 @@ func TestOpenAIChatCompletionsNormalizesMissingTopLevelFields(t *testing.T) {
 
 	if _, ok := raw["copilot_usage"]; !ok {
 		t.Fatal("copilot_usage was not preserved")
+	}
+}
+
+func TestOpenAIChatCompletionsRepairsZeroCreatedAndTotalTokens(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-zeroes","object":"chat.completion","created":0,"model":"gpt-4","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":0}}`)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}`))
+	w := httptest.NewRecorder()
+	handler.HandleOpenAIChatCompletions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	var response struct {
+		Created int64              `json:"created"`
+		Usage   models.OpenAIUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Created == 0 {
+		t.Fatal("created = 0, want normalized timestamp")
+	}
+	if response.Usage.PromptTokens != 2 || response.Usage.CompletionTokens != 3 || response.Usage.TotalTokens != 5 {
+		t.Fatalf("usage = %+v, want 2/3/5", response.Usage)
 	}
 }
 

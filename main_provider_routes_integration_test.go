@@ -99,7 +99,7 @@ func TestSchemaV2ProviderRoutesFileIntegration(t *testing.T) {
 				logger.NewWithWriter(logger.LevelError, io.Discard),
 				"127.0.0.1",
 				"0",
-				server.WithProxyOptions(proxy.WithProvidersConfig(cfg)),
+				server.WithProxyOptions(proxy.WithProvidersConfig(cfg), proxy.WithStateBindingsConfig(proxy.StateBindingsConfig{Mode: "memory"})),
 			)
 			if err != nil {
 				t.Fatalf("server.New() error = %v", err)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 	"gopkg.in/yaml.v3"
 )
 
@@ -26,6 +29,7 @@ const (
 	providerTypeOpenAICodex         providerType = "openai-codex"
 	providerTypeOpenAICompatible    providerType = "openai-compatible"
 	providerTypeAnthropicCompatible providerType = "anthropic-compatible"
+	providerTypeTypeSafeCompatible  providerType = "typesafe-compatible"
 
 	providerAuthModeAPIKey        providerAuthMode = "api_key"
 	providerAuthModeAzureIdentity providerAuthMode = "azure_identity"
@@ -73,6 +77,7 @@ const (
 	providerEndpointMessages        = "/v1/messages"
 	providerEndpointMessagesCount   = "/v1/messages/count_tokens"
 	providerEndpointModels          = "/models"
+	providerEndpointSystemOne       = "/systemone"
 )
 
 var openAICodexProviderEndpoints = []string{providerEndpointResponses}
@@ -80,20 +85,24 @@ var openAICodexProviderEndpoints = []string{providerEndpointResponses}
 // ProvidersConfig configures optional non-Copilot upstream providers.
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
 type ProvidersConfig struct {
-	SchemaVersion  int                   `json:"schema_version,omitempty" yaml:"schema_version,omitempty"`
-	Providers      []ProviderConfig      `json:"providers" yaml:"providers"`
-	ModelRoutes    []ModelRouteConfig    `json:"model_routes,omitempty" yaml:"model_routes,omitempty"`
-	PolicyProfiles []PolicyProfileConfig `json:"policy_profiles,omitempty" yaml:"policy_profiles,omitempty"`
-	ToolOptimizers ToolOptimizersConfig  `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+	SchemaVersion         int                          `json:"schema_version,omitempty" yaml:"schema_version,omitempty"`
+	Providers             []ProviderConfig             `json:"providers" yaml:"providers"`
+	ModelRoutes           []ModelRouteConfig           `json:"model_routes,omitempty" yaml:"model_routes,omitempty"`
+	PolicyProfiles        []PolicyProfileConfig        `json:"policy_profiles,omitempty" yaml:"policy_profiles,omitempty"`
+	ToolOptimizers        ToolOptimizersConfig         `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+	StateBindings         *StateBindingsConfig         `json:"state_bindings,omitempty" yaml:"state_bindings,omitempty"`
+	ConversationMigration *ConversationMigrationConfig `json:"conversation_migration,omitempty" yaml:"conversation_migration,omitempty"`
 	// InsightModel is the public model ID the dashboard uses to generate
 	// natural-language traffic insights on demand. Empty disables the feature
 	// (the dashboard's "Generate insights" button is hidden). The model must be
 	// one served by the configured providers.
 	InsightModel string `json:"insight_model,omitempty" yaml:"insight_model,omitempty"`
 
-	schemaVersionSet  bool
-	modelRoutesSet    bool
-	policyProfilesSet bool
+	schemaVersionSet         bool
+	modelRoutesSet           bool
+	policyProfilesSet        bool
+	stateBindingsSet         bool
+	conversationMigrationSet bool
 }
 
 // ProviderConfig configures one upstream provider instance.
@@ -117,14 +126,17 @@ type ProviderConfig struct {
 	ResponsesPath              string                      `json:"responses_path,omitempty" yaml:"responses_path,omitempty"`
 	MessagesPath               string                      `json:"messages_path,omitempty" yaml:"messages_path,omitempty"`
 	ModelsPath                 string                      `json:"models_path,omitempty" yaml:"models_path,omitempty"`
+	SystemOnePath              string                      `json:"systemone_path,omitempty" yaml:"systemone_path,omitempty"`
 	ModelDiscovery             string                      `json:"model_discovery,omitempty" yaml:"model_discovery,omitempty"`
 	TrustDomain                string                      `json:"trust_domain,omitempty" yaml:"trust_domain,omitempty"`
 	ClassifierNoStoreSupported *bool                       `json:"classifier_no_store_supported,omitempty" yaml:"classifier_no_store_supported,omitempty"`
+	HostedTools                []string                    `json:"hosted_tools,omitempty" yaml:"hosted_tools,omitempty"`
 	Headers                    CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
 	Models                     []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
 
 	trustDomainSet                bool
 	classifierNoStoreSupportedSet bool
+	hostedToolsSet                bool
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
@@ -158,17 +170,21 @@ type providerRuntime struct {
 	authType                   providerAuthType
 	authHeader                 string
 	authPrefix                 string
+	authValue                  string
 	extraHeaders               http.Header
 	paths                      providerEndpointPaths
 	modelDiscovery             providerModelDiscovery
 	trustDomain                string
 	classifierNoStoreSupported *bool
+	hostedTools                map[string]bool
 	includeModels              map[string]struct{}
 	excludeModels              map[string]struct{}
 	hiddenModels               map[string]struct{}
 	staticModels               map[string]providerModel
 	staticConfigs              map[string]ProviderModelConfig
 	staticOrder                []string
+	postRequestTemplates       map[string]*http.Request
+	postRequestAutoGzip        bool
 	codexAuth                  *openAICodexAuth
 	headerProfiles             CopilotHeaderProfilesConfig
 }
@@ -178,17 +194,20 @@ type providerEndpointPaths struct {
 	responses       string
 	messages        string
 	models          string
+	systemOne       string
 }
 
 type providerModel struct {
 	publicID               string
 	upstreamModel          string
+	upstreamModelJSON      json.RawMessage
 	providerID             string
 	supportedEndpoints     []string
 	parallelToolCalls      *bool
 	dropSamplingParams     bool
 	dropStopSequences      bool
 	useMaxCompletionTokens bool
+	maxPromptImages        int
 	disabled               bool
 	endpointsAdvertised    bool
 	raw                    json.RawMessage
@@ -237,8 +256,11 @@ type openAICodexModelPayload struct {
 	DefaultReasoningLevel       string                       `json:"default_reasoning_level"`
 }
 
+const upstreamAuthUnavailableCode = "upstream_auth_unavailable"
+
 type providerRequestError struct {
 	statusCode int
+	code       string
 	err        error
 }
 
@@ -266,11 +288,25 @@ func (e *providerRequestError) Unwrap() error {
 	return e.err
 }
 
+func providerRequestErrorCode(err error) string {
+	var providerErr *providerRequestError
+	if errors.As(err, &providerErr) {
+		return providerErr.code
+	}
+	return ""
+}
+
 // LoadProvidersConfigFile loads a provider configuration from a local path or
 // an HTTP(S) URL. Remote sources are fetched once per call with a bounded body
 // and timeout; Vekil does not poll them for changes.
 func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
-	cfg, _, err := LoadProvidersConfigSnapshot(context.Background(), path)
+	return LoadProvidersConfigFileContext(context.Background(), path)
+}
+
+// LoadProvidersConfigFileContext is LoadProvidersConfigFile with a context that
+// cancels a remote fetch.
+func LoadProvidersConfigFileContext(ctx context.Context, path string) (ProvidersConfig, error) {
+	cfg, _, err := LoadProvidersConfigSnapshot(ctx, path)
 	return cfg, err
 }
 
@@ -388,6 +424,9 @@ func ResolveStaticProviderModel(cfg ProvidersConfig, modelID string) (ProviderMo
 				// discovered catalog, so dry-run cannot resolve them statically.
 				continue
 			}
+		case providerTypeTypeSafeCompatible:
+			// Evaluation providers have no public model catalog.
+			continue
 		case providerTypeCopilot, providerTypeOpenAICodex:
 			// These providers are catalog-driven; their Models fields are not
 			// part of the configured static model table.
@@ -495,6 +534,8 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		cfg.schemaVersionSet = present["schema_version"]
 		cfg.modelRoutesSet = present["model_routes"]
 		cfg.policyProfilesSet = present["policy_profiles"]
+		cfg.stateBindingsSet = present["state_bindings"]
+		cfg.conversationMigrationSet = present["conversation_migration"]
 		markYAMLProvidersConfigFieldPresence(body, cfg)
 	default:
 		if err := rejectDuplicateJSONMappingKeys(body); err != nil {
@@ -522,6 +563,8 @@ func decodeProvidersConfigFile(path string, body []byte, cfg *ProvidersConfig) e
 		cfg.schemaVersionSet = present["schema_version"]
 		cfg.modelRoutesSet = present["model_routes"]
 		cfg.policyProfilesSet = present["policy_profiles"]
+		cfg.stateBindingsSet = present["state_bindings"]
+		cfg.conversationMigrationSet = present["conversation_migration"]
 		markJSONProvidersConfigFieldPresence(body, cfg)
 	}
 	return nil
@@ -839,6 +882,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 	ctx, cancel := context.WithTimeout(ctx, modelsUpstreamTimeout)
 	defer cancel()
 
+	catalogs := make(map[string][]providerModel)
 	for _, providerID := range providerOrder {
 		provider := providers[providerID]
 		if !providerUsesDynamicModels(provider) {
@@ -859,6 +903,14 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 			return nil, err
 		}
 		if err := setup.addProviderModels(providerID, h.filterAllowedModels(result.models)); err != nil {
+			return nil, err
+		}
+		catalogs[providerID] = result.models
+	}
+	// Auxiliary models join only after every catalog is registered, so a
+	// later provider's reservation makes them fall back instead of failing.
+	if len(h.auxiliaryModels) > 0 && len(catalogs) > 0 {
+		if err := h.replaceInstalledProviderModels(setup, catalogs); err != nil {
 			return nil, err
 		}
 	}
@@ -893,9 +945,9 @@ func (h *ProxyHandler) ValidateDynamicProviderModels(ctx context.Context) error 
 		if err := h.validateDynamicExplicitRouteTargets(setup, provider, result.models); err != nil {
 			return err
 		}
-		replacements[providerID] = h.filterAllowedModels(result.models)
+		replacements[providerID] = result.models
 	}
-	if err := setup.replaceProviderModelsBatch(replacements); err != nil {
+	if err := h.replaceInstalledProviderModels(setup, replacements); err != nil {
 		return err
 	}
 
@@ -1079,6 +1131,113 @@ func (h *ProxyHandler) providerMayExposeAllowedModelForSetup(setup *providerSetu
 	return false
 }
 
+// auxiliaryModelAllowed admits an auxiliary model only when every provider a
+// request for it can reach is already in the allowed-model scope. Ownership is
+// resolved the way dispatch resolves it: a public route first, with all of its
+// targets in scope, then a catalog model, then, for a model not yet
+// discovered, the default provider when it discovers models dynamically.
+func (h *ProxyHandler) auxiliaryModelAllowed(setup *providerSetup, model, endpoint string) bool {
+	if _, ok := h.auxiliaryModels[model]; !ok || len(h.allowedModels) == 0 {
+		return false
+	}
+	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+		return false
+	}
+	if route, ok := h.resolveModelRouteForRequest(model, endpoint); ok {
+		if route == nil || len(route.targets) == 0 {
+			return false
+		}
+		for _, target := range route.targets {
+			if !h.providerWithinAllowedModelScope(target.provider) {
+				return false
+			}
+		}
+		return true
+	}
+	if owner, ok := setup.lookupModel(model); ok {
+		return h.providerWithinAllowedModelScope(setup.providerByID(owner.providerID))
+	}
+	defaultProvider := setup.defaultProvider()
+	return providerUsesDynamicModels(defaultProvider) && h.providerWithinAllowedModelScope(defaultProvider)
+}
+
+// installedProviderModels is the part of a provider catalog kept for routing:
+// the allowed models plus the auxiliary models this provider serves when it
+// also serves an allowed model and no other provider or route claims the
+// auxiliary ID. Public listings keep filtering by the allowed models alone.
+func (h *ProxyHandler) installedProviderModels(setup *providerSetup, providerID string, models []providerModel) []providerModel {
+	installed := h.filterAllowedModels(models)
+	if len(h.allowedModels) == 0 || len(h.auxiliaryModels) == 0 ||
+		(len(installed) == 0 && !h.allowedRouteTargetsProvider(setup, providerID)) {
+		return installed
+	}
+	for _, model := range models {
+		if _, ok := h.auxiliaryModels[model.publicID]; !ok {
+			continue
+		}
+		if _, allowed := h.allowedModels[model.publicID]; allowed {
+			continue // already installed as an allowed model
+		}
+		if owner, ok := setup.lookupModel(model.publicID); ok && owner.providerID != providerID {
+			continue
+		}
+		if route, ok := setup.lookupRoute(model.publicID); ok && route != nil && !route.legacy {
+			continue
+		}
+		if entry, ok := setup.lookupPublicModelEntry(model.publicID); ok && entry != nil && entry.kind == publicEntryPolicy {
+			continue
+		}
+		installed = append(installed, model)
+	}
+	return installed
+}
+
+// replaceInstalledProviderModels replaces provider catalogs with their
+// auxiliary models. If those collide with any model, route, or alias
+// reservation, it retries without them: an auxiliary model must never fail
+// startup or a catalog refresh.
+func (h *ProxyHandler) replaceInstalledProviderModels(setup *providerSetup, catalogs map[string][]providerModel) error {
+	withAuxiliary := make(map[string][]providerModel, len(catalogs))
+	for providerID, models := range catalogs {
+		withAuxiliary[providerID] = h.installedProviderModels(setup, providerID, models)
+	}
+	err := setup.replaceProviderModelsBatch(withAuxiliary)
+	if err == nil || len(h.auxiliaryModels) == 0 {
+		return err
+	}
+	allowedOnly := make(map[string][]providerModel, len(catalogs))
+	for providerID, models := range catalogs {
+		allowedOnly[providerID] = h.filterAllowedModels(models)
+	}
+	return setup.replaceProviderModelsBatch(allowedOnly)
+}
+
+// allowedRouteTargetsProvider reports whether an allowed explicit route or
+// policy profile in setup dispatches to providerID, whose catalog then holds
+// upstream models rather than the allowed public IDs.
+func (h *ProxyHandler) allowedRouteTargetsProvider(setup *providerSetup, providerID string) bool {
+	provider := setup.providerByID(providerID)
+	if provider == nil {
+		return false
+	}
+	for model := range h.allowedModels {
+		if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
+			if h.policyEntryReferencesProviderForSetup(entry, provider, setup) {
+				return true
+			}
+			continue
+		}
+		if route, ok := setup.lookupRoute(model); ok && route != nil && !route.legacy {
+			for _, target := range route.targets {
+				if target.provider != nil && target.provider.id == providerID {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (h *ProxyHandler) providerWithinAllowedModelScope(provider *providerRuntime) bool {
 	if provider == nil {
 		return false
@@ -1194,8 +1353,10 @@ func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*provider
 	if defaultProviderID == "" {
 		switch {
 		case len(providers) == 1:
-			for id := range providers {
-				defaultProviderID = id
+			for id, provider := range providers {
+				if provider.kind != providerTypeTypeSafeCompatible {
+					defaultProviderID = id
+				}
 			}
 		case copilotProviders == 1:
 			for _, provider := range providers {
@@ -1234,9 +1395,13 @@ func buildProviderRuntimeForProvidersConfigWithResolver(cfg ProviderConfig, defa
 
 	kind := providerType(strings.TrimSpace(cfg.Type))
 	switch kind {
-	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 	default:
 		return nil, fmt.Errorf("provider %q has unsupported type %q", id, cfg.Type)
+	}
+
+	if kind != providerTypeTypeSafeCompatible && strings.TrimSpace(cfg.SystemOnePath) != "" {
+		return nil, fmt.Errorf("provider %q: systemone_path is only supported for typesafe-compatible providers", id)
 	}
 
 	runtime := &providerRuntime{
@@ -1247,6 +1412,7 @@ func buildProviderRuntimeForProvidersConfigWithResolver(cfg ProviderConfig, defa
 		modelDiscovery:             providerModelDiscoveryStatic,
 		trustDomain:                strings.TrimSpace(cfg.TrustDomain),
 		classifierNoStoreSupported: cloneBoolPtr(cfg.ClassifierNoStoreSupported),
+		hostedTools:                providerHostedToolSet(cfg.HostedTools),
 		includeModels:              make(map[string]struct{}, len(cfg.IncludeModels)),
 		excludeModels:              make(map[string]struct{}, len(cfg.ExcludeModels)),
 		hiddenModels:               make(map[string]struct{}),
@@ -1349,7 +1515,7 @@ func buildProviderRuntimeForProvidersConfigWithResolver(cfg ProviderConfig, defa
 		}
 		runtime.baseURL = baseURL
 		runtime.codexAuth = codexAuth
-	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 		if baseURL == "" {
 			return nil, fmt.Errorf("provider %q must set base_url", id)
@@ -1380,6 +1546,7 @@ func buildProviderRuntimeForProvidersConfigWithResolver(cfg ProviderConfig, defa
 		runtime.authHeader = authHeader
 		runtime.authPrefix = authPrefix
 		runtime.apiKey = apiKey
+		runtime.authValue = genericProviderAuthValue(authPrefix, apiKey)
 		runtime.extraHeaders = extraHeaders
 		runtime.modelDiscovery = modelDiscovery
 
@@ -1391,6 +1558,9 @@ func buildProviderRuntimeForProvidersConfigWithResolver(cfg ProviderConfig, defa
 		}
 	}
 
+	if err := sealProviderRequestTemplates(runtime); err != nil {
+		return nil, err
+	}
 	return runtime, nil
 }
 
@@ -1420,6 +1590,22 @@ func configuredProviderEndpointPaths(kind providerType, cfg ProviderConfig) (pro
 	paths := providerEndpointPolicyFor(kind).defaultEndpointPaths()
 
 	var err error
+	if kind == providerTypeTypeSafeCompatible {
+		for _, field := range []struct{ name, value string }{
+			{"chat_completions_path", cfg.ChatCompletionsPath},
+			{"responses_path", cfg.ResponsesPath},
+			{"messages_path", cfg.MessagesPath},
+			{"models_path", cfg.ModelsPath},
+		} {
+			if strings.TrimSpace(field.value) != "" {
+				return providerEndpointPaths{}, fmt.Errorf("%s is not supported for typesafe-compatible providers", field.name)
+			}
+		}
+		if paths.systemOne, err = normalizeProviderPath(cfg.SystemOnePath, paths.systemOne, "systemone_path"); err != nil {
+			return providerEndpointPaths{}, err
+		}
+		return paths, nil
+	}
 	if paths.chatCompletions, err = normalizeProviderPath(cfg.ChatCompletionsPath, paths.chatCompletions, "chat_completions_path"); err != nil {
 		return providerEndpointPaths{}, err
 	}
@@ -1560,6 +1746,9 @@ func configuredProviderModelDiscovery(kind providerType, configured string) (pro
 	discovery := providerModelDiscovery(strings.TrimSpace(configured))
 	if discovery == "" {
 		return providerModelDiscoveryStatic, nil
+	}
+	if kind == providerTypeTypeSafeCompatible && discovery != providerModelDiscoveryStatic {
+		return "", fmt.Errorf("typesafe-compatible providers require static model_discovery")
 	}
 	switch discovery {
 	case providerModelDiscoveryStatic, providerModelDiscoveryOpenAI, providerModelDiscoveryOllama, providerModelDiscoveryOpenRouterTools:
@@ -1798,6 +1987,7 @@ func buildStaticProviderModel(providerID string, cfg ProviderModelConfig, defaul
 	return providerModel{
 		publicID:               publicID,
 		upstreamModel:          upstreamModel,
+		upstreamModelJSON:      encodeProviderModelJSON(upstreamModel),
 		providerID:             providerID,
 		supportedEndpoints:     endpoints,
 		parallelToolCalls:      cloneBoolPtr(cfg.ParallelToolCalls),
@@ -2044,6 +2234,9 @@ func (h *ProxyHandler) modelAllowedForRequest(model, endpoint string) bool {
 	if _, ok := h.allowedModels[model]; ok {
 		return true
 	}
+	if h.auxiliaryModelAllowed(setup, model, endpoint) {
+		return true
+	}
 	if entry, ok := setup.lookupPublicModelEntry(model); ok && entry != nil && entry.kind == publicEntryPolicy {
 		for allowedModel := range h.allowedModels {
 			allowedEntry, allowed := setup.lookupPublicModelEntry(allowedModel)
@@ -2225,6 +2418,18 @@ func rewriteRequestModelForProvider(body []byte, upstreamModel string) ([]byte, 
 }
 
 func rewriteRequestModelForProviderFromModel(body []byte, currentModel string, upstreamModel string) ([]byte, bool, error) {
+	return rewriteRequestModelForProviderFromModelJSON(body, currentModel, upstreamModel, nil)
+}
+
+func rewriteRequestModelForProviderFromModelJSON(body []byte, currentModel string, upstreamModel string, rawModel json.RawMessage) ([]byte, bool, error) {
+	return rewriteRequestModelForProviderFromModelJSONWithValidation(body, currentModel, upstreamModel, rawModel, false)
+}
+
+func rewriteRequestModelForProviderFromModelJSONValidated(body []byte, currentModel string, upstreamModel string, rawModel json.RawMessage) ([]byte, bool, error) {
+	return rewriteRequestModelForProviderFromModelJSONWithValidation(body, currentModel, upstreamModel, rawModel, true)
+}
+
+func rewriteRequestModelForProviderFromModelJSONWithValidation(body []byte, currentModel string, upstreamModel string, rawModel json.RawMessage, bodyValidated bool) ([]byte, bool, error) {
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
 		return body, false, nil
@@ -2234,10 +2439,40 @@ func rewriteRequestModelForProviderFromModel(body []byte, currentModel string, u
 	if currentModel == "" || currentModel == upstreamModel {
 		return body, false, nil
 	}
+	if len(rawModel) == 0 {
+		var err error
+		rawModel, err = json.Marshal(upstreamModel)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	var rewritten []byte
+	var ok bool
+	if bodyValidated {
+		rewritten, ok = replaceSingleTopLevelRawJSONFieldValidated(body, "model", rawModel)
+	} else {
+		rewritten, ok = replaceSingleTopLevelRawJSONField(body, "model", rawModel)
+	}
+	if ok {
+		return rewritten, true, nil
+	}
 	return rewriteResponsesRequestModel(body, upstreamModel)
 }
 
+func encodeProviderModelJSON(model string) json.RawMessage {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+	raw, _ := json.Marshal(model)
+	return raw
+}
+
 func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string, extraQuery string, owners ...providerModel) (string, error) {
+	return buildProviderRequestURL(provider, path, extraQuery, owners...)
+}
+
+func buildProviderRequestURL(provider *providerRuntime, path string, extraQuery string, owners ...providerModel) (string, error) {
 	if provider == nil {
 		return "", fmt.Errorf("provider is required")
 	}
@@ -2275,6 +2510,137 @@ func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string
 		return appendRawQuery(fullURL, extraQuery), nil
 	}
 	return appendRawQuery(fullURL, appendQuery("api-version="+url.QueryEscape(provider.apiVersion), extraQuery)), nil
+}
+
+func sealProviderRequestTemplates(provider *providerRuntime) error {
+	if provider == nil || (provider.kind != providerTypeOpenAICompatible && provider.kind != providerTypeAnthropicCompatible) {
+		return nil
+	}
+	headers, err := sealedGenericProviderJSONHeaders(provider)
+	if err != nil {
+		return err
+	}
+	autoGzip := headers.Get("Accept-Encoding") == ""
+	if autoGzip {
+		headers["Accept-Encoding"] = []string{"gzip"}
+	}
+	templates := make(map[string]*http.Request, 4)
+	for _, endpoint := range []string{
+		providerEndpointChatCompletions,
+		providerEndpointResponses,
+		providerEndpointMessages,
+		providerEndpointMessagesCount,
+	} {
+		fullURL, err := buildProviderRequestURL(provider, endpoint, "")
+		if err != nil {
+			return err
+		}
+		template, err := http.NewRequest(http.MethodPost, fullURL, nil)
+		if err != nil {
+			return fmt.Errorf("provider %q build request template for %s: %w", provider.id, endpoint, err)
+		}
+		template.Header = headers
+		templates[endpoint] = template
+	}
+	provider.postRequestTemplates = templates
+	provider.postRequestAutoGzip = autoGzip
+	return nil
+}
+
+func sealedGenericProviderJSONHeaders(provider *providerRuntime) (http.Header, error) {
+	headers := make(http.Header, len(provider.extraHeaders)+3)
+	for key, values := range provider.extraHeaders {
+		cloned := append([]string(nil), values...)
+		headers[key] = cloned[:len(cloned):len(cloned)]
+	}
+	switch provider.authType {
+	case providerAuthTypeNone, "":
+	case providerAuthTypeBearer, providerAuthTypeAPIKeyHeader:
+		if strings.TrimSpace(provider.apiKey) == "" {
+			return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no API key configured", provider.id)}
+		}
+		header := strings.TrimSpace(provider.authHeader)
+		if header == "" {
+			return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no auth header configured", provider.id)}
+		}
+		headers.Set(header, provider.authValue)
+	default:
+		return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported auth type %q", provider.authType)}
+	}
+	headers.Set("Content-Type", "application/json")
+	return headers, nil
+}
+
+func shallowCloneHeader(src http.Header) http.Header {
+	dst := make(http.Header, len(src))
+	for key, values := range src {
+		dst[key] = values
+	}
+	return dst
+}
+
+func mergeHeaderValuesWithoutOverride(dst, src http.Header) {
+	for key, values := range src {
+		if _, exists := dst[http.CanonicalHeaderKey(key)]; exists {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+type providerRequestBody struct {
+	bytes.Reader
+	route              providerRouteInfo
+	autoDecompressGzip bool
+}
+
+func newProviderRequestBody(body []byte, route providerRouteInfo, autoDecompressGzip bool) *providerRequestBody {
+	reader := &providerRequestBody{route: route, autoDecompressGzip: autoDecompressGzip}
+	reader.Reset(body)
+	return reader
+}
+
+func (*providerRequestBody) Close() error {
+	return nil
+}
+
+func requestFromProviderTemplate(ctx context.Context, template *http.Request, body []byte, reuseSealedHeaders bool, route providerRouteInfo, autoDecompressGzip bool) *http.Request {
+	req := template.WithContext(ctx)
+	if !reuseSealedHeaders {
+		req.Header = shallowCloneHeader(template.Header)
+	}
+	if len(body) == 0 {
+		if autoDecompressGzip {
+			if reuseSealedHeaders {
+				req.Header = shallowCloneHeader(template.Header)
+			}
+			req.Header.Del("Accept-Encoding")
+		}
+		return req
+	}
+	reader := newProviderRequestBody(body, route, autoDecompressGzip)
+	req.Body = reader
+	req.ContentLength = int64(len(body))
+	if reuseSealedHeaders {
+		// Inference retries rebuild the whole request through their factory. Keep
+		// GetBody nil so net/http cannot create an unbudgeted transparent replay.
+		return req
+	}
+	snapshot := reader.Reader
+	req.GetBody = func() (io.ReadCloser, error) {
+		return &providerRequestBody{Reader: snapshot, route: route, autoDecompressGzip: autoDecompressGzip}, nil
+	}
+	return req
+}
+
+func providerRequestAutoDecompressGzip(req *http.Request) bool {
+	if req == nil || req.Body == nil {
+		return false
+	}
+	body, ok := req.Body.(*providerRequestBody)
+	return ok && body != nil && body.autoDecompressGzip
 }
 
 func azureClassicOpenAIBaseURL(baseURL string, baseKind azureBaseURLKind) string {
@@ -2318,6 +2684,8 @@ func (p *providerRuntime) upstreamPath(endpoint string) string {
 		if p.paths.models != "" {
 			return p.paths.models
 		}
+	case providerEndpointSystemOne:
+		return p.paths.systemOne
 	}
 	return endpoint
 }
@@ -2398,17 +2766,18 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 
 	switch provider.kind {
 	case providerTypeCopilot:
-		var token string
+		var credential auth.Credential
 		var err error
 		if endpoint == providerEndpointResponses {
-			token, err = h.auth.GetResponsesToken(req.Context())
+			credential, err = h.auth.GetResponsesCredential(req.Context())
 		} else {
-			token, err = h.auth.GetToken(req.Context())
+			credential, err = h.auth.GetCredential(req.Context())
 		}
 		if err != nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+			return &providerRequestError{statusCode: http.StatusServiceUnavailable, code: upstreamAuthUnavailableCode, err: fmt.Errorf("provider %q Copilot auth failed: %w", provider.id, err)}
 		}
-		h.setCopilotHeadersForProvider(req, token, provider, endpoint)
+		h.setCopilotHeadersForProvider(req, credential.Token, provider, endpoint)
+		*req = *req.WithContext(context.WithValue(req.Context(), copilotSourceFingerprintContextKey{}, credential.SourceFingerprint))
 	case providerTypeAzureOpenAI:
 		clearCopilotHeaders(req.Header)
 		mergeHeaderValues(req.Header, provider.extraHeaders)
@@ -2422,7 +2791,7 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 			}
 			token, err := provider.azureToken.AccessToken(req.Context())
 			if err != nil {
-				return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q Azure identity auth failed: %w", provider.id, err)}
+				return &providerRequestError{statusCode: http.StatusServiceUnavailable, code: upstreamAuthUnavailableCode, err: fmt.Errorf("provider %q Azure identity auth failed: %w", provider.id, err)}
 			}
 			req.Header.Set("Authorization", "Bearer "+token)
 		default:
@@ -2436,7 +2805,7 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 		}
 		credentials, err := provider.codexAuth.credentials(req.Context(), h.client)
 		if err != nil {
-			return &providerRequestError{statusCode: http.StatusInternalServerError, err: err}
+			return &providerRequestError{statusCode: http.StatusServiceUnavailable, code: upstreamAuthUnavailableCode, err: fmt.Errorf("provider %q OpenAI Codex auth failed: %w", provider.id, err)}
 		}
 		req.Header.Set("Authorization", "Bearer "+credentials.accessToken)
 		if credentials.accountID != "" {
@@ -2446,7 +2815,7 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 			req.Header.Set("X-OpenAI-Fedramp", "true")
 		}
 		req.Header.Set("Content-Type", "application/json")
-	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		clearCopilotHeaders(req.Header)
 		mergeHeaderValues(req.Header, provider.extraHeaders)
 		if err := applyGenericProviderAuth(req, provider); err != nil {
@@ -2473,15 +2842,23 @@ func applyGenericProviderAuth(req *http.Request, provider *providerRuntime) erro
 		if header == "" {
 			return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider %q has no auth header configured", provider.id)}
 		}
-		value := provider.apiKey
-		if prefix := strings.TrimSpace(provider.authPrefix); prefix != "" {
-			value = prefix + " " + value
+		value := provider.authValue
+		if value == "" {
+			value = genericProviderAuthValue(provider.authPrefix, provider.apiKey)
 		}
 		req.Header.Set(header, value)
 		return nil
 	default:
 		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("unsupported auth type %q", provider.authType)}
 	}
+}
+
+func genericProviderAuthValue(prefix, apiKey string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return apiKey
+	}
+	return prefix + " " + apiKey
 }
 
 type providerRouteContextKey struct{}
@@ -2529,27 +2906,117 @@ func providerRouteFromResponse(resp *http.Response) (providerRouteInfo, bool) {
 	if resp == nil || resp.Request == nil {
 		return providerRouteInfo{}, false
 	}
-	route, ok := resp.Request.Context().Value(providerRouteContextKey{}).(providerRouteInfo)
+	return providerRouteFromRequest(resp.Request)
+}
+
+func providerRouteFromRequest(req *http.Request) (providerRouteInfo, bool) {
+	if req == nil {
+		return providerRouteInfo{}, false
+	}
+	if body, ok := req.Body.(*providerRequestBody); ok && body != nil && body.route.id != "" {
+		return body.route, true
+	}
+	route, ok := req.Context().Value(providerRouteContextKey{}).(providerRouteInfo)
 	return route, ok && route.id != ""
 }
 
 func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
+	return h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, false, owners...)
+}
+
+// newProviderJSONInferenceRequest may reuse the immutable header map sealed on
+// a configured generic provider's request template. RoundTripper implementations
+// must not mutate requests, and inference retries call the factory again, so the
+// common path does not need a per-attempt header-map clone. Client.Do adds jar
+// cookies to the request header, so clients with a cookie jar retain isolation.
+func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
+	body, err := applyAnthropicChatCacheControl(ctx, provider, path, body)
+	if err != nil {
+		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+	}
+	// After the cache mapping: it projects the client's original content and refuses
+	// messages whose content no longer matches that projection.
+	body, omitted := omitChatImagesBeyondOwnerLimit(body, path, owners)
+	if omitted > 0 && h.log != nil {
+		providerID := ""
+		if provider != nil {
+			providerID = provider.id
+		}
+		h.log.Info("omitted images beyond the model's per-request limit",
+			logger.F("provider", providerID),
+			logger.F("model", owners[0].upstreamModel),
+			logger.F("limit", owners[0].maxPromptImages),
+			logger.F("omitted", omitted),
+		)
+	}
+	req, err := h.newProviderJSONRequestWithTemplateHeaders(ctx, provider, method, path, body, extraHeaders, extraQuery, true, owners...)
+	if err == nil && req != nil {
+		// Inference retries reserve every physical send explicitly. Disable the
+		// transparent transport replay that NewRequest enables for byte readers,
+		// including fallback paths that cannot use a sealed request template.
+		req.GetBody = nil
+		client := h.client
+		if client == nil {
+			client = http.DefaultClient
+		}
+		if client != nil && client.Jar != nil {
+			req.Header = shallowCloneHeader(req.Header)
+		}
+		req = withCopilotInferenceRequest(req, provider, path, body, owners...)
+		req = withTaskInferenceRequest(req, path)
+		req = withResponsesCitationSources(req, path, body)
+	}
+	return req, err
+}
+
+func (h *ProxyHandler) newProviderJSONRequestWithTemplateHeaders(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, reuseSealedHeaders bool, owners ...providerModel) (*http.Request, error) {
+	// The history assertion belongs to local request validation, including on
+	// routes where migration is disabled. Never forward it to a provider.
+	if _, present := extraHeaders["X-Vekil-History-Complete"]; present {
+		extraHeaders = extraHeaders.Clone()
+		extraHeaders.Del("X-Vekil-History-Complete")
+	}
 	route := providerRouteInfo{id: provider.id, kind: string(provider.kind)}
 	// Route selection has already happened before URL construction or provider
 	// authentication. Publish it now so failures in either step retain the actual
 	// provider attribution even if the dynamic model catalog changes afterward.
 	publishProviderRoute(ctx, route)
+	if method == http.MethodPost && extraQuery == "" && (len(extraHeaders) == 0 || path == providerEndpointMessages) {
+		if template := provider.postRequestTemplates[path]; template != nil {
+			// Inference sends go directly through the RoundTripper, which preserves
+			// the request body object on resp.Request. Store route attribution there
+			// and avoid a separate context layer on this common path. General Client
+			// requests retain the context fallback because redirect bookkeeping may
+			// wrap or replace their bodies.
+			if reuseSealedHeaders && len(body) > 0 {
+				req := requestFromProviderTemplate(ctx, template, body, reuseSealedHeaders, route, provider.postRequestAutoGzip)
+				if len(extraHeaders) > 0 {
+					req.Header = shallowCloneHeader(template.Header)
+					mergeHeaderValuesWithoutOverride(req.Header, extraHeaders)
+				}
+				return req, nil
+			}
+			ctx = context.WithValue(ctx, providerRouteContextKey{}, route)
+			req := requestFromProviderTemplate(ctx, template, body, reuseSealedHeaders, route, provider.postRequestAutoGzip)
+			if len(extraHeaders) > 0 {
+				if reuseSealedHeaders {
+					req.Header = shallowCloneHeader(req.Header)
+				}
+				mergeHeaderValuesWithoutOverride(req.Header, extraHeaders)
+			}
+			return req, nil
+		}
+	}
+	ctx = context.WithValue(ctx, providerRouteContextKey{}, route)
+
 	fullURL, err := h.providerRequestURL(provider, path, extraQuery, owners...)
 	if err != nil {
 		return nil, err
 	}
-
 	var bodyReader io.Reader
 	if len(body) > 0 {
 		bodyReader = bytes.NewReader(body)
 	}
-
-	ctx = context.WithValue(ctx, providerRouteContextKey{}, route)
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
 		return nil, err
@@ -2704,6 +3171,8 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		}
 		result.models = models
 		return result, nil
+	case providerTypeTypeSafeCompatible:
+		return providerModelsFetchResult{}, nil
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		if provider.modelDiscovery == providerModelDiscoveryStatic {
 			return providerModelsFetchResult{models: orderedStaticProviderModels(provider)}, nil
@@ -3003,6 +3472,13 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			if merged.disabled != models[index].disabled && !merged.disabled {
 				baseRaw = raw
 			}
+			// The image limit follows the published entry; when that entry declares none,
+			// a limit another entry for the same ID declares still applies.
+			if limit := providerModelMaxPromptImagesFromRaw(baseRaw); limit > 0 {
+				merged.maxPromptImages = limit
+			} else {
+				merged.maxPromptImages = max(merged.maxPromptImages, providerModelMaxPromptImagesFromRaw(raw))
+			}
 			merged.raw = mergeProviderModelRaw(baseRaw, merged.supportedEndpoints)
 			models[index] = merged
 			continue
@@ -3015,6 +3491,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			providerID:          provider.id,
 			supportedEndpoints:  supportedEndpoints,
 			parallelToolCalls:   providerModelParallelToolCallsFromRaw(raw),
+			maxPromptImages:     providerModelMaxPromptImagesFromRaw(raw),
 			disabled:            disabled,
 			endpointsAdvertised: endpointsAdvertised,
 			raw:                 mergeProviderModelRaw(raw, supportedEndpoints),
@@ -3036,6 +3513,32 @@ func providerModelParallelToolCallsFromRaw(raw json.RawMessage) *bool {
 		return nil
 	}
 	return cloneBoolPtr(parsed.Capabilities.Supports.ParallelToolCalls)
+}
+
+// providerModelMaxPromptImagesFromRaw honors the catalog image limit for Google models only.
+// Copilot enforces that limit for Gemini, while other vendors declare limits their endpoints
+// exceed in practice: GPT declares one image and has accepted eleven.
+func providerModelMaxPromptImagesFromRaw(raw json.RawMessage) int {
+	var parsed struct {
+		Vendor       string `json:"vendor"`
+		Capabilities struct {
+			Limits struct {
+				Vision struct {
+					MaxPromptImages json.RawMessage `json:"max_prompt_images"`
+				} `json:"vision"`
+			} `json:"limits"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil || !strings.EqualFold(strings.TrimSpace(parsed.Vendor), "Google") {
+		return 0
+	}
+	// Any integral JSON number counts, so 10, 10.0 and 1e1 all declare ten images. A
+	// string, fraction, nonpositive or out-of-range value declares no limit.
+	var limit float64
+	if json.Unmarshal(parsed.Capabilities.Limits.Vision.MaxPromptImages, &limit) != nil || limit < 1 || limit > math.MaxInt32 || limit != math.Trunc(limit) {
+		return 0
+	}
+	return int(limit)
 }
 
 func openRouterModelSupportsTools(supportedParams []string) bool {
@@ -3070,6 +3573,7 @@ func mergeDiscoveredProviderModelsWithStaticConfig(provider *providerRuntime, di
 				continue
 			}
 			staticModel.disabled = model.disabled
+			staticModel.maxPromptImages = model.maxPromptImages
 			staticModel.raw, err = mergeProviderModelMetadataOverlayRaw(staticModel.raw, model.raw, cfg)
 			if err != nil {
 				staticModel.raw = mergeProviderModelRaw(staticModel.raw, staticModel.supportedEndpoints)

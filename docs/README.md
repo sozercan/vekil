@@ -6,20 +6,23 @@ This folder is intentionally split into small, single-purpose files so humans an
 
 | File | Scope | Update When |
 |------|-------|-------------|
-| [`getting-started.md`](getting-started.md) | install, run, first authentication, deployment entry points, and current/native macOS distribution status | startup flow or distribution changes |
+| [`getting-started.md`](getting-started.md) | install, run, `vekil service` background service (systemd, launchd, Task Scheduler), first authentication, deployment entry points, and current/native macOS distribution status | startup flow, `vekil service`, or distribution changes |
 | [`configuration.md`](configuration.md) | configuration map, generic CLI flags/env vars, macOS configuration ownership, policy-routing runtime ceiling, and Copilot header overrides | generic flags, env vars, config ownership/modes, or Copilot header defaults change |
-| [`provider-routing.md`](provider-routing.md) | provider auth, schema-v2 model routes and policies, ordered priority failover, route exposure, model ownership, endpoint allowlists, and native-editor scope | providers, routing behavior, failover safety, auth, editor scope, or model metadata changes |
+| [`provider-routing.md`](provider-routing.md) | provider auth, schema-v2 model routes and policies, state-storage configuration, ordered priority failover, route exposure, model ownership, native endpoint allowlists, and native-editor scope | providers, routing behavior, failover safety, auth, editor scope, or model metadata changes |
+| [`state-recovery.md`](state-recovery.md) | default durable ownership for schema-v2 routes, shared providers configuration, macOS/Linux local storage, capacity, pruning, and recovery limits | persisted ownership, storage defaults/format, supported filesystems, retention, or recovery behavior changes |
+| [`conversation-migration.md`](conversation-migration.md) | opt-in Azure/Copilot Responses migration, complete visible history, local tools, continuation/reconnect, storage privacy and deletion | migration configuration, completeness, safety, diagnostics or history retention changes |
 | [`policy-routing.md`](policy-routing.md) | schema-v2 semantic policy routing, classifier privacy/trust, modes, fallbacks, metrics, evaluation, and rollout gates | policy schema, classifier behavior, supported surfaces, telemetry, or release gates change |
 | [`provider-api-keys.md`](provider-api-keys.md) | where to get provider API keys, config mapping, and macOS Keychain ownership | provider signup/key URLs, auth guidance, or managed secret handling changes |
 | [`tool-optimizers.md`](tool-optimizers.md) | optional shell command rewrite and tool-output reduction config | optimizer config or behavior changes |
-| [`responses-websocket.md`](responses-websocket.md) | Codex-style `GET /v1/responses` websocket bridge tuning | websocket bridge, auto-compaction, or compact retry knobs change |
+| [`responses-websocket.md`](responses-websocket.md) | Codex-style `GET /v1/responses` bridge, experimental native Copilot transport, and session limits | websocket transports, envelopes, auto-compaction, or compact retry knobs change |
 | [`clients.md`](clients.md) | copy-paste client examples | onboarding snippets or client compatibility changes |
 | [`agent-launchers.md`](agent-launchers.md) | one-command coding-agent launchers, lifecycle, logs, and credential isolation | launcher targets, flags, process lifecycle, or child configuration changes |
+| [`troubleshooting.md`](troubleshooting.md) | symptom-based recovery and diagnostic guidance for client-visible failures | a recurring failure gains a known recovery path or new diagnostic evidence |
 | [`api.md`](api.md) | public endpoint map plus cross-surface Chat/Responses compatibility contract | public routes or Chat compatibility behavior changes |
 | [`gemini.md`](gemini.md) | Gemini translation compatibility details | Gemini request/response translation behavior changes |
 | [`responses.md`](responses.md) | native Responses behavior, the Chat-over-Responses boundary, compact, and memory shims | Responses passthrough, Chat adaptation, compaction, or shim behavior changes |
 | [`architecture.md`](architecture.md) | package responsibilities, native macOS shell/helper boundary, route registry/executor, Chat execution seam, replay safety, and data flow | implementation boundaries or design decisions change |
-| [`dashboard.md`](dashboard.md) | browser dashboard, native analytics source/release status, route/attempt metrics, AI insights, and `/stats.json` | dashboard/native analytics, metrics, endpoints, insight routing, or stats behavior change |
+| [`dashboard.md`](dashboard.md) | browser dashboard, native analytics source/release status, route/attempt and full-task metrics, AI insights, and `/stats.json` | dashboard/native analytics, metrics, endpoints, insight routing, or stats behavior change |
 | [`menubar.md`](menubar.md) | published macOS/Linux tray usage plus implemented native-source and release-gate status | tray/native-shell behavior or packaging changes |
 | [`development.md`](development.md) | build, test, native macOS release gates, route-safety, policy-routing, Chat-over-Responses matrices, benchmark/evaluation baselines, and CI workflows | local dev, test/release gates, benchmark commands, evaluation gates, or CI change |
 

@@ -187,7 +187,7 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 			breaker:              breaker,
 			configGeneration:     configGeneration,
 			profileGeneration:    policyProfileGeneration(profileCfg, entry.contract, lightweight, powerful),
-			classifierGeneration: policyClassifierGeneration(classifierRoute),
+			classifierGeneration: policyClassifierGeneration(classifierRoute, profileCfg.Classifier.ReasoningEffort),
 			binaryGeneration:     binaryGeneration,
 		}
 		profile.classifierRuntime = newPolicyClassifierRuntime(classifierAdapter, admission, breaker)
@@ -383,9 +383,9 @@ func (c *chatPolicyRoutingController) Initialize(ctx context.Context) error {
 func policyPreflightFacts() policyClassifierFacts {
 	text := "Inspect one small function and report its behavior."
 	return policyClassifierFacts{
-		SchemaVersion: policyFactSchemaVersion,
-		FirstUserTask: &policyFactMessage{Role: policyFactRoleUser, Text: text, OriginalBytes: len(text)},
-		Counts:        policyFactCounts{Messages: 1, UserMessages: 1, TextMessages: 1, TaskOriginalBytes: len(text)},
+		SchemaVersion:   policyFactSchemaVersion,
+		CurrentUserTask: &policyFactMessage{Role: policyFactRoleUser, Text: text, OriginalBytes: len(text)},
+		Counts:          policyFactCounts{Messages: 1, UserMessages: 1, TextMessages: 1, TaskOriginalBytes: len(text)},
 	}
 }
 
@@ -413,9 +413,10 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	var replayRoute *modelRoute
 	var replayTier policyTier
 	downstreamReplayPassthrough := false
-	if chatRequestContainsResponsesReplayID(input.OriginalBody) {
+	containsReplay := chatRequestContainsResponsesReplayID(input.OriginalBody)
+	if containsReplay {
 		var replayErr error
-		replayRoute, replayTier, replayErr = c.resolvePolicyResponsesReplayRoute(profile, input.OriginalBody)
+		replayRoute, replayTier, replayErr = c.resolvePolicyResponsesReplayRoute(profile, input.OriginalBody, input.CarriedReasoning)
 		if replayErr != nil {
 			baselineRoute := profile.routeForTier(profile.baselineTier)
 			downstreamReplayPassthrough = (mode == policyModeOff || mode == policyModeObserve) &&
@@ -426,9 +427,18 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 				return chatOperationPlan{}, replayErr
 			}
 		}
+		if replayRoute != nil && len(policyCompletedReplayRoutes(profile)) > 0 && !chatRequestHasActiveResponsesPolicyReplay(input.OriginalBody) {
+			// The replay remains validated history. A new user task chooses its own
+			// effort once every earlier tool call and assistant turn has finished.
+			replayRoute = nil
+			replayTier = policyTierUnknown
+		}
 	}
 	if replayRoute == nil && !downstreamReplayPassthrough {
-		if err := c.validateResponsesBackedPolicyRequest(profile, input.OriginalBody); err != nil {
+		if err := c.validateResponsesBackedPolicyRequest(profile, input.OriginalBody, input.CarriedReasoning); err != nil {
+			if containsReplay {
+				return chatOperationPlan{}, err
+			}
 			return chatOperationPlan{}, &providerRequestError{
 				statusCode: http.StatusBadRequest,
 				err:        fmt.Errorf("policy model %q request is outside its shared terminal contract: %w", entry.id, err),
@@ -465,8 +475,26 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	return c.enforce(ctx, profile, input, facts, bucket)
 }
 
-func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profile *compiledPolicyProfile, body []byte) error {
+func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profile *compiledPolicyProfile, body []byte, carried map[string]carriedReplay) error {
 	if c == nil || c.h == nil || profile == nil {
+		return nil
+	}
+	completedReplayRoutes := policyCompletedReplayRoutes(profile)
+	if len(completedReplayRoutes) > 0 && chatRequestContainsResponsesReplayID(body) {
+		carried = routeSelectingCarriers(carried)
+		for index, route := range []*modelRoute{profile.lightweight, profile.powerful} {
+			replayRoute := completedReplayRoutes[index]
+			if _, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+				UpstreamModel:               replayRoute.UpstreamModel,
+				CarriedReasoning:            carried,
+				ReplayStore:                 c.h.responsesChatReplayStore(),
+				ReplayRoute:                 replayRoute,
+				CompletedPolicyReplayRoutes: cloneResponsesChatReplayRoutes(completedReplayRoutes),
+				DropSamplingParams:          route.public.policy.dropSamplingParams,
+			}); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	seen := make(map[string]struct{}, 2)
@@ -482,14 +510,15 @@ func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profi
 		if explicitRouteHasChatBackend(route, providerEndpointChatCompletions) || !explicitRouteHasChatBackend(route, providerEndpointResponses) {
 			continue
 		}
-		if _, _, err := c.h.prepareExplicitResponsesChatRequest(nil, route, body, chatExecutionOptions{}); err != nil {
+		// nil logger: a validation preflight re-translates, so its degrade is logged by the real pass.
+		if _, _, err := c.h.prepareExplicitResponsesChatRequest(nil, route, body, chatExecutionOptions{}, nil); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile *compiledPolicyProfile, body []byte) (*modelRoute, policyTier, error) {
+func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile *compiledPolicyProfile, body []byte, carried map[string]carriedReplay) (*modelRoute, policyTier, error) {
 	if c == nil || c.h == nil || profile == nil {
 		return nil, policyTierUnknown, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model does not support Responses replay continuations")}
 	}
@@ -497,6 +526,8 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 		route *modelRoute
 		tier  policyTier
 	}
+	carried = routeSelectingCarriers(carried)
+	completedReplayRoutes := policyCompletedReplayRoutes(profile)
 	candidates := []candidate{{route: profile.lightweight, tier: policyTierLightweight}, {route: profile.powerful, tier: policyTierPowerful}}
 	responsesCapable := false
 	var missing error
@@ -514,8 +545,9 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 				upstreamModel = profile.entry.id
 			}
 			_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
-				UpstreamModel: upstreamModel,
-				ReplayStore:   c.h.responsesChatReplayStore(),
+				UpstreamModel:    upstreamModel,
+				CarriedReasoning: carried,
+				ReplayStore:      c.h.responsesChatReplayStore(),
 				ReplayRoute: responsesChatReplayRoute{
 					ProviderID:    target.provider.id,
 					PublicModel:   profile.entry.id,
@@ -523,7 +555,8 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 					RouteID:       candidate.route.public.routeID,
 					PolicyTier:    candidate.tier.String(),
 				},
-				DropSamplingParams: candidate.route.public.policy.dropSamplingParams,
+				CompletedPolicyReplayRoutes: cloneResponsesChatReplayRoutes(completedReplayRoutes),
+				DropSamplingParams:          candidate.route.public.policy.dropSamplingParams,
 			})
 			if err == nil {
 				return candidate.route, candidate.tier, nil
@@ -756,21 +789,22 @@ func (c *chatPolicyRoutingController) sealPlan(profile *compiledPolicyProfile, i
 	decision.InputBytes = len(input.OriginalBody)
 	decision.Truncated = decision.Truncated || facts.truncated()
 	return newChatOperationPlan(chatOperationPlanOptions{
-		OperationID:             input.OperationID,
-		EntryID:                 profile.entry.id,
-		PublicID:                profile.entry.id,
-		RouteID:                 route.public.routeID,
-		Route:                   route,
-		Contract:                contract,
-		SelectedReasoningEffort: profile.reasoningEffortForTier(tier),
-		PolicyID:                profile.config.ID,
-		SelectedTier:            tier,
-		EffectiveMode:           profile.effectiveMode(),
-		ConfigGeneration:        profile.configGeneration,
-		ProfileGeneration:       profile.profileGeneration,
-		ClassifierGeneration:    profile.classifierGeneration,
-		BinaryGeneration:        profile.binaryGeneration,
-		Decision:                decision,
+		OperationID:                 input.OperationID,
+		EntryID:                     profile.entry.id,
+		PublicID:                    profile.entry.id,
+		RouteID:                     route.public.routeID,
+		Route:                       route,
+		Contract:                    contract,
+		SelectedReasoningEffort:     profile.reasoningEffortForTier(tier),
+		CompletedPolicyReplayRoutes: policyCompletedReplayRoutes(profile),
+		PolicyID:                    profile.config.ID,
+		SelectedTier:                tier,
+		EffectiveMode:               profile.effectiveMode(),
+		ConfigGeneration:            profile.configGeneration,
+		ProfileGeneration:           profile.profileGeneration,
+		ClassifierGeneration:        profile.classifierGeneration,
+		BinaryGeneration:            profile.binaryGeneration,
+		Decision:                    decision,
 	})
 }
 
@@ -784,21 +818,22 @@ func (c *chatPolicyRoutingController) sealRoutePlan(profile *compiledPolicyProfi
 	decision.InputBytes = len(input.OriginalBody)
 	decision.Truncated = decision.Truncated || facts.truncated()
 	return newChatOperationPlan(chatOperationPlanOptions{
-		OperationID:             input.OperationID,
-		EntryID:                 profile.entry.id,
-		PublicID:                profile.entry.id,
-		RouteID:                 route.public.routeID,
-		Route:                   route,
-		Contract:                contract,
-		SelectedReasoningEffort: profile.reasoningEffortForTier(tier),
-		PolicyID:                profile.config.ID,
-		SelectedTier:            tier,
-		EffectiveMode:           profile.effectiveMode(),
-		ConfigGeneration:        profile.configGeneration,
-		ProfileGeneration:       profile.profileGeneration,
-		ClassifierGeneration:    profile.classifierGeneration,
-		BinaryGeneration:        profile.binaryGeneration,
-		Decision:                decision,
+		OperationID:                 input.OperationID,
+		EntryID:                     profile.entry.id,
+		PublicID:                    profile.entry.id,
+		RouteID:                     route.public.routeID,
+		Route:                       route,
+		Contract:                    contract,
+		SelectedReasoningEffort:     profile.reasoningEffortForTier(tier),
+		CompletedPolicyReplayRoutes: policyCompletedReplayRoutes(profile),
+		PolicyID:                    profile.config.ID,
+		SelectedTier:                tier,
+		EffectiveMode:               profile.effectiveMode(),
+		ConfigGeneration:            profile.configGeneration,
+		ProfileGeneration:           profile.profileGeneration,
+		ClassifierGeneration:        profile.classifierGeneration,
+		BinaryGeneration:            profile.binaryGeneration,
+		Decision:                    decision,
 	})
 }
 
@@ -871,34 +906,48 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 	if !route.supportsEndpoint(endpoint) && route.supportsEndpoint(providerEndpointResponses) {
 		endpoint = providerEndpointResponses
 	}
+	newClassifier := newPolicyHTTPClassifier
+	if target.provider.kind == providerTypeTypeSafeCompatible {
+		endpoint = providerEndpointSystemOne
+		newClassifier = newPolicyTypeSafeClassifier
+	}
 	options := policyHTTPClassifierOptions{
 		Model:               target.upstreamModel,
+		ReasoningEffort:     profile.Classifier.ReasoningEffort,
 		MaxCompletionTokens: profile.Classifier.MaxCompletionTokens,
 		MaxFactsBytes:       profile.Classifier.MaxRequestBytes,
 		MaxResponseBytes:    policyClassifierResponseLimit,
 	}
-	return newPolicyHTTPClassifier(options, func(ctx context.Context, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
-		prepared, err := preparePolicyClassifierBody(body, target)
-		if err != nil {
-			return policyClassifierHTTPResponse{}, err
-		}
+	return newClassifier(options, func(ctx context.Context, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
+		ctx = withTaskInferenceKind(ctx, taskClassifier)
 		owner := providerModelFromRouteTarget(route, target)
-		prepared = applyProviderModelRequestPolicy(prepared, providerEndpointChatCompletions, owner)
-		if err := validatePolicyClassifierNoStore(prepared, target.provider); err != nil {
-			return policyClassifierHTTPResponse{}, err
+		prepared := body
+		var err error
+		if endpoint != providerEndpointSystemOne {
+			prepared, err = preparePolicyClassifierBody(body, target)
+			if err != nil {
+				return policyClassifierHTTPResponse{}, err
+			}
+			prepared = applyProviderModelRequestPolicy(prepared, providerEndpointChatCompletions, owner)
+			if err := validatePolicyClassifierNoStore(prepared, target.provider); err != nil {
+				return policyClassifierHTTPResponse{}, err
+			}
 		}
 
 		var response policyClassifierHTTPResponse
 		if endpoint == providerEndpointResponses {
 			response, err = h.sendPolicyClassifierOverResponses(ctx, route, target, owner, prepared, headers)
 		} else {
-			response, err = h.sendPolicyClassifierNativeChat(ctx, target, owner, prepared, headers)
+			response, err = h.sendPolicyClassifierJSON(ctx, target, owner, endpoint, prepared, headers)
 		}
 		if err != nil {
 			return policyClassifierHTTPResponse{}, err
 		}
 		if stats != nil {
 			usage := response.Usage
+			if endpoint == providerEndpointSystemOne {
+				usage = readPolicyTypeSafeUsage(response.Body)
+			}
 			if usage.isZero() {
 				usage = readPolicyClassifierUsage(response.Body)
 			}
@@ -910,17 +959,28 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 	})
 }
 
-func (h *ProxyHandler) sendPolicyClassifierNativeChat(ctx context.Context, target targetBinding, owner providerModel, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
-	req, err := h.newProviderJSONRequest(ctx, target.provider, http.MethodPost, providerEndpointChatCompletions, body, headers, "", owner)
+func (h *ProxyHandler) sendPolicyClassifierJSON(ctx context.Context, target targetBinding, owner providerModel, endpoint string, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
+	req, err := h.newProviderJSONInferenceRequest(ctx, target.provider, http.MethodPost, endpoint, body, headers, "", owner)
 	if err != nil {
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, true)
 	}
 	if err := ctx.Err(); err != nil {
 		return policyClassifierHTTPResponse{}, err
 	}
+	permit, blocked, admissionErr := h.acquireCopilotInference(req)
+	if admissionErr != nil || blocked != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		if blocked != nil {
+			return readPolicyClassifierHTTPResponse(blocked)
+		}
+		return policyClassifierHTTPResponse{}, admissionErr
+	}
 	observation := newRouteSendObservation(time.Now(), nil)
 	markPolicyClassifierDispatched(ctx)
 	resp, err := h.singleInferenceSend(req, observation)
+	h.finishCopilotInference(req, resp, err, permit)
 	if err != nil {
 		// Only failures proven to occur before any request bytes were written
 		// may affect shared health. Delivery-ambiguous resets stay local.
@@ -960,16 +1020,27 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 	if err := validatePolicyClassifierNoStore(requestBody, target.provider); err != nil {
 		return policyClassifierHTTPResponse{}, err
 	}
-	req, err := h.newProviderJSONRequest(ctx, target.provider, http.MethodPost, providerEndpointResponses, requestBody, headers, "", owner)
+	req, err := h.newProviderJSONInferenceRequest(ctx, target.provider, http.MethodPost, providerEndpointResponses, requestBody, headers, "", owner)
 	if err != nil {
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, true)
 	}
 	if err := ctx.Err(); err != nil {
 		return policyClassifierHTTPResponse{}, err
 	}
+	permit, blocked, admissionErr := h.acquireCopilotInference(req)
+	if admissionErr != nil || blocked != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		if blocked != nil {
+			return readPolicyClassifierHTTPResponse(blocked)
+		}
+		return policyClassifierHTTPResponse{}, admissionErr
+	}
 	observation := newRouteSendObservation(time.Now(), nil)
 	markPolicyClassifierDispatched(ctx)
 	resp, err := h.singleInferenceSend(req, observation)
+	h.finishCopilotInference(req, resp, err, permit)
 	if err != nil {
 		preSend := !observation.wroteHeaders.Load() && !observation.wroteRequest.Load()
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, preSend)
@@ -1104,6 +1175,7 @@ func readPolicyClassifierUsage(body []byte) policyStatsTokenUsage {
 			PromptTokens        int64 `json:"prompt_tokens"`
 			CompletionTokens    int64 `json:"completion_tokens"`
 			TotalTokens         int64 `json:"total_tokens"`
+			ReasoningTokens     int64 `json:"reasoning_tokens"`
 			PromptTokensDetails *struct {
 				CachedTokens int64 `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
@@ -1122,6 +1194,9 @@ func readPolicyClassifierUsage(body []byte) policyStatsTokenUsage {
 	}
 	if envelope.Usage.CompletionTokensDetails != nil {
 		usage.ReasoningTokens = envelope.Usage.CompletionTokensDetails.ReasoningTokens
+	}
+	if usage.ReasoningTokens <= 0 {
+		usage.ReasoningTokens = envelope.Usage.ReasoningTokens
 	}
 	return usage.normalized()
 }

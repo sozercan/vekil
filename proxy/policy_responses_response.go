@@ -257,6 +257,9 @@ func policyResponsesUsageFromChat(usage *models.OpenAIUsage) policyResponsesResp
 	if usage.CompletionTokensDetails != nil {
 		converted.OutputTokensDetails["reasoning_tokens"] = usage.CompletionTokensDetails.ReasoningTokens
 	}
+	if converted.OutputTokensDetails["reasoning_tokens"] <= 0 {
+		converted.OutputTokensDetails["reasoning_tokens"] = max(usage.ReasoningTokens, 0)
+	}
 	return converted
 }
 

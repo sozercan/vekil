@@ -418,10 +418,8 @@ func inputHasMessageRole(v interface{}, role string) bool {
 			}
 		}
 	case map[string]interface{}:
-		if itemType, _ := typed["type"].(string); itemType == "message" {
-			if messageRole, _ := typed["role"].(string); messageRole == role {
-				return true
-			}
+		if messageHasRole(typed, role) {
+			return true
 		}
 		for _, value := range typed {
 			if inputHasMessageRole(value, role) {
@@ -437,7 +435,12 @@ func messageHasRole(v interface{}, role string) bool {
 	if !ok {
 		return false
 	}
-	if itemType, _ := typed["type"].(string); itemType != "message" {
+	// Responses input messages may omit type when role and content identify them.
+	if rawType, hasType := typed["type"]; hasType {
+		if itemType, _ := rawType.(string); itemType != "message" {
+			return false
+		}
+	} else if _, hasContent := typed["content"]; !hasContent {
 		return false
 	}
 	messageRole, _ := typed["role"].(string)

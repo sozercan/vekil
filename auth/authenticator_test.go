@@ -198,8 +198,9 @@ func TestGetToken_FineGrainedPATUsesDirectBearer(t *testing.T) {
 
 func TestGetToken_SupportedEnvAccessTokensUseDirectBearer(t *testing.T) {
 	tests := map[string]string{
-		"oauth":    "gho_oauth-token",
-		"app-user": "ghu_user-token",
+		"oauth":         "gho_oauth-token",
+		"app-user":      "ghu_user-token",
+		"actions-token": "ghs_actions-token",
 	}
 	for name, accessToken := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -311,6 +312,7 @@ func TestGetResponsesToken_OtherSupportedCredentialsStayDirect(t *testing.T) {
 	for name, token := range map[string]string{
 		"oauth":            "gho_responses-direct",
 		"fine-grained PAT": "github_pat_responses-direct",
+		"Actions token":    "ghs_responses-direct",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("COPILOT_GITHUB_TOKEN", token)
@@ -626,7 +628,7 @@ func TestIsSupportedCopilotBearer(t *testing.T) {
 		"ghu_user":           true,
 		"github_pat_fine":    true,
 		"ghp_classic":        false,
-		"ghs_server":         false,
+		"ghs_actions":        true,
 		"legacy-token":       false,
 		"":                   false,
 		"GHU_not-normalized": false,
@@ -1810,6 +1812,48 @@ func TestRefreshTokenNonInteractive_PreservesTransientExchangeError(t *testing.T
 	}
 }
 
+func TestDeviceCodeFlowUsesDeviceCodePrompt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/device/code":
+			_ = json.NewEncoder(w).Encode(DeviceCodeResponse{
+				DeviceCode:      "dc_prompt",
+				UserCode:        "LOGS-1234",
+				VerificationURI: "https://github.com/login/device",
+				ExpiresIn:       60,
+				Interval:        1,
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(AccessTokenResponse{Error: "authorization_pending"})
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var gotURI, gotCode string
+	a := &Authenticator{
+		client:   server.Client(),
+		tokenDir: t.TempDir(),
+		DeviceCodePrompt: func(verificationURI, userCode string) {
+			gotURI, gotCode = verificationURI, userCode
+			cancel()
+		},
+	}
+	a.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		rewritten, _ := url.Parse(server.URL + req.URL.Path)
+		req.URL = rewritten
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	if err := a.deviceCodeFlow(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("deviceCodeFlow error = %v, want context.Canceled", err)
+	}
+	if gotURI != "https://github.com/login/device" || gotCode != "LOGS-1234" {
+		t.Fatalf("prompt got (%q, %q)", gotURI, gotCode)
+	}
+}
+
 func TestRefreshToken_AutoDeviceFlowReturnsTransientRefreshError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
@@ -2488,11 +2532,11 @@ func TestGetTokenDeviceLeaderCancellationDoesNotCancelLiveWaiter(t *testing.T) {
 		err   error
 	}, 1)
 	go func() {
-		token, err := a.getTokenWithDeviceFlow(context.Background())
+		credential, err := a.getTokenWithDeviceFlow(context.Background())
 		waiterDone <- struct {
 			token string
 			err   error
-		}{token: token, err: err}
+		}{token: credential.Token, err: err}
 	}()
 	waitForAuthDeviceWaiters(t, a, 2)
 	cancelLeader()
@@ -2689,11 +2733,11 @@ func TestSignOutInvalidatesInFlightDeviceResults(t *testing.T) {
 	}, 2)
 	for range 2 {
 		go func() {
-			token, err := a.getTokenWithDeviceFlow(context.Background())
+			credential, err := a.getTokenWithDeviceFlow(context.Background())
 			results <- struct {
 				token string
 				err   error
-			}{token: token, err: err}
+			}{token: credential.Token, err: err}
 		}()
 	}
 	waitForAuthDeviceWaiters(t, a, 2)
@@ -2728,21 +2772,21 @@ func TestSignOutInvalidatesCompletedSharedResults(t *testing.T) {
 	generation := a.generation.Load()
 	refresh := &authTokenCall{
 		done:       make(chan struct{}),
-		token:      "stale-refresh-token",
+		credential: Credential{Token: "stale-refresh-token"},
 		waiters:    1,
 		completed:  true,
 		generation: generation,
 	}
 	device := &authTokenCall{
 		done:       make(chan struct{}),
-		token:      "stale-device-token",
+		credential: Credential{Token: "stale-device-token"},
 		waiters:    1,
 		completed:  true,
 		generation: generation,
 	}
 	responses := &authTokenCall{
 		done:       make(chan struct{}),
-		token:      "stale-responses-token",
+		credential: Credential{Token: "stale-responses-token"},
 		waiters:    1,
 		completed:  true,
 		generation: generation,
@@ -2754,11 +2798,11 @@ func TestSignOutInvalidatesCompletedSharedResults(t *testing.T) {
 	if err := a.SignOut(); err != nil {
 		t.Fatalf("SignOut() error = %v", err)
 	}
-	if token, err, _ := a.waitForRefreshCall(context.Background(), refresh); token != "" || !errors.Is(err, ErrNotAuthenticated) {
-		t.Fatalf("completed refresh result = (%q, %v), want ErrNotAuthenticated", token, err)
+	if credential, err, _ := a.waitForRefreshCall(context.Background(), refresh); credential != (Credential{}) || !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("completed refresh result = (%v, %v), want ErrNotAuthenticated", credential, err)
 	}
-	if token, err := a.waitForDeviceCall(context.Background(), device); token != "" || !errors.Is(err, ErrNotAuthenticated) {
-		t.Fatalf("completed device result = (%q, %v), want ErrNotAuthenticated", token, err)
+	if credential, err := a.waitForDeviceCall(context.Background(), device); credential != (Credential{}) || !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("completed device result = (%v, %v), want ErrNotAuthenticated", credential, err)
 	}
 	if token, err, _ := a.waitForResponsesCall(context.Background(), responses); token != "" || !errors.Is(err, ErrNotAuthenticated) {
 		t.Fatalf("completed Responses result = (%q, %v), want ErrNotAuthenticated", token, err)

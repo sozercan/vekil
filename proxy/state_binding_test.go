@@ -264,7 +264,7 @@ func TestStateBindingStoreResolveKnownTokensMustAgree(t *testing.T) {
 	}
 
 	requireStateBindingResult(t, store.resolve(tokens), stateBindingLookupKnown, owner)
-	requireStateBindingResult(t, store.resolveForRoute("route-a", tokens), stateBindingLookupKnown, owner)
+	requireStateBindingResult(t, store.resolveForRoute("route-a", "", tokens), stateBindingLookupKnown, owner)
 }
 
 func TestStateBindingStoreResolveFailsClosed(t *testing.T) {
@@ -295,7 +295,7 @@ func TestStateBindingStoreResolveFailsClosed(t *testing.T) {
 		requireStateBindingResult(t, store.resolve([]stateBindingToken{
 			{stateType: stateBindingTypeResponseID, value: "known"},
 			{stateType: stateBindingTypeTurnState, value: "unknown"},
-		}), stateBindingLookupConflict, stateBindingOwner{})
+		}), stateBindingLookupUnknown, stateBindingOwner{})
 	})
 
 	t.Run("same route different targets", func(t *testing.T) {
@@ -348,7 +348,7 @@ func TestStateBindingStoreResolveForRouteRejectsCrossRouteOwnership(t *testing.T
 	owner := stateBindingOwner{routeID: "route-a", targetID: "target-1"}
 	store.bind(stateBindingTypeResponseID, "resp-1", owner)
 
-	requireStateBindingResult(t, store.resolveForRoute("route-b", []stateBindingToken{
+	requireStateBindingResult(t, store.resolveForRoute("route-b", "", []stateBindingToken{
 		{stateType: stateBindingTypeResponseID, value: "resp-1"},
 	}), stateBindingLookupConflict, stateBindingOwner{})
 }
@@ -501,5 +501,57 @@ func TestExtractExplicitResponsesRequestStateRejectsMalformedEncryptedContent(t 
 	_, err := extractExplicitResponsesRequestState([]byte(`{"model":"route","input":[{"type":"reasoning","encrypted_content":42}]}`), nil)
 	if err == nil || !strings.Contains(err.Error(), "encrypted_content") {
 		t.Fatalf("error = %v, want encrypted_content validation", err)
+	}
+}
+
+func TestStateBindingStoreResolveMissingProofPrecedence(t *testing.T) {
+	store := newTestStateBindingStore(t, 16, time.Hour, time.Now)
+	ownerA := stateBindingOwner{routeID: "route-a", targetID: "target-a"}
+	ownerB := stateBindingOwner{routeID: "route-a", targetID: "target-b"}
+	a := stateBindingToken{stateType: stateBindingTypeResponseID, value: "response-a"}
+	b := stateBindingToken{stateType: stateBindingTypeTurnState, value: "turn-b"}
+	missing := stateBindingToken{stateType: stateBindingTypeEncryptedContent, value: "missing"}
+	store.bind(a.stateType, a.value, ownerA)
+	store.bind(b.stateType, b.value, ownerB)
+
+	for _, tokens := range [][]stateBindingToken{{a, missing}, {missing, a}} {
+		requireStateBindingResult(t, store.resolve(tokens), stateBindingLookupUnknown, stateBindingOwner{})
+		requireStateBindingResult(t, store.resolveForRoute("route-a", "", tokens), stateBindingLookupUnknown, stateBindingOwner{})
+		requireStateBindingResult(t, store.resolveForRoute("route-b", "", tokens), stateBindingLookupConflict, stateBindingOwner{})
+	}
+	for _, tokens := range [][]stateBindingToken{
+		{a, b, missing}, {b, a, missing},
+		{a, missing, b}, {b, missing, a},
+		{missing, a, b}, {missing, b, a},
+	} {
+		requireStateBindingResult(t, store.resolve(tokens), stateBindingLookupConflict, stateBindingOwner{})
+		requireStateBindingResult(t, store.resolveForRoute("route-a", "", tokens), stateBindingLookupConflict, stateBindingOwner{})
+	}
+
+	store.bind(a.stateType, a.value, ownerB) // A live conflict tombstone.
+	for _, tokens := range [][]stateBindingToken{{a, missing}, {missing, a}, {{}, missing}, {missing, {}}} {
+		requireStateBindingResult(t, store.resolve(tokens), stateBindingLookupConflict, stateBindingOwner{})
+	}
+}
+
+func TestStateBindingStoreResolvePartiallyLostProof(t *testing.T) {
+	for _, loss := range []string{"expiry", "eviction"} {
+		t.Run(loss, func(t *testing.T) {
+			clock := &stateBindingTestClock{now: time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)}
+			store := newTestStateBindingStore(t, 2, time.Hour, clock.Now)
+			owner := stateBindingOwner{routeID: "route-a", targetID: "target-a"}
+			lost := stateBindingToken{stateType: stateBindingTypeResponseID, value: "lost"}
+			live := stateBindingToken{stateType: stateBindingTypeEncryptedContent, value: "live"}
+			store.bind(lost.stateType, lost.value, owner)
+			if loss == "expiry" {
+				clock.Advance(time.Hour)
+			} else {
+				store.bind(stateBindingTypeTurnState, "churn", owner)
+			}
+			store.bind(live.stateType, live.value, owner)
+			for _, tokens := range [][]stateBindingToken{{lost, live}, {live, lost}} {
+				requireStateBindingResult(t, store.resolveForRoute("route-a", "", tokens), stateBindingLookupUnknown, stateBindingOwner{})
+			}
+		})
 	}
 }

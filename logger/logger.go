@@ -16,6 +16,7 @@ type Level int
 const (
 	LevelDebug Level = iota
 	LevelInfo
+	LevelWarn
 	LevelError
 	LevelFatal
 )
@@ -23,6 +24,7 @@ const (
 var levelNames = map[Level]string{
 	LevelDebug: "debug",
 	LevelInfo:  "info",
+	LevelWarn:  "warn",
 	LevelError: "error",
 	LevelFatal: "fatal",
 }
@@ -32,6 +34,8 @@ func ParseLevel(s string) Level {
 	switch s {
 	case "debug":
 		return LevelDebug
+	case "warn":
+		return LevelWarn
 	case "error":
 		return LevelError
 	default:
@@ -59,6 +63,11 @@ func NewWithWriter(level Level, w io.Writer) *Logger {
 	return &Logger{level: level, writer: w}
 }
 
+// Enabled reports whether a message at level would be emitted.
+func (l *Logger) Enabled(level Level) bool {
+	return l != nil && level >= l.level
+}
+
 func (l *Logger) log(level Level, msg string, fields map[string]interface{}) {
 	if level < l.level {
 		return
@@ -79,16 +88,33 @@ func (l *Logger) log(level Level, msg string, fields map[string]interface{}) {
 
 // Debug logs a message at debug level.
 func (l *Logger) Debug(msg string, fields ...Field) {
+	if !l.Enabled(LevelDebug) {
+		return
+	}
 	l.log(LevelDebug, msg, toMap(fields))
 }
 
 // Info logs a message at info level.
 func (l *Logger) Info(msg string, fields ...Field) {
+	if !l.Enabled(LevelInfo) {
+		return
+	}
 	l.log(LevelInfo, msg, toMap(fields))
+}
+
+// Warn logs a message at warn level.
+func (l *Logger) Warn(msg string, fields ...Field) {
+	if !l.Enabled(LevelWarn) {
+		return
+	}
+	l.log(LevelWarn, msg, toMap(fields))
 }
 
 // Error logs a message at error level.
 func (l *Logger) Error(msg string, fields ...Field) {
+	if !l.Enabled(LevelError) {
+		return
+	}
 	l.log(LevelError, msg, toMap(fields))
 }
 

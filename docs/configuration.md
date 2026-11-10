@@ -7,6 +7,13 @@ Vekil supports two runtime patterns:
 
 Schema version 2 is the complete explicit-routing format: it supports public and internal routes, ordered failover, and optional [semantic policy profiles](policy-routing.md) that select one Chat-capable terminal route per request. Existing route-only version-2 files remain valid. By default, each profile's YAML `mode` is authoritative; an explicit process mode can still lower the effective mode as an operational override.
 
+Schema-v2 explicit routes also use durable provider-state ownership by default on
+macOS and Linux. Configure the top-level `state_bindings` block in this same
+JSON/YAML file; no additional flags or tray settings are required. Set
+`state_bindings.mode: memory` to opt out. Legacy and zero-config routing keep
+their existing memory behavior. See [State Recovery](state-recovery.md) for the
+configuration block, default application-data paths, retention, and pruning.
+
 ## Topic Map
 
 | Need | Doc |
@@ -39,14 +46,39 @@ This source implementation does not add provider-schema fields or public endpoin
 | `--host` | `HOST` | `127.0.0.1` | Listen host |
 | `--token-dir` | `TOKEN_DIR` | `~/.config/vekil` | Token storage directory |
 | `--providers-config` | `PROVIDERS_CONFIG` | unset | Local path or HTTP(S) URL to JSON or YAML provider configuration for explicit provider routing |
+| `--state-bindings-mode` | `STATE_BINDINGS_MODE` | `config` | Optional process override: `config`, `durable`, or `memory` |
+| `--state-bindings-file` | `STATE_BINDINGS_FILE` | providers config | Optional absolute file override in an existing private local directory |
+| `--state-bindings-max-entries` | `STATE_BINDINGS_MAX_ENTRIES` | `0`, follows providers config | Logical-record capacity including tombstones; durable default 8,388,608, without preallocation |
 | `--policy-routing` | `POLICY_ROUTING_MODE` | `config` | Policy-routing ceiling: `config` follows each profile's YAML `mode`; `off`, `observe`, or `enforce` explicitly cap every profile. A profile cannot run above an explicit ceiling. |
 | `--policy-routing-allow-remote-single-tenant` | `POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT` | `false` | Acknowledge running policy `observe`/`enforce` on a non-loopback bind for one trusted tenant. This adds no authentication or tenant isolation. |
-| `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, or `error` |
+| `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, or `error` |
+| `--log-file` | — | stderr | Write logs only to this private file, rotating at 16 MiB with one `.1` backup |
+| `--env-file` | — | unset | Load `KEY=value` lines (`#` comments, optional `export ` and quotes) before reading other settings; file values override the process environment. Used by [`vekil service`](getting-started.md#run-as-a-background-service) |
+| — | `INBOUND_AUTH_TOKEN` | unset | Shared caller token; see [Caller authentication](#caller-authentication). Environment or `--env-file` only, there is no flag |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
 
 Native CLI and tray-app runs default to `127.0.0.1`. Container deployments that publish the proxy port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path.
 
+State overrides follow flag, environment, providers-file, then schema-default
+precedence. An empty file override or zero capacity follows the providers file.
+A nonempty file override enables durable mode unless `memory` is explicitly
+selected; memory mode never opens that file. The CLI and agent launchers accept
+these flags, and the menubar uses the same environment parsing and shared store
+initialization. Storage or lock failures stop startup and never select memory
+automatically.
+
+Serve mode defaults Go's garbage-collection target to `GOGC=200` to favor
+throughput while retaining a bounded memory footprint. Whitespace-only `GOGC`
+values are treated as unset. Set a standard non-whitespace value, including
+`GOGC=off`, to override the default with the requested Go runtime behavior.
+
 Policy `observe` and `enforce` are a v1 single-tenant feature. Loopback is the default supported topology. A non-loopback bind requires the explicit remote-single-tenant acknowledgement above, but that acknowledgement does not protect the proxy; put remote deployments behind a trusted external authentication and network boundary.
+
+## Caller authentication
+
+For the command-line proxy, set `INBOUND_AUTH_TOKEN` to require a shared token on every route except `/healthz` and `/readyz`. The tray app does not read this setting. Clients send `Authorization: Bearer <token>` or `x-api-key: <token>`; missing or wrong tokens get `401` before any provider call. The value is read from the environment at startup, and an `--env-file` value overrides an inherited one. There is deliberately no flag, so the token never appears in command lines or help. Unset, empty, and whitespace-only values leave the proxy unauthenticated, as before. Agent launches remove the variable from child processes; managed `vekil launch` sessions still use their own per-launch token.
+
+The browser dashboard (`/dashboard`, `/stats.json`) is also protected and cannot be opened normally in a browser while a token is set, because browsers do not send these headers. This is one shared secret, not per-user authorization. Use TLS or a trusted network if the proxy is reachable beyond loopback. `vekil service install` does not persist your shell environment; put the setting in the service env file.
 
 ## Copilot Header Overrides
 
@@ -57,9 +89,40 @@ These overrides only affect Copilot-backed upstream requests. For provider-level
 | `--copilot-editor-version` | `COPILOT_EDITOR_VERSION` | `vscode/1.95.0` | Upstream `editor-version` header |
 | `--copilot-plugin-version` | `COPILOT_PLUGIN_VERSION` | `copilot-chat/0.26.7` | Upstream `editor-plugin-version` header |
 | `--copilot-user-agent` | `COPILOT_USER_AGENT` | `GitHubCopilotChat/0.26.7` | Upstream `user-agent` header |
-| `--copilot-integration-id` | `COPILOT_INTEGRATION_ID` | credential-aware | Upstream `copilot-integration-id` header; direct `ghu_` catalog/Chat requests default to `copilot-language-server`, while its Responses fallback and other credentials default to `vscode-chat` |
-| `--copilot-github-api-version` | `COPILOT_GITHUB_API_VERSION` | `2025-05-01` | Upstream `x-github-api-version` header |
+| `--copilot-integration-id` | `COPILOT_INTEGRATION_ID` | `copilot-developer-cli` | Upstream `copilot-integration-id` header for every Copilot credential: `gho_` OAuth, `ghu_` GitHub App user tokens (including device-code logins), `github_pat_`, `ghs_` Actions tokens, and exchanged or legacy Copilot tokens |
+| `--copilot-github-api-version` | `COPILOT_GITHUB_API_VERSION` | `2026-08-20` | Upstream `x-github-api-version` header |
 | `--copilot-openai-intent` | `COPILOT_OPENAI_INTENT` | unset (`conversation-panel` for chat/responses) | Upstream `openai-intent` header |
+
+The default applies to catalog, Chat, Responses, and native Responses
+websocket requests. It selects the CLI integration explicitly rather than an
+IDE integration, so requests are subject to Copilot CLI access policies,
+limits, and billing rules. Explicit integration
+overrides remain authoritative; endpoint profiles override provider defaults,
+which override the global setting.
+
+Existing durable Copilot deployments must [pin their previous integration
+before upgrading](state-recovery.md#upgrading-the-copilot-integration-default)
+to preserve state ownership.
+
+Vekil forwards explicit caller `X-Initiator` values of `user` or `agent`,
+`X-Interaction-Id`, and `X-Client-Session-Id` to Copilot inference requests.
+Each value must be unambiguous, contain no control characters, and fit within
+1,024 bytes. Authentication and integration settings come from the server's
+provider configuration.
+
+## Controlling upstream pressure
+
+Recognized Copilot account, model, and integration throttles create a shared,
+process-local cooldown for that scope. Vekil preserves long `Retry-After`
+values and returns the upstream response when the reset exceeds the request's
+remaining time budget. After a cooldown expires, one request probes recovery.
+See [throttling diagnostics](troubleshooting.md) for reset and request-ID details.
+
+To reduce token use, configure [tool-output reduction](tool-optimizers.md) and,
+where appropriate, [policy tier reasoning effort](policy-routing.md).
+Use the full-task totals in [`/stats.json`](dashboard.md) to include classifiers,
+retries, and compaction when comparing configurations. These controls remain
+explicit so operators can evaluate their effect on task quality.
 
 ## Provider Configs
 
@@ -93,4 +156,8 @@ At server startup, effective `enforce` profiles must pass live preflight before 
 
 ## Responses WebSocket Bridge
 
-The Codex-style `GET /v1/responses` websocket bridge is disabled by default and remains a proxy-owned transport over upstream HTTP `/responses`. See [Responses WebSocket Bridge](responses-websocket.md) for websocket flags, auto-compaction settings, chunked compaction knobs, and a debug run example.
+The Codex-style `GET /v1/responses` websocket bridge is disabled by default.
+When enabled it uses upstream HTTP `/responses` by default. A separate
+`--responses-ws-native-upstream` option enables experimental native Copilot
+connections. See [Responses WebSocket Bridge](responses-websocket.md) for its
+limits, websocket flags, and compaction settings.

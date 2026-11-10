@@ -4,7 +4,7 @@ These examples all target the same local proxy. Replace model IDs with public ID
 
 ## Schema-v2 policy profile IDs
 
-A semantic policy profile such as `coding-economy` is a narrower public model contract than a direct model ID. It accepts text/function-tool OpenAI Chat, translated Anthropic Messages and count-token probes, and bounded stateless OpenAI Responses—including structured text output—for Responses-only agents such as Codex. It is not accepted by Gemini routes/CLI, the Responses websocket bridge, compact/memory endpoints, images, hosted/custom tools, or stateful `previous_response_id` requests. Policy destinations may use native Chat or bounded Responses-backed Chat. Opaque `call_vekil_*` continuations must remain on the process that owns their replay state; direct in-process Copilot targets satisfy that requirement, while an external downstream bridge still requires a single instance or sticky ingress to the owning replica.
+A semantic policy profile such as `coding-economy` is a narrower public model contract than a direct model ID. It accepts text/function-tool OpenAI Chat, translated Anthropic Messages and count-token probes, and bounded stateless OpenAI Responses—including structured text output—for Responses-only agents such as Codex. It is not accepted by Gemini routes/CLI, the Responses websocket bridge, compact/memory endpoints, images, hosted/custom tools, or stateful `previous_response_id` requests. Policy destinations may use native Chat or bounded Responses-backed Chat. `call_vekil_*` continuations are still best served by the process that owns their replay state: reasoning continuity lives there, and so does policy-tier pinning, whose route tag is keyed per process. For a policy profile that affinity is a requirement, not a preference, and on every surface: the tier is recovered from a carrier tag keyed per process, so on a replica holding none of that state no tier can be selected and the request fails with `responses_replay_state_missing` — in the planner, before Anthropic ingress could fall back. The ID-only rebuild that does survive a replica is a direct-model-route behaviour over Anthropic Messages, not a policy one. Policy continuations need sticky routing to the owning replica. Direct in-process Copilot targets satisfy the affinity requirement; an external downstream bridge, whose continuation IDs are opaque to Vekil and carry nothing, still requires a single instance or sticky ingress to the owning replica.
 
 Chat clients and the supported translated agent surfaces may request a policy profile. The returned Chat JSON/SSE model identity remains the policy public ID; internal lightweight/powerful provider and route IDs are not a client contract. Exposed direct terminal routes and other public models remain independently requestable, so use `exposure: internal` when bypass must not be offered.
 
@@ -25,9 +25,11 @@ A model whose native catalog endpoint is only `/responses` can still serve OpenA
 
 The adapter is strict. It supports the mapped Chat field subset in [API Reference](api.md#responses-backed-chat-request-subset), rejects unknown fields instead of dropping them, does not emulate non-empty stop sequences, and accepts only function tools. Hosted tools such as web search, computer use, code execution, and image generation are not supported through Chat compatibility. Direct `/v1/responses` clients remain on the native path.
 
-Tool continuations returned by a Responses-native model can expose IDs such as `call_vekil_<22-character-base64url>` (including Anthropic `tool_use.id` or Gemini `functionCall.id`). Treat them as opaque and return them unchanged. Preserve the complete assistant tool-call list in its original order; tool-result messages for a complete parallel group may be returned in any order. When only a non-empty subset of results is available, Vekil replays only the matching calls because the verified upstream rejected a complete call group paired with partial outputs; missing calls may be reissued.
+Tool continuations use one of two minted ID shapes, including Anthropic `tool_use.id` and Gemini `functionCall.id`: `call_vekil_v1_<15-character-nonce>_<upstream-call-id>_<4-character-checksum>`, a self-describing form whose total length never exceeds 64 characters, or `call_vekil_<22-character-base64url>`, the opaque fallback when the upstream ID cannot be embedded. The versioned form exposes the upstream provider's call ID. Its checksum distinguishes Vekil-minted IDs from plausible native IDs but is not an authorization key. Return either ID unchanged, and do not construct, edit, or parse it.
 
-Replay state is byte-bounded, process-local, and expires one hour after the tool-call response. It is lost on restart. If a continuation receives `responses_replay_state_missing`, restart that assistant tool-call turn rather than inventing or editing the call ID.
+Preserve the complete assistant tool-call list in its original order; tool-result messages for a complete parallel group may be returned in any order. When only a non-empty subset of results is available, Vekil replays only the matching calls because the verified upstream rejected a complete call group paired with partial outputs; missing calls may be reissued.
+
+Replay state is byte-bounded, process-local, and expires one hour after the tool-call response. It is lost on restart. If a continuation receives `responses_replay_state_missing`, restart that assistant tool-call turn rather than inventing or editing the call ID. Anthropic clients such as Claude Code can switch a session to a direct model ID without a `/responses` backend; the continuation keeps the IDs on native Chat, where Vekil cannot restore the earlier hidden reasoning.
 
 Claude Code and Gemini `countTokens` calls also use the selected model's native backend. Anthropic counting requires reported upstream usage; Gemini counting retains its existing cache and can use a local estimate for transient failures or missing usage.
 
@@ -49,6 +51,14 @@ Use [`vekil launch claude`](agent-launchers.md) to start an ephemeral proxy and 
 env ANTHROPIC_BASE_URL=http://localhost:1337 \
   ANTHROPIC_API_KEY=dummy \
   claude --model claude-sonnet-5 --print --output-format text "Reply with exactly PROXY_OK"
+```
+
+Name Copilot models with a dotted version in Anthropic's hyphenated spelling, for example `claude-opus-5-5` for `claude-opus-5.5`, including in `ANTHROPIC_DEFAULT_*_MODEL` overrides. Vekil's Messages endpoint resolves the alias to the same model. Claude Code shapes requests from the model ID and treats a dotted one as an older model, so side queries such as WebFetch send `thinking.type: disabled`, which adaptive-only models reject. The launcher does this for you, and checks the alias first.
+
+Copilot also rejects the hosted web search tool behind Claude Code's built-in WebSearch. Disable WebSearch with `--disallowed-tools WebSearch` and register Vekil's [web search MCP endpoint](api.md#post-mcpweb-search) instead. Add an `Authorization` header with `--header` if the proxy requires an inbound token:
+
+```bash
+claude mcp add --transport http vekil http://localhost:1337/mcp/web-search
 ```
 
 When zero-config Copilot rejects `advisor-tool-2026-03-01` as an unsupported beta header, disable Claude Code's experimental Advisor Tool for that invocation:

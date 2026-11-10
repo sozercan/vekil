@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,14 +17,16 @@ import (
 type copilotResponsesPolicyUpstream struct {
 	server *httptest.Server
 
-	mu                 sync.Mutex
-	modelRequests      int
-	classifierRequests int
-	terminalModels     []string
-	paths              []string
-	classifierSignals  policyClassifierSignals
-	toolFailureModel   string
-	toolFailuresLeft   int
+	mu                     sync.Mutex
+	modelRequests          int
+	classifierRequests     int
+	terminalModels         []string
+	paths                  []string
+	responsesRequestBodies []string
+	responsesHeaders       []http.Header
+	classifierSignals      policyClassifierSignals
+	toolFailureModel       string
+	toolFailuresLeft       int
 }
 
 func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSignals) *copilotResponsesPolicyUpstream {
@@ -50,6 +54,18 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 			})
 		case providerEndpointResponses:
 			defer func() { _ = r.Body.Close() }()
+			// Read-and-restore: the decode below and every existing assertion still see an
+			// untouched body, so recording is invisible to the tests already using this fixture.
+			raw, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				http.Error(w, readErr.Error(), http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			upstream.mu.Lock()
+			upstream.responsesRequestBodies = append(upstream.responsesRequestBodies, string(raw))
+			upstream.responsesHeaders = append(upstream.responsesHeaders, r.Header.Clone())
+			upstream.mu.Unlock()
 			var request struct {
 				Model  string            `json:"model"`
 				Input  []json.RawMessage `json:"input"`
@@ -80,8 +96,9 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 				}
 				upstream.mu.Lock()
 				upstream.classifierRequests++
+				signals := upstream.classifierSignals
 				upstream.mu.Unlock()
-				arguments, _ := json.Marshal(upstream.classifierSignals)
+				arguments, _ := json.Marshal(signals)
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"id":         "resp-classifier",
 					"object":     "response",
@@ -191,6 +208,14 @@ func (u *copilotResponsesPolicyUpstream) snapshot() (int, int, []string, []strin
 	return u.modelRequests, u.classifierRequests, append([]string(nil), u.terminalModels...), append([]string(nil), u.paths...)
 }
 
+// Counts and model names cannot answer "did the reasoning actually travel" -- the question
+// every carrier continuation test was silently NOT asking. Bodies can.
+func (u *copilotResponsesPolicyUpstream) responsesBodies() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.responsesRequestBodies...)
+}
+
 func (u *copilotResponsesPolicyUpstream) failNextToolRequest(model string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -198,10 +223,17 @@ func (u *copilotResponsesPolicyUpstream) failNextToolRequest(model string) {
 	u.toolFailuresLeft = 1
 }
 
+func (u *copilotResponsesPolicyUpstream) setClassifierSignals(signals policyClassifierSignals) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.classifierSignals = signals
+}
+
 func directCopilotResponsesPolicyConfig(profileMode string) ProvidersConfig {
 	parallel := true
 	return ProvidersConfig{
 		SchemaVersion: ProvidersConfigSchemaVersion2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{{
 			ID:            "copilot",
 			Type:          string(providerTypeCopilot),
@@ -370,6 +402,119 @@ func TestPolicyRoutingUsesCopilotResponsesForClassifierAndTerminalText(t *testin
 	}
 }
 
+func TestPolicyRoutingCopilotResponsesClassifierReasoningEffort(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		effort string
+	}{
+		{name: "omitted"},
+		{name: "low", effort: "low"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
+				TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh,
+			})
+			cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+			cfg.ModelRoutes[0].ReasoningEffort = []string{"low", "medium"}
+			cfg.ModelRoutes[1].ReasoningEffort = []string{"medium", "max"}
+			cfg.ModelRoutes[2].ReasoningEffort = []string{"low"}
+			cfg.PolicyProfiles[0].Lightweight.ReasoningEffort = "low"
+			cfg.PolicyProfiles[0].Powerful.ReasoningEffort = "max"
+			cfg.PolicyProfiles[0].Classifier.ReasoningEffort = tc.effort
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
+				WithCopilotBaseURL(upstream.server.URL), WithProvidersConfig(cfg), WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+
+			recorder := httptest.NewRecorder()
+			h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+				"model":"gpt-5.6-semantic","input":"Plan a coordinated multi-file migration.",
+				"reasoning":{"effort":"medium"},"store":false
+			}`)))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			_, classifiers, terminals, _ := upstream.snapshot()
+			bodies := upstream.responsesBodies()
+			if classifiers != 2 || len(terminals) != 1 || len(bodies) != 3 {
+				t.Fatalf("upstream requests: classifiers=%d terminals=%v bodies=%d", classifiers, terminals, len(bodies))
+			}
+			for index, want := range []string{tc.effort, tc.effort, "max"} {
+				var request struct {
+					Reasoning *struct {
+						Effort string `json:"effort"`
+					} `json:"reasoning"`
+					ReasoningEffort json.RawMessage `json:"reasoning_effort"`
+				}
+				if err := json.Unmarshal([]byte(bodies[index]), &request); err != nil {
+					t.Fatal(err)
+				}
+				if len(request.ReasoningEffort) != 0 {
+					t.Errorf("Responses request %d contains Chat reasoning_effort", index)
+				}
+				if want == "" {
+					if request.Reasoning != nil {
+						t.Errorf("classifier request %d unexpectedly contains reasoning: %+v", index, request.Reasoning)
+					}
+				} else if request.Reasoning == nil || request.Reasoning.Effort != want {
+					t.Errorf("Responses request %d reasoning = %+v, want effort %q", index, request.Reasoning, want)
+				}
+			}
+		})
+	}
+}
+
+func TestPolicyResponsesIngressPreservesCopilotAttribution(t *testing.T) {
+	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
+		TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile, RiskLevel: policyRiskLevelHigh,
+	})
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
+		WithCopilotBaseURL(upstream.server.URL),
+		WithProvidersConfig(directCopilotResponsesPolicyConfig(policyConfigModeEnforce)),
+		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	upstream.mu.Lock()
+	preflightRequests := len(upstream.responsesHeaders)
+	upstream.mu.Unlock()
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.6-semantic","input":"Plan a coordinated multi-file migration.","store":false
+	}`))
+	request.Header.Set("X-Initiator", " agent ")
+	request.Header.Set("X-Interaction-Id", " interaction ")
+	request.Header.Set("X-Client-Session-Id", " session ")
+	request.Header.Set("Authorization", "Bearer caller-token")
+	recorder := httptest.NewRecorder()
+	h.HandleResponses(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	upstream.mu.Lock()
+	headers := append([]http.Header(nil), upstream.responsesHeaders[preflightRequests:]...)
+	upstream.mu.Unlock()
+	if len(headers) != 2 {
+		t.Fatalf("inference requests = %d, want classifier and terminal", len(headers))
+	}
+	for _, got := range headers {
+		assertResponsesAttribution(t, got, http.Header{
+			"X-Initiator": {"agent"}, "X-Interaction-Id": {"interaction"}, "X-Client-Session-Id": {"session"},
+		})
+	}
+}
+
 func TestPolicyRoutingSelectsCopilotResponsesLightweightRoute(t *testing.T) {
 	upstream := newCopilotResponsesPolicyUpstream(t, policyClassifierSignals{
 		TurnType:  policyTurnTypeLookup,
@@ -533,6 +678,7 @@ func TestPublicCopilotExplicitRouteValidatesPinnedModelWithoutLegacyExposure(t *
 	defer upstream.Close()
 	cfg := ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{{
 			ID: "copilot", Type: "copilot", Default: true, TrustDomain: "github-copilot", IncludeModels: []string{"gpt-5.6-sol"},
 		}},
@@ -808,7 +954,7 @@ func TestPolicyResponsesReplayPreservesPowerfulTierWhenRoutesShareTerminal(t *te
 		t.Fatal(err)
 	}
 
-	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, body)
+	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, body, nil)
 	if err != nil {
 		t.Fatalf("resolvePolicyResponsesReplayRoute() error = %v", err)
 	}
@@ -922,6 +1068,7 @@ func TestPolicyCopilotDynamicValidationSkipsInactiveTierRoutes(t *testing.T) {
 	classifierNoStore := true
 	cfg := ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{ID: "copilot", Type: "copilot", Default: true, TrustDomain: "org", IncludeModels: []string{"classifier", "power"}},
 			{ID: "local", Type: "openai-compatible", BaseURL: "https://local.example.test/v1", AuthType: "none", ModelDiscovery: "static", TrustDomain: "org", ClassifierNoStoreSupported: &classifierNoStore},
@@ -1163,6 +1310,7 @@ func TestPolicyCopilotSynchronousValidationSkipsInactiveTierRoutes(t *testing.T)
 	classifierNoStore := true
 	cfg := ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{ID: "copilot", Type: "copilot", Default: true, TrustDomain: "org", IncludeModels: []string{"classifier", "power"}},
 			{ID: "local", Type: "openai-compatible", BaseURL: "https://local.example.test/v1", AuthType: "none", ModelDiscovery: "static", TrustDomain: "org", ClassifierNoStoreSupported: &classifierNoStore},

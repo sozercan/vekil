@@ -105,6 +105,7 @@ func newExplicitRouteSurfaceHandlerWithRouting(t *testing.T, providerKind provid
 		logger.NewWithWriter(logger.LevelError, io.Discard),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: ProvidersConfigSchemaVersion2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{
 				provider("primary", primaryURL, "primary-key", true),
 				provider("secondary", secondaryURL, "secondary-key", false),
@@ -463,7 +464,7 @@ func TestExplicitRouteOpenAIChatHTTPRejectionPolicyAndPublicIdentity(t *testing.
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Vekil-Request-ID", "upstream-spoof")
-			_, _ = io.WriteString(w, `{"id":"chat-secondary","object":"chat.completion","model":"physical-secondary","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+			_, _ = io.WriteString(w, `{"id":"chat-secondary","object":"chat.completion","model":"physical-secondary","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"copilot_usage":{"token_details":[{"model":"physical-secondary","token_count":1}]}}`)
 		}))
 		defer secondary.Close()
 
@@ -479,8 +480,11 @@ func TestExplicitRouteOpenAIChatHTTPRejectionPolicyAndPublicIdentity(t *testing.
 		if primaryCalls.Load() != 1 || secondaryCalls.Load() != 1 {
 			t.Fatalf("calls primary=%d secondary=%d", primaryCalls.Load(), secondaryCalls.Load())
 		}
-		if !strings.Contains(w.Body.String(), `"model":"public-model"`) || strings.Contains(w.Body.String(), "physical-secondary") {
+		if strings.Count(w.Body.String(), `"model":"public-model"`) != 2 || strings.Contains(w.Body.String(), "physical-secondary") {
 			t.Fatalf("public model identity was not normalized: %s", w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"copilot_usage"`) {
+			t.Fatalf("copilot usage metadata was not preserved: %s", w.Body.String())
 		}
 		if got := w.Header().Get("X-Vekil-Request-ID"); got == "" || got == "upstream-spoof" || got != summary.OperationID() {
 			t.Fatalf("X-Vekil-Request-ID=%q summary=%q", got, summary.OperationID())
@@ -545,7 +549,8 @@ func TestExplicitRouteOpenAIChatStreamProtectsProxyOperationID(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("X-Vekil-Request-ID", "upstream-spoof")
 		w.Header().Set("X-Request-Id", "chat-stream-request-id")
-		_, _ = io.WriteString(w, "data: {\"id\":\"chat-primary\",\"object\":\"chat.completion.chunk\",\"model\":\"physical-primary\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chat-primary\",\"object\":\"chat.completion.chunk\",\"model\":\"public-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chat-primary\",\"object\":\"chat.completion.chunk\",\"model\":\"public-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"copilot_usage\":{\"token_details\":[{\"model\":\"physical-primary\",\"token_count\":1}]}}\n\n")
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	}))
 	defer primary.Close()
@@ -557,7 +562,7 @@ func TestExplicitRouteOpenAIChatStreamProtectsProxyOperationID(t *testing.T) {
 
 	h := newExplicitRouteSurfaceHandler(t, providerTypeAzureOpenAI, providerEndpointChatCompletions, primary.URL, secondary.URL)
 	ctx, summary := WithRequestSummary(context.Background())
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
 	w := httptest.NewRecorder()
 	h.HandleOpenAIChatCompletions(w, req)
 
@@ -572,6 +577,12 @@ func TestExplicitRouteOpenAIChatStreamProtectsProxyOperationID(t *testing.T) {
 	}
 	if got := w.Header().Get("X-Request-Id"); got != "chat-stream-request-id" {
 		t.Fatalf("X-Request-Id = %q, want chat-stream-request-id", got)
+	}
+	if strings.Count(w.Body.String(), `"model":"public-model"`) != 3 || strings.Contains(w.Body.String(), "physical-primary") {
+		t.Fatalf("stream public model identity was not normalized: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"copilot_usage"`) {
+		t.Fatalf("stream copilot usage metadata was not preserved: %s", w.Body.String())
 	}
 }
 
@@ -1176,6 +1187,7 @@ func TestAnthropicDuplicateModelSelectionPreservesLegacyForwarding(t *testing.T)
 
 			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 				SchemaVersion: ProvidersConfigSchemaVersion2,
+				StateBindings: &StateBindingsConfig{Mode: "memory"},
 				Providers: []ProviderConfig{
 					{
 						ID:       "legacy",
@@ -1264,6 +1276,7 @@ func TestMixedRouteConfigScopesAmbiguousJSONValidationToExplicitRoutes(t *testin
 
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: ProvidersConfigSchemaVersion2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{
 				ID:       "legacy",
@@ -1385,6 +1398,7 @@ func TestMixedRouteConfigOpenAIChatDuplicateModelValidationUsesForwardingSemanti
 
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: ProvidersConfigSchemaVersion2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{
 				ID:       "legacy",
@@ -1515,6 +1529,7 @@ func TestExplicitRouteGeminiCompressionAliasUsesCanonicalRouteOperation(t *testi
 
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers: []ProviderConfig{
 			{ID: "primary", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: primary.URL, AuthType: "none"},
 			{ID: "secondary", Type: string(providerTypeOpenAICompatible), BaseURL: secondary.URL, AuthType: "none"},
@@ -1591,6 +1606,7 @@ func TestExplicitRouteDoesNotInjectPolicyTierReasoningIntoTranslatedChatSurfaces
 
 			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 				SchemaVersion: 2,
+				StateBindings: &StateBindingsConfig{Mode: "memory"},
 				Providers: []ProviderConfig{{
 					ID: "openai", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.URL, AuthType: "none",
 				}},
@@ -1632,6 +1648,7 @@ func TestExplicitNativeAnthropicRouteAcceptsNormalizedAlias(t *testing.T) {
 	defer upstream.Close()
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &StateBindingsConfig{Mode: "memory"},
 		Providers:     []ProviderConfig{{ID: "anthropic", Type: string(providerTypeAnthropicCompatible), Default: true, BaseURL: upstream.URL, AuthType: "none"}},
 		ModelRoutes: []ModelRouteConfig{{
 			ID: "claude-route", PublicID: "claude-sonnet-4.5", Endpoints: []string{providerEndpointMessages},
@@ -1714,6 +1731,7 @@ func TestExplicitRouteOpenAISurfacesAcceptDatedNormalizedAlias(t *testing.T) {
 
 			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 				SchemaVersion: ProvidersConfigSchemaVersion2,
+				StateBindings: &StateBindingsConfig{Mode: "memory"},
 				Providers: []ProviderConfig{
 					{
 						ID:       "fallback",
@@ -1768,6 +1786,7 @@ func TestExplicitRouteCountTokenRecoveryRespectsOneSendBudget(t *testing.T) {
 		defer upstream.Close()
 		h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: 2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers:     []ProviderConfig{{ID: "openai", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.URL, AuthType: "none"}},
 			ModelRoutes: []ModelRouteConfig{{
 				ID: "route", PublicID: "gemini-3-pro-preview", Endpoints: []string{providerEndpointChatCompletions},
@@ -1796,6 +1815,7 @@ func TestExplicitRouteCountTokenRecoveryRespectsOneSendBudget(t *testing.T) {
 		defer upstream.Close()
 		h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: 2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers:     []ProviderConfig{{ID: "openai", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.URL, AuthType: "none"}},
 			ModelRoutes: []ModelRouteConfig{{
 				ID: "route", PublicID: "claude-route", Endpoints: []string{providerEndpointChatCompletions},

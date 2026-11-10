@@ -1143,6 +1143,7 @@ func TestCompactResponsesRequest_ExplicitPinnedTargetsKeepProviderCredentialsAnd
 		logger.New(logger.LevelError),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: 2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{
 				{
 					ID:           "compact-primary",
@@ -6799,6 +6800,7 @@ func newExplicitRouteResponsesWebSocketHandler(t *testing.T, primaryURL, seconda
 		logger.New(logger.LevelError),
 		WithProvidersConfig(ProvidersConfig{
 			SchemaVersion: 2,
+			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{
 				{
 					ID:      "ws-primary",
@@ -6916,9 +6918,13 @@ func mustDialResponsesWebSocket(t *testing.T, server *httptest.Server, headers h
 	return conn
 }
 
-func mustReadWebSocketJSON(t *testing.T, conn *websocket.Conn) map[string]interface{} {
+func mustReadWebSocketJSON(t *testing.T, conn *websocket.Conn, timeouts ...time.Duration) map[string]interface{} {
 	t.Helper()
-	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	timeout := 2 * time.Second
+	if len(timeouts) > 0 {
+		timeout = timeouts[0]
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		t.Fatalf("failed to set read deadline: %v", err)
 	}
 	_, data, err := conn.ReadMessage()
@@ -6934,10 +6940,10 @@ func mustReadWebSocketJSON(t *testing.T, conn *websocket.Conn) map[string]interf
 
 // mustReadWebSocketJSONSkipMetadata reads the next WebSocket frame, skipping
 // over any synthetic codex.response.metadata frames injected by the proxy.
-func mustReadWebSocketJSONSkipMetadata(t *testing.T, conn *websocket.Conn) map[string]interface{} {
+func mustReadWebSocketJSONSkipMetadata(t *testing.T, conn *websocket.Conn, timeouts ...time.Duration) map[string]interface{} {
 	t.Helper()
 	for {
-		payload := mustReadWebSocketJSON(t, conn)
+		payload := mustReadWebSocketJSON(t, conn, timeouts...)
 		if payload["type"] != "codex.response.metadata" {
 			return payload
 		}
@@ -7651,7 +7657,10 @@ func TestHandleResponsesWebSocket_EarlyWriteFailureDrainsLateTerminalBeforeCance
 	_ = serverConn.Close()
 	defer func() { _ = clientConn.Close() }()
 	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
-	session.terminalObservationWait = 3 * time.Second
+	// The scanner-limit terminal is expensive under -race. The reader release
+	// controls terminal availability; parsing duration is not the contract
+	// under test.
+	session.terminalObservationWait = 10 * time.Second
 	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
 
 	done := make(chan error, 1)
@@ -7674,7 +7683,7 @@ func TestHandleResponsesWebSocket_EarlyWriteFailureDrainsLateTerminalBeforeCance
 		if !errors.Is(err, errResponsesWebSocketClientWrite) {
 			t.Fatalf("handleCreateRequest error = %v, want client write error", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("handleCreateRequest did not finish after terminal release")
 	}
 	snap := handler.stats.snapshot()
@@ -8015,7 +8024,10 @@ func TestHandleResponsesWebSocket_PreservesUpstreamTimeoutTerminalAndReplayState
 			Request: req,
 		}, nil
 	})
-	WithStreamingUpstreamTimeout(time.Millisecond)(handler)
+	// Give request construction time to reach the fake transport under -race.
+	// The body still waits for the actual upstream deadline and then delays its
+	// terminal, so this cannot turn into a pre-timeout success.
+	WithStreamingUpstreamTimeout(100 * time.Millisecond)(handler)
 	handler.stats = newStatsCollector()
 	serverConn, clientConn := newResponsesWebSocketConnPair(t)
 	defer func() { _ = serverConn.Close() }()
@@ -8144,8 +8156,9 @@ func TestHandleResponsesWebSocket_OversizedTerminalFailureRetainsUsage(t *testin
 
 	done := make(chan error, 1)
 	go func() { done <- session.handleCreateRequest(handler, request) }()
-	_ = mustReadWebSocketJSON(t, clientConn) // metadata
-	wrapped := mustReadWebSocketJSON(t, clientConn)
+	// Allow parsing the oversized payload under race instrumentation.
+	_ = mustReadWebSocketJSON(t, clientConn, 15*time.Second) // metadata
+	wrapped := mustReadWebSocketJSON(t, clientConn, 15*time.Second)
 	if got := int(wrapped["status_code"].(float64)); got != http.StatusBadGateway {
 		t.Fatalf("wrapped status = %d, want 502", got)
 	}

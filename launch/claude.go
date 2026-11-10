@@ -2,15 +2,43 @@ package launch
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// dottedClaudeModelIDRegex matches catalog IDs such as claude-opus-5.5 whose
+// trailing version pair Anthropic spells with a hyphen (claude-opus-5-5).
+var dottedClaudeModelIDRegex = regexp.MustCompile(`^(claude(?:-[^-]+)*)-(\d+)\.(\d+)$`)
+
+// ClaudeAutoModeClassifierModel is the model Claude Code's auto mode uses to
+// approve actions. Claude Code refuses Opus 5.5, Sonnet 5.5 and Opus 5 for
+// that role, so a pinned launch keeps Claude Code's Sonnet 5 default.
+const ClaudeAutoModeClassifierModel = "claude-sonnet-5"
 
 // ClaudeAdapter prepares Claude Code to use Vekil's Anthropic-compatible
 // surface without modifying the user's Claude settings.
 type ClaudeAdapter struct{}
 
 func (ClaudeAdapter) Name() string { return "claude" }
+
+// claudeCodeModelID returns the model ID Claude Code should send. Claude Code
+// shapes requests from Anthropic's model IDs and misreads dotted catalog IDs as
+// older models; for claude-opus-5.5 it then sends thinking.type "disabled" on
+// side queries, which the upstream rejects. The hyphenated spelling is used
+// only when the launch proxy confirms it reaches the same model, because a raw
+// model can own that spelling. Policy IDs resolve only by exact public ID.
+func claudeCodeModelID(input PrepareInput) string {
+	id := strings.TrimSpace(input.Model.ID)
+	if strings.TrimSpace(input.Model.OwnedBy) == PolicyModelOwner || input.RoutesLikeModel == nil {
+		return id
+	}
+	if alias := dottedClaudeModelIDRegex.ReplaceAllString(id, "${1}-${2}-${3}"); alias != id && input.RoutesLikeModel(alias) {
+		return alias
+	}
+	return id
+}
 
 func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	model := strings.TrimSpace(input.Model.ID)
@@ -45,28 +73,37 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		return PreparedProcess{}, err
 	}
 
+	// Subprocess scrubbing keeps the local proxy token out of tool
+	// subprocesses, but Claude Code then forces the default permission mode.
+	// An explicitly requested mode turns scrubbing off so the mode applies.
+	subprocessScrub := "1"
+	if claudePermissionModeRequested(input.ForwardedArgs) {
+		subprocessScrub = "0"
+	}
 	envSet := map[string]string{
 		"ANTHROPIC_BASE_URL":                   baseURL,
 		"ANTHROPIC_AUTH_TOKEN":                 localToken,
 		"ANTHROPIC_API_KEY":                    "",
 		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "vekil",
-		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":     "1",
+		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB":     subprocessScrub,
 	}
 	if hasModel {
 		name := strings.TrimSpace(input.Model.Name)
 		if name == "" {
 			name = model
 		}
+		clientModel := claudeCodeModelID(input)
 		for key, value := range map[string]string{
-			"ANTHROPIC_MODEL":                           model,
-			"ANTHROPIC_DEFAULT_HAIKU_MODEL":             model,
-			"ANTHROPIC_DEFAULT_SONNET_MODEL":            model,
-			"ANTHROPIC_DEFAULT_OPUS_MODEL":              model,
-			"ANTHROPIC_DEFAULT_FABLE_MODEL":             model,
-			"ANTHROPIC_CUSTOM_MODEL_OPTION":             model,
+			"ANTHROPIC_MODEL":                           clientModel,
+			"ANTHROPIC_DEFAULT_HAIKU_MODEL":             clientModel,
+			"ANTHROPIC_DEFAULT_SONNET_MODEL":            clientModel,
+			"ANTHROPIC_DEFAULT_OPUS_MODEL":              clientModel,
+			"ANTHROPIC_DEFAULT_FABLE_MODEL":             clientModel,
+			"ANTHROPIC_CUSTOM_MODEL_OPTION":             clientModel,
 			"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":        name,
 			"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Routed through Vekil",
-			"CLAUDE_CODE_SUBAGENT_MODEL":                model,
+			"CLAUDE_CODE_SUBAGENT_MODEL":                clientModel,
+			"CLAUDE_CODE_AUTO_MODE_MODEL":               ClaudeAutoModeClassifierModel,
 		} {
 			envSet[key] = value
 		}
@@ -130,10 +167,19 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 			return PreparedProcess{}, err
 		}
 	}
-	settingsJSON, err := json.Marshal(map[string]interface{}{
+	settings := map[string]interface{}{
 		"env":                  settingsEnv,
 		"disableRemoteControl": true,
-	})
+	}
+	// Anthropic's hosted web_search tool survives only native Messages
+	// forwarding: Copilot rejects it and Chat translation carries only
+	// function tools. Hide WebSearch elsewhere instead of letting every call
+	// fail; search then comes from Vekil's web search MCP server when available.
+	nativeWebSearch := input.CopilotAbsent && (!hasModel || modelSupportsEndpoint(input.Model, "/v1/messages"))
+	if !nativeWebSearch {
+		settings["permissions"] = map[string][]string{"deny": {"WebSearch"}}
+	}
+	settingsJSON, err := json.Marshal(settings)
 	if err != nil {
 		return PreparedProcess{}, fmt.Errorf("build managed Claude settings: %w", err)
 	}
@@ -143,6 +189,18 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	}
 	args := append([]string(nil), executable.prefixArgs...)
 	args = append(args, "--settings", settingsPath)
+	if webSearchURL := strings.TrimSpace(input.WebSearchMCPURL); webSearchURL != "" {
+		mcpPath, mcpCleanup, err := writeClaudeWebSearchMCPConfig(webSearchURL, localToken)
+		if err != nil {
+			_ = cleanup()
+			return PreparedProcess{}, err
+		}
+		settingsCleanup := cleanup
+		cleanup = func() error { return errors.Join(mcpCleanup(), settingsCleanup()) }
+		// The = form keeps a variadic --mcp-config from consuming forwarded
+		// positional arguments.
+		args = append(args, "--mcp-config="+mcpPath)
+	}
 	args = append(args, input.ForwardedArgs...)
 
 	prepared := PreparedProcess{
@@ -160,19 +218,42 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	return prepared, nil
 }
 
+func (ClaudeAdapter) usesWebSearchMCP() bool { return true }
+
+func (ClaudeAdapter) auxiliaryModels() []string { return []string{ClaudeAutoModeClassifierModel} }
+
+// writeClaudeWebSearchMCPConfig registers the launch proxy's web search MCP
+// server, authenticated with the local proxy token, so the GitHub credential
+// stays inside Vekil.
+func writeClaudeWebSearchMCPConfig(url, localToken string) (string, func() error, error) {
+	config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{
+		"vekil": map[string]any{
+			"type":    "http",
+			"url":     url,
+			"headers": map[string]string{"Authorization": "Bearer " + localToken},
+		},
+	}})
+	if err != nil {
+		return "", nil, fmt.Errorf("build Claude MCP config: %w", err)
+	}
+	path, cleanup, err := writePrivateTempFile("vekil-claude-mcp-", config)
+	if err != nil {
+		return "", nil, fmt.Errorf("write Claude MCP config: %w", err)
+	}
+	return path, cleanup, nil
+}
+
 func validateClaudeVersion(executable resolvedExecutable, environment []string) error {
 	return validateExecutableVersion(executable, environment, "Claude Code", "Claude Code", minimumVersion{major: 2, minor: 1, patch: 83})
 }
 
 func validateClaudeForwardedArgs(args []string) error {
-	if err := validateClaudePermissionArgs(args); err != nil {
-		return err
-	}
 	expectValue := false
 	seenPositional := false
 	printMode := false
+	foregroundSession := false
 	endOptions := false
-	for _, arg := range args {
+	for index, arg := range args {
 		if expectValue {
 			expectValue = false
 			continue
@@ -196,27 +277,28 @@ func validateClaudeForwardedArgs(args []string) error {
 				arg == "--tmux" || strings.HasPrefix(arg, "--tmux="),
 				arg == "--remote" || strings.HasPrefix(arg, "--remote="),
 				arg == "--cloud" || strings.HasPrefix(arg, "--cloud="),
-				arg == "--remote-control" || strings.HasPrefix(arg, "--remote-control=") || arg == "--rc",
-				arg == "--fork-session":
+				arg == "--environment" || strings.HasPrefix(arg, "--environment="),
+				arg == "--teleport" || strings.HasPrefix(arg, "--teleport="),
+				arg == "--remote-control" || strings.HasPrefix(arg, "--remote-control=") || arg == "--rc":
 				return fmt.Errorf("detached Claude sessions are not supported by an ephemeral Vekil launcher")
 			case arg == "--model" || strings.HasPrefix(arg, "--model="),
 				arg == "--fallback-model" || strings.HasPrefix(arg, "--fallback-model="),
-				arg == "--continue" || arg == "-c",
-				arg == "--resume" || strings.HasPrefix(arg, "--resume=") || arg == "-r" || strings.HasPrefix(arg, "-r"),
-				arg == "--session-id" || strings.HasPrefix(arg, "--session-id="),
-				arg == "--from-pr" || strings.HasPrefix(arg, "--from-pr="),
-				arg == "--teleport" || strings.HasPrefix(arg, "--teleport="),
 				arg == "--agent" || strings.HasPrefix(arg, "--agent="),
 				arg == "--agents" || strings.HasPrefix(arg, "--agents="):
-				return fmt.Errorf("claude model or session overrides are not supported by the managed Vekil launcher")
+				return fmt.Errorf("claude model or custom-agent overrides are not supported by the managed Vekil launcher")
+			case claudeForegroundSessionSelector(arg):
+				foregroundSession = true
+				if claudeSessionSelectorHasOptionalValue(arg) && index+1 < len(args) && !strings.HasPrefix(args[index+1], "-") {
+					expectValue = true
+				}
 			}
-			if claudeOptionRequiresValue(arg) {
+			if claudeOptionRequiresValue(arg) && index+1 < len(args) && !strings.HasPrefix(args[index+1], "-") {
 				expectValue = true
 			}
 			continue
 		}
 		if !seenPositional {
-			if !printMode && claudeNonAgentCommand(arg) {
+			if !printMode && !foregroundSession && claudeNonAgentCommand(arg) {
 				return fmt.Errorf("detached Claude agent-management commands are not supported by an ephemeral Vekil launcher")
 			}
 			seenPositional = true
@@ -225,46 +307,63 @@ func validateClaudeForwardedArgs(args []string) error {
 	return nil
 }
 
-func validateClaudePermissionArgs(args []string) error {
+// claudePermissionModeRequested reports whether args ask Claude Code for a
+// permission mode other than the default.
+func claudePermissionModeRequested(args []string) bool {
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
-		if arg == "--" {
-			return nil
-		}
 		switch {
+		case arg == "--":
+			return false
 		case arg == "--dangerously-skip-permissions", arg == "--allow-dangerously-skip-permissions":
-			return fmt.Errorf(
-				"claude permission bypass %q is not supported by the managed Vekil launcher; use explicit --allowed-tools/--disallowed-tools rules",
-				arg,
-			)
-		case arg == "--permission-mode":
-			if index+1 >= len(args) {
-				return nil
-			}
-			index++
-			if mode := strings.TrimSpace(args[index]); mode != "manual" && mode != "default" {
-				return unsupportedClaudePermissionMode(mode)
-			}
+			return true
 		case strings.HasPrefix(arg, "--permission-mode="):
-			if mode := strings.TrimSpace(strings.TrimPrefix(arg, "--permission-mode=")); mode != "manual" && mode != "default" {
-				return unsupportedClaudePermissionMode(mode)
+			if claudeNonDefaultPermissionMode(strings.TrimPrefix(arg, "--permission-mode=")) {
+				return true
+			}
+		case claudeOptionRequiresValue(arg) && index+1 < len(args):
+			// Claude Code takes the next argument as this option's value even
+			// when it looks like a flag, so a prompt cannot request a mode.
+			index++
+			if arg == "--permission-mode" && claudeNonDefaultPermissionMode(args[index]) {
+				return true
 			}
 		}
 	}
-	return nil
+	return false
 }
 
-func unsupportedClaudePermissionMode(mode string) error {
-	return fmt.Errorf(
-		"claude permission mode %q is not supported by the managed Vekil launcher while subprocess credential scrubbing is enabled; use default/manual mode with explicit --allowed-tools/--disallowed-tools rules",
-		mode,
-	)
+func claudeNonDefaultPermissionMode(mode string) bool {
+	mode = strings.TrimSpace(mode)
+	return mode != "manual" && mode != "default"
 }
 
 func claudeNonAgentCommand(command string) bool {
 	switch command {
 	case "agents", "attach", "auth", "auto-mode", "doctor", "gateway", "install", "mcp",
-		"plugin", "plugins", "project", "remote-control", "setup-token", "ultrareview", "update", "upgrade":
+		"import", "kill", "logs", "plugin", "plugins", "project", "remote-control", "respawn", "rm",
+		"setup-token", "stop", "ultrareview", "update", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func claudeForegroundSessionSelector(arg string) bool {
+	switch {
+	case arg == "--continue" || arg == "-c",
+		arg == "--resume" || strings.HasPrefix(arg, "--resume=") || arg == "-r" || strings.HasPrefix(arg, "-r"),
+		arg == "--session-id" || strings.HasPrefix(arg, "--session-id="),
+		arg == "--from-pr" || strings.HasPrefix(arg, "--from-pr="):
+		return true
+	default:
+		return false
+	}
+}
+
+func claudeSessionSelectorHasOptionalValue(arg string) bool {
+	switch arg {
+	case "--resume", "-r", "--from-pr":
 		return true
 	default:
 		return false

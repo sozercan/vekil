@@ -6,9 +6,11 @@ Use this file when editing provider credentials, model ownership, JSON/YAML prov
 
 ### GitHub Copilot
 
-For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access. This is the only GitHub token environment variable Vekil consumes directly, and it overrides cached Vekil login state. Supported GitHub credentials are `gho_` OAuth user tokens, `ghu_` GitHub App user tokens, and `github_pat_` fine-grained PATs with the Copilot Requests permission. Vekil uses them directly where the Copilot upstream accepts them. The current exception is `/responses` with a `ghu_` credential: Copilot rejects that app-user bearer directly, so Vekil exchanges it through `/copilot_internal/v2/token` and caches the short-lived result in memory only. Vekil does not call the private Copilot user endpoint. Revoked, expired, unlicensed, or under-permissioned credentials surface as upstream authentication or permission failures.
+For CI or other non-interactive environments, set `COPILOT_GITHUB_TOKEN` to a GitHub token for a user with GitHub Copilot access, or to a GitHub Actions `GITHUB_TOKEN` as described below. This is the only GitHub token environment variable Vekil consumes directly, and it overrides cached Vekil login state. Supported GitHub credentials are `gho_` OAuth user tokens, `ghu_` GitHub App user tokens, `github_pat_` fine-grained PATs with the Copilot Requests permission, and `ghs_` GitHub Actions `GITHUB_TOKEN`s from organization-owned repositories whose job grants `copilot-requests: write` and whose organization enables "Allow use of Copilot CLI billed to the organization"; without that policy, Copilot returns 403. Vekil uses them directly where the Copilot upstream accepts them. The current exception is `/responses` with a `ghu_` credential: Copilot rejects that app-user bearer directly, so Vekil exchanges it through `/copilot_internal/v2/token` and caches the short-lived result in memory only. Vekil does not call the private Copilot user endpoint. Revoked, expired, unlicensed, or under-permissioned credentials surface as upstream authentication or permission failures.
 
-Unless explicitly overridden, direct `ghu_` credentials use the `copilot-language-server` integration ID for catalog and native Chat requests. Their exchanged Responses token uses `vscode-chat`; other direct credential types also use `vscode-chat`.
+Unless explicitly overridden, every Copilot credential uses the `copilot-developer-cli` integration ID for catalog, Chat, Responses, and native Responses websocket requests: `gho_` OAuth credentials (including GitHub CLI OAuth), `ghu_` GitHub App user tokens (including Vekil's device-code login), `github_pat_` fine-grained PATs, `ghs_` GitHub Actions tokens, and exchanged or legacy Copilot tokens. This applies Copilot CLI access policies, limits, and billing rules instead of an IDE integration's. The selected integration must support the credential type; explicit global, provider, and endpoint integration overrides are preserved.
+
+For existing durable routes, follow the [integration upgrade procedure](state-recovery.md#upgrading-the-copilot-integration-default) before restarting with the new default.
 
 Vekil intentionally ignores generic GitHub token variables such as `GH_TOKEN` and `GITHUB_TOKEN`. If you want Vekil to use an authenticated GitHub CLI account, opt in explicitly with `vekil login --github-cli` or `vekil login --gh`; Vekil then runs `gh auth token --hostname github.com` for Copilot access and keeps that token in memory only, without copying it into Vekil's `access-token` or `api-key.json` caches.
 
@@ -43,7 +45,7 @@ Entra token refreshes are shared across concurrent requests; waiters can time ou
 
 ### Generic Providers
 
-`openai-compatible` and `anthropic-compatible` providers use the generic auth fields:
+`openai-compatible`, `anthropic-compatible`, and `typesafe-compatible` providers use the generic auth fields:
 
 - `auth_type: bearer` sends `Authorization: Bearer <key>` by default.
 - `auth_type: api-key-header` sends the key through `auth_header`, with optional `auth_prefix`.
@@ -76,10 +78,15 @@ You can run Azure-only or Codex-only configs, or mix those providers with Copilo
 
 A provider file with no `schema_version` is version 1. Explicitly setting `schema_version: 0` is invalid. Only schema versions 1 and 2 are supported. Version-1 files keep the existing provider-owned `models[]`, dynamic discovery, default-provider, unknown-model, catalog, and retry behavior. A new binary does not rewrite those files.
 
-Schema version 2 is the complete explicit-routing schema. It adds public and internal `model_routes`, ordered target failover, provider trust metadata, internal classifier routes, and optional semantic `policy_profiles`. A route-only version-2 file remains valid without policy fields. A sole provider is the implicit default, and in a multi-provider configuration a single Copilot provider is the implicit default. Multiple non-Copilot providers may omit `default: true` only when none exposes a legacy static or dynamic model catalog and client-visible models are owned by public routes or policies. If any such provider exposes legacy/catalog models, configure exactly one explicit default provider. A complete route-only environment-variable example is checked in at [`examples/provider-routing-failover.yaml`](../examples/provider-routing-failover.yaml).
+Schema version 2 is the complete explicit-routing schema. It adds public and internal `model_routes`, ordered target failover, provider trust metadata, internal classifier routes, and optional semantic `policy_profiles`. Explicit routes use durable provider-state ownership by default, configured through the top-level `state_bindings` block. A route-only version-2 file remains valid without policy fields. A sole provider other than a TypeSafe-compatible classifier is the implicit default. In a multi-provider configuration, a single Copilot provider is the implicit default. Multiple non-Copilot providers may omit `default: true` only when none exposes a legacy static or dynamic model catalog and client-visible models are owned by public routes or policies. If any such provider exposes legacy/catalog models, configure exactly one explicit default provider. A complete route-only environment-variable example is checked in at [`examples/provider-routing-failover.yaml`](../examples/provider-routing-failover.yaml).
 
 ```yaml
 schema_version: 2
+
+state_bindings:
+  mode: durable
+  max_entries: 8388608
+  # file: /absolute/path/to/bindings.db
 
 providers:
   - id: azure-primary
@@ -123,6 +130,13 @@ model_routes:
       max_upstream_sends: 1
 ```
 
+The `state_bindings` block above shows the defaults for explicit routes. Omit
+`file` to use the private OS application-data path, or set `mode: memory` to
+retain process-local ownership with expiry and eviction. The providers file
+alone controls this behavior for the CLI, managed launchers, and menubar app.
+See [durable state recovery](state-recovery.md) for macOS/Linux storage support,
+capacity, multiple-instance isolation, and pruning.
+
 After the route has been validated in `primary_only`, enable ordered failover explicitly:
 
 ```yaml
@@ -141,7 +155,7 @@ The same schema-version-2 contract also includes:
 - provider `trust_domain` and classifier non-storage capability metadata; and
 - top-level `policy_profiles` that publish one Chat model ID and select a `lightweight` or `powerful` canonical-Chat terminal route backed by native Chat or bounded Chat-over-Responses.
 
-These fields are additive: existing route-only version-2 configurations remain valid, while version-1 files reject explicit-route and policy-routing fields. Internal routes have no public ID, aliases, picker metadata, `/v1/models` entry, dashboard insight-model eligibility, or direct client resolution. Policy destinations may be public or internal; exposed public destinations are deliberate policy bypasses. The recommended policy configuration keeps both destinations and the classifier internal. See [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml), the single-process [`examples/policy-routing-copilot.yaml`](../examples/policy-routing-copilot.yaml), and [Semantic Policy Routing](policy-routing.md).
+These fields are additive: existing route-only version-2 configurations remain valid, while version-1 files reject explicit-route, policy-routing, and `state_bindings` fields. Internal routes have no public ID, aliases, picker metadata, `/v1/models` entry, dashboard insight-model eligibility, or direct client resolution. Policy destinations may be public or internal; exposed public destinations are deliberate policy bypasses. The recommended policy configuration keeps both destinations and the classifier internal. See [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml), the single-process [`examples/policy-routing-copilot.yaml`](../examples/policy-routing-copilot.yaml), and [Semantic Policy Routing](policy-routing.md).
 
 ### Route schema and validation
 
@@ -197,7 +211,7 @@ For schema-v2 policies, explicitly request classifier protocol preflight with:
 vekil config validate --live --providers-config /path/to/providers.yaml
 ```
 
-`--live` sends one fixed non-user fixture per distinct classifier route selected by the policy config to verify authentication/reachability, forced strict function output, configured non-storage behavior, and the one-send contract. It does not prove the provider's retention policy. Configuration reload is not part of schema version 2; apply changes by restarting Vekil.
+`--live` sends one fixed non-user fixture per distinct classifier route selected by the policy config to verify authentication/reachability, the configured classifier protocol, configured non-storage behavior, and the one-send contract. It does not prove the provider's retention policy. Configuration reload is not part of schema version 2; apply changes by restarting Vekil.
 
 ### Routing modes and budgets
 
@@ -205,29 +219,43 @@ vekil config validate --live --providers-config /path/to/providers.yaml
 - `priority_failover` considers unattempted targets in configuration order, but only while the replay-safety gate remains open. It does not balance healthy requests across targets.
 - Changing only `mode` does not increase the budgets: with omitted budget fields, `priority_failover` still has one target attempt and one send. Configure larger values explicitly to permit a secondary.
 - `max_target_attempts` defaults to `1` when omitted, includes the first target, and cannot exceed the configured target count. An explicitly configured `0` is invalid, and `primary_only` requires this value to remain `1`.
-- `max_upstream_sends` defaults to `1` when omitted, must be at least `max_target_attempts`, and caps physical inference POSTs for one logical operation. An explicitly configured `0` is invalid. A named same-target protocol recovery, compact/replay child call, or compatibility-model call also consumes a send when that path is integrated with explicit routes; it is not a free retry or another target attempt.
+- `max_upstream_sends` defaults to `1` when omitted, must be at least `max_target_attempts`, and caps physical inference POSTs for one logical operation. An explicitly configured `0` is invalid. Azure rate-limit recovery, a named same-target protocol recovery, a compact/replay child call, or a compatibility-model call also consumes a send when that path is integrated with explicit routes; it is not a free retry or another target attempt.
 - Explicit routes do not nest the broad legacy same-target transport retry loop inside each target. Version-1 and compiled legacy routes retain their existing retry behavior, and the existing `retries` metric continues to describe those same-target retries.
 - Size `max_upstream_sends` for every reachable child send, not just normal targets. Responses compaction/replay, encrypted-content cleanup, stream-options recovery, and compatibility-model recovery all draw from the same route operation; the route cap can stop them before their own local fanout/recovery limit.
 
 One total inference deadline is shared across all attempts. It is not restarted per target, and the initial behavior does not allocate a smaller timeout to a hanging primary. Redirects and implicit transport body replay are disabled for inference sends so the send budget matches actual dispatches and credentials cannot follow redirects.
 
+Explicit Azure routes can retry an authoritative, fully cleaned-up `429` on the same target after a valid provider reset. This includes certified Responses stream admission failures and complete non-streaming `status: "failed"` JSON envelopes within the 4 KiB inspection limit. Neither may contain semantic output or reported usage. HTTP rejection bodies must also pass this check; malformed or duplicate-key JSON, truncated bodies, and read failures cannot authorize another send. Plain-text HTTP `429` admission errors retain their existing retry behavior. The request body and provider-owned state remain intact. An eligible configured failover target takes priority; a pinned operation, `primary_only` route, or last eligible Azure target can instead use remaining sends on its current target. This recovery applies to normal inference attempts, including later pinned websocket turns; it does not add retry loops inside compaction or protocol-recovery child calls. Missing reset data, ambiguous delivery, semantic/tool progress, and an exhausted deadline or send budget prevent another send.
+
+Azure cooldowns are shared by resource origin and physical deployment across public model aliases, reasoning tiers, provider aliases, and credentials. A successful response with an exhausted token or request balance and a valid reset also starts a cooldown without changing that response. During a cooldown, fresh requests can fail over without sending to the throttled deployment. Operations that must keep the target wait in a bounded, cancellable FIFO queue. Per-deployment queue limits prevent one deployment from consuming all shared waiting capacity. One recovery request holds the deployment permit until its stream shows output, or until its response body finishes or closes when no output arrives; queued requests then proceed one at a time. A long generation does not block the queue after its first output, but a pinned request still waits for each renewed reset. Limits and diagnostics are in [429 troubleshooting](troubleshooting.md#429-upstream-rate-limit).
+
 Automatic target switching is intentionally narrow:
+
+These are the default ownership rules. Opt-in
+[Responses conversation migration](conversation-migration.md) can reconstruct a
+saved complete conversation on another Azure resource or Copilot at the same
+safe boundaries. It never forwards an old resource's opaque state to the new
+resource.
 
 | Observed outcome | Switch to the next target |
 |------------------|---------------------------|
 | DNS, dial, or TLS failure before request bytes could be written | Yes, if admission, deadline, cleanup, and budgets still allow it |
-| Authoritative HTTP `429` | Yes |
+| Local credential acquisition failure before inference dispatch | Yes, if the operation is unpinned and admission, commitment, and budgets still allow it |
+| Authoritative HTTP `429` with no contradictory execution evidence | Yes |
 | Adapter-certified pre-execution overload/unavailable rejection, such as a supported `503`/`529` | Yes |
 | Adapter-certified pre-output Responses terminal admission failure | Yes, only when that exact condition proves no semantic/tool execution |
+| Azure Responses failed JSON inside HTTP `200` | Yes, within the bounded inspection limit and only without output or usage |
 | Client cancellation, shutdown, or total operation deadline | No |
-| Authentication, configuration, invalid-request, or content-policy error | No |
+| Upstream authentication rejection, configuration, invalid-request, or content-policy error | No |
 | Reset/timeout after request write, generic `502`/`504`, or other ambiguous delivery | No |
 | Partial success body, text/reasoning/tool output, malformed/unknown event, or any downstream commitment | No |
 | Known provider state owned by the previous target, or unknown/conflicting explicit-route state | No |
 
+Local Azure identity or Copilot credential failures can skip a target without spending an upstream-send slot. They still consume a target attempt. This does not retry upstream `401`/`403` responses or bypass provider-state ownership. If credential acquisition remains the final failure, OpenAI-compatible HTTP responses and Responses WebSocket error frames report `503` with `code: upstream_auth_unavailable` and the credential diagnostic. A credential failure during a scheduled same-target retry preserves the previous upstream rejection rather than replacing it.
+
 Attempts never overlap. Before switching, the failed response body and local readers/pumps must terminate. If delivery, semantic progress, commitment, state ownership, or cleanup is uncertain, Vekil returns an error instead of risking a duplicate generation, duplicate billing, duplicate server-side tool activity, or corrupted continuation.
 
-When several attempts fail, error selection is deterministic: ambiguous delivery wins over local state/configuration/authentication errors, which win over authoritative retryable rejections, which win over no-eligible-target exhaustion. If every attempt was an authoritative retryable rejection, the first attempted target's canonical protocol error is preserved; failed-attempt headers are not merged into a later response.
+When several attempts fail, error selection is deterministic: ambiguous delivery wins over local state/configuration/authentication errors, which win over authoritative retryable rejections, which win over no-eligible-target exhaustion. Equal-precedence failures preserve the first attempted target's canonical protocol error, using its latest result when that target was retried. A recovery wait stopped before dispatch preserves the upstream rejection and any longer shared reset. Failed-attempt headers are not merged into a later successful response.
 
 ### Supported route surfaces
 
@@ -239,28 +267,62 @@ Copilot targets:
 | `/responses` | `copilot`; `azure-openai`; static `openai-compatible` | Direct `POST /v1/responses`; route-aware compact/memory/replay helpers; optional proxy-owned `GET /v1/responses` websocket bridge; OpenAI Chat, translated Anthropic/Gemini, token probes, and dashboard insights through Chat-over-Responses when the request subset permits | Prewrite or adapter-certified pre-execution rejection; direct Responses and Responses-backed Chat streams may also switch after a held Responses preamble and a certified non-executing terminal admission failure, but never after semantic/tool progress or downstream commitment |
 | `/chat/completions` | `copilot`; `azure-openai`; static `openai-compatible` | OpenAI Chat Completions; translated Anthropic Messages; Gemini `generateContent` / `streamGenerateContent`; Chat-based token probes and dashboard insights | Prewrite or adapter-certified `429`/overload rejection; client streams can switch only while the held prefix is nonsemantic, and forced-stream aggregation only before text/reasoning/tool progress |
 | `/v1/messages` | static `anthropic-compatible` | Direct native Anthropic Messages | Prewrite or adapter-certified `429`/overload rejection while only a nonsemantic Anthropic preamble is held; no mixing with OpenAI-translated targets |
+| `/systemone` | static `typesafe-compatible` | Internal policy classification only | One target, one attempt, one send; no classifier failover |
 
 Native Anthropic `POST /v1/messages/count_tokens` is a bounded compatibility operation in the selected public route. In `priority_failover` mode it may switch targets only under the same replay-safe, precommit, adapter-certified rejection rules and shared target/send budgets as other route operations; protocol-recovery child sends remain pinned to their selected target. Chat-based Anthropic/Gemini token probes use canonical Chat execution and therefore the native `/chat/completions` or `/responses` endpoint selected from the route allowlist.
 
-For explicit client streams, Vekil bounds precommit inspection with the existing `750 ms` timeout and `64 KiB` prefix limit. Reaching either bound commits the current target and forwards the buffered prefix; unknown/malformed events, semantic output, tool activity, usage/accounting frames, or a client write also prohibit switching.
+For explicit client streams, Vekil bounds precommit inspection with the existing `750 ms` timeout and `64 KiB` prefix limit. Reaching either bound commits the current target and forwards the buffered prefix; unknown/malformed events, semantic output, tool activity, usage/accounting frames, or a client write also prohibit switching. When Responses stream headers already report exhausted quota (`Retry-After`, `retry-after-ms`, or an exhausted `x-ratelimit-remaining-*` count), Vekil holds an output-free `response.queued`/`response.created`/`response.in_progress` preamble for up to `10 s` and `512 KiB`. Azure can admit such a stream and fail it with a `429` after prefill of a large prompt. The first semantic event still commits immediately.
 
 An OpenAI-family route may use Copilot, Azure, or static OpenAI-compatible targets when all targets implement every advertised endpoint with equivalent semantics. Copilot targets use the configured `upstream_model` directly and authenticate through the process's normal Copilot authenticator; they do not require a second loopback Vekil bridge. An Anthropic-family route contains only static Anthropic-compatible targets. OpenAI Codex, dynamically discovered generic providers, native `/realtime`, and heterogeneous OpenAI/native-Anthropic target sets are rejected as explicit route targets. Provider-only version-1 routing for those providers remains available.
 
-Schema-v2 policy selection is narrower than this general explicit-route matrix. Both terminal routes and the classifier route must support canonical Chat execution through either native `/chat/completions` or Vekil's bounded Chat-over-Responses adapter. Copilot-backed Responses routes authenticate and adapt in process, so `vekil launch` remains a single command. The policy public ID still advertises `/chat/completions` and accepts text/function-tool OpenAI Chat, translated Anthropic Messages/counting, and bounded stateless Responses compatibility. It is rejected on the Responses websocket, compact/memory routes, hosted/custom tools, Gemini, multimodal input, and stateful `previous_response_id`. Process-local `call_vekil_*` continuations remain bound to their originating terminal route/tier; opaque downstream-bridge replay still requires the documented single-target `off`/`observe` baseline and sticky ingress. Direct public routes keep the general matrix above.
+Schema-v2 policy selection is narrower than this general explicit-route matrix. Both terminal routes must support canonical Chat execution through either native `/chat/completions` or Vekil's bounded Chat-over-Responses adapter. Classifier routes may also use a [TypeSafe-compatible `/systemone` endpoint](policy-routing.md#typesafe-compatible-classifiers). Copilot-backed Responses routes authenticate and adapt in process, so `vekil launch` remains a single command. The policy public ID still advertises `/chat/completions` and accepts text/function-tool OpenAI Chat, translated Anthropic Messages/counting, and bounded stateless Responses compatibility. It is rejected on the Responses websocket, compact/memory routes, hosted/custom tools, Gemini, multimodal input, and stateful `previous_response_id`. Active process-local `call_vekil_*` continuations remain bound to their originating terminal route/tier. Completed tool history can survive a later effort decision when both tiers configure effort and use the same single Responses provider/model target; see [Policy replay rules](policy-routing.md#locked-v1-scope). Opaque downstream-bridge replay still requires the documented single-target `off`/`observe` baseline and sticky ingress. Direct public routes keep the general matrix above.
 
-The optional websocket bridge is still transport adaptation over HTTP `/responses`. Its first provider-backed `response.create` may use the same safe precommit route failover; after a successful target is exposed, the session is pinned to that exact route/target and later turns fail closed rather than migrate. See [Responses WebSocket Bridge](responses-websocket.md).
+The optional websocket bridge uses upstream HTTP `/responses` by default. Its
+first provider-backed `response.create` may use the same safe precommit route
+failover; by default, after a successful target is exposed, the session is pinned
+to that exact route/target. Migration-enabled Azure routes select subsequent
+owners from immutable saved responses, including after reconnect. Experimental native Copilot connections additionally
+prohibit retry or migration after sending a create. See
+[Responses WebSocket Bridge](responses-websocket.md).
 
 ### Exact state binding and process-local limits
 
-Provider-issued state is bound to one exact `{route_id, target_id}`. This includes adapter-marked response IDs, trusted `X-Codex-Turn-State`, non-proxy opaque `encrypted_content`, and other opaque reasoning/session handles. Known state pins the owning target and disables failover. All supplied state values must agree; malformed, conflicting, cross-route, or mixed known/unknown state on an explicit `/responses` operation fails locally without an upstream call. A token observed from different owners becomes a conflict tombstone and remains fail-closed until that record expires or is evicted.
+Provider-issued state is bound to one exact `{route_id, target_id}`. This includes adapter-marked response IDs, trusted `X-Codex-Turn-State`, non-proxy opaque `encrypted_content`, and other opaque reasoning/session handles. By default, known state pins the owning target and disables failover. All supplied state values must agree; malformed, conflicting, cross-route, or mixed known/unknown state on an explicit `/responses` operation fails locally without an upstream call. A token observed from different owners becomes a conflict tombstone. Memory-only tombstones can expire or evict; durable tombstones remain until explicit pruning. Opt-in migration verifies complete visible history before reconstructing without old provider state; it never relabels an old token's owner.
 
 There is one narrow first-use exception for a client-supplied Responses `conversation` ID. When that conversation is the request's only explicit state and the route can select exactly one eligible Responses target, Vekil atomically binds the ID to that target before dispatch and hard-pins the operation. This covers a one-target route and a multi-target `primary_only` route whose configured primary is eligible. An unknown conversation on a multi-target `priority_failover` route remains fail-closed because ownership is ambiguous; other unknown provider state also remains fail-closed. `previous_response_id` cannot be combined with `conversation`. Vekil exposes no public conversation-registration endpoint and accepts no client target hint.
 
-The binding index is bounded to 262,144 entries with a 24-hour absolute TTL and is process-local. Capacity eviction, expiry, restart, or sending the next request to another Vekil process makes a prior binding unknown. For ordinary provider state that fails closed. A conversation-only request on a currently deterministic route can instead take the bootstrap path, which cannot distinguish genuine first use from a lost prior binding; keep the process affinity and deterministic target stable for the lifetime of active conversations. Lookups update recency for eviction but do not extend the absolute TTL; observing the same token again from the same owner refreshes it. **Every explicit Responses route that accepts provider-issued state requires one Vekil process or sticky ingress to the process that owns the binding**, including one-target and `primary_only` routes. Responses-backed Chat tool continuations use a separate process-local replay store and have the same affinity/restart constraint. Vekil does not migrate Responses state, replay a WebSocket session onto another target, or infer portability from user-provided strings. Durable/shared bindings and proxy-signed target hints are future work.
+[Durable state recovery](state-recovery.md) is the default for schema-v2 explicit
+routes. It binds the actual authenticated endpoint, deployment, and account
+identity and retains ownership across restart. The default capacity is 8,388,608
+logical records including tombstones; it does not preallocate that many records.
+New records fail at capacity without automatic expiry or eviction. The dashboard
+shows occupancy and file size and warns before the limit is reached.
 
-### No terminal-route balancing or circuit breaker
+`state_bindings.mode: memory` opts out. Its default capacity is 262,144 entries
+with a 24-hour absolute TTL and LRU eviction. Lookups update eviction recency but
+not TTL; observing the same token from its owner refreshes it. Expiry, eviction,
+restart, or another process makes proof unknown. Ordinary opaque state then
+fails closed; conversation-only IDs retain the narrow bootstrap exception.
+Enabling durability later cannot reconstruct lost proof.
 
-Schema version 2 deliberately does not include active-active/weighted routing, automatic affinity extraction, bounded-load selection, active health probes, user-defined quota/cache/failure domains, half-open terminal-target circuit-breaker state, configured cross-model fallback, or cross-route fallback. Temporary target errors also do not change `/readyz`. Any future exact-target cooldown based on authoritative `Retry-After` data requires separate implementation; no generic circuit-breaker framework is implied by `priority_failover`.
+Concurrent clients share the proxy's store safely. Every explicit stateful route,
+including one-target and `primary_only`, still needs one writer per file and
+ingress affinity when several proxies run independently. Responses-backed Chat
+replay remains a separate process-local store. Shared binding storage,
+client-supplied ownership hints and generic cross-provider session migration
+remain unsupported. Selected Azure routes can enable the narrower
+[`conversation_migration`](conversation-migration.md) contract through the
+providers file. It requires durable storage and saves conversation text with
+separate limits and deletion rules.
+
+### No terminal-route balancing or generic circuit breaker
+
+Schema version 2 does not include weighted routing, active health probes,
+user-defined quota domains, generic terminal-target circuit breakers, or
+cross-route fallback. Temporary target errors do not change `/readyz`.
+Azure deployment throttles and recognized Copilot throttles with authoritative
+reset data use [shared cooldowns](troubleshooting.md). Priority failover may select
+an unaffected target when the request has no binding that prevents a switch.
 
 Schema-v2 policy routing adds a separate infrastructure-only breaker for the **classifier route**, not for terminal target selection. Only pre-inference transport failures, `429`, and upstream `5xx` affect it. Timeouts, malformed classifier output, missing forced calls, abstention, content-dependent latency, and user validation errors do not change shared health. A selected terminal route still follows only its own configured `primary_only` or replay-safe `priority_failover` behavior; classifier failure selects the profile's configured unavailable tier and never creates cross-tier failover.
 
@@ -270,7 +332,21 @@ A conservative rollout is: validate the version-2 file, run a one-target route i
 
 Policy profiles have a separate operator gate: keep the global ceiling `off`, complete the powered end-to-end evaluation, graduate profiles independently through `observe`, require at least 5,000 completed observations and 95% admission in every declared traffic bucket, then enforce one profile at a time. See [Policy evaluation gates](policy-routing.md#evaluation-gates-before-enforcement) and [Policy rollout and rollback](policy-routing.md#rollout-and-rollback).
 
-To stop automatic switching, restore `mode: primary_only` and restart the same schema-version-2 binary. This is availability-safe but **not continuity-preserving**: restart clears process-local state bindings, Responses-backed Chat replay state, and WebSocket sessions, so drain stateful traffic first or accept deterministic continuation failures. The new process still interprets newly issued state with the same version-2 fail-closed rules. Do **not** restore a version-1 file or downgrade to an older binary while state issued by a secondary may still be presented. First fence new stateful continuations, drain WebSocket sessions, wait at least the 24-hour binding TTL plus any longer provider replay window, and perform an atomic no-mixed-version cutover. If that fence cannot be guaranteed, keep the running version-2 process in `primary_only` until the fence is complete. There is no automatic configuration migration in either direction.
+To stop automatic switching, restore `routing.mode: primary_only` and restart
+the same schema-v2 binary against the complete same store and exact owner
+configuration. Durable proof still pins state to its issuing target, including
+a secondary. Websocket connections and Responses-backed Chat replay remain
+process-local and need draining. In memory mode, the restart also clears
+ownership proof.
+
+Fence new stateful continuations before explicit pruning, changing to memory
+mode, restoring an older backup, using a version-1 configuration, or downgrading.
+Drain WebSocket sessions and prevent clients from presenting retired state to a
+different version or owner. Durable records have no TTL; the memory-only
+24-hour limit does not retire them. If that fence cannot be guaranteed, keep
+the version-2 configuration and complete store. There is no automatic
+configuration migration in either direction. See
+[recovery and rollback](state-recovery.md#failures-and-rollback).
 
 ### Native endpoints and Chat compatibility
 
@@ -371,7 +447,7 @@ Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decodi
 
 | Field | Applies To | Purpose |
 |-------|------------|---------|
-| `type` | all providers | Use `openai-compatible` or `anthropic-compatible` for generic providers. |
+| `type` | all providers | Use `openai-compatible`, `anthropic-compatible`, or `typesafe-compatible` for generic providers. TypeSafe is limited to internal policy classification. |
 | `base_url` | generic providers | Upstream origin and any fixed API prefix. The proxy appends only the configured path field. |
 | `api_key`, `api_key_env` | generic providers | Static credential value or the name of any environment variable you choose. |
 | `auth_type` | generic providers | `bearer`, `api-key-header`, or `none`. Defaults to `bearer` when a key is present, otherwise `none`. |
@@ -380,10 +456,12 @@ Successful decoded dynamic model catalogs are capped at 4 MiB before JSON decodi
 | `chat_completions_path` | `openai-compatible` | Upstream native Chat path, used when the selected model allows `/chat/completions`. Defaults to `/chat/completions`. |
 | `responses_path` | `openai-compatible` | Upstream native Responses path for direct Responses and Responses-backed Chat. Defaults to `/responses`; models must still opt in with `/responses`. |
 | `messages_path` | `anthropic-compatible` | Upstream path for public `POST /v1/messages`. Defaults to `/v1/messages`. |
-| `models_path` | generic providers | Upstream path for dynamic model discovery and readiness probes. Defaults to `/models`. |
-| `model_discovery` | generic providers | `static`, `openai`, `ollama`, or `openrouter-tools`. |
+| `systemone_path` | `typesafe-compatible` | Upstream evaluation path for internal classifiers. Defaults to `/systemone`, appended to `base_url`. |
+| `models_path` | OpenAI/Anthropic-compatible providers | Upstream path for dynamic model discovery and readiness probes. Defaults to `/models`. |
+| `model_discovery` | generic providers | `static`, `openai`, `ollama`, or `openrouter-tools`. TypeSafe-compatible providers require `static`. |
 | `trust_domain` | providers used by schema-v2 policy destinations/classifiers | Operator-defined data-governance domain. Required for every provider referenced by a policy; matching is enforced unless the profile acknowledges cross-domain forwarding. |
 | `classifier_no_store_supported` | provider used by a schema-v2 classifier route | Declares that Vekil can send the provider's supported non-storage option for classifier requests. This is a capability declaration, not proof of retention behavior. |
+| `hosted_tools` | schema-v2 providers used by [conversation migration](conversation-migration.md) targets | Hosted tools whose definitions and completed call items this provider accepts on replay. Only `web_search` is supported. A migration skips targets that have not declared the hosted tools a conversation uses. |
 | `models[].endpoints` | all static models | Verified native upstream endpoint allowlist. It controls rendered capability metadata and native backend selection; Vekil does not add served compatibility routes. |
 | `models[].drop_stop_sequences` | static models with `/chat/completions` | When `true`, remove OpenAI Chat `stop` after translation, including translated Anthropic `stop_sequences`. This changes stop behavior; use only when the upstream rejects the field and the client can tolerate model-determined termination. |
 | `models[].use_max_completion_tokens` | static models with `/chat/completions` | When `true`, rewrite translated Chat/Anthropic `max_tokens` to `max_completion_tokens` before forwarding. Use only for deployments that reject the legacy field. |
@@ -495,6 +573,8 @@ If LM Studio, llama.cpp, or Ollama exposes a native Anthropic Messages endpoint 
 
 Dynamic Copilot catalog entries are also eligible for native Anthropic Messages forwarding when their `supported_endpoints` explicitly includes `/v1/messages`. Vekil performs bounded catalog discovery before routing the first Messages request for an unknown Copilot model, then forwards the original Anthropic request directly so fields such as `thinking` and `stop_sequences` retain their native semantics. Chat-only, endpoint-less, and still-unknown Copilot models continue through Chat translation instead of assuming native Messages support.
 
+Dynamic catalog entries whose `vendor` is `Google` also cap native Chat images at their declared `capabilities.limits.vision.max_prompt_images` when a request resolves to the catalog entry itself. A request with more image parts has its oldest images replaced by a text placeholder instead of failing upstream for carrying too many images. Schema-v2 explicit routes and policy tiers build their targets from route configuration rather than from the catalog entry, so a route that pins such a model does not apply the cap. Other vendors' declared limits are not enforced because their endpoints accept more images than they declare.
+
 ### Copilot Provider Header Profiles
 
 `type: copilot` providers can define a `headers` block with a provider-wide `default` profile and endpoint-specific `chat_completions` and `responses` profiles. Endpoint-specific values override `headers.default`, which overrides the global Copilot header flags/environment variables, which then fall back to the built-in defaults. Omitted fields inherit from the lower-precedence profile. The built-in `openai-intent: conversation-panel` fallback is endpoint-aware: it is applied to upstream `/chat/completions` and `/responses` calls, while upstream `/models` calls send `openai-intent` only when you configure it explicitly through `--copilot-openai-intent`, `COPILOT_OPENAI_INTENT`, or a provider header profile.
@@ -532,7 +612,7 @@ Routing rules:
 - Azure `auth_mode` is optional and defaults to `api_key`. Supported values are `api_key` and `azure_identity`.
 - `openai-compatible` models default to `/chat/completions` when `models[].endpoints` is omitted. Add `/responses` only for models you have validated on `responses_path`.
 - `anthropic-compatible` models default to `/v1/messages` when `models[].endpoints` is omitted. OpenAI Chat Completions and Responses requests for those models fail fast.
-- Generic path fields are `chat_completions_path`, `responses_path`, `messages_path`, and `models_path`. They are paths relative to `base_url`, with no query string or fragment.
+- Generic path fields are `chat_completions_path`, `responses_path`, `messages_path`, `models_path`, and `systemone_path`. They are paths relative to `base_url`, with no query string or fragment.
 - Azure `base_url` must be an absolute URL whose path ends with either the OpenAI-compatible `/openai/v1` path or the legacy `/openai` path, with no query string or fragment.
 - Microsoft Foundry inference URLs ending in `/models` are not supported in `type: "azure-openai"` configs. Use the corresponding OpenAI-compatible `.../openai/v1` endpoint instead.
 - For `/openai/v1` base URLs, omit `api_version`; the proxy calls `/chat/completions`, `/responses`, and `/models` directly with no `api-version` query string.

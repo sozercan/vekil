@@ -1,0 +1,208 @@
+package proxy
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
+)
+
+func TestTaskUsageFragmentedStreamAccounting(t *testing.T) {
+	const billing = `"co\u0070ilot_usage":{"total_nano_aiu":31,"compute_units":2}`
+	const failure = "event: error\ndata: " + `{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}`
+	for _, tc := range []struct {
+		name, endpoint, prefix, terminal, escapedTerminal string
+	}{
+		{
+			name: "Chat", endpoint: providerEndpointChatCompletions,
+			prefix: "data: " + `{"u\u0073age":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9},` + "\r\ndata: " + billing + "}\r\r" +
+				"data: " + `{"USAGE":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}` + "\n\n",
+			terminal: "data: [DONE]", escapedTerminal: "data: [DONE]",
+		},
+		{
+			name: "Messages", endpoint: providerEndpointMessages,
+			prefix: "data: " + `{"type":"message_start","mess\u0061ge":{"usage":{"input_tokens":7,"output_tokens":2}},` + "\r\ndata: " + billing + "}\r\r" +
+				"data: " + `{"type":"message_delta","USAGE":{"output_tokens":3}}` + "\n\n",
+			terminal: "event: message_stop\rdata: {}\r\r", escapedTerminal: "data: " + `{"t\u0079pe":"message_st\u006fp"}`,
+		},
+		{
+			name: "Responses", endpoint: providerEndpointResponses,
+			prefix: "data: " + `{"type":"response.in_progress","resp\u006fnse":{"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}},` + "\r\ndata: " + billing + "}\r\r" +
+				"data: " + `{"type":"response.in_progress","RESPONSE":{"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}` + "\n\n",
+			terminal: "event: response.completed\rdata: {}\r\r", escapedTerminal: "data: " + `{"t\u0079pe":"response.compl\u0065ted"}`,
+		},
+	} {
+		for _, ending := range []struct {
+			name, body            string
+			wantErrors, throttles int64
+		}{
+			{name: "terminal", body: tc.terminal},
+			{name: "escaped terminal", body: tc.escapedTerminal},
+			{name: "throttled", body: failure, wantErrors: 1, throttles: 1},
+			{name: "truncated", wantErrors: 1},
+		} {
+			for _, chunkSize := range []int{1, 31, 4096} {
+				t.Run(fmt.Sprintf("%s/%s/chunk%d", tc.name, ending.name, chunkSize), func(t *testing.T) {
+					body := tc.prefix + "data: " + `{"metadata":{"usage":{"prompt_tokens":999999},"copilot_usage":{"total_nano_aiu":999999}}}` + "\n\n" + ending.body
+					var chunks []string
+					for start := 0; start < len(body); start += chunkSize {
+						chunks = append(chunks, body[start:min(start+chunkSize, len(body))])
+					}
+					h := &ProxyHandler{stats: newStatsCollector()}
+					resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: newSplitChunkEOFReadCloser(chunks...)}
+					h.beginTaskInferenceSend(httptest.NewRequest(http.MethodPost, tc.endpoint, nil)).finish(resp, nil)
+					got, err := io.ReadAll(resp.Body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := resp.Body.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if string(got) != body {
+						t.Fatal("accounting changed the forwarded stream")
+					}
+					snapshot := h.stats.taskUsage.snapshot()
+					totals := snapshot.Totals
+					if snapshot.Inflight != 0 || totals.Sends != 1 || totals.Completed != 1 || totals.Errors != ending.wantErrors || totals.Throttled != ending.throttles || totals.ReportedUsageSends != 1 {
+						t.Fatalf("stream accounting = %+v", snapshot)
+					}
+					if totals.Usage.PromptTokens != 7 || totals.Usage.CompletionTokens != 3 || totals.Usage.TotalTokens != 10 || totals.CopilotUsage != (copilotUsageTotals{TotalNanoAIU: 31, ComputeUnits: 2}) {
+						t.Fatalf("stream lost reported usage or counted nested metadata: %+v", totals)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestTaskUsagePublicStreamingBilling(t *testing.T) {
+	const initialBilling = `"copilot_usage":{"total_nano_aiu":7,"compute_units":1}`
+	const finalBilling = `"copilot_usage":{"total_nano_aiu":31,"compute_units":2,"token_details":[{"model":"excluded-accounting-model"}]}`
+	for _, tc := range []struct {
+		name, endpoint, request string
+		events                  []string
+		wantErrors              int64
+	}{
+		{
+			name: "Chat", endpoint: providerEndpointChatCompletions,
+			request: `{"model":"billing-model","messages":[{"role":"user","content":"hello"}],"stream":true}`,
+			events: []string{
+				`{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13},` + initialBilling + `}`,
+				`{"choices":[{"index":0,"delta":{"content":"literal \"copilot_usage\":{\"total_nano_aiu\":999999}"}}],"metadata":{"copilot_usage":{"total_nano_aiu":999999}}}`,
+				`{"choices":[],"copilot_usage":{"total_nano_aiu":999999,"compute_units":"invalid"}}`,
+				`{"choices":[],"copilot_usage":{"total_nano_aiu":999999,"padding":"` + strings.Repeat("x", 64<<10) + `"}}`,
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18},` + finalBilling + `}`,
+				"[DONE]",
+			},
+		},
+		{
+			name: "Responses", endpoint: providerEndpointResponses,
+			request: `{"model":"billing-model","input":"hello","stream":true}`,
+			events: []string{
+				`{"type":"response.in_progress","response":{"id":"resp-billing","usage":{"input_tokens":11,"output_tokens":2}},` + initialBilling + `}`,
+				`{"type":"response.output_text.delta","delta":"literal \"copilot_usage\":{\"total_nano_aiu\":999999}","metadata":{"copilot_usage":{"total_nano_aiu":999999}}}`,
+				`{"type":"response.in_progress","copilot_usage":{"total_nano_aiu":999999,"compute_units":"invalid"}}`,
+				`{"type":"response.in_progress","copilot_usage":{"total_nano_aiu":999999,"padding":"` + strings.Repeat("x", 64<<10) + `"}}`,
+				`{"type":"response.completed","response":{"id":"resp-billing","output":[],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}},` + finalBilling + `}`,
+				`{"type":"response.completed","response":{"id":"resp-billing","output":[],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}},` + finalBilling + `}`,
+			},
+		},
+		{
+			name: "Responses missing terminal with Chat sentinel", endpoint: providerEndpointResponses,
+			request: `{"model":"billing-model","input":"hello","stream":true}`,
+			events: []string{
+				`{"type":"response.in_progress","response":{"id":"resp-billing","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}},` + finalBilling + `}`,
+				`{"type":"response.output_text.delta","delta":"partial"}`,
+				"[DONE]",
+			},
+			wantErrors: 1,
+		},
+		{
+			name: "Anthropic", endpoint: providerEndpointMessages,
+			request: `{"model":"billing-model","max_tokens":64,"messages":[{"role":"user","content":"hello"}],"stream":true}`,
+			events: []string{
+				`{"type":"message_start","message":{"id":"msg-billing","type":"message","role":"assistant","model":"billing-model","content":[],"usage":{"input_tokens":11,"output_tokens":0}},` + initialBilling + `}`,
+				`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"literal \"copilot_usage\":{\"total_nano_aiu\":999999}"},"metadata":{"copilot_usage":{"total_nano_aiu":999999}}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"ping","copilot_usage":{"total_nano_aiu":999999,"compute_units":"invalid"}}`,
+				`{"type":"ping","copilot_usage":{"total_nano_aiu":999999,"padding":"` + strings.Repeat("x", 64<<10) + `"}}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7},` + finalBilling + `}`,
+				`{"type":"message_stop",` + finalBilling + `}`,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stream strings.Builder
+			for _, event := range tc.events {
+				if event != "[DONE]" && !json.Valid([]byte(event)) {
+					t.Fatalf("invalid fixture: %s", event)
+				}
+				stream.WriteString("data: " + event + "\n\n")
+			}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == providerEndpointModels {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"data":[{"id":"billing-model","supported_endpoints":["/chat/completions","/responses","/v1/messages"]}]}`)
+					return
+				}
+				if r.URL.Path != tc.endpoint {
+					t.Errorf("upstream path = %s, want %s", r.URL.Path, tc.endpoint)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, stream.String())
+			}))
+			defer upstream.Close()
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithCopilotBaseURL(upstream.URL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			if err := h.ValidateDynamicProviderModels(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			w := httptest.NewRecorder()
+			switch tc.endpoint {
+			case providerEndpointChatCompletions:
+				h.HandleOpenAIChatCompletions(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.request)))
+			case providerEndpointResponses:
+				h.HandleResponses(w, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(tc.request)))
+			default:
+				h.HandleAnthropicMessages(w, httptest.NewRequest(http.MethodPost, tc.endpoint, strings.NewReader(tc.request)))
+			}
+			if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), finalBilling) {
+				t.Fatalf("stream lost billing data: status=%d body=%s", w.Code, w.Body.String())
+			}
+			w = httptest.NewRecorder()
+			h.HandleStatsJSON(w, httptest.NewRequest(http.MethodGet, "/stats.json", nil))
+			var stats struct {
+				TaskUsage taskUsageSnapshot `json:"task_usage"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &stats); err != nil {
+				t.Fatal(err)
+			}
+			snapshot := stats.TaskUsage
+			totals := snapshot.Totals
+			if snapshot.Inflight != 0 || totals.Sends != 1 || totals.Completed != 1 || totals.Errors != tc.wantErrors || totals.ReportedUsageSends != 1 || totals.Usage.TotalTokens != 18 {
+				t.Fatalf("stream ledger = %+v", snapshot)
+			}
+			if totals.CopilotUsage != (copilotUsageTotals{TotalNanoAIU: 31, ComputeUnits: 2}) {
+				t.Fatalf("stream billing was lost or counted repeatedly: %+v", totals.CopilotUsage)
+			}
+			if len(snapshot.ByKind) != 1 || snapshot.ByKind[0].Kind != "inference" || snapshot.ByKind[0].CopilotUsage != totals.CopilotUsage {
+				t.Fatalf("billing missing from inference totals: %+v", snapshot.ByKind)
+			}
+			if strings.Contains(w.Body.String(), "excluded-accounting-model") {
+				t.Fatal("stats retained billing metadata")
+			}
+		})
+	}
+}

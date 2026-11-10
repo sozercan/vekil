@@ -259,13 +259,20 @@ func TestCodexAdapterRejectsManagedOverridesAndNonAgentModes(t *testing.T) {
 		{name: "config", args: []string{"-c", `model_provider="other"`}, want: "model or provider overrides"},
 		{name: "profile", args: []string{"-p", "other"}, want: "model or provider overrides"},
 		{name: "remote", args: []string{"--remote", "ws://example"}, want: "remote Codex sessions"},
-		{name: "resume", args: []string{"resume", "last"}, want: "resumed Codex sessions"},
-		{name: "exec resume", args: []string{"exec", "resume", "last"}, want: "resumed Codex sessions"},
-		{name: "alias exec resume", args: []string{"e", "resume", "last"}, want: "resumed Codex sessions"},
+		{name: "resume model override", args: []string{"resume", "--last", "--model", "other"}, want: "model or provider overrides"},
+		{name: "fork config override", args: []string{"fork", "session-id", "-c", `model_provider="other"`}, want: "model or provider overrides"},
+		{name: "exec resume profile override", args: []string{"exec", "resume", "--last", "--profile", "other"}, want: "model or provider overrides"},
+		{name: "alias exec resume local provider override", args: []string{"e", "resume", "session-id", "--local-provider", "ollama"}, want: "model or provider overrides"},
+		{name: "resume remote", args: []string{"resume", "--last", "--remote", "ws://example"}, want: "remote Codex sessions"},
+		{name: "fork remote auth", args: []string{"fork", "session-id", "--remote-auth-token-env", "REMOTE_TOKEN"}, want: "remote Codex sessions"},
 		{name: "app server", args: []string{"app-server"}, want: "detached or server"},
+		{name: "cloud", args: []string{"cloud"}, want: "detached or server"},
 		{name: "cloud tasks", args: []string{"cloud-tasks"}, want: "detached or server"},
 		{name: "responses proxy", args: []string{"responses-api-proxy"}, want: "detached or server"},
 		{name: "stdio relay", args: []string{"stdio-to-uds"}, want: "detached or server"},
+		{name: "agents", args: []string{"agents"}, want: "not an agent session"},
+		{name: "queue", args: []string{"queue", "session-id", "message"}, want: "not an agent session"},
+		{name: "migrate rollouts", args: []string{"migrate-rollouts"}, want: "not an agent session"},
 		{name: "apply alias", args: []string{"a"}, want: "not an agent session"},
 		{name: "execpolicy", args: []string{"execpolicy"}, want: "not an agent session"},
 		{name: "login", args: []string{"login"}, want: "not an agent session"},
@@ -290,6 +297,56 @@ func TestCodexAdapterRejectsManagedOverridesAndNonAgentModes(t *testing.T) {
 		if err := validateCodexForwardedArgs(args); err != nil {
 			t.Fatalf("validateCodexForwardedArgs(%#v) = %v", args, err)
 		}
+	}
+}
+
+func TestCodexAdapterPreservesForegroundContinuationArgs(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "56d7498d-6b2e-47ca-92a6-92ddee84ab25"
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "interactive resume by id", args: []string{"resume", sessionID, "continue the review"}},
+		{name: "interactive resume latest", args: []string{"resume", "--last"}},
+		{name: "interactive fork by id", args: []string{"fork", sessionID, "try another approach"}},
+		{name: "exec resume", args: []string{"exec", "resume", "--last", "continue the review"}},
+		{name: "exec alias resume by id", args: []string{"e", "resume", sessionID, "continue the review"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, err := (CodexAdapter{}).Prepare(PrepareInput{
+				BaseURL: "http://127.0.0.1:43210",
+				Model: ModelInfo{
+					ID:                 "gpt-public",
+					SupportedEndpoints: []string{"/responses"},
+				},
+				Binary:        binary,
+				LocalToken:    "test-token-placeholder",
+				ForwardedArgs: tc.args,
+				DryRun:        true,
+			})
+			if err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			if prepared.Cleanup != nil {
+				t.Cleanup(func() { _ = prepared.Cleanup() })
+			}
+			if !containsAdjacent(prepared.Args, "-m", "gpt-public") {
+				t.Fatalf("Codex args did not preserve the managed model: %#v", prepared.Args)
+			}
+			providerID := codexProviderID("test-token-placeholder")
+			if !containsString(prepared.Args, `model_provider="`+providerID+`"`) {
+				t.Fatalf("Codex args did not preserve the managed provider: %#v", prepared.Args)
+			}
+			got := prepared.Args[len(prepared.Args)-len(tc.args):]
+			if !reflect.DeepEqual(got, tc.args) {
+				t.Fatalf("forwarded args = %#v, want %#v", got, tc.args)
+			}
+		})
 	}
 }
 

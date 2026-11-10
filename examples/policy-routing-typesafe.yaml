@@ -1,0 +1,79 @@
+# Jev classifies requests for two Copilot terminal models.
+# Authenticate Copilot with "vekil login" and export TYPESAFE_API_KEY.
+#
+# Validate offline:
+#   vekil config validate --providers-config examples/policy-routing-typesafe.yaml
+# Validate the classifier with a fixed fixture:
+#   vekil config validate --live --providers-config examples/policy-routing-typesafe.yaml
+# Run in observe mode:
+#   vekil --providers-config examples/policy-routing-typesafe.yaml
+
+schema_version: 2
+
+providers:
+  - id: copilot
+    type: copilot
+    trust_domain: github-copilot
+  - id: evaluator
+    type: typesafe-compatible
+    base_url: https://api.typesafe.ai/v1
+    api_key_env: TYPESAFE_API_KEY
+    trust_domain: typesafe
+    # Optional path override; appended to base_url.
+    systemone_path: /systemone
+
+model_routes:
+  - id: lightweight
+    exposure: internal
+    endpoints: [/responses]
+    reasoning_effort: [low]
+    drop_sampling_params: true
+    targets:
+      - id: lightweight-primary
+        provider: copilot
+        upstream_model: gpt-5.6-luna
+
+  - id: powerful
+    exposure: internal
+    endpoints: [/responses]
+    reasoning_effort: [max]
+    drop_sampling_params: true
+    targets:
+      - id: powerful-primary
+        provider: copilot
+        upstream_model: gpt-5.6-sol
+
+  - id: classifier
+    exposure: internal
+    internal_purpose: policy_classifier
+    endpoints: [/systemone]
+    targets:
+      - id: evaluator-primary
+        provider: evaluator
+        upstream_model: jev-latest
+    routing:
+      mode: primary_only
+      max_target_attempts: 1
+      max_upstream_sends: 1
+
+policy_profiles:
+  - id: coding-policy
+    public_id: coding-economy
+    mode: observe
+    lightweight:
+      route: lightweight
+      reasoning_effort: low
+    powerful:
+      route: powerful
+      reasoning_effort: max
+    classifier:
+      route: classifier
+      profile: coding_agent_v1
+      timeout_ms: 3000
+      max_request_bytes: 16000
+    data_policy:
+      # Bounded request content goes to the separate classifier provider.
+      content_forwarding_acknowledged: true
+      allow_cross_trust_domain: true
+      # The TypeSafe protocol has no request-level non-storage control.
+      allow_provider_retention: true

@@ -32,12 +32,15 @@ const (
 	chatStreamEventChunk chatStreamEventKind = iota + 1
 	chatStreamEventSuccess
 	chatStreamEventError
+	// A distinct kind, not a chunk field, so it can never reach a surface.
+	chatStreamEventCarriedReasoning
 )
 
 type chatStreamEvent struct {
-	kind      chatStreamEventKind
-	chunk     models.OpenAIStreamChunk
-	streamErr *chatStreamError
+	kind             chatStreamEventKind
+	chunk            models.OpenAIStreamChunk
+	streamErr        *chatStreamError
+	carriedReasoning carriedTurn
 }
 
 // chatStreamError names the execution error carried by a terminal stream event.
@@ -82,9 +85,10 @@ type chatStreamEventWriter struct {
 // chatStreamEventStream is the consumer side of the canonical Chat event
 // transport. Canceling it releases a producer blocked by the bounded buffer.
 type chatStreamEventStream struct {
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-	events <-chan chatStreamEvent
+	ctx              context.Context
+	cancel           context.CancelCauseFunc
+	events           <-chan chatStreamEvent
+	carriedReasoning carriedTurn
 }
 
 func newChatStreamEventPipe(parent context.Context) (*chatStreamEventWriter, *chatStreamEventStream) {
@@ -94,17 +98,24 @@ func newChatStreamEventPipe(parent context.Context) (*chatStreamEventWriter, *ch
 	ctx, cancel := context.WithCancelCause(parent)
 	events := make(chan chatStreamEvent, chatStreamEventBufferSize)
 	return &chatStreamEventWriter{
-			ctx:    ctx,
-			events: events,
-		}, &chatStreamEventStream{
-			ctx:    ctx,
-			cancel: cancel,
-			events: events,
-		}
+		ctx:    ctx,
+		events: events,
+	}, &chatStreamEventStream{
+		ctx:    ctx,
+		cancel: cancel,
+		events: events,
+	}
 }
 
 func (w *chatStreamEventWriter) sendChunk(chunk models.OpenAIStreamChunk) error {
 	return w.send(chatStreamEvent{kind: chatStreamEventChunk, chunk: chunk}, false)
+}
+
+func (w *chatStreamEventWriter) sendCarriedReasoning(turn carriedTurn) error {
+	if !turn.present() {
+		return nil
+	}
+	return w.send(chatStreamEvent{kind: chatStreamEventCarriedReasoning, carriedReasoning: turn}, false)
 }
 
 func (w *chatStreamEventWriter) succeed() error {
@@ -185,7 +196,9 @@ func (s *chatStreamEventStream) stop(cause error) {
 	s.cancel(cause)
 }
 
-func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.OpenAIStreamChunk) error) (err error) {
+func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.OpenAIStreamChunk) error,
+	onCarriedReasoning func(carriedTurn) error,
+) (err error) {
 	defer func() {
 		if stream != nil {
 			stream.stop(err)
@@ -206,6 +219,18 @@ func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.
 			}
 		case chatStreamEventSuccess:
 			return nil
+		case chatStreamEventCarriedReasoning:
+			if stream != nil {
+				stream.carriedReasoning = event.carriedReasoning
+			}
+			if onCarriedReasoning != nil {
+				// A dropped carrier is a silent wedge: the turn completes, the client
+				// stores a transcript with no signature, and the next request cannot
+				// resolve its own minted ids.
+				if err := onCarriedReasoning(event.carriedReasoning); err != nil {
+					return err
+				}
+			}
 		case chatStreamEventError:
 			if event.streamErr == nil {
 				return &chatStreamError{StatusCode: http.StatusBadGateway}
@@ -218,9 +243,10 @@ func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.
 }
 
 type chatStreamEventCallbacks struct {
-	DropUsage bool
-	OnUsage   func(*models.OpenAIUsage)
-	OnFinal   func(*models.OpenAIResponse)
+	DropUsage      bool
+	OnUsage        func(*models.OpenAIUsage)
+	OnCopilotUsage func(json.RawMessage)
+	OnFinal        func(*models.OpenAIResponse)
 }
 
 func selectChatStreamEventCallbacks(callbacks []chatStreamEventCallbacks) chatStreamEventCallbacks {
@@ -256,6 +282,9 @@ func streamChatEventsToOpenAI(w http.ResponseWriter, stream *chatStreamEventStre
 	}
 
 	err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
+		if callbacks.OnCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			callbacks.OnCopilotUsage(chunk.CopilotUsage)
+		}
 		if chunk.Usage != nil && callbacks.OnUsage != nil {
 			callbacks.OnUsage(chunk.Usage)
 		}
@@ -263,13 +292,16 @@ func streamChatEventsToOpenAI(w http.ResponseWriter, stream *chatStreamEventStre
 			addChatStreamChunkForToolCapture(aggregator, chunk)
 		}
 		if callbacks.DropUsage && chunk.Usage != nil && len(chunk.Choices) == 0 {
-			return nil
+			if rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+				return nil
+			}
+			chunk.Usage = nil
 		}
 		if err := writeOpenAIChatSSEData(w, chunk); err != nil {
 			return errors.Join(errChatStreamClientWriteFailed, err)
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		var streamErr *chatStreamError
 		if errors.As(err, &streamErr) {
@@ -371,7 +403,7 @@ func aggregateChatStreamEventsWithOptions(stream *chatStreamEventStream, options
 	aggregator := newOpenAIResponseAggregatorWithOptions(options)
 	if err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
 		return aggregator.addChunkBounded(chunk)
-	}); err != nil {
+	}, nil); err != nil {
 		return nil, err
 	}
 	if options.rejectInvalidTextDeltas {
@@ -402,6 +434,9 @@ func streamChatEventsToAnthropic(
 	}
 
 	err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
+		if callbacks.OnCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			callbacks.OnCopilotUsage(chunk.CopilotUsage)
+		}
 		if chunk.Usage != nil && callbacks.OnUsage != nil {
 			callbacks.OnUsage(chunk.Usage)
 		}
@@ -409,6 +444,11 @@ func streamChatEventsToAnthropic(
 			addChatStreamChunkForToolCapture(aggregator, chunk)
 		}
 		if !state.consumeChunk(chunk) {
+			return errChatStreamClientWriteFailed
+		}
+		return nil
+	}, func(turn carriedTurn) error {
+		if !state.emitCarriedReasoning(turn) {
 			return errChatStreamClientWriteFailed
 		}
 		return nil
@@ -441,6 +481,9 @@ func streamChatEventsToGemini(w http.ResponseWriter, stream *chatStreamEventStre
 	state := newGeminiStreamState(w)
 
 	err := consumeChatStreamEvents(stream, func(chunk models.OpenAIStreamChunk) error {
+		if callbacks.OnCopilotUsage != nil && !rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
+			callbacks.OnCopilotUsage(chunk.CopilotUsage)
+		}
 		if chunk.Usage != nil && callbacks.OnUsage != nil {
 			callbacks.OnUsage(chunk.Usage)
 		}
@@ -458,7 +501,7 @@ func streamChatEventsToGemini(w http.ResponseWriter, stream *chatStreamEventStre
 			}
 		}
 		return errChatStreamClientWriteFailed
-	})
+	}, nil)
 	if err != nil {
 		var streamErr *chatStreamError
 		if errors.As(err, &streamErr) {

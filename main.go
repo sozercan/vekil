@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,6 +29,8 @@ const (
 	cliCommandLogout
 	cliCommandLaunch
 	cliCommandConfig
+	cliCommandState
+	cliCommandService
 )
 
 func main() {
@@ -44,6 +47,14 @@ func main() {
 		return
 	case cliCommandConfig:
 		runConfig(os.Args[2:])
+		return
+	case cliCommandState:
+		if code := runState(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			os.Exit(code)
+		}
+		return
+	case cliCommandService:
+		runService(os.Args[2:])
 		return
 	}
 
@@ -64,6 +75,10 @@ func commandFromArgs(args []string) cliCommand {
 		return cliCommandLaunch
 	case "config":
 		return cliCommandConfig
+	case "state":
+		return cliCommandState
+	case "service":
+		return cliCommandService
 	default:
 		return cliCommandServe
 	}
@@ -368,10 +383,13 @@ func writeConfigValidateUsage(w io.Writer) {
 }
 
 type serveFlags struct {
+	stateBindingsFlags
 	port                            *string
 	host                            *string
 	tokenDir                        *string
 	providersConfigPath             *string
+	envFile                         *string
+	logFile                         *string
 	policyRoutingMode               *string
 	policyRoutingAllowRemote        *bool
 	logLevel                        *string
@@ -383,6 +401,7 @@ type serveFlags struct {
 	copilotGitHubAPIVersion         *string
 	copilotOpenAIIntent             *string
 	responsesWSEnabled              *bool
+	responsesWSNativeUpstream       *bool
 	responsesWSTurnStateDelta       *bool
 	responsesWSDisableAutoCompact   *bool
 	responsesWSCompactMaxItems      *int
@@ -395,10 +414,13 @@ type serveFlags struct {
 
 func registerServeFlags(fs *flag.FlagSet) serveFlags {
 	return serveFlags{
+		stateBindingsFlags:              registerStateBindingsFlags(fs),
 		port:                            fs.String("port", getEnv("PORT", "1337"), "Listen port"),
 		host:                            fs.String("host", getEnv("HOST", "127.0.0.1"), "Listen host"),
 		tokenDir:                        fs.String("token-dir", getEnv("TOKEN_DIR", ""), "Token storage directory (default: ~/.config/vekil)"),
 		providersConfigPath:             registerProvidersConfigFlag(fs, getEnv("PROVIDERS_CONFIG", "")),
+		envFile:                         fs.String(serveEnvFileFlag, "", "Load KEY=value environment variables from this file before reading other settings; file values override the process environment"),
+		logFile:                         fs.String(serveLogFileFlag, "", "Write logs to this private file instead of stderr, rotating at 16 MiB with one .1 backup"),
 		policyRoutingMode:               fs.String("policy-routing", getPolicyRoutingModeEnv(), "Policy routing mode: config (follow providers YAML), off, observe, or enforce"),
 		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
@@ -410,6 +432,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		copilotGitHubAPIVersion:         fs.String("copilot-github-api-version", getEnv("COPILOT_GITHUB_API_VERSION", ""), "Upstream Copilot x-github-api-version header"),
 		copilotOpenAIIntent:             fs.String("copilot-openai-intent", getEnv("COPILOT_OPENAI_INTENT", ""), "Upstream Copilot openai-intent header"),
 		responsesWSEnabled:              fs.Bool("responses-ws-enabled", getEnvBool("RESPONSES_WS_ENABLED", false), "Enable proxy-owned Codex websocket bridge on GET /v1/responses"),
+		responsesWSNativeUpstream:       fs.Bool("responses-ws-native-upstream", getEnvBool("RESPONSES_WS_NATIVE_UPSTREAM", false), "Use native upstream Copilot Responses websockets for websocket sessions"),
 		responsesWSTurnStateDelta:       fs.Bool("responses-ws-turn-state-delta", getEnvBool("RESPONSES_WS_TURN_STATE_DELTA", false), "Attempt delta-only replay when upstream returns X-Codex-Turn-State"),
 		responsesWSDisableAutoCompact:   fs.Bool("responses-ws-disable-auto-compact", getEnvBool("RESPONSES_WS_DISABLE_AUTO_COMPACT", false), "Disable automatic websocket-session history compaction"),
 		responsesWSCompactMaxItems:      fs.Int("responses-ws-auto-compact-max-items", getEnvInt("RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS", proxy.DefaultResponsesWebSocketConfig().AutoCompactMaxItems), "Auto-compact websocket session history after this many items"),
@@ -428,6 +451,24 @@ func (f serveFlags) parsedPolicyRoutingMode() (proxy.PolicyRoutingMode, error) {
 	return proxy.ParsePolicyRoutingMode(*f.policyRoutingMode)
 }
 
+type stateBindingsFlags struct {
+	stateBindingsMode       *string
+	stateBindingsFile       *string
+	stateBindingsMaxEntries *string
+}
+
+func registerStateBindingsFlags(fs *flag.FlagSet) stateBindingsFlags {
+	return stateBindingsFlags{
+		stateBindingsMode:       fs.String("state-bindings-mode", getEnv("STATE_BINDINGS_MODE", "config"), "Provider state mode override: config, durable, or memory"),
+		stateBindingsFile:       fs.String("state-bindings-file", getEnv("STATE_BINDINGS_FILE", ""), "Override the provider-state file with an absolute path in a private local directory"),
+		stateBindingsMaxEntries: fs.String("state-bindings-max-entries", getEnv("STATE_BINDINGS_MAX_ENTRIES", "0"), "Override logical-record capacity including tombstones (0 follows providers config; durable default: 8388608)"),
+	}
+}
+
+func (f stateBindingsFlags) parsedStateBindingsConfig() (proxy.StateBindingsConfig, error) {
+	return proxy.ParseStateBindingsOverrides(*f.stateBindingsMode, *f.stateBindingsFile, *f.stateBindingsMaxEntries)
+}
+
 func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
 	return proxy.CopilotHeaderConfig{
 		EditorVersion:       *f.copilotEditorVersion,
@@ -442,6 +483,7 @@ func (f serveFlags) copilotHeaderConfig() proxy.CopilotHeaderConfig {
 func (f serveFlags) responsesWebSocketConfig() proxy.ResponsesWebSocketConfig {
 	return proxy.ResponsesWebSocketConfig{
 		Enabled:             *f.responsesWSEnabled,
+		NativeUpstream:      *f.responsesWSNativeUpstream,
 		TurnStateDelta:      *f.responsesWSTurnStateDelta,
 		DisableAutoCompact:  *f.responsesWSDisableAutoCompact,
 		AutoCompactMaxItems: *f.responsesWSCompactMaxItems,
@@ -628,19 +670,37 @@ func stopServeServer(srv serveLifecycleServer, log *logger.Logger) error {
 }
 
 func runServe() {
+	configureServeGC()
+
+	logWriter, err := prepareServeFiles(os.Args[1:])
+	if err != nil {
+		logger.NewWithWriter(logger.LevelInfo, logWriter).Fatal("failed to prepare serve files", logger.Err(err))
+	}
+
 	serve := registerServeFlags(flag.CommandLine)
 	flag.Parse()
 
-	log := logger.New(logger.ParseLevel(*serve.logLevel))
+	log := logger.NewWithWriter(logger.ParseLevel(*serve.logLevel), logWriter)
 
 	policyRoutingMode, err := serve.parsedPolicyRoutingMode()
 	if err != nil {
 		log.Fatal("invalid policy routing mode", logger.Err(err))
 	}
+	stateBindings, err := serve.parsedStateBindingsConfig()
+	if err != nil {
+		log.Fatal("invalid state bindings configuration", logger.Err(err))
+	}
 
 	authenticator, err := auth.NewAuthenticator(*serve.tokenDir)
 	if err != nil {
 		log.Fatal("failed to initialize authenticator", logger.Err(err))
+	}
+	if logWriter != nil {
+		// Error level keeps this actionable prompt visible at every log level.
+		authenticator.DeviceCodePrompt = func(verificationURI, userCode string) {
+			log.Error("GitHub sign-in required: visit the URL and enter the code, or run `vekil login` and restart",
+				logger.F("url", verificationURI), logger.F("code", userCode))
+		}
 	}
 
 	providersCfg, err := proxy.LoadProvidersConfigFile(*serve.providersConfigPath)
@@ -653,6 +713,8 @@ func runServe() {
 		log,
 		*serve.host,
 		*serve.port,
+		// Read after prepareServeFiles so --env-file overrides the inherited value.
+		server.WithInboundAuthToken(os.Getenv("INBOUND_AUTH_TOKEN")),
 		server.WithStreamingUpstreamTimeout(*serve.streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(serve.copilotHeaderConfig()),
 		server.WithResponsesWebSocketConfig(serve.responsesWebSocketConfig()),
@@ -662,6 +724,7 @@ func runServe() {
 		server.WithPolicyRoutingAllowRemoteSingleTenant(*serve.policyRoutingAllowRemote),
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(providersCfg),
+			proxy.WithStateBindingsConfig(stateBindings),
 			proxy.WithPolicyRoutingMode(policyRoutingMode),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),
 		),
@@ -676,6 +739,18 @@ func runServe() {
 	if err := serveUntilContextDone(ctx, srv, authenticator, serveUsesCopilot(srv, providersCfg.UsesCopilot()), log); err != nil {
 		log.Fatal("serve error", logger.Err(err))
 	}
+}
+
+const defaultServeGCPercent = 200
+
+func configureServeGC() {
+	if shouldApplyServeGCDefault(os.Getenv("GOGC")) {
+		debug.SetGCPercent(defaultServeGCPercent)
+	}
+}
+
+func shouldApplyServeGCDefault(value string) bool {
+	return strings.TrimSpace(value) == ""
 }
 
 func getPolicyRoutingModeEnv() string {

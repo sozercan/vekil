@@ -1,0 +1,278 @@
+# Troubleshooting
+
+Start with the status code or error text shown by the client. Each entry explains
+what the error means, what to try first, how to confirm recovery, and what to
+capture if it keeps happening.
+
+## `400 provider_state_unavailable`: provider-state ownership is unavailable
+
+On an explicit model route, this code means one or more supplied provider-state
+values have no ownership binding in the active store. It applies both when
+all bindings are missing and when some remain known. The request is rejected
+before any provider send, including when streaming was requested. HTTP responses
+retain `type: invalid_request_error`; WebSocket error frames carry the same code
+and `status_code: 400`. The compact and memory shims also report it when their
+state validation encounters a missing binding.
+
+The code does not identify why proof is missing. A binding may never have been
+observed here, or may have been lost through expiry, eviction, restart, or sending
+the request to another process when using `mode: memory`.
+[Durable ownership](state-recovery.md) is the default for schema-v2 explicit
+routes. Its proof survives process restart in the
+same store but may be missing because it was never committed there, was explicitly
+pruned, or the original store was lost or replaced. A proven owner disagreement, conflict tombstone,
+malformed value, or cross-route binding still fails with its existing validation
+error, even when other bindings are missing. A known owner that disagrees with an
+established WebSocket target pin also remains a conflict.
+
+If the original Vekil process still holds memory bindings, restore request affinity
+to that process and keep the configured owner stable. For durable mode, reopen the
+original intact store with the same owner configuration and authenticated account;
+only one process can use it at a time. Otherwise Vekil cannot
+reconstruct ownership from opaque state. Retrying or compacting the same missing
+state does not recover it. Preserve the transcript; begin a fresh session with
+client-supported context if continuation cannot be restored. Do not strip state
+or switch providers to bypass this check. Enabling durable mode after proof has
+already been lost does not reconstruct it or permit cross-target replay.
+
+## `503 upstream_auth_unavailable`: provider credentials are unavailable
+
+Vekil could not obtain credentials for the selected provider before sending its
+inference request. The OpenAI-compatible error message identifies the provider
+and credential failure; Responses WebSocket error frames carry the same code and
+`status_code: 503`. This covers Azure identity, Copilot sign-in, and OpenAI Codex
+file-auth failures, not authentication errors returned by an inference upstream.
+
+For Azure CLI errors, first distinguish an unavailable executable from an expired
+sign-in. The macOS menubar app recovers your shell PATH with a five-second limit
+and falls back to `/opt/homebrew/bin` and `/usr/local/bin` if that lookup fails.
+A CLI installed elsewhere still needs a working shell PATH. If the diagnostic
+requests sign-in, restore the Azure CLI session with `az login`. PATH recovery
+cannot renew credentials. See [menubar authentication](menubar.md).
+
+An unpinned `priority_failover` route may try the next configured target without
+sending inference to the unavailable provider. State-bound requests keep their
+owner, and normal cancellation and attempt budgets still apply. Restore that
+provider's credentials when failover is unavailable; do not strip conversation
+state to force a switch.
+
+## `429`: upstream rate limit
+
+Keep the `Retry-After` response header. Vekil preserves long resets and returns
+the upstream response immediately when another attempt cannot fit within the
+request timeout. It also honors `retry-after-ms` and exhausted quota reset
+headers. Increasing the timeout does not increase the upstream quota.
+
+For schema-v2 explicit Azure routes, an authoritative `429` with a valid reset
+starts a cooldown shared by the Azure resource origin and physical deployment.
+Public aliases, reasoning tiers, and different credentials for that deployment
+share the cooldown. Fresh requests can use a configured failover target;
+provider-bound continuations keep their owner and wait before retrying the same
+request. Each retry consumes `max_upstream_sends`, so allow more than one send to
+enable this recovery. Azure TPM remains unchanged.
+
+Recovery also handles certified pre-output Responses stream rejections and
+complete non-streaming `status: "failed"` JSON envelopes up to 4 KiB after
+HTTP `200`, including reset headers embedded in the error. Rejection bodies
+with output, nonzero or malformed usage, duplicate keys, truncation, or read
+errors cannot authorize replay. Plain-text HTTP `429` admission errors remain
+retryable. Larger JSON failures retain their original
+response and can update the cooldown when consumed. A late streamed throttle
+updates the cooldown for other requests while preserving the current stream's
+failure.
+
+A successful response with zero or negative remaining tokens or requests and a
+valid reset starts the same cooldown. Vekil preserves the successful response and
+applies the delay to subsequent requests without waiting for another `429`.
+See [Azure's rate-limit guidance](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/how-to/quota)
+for the remaining-capacity and reset headers.
+
+Azure recovery admits one request at a time per deployment until its waiting
+queue drains. A streamed permit ends at the first text, reasoning, or tool
+output, because that output shows Azure admitted the request. A throttle later in
+the same stream still renews the cooldown for requests not yet admitted.
+Rejections, non-streaming responses, and streams without output keep the permit
+until the response completes or closes. Each deployment may
+queue at most 16 requests and 16 MiB of request bodies. The process keeps at most
+256 deployment cooldowns, 64 waiting requests, and 64 MiB of queued request bodies.
+Requests larger than 16 MiB can run immediately but cannot enter a recovery queue.
+Each wait is capped at five minutes and by the request deadline; disconnects and
+shutdown cancel it. Queue overflow returns `503 rate_limit_queue_full` for a new
+admission. A retry that cannot wait returns its last upstream rejection, retaining
+the reset and request correlation. These limits apply to explicit Azure inference
+routes; classifier admission and version-1 retries retain their existing behavior.
+
+A wait that reaches the five-minute cap returns a local `429` with the message
+`Azure deployment rate limit is still active` and no upstream send. Codex 0.157
+does not retry HTTP `429`, so it ends the turn with `exceeded retry limit, last
+status: 429 Too Many Requests`. This affects any request that must stay on the
+cooling deployment: provider-bound threads that cannot migrate (such as threads
+with Codex compaction items), `primary_only` routes, and routes without another
+eligible target. On `priority_failover` routes, fresh requests fail over to an
+eligible target instead. If this repeats, the deployment's TPM is below
+sustained demand.
+
+Client retries start new operation send budgets, but share these deployment
+cooldowns within the process. Vekil does not deduplicate identical requests,
+because they may be intentional independent calls. Bound client retry time as
+well as proxy send counts. Cooldowns do not reserve Azure capacity or coordinate
+other Vekil processes and external clients; already-dispatched requests can still
+consume quota after a failover target is selected.
+
+In attempt diagnostics, `retry_same_target` records the recovery decision and
+`rate_limit_retry` identifies the subsequent physical send. A wait canceled before
+dispatch reports `suppressed_retry_admission` or `suppressed_lifecycle` without
+adding a send. Capture the Vekil request ID, upstream request ID from the attempt
+trace, reset headers, and remaining-token headers when investigating repeated
+Azure throttling. A retry budget cannot guarantee recovery while demand continues
+to exceed the deployment's quota.
+
+For recognized Copilot limits with a valid reset, Vekil shares a process-local
+cooldown across affected requests. Model limits apply to that model and
+credential, account and weekly limits apply across models for that credential,
+and integration limits apply to that integration within the configured provider.
+An active cooldown returns 429 without sending another inference request. After
+the reset, one request probes availability before queued callers continue.
+Cooldown records are bounded and lost on restart.
+
+The same rules apply when a Chat, native Messages, or Responses stream returns a
+structured throttle after HTTP `200`. This includes Responses-backed Chat and
+requests streamed internally for tool-call aggregation. Responses errors can
+supply reset headers in the stream itself.
+A recovery probe that repeats the throttle renews the cooldown before queued
+requests continue. An already-started client stream reports the error in its
+stream; a non-streaming request returns `429`.
+
+Configured priority failover can still use an unaffected compatible target.
+Requests with provider-bound state retain their selected target. Switching models
+within the same account does not avoid an account or weekly cooldown.
+
+Requests waiting for a recovery probe honor disconnects, request deadlines, and
+shutdown. The number of waiters is bounded; excess requests receive 503.
+
+To investigate repeated throttling, record the error code, reset, timestamp, and
+`X-Copilot-Service-Request-Id` when present. Quota snapshot and usage-rate-limit
+headers provide additional account-specific diagnostics. Avoid sharing request
+contents or credentials.
+
+## `409 conversation_execution_uncertain`: an earlier attempt may have executed
+
+This code appears only on [conversation migration](conversation-migration.md)
+routes. An earlier turn of the same conversation was dispatched, but Vekil did
+not save its completion or learn its outcome. A tool call's complete arguments
+reached the client without the finished call, executable content arrived that
+Vekil could not save, the request may have reached the upstream before a
+failure, a save failed, or Vekil crashed. Every later turn of that conversation
+returns this `409`, including after restart, so a client's automatic retries
+fail immediately. Other conversations are unaffected.
+
+Codex 0.157 and later is an exception. It resends every output item it
+completed, each tool call with its output, so Vekil admits a Codex request whose
+history validates and replaces the old attempt. Sending a new message in Codex continues the conversation, and
+its own automatic retry usually does too, including when it resends a tool call
+and its output that Vekil could not save before a crash.
+
+One case is recoverable for any client. After a turn that delivered a completed
+tool call ended, a turn that retries from before that call gets this `409`,
+because it could repeat the call. A turn that continues from the delivered
+items and returns the call's output is still admitted, as Codex's own retry is.
+
+Common interruptions do not cause this code. A stream that the upstream or
+Vekil ends while the client stays connected, such as an Azure `429` sent after
+HTTP `200`, a stream that closes partway through, a streaming timeout or a
+Vekil restart, either fails over before the stream is committed or reaches the
+client unchanged after commitment, so the client can retry. This includes a
+long quiet stream that sent only `keepalive` events, a stream that sent only
+reasoning, message text or part of a tool call, and a stream that delivered a
+completed tool call. In the last case Vekil saves what it delivered, so Codex's
+retry, which carries the call and its output, continues the conversation. The
+exception is a stream Vekil ends itself, through a streaming timeout or a
+restart, right after a completed tool call. Vekil cannot tell whether the client
+received that call, so the next turn gets this code unless it is Codex's. A
+client that disconnects or cancels a turn, such as an interrupted agent, keeps
+the conversation usable; see
+[conversation migration](conversation-migration.md#storage-diagnostics-and-deletion).
+
+What to do first: in Codex 0.157 or later, send a new message. With other
+clients, start a new conversation in the client. To keep the blocked
+conversation, stop Vekil and run `vekil state prune-history` with a cutoff after
+the failed attempt, as described in
+[Storage, diagnostics and deletion](conversation-migration.md#storage-diagnostics-and-deletion).
+Pruning also deletes every older snapshot, and the next turn of a pruned
+conversation must resend its history with `X-Vekil-History-Complete: true`.
+
+To investigate, find the earlier attempt in `/stats.json` `recent_attempts` using
+the `X-Vekil-Request-ID` of the first failed turn. Record its status, delivery,
+`semantic_progress`, and `downstream_commitment`. The `conversation recovery`
+log lines name each outcome and reason; the menubar app keeps them in
+`~/Library/Logs/vekil/menubar.log` on macOS (see [Menubar](menubar.md)).
+
+## `cyber_policy`: content flagged for possible cybersecurity risk
+
+Codex may report:
+
+```text
+This content was flagged for possible cybersecurity risk. If this seems wrong,
+try rephrasing your request.
+```
+
+The upstream model's safety check blocked the turn; Vekil only relays it.
+Copilot returns it as HTTP `422` before streaming starts, which Codex retries
+until its retry budget is spent. When the flag arrives mid-stream as an `error`
+event, Vekil follows it with a `response.failed` carrying `cyber_policy`, so Codex
+stops without retrying.
+
+The flagged content usually stays in the thread's history and blocks every later
+turn. Start a new thread, or step back to before the flagged turn and rephrase.
+Retrying the same thread does not clear it.
+
+To confirm, look for `responses stream reported failure after commit` with
+`error_code` `content_filter` in the proxy log, or `"status": 422` entries in
+`GET /stats.json` `recent` for that model.
+
+## `408 user_request_timeout`: timed out reading request body
+
+### Symptom
+
+Codex may report:
+
+```text
+unexpected status 408 Request Timeout: upstream error (408):
+Timed out reading request body. Try again, or use a smaller request size.
+(code=user_request_timeout)
+```
+
+The URL in the error is the local Vekil endpoint because Codex connected to
+Vekil. The nested `upstream error` means the selected provider returned the 408
+while reading the forwarded body.
+
+This is separate from Vekil's `64 MiB` inbound limit for Responses requests.
+Changing `--streaming-upstream-timeout` does not address it because response
+streaming has not started.
+
+### What to do first
+
+Retry the turn. Vekil treats HTTP 408 as transient and sends a fresh request body
+within its retry budget. The client may also retry after Vekil returns the final
+error.
+
+If the same session keeps failing, compact it or start a new session with less
+history. If several independent sessions fail in the same time window, the
+selected provider's ingress path may be having trouble accepting request bodies.
+
+### How to confirm recovery
+
+For a launcher session, inspect the proxy JSON log path printed in the startup
+banner. For a normal server, use the dashboard or `GET /stats.json`:
+
+- `retries_by_code` with label `408` means Vekil retried an upstream 408.
+- `status_codes` with label `408` counts requests that still ended with 408.
+- A newer `recent` entry for the same endpoint and model with `"status": 200`
+  confirms that a later request completed.
+
+### What to capture if it repeats
+
+Keep the failed request ID and timestamp. Also record the public model or route,
+whether one or several sessions were affected, and the relevant proxy log lines.
+These details distinguish one large session replay from a provider-wide
+ingress problem without exposing the request body.

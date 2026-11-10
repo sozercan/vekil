@@ -99,6 +99,9 @@ type openAIStreamError struct {
 	Type    string
 	Code    string
 	Message string
+	// Safe metadata belongs to the response that produced this error, including
+	// when route failover later selects it as the canonical failure.
+	headers http.Header
 }
 
 // httpStatus maps an OpenAI-style stream error to an HTTP status so a
@@ -110,6 +113,8 @@ func (e *openAIStreamError) httpStatus() int {
 	}
 	switch strings.ToLower(strings.TrimSpace(e.Code)) {
 	case "too_many_requests", "rate_limit_exceeded", "rate_limit_error":
+		return http.StatusTooManyRequests
+	case "user_model_rate_limited", "user_global_rate_limited", "user_weekly_rate_limited", "integration_rate_limited":
 		return http.StatusTooManyRequests
 	case "model_overloaded", "engine_overloaded", "overloaded_error", "service_unavailable":
 		return http.StatusServiceUnavailable

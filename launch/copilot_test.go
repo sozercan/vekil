@@ -3,6 +3,7 @@ package launch
 import (
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -79,6 +80,42 @@ func TestCopilotAdapterPrepareResponses(t *testing.T) {
 	}
 }
 
+func TestCopilotAdapterPromptLimits(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, metadata, want string
+	}{
+		{"prompt precedence", `{"capabilities":{"limits":{"max_prompt_tokens":128000,"max_prompt":96000,"max_input_tokens":64000,"max_context_window_tokens":400000}}}`, "128000"},
+		{"prompt alias", `{"capabilities":{"limits":{"max_prompt":96000,"max_input_tokens":64000,"max_context_window_tokens":400000}}}`, "96000"},
+		{"input alias", `{"capabilities":{"limits":{"max_input_tokens":64000,"max_context_window_tokens":400000}}}`, "64000"},
+		{"public context window", `{"context_window":100000,"capabilities":{"limits":{"max_prompt_tokens":128000}}}`, "100000"},
+		{"context fallback", `{"capabilities":{"limits":{"context_window_tokens":200000}}}`, "200000"},
+		{"ignore invalid limits", `{"capabilities":{"limits":{"max_prompt_tokens":-1,"max_prompt":0,"max_input_tokens":32000}}}`, "32000"},
+		{"unknown limit", `{}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := ModelInfo{ID: "limit-model", SupportedEndpoints: []string{"/responses"}}
+			if err := json.Unmarshal([]byte(tc.metadata), &model); err != nil {
+				t.Fatal(err)
+			}
+			prepared, err := (CopilotAdapter{}).Prepare(PrepareInput{
+				BaseURL: "http://127.0.0.1:43210", Model: model, Binary: binary,
+				LocalToken: "test-token", DryRun: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, set := prepared.EnvSet["COPILOT_PROVIDER_MAX_PROMPT_TOKENS"]
+			if got != tc.want || set != (tc.want != "") {
+				t.Fatalf("prompt limit = %q, set=%v, want %q", got, set, tc.want)
+			}
+		})
+	}
+}
+
 func TestCopilotAdapterSelectsChatCompletions(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
@@ -96,6 +133,49 @@ func TestCopilotAdapterSelectsChatCompletions(t *testing.T) {
 	}
 	if got := prepared.EnvSet["COPILOT_PROVIDER_WIRE_API"]; got != "completions" {
 		t.Fatalf("wire API = %q, want completions", got)
+	}
+}
+
+func TestCopilotAdapterPreservesLocalSessionContinuationArgs(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "56d7498d-6b2e-47ca-92a6-92ddee84ab25"
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "continue", args: []string{"--continue"}},
+		{name: "long picker", args: []string{"--resume"}},
+		{name: "long separate value", args: []string{"--resume", "login"}},
+		{name: "long equals value", args: []string{"--resume=" + sessionID}},
+		{name: "short picker", args: []string{"-r"}},
+		{name: "short separate value", args: []string{"-r", "login"}},
+		{name: "short attached value", args: []string{"-r" + sessionID}},
+		{name: "short equals value", args: []string{"-r=" + sessionID}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, err := (CopilotAdapter{}).Prepare(PrepareInput{
+				BaseURL:       "http://127.0.0.1:43210",
+				Model:         ModelInfo{ID: "chat-model", SupportedEndpoints: []string{"/chat/completions"}},
+				Binary:        binary,
+				ForwardedArgs: tc.args,
+				LocalToken:    "token",
+				DryRun:        true,
+			})
+			if err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			if len(prepared.Args) < len(tc.args) {
+				t.Fatalf("prepared args too short: %#v", prepared.Args)
+			}
+			got := prepared.Args[len(prepared.Args)-len(tc.args):]
+			if !slices.Equal(got, tc.args) {
+				t.Fatalf("continuation args = %#v, want exact %#v", got, tc.args)
+			}
+		})
 	}
 }
 
@@ -185,12 +265,12 @@ func TestCopilotAdapterRejectsManagedOverridesAndRemoteModes(t *testing.T) {
 		{name: "model", args: []string{"--model", "other"}, want: "model, agent, or environment"},
 		{name: "agent", args: []string{"--agent", "other"}, want: "model, agent, or environment"},
 		{name: "managed safety", args: []string{"--no-remote=false"}, want: "safety overrides"},
-		{name: "connect", args: []string{"--connect=session"}, want: "remote, resumed, or shared"},
-		{name: "continue", args: []string{"--continue"}, want: "remote, resumed, or shared"},
-		{name: "resume", args: []string{"--resume=abc"}, want: "remote, resumed, or shared"},
-		{name: "attached short resume", args: []string{"-rabc"}, want: "remote, resumed, or shared"},
-		{name: "remote", args: []string{"--remote"}, want: "remote, resumed, or shared"},
-		{name: "share", args: []string{"--share-gist"}, want: "remote, resumed, or shared"},
+		{name: "connect", args: []string{"--connect=session"}, want: "remote, session-ID, or shared"},
+		{name: "session id", args: []string{"--session-id", "56d7498d-6b2e-47ca-92a6-92ddee84ab25"}, want: "remote, session-ID, or shared"},
+		{name: "attached session id", args: []string{"--session-id=56d7498d-6b2e-47ca-92a6-92ddee84ab25"}, want: "remote, session-ID, or shared"},
+		{name: "remote", args: []string{"--remote"}, want: "remote, session-ID, or shared"},
+		{name: "remote export", args: []string{"--remote-export"}, want: "remote, session-ID, or shared"},
+		{name: "share", args: []string{"--share-gist"}, want: "remote, session-ID, or shared"},
 		{name: "acp", args: []string{"--acp"}, want: "ACP server"},
 		{name: "login", args: []string{"login"}, want: "not an agent session"},
 		{name: "logout", args: []string{"logout"}, want: "not an agent session"},

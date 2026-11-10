@@ -124,7 +124,7 @@ func (u statsTokenUsage) normalized() statsTokenUsage {
 		u.TotalTokens = 0
 	}
 	if u.TotalTokens == 0 {
-		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+		u.TotalTokens = policyStatsSaturatingAdd(u.PromptTokens, u.CompletionTokens)
 	}
 	return u
 }
@@ -134,11 +134,11 @@ func (u *statsTokenUsage) add(other statsTokenUsage) {
 		return
 	}
 	other = other.normalized()
-	u.PromptTokens += other.PromptTokens
-	u.CompletionTokens += other.CompletionTokens
-	u.TotalTokens += other.TotalTokens
-	u.CachedTokens += other.CachedTokens
-	u.ReasoningTokens += other.ReasoningTokens
+	u.PromptTokens = policyStatsSaturatingAdd(u.PromptTokens, other.PromptTokens)
+	u.CompletionTokens = policyStatsSaturatingAdd(u.CompletionTokens, other.CompletionTokens)
+	u.TotalTokens = policyStatsSaturatingAdd(u.TotalTokens, other.TotalTokens)
+	u.CachedTokens = policyStatsSaturatingAdd(u.CachedTokens, other.CachedTokens)
+	u.ReasoningTokens = policyStatsSaturatingAdd(u.ReasoningTokens, other.ReasoningTokens)
 }
 
 func statsTokenUsageFromResponses(usage responsesUsage) statsTokenUsage {
@@ -171,18 +171,20 @@ type statsErrorRow struct {
 
 // statsSnapshot is the payload served at GET /stats.json.
 type statsSnapshot struct {
-	UptimeSeconds int64                  `json:"uptime_seconds"`
-	Inflight      int64                  `json:"inflight"`
-	Totals        statsTotals            `json:"totals"`
-	Status        map[string]int64       `json:"status"`
-	StatusCodes   []statsErrorRow        `json:"status_codes"`
-	Errors        []statsErrorRow        `json:"errors"`
-	Series        []statsSeriesPoint     `json:"series"`
-	ByModel       []statsBreakdown       `json:"by_model"`
-	ByProvider    []statsBreakdown       `json:"by_provider"`
-	ByAgent       []statsBreakdown       `json:"by_agent"`
-	ByRoute       []statsBreakdown       `json:"by_route"`
-	ByTarget      []statsTargetBreakdown `json:"by_target"`
+	TaskUsage         taskUsageSnapshot      `json:"task_usage"`
+	UptimeSeconds     int64                  `json:"uptime_seconds"`
+	Inflight          int64                  `json:"inflight"`
+	AuxiliaryInflight int64                  `json:"auxiliary_inflight"`
+	Totals            statsTotals            `json:"totals"`
+	Status            map[string]int64       `json:"status"`
+	StatusCodes       []statsErrorRow        `json:"status_codes"`
+	Errors            []statsErrorRow        `json:"errors"`
+	Series            []statsSeriesPoint     `json:"series"`
+	ByModel           []statsBreakdown       `json:"by_model"`
+	ByProvider        []statsBreakdown       `json:"by_provider"`
+	ByAgent           []statsBreakdown       `json:"by_agent"`
+	ByRoute           []statsBreakdown       `json:"by_route"`
+	ByTarget          []statsTargetBreakdown `json:"by_target"`
 	// PhysicalUsage counts usage reported by explicit-route upstream sends.
 	// WastedUsage is the subset reported by attempts that did not become an
 	// accepted client-visible result. Both ledgers are additive to, and do not
@@ -200,6 +202,8 @@ type statsSnapshot struct {
 	StateBindingHits      int64 `json:"state_binding_hits"`
 	StateBindingMisses    int64 `json:"state_binding_misses"`
 	StateBindingEvictions int64 `json:"state_binding_evictions"`
+	// Storage gauges include recovered records and do not reset with traffic.
+	StateBindings stateBindingStatsSnapshot `json:"state_bindings"`
 	// Retries is the total upstream retry attempts and the breakdown by the
 	// status that triggered them (surfaces flakiness the proxy absorbed).
 	Retries       int64           `json:"retries"`
@@ -251,6 +255,7 @@ type targetAttemptCounter struct {
 // per-second series uses a lazy ring buffer so no background goroutine is
 // needed. The clock is injectable for deterministic tests.
 type statsCollector struct {
+	taskUsage   taskUsageCollector
 	mu          sync.Mutex
 	start       time.Time
 	now         func() time.Time
@@ -609,10 +614,6 @@ func (r *routeAttemptRecord) complete(completion routeAttemptCompletion) {
 	}
 	if completion.RetryAfterSeconds != nil {
 		value := max(*completion.RetryAfterSeconds, 0)
-		maxSeconds := int64(maxRetryAfter / time.Second)
-		if value > maxSeconds {
-			value = maxSeconds
-		}
 		if value > 0 {
 			row.RetryAfterSeconds = &value
 		}
@@ -1144,6 +1145,7 @@ func (c *statsCollector) snapshot() statsSnapshot {
 	totals.LatencyP50, totals.LatencyP95, totals.LatencyP99 = c.latencyPercentiles()
 
 	return statsSnapshot{
+		TaskUsage:             c.taskUsage.snapshot(),
 		UptimeSeconds:         int64(now.Sub(c.start).Seconds()),
 		Inflight:              c.inflight.Load(),
 		Totals:                totals,
@@ -1785,12 +1787,19 @@ func markRetryStatsTracked(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.WithValue(context.Background(), retryStatsTrackedContextKey{}, true)
 	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.retryStatsTracked.Store(true)
+		return ctx
+	}
 	return context.WithValue(ctx, retryStatsTrackedContextKey{}, true)
 }
 
 func isRetryStatsTracked(ctx context.Context) bool {
 	if ctx == nil {
 		return false
+	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil && summary.retryStatsTracked.Load() {
+		return true
 	}
 	v, _ := ctx.Value(retryStatsTrackedContextKey{}).(bool)
 	return v
@@ -1876,10 +1885,21 @@ func (h *ProxyHandler) AddResponsesTurnUsage(record responsesTurnStatsRecord, us
 func (h *ProxyHandler) HandleStatsJSON(w http.ResponseWriter, r *http.Request) {
 	var snap statsSnapshot
 	if h != nil && h.stats != nil {
+		// Sample activity in scheduling order before totals: a client request
+		// can register a detached worker, which can start an upstream send.
+		// Reversing the order can report idle with totals from before that work.
+		inflight := h.stats.inflight.Load()
+		h.lifecycleWorkersMu.Lock()
+		auxiliaryInflight := int64(h.lifecycleWorkersActive)
+		h.lifecycleWorkersMu.Unlock()
 		snap = h.stats.snapshot()
+		snap.Inflight = inflight
+		snap.AuxiliaryInflight = auxiliaryInflight
 	}
 	snap.PolicyRouting = emptyPolicyStatsSnapshot()
+	snap.StateBindings = (*stateBindingStore)(nil).dashboardStats()
 	if h != nil {
+		snap.StateBindings = h.stateBindings.dashboardStats()
 		snap.InsightsEnabled = strings.TrimSpace(h.providersConfig.InsightModel) != ""
 		if controller, ok := h.policyRoutingController.(*chatPolicyRoutingController); ok {
 			snap.PolicyRouting = controller.PolicyStatsSnapshot()

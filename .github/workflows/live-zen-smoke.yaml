@@ -6,8 +6,9 @@ name: Live OpenCode Zen Smoke
 # openai-compatible provider routing end to end through real coding-agent CLIs.
 #
 # The Zen free tier rotates and is rate-limited per IP. The script neutral-skips
-# only when no model is reachable before any CLI is exercised; once a canary
-# reaches a model, every installed CLI is an independent hard gate. See
+# only when no model is reachable before any CLI is exercised, including Zen's
+# HTTP 403 FreeTierError that limits the free tier to the OpenCode client; once a
+# canary reaches a model, every installed CLI is an independent hard gate. See
 # docs/development.md.
 
 on:
@@ -35,7 +36,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
 
@@ -88,7 +89,17 @@ jobs:
           LIVE_CLI_SMOKE_DIR: ${{ runner.temp }}/live-zen-cli-smoke
           SMOKE_CLI_TIMEOUT_SECONDS: "120"
           SMOKE_CURL_MAX_TIME_SECONDS: "45"
-        run: scripts/live-cli-smoke.sh
+        run: |
+          zen_smoke_config="$RUNNER_TEMP/opencode-zen-smoke.yaml"
+          zen_smoke_session_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          cp "$PROVIDERS_CONFIG" "$zen_smoke_config"
+          cat >> "$zen_smoke_config" <<EOF
+              extra_headers:
+                User-Agent: vekil-live-smoke/1
+                x-opencode-session: "$zen_smoke_session_id"
+          EOF
+          ./vekil config validate --providers-config "$zen_smoke_config"
+          PROVIDERS_CONFIG="$zen_smoke_config" scripts/live-cli-smoke.sh
 
       - name: Show proxy log on failure
         if: failure()

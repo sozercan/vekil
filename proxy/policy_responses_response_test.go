@@ -233,6 +233,51 @@ func TestPolicyResponsesResponseNormalizesMissingUsage(t *testing.T) {
 	}
 }
 
+func TestPolicyResponsesAndClassifierPreserveChatReasoningUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name, fields string
+		want         int
+	}{
+		{name: "top level", fields: `,"reasoning_tokens":5`, want: 5},
+		{name: "nested precedence", fields: `,"reasoning_tokens":5,"completion_tokens_details":{"reasoning_tokens":3}`, want: 3},
+		{name: "zero nested fallback", fields: `,"reasoning_tokens":5,"completion_tokens_details":{"reasoning_tokens":0}`, want: 5},
+		{name: "negative nested fallback", fields: `,"reasoning_tokens":5,"completion_tokens_details":{"reasoning_tokens":-1}`, want: 5},
+		{name: "nested only", fields: `,"completion_tokens_details":{"reasoning_tokens":3}`, want: 3},
+		{name: "negative top level", fields: `,"reasoning_tokens":-1`},
+		{name: "missing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":2}` + tc.fields + `}}`)
+			var chat models.OpenAIResponse
+			if err := json.Unmarshal(body, &chat); err != nil {
+				t.Fatal(err)
+			}
+			response, err := buildPolicyResponsesResponse(&chat, "policy", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorder := httptest.NewRecorder()
+			if err := writePolicyResponsesResult(recorder, response, false); err != nil {
+				t.Fatal(err)
+			}
+			var decoded struct {
+				Usage policyResponsesResponseUsage `json:"usage"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			usage := decoded.Usage
+			if usage.InputTokens != 11 || usage.OutputTokens != 7 || usage.TotalTokens != 18 || usage.InputTokensDetails["cached_tokens"] != 2 || usage.OutputTokensDetails["reasoning_tokens"] != tc.want {
+				t.Errorf("Responses usage = %+v, want reasoning tokens %d with other usage preserved", usage, tc.want)
+			}
+			want := policyStatsTokenUsage{InputTokens: 11, OutputTokens: 7, TotalTokens: 18, CachedInputTokens: 2, ReasoningTokens: int64(tc.want)}
+			if got := readPolicyClassifierUsage(body); got != want {
+				t.Errorf("classifier usage = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
 func TestPolicyResponsesTextOutputCanBeReplayedAsStatelessInput(t *testing.T) {
 	finishReason := "stop"
 	response, err := buildPolicyResponsesResponse(&models.OpenAIResponse{

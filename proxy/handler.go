@@ -4,6 +4,7 @@
 package proxy
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -59,9 +60,8 @@ const (
 	defaultCopilotEditorVersion       = "vscode/1.95.0"
 	defaultCopilotEditorPluginVersion = "copilot-chat/0.26.7"
 	defaultCopilotUserAgent           = "GitHubCopilotChat/0.26.7"
-	defaultCopilotIntegrationID       = "vscode-chat"
-	directGitHubAppIntegrationID      = "copilot-language-server"
-	defaultCopilotGitHubAPIVersion    = "2025-05-01"
+	defaultCopilotIntegrationID       = "copilot-developer-cli"
+	defaultCopilotGitHubAPIVersion    = "2026-08-20"
 	defaultCopilotOpenAIIntent        = "conversation-panel"
 	defaultResponsesWSCompactMaxItems = 8
 	defaultResponsesWSCompactMaxBytes = 32 << 10
@@ -137,6 +137,7 @@ type CopilotHeaderProfilesConfig struct {
 // Codex-style GET /v1/responses clients.
 type ResponsesWebSocketConfig struct {
 	Enabled             bool
+	NativeUpstream      bool
 	TurnStateDelta      bool
 	DisableAutoCompact  bool
 	AutoCompactMaxItems int
@@ -250,21 +251,27 @@ type ProxyHandler struct {
 	client                           *http.Client
 	copilotURL                       string
 	copilotHeaders                   CopilotHeaderConfig
+	copilotTraffic                   copilotTrafficController
+	azureTraffic                     azureTrafficController
 	providersConfig                  ProvidersConfig
 	providerSecretResolver           ProviderSecretResolver
 	allowedModels                    map[string]struct{}
+	auxiliaryModels                  map[string]struct{}
 	providersState                   *providerSetup
 	deferDynamicProviderModelRefresh bool
 	policyRoutingMode                PolicyRoutingMode
 	draining                         atomic.Bool
 	lifecycleOnce                    sync.Once
 	lifecycleCtx                     context.Context
+	retryTrackedLifecycleCtx         context.Context
 	lifecycleCancel                  context.CancelCauseFunc
 	shutdownSequenceOnce             sync.Once
 	shutdownSequence                 atomic.Uint64
 	lifecycleWorkersMu               sync.Mutex
 	lifecycleWorkers                 sync.WaitGroup
 	lifecycleWorkersActive           int
+	lifecycleRequestBodiesMu         sync.Mutex
+	lifecycleRequestBodies           map[*lifecycleRequestBody]struct{}
 	startupAuthenticationPending     atomic.Bool
 	dynamicProviderValidationPending atomic.Bool
 	azureIdentityTokenSourceFactory  azureIdentityTokenSourceFactory
@@ -302,6 +309,8 @@ type ProxyHandler struct {
 	stateBindingsOnce                sync.Once
 	stateBindings                    *stateBindingStore
 	stateBindingsErr                 error
+	stateBindingsOverride            StateBindingsConfig
+	conversationHistory              *conversationHistoryStore
 	insightGate                      *insightGate
 	insightGateOnce                  sync.Once
 }
@@ -315,6 +324,7 @@ func (h *ProxyHandler) initializeLifecycle() {
 	}
 	h.lifecycleOnce.Do(func() {
 		h.lifecycleCtx, h.lifecycleCancel = context.WithCancelCause(context.Background())
+		h.retryTrackedLifecycleCtx = context.WithValue(h.lifecycleCtx, retryStatsTrackedContextKey{}, true)
 	})
 }
 
@@ -324,6 +334,14 @@ func (h *ProxyHandler) lifecycleContext() context.Context {
 	}
 	h.initializeLifecycle()
 	return h.lifecycleCtx
+}
+
+func (h *ProxyHandler) lifecycleContextForRetryStats(tracked bool) context.Context {
+	if !tracked || h == nil {
+		return h.lifecycleContext()
+	}
+	h.initializeLifecycle()
+	return h.retryTrackedLifecycleCtx
 }
 
 func (h *ProxyHandler) responsesChatReplayStore() *responsesChatReplayStore {
@@ -367,6 +385,7 @@ func (h *ProxyHandler) BeginShutdown() {
 		})
 	})
 	h.draining.Store(true)
+	h.cancelLifecycleRequestBodies()
 	h.initializeLifecycle()
 	h.lifecycleCancel(errProxyLifecycleShutdown)
 	if h.client != nil {
@@ -384,53 +403,154 @@ func (h *ProxyHandler) upstreamShutdownStarted() bool {
 	return h.ShuttingDown()
 }
 
+var lifecycleRequestBodyPool = sync.Pool{New: func() any {
+	return new(lifecycleRequestBody)
+}}
+
+func recycleLifecycleRequestBody(body *lifecycleRequestBody) {
+	lifecycleRequestBodyPool.Put(body)
+}
+
 // BindRequestBodyToLifecycle makes a request body read interruptible by proxy
-// shutdown without changing the inbound request context. The separate cause
-// context preserves whether client cancellation or lifecycle shutdown happened
+// shutdown without changing the inbound request context. A small atomic cause
+// state preserves whether client cancellation or lifecycle shutdown happened
 // first, so a client disconnect racing shutdown is not rewritten as a local 503.
-func (h *ProxyHandler) BindRequestBodyToLifecycle(r *http.Request, forceClose func()) func() {
+func (h *ProxyHandler) BindRequestBodyToLifecycle(r *http.Request, forceClose io.Closer) RequestBodyLifecycleBinding {
 	if h == nil || r == nil || r.Body == nil || r.Body == http.NoBody {
-		return func() {}
+		return RequestBodyLifecycleBinding{}
 	}
 
-	causeCtx, cancelCause := context.WithCancelCause(r.Context())
-	body := &lifecycleRequestBody{ReadCloser: r.Body, causeCtx: causeCtx}
+	body := lifecycleRequestBodyPool.Get().(*lifecycleRequestBody)
+	lease := body.beginLease(r.Body, r.Context(), h, forceClose)
 	r.Body = body
-
-	cancelForShutdown := func() {
-		cancelCause(errProxyLifecycleShutdown)
-		if !body.complete.Load() && forceClose != nil {
-			forceClose()
-			return
-		}
-		_ = body.Close()
+	if !h.registerLifecycleRequestBody(body) {
+		body.cancelForShutdown()
 	}
-	stopLifecycle := context.AfterFunc(h.lifecycleContext(), cancelForShutdown)
-	if h.ShuttingDown() {
-		cancelForShutdown()
-	}
+	return RequestBodyLifecycleBinding{body: body, lease: lease}
+}
 
-	return func() {
-		stopLifecycle()
-		cancelCause(context.Canceled)
+// RequestBodyLifecycleBinding releases a request body from shutdown tracking.
+// The value handle avoids allocating a closure on every admitted HTTP request.
+type RequestBodyLifecycleBinding struct {
+	body  *lifecycleRequestBody
+	lease uint64
+}
+
+// Release stops lifecycle tracking without closing the underlying request body.
+func (b RequestBodyLifecycleBinding) Release() {
+	if b.body != nil {
+		b.body.releaseLease(b.lease)
 	}
 }
 
+// ReleaseAndRecycle finishes server-owned request-body tracking after the
+// handler has returned. It restores the original body on the request before
+// pooling the wrapper so net/http can retain its ordinary body-close behavior.
+// A wrapper captured by the shutdown cancellation snapshot is deliberately not
+// pooled because that snapshot may still call cancelForShutdown asynchronously.
+func (b RequestBodyLifecycleBinding) ReleaseAndRecycle(r *http.Request) {
+	b.releaseAndRecycle(r, recycleLifecycleRequestBody)
+}
+
+func (b RequestBodyLifecycleBinding) releaseAndRecycle(r *http.Request, recycle func(*lifecycleRequestBody)) {
+	body := b.body
+	if body == nil {
+		return
+	}
+	body.leaseMu.Lock()
+	if body.lease != b.lease || body.recycleClaimed {
+		body.leaseMu.Unlock()
+		return
+	}
+	body.recycleClaimed = true
+	if r != nil && r.Body == body {
+		r.Body = body.ReadCloser
+	}
+	body.release()
+	if body.shutdownScheduled.Load() {
+		body.leaseMu.Unlock()
+		return
+	}
+	body.clearForPool()
+	body.leaseMu.Unlock()
+	if recycle != nil {
+		recycle(body)
+	}
+}
+
+type lifecycleRequestBodyCause uint32
+
+const (
+	lifecycleRequestBodyCauseOpen lifecycleRequestBodyCause = iota
+	lifecycleRequestBodyCauseOther
+	lifecycleRequestBodyCauseShutdown
+)
+
 type lifecycleRequestBody struct {
 	io.ReadCloser
-	causeCtx context.Context
-	closeMu  sync.Mutex
-	closed   bool
-	closeErr error
-	complete atomic.Bool
+	leaseMu           sync.Mutex
+	lease             uint64
+	recycleClaimed    bool
+	requestCtx        context.Context
+	owner             *ProxyHandler
+	forceClose        io.Closer
+	closeMu           sync.Mutex
+	closed            bool
+	closeErr          error
+	complete          atomic.Bool
+	released          atomic.Bool
+	shutdownScheduled atomic.Bool
+	cause             atomic.Uint32
+}
+
+func (b *lifecycleRequestBody) beginLease(readCloser io.ReadCloser, requestCtx context.Context, owner *ProxyHandler, forceClose io.Closer) uint64 {
+	b.leaseMu.Lock()
+	b.lease++
+	lease := b.lease
+	b.recycleClaimed = false
+	b.ReadCloser = readCloser
+	b.requestCtx = requestCtx
+	b.owner = owner
+	b.forceClose = forceClose
+	b.closeMu = sync.Mutex{}
+	b.closed = false
+	b.closeErr = nil
+	b.complete.Store(false)
+	b.released.Store(false)
+	b.shutdownScheduled.Store(false)
+	b.cause.Store(uint32(lifecycleRequestBodyCauseOpen))
+	b.leaseMu.Unlock()
+	return lease
+}
+
+func (b *lifecycleRequestBody) clearForPool() {
+	b.ReadCloser = nil
+	b.requestCtx = nil
+	b.owner = nil
+	b.forceClose = nil
+	b.closeMu = sync.Mutex{}
+	b.closed = false
+	b.closeErr = nil
+}
+
+func (b *lifecycleRequestBody) releaseLease(lease uint64) {
+	b.leaseMu.Lock()
+	if b.lease == lease && !b.recycleClaimed {
+		b.release()
+	}
+	b.leaseMu.Unlock()
 }
 
 func (b *lifecycleRequestBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if errors.Is(err, io.EOF) {
 		b.complete.Store(true)
+		b.release()
 	}
-	if err != nil && b.causeCtx != nil && errors.Is(context.Cause(b.causeCtx), errProxyLifecycleShutdown) {
+	if err != nil {
+		b.recordClientCancellation()
+	}
+	if err != nil && lifecycleRequestBodyCause(b.cause.Load()) == lifecycleRequestBodyCauseShutdown {
 		return n, errProxyLifecycleShutdown
 	}
 	return n, err
@@ -441,12 +561,93 @@ func (b *lifecycleRequestBody) Close() error {
 		return nil
 	}
 	b.closeMu.Lock()
-	defer b.closeMu.Unlock()
 	if !b.closed {
 		b.closed = true
 		b.closeErr = b.ReadCloser.Close()
 	}
-	return b.closeErr
+	err := b.closeErr
+	b.closeMu.Unlock()
+	b.release()
+	return err
+}
+
+func (b *lifecycleRequestBody) release() {
+	if b == nil || !b.released.CompareAndSwap(false, true) {
+		return
+	}
+	b.cause.CompareAndSwap(uint32(lifecycleRequestBodyCauseOpen), uint32(lifecycleRequestBodyCauseOther))
+	if b.owner != nil {
+		b.owner.unregisterLifecycleRequestBody(b)
+	}
+}
+
+func (b *lifecycleRequestBody) recordClientCancellation() {
+	if b == nil || b.requestCtx == nil || b.requestCtx.Err() == nil {
+		return
+	}
+	b.cause.CompareAndSwap(uint32(lifecycleRequestBodyCauseOpen), uint32(lifecycleRequestBodyCauseOther))
+}
+
+func (b *lifecycleRequestBody) cancelForShutdown() {
+	if b == nil {
+		return
+	}
+	b.shutdownScheduled.Store(true)
+	if b.released.Load() {
+		return
+	}
+	b.recordClientCancellation()
+	b.cause.CompareAndSwap(uint32(lifecycleRequestBodyCauseOpen), uint32(lifecycleRequestBodyCauseShutdown))
+	if b.released.Load() {
+		return
+	}
+	if !b.complete.Load() && b.forceClose != nil {
+		_ = b.forceClose.Close()
+		return
+	}
+	_ = b.Close()
+}
+
+func (h *ProxyHandler) registerLifecycleRequestBody(body *lifecycleRequestBody) bool {
+	if h == nil || body == nil {
+		return false
+	}
+	h.lifecycleRequestBodiesMu.Lock()
+	defer h.lifecycleRequestBodiesMu.Unlock()
+	if h.ShuttingDown() {
+		return false
+	}
+	if h.lifecycleRequestBodies == nil {
+		h.lifecycleRequestBodies = make(map[*lifecycleRequestBody]struct{})
+	}
+	h.lifecycleRequestBodies[body] = struct{}{}
+	return true
+}
+
+func (h *ProxyHandler) unregisterLifecycleRequestBody(body *lifecycleRequestBody) {
+	if h == nil || body == nil {
+		return
+	}
+	h.lifecycleRequestBodiesMu.Lock()
+	delete(h.lifecycleRequestBodies, body)
+	h.lifecycleRequestBodiesMu.Unlock()
+}
+
+func (h *ProxyHandler) cancelLifecycleRequestBodies() {
+	if h == nil {
+		return
+	}
+	h.lifecycleRequestBodiesMu.Lock()
+	bodies := make([]*lifecycleRequestBody, 0, len(h.lifecycleRequestBodies))
+	for body := range h.lifecycleRequestBodies {
+		body.shutdownScheduled.Store(true)
+		bodies = append(bodies, body)
+	}
+	h.lifecycleRequestBodies = nil
+	h.lifecycleRequestBodiesMu.Unlock()
+	for _, body := range bodies {
+		body.cancelForShutdown()
+	}
 }
 
 func (h *ProxyHandler) beginLifecycleWorker() bool {
@@ -482,12 +683,13 @@ func (h *ProxyHandler) WaitLifecycleWorkers(ctx context.Context) (err error) {
 	if h == nil {
 		return nil
 	}
-	// Server.stop calls this after http.Server.Shutdown. Clear replay state only
-	// after a successful, non-expired drain; a forced-close timeout can still have
-	// handler goroutines unwinding from lifecycle cancellation.
+	// Server.stop calls this after actual HTTP handler return, even when its
+	// caller timed out. Other callers must likewise establish handler drain;
+	// an expired context alone is not proof that handlers have finished.
 	defer func() {
 		if err == nil && h.ShuttingDown() && (ctx == nil || ctx.Err() == nil) {
 			h.closeResponsesChatReplayStore()
+			err = h.stateBindings.close()
 		}
 	}()
 	h.lifecycleWorkersMu.Lock()
@@ -535,10 +737,37 @@ func (h *ProxyHandler) handleResponseBodyWriteError(w http.ResponseWriter, r *ht
 	if !errors.As(err, &bodyErr) {
 		return false
 	}
+	if code := providerRequestErrorCode(err); strings.HasPrefix(code, "conversation_") {
+		status := upstreamStatusCode(err, http.StatusBadGateway)
+		if r != nil {
+			observeResponseFailureStatus(r.Context(), status)
+		}
+		if !bodyErr.committed {
+			writeOpenAIErrorWithDetails(w, status, err.Error(), "server_error", "", code)
+		}
+		return true
+	}
+	if message, _, ok := durableStateFailureDetails(err); ok {
+		if r != nil {
+			observeResponseFailureStatus(r.Context(), http.StatusServiceUnavailable)
+		}
+		if !bodyErr.committed {
+			switch endpoint {
+			case "anthropic", "anthropic_count_tokens":
+				writeAnthropicError(w, http.StatusServiceUnavailable, "overloaded_error", message)
+			default:
+				writeDurableStateFailure(w, err)
+			}
+		}
+		return true
+	}
 	if !bodyErr.upstream {
 		return true
 	}
-	if bodyErr.statusCode < http.StatusOK || bodyErr.statusCode >= http.StatusMultipleChoices {
+	durable := h.stateBindings != nil && h.stateBindings.durable != nil
+	if (bodyErr.statusCode < http.StatusOK || bodyErr.statusCode >= http.StatusMultipleChoices) && (bodyErr.committed || !durable) {
+		// Durable final-error writers validate before exposing headers. A local
+		// validation/read failure there still needs a visible terminal error.
 		return true
 	}
 	if bodyErr.cancellationAtFailure && h.ShuttingDown() && upstreamCtx != nil && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown) {
@@ -612,6 +841,9 @@ func (h *ProxyHandler) lifecycleStreamHooks(observeCtx context.Context, canceled
 		writePrecommitShutdown = precommit[0]
 	}
 	return streamLifecycleHooks{
+		onCopilotUsage: func(raw json.RawMessage) {
+			observeCopilotUsage(observeCtx, raw)
+		},
 		transportCanceled: func() bool {
 			return h.ShuttingDown() && canceledAtFailure != nil && canceledAtFailure()
 		},
@@ -704,6 +936,23 @@ func WithAllowedModels(models ...string) Option {
 		for _, model := range models {
 			if model = strings.TrimSpace(model); model != "" {
 				h.allowedModels[model] = struct{}{}
+			}
+		}
+	}
+}
+
+// WithAuxiliaryModels admits models an agent needs beside the allowed ones,
+// such as Claude Code's auto-mode classifier. Each is admitted only when a
+// provider already serving an allowed model owns it, so auxiliary models never
+// widen provider discovery or credentials.
+func WithAuxiliaryModels(models ...string) Option {
+	return func(h *ProxyHandler) {
+		if h.auxiliaryModels == nil {
+			h.auxiliaryModels = make(map[string]struct{})
+		}
+		for _, model := range models {
+			if model = strings.TrimSpace(model); model != "" {
+				h.auxiliaryModels[model] = struct{}{}
 			}
 		}
 	}
@@ -897,6 +1146,12 @@ func NewProxyHandlerContext(ctx context.Context, a *auth.Authenticator, log *log
 		stats:                           newStatsCollector(),
 	}
 	h.initializeLifecycle()
+	initialized := false
+	defer func() {
+		if !initialized {
+			_ = h.stateBindings.close()
+		}
+	}()
 	for _, opt := range opts {
 		if opt != nil {
 			opt(h)
@@ -915,6 +1170,10 @@ func NewProxyHandlerContext(ctx context.Context, a *auth.Authenticator, log *log
 		h.BeginShutdown()
 		return nil, err
 	}
+	if err := h.initializeConversationHistory(); err != nil {
+		h.BeginShutdown()
+		return nil, err
+	}
 	controller, err := newChatPolicyRoutingController(h, h.providersConfig, h.policyRoutingMode)
 	if err != nil {
 		h.BeginShutdown()
@@ -926,6 +1185,7 @@ func NewProxyHandlerContext(ctx context.Context, a *auth.Authenticator, log *log
 		h.policyPreflightPending.Store(controller.Active())
 	}
 	h.validateInsightModel()
+	initialized = true
 	return h, nil
 }
 
@@ -1015,11 +1275,11 @@ func (h *ProxyHandler) ServerWriteTimeout() time.Duration {
 }
 
 func setCopilotHeaders(req *http.Request, token string) {
-	setCopilotHeadersWithConfig(req, token, DefaultCopilotHeaderConfig())
+	setCopilotHeadersWithConfig(req, token, CopilotHeaderConfig{})
 }
 
 func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHeaderConfig) {
-	cfg = cfg.withCredentialDefaults(token)
+	cfg = cfg.withDefaults()
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("editor-version", cfg.EditorVersion)
 	req.Header.Set("editor-plugin-version", cfg.EditorPluginVersion)
@@ -1029,13 +1289,6 @@ func setCopilotHeadersWithConfig(req *http.Request, token string, cfg CopilotHea
 	req.Header.Set("x-request-id", uuid.New().String())
 	req.Header.Set("openai-intent", cfg.OpenAIIntent)
 	req.Header.Set("Content-Type", "application/json")
-}
-
-func (c CopilotHeaderConfig) withCredentialDefaults(token string) CopilotHeaderConfig {
-	if c.IntegrationID == "" && strings.HasPrefix(strings.TrimSpace(token), "ghu_") {
-		c.IntegrationID = directGitHubAppIntegrationID
-	}
-	return c.withDefaults()
 }
 
 func clearCopilotHeaders(headers http.Header) {
@@ -1048,6 +1301,9 @@ func clearCopilotHeaders(headers http.Header) {
 		"x-github-api-version",
 		"x-request-id",
 		"openai-intent",
+		"x-initiator",
+		"x-interaction-id",
+		"x-client-session-id",
 	} {
 		headers.Del(header)
 	}
@@ -1064,7 +1320,7 @@ func copilotEndpointUsesDefaultOpenAIIntent(endpoint string) bool {
 
 func setCopilotHeadersForEndpoint(req *http.Request, token string, cfg CopilotHeaderConfig, endpoint string) {
 	explicitOpenAIIntent := cfg.OpenAIIntent != ""
-	cfg = cfg.withCredentialDefaults(token)
+	cfg = cfg.withDefaults()
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("editor-version", cfg.EditorVersion)
 	req.Header.Set("editor-plugin-version", cfg.EditorPluginVersion)
@@ -1088,6 +1344,7 @@ func (h *ProxyHandler) setCopilotHeadersForProvider(req *http.Request, token str
 		cfg = provider.headerProfiles.profileForEndpointRaw(endpoint, cfg)
 	}
 	setCopilotHeadersForEndpoint(req, token, cfg, endpoint)
+	copyCopilotRequestMetadata(req.Header, copilotRequestMetadataFromContext(req.Context()))
 }
 
 var hopByHopHeaders = map[string]struct{}{
@@ -1115,8 +1372,12 @@ func sanitizeProxySummaryText(text string) string {
 }
 
 func copyPassthroughHeaders(dst, src http.Header) {
-	connectionTokens := make(map[string]struct{})
-	for _, value := range src.Values("Connection") {
+	var connectionTokens map[string]struct{}
+	connectionValues := src.Values("Connection")
+	if len(connectionValues) > 0 {
+		connectionTokens = make(map[string]struct{})
+	}
+	for _, value := range connectionValues {
 		for _, token := range strings.Split(value, ",") {
 			token = http.CanonicalHeaderKey(strings.TrimSpace(token))
 			if token != "" {
@@ -1133,10 +1394,14 @@ func copyPassthroughHeaders(dst, src http.Header) {
 		if _, skip := connectionTokens[canonicalKey]; skip {
 			continue
 		}
-		dst.Del(key)
-		for _, value := range values {
-			dst.Add(key, value)
+		if len(values) == 0 {
+			delete(dst, canonicalKey)
+			continue
 		}
+		// Upstream response headers are immutable after receipt. Borrow their
+		// value slices with capped capacity so a later Header.Add allocates instead
+		// of modifying the upstream slice in place.
+		dst[canonicalKey] = values[:len(values):len(values)]
 	}
 }
 
@@ -1375,6 +1640,9 @@ func providerSkipsReadyzProbe(provider *providerRuntime) bool {
 	}
 	switch provider.kind {
 	case providerTypeAzureOpenAI:
+		return true
+	case providerTypeTypeSafeCompatible:
+		// Policy preflight gates readiness; classifiers have no model catalog.
 		return true
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		return provider.modelDiscovery == providerModelDiscoveryStatic
@@ -1650,7 +1918,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			}
 			allDynamicProvidersUnchanged = false
 			if canonicalRefresh {
-				refreshedDynamicModels[provider.id] = models
+				refreshedDynamicModels[provider.id] = filterHiddenProviderModels(provider, filterProviderModels(provider, result.models))
 			}
 			if result.etag != "" {
 				mergedETag = result.etag
@@ -1683,7 +1951,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		return cachedModelsResponse{}, false, err
 	}
 
-	if err := setup.replaceProviderModelsBatch(refreshedDynamicModels); err != nil {
+	if err := h.replaceInstalledProviderModels(setup, refreshedDynamicModels); err != nil {
 		return cachedModelsResponse{}, false, err
 	}
 
@@ -1976,12 +2244,12 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 	})
 }
 
-var upstreamRequestIDHeaderNames = []string{"X-Request-Id", "X-Azure-Request-Id", "Openai-Request-Id"}
+var upstreamRequestIDHeaderNames = []string{"X-Request-Id", "X-Copilot-Service-Request-Id", "X-Github-Request-Id", "X-Azure-Request-Id", "Openai-Request-Id"}
 
 // UpstreamRequestID returns the first recognized upstream request id from headers.
 func UpstreamRequestID(headers http.Header) string {
 	for _, name := range upstreamRequestIDHeaderNames {
-		if value := headers.Get(name); value != "" {
+		if value := boundedSingleHeaderValue(headers, name); value != "" {
 			return value
 		}
 	}
@@ -1994,13 +2262,9 @@ func writeOpenAIErrorWithRetryAfter(w http.ResponseWriter, status int, message, 
 
 func writeOpenAIErrorWithRetryAfterDetails(w http.ResponseWriter, status int, message, errType, retryAfter string, upstreamHeaders http.Header, param, code string) {
 	w.Header().Set("Content-Type", "application/json")
+	copyCopilotDiagnosticHeaders(w.Header(), upstreamHeaders)
 	if retryAfter != "" {
 		w.Header().Set("Retry-After", retryAfter)
-	}
-	for _, name := range upstreamRequestIDHeaderNames {
-		for _, value := range headerValuesCI(upstreamHeaders, name) {
-			w.Header().Add(name, value)
-		}
 	}
 	var paramValue interface{}
 	if strings.TrimSpace(param) != "" {
@@ -2051,6 +2315,100 @@ func writeOpenAIErrorWithDetails(w http.ResponseWriter, status int, message, err
 // the limit, it returns an error so callers can return HTTP 413.
 func readBody(r *http.Request) ([]byte, error) {
 	return readBodyWithLimit(r, maxRequestBodySize)
+}
+
+const (
+	tinyRequestBodyBufferSize  = 512
+	smallRequestBodyBufferSize = 4 << 10
+)
+
+var tinyRequestBodyBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, tinyRequestBodyBufferSize)
+	return &buffer
+}}
+
+var smallRequestBodyBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, smallRequestBodyBufferSize)
+	return &buffer
+}}
+
+// readBodyBorrowed reads an ordinary small request into a pooled buffer. The
+// caller must release a non-nil pooled buffer only after it has finished using
+// body. Unknown-length, compressed, and larger requests retain the general
+// bounded reader below.
+func readBodyBorrowed(r *http.Request) ([]byte, *[]byte, error) {
+	return readBodyBorrowedWithLimit(r, maxRequestBodySize)
+}
+
+// readBodyBorrowedWithLimit applies the small known-length fast path while
+// preserving the caller's endpoint-specific body limit for every fallback and
+// mismatched Content-Length case.
+func readBodyBorrowedWithLimit(r *http.Request, limit int64) ([]byte, *[]byte, error) {
+	if r == nil || r.Body == nil || r.Header.Get("Content-Encoding") != "" ||
+		r.ContentLength < 0 || r.ContentLength >= smallRequestBodyBufferSize ||
+		r.ContentLength > limit {
+		body, err := readBodyWithLimit(r, limit)
+		return body, nil, err
+	}
+
+	var pooled *[]byte
+	if r.ContentLength < tinyRequestBodyBufferSize {
+		pooled = tinyRequestBodyBufferPool.Get().(*[]byte)
+	} else {
+		pooled = smallRequestBodyBufferPool.Get().(*[]byte)
+	}
+	buffer := (*pooled)[:int(r.ContentLength)+1]
+	n, err := io.ReadFull(r.Body, buffer)
+	switch err {
+	case nil:
+		// The body exceeded its advertised length. Continue through the normal
+		// request cap so a mismatched Content-Length cannot truncate it.
+		remaining := limit + 1 - int64(len(buffer))
+		rest, readErr := io.ReadAll(io.LimitReader(r.Body, remaining))
+		body := append(buffer, rest...)
+		if readErr != nil {
+			return nil, pooled, &requestBodyError{statusCode: http.StatusBadRequest, err: readErr}
+		}
+		if int64(len(body)) > limit {
+			return nil, pooled, &requestBodyError{
+				statusCode: http.StatusRequestEntityTooLarge,
+				err:        fmt.Errorf("request body too large (max %d bytes)", limit),
+			}
+		}
+		return body, pooled, nil
+	case io.EOF, io.ErrUnexpectedEOF:
+		if int64(n) != r.ContentLength {
+			return nil, pooled, &requestBodyError{statusCode: http.StatusBadRequest, err: io.ErrUnexpectedEOF}
+		}
+		return buffer[:n], pooled, nil
+	default:
+		return nil, pooled, &requestBodyError{statusCode: http.StatusBadRequest, err: err}
+	}
+}
+
+func detachBorrowedRequestBody(body []byte, buffer *[]byte) []byte {
+	if buffer != nil && len(body) > 0 && len(*buffer) > 0 && &body[0] == &(*buffer)[0] {
+		return bytes.Clone(body)
+	}
+	return body
+}
+
+func releaseSmallRequestBodyBuffer(buffer *[]byte) {
+	if buffer == nil {
+		return
+	}
+	switch cap(*buffer) {
+	case tinyRequestBodyBufferSize:
+		full := (*buffer)[:tinyRequestBodyBufferSize]
+		clear(full)
+		*buffer = full
+		tinyRequestBodyBufferPool.Put(buffer)
+	case smallRequestBodyBufferSize:
+		full := (*buffer)[:smallRequestBodyBufferSize]
+		clear(full)
+		*buffer = full
+		smallRequestBodyBufferPool.Put(buffer)
+	}
 }
 
 // readBodyWithLimit reads and transparently decompresses the request body up to

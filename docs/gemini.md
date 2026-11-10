@@ -8,6 +8,8 @@ Schema-v2 policy profile IDs are unsupported on Gemini `generateContent`, `strea
 
 For a schema-version-2 explicit route, Gemini `generateContent`, `streamGenerateContent`, and `countTokens` submit one canonical Chat operation. Translation and opt-in tool optimization run once on an immutable logical request; backend selection, target-specific model rewrite, URL construction, wire policy, and authentication stay behind the Chat execution and route-executor seams. Gemini routing and catalog identity remain the requested public ID; Vekil does not expose a physical deployment name in the Gemini response payload.
 
+Generation responses preserve bounded request IDs, quota and rate-limit telemetry, and retry headers through JSON, streaming, and forced aggregation. After failover, these headers describe the selected response or provider error. Credential headers, cookies, oversized values, and ambiguous repeated values are excluded.
+
 `primary_only` uses the first configured target. `priority_failover` can select the next equivalent target only before request delivery or semantic progress is ambiguous and before any Gemini response is committed. Native Chat attempts can switch after prewrite transport failures or adapter-certified `429`/overload rejections. Responses-backed attempts may also switch after an adapter-certified pre-output terminal admission failure that proves no semantic or tool execution occurred. This is not cross-model fallback, and one route cannot mix a native-Anthropic target with an OpenAI-translated target.
 
 Commitment rules are surface-specific:

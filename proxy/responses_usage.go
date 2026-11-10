@@ -77,6 +77,9 @@ func (u responsesUsage) toOpenAIUsage() *models.OpenAIUsage {
 // Responses JSON body (envelope { "usage": {...} }). Returns the zero value
 // when absent or unparseable; callers treat a zero result as "no usage".
 func sniffResponsesUsageBody(body []byte) responsesUsage {
+	if usage, ok := sniffResponsesUsageBodyFast(body); ok {
+		return usage
+	}
 	var envelope struct {
 		Usage responsesUsage `json:"usage"`
 	}
@@ -84,6 +87,138 @@ func sniffResponsesUsageBody(body []byte) responsesUsage {
 		return responsesUsage{}
 	}
 	return envelope.Usage
+}
+
+func sniffResponsesUsageBodyFast(body []byte) (responsesUsage, bool) {
+	object, ok := newStrictRawJSONObjectScanner(body)
+	if !ok {
+		return responsesUsage{}, false
+	}
+	var usageRaw []byte
+	usageSeen := false
+	for {
+		key, start, end, done, scanOK := object.next()
+		if !scanOK {
+			return responsesUsage{}, false
+		}
+		if done {
+			break
+		}
+		if rawJSONKeyEqual(key, "usage") {
+			if usageSeen {
+				return responsesUsage{}, false
+			}
+			usageSeen = true
+			usageRaw = body[start:end]
+		} else if rawJSONKeyEqualFold(key, "usage") {
+			return responsesUsage{}, false
+		}
+	}
+	if !usageSeen {
+		return responsesUsage{}, true
+	}
+	return parseResponsesUsageFast(usageRaw)
+}
+
+func parseResponsesUsageFast(raw []byte) (responsesUsage, bool) {
+	raw = bytes.TrimSpace(raw)
+	if bytes.Equal(raw, []byte("null")) {
+		return responsesUsage{}, true
+	}
+	object, ok := newRawJSONObjectScanner(raw)
+	if !ok {
+		return responsesUsage{}, false
+	}
+	var usage responsesUsage
+	var inputSeen, outputSeen, totalSeen, inputDetailsSeen, outputDetailsSeen bool
+	for {
+		key, start, end, done, scanOK := object.next()
+		if !scanOK {
+			return responsesUsage{}, false
+		}
+		if done {
+			break
+		}
+		value := raw[start:end]
+		switch {
+		case rawJSONKeyEqual(key, "input_tokens"):
+			if inputSeen {
+				return responsesUsage{}, false
+			}
+			inputSeen = true
+			usage.InputTokens, ok = rawJSONInt(value)
+		case rawJSONKeyEqual(key, "output_tokens"):
+			if outputSeen {
+				return responsesUsage{}, false
+			}
+			outputSeen = true
+			usage.OutputTokens, ok = rawJSONInt(value)
+		case rawJSONKeyEqual(key, "total_tokens"):
+			if totalSeen {
+				return responsesUsage{}, false
+			}
+			totalSeen = true
+			usage.TotalTokens, ok = rawJSONInt(value)
+		case rawJSONKeyEqual(key, "input_tokens_details"):
+			if inputDetailsSeen {
+				return responsesUsage{}, false
+			}
+			inputDetailsSeen = true
+			usage.InputTokensDetails.CachedTokens, ok = parseResponsesUsageDetailFast(value, "cached_tokens")
+		case rawJSONKeyEqual(key, "output_tokens_details"):
+			if outputDetailsSeen {
+				return responsesUsage{}, false
+			}
+			outputDetailsSeen = true
+			usage.OutputTokensDetails.ReasoningTokens, ok = parseResponsesUsageDetailFast(value, "reasoning_tokens")
+		default:
+			if rawJSONKeyEqualFold(key, "input_tokens") || rawJSONKeyEqualFold(key, "output_tokens") ||
+				rawJSONKeyEqualFold(key, "total_tokens") || rawJSONKeyEqualFold(key, "input_tokens_details") ||
+				rawJSONKeyEqualFold(key, "output_tokens_details") {
+				return responsesUsage{}, false
+			}
+			ok = true
+		}
+		if !ok {
+			return responsesUsage{}, false
+		}
+	}
+	return usage, true
+}
+
+func parseResponsesUsageDetailFast(raw []byte, field string) (int, bool) {
+	raw = bytes.TrimSpace(raw)
+	if bytes.Equal(raw, []byte("null")) {
+		return 0, true
+	}
+	object, ok := newRawJSONObjectScanner(raw)
+	if !ok {
+		return 0, false
+	}
+	value := 0
+	seen := false
+	for {
+		key, start, end, done, scanOK := object.next()
+		if !scanOK {
+			return 0, false
+		}
+		if done {
+			break
+		}
+		if rawJSONKeyEqual(key, field) {
+			if seen {
+				return 0, false
+			}
+			seen = true
+			value, ok = rawJSONInt(raw[start:end])
+			if !ok {
+				return 0, false
+			}
+		} else if rawJSONKeyEqualFold(key, field) {
+			return 0, false
+		}
+	}
+	return value, true
 }
 
 // extractResponsesUsageObject finds the last "usage":{...} object in a raw byte
@@ -179,12 +314,17 @@ func observeResponsesUsage(ctx context.Context, usage responsesUsage) {
 // cached-prompt detail; Anthropic does not report a separate reasoning count.
 func observeAnthropicUsageBody(ctx context.Context, body []byte) {
 	var parsed struct {
-		Usage models.AnthropicUsage `json:"usage"`
+		Usage        models.AnthropicUsage `json:"usage"`
+		CopilotUsage json.RawMessage       `json:"copilot_usage"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return
 	}
-	u := parsed.Usage
+	observeAnthropicUsage(ctx, parsed.Usage)
+	observeCopilotUsage(ctx, parsed.CopilotUsage)
+}
+
+func observeAnthropicUsage(ctx context.Context, u models.AnthropicUsage) {
 	if u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadInputTokens == 0 && u.CacheCreationInputTokens == 0 {
 		return
 	}
@@ -222,16 +362,17 @@ type anthropicStreamUsageAccumulator struct {
 	haveOutput    bool
 }
 
-func (a *anthropicStreamUsageAccumulator) observe(data []byte) {
+func (a *anthropicStreamUsageAccumulator) observe(data []byte) json.RawMessage {
 	var event struct {
 		Type    string `json:"type"`
 		Message *struct {
 			Usage *models.AnthropicUsage `json:"usage"`
 		} `json:"message"`
-		Usage *models.AnthropicUsage `json:"usage"`
+		Usage        *models.AnthropicUsage `json:"usage"`
+		CopilotUsage json.RawMessage        `json:"copilot_usage"`
 	}
 	if err := json.Unmarshal(data, &event); err != nil {
-		return
+		return event.CopilotUsage
 	}
 	switch event.Type {
 	case "message_start":
@@ -251,6 +392,7 @@ func (a *anthropicStreamUsageAccumulator) observe(data []byte) {
 			a.haveOutput = true
 		}
 	}
+	return event.CopilotUsage
 }
 
 // anthropicStreamErrorStatus inspects an Anthropic SSE data payload and, if it
@@ -263,6 +405,7 @@ func anthropicStreamErrorStatus(data []byte) (int, bool) {
 		Type  string `json:"type"`
 		Error *struct {
 			Type string `json:"type"`
+			Code string `json:"code"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(data, &event); err != nil {
@@ -274,6 +417,10 @@ func anthropicStreamErrorStatus(data []byte) (int, bool) {
 	errType := ""
 	if event.Error != nil {
 		errType = strings.ToLower(strings.TrimSpace(event.Error.Type))
+		switch strings.ToLower(strings.TrimSpace(event.Error.Code)) {
+		case "user_model_rate_limited", "user_global_rate_limited", "user_weekly_rate_limited", "integration_rate_limited":
+			return http.StatusTooManyRequests, true
+		}
 	}
 	switch errType {
 	case "rate_limit_error", "rate_limit_exceeded":

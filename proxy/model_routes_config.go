@@ -215,6 +215,9 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 	if cfg.schemaVersionSet && cfg.SchemaVersion == 0 {
 		return validatedProvidersConfig{}, configPathError("schema_version", "unsupported schema version 0; supported versions are 1 and 2")
 	}
+	if err := validateProviderStateBindings(cfg); err != nil {
+		return validatedProvidersConfig{}, err
+	}
 
 	switch validated.schemaVersion {
 	case ProvidersConfigSchemaVersion1:
@@ -251,6 +254,11 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 				return validatedProvidersConfig{}, configPathError(fmt.Sprintf("providers[%d].trust_domain", providerIndex), "must not contain control characters")
 			}
 			provider.ClassifierNoStoreSupported = cloneBoolPtr(provider.ClassifierNoStoreSupported)
+			normalized, err := normalizeProviderHostedTools(provider.HostedTools, fmt.Sprintf("providers[%d].hosted_tools", providerIndex))
+			if err != nil {
+				return validatedProvidersConfig{}, err
+			}
+			provider.HostedTools = normalized
 		}
 	}
 
@@ -405,16 +413,17 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 
 	preflightContracts := make(map[string]PolicyClassifierConfig, len(validated.config.PolicyProfiles))
 	preflightOwners := make(map[string]int, len(validated.config.PolicyProfiles))
-	for profileIndex, profile := range validated.config.PolicyProfiles {
+	for profileIndex := range validated.config.PolicyProfiles {
+		profile := &validated.config.PolicyProfiles[profileIndex]
 		if err := validatePolicyProfileConfigReferences(profile, profileIndex, routeConfigs, providers, policyReferences); err != nil {
 			return validatedProvidersConfig{}, err
 		}
 		if previous, exists := preflightContracts[profile.Classifier.Route]; exists {
-			if previous.TimeoutMS != profile.Classifier.TimeoutMS || previous.MaxCompletionTokens != profile.Classifier.MaxCompletionTokens {
+			if previous.TimeoutMS != profile.Classifier.TimeoutMS || previous.MaxCompletionTokens != profile.Classifier.MaxCompletionTokens || previous.ReasoningEffort != profile.Classifier.ReasoningEffort {
 				owner := preflightOwners[profile.Classifier.Route]
 				return validatedProvidersConfig{}, configPathError(
 					fmt.Sprintf("policy_profiles[%d].classifier", profileIndex),
-					"must use the same timeout_ms and max_completion_tokens as policy_profiles[%d].classifier when sharing classifier route %q",
+					"must use the same timeout_ms, max_completion_tokens, and reasoning_effort as policy_profiles[%d].classifier when sharing classifier route %q",
 					owner,
 					profile.Classifier.Route,
 				)
@@ -438,6 +447,9 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 		}
 	}
 
+	if err := normalizeAndValidateConversationMigrationConfig(&validated.config, routeConfigs, providers); err != nil {
+		return validatedProvidersConfig{}, err
+	}
 	return validated, nil
 }
 
@@ -448,12 +460,21 @@ func validateSchemaV2FeatureFields(cfg ProvidersConfig, schemaVersion int) error
 	if cfg.policyProfilesSet || cfg.PolicyProfiles != nil {
 		return configPathError("policy_profiles", "requires schema_version: 2")
 	}
+	if cfg.conversationMigrationSet || cfg.ConversationMigration != nil {
+		return configPathError("conversation_migration", "requires schema_version: 2")
+	}
 	for providerIndex, provider := range cfg.Providers {
+		if providerType(strings.TrimSpace(provider.Type)) == providerTypeTypeSafeCompatible {
+			return configPathError(fmt.Sprintf("providers[%d].type", providerIndex), "typesafe-compatible requires schema_version: 2")
+		}
 		if provider.trustDomainSet || strings.TrimSpace(provider.TrustDomain) != "" {
 			return configPathError(fmt.Sprintf("providers[%d].trust_domain", providerIndex), "requires schema_version: 2")
 		}
 		if provider.classifierNoStoreSupportedSet || provider.ClassifierNoStoreSupported != nil {
 			return configPathError(fmt.Sprintf("providers[%d].classifier_no_store_supported", providerIndex), "requires schema_version: 2")
+		}
+		if provider.hostedToolsSet || len(provider.HostedTools) > 0 {
+			return configPathError(fmt.Sprintf("providers[%d].hosted_tools", providerIndex), "requires schema_version: 2")
 		}
 	}
 	for routeIndex, route := range cfg.ModelRoutes {
@@ -469,6 +490,15 @@ func validateSchemaV2FeatureFields(cfg ProvidersConfig, schemaVersion int) error
 
 func cloneProvidersConfigForValidation(cfg ProvidersConfig) ProvidersConfig {
 	cloned := cfg
+	if cfg.StateBindings != nil {
+		stateBindings := *cfg.StateBindings
+		cloned.StateBindings = &stateBindings
+	}
+	if cfg.ConversationMigration != nil {
+		migration := *cfg.ConversationMigration
+		migration.Routes = append([]string(nil), cfg.ConversationMigration.Routes...)
+		cloned.ConversationMigration = &migration
+	}
 	if cfg.Providers != nil {
 		cloned.Providers = make([]ProviderConfig, len(cfg.Providers))
 		for index := range cfg.Providers {
@@ -476,6 +506,7 @@ func cloneProvidersConfigForValidation(cfg ProvidersConfig) ProvidersConfig {
 			provider.IncludeModels = append([]string(nil), cfg.Providers[index].IncludeModels...)
 			provider.ExcludeModels = append([]string(nil), cfg.Providers[index].ExcludeModels...)
 			provider.ClassifierNoStoreSupported = cloneBoolPtr(cfg.Providers[index].ClassifierNoStoreSupported)
+			provider.HostedTools = append([]string(nil), cfg.Providers[index].HostedTools...)
 			if cfg.Providers[index].ExtraHeaders != nil {
 				provider.ExtraHeaders = make(map[string]string, len(cfg.Providers[index].ExtraHeaders))
 				for key, value := range cfg.Providers[index].ExtraHeaders {
@@ -557,7 +588,7 @@ func validateProviderConfigDescriptors(configured []ProviderConfig, allowRouteOn
 
 		kind := providerType(strings.TrimSpace(provider.Type))
 		switch kind {
-		case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+		case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICodex, providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		default:
 			return nil, nil, false, configPathError(path+".type", "unsupported provider type %q", provider.Type)
 		}
@@ -635,6 +666,20 @@ func validateProviderRuntimeEnvironmentWithResolver(cfg ProviderConfig, provider
 }
 
 func validateProviderShellWithoutSecrets(cfg ProviderConfig, kind providerType, path string) error {
+	if kind != providerTypeTypeSafeCompatible && strings.TrimSpace(cfg.SystemOnePath) != "" {
+		return configPathError(path+".systemone_path", "is only supported for typesafe-compatible providers")
+	}
+	if kind == providerTypeTypeSafeCompatible {
+		if cfg.Default {
+			return configPathError(path+".default", "typesafe-compatible providers are internal classifiers and cannot be the default provider")
+		}
+		if len(cfg.Models) > 0 {
+			return configPathError(path+".models", "typesafe-compatible models must be pinned in internal policy_classifier routes")
+		}
+		if boolConfigValue(cfg.ClassifierNoStoreSupported) {
+			return configPathError(path+".classifier_no_store_supported", "the TypeSafe protocol has no request-level non-storage option")
+		}
+	}
 	switch kind {
 	case providerTypeAzureOpenAI:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
@@ -681,7 +726,7 @@ func validateProviderShellWithoutSecrets(cfg ProviderConfig, kind providerType, 
 				return configPathError(path+".base_url", "%v", err)
 			}
 		}
-	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 		if baseURL == "" {
 			return configPathError(path+".base_url", "is required")
@@ -789,7 +834,7 @@ func validateGenericProviderAuthWithoutEnvironment(cfg ProviderConfig) *provider
 
 func providerPathValidationField(err error) string {
 	message := err.Error()
-	for _, field := range []string{"chat_completions_path", "responses_path", "messages_path", "models_path"} {
+	for _, field := range []string{"chat_completions_path", "responses_path", "messages_path", "models_path", "systemone_path"} {
 		if strings.HasPrefix(message, field+" ") || strings.HasPrefix(message, field+" must") {
 			return field
 		}
@@ -862,7 +907,7 @@ func providerConfigRequiresStaticModels(provider providerConfigDescriptor) bool 
 	switch provider.kind {
 	case providerTypeAzureOpenAI:
 		return true
-	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		return provider.modelDiscovery == providerModelDiscoveryStatic
 	default:
 		return false
@@ -944,7 +989,14 @@ func normalizeAndValidateModelRouteForSchema(route *ModelRouteConfig, path strin
 		if endpoint == "" {
 			return configPathError(endpointPath, "must not be empty")
 		}
-		if !knownProviderEndpoint(endpoint) {
+		if endpoint == providerEndpointSystemOne {
+			if isPublic || route.InternalPurpose != modelRouteInternalPurposePolicyClassifier || len(route.Endpoints) != 1 {
+				return configPathError(endpointPath, "systemone is only supported as the sole endpoint of an internal policy_classifier route")
+			}
+			if len(route.ReasoningEffort) > 0 {
+				return configPathError(path+".reasoning_effort", "is not supported by the TypeSafe protocol")
+			}
+		} else if !knownProviderEndpoint(endpoint) {
 			return configPathError(endpointPath, "unsupported canonical endpoint %q", rawEndpoint)
 		}
 		if prior, exists := seenEndpoints[endpoint]; exists {
@@ -1133,7 +1185,7 @@ func configuredPublicModelAliases(publicID string) []string {
 
 func providerKindSupportsExplicitRoutes(kind providerType) bool {
 	switch kind {
-	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
+	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible, providerTypeAnthropicCompatible, providerTypeTypeSafeCompatible:
 		return true
 	default:
 		return false
@@ -1142,6 +1194,8 @@ func providerKindSupportsExplicitRoutes(kind providerType) bool {
 
 func explicitRouteProviderFamily(kind providerType) string {
 	switch kind {
+	case providerTypeTypeSafeCompatible:
+		return "typesafe"
 	case providerTypeAnthropicCompatible:
 		return "anthropic"
 	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible:
@@ -1153,6 +1207,8 @@ func explicitRouteProviderFamily(kind providerType) string {
 
 func providerKindSupportsExplicitEndpoint(kind providerType, endpoint string) bool {
 	switch kind {
+	case providerTypeTypeSafeCompatible:
+		return endpoint == providerEndpointSystemOne
 	case providerTypeCopilot, providerTypeAzureOpenAI, providerTypeOpenAICompatible:
 		return endpoint == providerEndpointResponses || endpoint == providerEndpointChatCompletions
 	case providerTypeAnthropicCompatible:
@@ -1207,9 +1263,10 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 				return nil, configPathError(fmt.Sprintf("model_routes[%d].targets[%d].provider", routeIndex, targetIndex), "references unknown provider %q", targetCfg.Provider)
 			}
 			targets = append(targets, targetBinding{
-				id:            targetCfg.ID,
-				provider:      provider,
-				upstreamModel: targetCfg.UpstreamModel,
+				id:                targetCfg.ID,
+				provider:          provider,
+				upstreamModel:     targetCfg.UpstreamModel,
+				upstreamModelJSON: encodeProviderModelJSON(targetCfg.UpstreamModel),
 				wirePolicy: providerRequestPolicy{
 					useMaxCompletionTokens: targetCfg.UseMaxCompletionTokens != nil && *targetCfg.UseMaxCompletionTokens,
 				},
@@ -1247,14 +1304,19 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 }
 
 var topLevelProviderConfigFields = configFieldSet(
-	"schema_version", "providers", "model_routes", "policy_profiles", "tool_optimizers", "insight_model",
+	"schema_version", "providers", "model_routes", "policy_profiles", "tool_optimizers", "insight_model", "state_bindings",
+	"conversation_migration",
 )
+
+var stateBindingsConfigFields = configFieldSet("mode", "max_entries", "file")
+
+var conversationMigrationConfigFields = configFieldSet("routes", "max_history_bytes", "max_total_bytes", "max_snapshots")
 
 var providerConfigFields = configFieldSet(
 	"id", "type", "default", "include_models", "exclude_models", "base_url", "auth_mode",
 	"api_key", "api_key_env", "api_version", "token_scope", "auth_type", "auth_header",
 	"auth_prefix", "extra_headers", "chat_completions_path", "responses_path", "messages_path",
-	"models_path", "model_discovery", "trust_domain", "classifier_no_store_supported", "headers", "models",
+	"models_path", "systemone_path", "model_discovery", "trust_domain", "classifier_no_store_supported", "hosted_tools", "headers", "models",
 )
 
 var providerModelConfigFields = configFieldSet(
@@ -1288,7 +1350,7 @@ var policyTierConfigFields = configFieldSet(
 )
 
 var policyClassifierConfigFields = configFieldSet(
-	"route", "profile", "timeout_ms", "max_completion_tokens", "max_request_bytes",
+	"route", "profile", "reasoning_effort", "timeout_ms", "max_completion_tokens", "max_request_bytes",
 	"recent_turns", "max_concurrency", "observe_sample_rate",
 )
 
@@ -1317,6 +1379,16 @@ func validateJSONConfigFieldPaths(body []byte) error {
 	}
 	if err := validateJSONKnownFields(root, topLevelProviderConfigFields, ""); err != nil {
 		return err
+	}
+	if bindings, ok := root["state_bindings"].(map[string]interface{}); ok {
+		if err := validateJSONKnownFields(bindings, stateBindingsConfigFields, "state_bindings"); err != nil {
+			return err
+		}
+	}
+	if migration, ok := root["conversation_migration"].(map[string]interface{}); ok {
+		if err := validateJSONKnownFields(migration, conversationMigrationConfigFields, "conversation_migration"); err != nil {
+			return err
+		}
 	}
 	if providers, ok := root["providers"].([]interface{}); ok {
 		for index, rawProvider := range providers {
@@ -1432,6 +1504,19 @@ func validateYAMLConfigFieldPaths(body []byte) error {
 	if err := validateYAMLKnownFields(root, topLevelProviderConfigFields, ""); err != nil {
 		return err
 	}
+	if bindings := yamlMappingValue(root, "state_bindings"); bindings != nil && bindings.Kind == yaml.MappingNode {
+		if err := validateYAMLKnownFields(bindings, stateBindingsConfigFields, "state_bindings"); err != nil {
+			return err
+		}
+	}
+	if migration := yamlDereferenceAlias(yamlMappingValue(root, "conversation_migration")); migration != nil && migration.Kind == yaml.MappingNode {
+		if err := validateYAMLKnownFields(migration, conversationMigrationConfigFields, "conversation_migration"); err != nil {
+			return err
+		}
+		if err := validateYAMLConversationMigrationFieldTypes(migration); err != nil {
+			return err
+		}
+	}
 	if providers := yamlMappingValue(root, "providers"); providers != nil && providers.Kind == yaml.SequenceNode {
 		for index, provider := range providers.Content {
 			if provider.Kind != yaml.MappingNode {
@@ -1541,6 +1626,20 @@ func markJSONProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 	if json.Unmarshal(body, &root) != nil {
 		return
 	}
+	if cfg.StateBindings != nil {
+		var bindings map[string]json.RawMessage
+		if json.Unmarshal(root["state_bindings"], &bindings) == nil {
+			_, cfg.StateBindings.maxEntriesSet = bindings["max_entries"]
+		}
+	}
+	if cfg.ConversationMigration != nil {
+		var migration map[string]json.RawMessage
+		if json.Unmarshal(root["conversation_migration"], &migration) == nil {
+			_, cfg.ConversationMigration.maxHistoryBytesSet = migration["max_history_bytes"]
+			_, cfg.ConversationMigration.maxTotalBytesSet = migration["max_total_bytes"]
+			_, cfg.ConversationMigration.maxSnapshotsSet = migration["max_snapshots"]
+		}
+	}
 
 	var providers []map[string]json.RawMessage
 	if json.Unmarshal(root["providers"], &providers) == nil {
@@ -1550,6 +1649,7 @@ func markJSONProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			}
 			_, cfg.Providers[index].trustDomainSet = providers[index]["trust_domain"]
 			_, cfg.Providers[index].classifierNoStoreSupportedSet = providers[index]["classifier_no_store_supported"]
+			_, cfg.Providers[index].hostedToolsSet = providers[index]["hosted_tools"]
 		}
 	}
 
@@ -1620,6 +1720,20 @@ func markYAMLProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 	if root.Kind != yaml.MappingNode {
 		return
 	}
+	if cfg.StateBindings != nil {
+		bindings := yamlDereferenceAlias(yamlMappingValue(root, "state_bindings"))
+		if bindings != nil && bindings.Kind == yaml.MappingNode {
+			cfg.StateBindings.maxEntriesSet = yamlMappingHasField(bindings, "max_entries")
+		}
+	}
+	if cfg.ConversationMigration != nil {
+		migration := yamlDereferenceAlias(yamlMappingValue(root, "conversation_migration"))
+		if migration != nil && migration.Kind == yaml.MappingNode {
+			cfg.ConversationMigration.maxHistoryBytesSet = yamlMappingHasField(migration, "max_history_bytes")
+			cfg.ConversationMigration.maxTotalBytesSet = yamlMappingHasField(migration, "max_total_bytes")
+			cfg.ConversationMigration.maxSnapshotsSet = yamlMappingHasField(migration, "max_snapshots")
+		}
+	}
 
 	if providers := yamlMappingValue(root, "providers"); providers != nil && providers.Kind == yaml.SequenceNode {
 		for index, provider := range providers.Content {
@@ -1629,6 +1743,7 @@ func markYAMLProvidersConfigFieldPresence(body []byte, cfg *ProvidersConfig) {
 			}
 			cfg.Providers[index].trustDomainSet = yamlMappingHasField(provider, "trust_domain")
 			cfg.Providers[index].classifierNoStoreSupportedSet = yamlMappingHasField(provider, "classifier_no_store_supported")
+			cfg.Providers[index].hostedToolsSet = yamlMappingHasField(provider, "hosted_tools")
 		}
 	}
 	if routes := yamlMappingValue(root, "model_routes"); routes != nil && routes.Kind == yaml.SequenceNode {
@@ -1696,6 +1811,7 @@ func markPolicyClassifierFieldPresence(classifier *PolicyClassifierConfig, has f
 	if classifier == nil || has == nil {
 		return
 	}
+	classifier.reasoningEffortSet = has("reasoning_effort")
 	classifier.timeoutMSSet = has("timeout_ms")
 	classifier.maxCompletionTokensSet = has("max_completion_tokens")
 	classifier.maxRequestBytesSet = has("max_request_bytes")
@@ -1705,6 +1821,7 @@ func markPolicyClassifierFieldPresence(classifier *PolicyClassifierConfig, has f
 	if isNull == nil {
 		return
 	}
+	classifier.reasoningEffortNull = isNull("reasoning_effort")
 	classifier.timeoutMSNull = isNull("timeout_ms")
 	classifier.maxCompletionTokensNull = isNull("max_completion_tokens")
 	classifier.maxRequestBytesNull = isNull("max_request_bytes")
@@ -1778,13 +1895,13 @@ func yamlTopLevelConfigFields(body []byte) (map[string]bool, error) {
 func rejectDuplicateJSONMappingKeys(body []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
-	if err := scanJSONValueForDuplicateKeys(decoder, ""); err != nil {
+	if err := scanJSONValueForDuplicateKeys(decoder, "", true); err != nil {
 		return err
 	}
 	return nil
 }
 
-func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string) error {
+func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string, reportPaths bool) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
@@ -1806,12 +1923,15 @@ func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string) error {
 			if !ok {
 				return fmt.Errorf("%s: JSON mapping key is not a string", path)
 			}
-			keyPath := appendConfigObjectPath(path, key)
+			keyPath := path
+			if reportPaths {
+				keyPath = appendConfigObjectPath(path, key)
+			}
 			if _, exists := seen[key]; exists {
 				return configPathError(keyPath, "duplicate mapping key %q", key)
 			}
 			seen[key] = struct{}{}
-			if err := scanJSONValueForDuplicateKeys(decoder, keyPath); err != nil {
+			if err := scanJSONValueForDuplicateKeys(decoder, keyPath, reportPaths); err != nil {
 				return err
 			}
 		}
@@ -1820,7 +1940,11 @@ func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string) error {
 	case '[':
 		index := 0
 		for decoder.More() {
-			if err := scanJSONValueForDuplicateKeys(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+			itemPath := path
+			if reportPaths {
+				itemPath = fmt.Sprintf("%s[%d]", path, index)
+			}
+			if err := scanJSONValueForDuplicateKeys(decoder, itemPath, reportPaths); err != nil {
 				return err
 			}
 			index++

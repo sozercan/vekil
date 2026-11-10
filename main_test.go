@@ -85,6 +85,25 @@ func TestGetEnvDuration(t *testing.T) {
 	}
 }
 
+func TestShouldApplyServeGCDefault(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "unset or empty", want: true},
+		{name: "whitespace", value: "  ", want: true},
+		{name: "explicit percent", value: "100", want: false},
+		{name: "disabled", value: "off", want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldApplyServeGCDefault(tt.value); got != tt.want {
+				t.Fatalf("shouldApplyServeGCDefault(%q) = %t, want %t", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetEnvBool(t *testing.T) {
 	const envKey = "TEST_BOOL_VAR"
 
@@ -340,7 +359,29 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 	}
 }
 
+func TestServeFlagsResponsesWebSocketNativeUpstream(t *testing.T) {
+	t.Setenv("RESPONSES_WS_NATIVE_UPSTREAM", "false")
+	defaults := parseServeFlagsForTest(t)
+	if defaults.responsesWebSocketConfig().NativeUpstream {
+		t.Fatal("native upstream websocket should be disabled by default")
+	}
+	t.Setenv("RESPONSES_WS_NATIVE_UPSTREAM", "true")
+	configured := parseServeFlagsForTest(t)
+	if !configured.responsesWebSocketConfig().NativeUpstream {
+		t.Fatal("native upstream websocket did not use environment configuration")
+	}
+	override := parseServeFlagsForTest(t, "--responses-ws-native-upstream=false")
+	if override.responsesWebSocketConfig().NativeUpstream {
+		t.Fatal("native upstream websocket flag did not override environment configuration")
+	}
+}
+
 func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	client := &http.Client{Transport: transport}
+	t.Cleanup(transport.CloseIdleConnections)
+
 	upstreamStarted := make(chan struct{})
 	upstreamCanceled := make(chan struct{})
 	releaseUpstream := make(chan struct{})
@@ -392,7 +433,7 @@ func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
 	for {
 		if addr := srv.Addr(); addr != "127.0.0.1:0" {
 			baseURL = "http://" + addr
-			resp, requestErr := http.Get(baseURL + "/healthz")
+			resp, requestErr := client.Get(baseURL + "/healthz")
 			if requestErr == nil {
 				_ = resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
@@ -418,7 +459,7 @@ func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
 	}
 	requestDone := make(chan requestResult, 1)
 	go func() {
-		resp, requestErr := http.Post(
+		resp, requestErr := client.Post(
 			baseURL+"/v1/chat/completions",
 			"application/json",
 			strings.NewReader(`{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}`),
@@ -869,6 +910,11 @@ func TestCommandFromArgs(t *testing.T) {
 			name: "config validate dispatches without serving",
 			args: []string{"placeholder", "config", "validate", "--providers-config", "/tmp/providers.yaml"},
 			want: cliCommandConfig,
+		},
+		{
+			name: "service subcommand dispatches without serving",
+			args: []string{"placeholder", "service", "install"},
+			want: cliCommandService,
 		},
 		{
 			name: "unknown subcommand falls back to serve",
@@ -1337,6 +1383,7 @@ func TestLaunchUsesCopilotForDirectPolicyModel(t *testing.T) {
 	classifierNoStore := false
 	cfg := proxy.ProvidersConfig{
 		SchemaVersion: 2,
+		StateBindings: &proxy.StateBindingsConfig{Mode: "memory"},
 		Providers: []proxy.ProviderConfig{{
 			ID:                         "copilot",
 			Type:                       "copilot",
@@ -1491,6 +1538,43 @@ func TestRunLaunchCommandDispatchesSupportedTargets(t *testing.T) {
 			}
 			if target == "copilot" && strings.Contains(stderr.String(), "COPILOT_PROVIDER_WIRE_API=") {
 				t.Fatalf("Copilot dry-run guessed a wire API without model metadata: %s", stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunLaunchCommandDryRunForwardsForegroundSessionArgs(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "56d7498d-6b2e-47ca-92a6-92ddee84ab25"
+	tests := []struct {
+		name       string
+		target     string
+		forwarded  []string
+		wantOutput string
+	}{
+		{name: "Claude resume", target: "claude", forwarded: []string{"--resume", sessionID}, wantOutput: `"--resume" "` + sessionID + `"`},
+		{name: "Codex resume", target: "codex", forwarded: []string{"resume", sessionID}, wantOutput: `"resume" "` + sessionID + `"`},
+		{name: "Copilot resume", target: "copilot", forwarded: []string{"--resume=" + sessionID}, wantOutput: `"--resume=` + sessionID + `"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{
+				tc.target,
+				"--model", "test-model",
+				"--binary", binary,
+				"--dry-run",
+				"--",
+			}
+			args = append(args, tc.forwarded...)
+			var stderr bytes.Buffer
+			if code := runLaunchCommand(args, &stderr); code != 0 {
+				t.Fatalf("runLaunchCommand() code = %d; stderr=%s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantOutput) {
+				t.Fatalf("dry-run did not preserve session args %q:\n%s", tc.forwarded, stderr.String())
 			}
 		})
 	}
@@ -1747,6 +1831,7 @@ func TestRunLaunchClaudeEndToEndWithStaticProvider(t *testing.T) {
 	t.Setenv("MAIN_LAUNCH_HELPER_TARGET", "claude")
 	t.Setenv("TEST_LAUNCH_PROVIDER_SECRET", "redacted")
 	t.Setenv("PROVIDERS_CONFIG", "https://config.example/providers.yaml?signature=launch-secret")
+	t.Setenv("INBOUND_AUTH_TOKEN", "synthetic-inbound-secret")
 
 	var stderr bytes.Buffer
 	code := runLaunchClaude([]string{
@@ -1776,6 +1861,9 @@ func TestRunLaunchClaudeEndToEndWithStaticProvider(t *testing.T) {
 	}
 	if capture["removed_value"] != "" {
 		t.Fatalf("provider secret leaked to child: %q", capture["removed_value"])
+	}
+	if capture["inbound_auth"] != "" || capture["auth_value"] == "synthetic-inbound-secret" {
+		t.Fatalf("inherited inbound auth leaked or replaced launch token: %#v", capture)
 	}
 	if capture["providers_config"] != "" {
 		t.Fatalf("providers config source leaked to child: %q", capture["providers_config"])
@@ -1959,6 +2047,7 @@ func TestRunLaunchAgentInitializesConfiguredPolicyRouting(t *testing.T) {
 			tmp := t.TempDir()
 			providersPath := filepath.Join(tmp, "providers.yaml")
 			providersBody := fmt.Sprintf(`schema_version: 2
+state_bindings: {mode: memory}
 providers:
   - id: policy-provider
     type: openai-compatible
@@ -2029,6 +2118,7 @@ func writeStaticPolicyLaunchProvidersConfig(t *testing.T) string {
 	t.Helper()
 	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
 	providersBody := `schema_version: 2
+state_bindings: {mode: memory}
 providers:
   - id: policy-provider
     type: openai-compatible
@@ -2072,6 +2162,7 @@ func writeCopilotPolicyLaunchProvidersConfig(t *testing.T) string {
 	t.Helper()
 	providersPath := filepath.Join(t.TempDir(), "providers.yaml")
 	providersBody := `schema_version: 2
+state_bindings: {mode: memory}
 providers:
   - id: copilot
     type: copilot
@@ -2196,6 +2287,7 @@ func TestMainLaunchHelperProcess(t *testing.T) {
 		"github_token":     os.Getenv("GITHUB_TOKEN"),
 		"removed_value":    os.Getenv("TEST_LAUNCH_PROVIDER_SECRET"),
 		"providers_config": os.Getenv("PROVIDERS_CONFIG"),
+		"inbound_auth":     os.Getenv("INBOUND_AUTH_TOKEN"),
 	}
 	body, err := json.Marshal(capture)
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,12 +48,29 @@ var (
 	signInMu     sync.Mutex
 	signInCancel context.CancelFunc
 
+	// providersStateMu guards the saved providers selection and its most recent
+	// load. Each start reloads them from its worker while the menu loop reads them.
+	providersStateMu   sync.Mutex
 	menubarCfg         menubarConfig
 	providersCfg       proxy.ProvidersConfig
 	providersConfigErr error
 )
 
 func main() {
+	// A menubar app's stderr goes nowhere, so keep its logs in a file too.
+	if path, err := menubarLogPath(); err != nil {
+		log.Warn("could not locate menubar log file", logger.Err(err))
+	} else if file, err := logger.OpenRotatingFile(path, menubarLogMaxBytes); err != nil {
+		log.Warn("could not open menubar log file", logger.Err(err))
+	} else {
+		// MultiWriter stops at the first failing writer, so a closed stderr
+		// must come after the file.
+		log = logger.NewWithWriter(logger.ParseLevel("info"), io.MultiWriter(file, os.Stderr))
+	}
+	if err := initializeMenubarPATH(); err != nil {
+		log.Warn("could not fully recover menubar PATH", logger.Err(err))
+	}
+
 	var err error
 	authenticator, err = auth.NewAuthenticator("")
 	if err != nil {
@@ -60,7 +78,7 @@ func main() {
 	}
 	authenticator.DisableAutoDeviceFlow = true
 
-	menubarCfg, providersCfg, providersConfigErr = loadProvidersConfigForMenubar()
+	menubarCfg, providersCfg, providersConfigErr = loadProvidersConfigForMenubar(context.Background())
 	if providersConfigErr != nil {
 		logProvidersConfigLoadError(providersConfigErr)
 	}
@@ -193,12 +211,38 @@ func startProxy() {
 	}
 
 	setProxyStartingUI()
-	cfg := providersCfg
-	configErr := providersConfigErr
 	authn := authenticator
 	go func() {
+		// Reload on every start so edits to the saved providers config apply
+		// after Stop and Start without relaunching the app.
+		cfg, configErr := reloadProvidersState(ctx)
 		completeProxyStartup(generation, runProxyStartup(ctx, authn, cfg, configErr))
 	}()
+}
+
+// reloadProvidersState re-reads the saved menubar config and the providers
+// config it selects, then publishes the result for the menu. A canceled reload
+// says nothing about the file, so it leaves the published state unchanged.
+func reloadProvidersState(ctx context.Context) (proxy.ProvidersConfig, error) {
+	cfg, loadedProvidersCfg, err := loadProvidersConfigForMenubar(ctx)
+	if ctx.Err() == nil {
+		setProvidersState(cfg, loadedProvidersCfg, err)
+	}
+	return loadedProvidersCfg, err
+}
+
+func providersState() (menubarConfig, proxy.ProvidersConfig, error) {
+	providersStateMu.Lock()
+	defer providersStateMu.Unlock()
+	return menubarCfg, providersCfg, providersConfigErr
+}
+
+func setProvidersState(cfg menubarConfig, loadedProvidersCfg proxy.ProvidersConfig, err error) {
+	providersStateMu.Lock()
+	defer providersStateMu.Unlock()
+	menubarCfg = cfg
+	providersCfg = loadedProvidersCfg
+	providersConfigErr = err
 }
 
 // menubarPolicyRoutingMode follows the providers YAML unless a non-empty
@@ -217,6 +261,10 @@ func runProxyStartup(
 	cfg proxy.ProvidersConfig,
 	configErr error,
 ) proxyStartResult {
+	return runProxyStartupAt(ctx, authn, cfg, configErr, proxyHost, proxyPort)
+}
+
+func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy.ProvidersConfig, configErr error, host, port string) proxyStartResult {
 	if configErr != nil {
 		title, message := providersConfigStartDialog(configErr)
 		return proxyStartFailure(
@@ -240,13 +288,18 @@ func runProxyStartup(
 			err,
 		)
 	}
+	stateBindings, err := proxy.StateBindingsEnvironmentOverrides()
+	if err != nil {
+		return proxyStartFailure("invalid state bindings configuration", "Vekil Start Failed", fmt.Sprintf("Invalid state bindings override.\n\n%v", err), err)
+	}
 	nextSrv, err := server.New(
 		authn,
 		log,
-		proxyHost,
-		proxyPort,
+		host,
+		port,
 		server.WithProxyOptions(
 			proxy.WithProvidersConfig(cfg),
+			proxy.WithStateBindingsConfig(stateBindings),
 			proxy.WithPolicyRoutingMode(policyMode),
 			proxy.WithDeferredDynamicProviderModelValidation(cfg.UsesCopilot()),
 		),
@@ -295,7 +348,7 @@ func runProxyStartup(
 		return proxyStartFailure(
 			"server start failed",
 			"Vekil Start Failed",
-			fmt.Sprintf("Could not start Vekil on port 1337.\n\n%v", err),
+			fmt.Sprintf("Could not start Vekil on port %s.\n\n%v", port, err),
 			err,
 		)
 	}
@@ -563,7 +616,8 @@ func signOut() {
 	}
 	signInMu.Unlock()
 
-	if providersRequireGitHubAuth(providersCfg, providersConfigErr) {
+	_, currentProvidersCfg, currentProvidersErr := providersState()
+	if providersRequireGitHubAuth(currentProvidersCfg, currentProvidersErr) {
 		_ = cancelProxyStartup()
 	}
 	if proxyLifecycle.usesCopilot() && proxyLifecycle.isRunning() {
@@ -622,9 +676,7 @@ func applyProvidersConfigPath(path string) error {
 		return err
 	}
 
-	menubarCfg = nextCfg
-	providersCfg = loadedProvidersCfg
-	providersConfigErr = nil
+	setProvidersState(nextCfg, loadedProvidersCfg, nil)
 
 	_ = cancelProxyStartupWithRestart(true)
 	wasRunning := proxyLifecycle.isRunning()
@@ -681,21 +733,13 @@ func refreshSessionUI() {
 			mDashboard.Disable()
 		}
 	}
-	switch {
-	case providersConfigErr != nil:
-		mToggle.Disable()
-		if !running {
-			mToggle.SetTitle("Start Vekil")
-			systray.SetIcon(iconOff)
-			systray.SetTooltip("Vekil - Stopped")
-		}
-	default:
-		mToggle.Enable()
-		if !running {
-			mToggle.SetTitle("Start Vekil")
-			systray.SetIcon(iconOff)
-			systray.SetTooltip("Vekil - Stopped")
-		}
+	// Start stays available with an invalid config because it reloads the
+	// config, so fixing the file and starting again recovers.
+	mToggle.Enable()
+	if !running {
+		mToggle.SetTitle("Start Vekil")
+		systray.SetIcon(iconOff)
+		systray.SetTooltip("Vekil - Stopped")
 	}
 }
 
@@ -763,7 +807,8 @@ func refreshProvidersMenu() {
 	if mProvidersChoose != nil {
 		mProvidersChoose.Enable()
 	}
-	if menubarCfg.ProvidersConfigPath == "" {
+	cfg, _, _ := providersState()
+	if cfg.ProvidersConfigPath == "" {
 		mProvidersClear.Disable()
 		return
 	}
@@ -771,17 +816,18 @@ func refreshProvidersMenu() {
 }
 
 func providersMenuTitle() string {
+	cfg, _, err := providersState()
 	switch {
-	case isMenubarConfigLoadError(providersConfigErr):
+	case isMenubarConfigLoadError(err):
 		return "Providers: Config unavailable"
-	case providersConfigErr != nil && menubarCfg.ProvidersConfigPath != "":
-		return fmt.Sprintf("Providers: Invalid (%s)", providersConfigDisplayName(menubarCfg.ProvidersConfigPath))
-	case providersConfigErr != nil:
+	case err != nil && cfg.ProvidersConfigPath != "":
+		return fmt.Sprintf("Providers: Invalid (%s)", providersConfigDisplayName(cfg.ProvidersConfigPath))
+	case err != nil:
 		return "Providers: Invalid"
-	case menubarCfg.ProvidersConfigPath == "":
+	case cfg.ProvidersConfigPath == "":
 		return "Providers: Copilot default"
 	default:
-		return fmt.Sprintf("Providers: %s", providersConfigDisplayName(menubarCfg.ProvidersConfigPath))
+		return fmt.Sprintf("Providers: %s", providersConfigDisplayName(cfg.ProvidersConfigPath))
 	}
 }
 

@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Mock upstream usage must not appear as real live usage in the CI summary.
+unset GITHUB_STEP_SUMMARY
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vekil-smoke-reliability.XXXXXX")"
@@ -67,6 +70,7 @@ parser.add_argument("--port", type=int, default=0)
 parser.add_argument("--canary-status", type=int, default=200)
 parser.add_argument("--canary-status-sequence", default="")
 parser.add_argument("--canary-message", default="")
+parser.add_argument("--canary-error-type", default="")
 parser.add_argument("--canary-bad-shape", action="store_true")
 parser.add_argument("--hang-chat", action="store_true")
 parser.add_argument("--compact-status", type=int, default=200)
@@ -106,9 +110,11 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": "mimo-v2.5-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "hy3-free", "supported_endpoints": ["/chat/completions"]},
                 {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
+                {"id": "gpt-5.6-luna-utility", "supported_endpoints": ["/responses"]},
                 {"id": "muse-spark-1.2-contributor-free", "supported_endpoints": ["/responses"]},
                 {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
                 {"id": "claude-sonnet-5", "supported_endpoints": ["/chat/completions"]},
+                {"id": "claude-haiku-5.5", "supported_endpoints": ["/chat/completions"]},
             ]})
             return
         self.send_json(404, {"error": {"message": "not found"}})
@@ -139,7 +145,10 @@ class Handler(BaseHTTPRequestHandler):
                     "choices": [{"message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
                 })
             else:
-                self.send_json(status, {"error": {"message": message}})
+                error = {"message": message}
+                if args.canary_error_type:
+                    error["type"] = args.canary_error_type
+                self.send_json(status, {"error": error})
             return
         if self.path == "/v1/responses/compact":
             if args.compact_status != 200:
@@ -229,6 +238,9 @@ start_mock_server() {
   fi
   if [[ -n "${message}" ]]; then
     args+=(--canary-message "${message}")
+  fi
+  if [[ -n "${MOCK_CANARY_ERROR_TYPE:-}" ]]; then
+    args+=(--canary-error-type "${MOCK_CANARY_ERROR_TYPE}")
   fi
   if [[ "${bad_shape}" == "1" ]]; then
     args+=(--canary-bad-shape)
@@ -418,6 +430,7 @@ set -euo pipefail
 capture_dir="${FAKE_CLAUDE_CAPTURE_DIR:?}"
 mkdir -p "${capture_dir}"
 printf '%s' "${CLAUDE_CODE_DISABLE_ADVISOR_TOOL-}" > "${capture_dir}/disable-advisor-tool"
+printf '%s' "${MAX_THINKING_TOKENS-}" > "${capture_dir}/max-thinking-tokens"
 model=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -722,6 +735,7 @@ cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
 | Big Pickle | big-pickle | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
 | Ox Alpha Free | x-preview-f-free | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
 | Muse Spark Free | muse-spark-free | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
+| Jev Free | jev-free | `https://opencode.ai/zen/v1/systemone` | - |
 
 ## Pricing
 
@@ -731,6 +745,7 @@ cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
 | Big Pickle | Free | Free | Free | - |
 | Ox Alpha Free | Free | Free | Free | - |
 | Muse Spark Free | Free | Free | Free | - |
+| Jev Free | Free | Free | - | - |
 
 ### Retirement dates
 
@@ -742,6 +757,7 @@ cat > "${zen_parser_dir}/expected.tsv" <<'EOF_ZEN_EXPECTED'
 big-pickle	Big Pickle	/chat/completions
 x-preview-f-free	Ox Alpha Free	/chat/completions
 muse-spark-free	Muse Spark Free	/responses
+jev-free	Jev Free	/systemone
 EOF_ZEN_EXPECTED
 if "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
   "${zen_parser_dir}/zen.mdx" > "${zen_parser_dir}/actual.tsv" \
@@ -824,9 +840,9 @@ if GITHUB_OUTPUT="${zen_render_outputs}" \
   "${zen_parser_dir}/zen.mdx" "${zen_parser_dir}/render-config.yaml" \
   && cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" \
   && grep -Fxq 'changed=true' "${zen_render_outputs}"; then
-  record_success "Zen config updater replaces only the generated block with sorted endpoints"
+  record_success "Zen config updater skips classifiers and sorts public endpoints"
 else
-  record_failure "Zen config updater replaces only the generated block with sorted endpoints" \
+  record_failure "Zen config updater skips classifiers and sorts public endpoints" \
     "$(diff -u "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" 2>&1 || true)"
 fi
 
@@ -859,6 +875,45 @@ expect_hard_failure_with_stderr "Zen config updater rejects endpoints outside op
   "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
   "${zen_parser_dir}/messages-free.mdx" "${zen_parser_dir}/render-config.yaml"
 
+cat > "${zen_parser_dir}/systemone-free.mdx" <<'EOF_ZEN_SYSTEMONE'
+## Endpoints
+
+| Model | Model ID | Endpoint | AI SDK Package |
+| ----- | -------- | -------- | -------------- |
+| Jev 1.13 Free | jev-1.13-free | `https://opencode.ai/zen/v1/systemone` | - |
+
+## Pricing
+
+| Model | Input | Output | Cached Read | Cached Write |
+| ----- | ----- | ------ | ----------- | ------------ |
+| Jev 1.13 Free | Free | Free | - | - |
+EOF_ZEN_SYSTEMONE
+printf '%s\n' $'jev-1.13-free\tJev 1.13 Free\t/systemone' > "${zen_parser_dir}/systemone-expected.tsv"
+if "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/systemone-free.mdx" > "${zen_parser_dir}/systemone-actual.tsv" \
+  && cmp -s "${zen_parser_dir}/systemone-expected.tsv" "${zen_parser_dir}/systemone-actual.tsv"; then
+  record_success "Zen free-label parser retains SystemOne catalog metadata"
+else
+  record_failure "Zen free-label parser retains SystemOne catalog metadata" \
+    "$(diff -u "${zen_parser_dir}/systemone-expected.tsv" "${zen_parser_dir}/systemone-actual.tsv" 2>&1 || true)"
+fi
+expect_hard_failure_with_stderr "Zen config updater rejects a classifier-only catalog" 4 \
+  'no OpenCode Zen free Chat or Responses models were parsed' \
+  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
+  "${zen_parser_dir}/systemone-free.mdx" "${zen_parser_dir}/render-config.yaml"
+if cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml"; then
+  record_success "Zen classifier-only catalog preserves the existing config"
+else
+  record_failure "Zen classifier-only catalog preserves the existing config" "config changed after rejected update"
+fi
+
+sed 's@/systemone@/unknown-evaluation@g' "${zen_parser_dir}/systemone-free.mdx" \
+  > "${zen_parser_dir}/unknown-endpoint.mdx"
+expect_hard_failure_with_stderr "Zen free-label parser rejects unknown evaluation endpoints" 4 \
+  'unsupported endpoint for Jev 1.13 Free: https://opencode.ai/zen/v1/unknown-evaluation' \
+  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
+  "${zen_parser_dir}/unknown-endpoint.mdx"
+
 claude_contract_dir="${TMP_ROOT}/setup/claude-defaults-and-model-preference"
 start_mock_server "${claude_contract_dir}/server" 200
 claude_contract_port="${MOCK_SERVER_PORT}"
@@ -881,11 +936,19 @@ if expect_success "Claude subprocess defaults and model preference" 8 \
   fi
 
   captured_claude_model="$(cat "${claude_capture_dir}/model" 2>/dev/null || true)"
-  if [[ "${captured_claude_model}" == "claude-sonnet-5" ]]; then
-    record_success "Claude model selection prefers Sonnet 5 over catalogued Sonnet 4"
+  if [[ "${captured_claude_model}" == "claude-haiku-5-5" ]]; then
+    record_success "Claude model selection uses its recognized Haiku alias despite catalogued Sonnet models"
   else
-    record_failure "Claude model selection prefers Sonnet 5 over catalogued Sonnet 4" \
+    record_failure "Claude model selection uses its recognized Haiku alias despite catalogued Sonnet models" \
       "captured model=${captured_claude_model:-<missing>}"
+  fi
+
+  captured_thinking_tokens="$(cat "${claude_capture_dir}/max-thinking-tokens" 2>/dev/null || true)"
+  if [[ "${captured_thinking_tokens}" == "0" ]]; then
+    record_success "Claude file-reading smoke disables thinking"
+  else
+    record_failure "Claude file-reading smoke disables thinking" \
+      "captured MAX_THINKING_TOKENS=${captured_thinking_tokens:-<missing>}"
   fi
 fi
 
@@ -1066,6 +1129,7 @@ write_fake_clients "${free_filter_dir}/bin" pass pass pass
 printf '%s\n' \
   $'mimo-v2.5-free\tMiMo V2.5 Free\t/chat/completions' \
   $'muse-spark-1.2-contributor-free\tMuse Spark Free\t/responses' \
+  $'jev-1.13-free\tJev 1.13 Free\t/systemone' \
   > "${free_filter_dir}/free-models.tsv"
 free_filter_name="Zen candidates honor parsed free labels"
 if expect_success "${free_filter_name}" 8 \
@@ -1195,6 +1259,33 @@ expect_hard_failure_with_stderr "removed Zen model is transient in raw smoke" 8 
   env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${removed_model_port}" \
     LIVE_ZEN_SMOKE_DIR="${removed_model_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
+
+# OpenCode restricts its free tier to the OpenCode client. The exact FreeTierError
+# must neutral-skip after one canary and before any client runs (exit42 clients
+# would fail the harness if invoked); the same text without that type stays hard.
+free_tier_message="Error from provider (Console): OpenCode's free tier can only be used from within OpenCode"
+free_tier_dir="${TMP_ROOT}/setup/zen-free-tier-client-restricted"
+MOCK_CANARY_ERROR_TYPE=FreeTierError start_mock_server "${free_tier_dir}/server" 403 "" "${free_tier_message}"
+free_tier_port="${MOCK_SERVER_PORT}"
+write_fake_clients "${free_tier_dir}/bin" exit42 exit42 exit42
+free_tier_case="Zen free-tier client restriction is a neutral pre-client skip"
+if expect_success "${free_tier_case}" 8 \
+  env PATH="${free_tier_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${free_tier_port}" \
+    LIVE_CLI_SMOKE_DIR="${free_tier_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
+  free_tier_stderr="${TMP_ROOT}/cases/${free_tier_case//[^a-zA-Z0-9_.-]/_}/stderr"
+  if grep -Fq 'NEUTRAL SKIP: OpenCode Zen restricts its free tier to the OpenCode client' "${free_tier_stderr}" \
+    && [[ "$(grep -c 'refused by provider policy' "${free_tier_stderr}")" -eq 1 ]]; then
+    record_success "Zen free-tier restriction stops after one canary"
+  else
+    record_failure "Zen free-tier restriction stops after one canary" "missing skip reason or more than one refused canary"
+    cat "${free_tier_stderr}" >&2 || true
+  fi
+fi
+run_zen_case_expect_failure "Zen free-tier text without FreeTierError type is hard" 403 pass pass pass \
+  "${free_tier_message}"
 
 hanging_chat_dir="${TMP_ROOT}/setup/hanging-chat-canary"
 start_mock_server "${hanging_chat_dir}/server" 200 "" "" 0 1

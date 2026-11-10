@@ -95,11 +95,11 @@ func TestPolicyProfileAndClassifierGenerationsChangeWithRelevantInputs(t *testin
 	}
 
 	route, _ := setup.lookupTerminalRoute("classifier-route")
-	firstClassifier := policyClassifierGeneration(route)
+	firstClassifier := policyClassifierGeneration(route, profile.Classifier.ReasoningEffort)
 	cloned := *route
 	cloned.targets = append([]targetBinding(nil), route.targets...)
 	cloned.targets[0].upstreamModel = "other-classifier"
-	if second := policyClassifierGeneration(&cloned); second == firstClassifier {
+	if second := policyClassifierGeneration(&cloned, profile.Classifier.ReasoningEffort); second == firstClassifier {
 		t.Fatal("classifier generation did not change")
 	}
 	if binary := policyBinaryGeneration(); len(binary) != 64 {
@@ -159,6 +159,28 @@ func TestPolicyTierReasoningChangesConfigAndProfileGenerations(t *testing.T) {
 	}
 	if string(firstEntries[0].contract.raw) != string(secondEntries[0].contract.raw) {
 		t.Fatal("public policy contract changed with private tier reasoning")
+	}
+}
+
+func TestPolicyClassifierReasoningEffortChangesGenerations(t *testing.T) {
+	cfg := policyIntegrationConfig("https://light.example.test", "https://power.example.test", policyConfigModeEnforce)
+	cfg.ModelRoutes[2].ReasoningEffort = []string{"low", "max"}
+	omitted := policyGenerationHashesForTest(t, cfg)
+	cfg.PolicyProfiles[0].Classifier.ReasoningEffort = " low "
+	low := policyGenerationHashesForTest(t, cfg)
+	if cfg.PolicyProfiles[0].Classifier.ReasoningEffort != " low " {
+		t.Fatal("generation hashing mutated source config")
+	}
+	cfg.PolicyProfiles[0].Classifier.ReasoningEffort = "low"
+	if normalized := policyGenerationHashesForTest(t, cfg); normalized != low {
+		t.Fatalf("normalized-equivalent generation hashes = %q and %q", low, normalized)
+	}
+	cfg.PolicyProfiles[0].Classifier.ReasoningEffort = "max"
+	maxEffort := policyGenerationHashesForTest(t, cfg)
+	for index, name := range []string{"config", "profile", "classifier"} {
+		if omitted[index] == low[index] || low[index] == maxEffort[index] || omitted[index] == maxEffort[index] {
+			t.Errorf("%s generation did not change with classifier reasoning effort", name)
+		}
 	}
 }
 
@@ -244,6 +266,6 @@ func policyGenerationHashesForTest(t *testing.T, cfg ProvidersConfig) [3]string 
 	return [3]string{
 		configGeneration,
 		policyProfileGeneration(profile, entries[0].contract, lightweight, powerful),
-		policyClassifierGeneration(classifierRoute),
+		policyClassifierGeneration(classifierRoute, profile.Classifier.ReasoningEffort),
 	}
 }

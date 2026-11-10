@@ -182,17 +182,17 @@ func validateCodexForwardedArgs(args []string) error {
 	}
 	switch positionals[0] {
 	case "exec", "e":
-		if len(positionals) > 1 && positionals[1] == "resume" {
-			return fmt.Errorf("resumed Codex sessions are not supported by an ephemeral Vekil launcher")
-		}
+		// Normal exec and exec resume remain attached to the managed child.
+		return nil
+	case "resume", "fork":
+		// Interactive resume and fork remain attached to the managed child.
+		// Remote variants are rejected above.
 		return nil
 	case "review":
 		return nil
-	case "resume", "fork":
-		return fmt.Errorf("resumed Codex sessions are not supported by an ephemeral Vekil launcher")
 	case "app-server", "remote-control", "cloud", "cloud-tasks", "responses-api-proxy", "stdio-to-uds", "exec-server", "mcp-server":
 		return fmt.Errorf("detached or server Codex modes are not supported by an ephemeral Vekil launcher")
-	case "login", "logout", "mcp", "plugin", "plugins", "app", "completion", "update", "doctor", "debug", "execpolicy", "apply", "a", "archive", "delete", "unarchive", "features", "sandbox", "help":
+	case "agents", "login", "logout", "mcp", "plugin", "plugins", "app", "completion", "update", "doctor", "debug", "execpolicy", "apply", "a", "queue", "archive", "delete", "migrate-rollouts", "unarchive", "features", "sandbox", "help":
 		return fmt.Errorf("codex command %q is not an agent session", positionals[0])
 	default:
 		return nil

@@ -21,6 +21,7 @@ type chatPolicyInput struct {
 	// FactSourceBytesLimit is non-zero only for a trusted canonical translation
 	// whose public ingress was already checked against the default fact limit.
 	FactSourceBytesLimit int
+	CarriedReasoning     map[string]carriedReplay
 }
 
 func (i chatPolicyInput) normalized() chatPolicyInput {
@@ -37,10 +38,19 @@ func (h *ProxyHandler) planOpenAIChatPolicy(ctx context.Context, model string, o
 }
 
 func (h *ProxyHandler) planOpenAIChatPolicyWithFactSourceLimit(ctx context.Context, model string, originalBody []byte, factSourceBytesLimit int) (chatOperationPlan, error) {
+	return h.planOpenAIChatPolicyWithCarrier(ctx, model, originalBody, factSourceBytesLimit, nil)
+}
+
+func (h *ProxyHandler) planOpenAIChatPolicyWithCarrier(ctx context.Context, model string, originalBody []byte, factSourceBytesLimit int, carried map[string]carriedReplay) (chatOperationPlan, error) {
 	if h == nil || h.chatPolicyPlanner == nil {
 		return chatOperationPlan{}, nil
 	}
-	input := chatPolicyInput{Model: model, OriginalBody: originalBody, FactSourceBytesLimit: factSourceBytesLimit}
+	input := chatPolicyInput{
+		Model:                model,
+		OriginalBody:         originalBody,
+		FactSourceBytesLimit: factSourceBytesLimit,
+		CarriedReasoning:     carried,
+	}
 	// Policy ingress may establish a client-visible request identity before
 	// translation and planning. Reuse it so sampling, route attempts, response
 	// headers, and request summaries all describe the same logical operation.

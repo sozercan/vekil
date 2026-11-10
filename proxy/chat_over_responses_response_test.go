@@ -291,6 +291,10 @@ func TestResponsesChatCodeOnlyFailuresAreClassified(t *testing.T) {
 		wantType   string
 	}{
 		{"rate_limit_exceeded", http.StatusTooManyRequests, "rate_limit_error"},
+		{"user_model_rate_limited", http.StatusTooManyRequests, "rate_limit_error"},
+		{"user_global_rate_limited", http.StatusTooManyRequests, "rate_limit_error"},
+		{"user_weekly_rate_limited", http.StatusTooManyRequests, "rate_limit_error"},
+		{"integration_rate_limited", http.StatusTooManyRequests, "rate_limit_error"},
 		{"invalid_prompt", http.StatusBadRequest, "invalid_request_error"},
 		{"invalid_image_url", http.StatusBadRequest, "invalid_request_error"},
 		{"vector_store_timeout", http.StatusGatewayTimeout, "server_error"},

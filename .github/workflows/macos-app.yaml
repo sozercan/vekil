@@ -37,6 +37,9 @@ jobs:
       - name: Require native source contract
         run: make require-native-macos-sources
 
+      - name: Test legacy Go menubar shell
+        run: go test -race ./cmd/menubar -count=1
+
       - name: Keep legacy Go shell buildable
         run: make test-legacy-app
 

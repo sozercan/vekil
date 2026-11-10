@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -28,6 +29,7 @@ type responsesChatStreamConfig struct {
 	ReplayStore        *responsesChatReplayStore
 	ReplayRoute        responsesChatReplayRoute
 	ReplayToolDefaults responsesChatReplayToolDefaults
+	Carrier            carrierEmit
 
 	PrecommitTimeout  time.Duration
 	PrecommitMaxBytes int
@@ -79,6 +81,7 @@ func translateResponsesSSEToChat(ctx context.Context, body io.ReadCloser, option
 		ReplayStore:        options.ReplayStore,
 		ReplayRoute:        options.ReplayRoute,
 		ReplayToolDefaults: options.ReplayToolDefaults,
+		Carrier:            options.Carrier,
 	})
 }
 
@@ -340,7 +343,6 @@ type responsesChatMessageState struct {
 
 type responsesChatToolState struct {
 	outputIndex   int
-	denseIndex    int
 	upstreamCall  string
 	name          string
 	arguments     strings.Builder
@@ -359,6 +361,7 @@ type responsesChatStreamState struct {
 
 	hasSequence            bool
 	sequence               int64
+	sequenceGapLogged      bool
 	createdSeen            bool
 	progressSeen           bool
 	terminalSeen           bool
@@ -366,7 +369,6 @@ type responsesChatStreamState struct {
 	itemsByIndex           map[int]string
 	doneByIndex            map[int]bool
 	reasoningStatusByIndex map[int]string
-	tools                  []*responsesChatToolState
 	toolsByIndex           map[int]*responsesChatToolState
 	replayBytes            int
 	hasIncompleteTool      bool
@@ -428,42 +430,46 @@ func (s *responsesChatStreamState) finishChunk(reason string) models.OpenAIStrea
 	return chunk
 }
 
-func (s *responsesChatStreamState) usageChunk(usage *models.OpenAIUsage) models.OpenAIStreamChunk {
+func (s *responsesChatStreamState) usageChunk(usage *models.OpenAIUsage, copilotUsage json.RawMessage) models.OpenAIStreamChunk {
 	chunk := s.baseChunk()
 	chunk.Choices = []models.OpenAIStreamChoice{}
 	chunk.Usage = usage
+	if !rawJSONIsNullOrEmpty(copilotUsage) {
+		payload := map[string]json.RawMessage{"copilot_usage": copilotUsage}
+		rewriteOpenAIChatCompletionModelIdentity(payload, s.config.PublicModel)
+		chunk.CopilotUsage = payload["copilot_usage"]
+	}
 	return chunk
 }
 
-func (s *responsesChatStreamState) toolStartChunk(tool *responsesChatToolState, proxyID string) models.OpenAIStreamChunk {
-	index := tool.denseIndex
+func (s *responsesChatStreamState) toolStartChunk(call responsesChatReplayProjectedCall, index int) models.OpenAIStreamChunk {
 	chunk := s.baseChunk()
 	chunk.Choices = []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{
-		ID:    proxyID,
+		ID:    call.ID,
 		Type:  "function",
 		Index: &index,
 		Function: models.OpenAIFunctionCall{
-			Name: tool.name,
+			Name: call.Name,
 		},
 	}}}}}
 	return chunk
 }
 
-func (s *responsesChatStreamState) toolArgumentsChunk(tool *responsesChatToolState) models.OpenAIStreamChunk {
-	index := tool.denseIndex
+func (s *responsesChatStreamState) toolArgumentsChunk(call responsesChatReplayProjectedCall, index int) models.OpenAIStreamChunk {
 	chunk := s.baseChunk()
 	chunk.Choices = []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{
 		Index: &index,
 		Function: models.OpenAIFunctionCall{
-			Arguments: tool.arguments.String(),
+			Arguments: call.Arguments,
 		},
 	}}}}}
 	return chunk
 }
 
 type responsesChatStreamTransition struct {
-	chunks   []models.OpenAIStreamChunk
-	terminal bool
+	chunks           []models.OpenAIStreamChunk
+	terminal         bool
+	carriedReasoning carriedTurn
 }
 
 func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (responsesChatStreamTransition, error) {
@@ -484,8 +490,20 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 	if named := strings.TrimSpace(msg.event); named != "" && named != eventType {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses SSE event name does not match its JSON type")
 	}
-	if s.hasSequence && header.SequenceNumber != s.sequence+1 {
-		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses stream sequence is not contiguous")
+	// Numeric sequence metadata does not order, deduplicate or reassemble the
+	// stream, so a discontinuity must not discard a structurally valid turn.
+	// Content parts and messages are admitted by their semantic predecessors
+	// below, so visible output never starts out of index order. Within one part,
+	// a dropped, repeated or swapped delta is caught only by the output_text.done
+	// digest, after the deltas before it have been streamed.
+	if s.hasSequence && header.SequenceNumber != s.sequence+1 && !s.sequenceGapLogged {
+		s.sequenceGapLogged = true
+		if s.config.Carrier.Log != nil {
+			s.config.Carrier.Log.Info("tolerated upstream Responses sequence discontinuity",
+				logger.F("previous_sequence", s.sequence),
+				logger.F("sequence", header.SequenceNumber),
+			)
+		}
 	}
 	s.hasSequence = true
 	s.sequence = header.SequenceNumber
@@ -534,7 +552,22 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 		"response.reasoning_text.delta",
 		"response.reasoning_text.done":
 		return s.handleReasoningProgress(eventType, []byte(msg.data))
+	case "keepalive":
+		// Copilot Responses upstream emits during long generations; no state carried, drop.
+		return responsesChatStreamTransition{}, nil
 	default:
+		// Log bounded metadata so new event types are diagnosable without exposing payloads.
+		if s.config.Carrier.Log != nil {
+			const maxLoggedEventTypeBytes = 128
+			loggedEventType := eventType
+			if len(loggedEventType) > maxLoggedEventTypeBytes {
+				loggedEventType = strings.ToValidUTF8(loggedEventType[:maxLoggedEventTypeBytes], "")
+			}
+			s.config.Carrier.Log.Warn("unhandled upstream Responses event",
+				logger.F("event_type", loggedEventType),
+				logger.F("data_bytes", len(msg.data)),
+			)
+		}
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_event", fmt.Sprintf("upstream Responses event %q is not supported", eventType))
 	}
 }
@@ -673,8 +706,8 @@ func (s *responsesChatStreamState) handleOutputItemAdded(data []byte) (responses
 		}
 		s.messagesByIndex[*event.OutputIndex] = &responsesChatMessageState{outputIndex: *event.OutputIndex, parts: make(map[int]*responsesChatTextPart)}
 	case "function_call":
-		if len(s.tools) >= responsesChatReplayMaxCalls {
-			return responsesChatStreamTransition{}, mapResponsesChatReplayPublishError(&responsesChatReplayTooLargeError{Limit: responsesChatReplayLimitCalls, Actual: len(s.tools) + 1, Maximum: responsesChatReplayMaxCalls})
+		if len(s.toolsByIndex) >= responsesChatReplayMaxCalls {
+			return responsesChatStreamTransition{}, mapResponsesChatReplayPublishError(&responsesChatReplayTooLargeError{Limit: responsesChatReplayLimitCalls, Actual: len(s.toolsByIndex) + 1, Maximum: responsesChatReplayMaxCalls})
 		}
 		if strings.TrimSpace(event.Item.CallID) == "" || strings.TrimSpace(event.Item.Name) == "" {
 			return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "function-call output item is malformed")
@@ -690,12 +723,10 @@ func (s *responsesChatStreamState) handleOutputItemAdded(data []byte) (responses
 		}
 		tool := &responsesChatToolState{
 			outputIndex:  *event.OutputIndex,
-			denseIndex:   len(s.tools),
 			upstreamCall: event.Item.CallID,
 			name:         event.Item.Name,
 		}
 		tool.arguments.WriteString(event.Item.Arguments)
-		s.tools = append(s.tools, tool)
 		s.toolsByIndex[tool.outputIndex] = tool
 	case "reasoning":
 		// Hidden from Chat and retained only from authoritative terminal output.
@@ -767,6 +798,21 @@ func (s *responsesChatStreamState) handleVisibleTextDelta(data []byte, kind stri
 	part := message.parts[*event.ContentIndex]
 	if part == nil || part.kind != kind || part.valueDone || part.partDone || !part.matches(event.ItemID, event.OutputIndex, event.ContentIndex) {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "output text delta correlation is invalid")
+	}
+	// Admit visible output by semantic indexes, not sequence metadata. The first
+	// missing predecessor bounds each scan; the byte count caches admission.
+	if event.Delta != "" && part.bytes == 0 {
+		for index := 0; index < part.contentIndex; index++ {
+			if previous := message.parts[index]; previous == nil || !previous.valueDone {
+				return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "assistant content parts are out of order")
+			}
+		}
+		for index := 0; index < part.outputIndex; index++ {
+			itemType, known := s.itemsByIndex[index]
+			if !known || (itemType == "message" && !s.doneByIndex[index]) {
+				return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "assistant output messages are out of order")
+			}
+		}
 	}
 	if s.visibleBytesCharged {
 		if err := s.chargeReplayBytes(len(event.Delta)); err != nil {
@@ -1006,16 +1052,23 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "response.completed arrived before response.created")
 	}
 	var event struct {
-		Response responsesChatJSONEnvelope `json:"response"`
+		Response     responsesChatJSONEnvelope `json:"response"`
+		CopilotUsage json.RawMessage           `json:"copilot_usage"`
 	}
 	if unmarshalErr := json.Unmarshal(data, &event); unmarshalErr != nil {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "terminal Responses event is malformed")
+	}
+	billing := event.CopilotUsage
+	if rawJSONIsNullOrEmpty(billing) {
+		billing = event.Response.CopilotUsage
 	}
 	var terminalUsage *models.OpenAIUsage
 	usageFailureTransition := responsesChatStreamTransition{}
 	if event.Response.Usage != nil {
 		terminalUsage = event.Response.Usage.toOpenAIUsage()
-		usageFailureTransition.chunks = []models.OpenAIStreamChunk{s.usageChunk(terminalUsage)}
+	}
+	if terminalUsage != nil || !rawJSONIsNullOrEmpty(billing) {
+		usageFailureTransition.chunks = []models.OpenAIStreamChunk{s.usageChunk(terminalUsage, billing)}
 	}
 	defer func() {
 		if err == nil {
@@ -1041,7 +1094,7 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 	hasRefusal := false
 	// Chat-style surfaces intentionally do not run command_rewrite; they preserve
 	// upstream arguments and only capture tool context for later output reduction.
-	publishCalls := make([]responsesChatReplayPublishCall, 0, len(s.tools))
+	publishCalls := make([]responsesChatReplayPublishCall, 0, len(s.toolsByIndex))
 	for outputIndex, raw := range event.Response.Output {
 		var header struct {
 			Type   string `json:"type"`
@@ -1135,7 +1188,7 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 	}
 
 	assistantContent, _ := json.Marshal(assistantText.String())
-	if len(s.tools) > 0 && hasRefusal {
+	if len(s.toolsByIndex) > 0 && hasRefusal {
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", "Responses tool-call turns with refusal content are not supported")
 	}
 	exposeTools := len(publishCalls) > 0 && !s.hasIncompleteTool
@@ -1146,7 +1199,7 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 	if err != nil {
 		return responsesChatStreamTransition{}, err
 	}
-	chunks := make([]models.OpenAIStreamChunk, 0, len(s.tools)*2+2)
+	chunks := make([]models.OpenAIStreamChunk, 0, len(s.toolsByIndex)*2+2)
 	if exposeTools {
 		if s.config.ReplayStore == nil {
 			replayErr := newChatServerError("responses_replay_unavailable", "Responses replay storage is unavailable")
@@ -1161,31 +1214,28 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 			attachChatExecutionErrorUsage(replayErr, terminalUsage)
 			return usageFailureTransition, replayErr
 		}
-		proxyByUpstream := make(map[string]string, len(published.Calls))
-		for _, call := range published.Calls {
-			proxyByUpstream[call.UpstreamCallID] = call.ProxyCallID
-		}
-		for _, tool := range s.tools {
-			proxyID := proxyByUpstream[tool.upstreamCall]
-			if proxyID == "" {
+		transition.carriedReasoning = carriedTurnFromPublished(s.config.ReplayRoute, event.Response.Output, published, s.config.Carrier)
+		// Emit the stored projection itself, so streamed IDs, names, arguments and
+		// dense indexes are exactly what a later turn must replay.
+		for index, call := range published.Projection.Calls {
+			if call.ID == "" {
 				return responsesChatStreamTransition{}, newChatServerError("responses_replay_state_invalid", "published Responses replay state is incomplete")
 			}
-			chunks = append(chunks, s.toolStartChunk(tool, proxyID))
-			if tool.arguments.Len() > 0 {
-				chunks = append(chunks, s.toolArgumentsChunk(tool))
+			chunks = append(chunks, s.toolStartChunk(call, index))
+			if call.Arguments != "" {
+				chunks = append(chunks, s.toolArgumentsChunk(call, index))
 			}
 		}
 	}
 
 	chunks = append(chunks, s.finishChunk(finishReason))
-	if terminalUsage != nil {
-		// Canonical event streams always carry terminal usage for aggregation and
-		// accounting. The OpenAI public adapter drops this chunk unless the original
-		// client requested stream_options.include_usage; Anthropic/Gemini consume it internally.
-		chunks = append(chunks, s.usageChunk(terminalUsage))
-	}
+	// Canonical streams carry terminal token usage and billing for aggregation and
+	// accounting. Public adapters decide which fields to expose.
+	chunks = append(chunks, usageFailureTransition.chunks...)
 	s.terminalSeen = true
-	return responsesChatStreamTransition{chunks: chunks, terminal: true}, nil
+	transition.chunks = chunks
+	transition.terminal = true
+	return transition, nil
 }
 
 func parseResponsesChatTopLevelError(data []byte) *chatExecutionError {
@@ -1241,21 +1291,28 @@ func parseResponsesChatTopLevelError(data []byte) *chatExecutionError {
 	if message == "" {
 		message = "upstream Responses stream reported an error"
 	}
-	return &chatExecutionError{StatusCode: status, Type: errorType, Code: code, Param: param, Message: message}
+	return &chatExecutionError{StatusCode: status, Type: errorType, Code: code, Param: param, Message: message, upstreamAuthored: true}
 }
 
 func (s *responsesChatStreamState) handleFailed(data []byte) (responsesChatStreamTransition, error) {
 	var event struct {
-		Response responsesChatJSONEnvelope `json:"response"`
+		Response     responsesChatJSONEnvelope `json:"response"`
+		CopilotUsage json.RawMessage           `json:"copilot_usage"`
 	}
 	if err := json.Unmarshal(data, &event); err != nil || event.Response.Status != "failed" {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "response.failed is malformed")
+	}
+	billing := event.CopilotUsage
+	if rawJSONIsNullOrEmpty(billing) {
+		billing = event.Response.CopilotUsage
 	}
 	var usage *models.OpenAIUsage
 	transition := responsesChatStreamTransition{}
 	if event.Response.Usage != nil {
 		usage = event.Response.Usage.toOpenAIUsage()
-		transition.chunks = []models.OpenAIStreamChunk{s.usageChunk(usage)}
+	}
+	if usage != nil || !rawJSONIsNullOrEmpty(billing) {
+		transition.chunks = []models.OpenAIStreamChunk{s.usageChunk(usage, billing)}
 	}
 	s.terminalSeen = true
 	return transition, responsesChatFailedExecutionError(event.Response.Error, usage)
@@ -1389,6 +1446,19 @@ func runResponsesChatStream(writer *chatStreamEventWriter, control *responsesCha
 			if err := emitChunks(transition.chunks); err != nil {
 				return err
 			}
+		}
+		// The carrier is trailing client state. If a future terminal transition carries
+		// no chunks of its own, commit and flush the role/chunk path before enqueuing it;
+		// otherwise short precommit responses can put the carrier ahead of visible output.
+		if transition.carriedReasoning.present() && !committed {
+			if err := emitChunks(nil); err != nil {
+				return err
+			}
+		}
+		// Unguarded: the writer owns "worth emitting". An item count here drops a
+		// capped carrier, which holds only its mapping.
+		if err := writer.sendCarriedReasoning(transition.carriedReasoning); err != nil {
+			return err
 		}
 		if transition.terminal {
 			if !committed {
