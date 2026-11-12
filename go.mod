@@ -15,7 +15,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/klauspost/compress v1.20.1
 	go.etcd.io/bbolt v1.5.0
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.50.0
 	golang.org/x/term v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
