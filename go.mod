@@ -13,7 +13,7 @@ require (
 	github.com/godbus/dbus/v5 v5.2.4
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/klauspost/compress v1.20.1
+	github.com/klauspost/compress v1.20.3
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/net v0.61.0
 	golang.org/x/sys v0.50.0
