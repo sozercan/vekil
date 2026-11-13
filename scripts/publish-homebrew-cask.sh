@@ -28,8 +28,8 @@ cask "vekil" do
 
   app "Vekil.app"
 
-  postflight do
-    system_command "/usr/bin/xattr", args: ["-cr", "#{appdir}/Vekil.app"], sudo: false
+  postflight_steps do
+    run "/usr/bin/xattr", args: ["-cr", "{{appdir}}/Vekil.app"], sudo: false, must_succeed: false
   end
 
   zap trash: [

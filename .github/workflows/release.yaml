@@ -163,13 +163,6 @@ jobs:
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           ./scripts/publish-homebrew-cask.sh "$VERSION" "${{ needs.macos-app.outputs.app_sha256 }}" homebrew-repo
-          # Structured flight steps use run and install-time path templates.
-          sed -i \
-            -e 's/^  postflight do$/  postflight_steps do/' \
-            -e 's/^    system_command /    run /' \
-            -e 's/#{appdir}/{{appdir}}/g' \
-            -e 's/sudo: false$/sudo: false, must_succeed: false/' \
-            homebrew-repo/Casks/vekil.rb
 
       - name: Commit and push Homebrew cask
         run: |
