@@ -233,6 +233,10 @@ Responses requests are routed by public `model` ID. A version-2 `priority_failov
 
 See [OpenAI Responses Compatibility](responses.md) for compaction, oversized replay, transient streaming failure, websocket semantics, and the separation between native Responses and Chat-over-Responses compatibility. See [Responses WebSocket Bridge](responses-websocket.md) for websocket tuning flags.
 
+## `POST /v1/decisions`
+
+A passthrough for OpenAI Decisions requests (`input` plus `questions`, answered with `answers` and `usage`). Vekil forwards the request and response bodies unchanged. A request is accepted only when the `GET /v1/models` catalog lists its `model` with `/v1/decisions` in `supported_endpoints`; other models are rejected with `400` before the request is forwarded. For example, GitHub Copilot serves `gpt-6-luna-decisions` on `/v1/decisions`. The endpoint is non-streaming, is counted in traffic dashboard totals with the reported `input_tokens` and `output_tokens`, and does not accept policy public IDs or explicit schema-v2 routes.
+
 ## `POST /mcp/web-search`
 
 A stateless, single-tool MCP server (Streamable HTTP with JSON responses) whose only tool, `web_search`, is backed by the `web_search` tool on GitHub's hosted MCP server (`https://api.githubcopilot.com/mcp/`). It exists only while Vekil uses a Copilot provider and returns `404` otherwise. Vekil calls GitHub with the Copilot provider's GitHub credential; clients authenticate to Vekil like any other route and never receive that credential. `GET` returns `405` because the server sends no unsolicited messages. Requests that carry an `Origin` header, which browsers always send, are rejected with `403` so web pages cannot spend the user's search.
