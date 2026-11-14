@@ -40,6 +40,7 @@ The following matrix defines the supported and unsupported v1 behavior for polic
 | Proxy-owned `GET /v1/responses` websocket bridge | Unsupported |
 | `POST /v1/responses/compact` | Unsupported |
 | `POST /v1/memories/trace_summarize` | Unsupported |
+| `POST /v1/decisions` | Unsupported |
 | Responses-backed Chat terminal routes | Supported through the bounded Chat-over-Responses adapter; destination and classifier routes may expose `/responses` |
 | `POST /v1/messages` and `/v1/messages/count_tokens` | Translated to canonical Chat, planned by the policy, and translated back to Anthropic |
 | Gemini `generateContent`, `streamGenerateContent`, and `countTokens` routes | Unsupported |
