@@ -66,13 +66,13 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	catalogCtx, catalogCancel := h.newLifecycleUpstreamContext(modelsUpstreamTimeout)
+	defer catalogCancel()
 	supported, err := h.catalogModelSupportsEndpoint(catalogCtx, r.Context(), model, endpoint)
-	catalogCancel()
 	if err != nil {
 		if r.Context().Err() != nil {
 			return
 		}
-		if h.handleShutdownError(w, r, nil, err) {
+		if h.handleShutdownError(w, r, catalogCtx, err) {
 			return
 		}
 		h.log.Error("model catalog unavailable", logger.F("endpoint", summaryEndpoint), logger.Err(err))

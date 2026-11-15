@@ -174,6 +174,42 @@ func TestDecisionsTruncatedUpstreamBodyReturnsBadGateway(t *testing.T) {
 	}
 }
 
+func TestDecisionsCatalogShutdownReturnsShutdown503(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(started)
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	defer upstream.Close()
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithCopilotBaseURL(upstream.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{"model":"example-decisions-model","input":"x"}`))
+	ctx, summary := WithRequestSummary(req.Context())
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { defer close(done); h.HandleDecisions(rec, req) }()
+	waitForLifecycleSignal(t, started, "catalog fetch to start")
+	h.BeginShutdown()
+	waitForLifecycleSignal(t, canceled, "catalog fetch cancellation")
+	waitForLifecycleSignal(t, done, "decisions handler")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status/body = %d %s, want shutdown 503", rec.Code, rec.Body.String())
+	}
+	if !summary.StatsSuppressed() {
+		t.Fatal("decisions catalog shutdown was not stats-suppressed")
+	}
+}
+
 // An openai-compatible catalog can advertise /v1/decisions, but that provider
 // type routes only Chat and Responses paths under its base URL.
 func TestDecisionsRejectsOpenAICompatibleProvider(t *testing.T) {
