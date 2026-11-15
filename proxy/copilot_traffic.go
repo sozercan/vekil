@@ -52,7 +52,7 @@ func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, e
 		return req
 	}
 	switch endpoint {
-	case providerEndpointChatCompletions, providerEndpointMessages, providerEndpointResponses:
+	case providerEndpointChatCompletions, providerEndpointMessages, providerEndpointResponses, copilotEndpointDecisions:
 	default:
 		return req
 	}

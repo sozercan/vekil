@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,13 +21,14 @@ const decisionsTestCatalog = `{"data":[
 ]}`
 
 type decisionsTestUpstream struct {
-	mu        sync.Mutex
-	paths     []string
-	bodies    []string
-	status    int
-	response  string
-	authValid bool
-	noCatalog bool
+	mu         sync.Mutex
+	paths      []string
+	bodies     []string
+	status     int
+	retryAfter string
+	response   string
+	authValid  bool
+	noCatalog  bool
 }
 
 func newDecisionsTestHandler(t *testing.T, upstream *decisionsTestUpstream, opts ...Option) *ProxyHandler {
@@ -46,10 +48,13 @@ func newDecisionsTestHandler(t *testing.T, upstream *decisionsTestUpstream, opts
 		upstream.paths = append(upstream.paths, r.URL.Path)
 		upstream.bodies = append(upstream.bodies, string(body))
 		upstream.authValid = r.Header.Get("Authorization") == "Bearer test-token"
-		status, response := upstream.status, upstream.response
+		status, response, retryAfter := upstream.status, upstream.response, upstream.retryAfter
 		upstream.mu.Unlock()
 		if status == 0 {
 			status = http.StatusOK
+		}
+		if retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
 		}
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, response)
@@ -111,7 +116,10 @@ func TestDecisionsRejectsModelsWithoutAdvertisedEndpoint(t *testing.T) {
 		{"missing model", `{"input":"x"}`, `model is required`},
 		{"non-string model", `{"model":7}`, `model is required`},
 		{"padded model", `{"model":" example-decisions-model"}`, `surrounding whitespace`},
+		{"case-variant model key", `{"model":"example-chat-model","Model":"example-decisions-model"}`, `unsupported field \"Model\"`},
+		{"only a case-variant model key", `{"MODEL":"example-decisions-model"}`, `unsupported field \"MODEL\"`},
 		{"not an object", `[]`, `JSON object`},
+		{"null body", `null`, `JSON object`},
 		{"duplicate model", `{"model":"example-chat-model","model":"example-decisions-model"}`, `invalid JSON`},
 	}
 	for _, tt := range tests {
@@ -175,5 +183,91 @@ func TestDecisionsFailsClosedWithoutCatalog(t *testing.T) {
 	defer upstream.mu.Unlock()
 	if len(upstream.paths) != 0 {
 		t.Fatalf("request without a catalog reached upstream: %v", upstream.paths)
+	}
+}
+
+// decisionsTestChatRequest builds a Chat request the way the proxy sends one,
+// so it carries the same Copilot account and integration identity as a
+// Decisions request from the same handler.
+func decisionsTestChatRequest(t *testing.T, h *ProxyHandler) *http.Request {
+	t.Helper()
+	body := []byte(`{"model":"example-chat-model","messages":[{"role":"user","content":"hi"}]}`)
+	provider, owner, body, err := h.resolveProviderRequest(body, providerEndpointChatCompletions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := h.newProviderJSONInferenceRequest(context.Background(), provider, http.MethodPost, providerEndpointChatCompletions, body, nil, "", owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = req.Body.Close() })
+	return req
+}
+
+func TestDecisionsHonorsCopilotAccountCooldown(t *testing.T) {
+	upstream := &decisionsTestUpstream{response: `{}`}
+	h := newDecisionsTestHandler(t, upstream)
+	chat := decisionsTestChatRequest(t, h)
+	h.copilotTraffic.observeThrottle(copilotTrafficTestMetadata(t, chat), http.StatusTooManyRequests, "604800", []byte(`{"error":{"code":"user_global_rate_limited"}}`))
+
+	rec := httptest.NewRecorder()
+	h.HandleDecisions(rec, httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{"model":"example-decisions-model"}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status/body = %d %s", rec.Code, rec.Body.String())
+	}
+	upstream.mu.Lock()
+	defer upstream.mu.Unlock()
+	if len(upstream.paths) != 0 {
+		t.Fatalf("request during an account cooldown reached upstream: %v", upstream.paths)
+	}
+}
+
+func TestDecisionsThrottleSetsSharedCooldown(t *testing.T) {
+	upstream := &decisionsTestUpstream{
+		status:     http.StatusTooManyRequests,
+		retryAfter: "604800",
+		response:   `{"error":{"code":"user_global_rate_limited","message":"rate limited"}}`,
+	}
+	h := newDecisionsTestHandler(t, upstream)
+	send := func() int {
+		rec := httptest.NewRecorder()
+		h.HandleDecisions(rec, httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{"model":"example-decisions-model"}`)))
+		return rec.Code
+	}
+	if code := send(); code != http.StatusTooManyRequests {
+		t.Fatalf("first status = %d", code)
+	}
+	if code := send(); code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d", code)
+	}
+	upstream.mu.Lock()
+	sent := len(upstream.paths)
+	upstream.mu.Unlock()
+	if sent != 1 {
+		t.Fatalf("upstream sends = %d, want 1: the throttle did not set a cooldown", sent)
+	}
+
+	permit, blocked, err := h.acquireCopilotInference(decisionsTestChatRequest(t, h))
+	permit.release()
+	if err != nil || blocked == nil {
+		t.Fatalf("chat admission after a Decisions throttle: blocked=%v err=%v", blocked != nil, err)
+	}
+	_ = blocked.Body.Close()
+}
+
+func TestObserveResponseProviderUsesServingProvider(t *testing.T) {
+	ctx, summary := WithRequestSummary(context.Background())
+	summary.setProvider("copilot", "copilot")
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", nil)
+	req = req.WithContext(context.WithValue(req.Context(), providerRouteContextKey{}, providerRouteInfo{id: "discovered", kind: "openai"}))
+
+	observeResponseProvider(ctx, &http.Response{Request: req})
+
+	fields := map[string]any{}
+	for _, field := range summary.LoggerFields() {
+		fields[field.Key] = field.Value
+	}
+	if fields["provider"] != "discovered" || fields["provider_kind"] != "openai" {
+		t.Fatalf("summary fields = %#v", fields)
 	}
 }

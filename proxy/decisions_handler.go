@@ -34,15 +34,22 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 		return
 	}
-	var request struct {
-		Model json.RawMessage `json:"model"`
-	}
-	if err := json.Unmarshal(body, &request); err != nil {
+	// Decode exact keys: a struct field would also match "Model", letting the
+	// gate check one key while upstream reads another.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil || fields == nil {
 		writeOpenAIError(w, http.StatusBadRequest, "request body must be a JSON object", "invalid_request_error")
 		return
 	}
+	for key := range fields {
+		if key != "model" && strings.EqualFold(key, "model") {
+			writeOpenAIErrorWithDetails(w, http.StatusBadRequest,
+				fmt.Sprintf("unsupported field %q; use \"model\"", key), "invalid_request_error", "model", "")
+			return
+		}
+	}
 	var model string
-	if len(request.Model) == 0 || json.Unmarshal(request.Model, &model) != nil || strings.TrimSpace(model) == "" {
+	if rawModel := fields["model"]; len(rawModel) == 0 || json.Unmarshal(rawModel, &model) != nil || strings.TrimSpace(model) == "" {
 		writeOpenAIErrorWithDetails(w, http.StatusBadRequest, "model is required", "invalid_request_error", "model", "")
 		return
 	}
@@ -98,6 +105,7 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	observeUpstreamHeaders(r.Context(), resp.Header)
+	observeResponseProvider(r.Context(), resp)
 
 	writeErr := writePassthroughSniffingUsage(w, resp, func(responseBody []byte) ([]byte, bool) {
 		observeDecisionUsage(r.Context(), responseBody)
