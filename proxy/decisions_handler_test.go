@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -14,7 +15,7 @@ import (
 )
 
 const decisionsTestCatalog = `{"data":[
-{"id":"example-decisions-model","supported_endpoints":["/v1/decisions"]},
+{"id":"example-decisions-model","supported_endpoints":["/v1/decisions"],"capabilities":{"supports":{"parallel_tool_calls":false}}},
 {"id":"example-responses-model","supported_endpoints":["/responses"]},
 {"id":"example-chat-model","supported_endpoints":["/chat/completions"]},
 {"id":"example-legacy-model"}
@@ -27,6 +28,7 @@ type decisionsTestUpstream struct {
 	status     int
 	retryAfter string
 	response   string
+	truncate   bool
 	authValid  bool
 	noCatalog  bool
 }
@@ -48,13 +50,17 @@ func newDecisionsTestHandler(t *testing.T, upstream *decisionsTestUpstream, opts
 		upstream.paths = append(upstream.paths, r.URL.Path)
 		upstream.bodies = append(upstream.bodies, string(body))
 		upstream.authValid = r.Header.Get("Authorization") == "Bearer test-token"
-		status, response, retryAfter := upstream.status, upstream.response, upstream.retryAfter
+		status, response, retryAfter, truncate := upstream.status, upstream.response, upstream.retryAfter, upstream.truncate
 		upstream.mu.Unlock()
 		if status == 0 {
 			status = http.StatusOK
 		}
 		if retryAfter != "" {
 			w.Header().Set("Retry-After", retryAfter)
+		}
+		if truncate {
+			// Promise more bytes than are sent so the client's body read fails.
+			w.Header().Set("Content-Length", strconv.Itoa(len(response)+16))
 		}
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, response)
@@ -137,6 +143,34 @@ func TestDecisionsRejectsModelsWithoutAdvertisedEndpoint(t *testing.T) {
 				t.Fatalf("rejected request reached upstream: %v", upstream.paths)
 			}
 		})
+	}
+}
+
+// The catalog marks example-decisions-model as not supporting parallel tool
+// calls, which would make Chat-style model policy drop the field and reserialize.
+func TestDecisionsForwardsRequestBodyUnchanged(t *testing.T) {
+	const request = `{ "model": "example-decisions-model", "input": "x", "parallel_tool_calls": true, "temperature": 0 }`
+	upstream := &decisionsTestUpstream{response: `{}`}
+	h := newDecisionsTestHandler(t, upstream)
+	rec := httptest.NewRecorder()
+	h.HandleDecisions(rec, httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(request)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status/body = %d %s", rec.Code, rec.Body.String())
+	}
+	upstream.mu.Lock()
+	defer upstream.mu.Unlock()
+	if len(upstream.bodies) != 1 || upstream.bodies[0] != request {
+		t.Fatalf("upstream bodies = %q, want the request unchanged", upstream.bodies)
+	}
+}
+
+func TestDecisionsTruncatedUpstreamBodyReturnsBadGateway(t *testing.T) {
+	upstream := &decisionsTestUpstream{response: `{"answers":[]}`, truncate: true}
+	h := newDecisionsTestHandler(t, upstream)
+	rec := httptest.NewRecorder()
+	h.HandleDecisions(rec, httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{"model":"example-decisions-model","input":"x"}`)))
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "failed to read upstream response") {
+		t.Fatalf("status/body = %d %s", rec.Code, rec.Body.String())
 	}
 }
 

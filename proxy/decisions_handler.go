@@ -111,8 +111,8 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 		observeDecisionUsage(r.Context(), responseBody)
 		return responseBody, false
 	})
-	if writeErr != nil {
-		h.handleResponseBodyWriteError(w, r, upstreamCtx, summaryEndpoint, writeErr)
+	if writeErr != nil && !h.handleResponseBodyWriteError(w, r, upstreamCtx, summaryEndpoint, writeErr) {
+		writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream response", "server_error")
 	}
 }
 

@@ -267,6 +267,10 @@ func prepareResolvedProviderRequestBodyWithValidation(
 }
 
 func applyProviderModelRequestPolicy(body []byte, endpoint string, owner providerModel) []byte {
+	// Decisions is a passthrough: the client's fields reach upstream as sent.
+	if endpoint == copilotEndpointDecisions {
+		return body
+	}
 	rewriteMaxTokens := endpoint == providerEndpointChatCompletions && owner.useMaxCompletionTokens
 	dropStopSequences := endpoint == providerEndpointChatCompletions && owner.dropStopSequences
 	if !owner.dropSamplingParams && !dropStopSequences && !rewriteMaxTokens && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
