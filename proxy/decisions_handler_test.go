@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
@@ -161,6 +162,24 @@ func TestDecisionsForwardsRequestBodyUnchanged(t *testing.T) {
 	defer upstream.mu.Unlock()
 	if len(upstream.bodies) != 1 || upstream.bodies[0] != request {
 		t.Fatalf("upstream bodies = %q, want the request unchanged", upstream.bodies)
+	}
+}
+
+// When retries run out, Decisions returns the shared upstream error shape used
+// by Chat and Responses, keeping the upstream status and message.
+func TestDecisionsExhaustedRetriesKeepUpstreamStatusAndMessage(t *testing.T) {
+	upstream := &decisionsTestUpstream{status: http.StatusServiceUnavailable, response: `{"error":{"message":"decisions overloaded","code":"overloaded"}}`}
+	h := newDecisionsTestHandler(t, upstream)
+	h.retryBaseDelay = time.Nanosecond
+	rec := httptest.NewRecorder()
+	h.HandleDecisions(rec, httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{"model":"example-decisions-model","input":"x"}`)))
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "decisions overloaded") {
+		t.Fatalf("status/body = %d %s", rec.Code, rec.Body.String())
+	}
+	upstream.mu.Lock()
+	defer upstream.mu.Unlock()
+	if len(upstream.paths) < 2 {
+		t.Fatalf("upstream attempts = %d, want retries before giving up", len(upstream.paths))
 	}
 }
 
