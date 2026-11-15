@@ -140,6 +140,44 @@ func TestDecisionsRejectsModelsWithoutAdvertisedEndpoint(t *testing.T) {
 	}
 }
 
+// An openai-compatible catalog can advertise /v1/decisions, but that provider
+// type routes only Chat and Responses paths under its base URL.
+func TestDecisionsRejectsOpenAICompatibleProvider(t *testing.T) {
+	var mu sync.Mutex
+	var inference []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == providerEndpointModels {
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"example-decisions-model","supported_endpoints":["/v1/decisions"]}]}`)
+			return
+		}
+		mu.Lock()
+		inference = append(inference, r.URL.Path)
+		mu.Unlock()
+	}))
+	t.Cleanup(server.Close)
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+			ID: "compatible", Type: "openai-compatible", Default: true, BaseURL: server.URL, AuthType: "none", ModelDiscovery: "openai",
+		}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.BeginShutdown)
+
+	rec := httptest.NewRecorder()
+	h.HandleDecisions(rec, httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{"model":"example-decisions-model","input":"x"}`)))
+	// The provider-level message shows the catalog gate passed and dispatch refused.
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `provider \"compatible\" does not support /v1/decisions`) {
+		t.Fatalf("status/body = %d %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(inference) != 0 {
+		t.Fatalf("rejected request reached upstream: %v", inference)
+	}
+}
+
 func TestDecisionsPassesThroughUpstreamErrors(t *testing.T) {
 	upstream := &decisionsTestUpstream{status: http.StatusUnprocessableEntity, response: `{"error":{"message":"bad question"}}`}
 	h := newDecisionsTestHandler(t, upstream)
