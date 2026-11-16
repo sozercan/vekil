@@ -141,24 +141,68 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 // Rewrite only protocol-owned call fields. Tool arguments, output strings,
 // schemas and vendor data must never be searched recursively for aliases.
 func (tr *responsesNamespaceTranslation) restore(data []byte, _ string) ([]byte, bool) {
+	// Preserve ambiguous bytes for the downstream durable state validator.
+	// Decoding into maps would collapse duplicate keys before it sees them.
+	if validateUnambiguousResponsesJSON(data) != nil {
+		return data, false
+	}
 	var root map[string]json.RawMessage
 	if json.Unmarshal(data, &root) != nil {
 		return data, false
 	}
 	changed := false
-	call := func(item map[string]json.RawMessage) {
-		if typ := rawJSONString(item["type"]); typ != "function_call" && typ != "response.function_call_arguments.done" {
-			return
-		}
+	restoreName := func(item map[string]json.RawMessage) bool {
 		d, ok := tr.tools[rawJSONString(item["name"])]
 		if !ok {
-			return
+			return false
 		}
 		item["name"], _ = json.Marshal(d.Name)
 		if d.Namespace != "" {
 			item["namespace"], _ = json.Marshal(d.Namespace)
 		}
 		changed = true
+		return true
+	}
+	call := func(item map[string]json.RawMessage) {
+		if typ := rawJSONString(item["type"]); typ != "function_call" && typ != "response.function_call_arguments.done" {
+			return
+		}
+		restoreName(item)
+	}
+	// Echoed choices must reference the restored catalog, not upstream aliases.
+	toolChoice := func(obj map[string]json.RawMessage) {
+		raw := obj["tool_choice"]
+		if len(raw) == 0 || !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
+			return
+		}
+		var choice map[string]json.RawMessage
+		if json.Unmarshal(raw, &choice) != nil {
+			return
+		}
+		switch rawJSONString(choice["type"]) {
+		case "function":
+			if !restoreName(choice) {
+				return
+			}
+		case "allowed_tools":
+			var allowed []map[string]json.RawMessage
+			if json.Unmarshal(choice["tools"], &allowed) != nil {
+				return
+			}
+			restored := false
+			for _, item := range allowed {
+				if rawJSONString(item["type"]) == "function" && restoreName(item) {
+					restored = true
+				}
+			}
+			if !restored {
+				return
+			}
+			choice["tools"], _ = json.Marshal(allowed)
+		default:
+			return
+		}
+		obj["tool_choice"], _ = json.Marshal(choice)
 	}
 	response := func(obj map[string]json.RawMessage) {
 		var output []map[string]json.RawMessage
@@ -174,6 +218,7 @@ func (tr *responsesNamespaceTranslation) restore(data []byte, _ string) ([]byte,
 			obj["tools"] = tr.catalog
 			changed = true
 		}
+		toolChoice(obj)
 	}
 	typ := rawJSONString(root["type"])
 	if typ == "response.output_item.added" || typ == "response.output_item.done" {
@@ -212,7 +257,7 @@ func restoreCopilotNamespaceResponse(req *http.Request, resp *http.Response) {
 	if tr == nil {
 		return
 	}
-	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+	if isEventStreamContentType(resp.Header.Get("Content-Type")) {
 		wrapResponsesSSEBody(resp, func(raw []byte) ([]byte, bool) { return rewriteResponsesSSEEventData(raw, tr.restore) })
 	} else {
 		resp.Body = &responsesNamespaceJSONBody{ReadCloser: resp.Body, tr: tr}

@@ -25,14 +25,20 @@ func normalizeCopilotResponsesItemIDs(resp *http.Response, endpoint string) {
 	})
 }
 
+// isEventStreamContentType reports whether a Content-Type header names the
+// SSE media type. Media types are case-insensitive and may carry parameters.
+func isEventStreamContentType(header string) bool {
+	contentType, _, _ := strings.Cut(header, ";")
+	return strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
+}
+
 // wrapResponsesSSEBody rewrites each successful Responses SSE event in place.
 // Oversized events and lines pass through unchanged.
 func wrapResponsesSSEBody(resp *http.Response, rewriteEvent func([]byte) ([]byte, bool)) {
 	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
 		return
 	}
-	contentType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
-	if !strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream") {
+	if !isEventStreamContentType(resp.Header.Get("Content-Type")) {
 		return
 	}
 	resp.Body = &responsesSSERewriteBody{

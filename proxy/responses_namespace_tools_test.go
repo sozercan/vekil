@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
@@ -150,5 +151,126 @@ func TestCopilotNamespaceAdditionalToolsAndAllowedChoice(t *testing.T) {
 	}
 	if len(tr.tools) != 3 {
 		t.Fatalf("tools=%d", len(tr.tools))
+	}
+}
+
+func newNamespaceTestTranslation(t *testing.T) (*responsesNamespaceTranslation, string) {
+	t.Helper()
+	_, tr, err := translateCopilotNamespaceTools([]byte(`{"model":"grok-4.7","tools":` + namespaceTestCatalog + `}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := policyResponsesStableToolAlias(policyResponsesToolDescriptor{Kind: "function", Name: "run", Namespace: "shell"})
+	if _, ok := tr.tools[alias]; !ok {
+		t.Fatalf("alias %q not registered", alias)
+	}
+	return tr, alias
+}
+
+func TestCopilotNamespaceRestorePreservesAmbiguousPayloads(t *testing.T) {
+	tr, alias := newNamespaceTestTranslation(t)
+	call := fmt.Sprintf(`{"type":"function_call","id":"fc-1","id":"fc-2","call_id":"call-1","name":%q,"arguments":"{}"}`, alias)
+	for name, data := range map[string]string{
+		"json":     `{"output":[` + call + `]}`,
+		"terminal": `{"type":"response.completed","response":{"output":[` + call + `]}}`,
+		"item":     `{"type":"response.output_item.done","item":` + call + `}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, changed := tr.restore([]byte(data), "")
+			if changed || string(got) != data {
+				t.Fatalf("ambiguous payload rewritten: changed=%v %s", changed, got)
+			}
+		})
+	}
+
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"output":[` + call + `]}`))}
+	req := httptest.NewRequest(http.MethodPost, "/responses", nil)
+	req = req.WithContext(context.WithValue(req.Context(), responsesNamespaceContextKey{}, tr))
+	restoreCopilotNamespaceResponse(req, resp)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"output":[`+call+`]}` {
+		t.Fatalf("ambiguous JSON body rewritten: %s", raw)
+	}
+}
+
+func TestCopilotNamespaceRestoresResponseToolChoice(t *testing.T) {
+	tr, alias := newNamespaceTestTranslation(t)
+	for name, choice := range map[string]string{
+		"function": fmt.Sprintf(`{"type":"function","name":%q}`, alias),
+		"allowed":  fmt.Sprintf(`{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":%q},{"type":"function","name":"unrelated"}]}`, alias),
+	} {
+		for _, wrap := range []string{"json", "lifecycle"} {
+			t.Run(name+"/"+wrap, func(t *testing.T) {
+				obj := `{"tools":[],"tool_choice":` + choice + `}`
+				if wrap == "lifecycle" {
+					obj = `{"type":"response.created","response":` + obj + `}`
+				}
+				got, changed := tr.restore([]byte(obj), "")
+				if !changed {
+					t.Fatalf("not changed: %s", got)
+				}
+				var root map[string]json.RawMessage
+				if err := json.Unmarshal(got, &root); err != nil {
+					t.Fatal(err)
+				}
+				if wrap == "lifecycle" {
+					var event struct {
+						Response map[string]json.RawMessage `json:"response"`
+					}
+					if err := json.Unmarshal(got, &event); err != nil {
+						t.Fatal(err)
+					}
+					root = event.Response
+				}
+				restored := string(root["tool_choice"])
+				if strings.Contains(restored, alias) || !strings.Contains(restored, `"namespace":"shell"`) || !strings.Contains(restored, `"name":"run"`) {
+					t.Fatalf("tool_choice not restored: %s", restored)
+				}
+				if name == "allowed" && !strings.Contains(restored, `"name":"unrelated"`) {
+					t.Fatalf("unrelated allowed tool changed: %s", restored)
+				}
+			})
+		}
+	}
+}
+
+func TestCopilotNamespaceSSEContentTypeIsCaseInsensitive(t *testing.T) {
+	tr, alias := newNamespaceTestTranslation(t)
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"Text/Event-Stream; charset=utf-8"}}, Body: pr}
+	req := httptest.NewRequest(http.MethodPost, "/responses", nil)
+	req = req.WithContext(context.WithValue(req.Context(), responsesNamespaceContextKey{}, tr))
+	restoreCopilotNamespaceResponse(req, resp)
+
+	go func() {
+		_, _ = fmt.Fprintf(pw, "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc-1\",\"call_id\":\"call-1\",\"name\":%q,\"arguments\":\"\"}}\n\n", alias)
+	}()
+	// The stream must deliver events before EOF; the JSON branch would block.
+	done := make(chan struct{})
+	var got []byte
+	var readErr error
+	go func() {
+		defer close(done)
+		buf := make([]byte, 4096)
+		for !strings.Contains(string(got), "\n\n") && readErr == nil {
+			var n int
+			n, readErr = resp.Body.Read(buf)
+			got = append(got, buf[:n]...)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SSE event was not delivered incrementally")
+	}
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(got), alias) || !strings.Contains(string(got), `"namespace":"shell"`) {
+		t.Fatalf("SSE event not restored: %s", got)
 	}
 }
