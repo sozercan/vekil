@@ -182,6 +182,23 @@ func responsesOverChatCapabilitiesFromRaw(raw json.RawMessage) responsesOverChat
 	}
 }
 
+// classifyResponsesCompatibility is the single decision table shared by
+// request admission (resolveResponsesCompatibility) and catalog projection
+// (annotateResponsesOverChatCatalog). allowsChat/allowsResponses describe the
+// native endpoints of the resolved provider model or explicit route contract.
+func classifyResponsesCompatibility(allowsChat, allowsResponses bool, caps responsesOverChatCapabilities) (responsesExecutionMode, string) {
+	switch {
+	case allowsResponses:
+		return responsesExecutionNative, ""
+	case !allowsChat:
+		return responsesExecutionUnsupported, "model has no native Chat Completions endpoint"
+	case caps.toolCalls != nil && !*caps.toolCalls:
+		return responsesExecutionUnsupported, "model does not advertise function-tool support"
+	default:
+		return responsesExecutionOverChat, ""
+	}
+}
+
 // resolveResponsesCompatibility decides how a public Responses request for
 // model is executed. Models that are not opted in always resolve native so the
 // existing passthrough path, including its error behavior, is unchanged.
@@ -203,19 +220,9 @@ func (h *ProxyHandler) resolveResponsesCompatibility(ctx context.Context, model 
 		compat.publicModel = route.public.id
 		// Explicit route endpoints are the validated public contract shared by
 		// every target, so one decision covers the whole failover chain.
-		if route.supportsEndpoint(providerEndpointResponses) {
-			return compat
-		}
-		if !route.supportsEndpoint(providerEndpointChatCompletions) {
-			compat.mode, compat.reason = responsesExecutionUnsupported, "model has no native Chat Completions endpoint"
-			return compat
-		}
 		caps := responsesOverChatCapabilitiesFromRaw(route.public.raw)
-		if caps.toolCalls != nil && !*caps.toolCalls {
-			compat.mode, compat.reason = responsesExecutionUnsupported, "model does not advertise function-tool support"
-			return compat
-		}
-		compat.mode = responsesExecutionOverChat
+		compat.mode, compat.reason = classifyResponsesCompatibility(
+			route.supportsEndpoint(providerEndpointChatCompletions), route.supportsEndpoint(providerEndpointResponses), caps)
 		compat.reasoningEfforts = caps.reasoningEfforts
 		return compat
 	}
@@ -229,22 +236,77 @@ func (h *ProxyHandler) resolveResponsesCompatibility(ctx context.Context, model 
 		compat.mode, compat.reason = responsesExecutionUnsupported, "model is not in the provider model catalog"
 		return compat
 	}
-	if chatRouteAllowsEndpoint(route.provider, route.owner, route.known, providerEndpointResponses) {
-		return compat
-	}
-	if route.backend != chatBackendNativeChat {
-		compat.mode, compat.reason = responsesExecutionUnsupported, "model has no native Chat Completions endpoint"
-		return compat
-	}
 	caps := responsesOverChatCapabilitiesFromRaw(route.owner.raw)
-	if caps.toolCalls != nil && !*caps.toolCalls {
-		compat.mode, compat.reason = responsesExecutionUnsupported, "model does not advertise function-tool support"
-		return compat
-	}
-	compat.mode = responsesExecutionOverChat
+	compat.mode, compat.reason = classifyResponsesCompatibility(
+		route.backend == chatBackendNativeChat,
+		chatRouteAllowsEndpoint(route.provider, route.owner, route.known, providerEndpointResponses),
+		caps)
 	compat.reasoningEfforts = caps.reasoningEfforts
 	compat.nativeChat = &route
 	return compat
+}
+
+// responsesCompatibilityCatalogField marks a /v1/models entry that Vekil
+// serves on /v1/responses through Responses-over-Chat. It is deliberately
+// separate from supported_endpoints, which keeps listing only native routes.
+const responsesCompatibilityCatalogField = "vekil_responses_compatibility"
+
+// annotateResponsesOverChatCatalog adds responsesCompatibilityCatalogField to
+// opted-in catalog entries that classify as Responses-over-Chat and returns
+// the set of annotated IDs for the Codex projection. The opt-in list is fixed
+// for the process lifetime, so the annotated body can share the normal
+// /v1/models cache and refresh cycle.
+func (h *ProxyHandler) annotateResponsesOverChatCatalog(body []byte) ([]byte, map[string]struct{}) {
+	if h == nil || len(h.responsesOverChatModels) == 0 {
+		return body, nil
+	}
+	var catalog struct {
+		Object string            `json:"object"`
+		Data   []json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(body, &catalog) != nil {
+		return body, nil
+	}
+	annotated := make(map[string]struct{})
+	for index, raw := range catalog.Data {
+		var entry struct {
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		}
+		if json.Unmarshal(raw, &entry) != nil || !h.responsesOverChatOptedIn(entry.ID) {
+			continue
+		}
+		if _, policy := h.policyPublicModelID(entry.ID); policy || len(entry.SupportedEndpoints) == 0 {
+			// An entry without endpoint metadata is treated as native everywhere.
+			continue
+		}
+		mode, _ := classifyResponsesCompatibility(
+			supportsEndpoint(entry.SupportedEndpoints, providerEndpointChatCompletions),
+			supportsEndpoint(entry.SupportedEndpoints, providerEndpointResponses),
+			responsesOverChatCapabilitiesFromRaw(raw))
+		if mode != responsesExecutionOverChat {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) != nil {
+			continue
+		}
+		fields[responsesCompatibilityCatalogField] = json.RawMessage(`"` + responsesExecutionOverChat.String() + `"`)
+		rewritten, err := json.Marshal(fields)
+		if err != nil {
+			continue
+		}
+		catalog.Data[index] = rewritten
+		annotated[strings.TrimSpace(entry.ID)] = struct{}{}
+	}
+	if len(annotated) == 0 {
+		return body, nil
+	}
+	rewritten, err := json.Marshal(catalog)
+	if err != nil {
+		return body, nil
+	}
+	return rewritten, annotated
 }
 
 // applyResponsesOverChatReasoning validates the translated reasoning_effort

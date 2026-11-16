@@ -1,0 +1,127 @@
+package proxy
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
+)
+
+type rocCatalog struct {
+	Data   []map[string]any `json:"data"`
+	Models []map[string]any `json:"models"`
+}
+
+func fetchROCCatalog(t *testing.T, h *ProxyHandler) rocCatalog {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	h.HandleModels(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var catalog rocCatalog
+	if err := json.Unmarshal(recorder.Body.Bytes(), &catalog); err != nil {
+		t.Fatal(err)
+	}
+	return catalog
+}
+
+func rocCatalogEntry(t *testing.T, entries []map[string]any, key, id string) map[string]any {
+	t.Helper()
+	for _, entry := range entries {
+		if entry[key] == id {
+			return entry
+		}
+	}
+	t.Fatalf("catalog has no %s=%q", key, id)
+	return nil
+}
+
+func TestResponsesOverChatCatalogMarksOnlyOptedInChatModels(t *testing.T) {
+	upstream := newROCUpstream(t, rocSSE(t, rocStop, "[DONE]"))
+	h := newROCHandler(t, upstream.server.URL)
+	catalog := fetchROCCatalog(t, h)
+
+	gemini := rocCatalogEntry(t, catalog.Data, "id", "gemini-test")
+	if gemini[responsesCompatibilityCatalogField] != "responses_over_chat" {
+		t.Fatalf("gemini compatibility = %v", gemini[responsesCompatibilityCatalogField])
+	}
+	if endpoints, _ := gemini["supported_endpoints"].([]any); len(endpoints) != 1 || endpoints[0] != "/chat/completions" {
+		t.Fatalf("native endpoints changed: %v", gemini["supported_endpoints"])
+	}
+	for _, id := range []string{"gpt-native", "chat-no-tools"} {
+		if value, ok := rocCatalogEntry(t, catalog.Data, "id", id)[responsesCompatibilityCatalogField]; ok {
+			t.Fatalf("%s compatibility = %v, want absent", id, value)
+		}
+	}
+
+	codexGemini := rocCatalogEntry(t, catalog.Models, "slug", "gemini-test")
+	if codexGemini["visibility"] != "list" || codexGemini["supported_in_api"] != true {
+		t.Fatalf("codex gemini = %v", codexGemini)
+	}
+	if modalities, _ := codexGemini["input_modalities"].([]any); len(modalities) != 1 || modalities[0] != "text" {
+		t.Fatalf("input_modalities = %v", codexGemini["input_modalities"])
+	}
+	if codexGemini["use_responses_lite"] != false || codexGemini["supports_search_tool"] != false || codexGemini["supports_reasoning_summaries"] != false {
+		t.Fatalf("restrictions = %v", codexGemini)
+	}
+	if levels, _ := codexGemini["supported_reasoning_levels"].([]any); len(levels) != 3 || codexGemini["default_reasoning_level"] != "medium" {
+		t.Fatalf("reasoning levels = %v default=%v", codexGemini["supported_reasoning_levels"], codexGemini["default_reasoning_level"])
+	}
+	if codexGemini["context_window"] != float64(983040) {
+		t.Fatalf("context_window = %v", codexGemini["context_window"])
+	}
+	native := rocCatalogEntry(t, catalog.Models, "slug", "gpt-native")
+	if _, ok := native["use_responses_lite"]; ok {
+		t.Fatalf("native entry gained adapter restrictions: %v", native)
+	}
+	if hidden := rocCatalogEntry(t, catalog.Models, "slug", "chat-no-tools"); hidden["visibility"] != "hide" {
+		t.Fatalf("chat-no-tools visibility = %v", hidden["visibility"])
+	}
+}
+
+func TestResponsesOverChatCatalogUnchangedWithoutOptIn(t *testing.T) {
+	upstream := newROCUpstream(t, rocSSE(t, rocStop, "[DONE]"))
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture"), logger.NewWithWriter(logger.LevelError, io.Discard), WithCopilotBaseURL(upstream.server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	catalog := fetchROCCatalog(t, h)
+	gemini := rocCatalogEntry(t, catalog.Data, "id", "gemini-test")
+	if _, ok := gemini[responsesCompatibilityCatalogField]; ok {
+		t.Fatalf("compatibility advertised without opt-in: %v", gemini)
+	}
+	codexGemini := rocCatalogEntry(t, catalog.Models, "slug", "gemini-test")
+	if codexGemini["visibility"] != "hide" || codexGemini["supported_in_api"] != false {
+		t.Fatalf("codex gemini without opt-in = %v", codexGemini)
+	}
+	if _, ok := codexGemini["use_responses_lite"]; ok {
+		t.Fatalf("restrictions added without opt-in: %v", codexGemini)
+	}
+}
+
+func TestClassifyResponsesCompatibilityTable(t *testing.T) {
+	no := false
+	cases := []struct {
+		name            string
+		chat, responses bool
+		caps            responsesOverChatCapabilities
+		want            responsesExecutionMode
+	}{
+		{"native wins", true, true, responsesOverChatCapabilities{}, responsesExecutionNative},
+		{"responses only", false, true, responsesOverChatCapabilities{}, responsesExecutionNative},
+		{"chat only", true, false, responsesOverChatCapabilities{}, responsesExecutionOverChat},
+		{"chat without tools", true, false, responsesOverChatCapabilities{toolCalls: &no}, responsesExecutionUnsupported},
+		{"neither", false, false, responsesOverChatCapabilities{}, responsesExecutionUnsupported},
+	}
+	for _, tc := range cases {
+		if got, _ := classifyResponsesCompatibility(tc.chat, tc.responses, tc.caps); got != tc.want {
+			t.Fatalf("%s: mode = %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
