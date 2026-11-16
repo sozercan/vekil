@@ -51,6 +51,65 @@ func TestColdChatRouteDiscoversResponsesOnlyCopilotModel(t *testing.T) {
 	}
 }
 
+func TestColdChatRouteCopilotVendorScopedDualEndpointRouting(t *testing.T) {
+	var chatHits, responsesHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case providerEndpointModels:
+			_, _ = w.Write([]byte(`{"object":"list","data":[` +
+				`{"id":"mai-code-2","object":"model","vendor":"Experimental","supported_endpoints":["/chat/completions","/responses"]},` +
+				`{"id":"mai-code-1.1","object":"model","vendor":"Microsoft","supported_endpoints":["/chat/completions","/responses"]},` +
+				`{"id":"gemini-dual","object":"model","vendor":"Google","supported_endpoints":["/chat/completions","/responses"]},` +
+				`{"id":"deepseek-dual","object":"model","supported_endpoints":["/chat/completions","/responses"]}` +
+				`]}`))
+		case providerEndpointResponses:
+			responsesHits.Add(1)
+			_, _ = w.Write([]byte(`{"id":"resp_mai","object":"response","created_at":1700000000,"status":"completed","model":"mai-code-2","output":[{"type":"message","id":"msg_mai","status":"completed","role":"assistant","content":[{"type":"output_text","text":"MAI_OK","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}`))
+		case providerEndpointChatCompletions:
+			chatHits.Add(1)
+			_, _ = w.Write([]byte(`{"id":"chatcmpl_native","object":"chat.completion","created":1700000000,"model":"gemini-dual","choices":[{"index":0,"message":{"role":"assistant","content":"NATIVE_OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`))
+		default:
+			t.Fatalf("unexpected upstream path %q", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	handler, err := NewProxyHandler(
+		auth.NewTestAuthenticator("fixture"),
+		logger.New(logger.LevelError),
+		WithCopilotBaseURL(upstream.URL),
+	)
+	if err != nil {
+		t.Fatalf("NewProxyHandler() error = %v", err)
+	}
+
+	for _, model := range []string{"mai-code-2", "mai-code-1.1"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"ping"}]}`, model)))
+		handler.HandleOpenAIChatCompletions(rec, req)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "MAI_OK") {
+			t.Fatalf("%s status=%d body=%s", model, rec.Code, rec.Body.String())
+		}
+	}
+
+	for _, model := range []string{"gemini-dual", "deepseek-dual"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"ping"}]}`, model)))
+		handler.HandleOpenAIChatCompletions(rec, req)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "NATIVE_OK") {
+			t.Fatalf("%s status=%d body=%s", model, rec.Code, rec.Body.String())
+		}
+	}
+
+	if got := responsesHits.Load(); got != 2 {
+		t.Fatalf("/responses hits = %d, want 2 (mai-code-2 and mai-code-1.1)", got)
+	}
+	if got := chatHits.Load(); got != 2 {
+		t.Fatalf("/chat/completions hits = %d, want 2 (gemini-dual and deepseek-dual)", got)
+	}
+}
+
 func TestColdChatRouteTimeoutFallsBackWithinBound(t *testing.T) {
 	var modelHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

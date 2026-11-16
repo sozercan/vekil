@@ -189,6 +189,7 @@ type providerModel struct {
 	dropStopSequences      bool
 	useMaxCompletionTokens bool
 	maxPromptImages        int
+	preferResponses        bool
 	disabled               bool
 	endpointsAdvertised    bool
 	raw                    json.RawMessage
@@ -3407,6 +3408,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			} else {
 				merged.maxPromptImages = max(merged.maxPromptImages, providerModelMaxPromptImagesFromRaw(raw))
 			}
+			merged.preferResponses = providerModelPrefersResponsesFromRaw(baseRaw)
 			merged.raw = mergeProviderModelRaw(baseRaw, merged.supportedEndpoints)
 			models[index] = merged
 			continue
@@ -3420,6 +3422,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			supportedEndpoints:  supportedEndpoints,
 			parallelToolCalls:   providerModelParallelToolCallsFromRaw(raw),
 			maxPromptImages:     providerModelMaxPromptImagesFromRaw(raw),
+			preferResponses:     providerModelPrefersResponsesFromRaw(raw),
 			disabled:            disabled,
 			endpointsAdvertised: endpointsAdvertised,
 			raw:                 mergeProviderModelRaw(raw, supportedEndpoints),
@@ -3467,6 +3470,26 @@ func providerModelMaxPromptImagesFromRaw(raw json.RawMessage) int {
 		return 0
 	}
 	return int(limit)
+}
+
+// providerModelPrefersResponsesFromRaw reports whether a discovered Copilot catalog entry's
+// vendor requires preferring /responses when both /chat/completions and /responses are listed.
+// Copilot advertises ["/chat/completions", "/responses"] for Microsoft / Experimental MAI models
+// (such as mai-code-2*) while serving them only on /responses, whereas Google/Anthropic/OpenAI
+// dual-endpoint or native-Chat entries retain Vekil's native /chat/completions preference.
+func providerModelPrefersResponsesFromRaw(raw json.RawMessage) bool {
+	var parsed struct {
+		Vendor string `json:"vendor"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(parsed.Vendor)) {
+	case "microsoft", "experimental":
+		return true
+	default:
+		return false
+	}
 }
 
 func openRouterModelSupportsTools(supportedParams []string) bool {

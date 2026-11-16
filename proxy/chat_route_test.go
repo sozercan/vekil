@@ -74,6 +74,85 @@ func TestChooseChatRoute_BothPrefersNativeChat(t *testing.T) {
 	}
 }
 
+func TestChooseChatRoute_CopilotVendorScopedResponsesPreference(t *testing.T) {
+	copilot := &providerRuntime{id: "copilot", kind: providerTypeCopilot}
+	nonCopilot := &providerRuntime{id: "other", kind: providerTypeOpenAICompatible}
+
+	for _, tc := range []struct {
+		name            string
+		provider        *providerRuntime
+		known           bool
+		preferResponses bool
+		endpoints       []string
+		wantBackend     chatBackend
+		wantEndpoint    string
+	}{
+		{
+			name:            "Copilot Experimental dual-endpoint prefers Responses",
+			provider:        copilot,
+			known:           true,
+			preferResponses: true,
+			endpoints:       []string{providerEndpointChatCompletions, providerEndpointResponses},
+			wantBackend:     chatBackendResponses,
+			wantEndpoint:    providerEndpointResponses,
+		},
+		{
+			name:            "Copilot Google/OpenAI dual-endpoint keeps native Chat",
+			provider:        copilot,
+			known:           true,
+			preferResponses: false,
+			endpoints:       []string{providerEndpointChatCompletions, providerEndpointResponses},
+			wantBackend:     chatBackendNativeChat,
+			wantEndpoint:    providerEndpointChatCompletions,
+		},
+		{
+			name:            "Copilot Microsoft Chat-only keeps native Chat",
+			provider:        copilot,
+			known:           true,
+			preferResponses: true,
+			endpoints:       []string{providerEndpointChatCompletions},
+			wantBackend:     chatBackendNativeChat,
+			wantEndpoint:    providerEndpointChatCompletions,
+		},
+		{
+			name:            "Copilot endpoint-less entry keeps native Chat",
+			provider:        copilot,
+			known:           true,
+			preferResponses: true,
+			endpoints:       nil,
+			wantBackend:     chatBackendNativeChat,
+			wantEndpoint:    providerEndpointChatCompletions,
+		},
+		{
+			name:            "Non-Copilot provider keeps native Chat even with preferResponses",
+			provider:        nonCopilot,
+			known:           true,
+			preferResponses: true,
+			endpoints:       []string{providerEndpointChatCompletions, providerEndpointResponses},
+			wantBackend:     chatBackendNativeChat,
+			wantEndpoint:    providerEndpointChatCompletions,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := providerModel{
+				publicID:           "model-under-test",
+				upstreamModel:      "model-under-test",
+				providerID:         tc.provider.id,
+				supportedEndpoints: tc.endpoints,
+				preferResponses:    tc.preferResponses,
+			}
+			route, err := chooseChatRoute(tc.provider, owner, tc.known, owner.publicID)
+			if err != nil {
+				t.Fatalf("chooseChatRoute() error = %v", err)
+			}
+			if route.backend != tc.wantBackend || route.nativeEndpoint != tc.wantEndpoint {
+				t.Fatalf("route = backend %v endpoint %q, want backend %v endpoint %q",
+					route.backend, route.nativeEndpoint, tc.wantBackend, tc.wantEndpoint)
+			}
+		})
+	}
+}
+
 func TestChooseChatRoute_NeitherRejectsWithoutUpstream(t *testing.T) {
 	provider := &providerRuntime{id: "chat-provider", kind: providerTypeOpenAICompatible}
 	owner := providerModel{

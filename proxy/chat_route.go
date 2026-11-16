@@ -44,6 +44,11 @@ func chooseChatRouteWithOwner(provider *providerRuntime, owner providerModel, kn
 		}
 	}
 
+	if provider.kind == providerTypeCopilot && known && owner.preferResponses &&
+		supportsEndpoint(owner.supportedEndpoints, providerEndpointResponses) &&
+		provider.supportsEndpoint(providerEndpointResponses) {
+		return newResolvedChatRouteWithOwner(provider, owner, known, model, providerEndpointResponses, chatBackendResponses, ownerSnapshot), nil
+	}
 	if chatRouteAllowsEndpoint(provider, owner, known, providerEndpointChatCompletions) {
 		return newResolvedChatRouteWithOwner(provider, owner, known, model, providerEndpointChatCompletions, chatBackendNativeChat, ownerSnapshot), nil
 	}

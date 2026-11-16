@@ -92,7 +92,7 @@ See [responses-websocket.md](responses-websocket.md) for tuning flags.
 
 This adapter also serves internal v1 policy destinations selected from the public Chat surface. A policy public ID never becomes a public Responses model ID, but its selected internal terminal route may use the same process-owned conversion and replay store.
 
-A model that natively allows `/responses` but not `/chat/completions` can also serve Vekil's Chat-compatible public surfaces: OpenAI Chat Completions, translated Anthropic Messages, translated Gemini generation, both translated count-token probes, and dashboard insights. Native Chat remains preferred when a model supports both endpoints.
+A model that natively allows `/responses` but not `/chat/completions` can also serve Vekil's Chat-compatible public surfaces: OpenAI Chat Completions, translated Anthropic Messages, translated Gemini generation, both translated count-token probes, and dashboard insights. Native Chat remains preferred when a model supports both endpoints, except for discovered GitHub Copilot `Microsoft`/`Experimental` catalog entries that advertise `/responses`.
 
 This adapter uses low-level provider transport to `/responses`; it does **not** call the public `POST /v1/responses` handler and therefore does not enter compaction expansion, replay-`413` summarization, websocket session state, lineage reset, or the public Responses tool-optimizer pipeline. Its streaming decoder emits typed internal Chat events that the OpenAI, Anthropic, and Gemini adapters consume directly rather than synthesizing and reparsing Chat SSE.
 
