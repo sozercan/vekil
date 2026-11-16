@@ -183,6 +183,38 @@ func TestDecisionsExhaustedRetriesKeepUpstreamStatusAndMessage(t *testing.T) {
 	}
 }
 
+// The catalog fetch runs on the proxy lifecycle, so it can fail after the
+// client has left; that client-first abort is recorded as 499.
+func TestDecisionsClientCancelDuringCatalogRecords499(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(started) })
+		<-release
+		http.Error(w, "catalog unavailable", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(upstream.Close)
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithCopilotBaseURL(upstream.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.retryBaseDelay = time.Nanosecond
+	t.Cleanup(h.BeginShutdown)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{"model":"example-decisions-model","input":"x"}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { defer close(done); h.HandleDecisions(rec, req) }()
+	waitForLifecycleSignal(t, started, "catalog fetch")
+	cancel()
+	close(release)
+	waitForLifecycleSignal(t, done, "decisions handler")
+	if rec.Code != 499 {
+		t.Fatalf("status/body = %d %s, want 499", rec.Code, rec.Body.String())
+	}
+}
+
 func TestDecisionsTruncatedUpstreamBodyReturnsBadGateway(t *testing.T) {
 	upstream := &decisionsTestUpstream{response: `{"answers":[]}`, truncate: true}
 	h := newDecisionsTestHandler(t, upstream)

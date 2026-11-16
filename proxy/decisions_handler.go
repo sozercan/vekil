@@ -70,6 +70,8 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 	supported, err := h.catalogModelSupportsEndpoint(catalogCtx, r.Context(), model, endpoint)
 	if err != nil {
 		if r.Context().Err() != nil {
+			// Record a client-first abort as 499, as Responses does.
+			w.WriteHeader(499)
 			return
 		}
 		if h.handleShutdownError(w, r, catalogCtx, err) {
@@ -91,16 +93,9 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.postJSONEndpointWithHeadersForModel(upstreamCtx, endpoint, body, nil, model)
 	if err != nil {
-		if h.handleShutdownError(w, r, upstreamCtx, err) {
-			return
-		}
-		statusCode := upstreamStatusCode(err, http.StatusBadGateway)
-		h.log.Error("upstream request failed", logger.F("endpoint", summaryEndpoint), logger.Err(err))
-		if statusCode == http.StatusBadRequest {
-			writeOpenAIError(w, statusCode, err.Error(), "invalid_request_error")
-			return
-		}
-		writeOpenAIUpstreamRequestFailure(w, statusCode, err)
+		// Shared with Responses: a shutdown 503, a client-first 499 during
+		// admission, and the standard upstream failure shapes.
+		h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, summaryEndpoint, err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
