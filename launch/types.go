@@ -11,12 +11,20 @@ import (
 // PolicyModelOwner is the /v1/models owner for policy-routing public IDs.
 const PolicyModelOwner = "vekil-policy"
 
+// ResponsesOverChatCompatibility is the /v1/models
+// vekil_responses_compatibility value for an opted-in Chat-only model that
+// Vekil serves on /v1/responses through its Responses-over-Chat adapter.
+const ResponsesOverChatCompatibility = "responses_over_chat"
+
 // ModelInfo is the launcher-relevant subset of one /v1/models entry.
 type ModelInfo struct {
-	ID                               string            `json:"id"`
-	Name                             string            `json:"name,omitempty"`
-	OwnedBy                          string            `json:"owned_by,omitempty"`
-	SupportedEndpoints               []string          `json:"supported_endpoints,omitempty"`
+	ID                 string   `json:"id"`
+	Name               string   `json:"name,omitempty"`
+	OwnedBy            string   `json:"owned_by,omitempty"`
+	SupportedEndpoints []string `json:"supported_endpoints,omitempty"`
+	// ResponsesCompatibility is Vekil's served Responses compatibility, kept
+	// separate from the native SupportedEndpoints.
+	ResponsesCompatibility           string            `json:"vekil_responses_compatibility,omitempty"`
 	Capabilities                     ModelCapabilities `json:"capabilities,omitempty"`
 	ContextWindow                    *int64            `json:"context_window,omitempty"`
 	MaxContextWindow                 *int64            `json:"max_context_window,omitempty"`

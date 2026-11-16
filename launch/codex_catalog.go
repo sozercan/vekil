@@ -125,12 +125,12 @@ func buildCodexModelCatalog(executable resolvedExecutable, environment []string,
 	template["supported_reasoning_levels"] = levels
 	if len(validEfforts) > 0 {
 		template["default_reasoning_level"] = defaultReasoningEffort(validEfforts)
-	} else if strings.TrimSpace(model.OwnedBy) == PolicyModelOwner {
+	} else if chatBackedCodexModel(model) {
 		// An explicit "none" default makes Codex serialize
-		// reasoning:{effort:"none"}. Policy models whose public contract does
-		// not advertise reasoning controls must instead leave the effort unset;
-		// Codex then emits an empty reasoning object, which the compatibility
-		// translator correctly treats as no reasoning_effort override.
+		// reasoning:{effort:"none"}. Chat-backed models whose public contract
+		// does not advertise reasoning controls must instead leave the effort
+		// unset; Codex then emits an empty reasoning object, which the
+		// compatibility translator treats as no reasoning_effort override.
 		delete(template, "default_reasoning_level")
 	} else {
 		// Direct Responses models keep Codex's explicit non-reasoning control;
@@ -142,27 +142,35 @@ func buildCodexModelCatalog(executable resolvedExecutable, environment []string,
 	template["support_verbosity"] = false
 	template["supports_search_tool"] = false
 	template["experimental_supported_tools"] = []interface{}{}
-	if strings.TrimSpace(model.OwnedBy) == PolicyModelOwner {
-		applyPolicyCodexCatalogRestrictions(template)
+	if chatBackedCodexModel(model) {
+		applyChatBackedCodexCatalogRestrictions(template)
 	}
 	template["supports_parallel_tool_calls"] = model.Capabilities.Supports.ParallelToolCalls
 	template["supports_image_detail_original"] = false
 	template["input_modalities"] = []string{"text"}
-	if model.Capabilities.Supports.Vision {
+	// Responses-over-Chat carries text only, even for a vision-capable model.
+	if model.Capabilities.Supports.Vision && !isResponsesOverChatModel(model) {
 		template["input_modalities"] = []string{"text", "image"}
 	}
 	return json.Marshal(codexCatalog{Models: []map[string]interface{}{template}})
 }
 
-func applyPolicyCodexCatalogRestrictions(template map[string]interface{}) {
-	// Policy Responses compatibility translates only standard function and
-	// namespace-child function tools into canonical Chat tools. Disable donor
-	// modes that emit custom/code tools or Responses-Lite-only request items.
+func chatBackedCodexModel(model ModelInfo) bool {
+	return strings.TrimSpace(model.OwnedBy) == PolicyModelOwner || isResponsesOverChatModel(model)
+}
+
+// applyChatBackedCodexCatalogRestrictions describes the capabilities of
+// Vekil's bounded Responses-to-Chat translation, which serves both policy and
+// Responses-over-Chat models. These are adapter limits, not policy semantics.
+func applyChatBackedCodexCatalogRestrictions(template map[string]interface{}) {
+	// The translation carries only standard function and namespace-child
+	// function tools into canonical Chat tools. Disable donor modes that emit
+	// custom/code tools or Responses-Lite-only request items.
 	template["apply_patch_tool_type"] = nil
 	template["use_responses_lite"] = false
 	delete(template, "tool_mode")
-	// Speed tiers are provider-specific Responses semantics. Policy routes
-	// select a Chat terminal and must not inherit donor-model tier controls.
+	// Speed tiers are provider-specific Responses semantics. Chat-backed
+	// models must not inherit donor-model tier controls.
 	template["additional_speed_tiers"] = []interface{}{}
 	template["service_tiers"] = []interface{}{}
 }
