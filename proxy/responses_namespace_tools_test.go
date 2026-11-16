@@ -60,12 +60,12 @@ func TestCopilotNamespaceRoundTrip(t *testing.T) {
 					call := fmt.Sprintf(`{"type":"function_call","id":"fc-1","call_id":"call-1","name":%q,"arguments":%q}`, alias, `{"name":"`+alias+`"}`)
 					if stream {
 						w.Header().Set("Content-Type", "text/event-stream")
-						fmt.Fprintf(w, "data: {\"type\":\"response.output_item.added\",\"item\":%s}\n\n", call)
-						fmt.Fprint(w, "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\n\n")
-						fmt.Fprintf(w, "data: {\"type\":\"response.output_item.done\",\"item\":%s}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[%s]}}\n\n", call, call)
+						_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.output_item.added\",\"item\":%s}\n\n", call)
+						_, _ = fmt.Fprint(w, "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\n\n")
+						_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.output_item.done\",\"item\":%s}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[%s]}}\n\n", call, call)
 					} else {
 						w.Header().Set("Content-Type", "application/json")
-						fmt.Fprintf(w, `{"output":[%s]}`, call)
+						_, _ = fmt.Fprintf(w, `{"output":[%s]}`, call)
 					}
 				}))
 				defer upstream.Close()
@@ -94,7 +94,7 @@ func TestCopilotNamespaceRoundTrip(t *testing.T) {
 						t.Fatal(err)
 					}
 					raw, err := io.ReadAll(resp.Body)
-					resp.Body.Close()
+					_ = resp.Body.Close()
 					if err != nil {
 						t.Fatal(err)
 					}

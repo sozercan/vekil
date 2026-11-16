@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -43,7 +44,7 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 	flatten := func(raw json.RawMessage) (json.RawMessage, error) {
 		parsed, err := parsePolicyResponsesTools(raw)
 		if err != nil {
-			return nil, fmt.Errorf("Copilot Grok supports function tools only: %w; disable hosted web search in the client and use a function-based search integration", err)
+			return nil, fmt.Errorf("only function tools are supported for Copilot Grok: %w; disable hosted web search in the client and use a function-based search integration", err)
 		}
 		out := make([]map[string]any, 0, len(parsed))
 		for _, tool := range parsed {
@@ -106,7 +107,7 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 		}
 		rewrite := func(item map[string]json.RawMessage) error {
 			if rawJSONString(item["type"]) != "function" {
-				return fmt.Errorf("Copilot Grok tool_choice supports function tools only")
+				return errors.New("only function tool_choice values are supported for Copilot Grok")
 			}
 			d := policyResponsesToolDescriptor{Kind: "function", Name: rawJSONString(item["name"]), Namespace: rawJSONString(item["namespace"])}
 			alias, err := register(d)
@@ -233,7 +234,7 @@ func (b *responsesNamespaceJSONBody) Read(p []byte) (int, error) {
 			return 0, err
 		}
 		if len(raw) > maxLargeRequestBodySize {
-			return 0, fmt.Errorf("Responses tool translation exceeds response size limit")
+			return 0, errors.New("responses tool translation exceeds response size limit")
 		}
 		if rewritten, ok := b.tr.restore(raw, ""); ok {
 			raw = rewritten
