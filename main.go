@@ -394,6 +394,7 @@ type serveFlags struct {
 	policyRoutingAllowRemote        *bool
 	logLevel                        *string
 	streamingUpstreamTimeout        *time.Duration
+	responsesOverChatModels         *string
 	copilotEditorVersion            *string
 	copilotPluginVersion            *string
 	copilotUserAgent                *string
@@ -425,6 +426,7 @@ func registerServeFlags(fs *flag.FlagSet) serveFlags {
 		policyRoutingAllowRemote:        fs.Bool("policy-routing-allow-remote-single-tenant", getEnvBool("POLICY_ROUTING_ALLOW_REMOTE_SINGLE_TENANT", false), "Acknowledge single-tenant operation when policy routing listens beyond loopback"),
 		logLevel:                        fs.String("log-level", getEnv("LOG_LEVEL", "info"), "Log level"),
 		streamingUpstreamTimeout:        fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests"),
+		responsesOverChatModels:         fs.String("responses-over-chat-models", getEnv("RESPONSES_OVER_CHAT_MODELS", ""), "Comma-separated public model IDs to serve on POST /v1/responses through their native Chat Completions endpoint when they have no native Responses endpoint"),
 		copilotEditorVersion:            fs.String("copilot-editor-version", getEnv("COPILOT_EDITOR_VERSION", ""), "Upstream Copilot editor-version header"),
 		copilotPluginVersion:            fs.String("copilot-plugin-version", getEnv("COPILOT_PLUGIN_VERSION", ""), "Upstream Copilot editor-plugin-version header"),
 		copilotUserAgent:                fs.String("copilot-user-agent", getEnv("COPILOT_USER_AGENT", ""), "Upstream Copilot user-agent header"),
@@ -726,6 +728,7 @@ func runServe() {
 			proxy.WithProvidersConfig(providersCfg),
 			proxy.WithStateBindingsConfig(stateBindings),
 			proxy.WithPolicyRoutingMode(policyRoutingMode),
+			proxy.WithResponsesOverChatModels(*serve.responsesOverChatModels),
 			proxy.WithDeferredDynamicProviderModelValidation(providersCfg.UsesCopilot()),
 		),
 	)

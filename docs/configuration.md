@@ -43,6 +43,7 @@ configuration block, default application-data paths, retention, and pruning.
 | `--env-file` | — | unset | Load `KEY=value` lines (`#` comments, optional `export ` and quotes) before reading other settings; file values override the process environment. Used by [`vekil service`](getting-started.md#run-as-a-background-service) |
 | — | `INBOUND_AUTH_TOKEN` | unset | Shared caller token; see [Caller authentication](#caller-authentication). Environment or `--env-file` only, there is no flag |
 | `--streaming-upstream-timeout` | `STREAMING_UPSTREAM_TIMEOUT` | `1h0m0s` | Timeout for streaming upstream inference requests |
+| `--responses-over-chat-models` | `RESPONSES_OVER_CHAT_MODELS` | unset | Comma-separated public model IDs that may serve `POST /v1/responses` through their native Chat Completions endpoint when they have no native Responses endpoint. Off by default; see [Responses-over-Chat](responses.md#responses-compatibility-over-a-native-chat-model-responses-over-chat). The tray app reads the environment variable. |
 
 Native CLI and tray-app runs default to `127.0.0.1`. Container deployments that publish the proxy port must bind to `0.0.0.0`; the official image and sample Kubernetes manifest set `HOST=0.0.0.0` for that path.
 

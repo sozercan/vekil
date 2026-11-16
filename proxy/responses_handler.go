@@ -315,6 +315,20 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		h.handlePolicyResponses(w, r, bodyBytes, publicID)
 		return
 	}
+	if h.responsesOverChatOptedIn(requestedModel) {
+		// Select the compatibility path before native Responses admission so an
+		// opted-in Chat-only model never reaches the upstream /responses route.
+		switch compat := h.resolveResponsesCompatibility(r.Context(), requestedModel); compat.mode {
+		case responsesExecutionOverChat:
+			h.handleResponsesOverChat(w, r, bodyBytes, compat)
+			return
+		case responsesExecutionUnsupported:
+			writeOpenAIError(w, http.StatusBadRequest,
+				fmt.Sprintf("model %q is enabled for Responses-over-Chat but cannot use it: %s", requestedModel, compat.reason),
+				"invalid_request_error")
+			return
+		}
+	}
 	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointResponses)
 	if err != nil {
 		h.writeResponsesUpstreamRequestFailure(w, r, nil, "responses_admission", err)

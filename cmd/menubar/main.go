@@ -301,6 +301,7 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 			proxy.WithProvidersConfig(cfg),
 			proxy.WithStateBindingsConfig(stateBindings),
 			proxy.WithPolicyRoutingMode(policyMode),
+			proxy.WithResponsesOverChatModels(os.Getenv("RESPONSES_OVER_CHAT_MODELS")),
 			proxy.WithDeferredDynamicProviderModelValidation(cfg.UsesCopilot()),
 		),
 	)

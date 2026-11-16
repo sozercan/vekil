@@ -102,6 +102,48 @@ The Chat adapter is intentionally narrower than direct Responses passthrough. It
 
 For privacy and stateless continuation, omitted Chat storage is materialized as `store: false`, and the adapter internally requests encrypted reasoning content. Streamed replay state is charged cumulatively while deltas arrive, so item, call, and byte limits fail before unbounded in-memory growth. Hidden reasoning-progress events are validated and suppressed; authoritative terminal reasoning items are retained only when a function-call turn needs replay.
 
+## Responses compatibility over a native Chat model (Responses-over-Chat)
+
+Responses-over-Chat is the opposite direction of the Chat adapter above. It lets a Responses client such as Codex call a model whose provider exposes only native `/chat/completions`, for example Copilot's Gemini models. It is **off by default** and opted in per public model ID:
+
+```bash
+vekil --responses-over-chat-models gemini-3.8-flash
+# or
+RESPONSES_OVER_CHAT_MODELS=gemini-3.8-flash,gemini-4-hydrogen vekil
+```
+
+The macOS/Linux tray app reads the same `RESPONSES_OVER_CHAT_MODELS` environment variable. Remove the model from the list (or unset the variable) to disable the feature; the model then returns to the unchanged native passthrough.
+
+Vekil resolves one execution mode per opted-in model, bound to the selected provider or explicit route rather than to a display name:
+
+| Resolved mode | When | Behavior |
+| --- | --- | --- |
+| `native_responses` | The model, or every target of its explicit route, allows native `/responses` | Unchanged native passthrough. GPT and Grok models are never moved to Chat because they also expose Chat. |
+| `responses_over_chat` | The model is in the provider catalog, allows native `/chat/completions` but not `/responses`, and does not advertise `tool_calls: false` | Translated to canonical Chat and executed through the shared Chat execution seam pinned to native `/chat/completions`. |
+| `unsupported` | Unknown or undiscovered model, internal route, no native Chat endpoint, or no function-tool support | `400 invalid_request_error` before any upstream send. |
+
+Startup fails if a listed ID is a schema-v2 policy profile (policy IDs already have their own Responses adapter) or names an internal route. The launcher model allowlist and provider model filters still apply. Native endpoint metadata is unchanged: a Chat-only model keeps `supported_endpoints: ["/chat/completions"]`; Vekil never appends `/responses`.
+
+Execution reuses provider authentication, Copilot headers, the explicit-route executor, retries, and route commitment rules. It never calls the classifier, never substitutes another model, and never sends an upstream `/responses` inference request. Requests always stream upstream. Streaming clients receive genuinely incremental Responses SSE (`response.created`, `response.in_progress`, text and function-argument deltas as they arrive, item/part completion, then `response.completed`, `response.incomplete`, or `response.failed`); non-streaming clients receive the final object from the same state machine. An explicit route may switch targets only before semantic output, exactly as for native Chat streams. When the client disconnects, the upstream request is canceled.
+
+Supported request contract (strict; anything else is rejected with an actionable `invalid_request_error`):
+
+| Area | Supported | Rejected |
+| --- | --- | --- |
+| Transport | HTTP `POST /v1/responses`, JSON or SSE | The proxy-owned websocket bridge (`GET /v1/responses`) rejects turns for these models; configure the client for HTTP |
+| State | Full-history, `store: false` or omitted | `store: true`, `previous_response_id`, `conversation` |
+| Input | `instructions`, `message` items (`system`, `developer`, `user`, `assistant`) with text parts, `function_call`, `function_call_output` (string or text parts) | Images, `reasoning`/encrypted-reasoning items from another backend, compaction items, Vekil `call_vekil_*` replay IDs minted by a Responses-backed Chat model |
+| Tools | `function` and `namespace` children, `tool_choice` `none`/`auto`/`required`/named function, `parallel_tool_calls`, omitted versus explicit `strict` | Hosted (`web_search`, `file_search`, `image_generation`, `mcp`, `tool_search`), `custom`/freeform tools, `defer_loading: true` |
+| Output | `text.format` `text`, `json_object`, `json_schema`; `max_output_tokens`; `temperature`; `top_p` | — |
+| Reasoning | `reasoning.effort` when it is one of the model's advertised `reasoning_effort` values; `reasoning.summary` accepted as a no-op; an explicit `none` on a model without reasoning controls is dropped | Any other effort |
+| Metadata | `include: ["reasoning.encrypted_content"]`, `prompt_cache_key`, `metadata`, `client_metadata`, `safety_identifier`, `user` (validated, not forwarded) | Unknown fields |
+
+Bounds: 10 MiB request, 15 MiB translated Chat body, 16,384 input items, 1,024 flattened function tools, and 64 MiB of streamed text plus arguments per turn. Tools and history are never truncated.
+
+Tool names are mapped to stable, collision-checked Chat aliases (`vkl1__...`) when a namespace or a non-Chat-safe name requires it, and restored to the original `namespace`/`name` before a call is exposed. Interleaved parallel calls whose IDs, names, and argument fragments arrive in separate chunks are tracked independently. Argument deltas stream as they arrive, but `response.function_call_arguments.done` and the executable `response.output_item.done` are emitted only after a successful finish with valid JSON arguments. A `length` or `content_filter` finish ends as `response.incomplete` and never exposes a partial function call. A stream that ends before a finish reason, an upstream error event, or an invalid tool call ends as `response.failed` (or an HTTP error for non-streaming requests). Copilot's Gemini models may report `finish_reason: "stop"` for a turn that ends in function calls; complete calls are still returned. Upstream usage is preserved when reported and is `null` otherwise.
+
+Gemini thought signatures: Copilot returns an opaque `reasoning_opaque` field alongside Gemini tool calls. Live checks on 2026-11-16 with `gemini-3.8-flash` and `gemini-4-hydrogen` showed Copilot accepts tool-call replay without it, so v1 does not carry it and holds no replay state. If Copilot later requires it, the upstream `400` is returned to the client rather than hidden.
+
 ## `POST /v1/responses/compact`
 
 Compatibility shim for environments expecting `/responses/compact`. The proxy rewrites the request into a normal upstream `/responses` call with a compaction prompt, then returns:

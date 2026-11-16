@@ -1458,6 +1458,19 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			}
 			return err
 		}
+		if h.responsesOverChatOptedIn(request.Model) && h.resolveResponsesCompatibility(s.ctx, request.Model).mode != responsesExecutionNative {
+			// Responses-over-Chat is an HTTP-only adapter. Never forward these turns
+			// to an upstream Responses transport the model does not have.
+			err := &providerRequestError{
+				statusCode: http.StatusBadRequest,
+				err:        fmt.Errorf("model %q is served through Responses-over-Chat, which supports HTTP POST %s only; disable websockets for this client", strings.TrimSpace(request.Model), "/v1/responses"),
+			}
+			s.recordTurnStats(h, strings.TrimSpace(request.Model), "", "", http.StatusBadRequest, responsesUsage{}, nil)
+			if writeErr := s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil); writeErr != nil {
+				return writeErr
+			}
+			return err
+		}
 	}
 	s.syncTurnMetadata(request)
 	if request.PreviousResponseID == "" {
