@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -225,39 +226,50 @@ func TestDecisionsTruncatedUpstreamBodyReturnsBadGateway(t *testing.T) {
 	}
 }
 
+// Shutdown that cancels the catalog fetch wins over a client that has also
+// left, so both cases return the stats-suppressed 503 rather than 499.
 func TestDecisionsCatalogShutdownReturnsShutdown503(t *testing.T) {
-	started := make(chan struct{})
-	canceled := make(chan struct{})
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-		close(started)
-		<-r.Context().Done()
-		close(canceled)
-	}))
-	defer upstream.Close()
-	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithCopilotBaseURL(upstream.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{"model":"example-decisions-model","input":"x"}`))
-	ctx, summary := WithRequestSummary(req.Context())
-	req = req.WithContext(ctx)
-	rec := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() { defer close(done); h.HandleDecisions(rec, req) }()
-	waitForLifecycleSignal(t, started, "catalog fetch to start")
-	h.BeginShutdown()
-	waitForLifecycleSignal(t, canceled, "catalog fetch cancellation")
-	waitForLifecycleSignal(t, done, "decisions handler")
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status/body = %d %s, want shutdown 503", rec.Code, rec.Body.String())
-	}
-	if !summary.StatsSuppressed() {
-		t.Fatal("decisions catalog shutdown was not stats-suppressed")
+	for _, clientLeft := range []bool{false, true} {
+		t.Run(fmt.Sprintf("client left %v", clientLeft), func(t *testing.T) {
+			started := make(chan struct{})
+			canceled := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				close(started)
+				<-r.Context().Done()
+				close(canceled)
+			}))
+			defer upstream.Close()
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.NewWithWriter(logger.LevelError, io.Discard), WithCopilotBaseURL(upstream.URL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			clientCtx, cancelClient := context.WithCancel(context.Background())
+			defer cancelClient()
+			req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{"model":"example-decisions-model","input":"x"}`)).WithContext(clientCtx)
+			ctx, summary := WithRequestSummary(req.Context())
+			req = req.WithContext(ctx)
+			rec := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() { defer close(done); h.HandleDecisions(rec, req) }()
+			waitForLifecycleSignal(t, started, "catalog fetch to start")
+			if clientLeft {
+				cancelClient()
+			}
+			h.BeginShutdown()
+			waitForLifecycleSignal(t, canceled, "catalog fetch cancellation")
+			waitForLifecycleSignal(t, done, "decisions handler")
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status/body = %d %s, want shutdown 503", rec.Code, rec.Body.String())
+			}
+			if !summary.StatsSuppressed() {
+				t.Fatal("decisions catalog shutdown was not stats-suppressed")
+			}
+		})
 	}
 }
 

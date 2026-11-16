@@ -69,12 +69,12 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 	defer catalogCancel()
 	supported, err := h.catalogModelSupportsEndpoint(catalogCtx, r.Context(), model, endpoint)
 	if err != nil {
+		if h.handleShutdownError(w, r, catalogCtx, err) {
+			return
+		}
 		if r.Context().Err() != nil {
 			// Record a client-first abort as 499, as Responses does.
 			w.WriteHeader(499)
-			return
-		}
-		if h.handleShutdownError(w, r, catalogCtx, err) {
 			return
 		}
 		h.log.Error("model catalog unavailable", logger.F("endpoint", summaryEndpoint), logger.Err(err))
