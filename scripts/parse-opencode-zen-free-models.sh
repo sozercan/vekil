@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ "$#" -ne 1 ]]; then
-  printf 'usage: %s <zen.mdx|->\n' "$0" >&2
+  printf 'usage: %s <models.mdx|->\n' "$0" >&2
   exit 2
 fi
 
@@ -120,8 +120,14 @@ END {
       continue
     }
 
+    # Console docs publish per-family bases such as
+    # https://opencode.ai/inference/openai/v1/chat/completions; the legacy Zen
+    # page used https://opencode.ai/zen/v1/chat/completions. Both reduce to the
+    # same native endpoint path.
     endpoint = endpoint_url_by_label[label]
-    sub(/^https:\/\/opencode\.ai\/zen\/v1/, "", endpoint)
+    if (!sub(/^https:\/\/opencode\.ai\/inference\/[a-z]+\/v1\//, "/", endpoint)) {
+      sub(/^https:\/\/opencode\.ai\/zen\/v1\//, "/", endpoint)
+    }
     if (endpoint != "/chat/completions" && endpoint != "/responses" && endpoint != "/messages" && endpoint != "/systemone") {
       fail("unsupported endpoint for " label ": " endpoint_url_by_label[label])
       continue

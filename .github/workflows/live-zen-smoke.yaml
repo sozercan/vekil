@@ -42,9 +42,9 @@ jobs:
 
       - name: Parse current OpenCode Zen free labels
         env:
-          OPENCODE_ZEN_DOC_URL: https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx
+          OPENCODE_ZEN_DOC_URL: https://raw.githubusercontent.com/anomalyco/opencode/dev/services/site/src/docs/content/console/models.mdx
         run: |
-          doc="$RUNNER_TEMP/opencode-zen.mdx"
+          doc="$RUNNER_TEMP/opencode-zen-models.mdx"
           models="$RUNNER_TEMP/opencode-zen-free-models.tsv"
           curl --fail --silent --show-error --location --retry 3 \
             --connect-timeout 10 --max-time 60 \

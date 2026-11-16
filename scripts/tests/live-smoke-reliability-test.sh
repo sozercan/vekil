@@ -729,23 +729,40 @@ mkdir -p "${zen_parser_dir}"
 cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
 ## Endpoints
 
-| Model | Model ID | Endpoint | AI SDK Package |
-| ----- | -------- | -------- | -------------- |
-| Paid Model | paid-model | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
-| Big Pickle | big-pickle | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
-| Ox Alpha Free | x-preview-f-free | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
-| Muse Spark Free | muse-spark-free | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
-| Jev Free | jev-free | `https://opencode.ai/zen/v1/systemone` | - |
+You can also access the models directly through the following API endpoints.
+
+<div class="docs-table-scroll" role="region" aria-label="Console model endpoints" tabIndex={0}>
+
+| Model           | Model ID         | Endpoint                                                   | AI SDK Package              |
+| --------------- | ---------------- | ---------------------------------------------------------- | --------------------------- |
+| Paid Model      | paid-model       | `https://opencode.ai/inference/openai/v1/responses`        | `@ai-sdk/openai`            |
+| Big Pickle      | big-pickle       | `https://opencode.ai/inference/openai/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+| Ox Alpha Free   | x-preview-f-free | `https://opencode.ai/inference/openai/v1/chat/completions` | `@ai-sdk/openai-compatible` |
+| Muse Spark Free | muse-spark-free  | `https://opencode.ai/inference/openai/v1/responses`        | `@ai-sdk/openai`            |
+| Jev Free        | jev-free         | `https://opencode.ai/inference/systemone/v1/systemone`     | -                           |
+
+</div>
+
+### Model list
+
+```bash
+curl https://opencode.ai/inference/v1/models
+```
 
 ## Pricing
 
-| Model | Input | Output | Cached Read | Cached Write |
-| ----- | ----- | ------ | ----------- | ------------ |
-| Paid Model | $1.00 | $2.00 | - | - |
-| Big Pickle | Free | Free | Free | - |
-| Ox Alpha Free | Free | Free | Free | - |
-| Muse Spark Free | Free | Free | Free | - |
-| Jev Free | Free | Free | - | - |
+<div class="docs-table-scroll" role="region" aria-label="Console model pricing" tabIndex={0}>
+
+| Model                    | Input | Output | Cached Read | Cached Write |
+| ------------------------ | ----- | ------ | ----------- | ------------ |
+| Paid Model               | $1.00 | $2.00  | -           | -            |
+| Paid Model (> 272K tokens) | $2.00 | Free | -           | -            |
+| Big Pickle               | Free  | Free   | Free        | -            |
+| Ox Alpha Free            | Free  | Free   | Free        | -            |
+| Muse Spark Free          | Free  | Free   | Free        | -            |
+| Jev Free                 | Free  | Free   | -           | -            |
+
+</div>
 
 ### Retirement dates
 
@@ -862,7 +879,7 @@ cat > "${zen_parser_dir}/messages-free.mdx" <<'EOF_ZEN_MESSAGES'
 
 | Model | Model ID | Endpoint | AI SDK Package |
 | ----- | -------- | -------- | -------------- |
-| Claude Free | claude-free | `https://opencode.ai/zen/v1/messages` | `@ai-sdk/anthropic` |
+| Claude Free | claude-free | `https://opencode.ai/inference/anthropic/v1/messages` | `@ai-sdk/anthropic` |
 
 ## Pricing
 
@@ -875,6 +892,8 @@ expect_hard_failure_with_stderr "Zen config updater rejects endpoints outside op
   "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
   "${zen_parser_dir}/messages-free.mdx" "${zen_parser_dir}/render-config.yaml"
 
+# Keep this fixture on the legacy zen.mdx endpoint prefix so the parser keeps
+# accepting both documentation layouts.
 cat > "${zen_parser_dir}/systemone-free.mdx" <<'EOF_ZEN_SYSTEMONE'
 ## Endpoints
 

@@ -25,7 +25,7 @@ write_output() {
 }
 
 if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
-  printf 'usage: %s <zen.mdx|-> [config.yaml]\n' "$0" >&2
+  printf 'usage: %s <models.mdx|-> [config.yaml]\n' "$0" >&2
   exit 2
 fi
 
