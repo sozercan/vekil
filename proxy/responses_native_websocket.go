@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sozercan/vekil/logger"
 )
 
 const responsesNativeMaxPendingItems = 4096
@@ -58,6 +59,7 @@ type responsesNativeUpstream struct {
 	credential [32]byte
 	model      string
 	responseID string
+	requestID  string
 	turn       *responsesNativeTurn
 	closed     bool
 	done       chan struct{}
@@ -83,6 +85,17 @@ func (u *responsesNativeUpstream) previousResponseID() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.responseID
+}
+
+// upstreamRequestID is the GitHub request ID of the websocket handshake, which
+// identifies the upstream connection in Copilot diagnostics.
+func (u *responsesNativeUpstream) upstreamRequestID() string {
+	if u == nil {
+		return ""
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.requestID
 }
 
 func (u *responsesNativeUpstream) rememberResponse(id string) {
@@ -177,6 +190,13 @@ func (h *ProxyHandler) maybeRejectNativeResponsesRequest(req *http.Request) *htt
 		}
 		return nil
 	}
+	if !started {
+		// Only models whose catalog entry advertises ws:/responses open a native
+		// connection; others keep the HTTP bridge and its input contract.
+		if eligible, _ := h.responsesNativeModelEligible(req, provider.id); !eligible {
+			return nil
+		}
+	}
 	if started && binding != responsesNativeRequestBinding(req, provider.id, marker.model) {
 		return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model")
 	}
@@ -242,6 +262,16 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 		}
 		return nil, false, nil
 	}
+	if !marker.upstream.started() {
+		if eligible, reason := h.responsesNativeModelEligible(req, provider.id); !eligible {
+			h.log.Debug("responses websocket using HTTP upstream transport",
+				logger.F("provider", provider.id),
+				logger.F("model", responsesNativeRequestModel(req)),
+				logger.F("reason", reason),
+			)
+			return nil, false, nil
+		}
+	}
 	if req.Body == nil {
 		return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket requires a request body"), true, nil
 	}
@@ -293,9 +323,16 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 			}
 			return nil, true, err
 		}
+		requestID := ""
 		if handshake != nil {
 			copyCopilotDiagnosticHeaders(responseHeaders, handshake.Header)
+			requestID = boundedSingleHeaderValue(handshake.Header, "X-Github-Request-Id")
 		}
+		h.log.Debug("responses websocket native upstream connected",
+			logger.F("provider", provider.id),
+			logger.F("model", model),
+			logger.F("upstream_request_id", requestID),
+		)
 		conn.SetReadLimit(openAIStreamScannerMaxBuffer - 64)
 		u.mu.Lock()
 		if u.closed || u.ctx.Err() != nil {
@@ -303,7 +340,7 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 			_ = conn.Close()
 			return nil, true, context.Canceled
 		}
-		u.conn, u.binding, u.model, u.credential = conn, binding, model, credential
+		u.conn, u.binding, u.model, u.credential, u.requestID = conn, binding, model, credential, requestID
 		u.mu.Unlock()
 		go u.readPump(conn)
 	}

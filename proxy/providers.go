@@ -3056,6 +3056,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
+		h.copilotNativeWS.record(provider.id, models, strings.TrimSpace(rawQuery) == "")
 		result.models = filterProviderModels(provider, models)
 		return result, nil
 	case providerTypeOpenAICodex:

@@ -2005,23 +2005,39 @@ func (s *responsesWebSocketSession) nativeInputLimitsApply(h *ProxyHandler, mode
 		}
 		if s.explicitTargetID != "" {
 			target, ok := route.targetByID(s.explicitTargetID)
-			return ok && target.provider != nil && target.provider.kind == providerTypeCopilot
+			return ok && h.copilotTargetAdvertisesNativeWebSocket(target.provider, target.upstreamModel)
 		}
 		targets := route.targets
 		if route.policy.mode == routeModePrimaryOnly && len(targets) > 0 {
 			targets = targets[:1]
 		}
 		for _, target := range targets {
-			if target.provider == nil || target.provider.kind != providerTypeCopilot {
-				// Mixed routes validate again after target selection. A possible
-				// native fallback must not constrain an HTTP-backed primary.
+			if !h.copilotTargetAdvertisesNativeWebSocket(target.provider, target.upstreamModel) {
+				// Mixed routes and HTTP-only Copilot models validate again after
+				// target selection. A possible native fallback must not constrain
+				// an HTTP-backed primary.
 				return false
 			}
 		}
 		return len(targets) > 0
 	}
-	provider, _, _ := h.resolveProviderModelForRequest(model, providerEndpointResponses)
-	return provider != nil && provider.kind == providerTypeCopilot
+	provider, owner, _ := h.resolveProviderModelForRequest(model, providerEndpointResponses)
+	upstreamModel := owner.upstreamModel
+	if upstreamModel == "" {
+		upstreamModel = model
+	}
+	return h.copilotTargetAdvertisesNativeWebSocket(provider, upstreamModel)
+}
+
+// copilotTargetAdvertisesNativeWebSocket is the planning-time view of native
+// eligibility. It never refreshes the catalog; an unknown capability keeps HTTP
+// limits, and dispatch revalidates native limits if it does select native.
+func (h *ProxyHandler) copilotTargetAdvertisesNativeWebSocket(provider *providerRuntime, upstreamModel string) bool {
+	if provider == nil || provider.kind != providerTypeCopilot {
+		return false
+	}
+	advertised, _ := h.copilotNativeWS.lookup(provider.id, upstreamModel)
+	return advertised
 }
 
 func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan, metrics *responsesWebSocketRequestMetrics) (*http.Response, bool, bool, error) {
@@ -2543,8 +2559,14 @@ func (s *responsesWebSocketSession) compactHistoryItemsWithKeepTail(h *ProxyHand
 }
 
 func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *responsesWebSocketCreateRequest, responseID string, metrics responsesWebSocketRequestMetrics) {
+	transport := "http"
+	if s.nativeUpstream.started() {
+		transport = "native"
+	}
 	h.log.Debug("responses websocket request completed",
 		logger.F("model", request.Model),
+		logger.F("transport", transport),
+		logger.F("upstream_request_id", s.nativeUpstream.upstreamRequestID()),
 		logger.F("previous_response_id", request.PreviousResponseID),
 		logger.F("response_id", responseID),
 		logger.F("delta_attempted", metrics.deltaAttempted),

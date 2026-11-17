@@ -66,6 +66,7 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 		}
 	})
 	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true, AutoCompactMaxItems: 1, AutoCompactMaxBytes: 1}
+	advertiseNativeWebSocketForTest(h)
 	h.stats = newStatsCollector()
 	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 	defer func() { _ = conn.Close() }()
@@ -202,6 +203,7 @@ func TestResponsesNativeWebSocketFailureDoesNotReconnect(t *testing.T) {
 		}
 	})
 	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+	advertiseNativeWebSocketForTest(h)
 	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 	defer func() { _ = conn.Close() }()
 	request := newResponsesWebSocketCreateRequest(nil)
@@ -249,6 +251,7 @@ func TestResponsesNativeWebSocketInvalidTerminalRetiresSession(t *testing.T) {
 				}
 			})
 			h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+			advertiseNativeWebSocketForTest(h)
 			h.stats = newStatsCollector()
 			conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 			defer func() { _ = conn.Close() }()
@@ -321,6 +324,7 @@ func TestResponsesNativeWebSocketPinnedRouteAndCancellation(t *testing.T) {
 	h.log = logger.New(logger.LevelError)
 	h.stats = newStatsCollector()
 	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+	advertiseNativeWebSocketForTest(h)
 	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 	defer func() { _ = conn.Close() }()
 	request := newResponsesWebSocketCreateRequest(nil)
@@ -446,6 +450,7 @@ func TestResponsesNativeWebSocketCredentialBinding(t *testing.T) {
 	u := newResponsesNativeUpstream(context.Background())
 	defer u.close()
 	provider := &providerRuntime{id: "copilot", kind: providerTypeCopilot}
+	advertiseNativeWebSocketForTest(h)
 	newRequest := func(bearer, source string) *http.Request {
 		t.Helper()
 		body := []byte(`{"model":"gpt-5.4","stream":true,"input":[]}`)
@@ -533,6 +538,7 @@ func TestResponsesNativeWebSocketInputLimitsBeforeDispatch(t *testing.T) {
 				model = "public-model"
 			}
 			h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+			advertiseNativeWebSocketForTest(h)
 			h.stats = newStatsCollector()
 			if tc.largeText {
 				h.streamingUpstreamTimeout = 15 * time.Second
@@ -598,6 +604,7 @@ func TestResponsesNativeWebSocketLifecycleCancellation(t *testing.T) {
 		_, _, _ = conn.ReadMessage()
 	})
 	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+	advertiseNativeWebSocketForTest(h)
 	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 	defer func() { _ = conn.Close() }()
 	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
@@ -639,6 +646,7 @@ func TestResponsesNativeWebSocketRejectsConnectionModelChange(t *testing.T) {
 		}
 	})
 	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+	advertiseNativeWebSocketForTest(h)
 	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 	defer func() { _ = conn.Close() }()
 	request := newResponsesWebSocketCreateRequest(nil)
@@ -664,7 +672,9 @@ func TestResponsesNativeWebSocketBounds(t *testing.T) {
 	}
 	request.Input = make([]json.RawMessage, responsesNativeMaxPendingItems+1)
 	session := &responsesWebSocketSession{nativeUpstream: marker}
-	if _, err := session.planRequest(&ProxyHandler{}, request); err == nil {
+	h := &ProxyHandler{}
+	advertiseNativeWebSocketForTest(h)
+	if _, err := session.planRequest(h, request); err == nil {
 		t.Fatal("unbounded native pending input accepted")
 	}
 	request.Input = []json.RawMessage{json.RawMessage(`{"role":"user","content":"next"}`)}
@@ -672,7 +682,7 @@ func TestResponsesNativeWebSocketBounds(t *testing.T) {
 	session.lastResponseID = request.PreviousResponseID
 	session.lastSignature = request.signature()
 	session.historyItems = make([]json.RawMessage, responsesNativeMaxPendingItems)
-	if _, err := session.planRequest(&ProxyHandler{}, request); err == nil {
+	if _, err := session.planRequest(h, request); err == nil {
 		t.Fatal("unbounded local warmups before the first native send accepted")
 	}
 	for name, headers := range map[string]http.Header{
@@ -720,6 +730,7 @@ func TestResponsesNativeWebSocketTLSUpgradeUsesHTTP1(t *testing.T) {
 		log: logger.New(logger.LevelError), maxRetries: 1,
 		responsesWS: ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true},
 	}
+	advertiseNativeWebSocketForTest(h)
 	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 	defer func() { _ = conn.Close() }()
 	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(nil)); err != nil {
@@ -772,6 +783,7 @@ func TestResponsesNativeWebSocketFirstFrameFailureDoesNotFailover(t *testing.T) 
 			h.log = logger.New(logger.LevelError)
 			h.stats = newStatsCollector()
 			h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+			advertiseNativeWebSocketForTest(h)
 			conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 			defer func() { _ = conn.Close() }()
 			request := newResponsesWebSocketCreateRequest(nil)
@@ -807,6 +819,7 @@ func TestResponsesNativeWebSocketLocalRejectionDoesNotCountSend(t *testing.T) {
 	h.log = logger.New(logger.LevelError)
 	h.stats = newStatsCollector()
 	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+	advertiseNativeWebSocketForTest(h)
 	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 	defer func() { _ = conn.Close() }()
 	request := newResponsesWebSocketCreateRequest(nil)
@@ -849,6 +862,7 @@ func TestResponsesNativeWebSocketCanceledClosesWithUsage(t *testing.T) {
 	})
 	h.stats = newStatsCollector()
 	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true}
+	advertiseNativeWebSocketForTest(h)
 	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
 	defer func() { _ = conn.Close() }()
 	request := newResponsesWebSocketCreateRequest(nil)
@@ -877,4 +891,21 @@ func TestResponsesNativeWebSocketCanceledClosesWithUsage(t *testing.T) {
 	if sends.Load() != 1 || stats.TaskUsage.Totals.Sends != 1 || stats.TaskUsage.Totals.Errors != 0 || stats.TaskUsage.Totals.Usage.TotalTokens != 9 {
 		t.Fatalf("cancelled native task accounting = sends:%d task:%+v", sends.Load(), stats.TaskUsage)
 	}
+}
+
+// advertiseNativeWebSocketForTest records catalogs in which the upstream models
+// used by these tests advertise ws:/responses: the legacy "copilot" provider's
+// gpt-5.4 and the explicit-route "primary" provider's deployment-a.
+func advertiseNativeWebSocketForTest(h *ProxyHandler) {
+	for providerID, model := range map[string]string{"copilot": "gpt-5.4", "primary": "deployment-a"} {
+		h.copilotNativeWS.record(providerID, []providerModel{nativeWebSocketTestModel(model, true)}, true)
+	}
+}
+
+func nativeWebSocketTestModel(id string, websocket bool) providerModel {
+	endpoints := []string{providerEndpointResponses}
+	if websocket {
+		endpoints = append(endpoints, providerEndpointResponsesWebSocket)
+	}
+	return providerModel{publicID: id, upstreamModel: id, supportedEndpoints: endpoints, endpointsAdvertised: true}
 }
