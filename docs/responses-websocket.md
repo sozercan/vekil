@@ -44,7 +44,7 @@ staging is still connection-local and is not recoverable after reconnect.
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--responses-ws-enabled` | `RESPONSES_WS_ENABLED` | `false` | Enable the proxy-owned Codex websocket bridge on `GET /v1/responses` |
-| `--responses-ws-native-upstream` | `RESPONSES_WS_NATIVE_UPSTREAM` | `false` | Experimental persistent upstream Copilot Responses websocket; requires the bridge to be enabled |
+| `--responses-ws-native-upstream` | `RESPONSES_WS_NATIVE_UPSTREAM` | `true` | Persistent upstream Copilot Responses websocket for models that advertise it; applies only when the bridge is enabled |
 | `--responses-ws-turn-state-delta` | `RESPONSES_WS_TURN_STATE_DELTA` | `false` | Experimental: if the pinned upstream returns `X-Codex-Turn-State`, try replaying only the newest delta input on the next turn; rejection falls back to full replay on the same target |
 | `--responses-ws-disable-auto-compact` | `RESPONSES_WS_DISABLE_AUTO_COMPACT` | `false` | Disable automatic session-history compaction |
 | `--responses-ws-auto-compact-max-items` | `RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS` | `8` | Auto-compact when history item count exceeds this threshold |
@@ -64,10 +64,11 @@ metadata. `stream_id` fails explicitly because sessions are serialized.
 Multiplexing and request superseding are unsupported. Local `generate: false`
 staging does not dispatch inference.
 
-## Experimental native upstream transport
+## Native upstream transport
 
-With both `--responses-ws-enabled` and `--responses-ws-native-upstream`,
-Copilot-backed sessions can keep one upstream Responses websocket open. After
+When the bridge is enabled, Copilot-backed sessions keep one upstream Responses
+websocket open by default; `--responses-ws-native-upstream=false` keeps every turn
+on upstream HTTP. After
 the first turn, continuations send new input with the last response ID, reducing
 history uploads. Other providers retain the HTTP bridge. This option does not
 enable Azure `/realtime`.
