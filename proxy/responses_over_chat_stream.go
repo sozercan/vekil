@@ -300,6 +300,10 @@ func (s *responsesOverChatStream) applyToolCallDelta(delta models.OpenAIToolCall
 	if err != nil {
 		return err
 	}
+	// A delta for another call means every earlier call's name is complete.
+	if err := s.promoteNamedToolCalls(call); err != nil {
+		return err
+	}
 	if id := strings.TrimSpace(delta.ID); id != "" {
 		if call.callID != "" && call.callID != id {
 			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream changed a tool-call ID mid-stream"}
@@ -334,8 +338,26 @@ func (s *responsesOverChatStream) applyToolCallDelta(delta models.OpenAIToolCall
 			call.pending.WriteString(fragment)
 		}
 	}
-	if !call.added && call.callID != "" && call.chatName != "" {
+	// Providers may fragment the name across deltas, so the call is validated
+	// and exposed only once its name is known to be complete: when its
+	// arguments start, another call or text begins, or the stream finishes.
+	if !call.added && call.callID != "" && call.chatName != "" && call.pending.Len() > 0 {
 		return s.addToolCall(call)
+	}
+	return nil
+}
+
+// promoteNamedToolCalls exposes pending calls, other than except, whose
+// identity is known. It runs when later output proves their names are complete.
+func (s *responsesOverChatStream) promoteNamedToolCalls(except *responsesOverChatToolCall) error {
+	for _, index := range s.callOrder {
+		call := s.calls[index]
+		if call == except || call.added || call.callID == "" || call.chatName == "" {
+			continue
+		}
+		if err := s.addToolCall(call); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -410,8 +432,11 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream sent output after its finish reason"}
 		}
 		if text != "" {
-			// Text after a function call opens a new message item, so output
-			// indexes stay monotonic.
+			// Text ends any pending call's name. Text after a function call
+			// opens a new message item, so output indexes stay monotonic.
+			if err := s.promoteNamedToolCalls(nil); err != nil {
+				return err
+			}
 			if err := s.appendText(text); err != nil {
 				return err
 			}
@@ -421,6 +446,9 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned a non-text refusal"}
 		}
 		if refusal != "" {
+			if err := s.promoteNamedToolCalls(nil); err != nil {
+				return err
+			}
 			if s.anyToolCallAdded() {
 				return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned a refusal together with function calls"}
 			}
