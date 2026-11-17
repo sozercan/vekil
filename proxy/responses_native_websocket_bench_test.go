@@ -49,6 +49,9 @@ func BenchmarkResponsesTransportNativeUpstream(b *testing.B) {
 				}
 			})
 			h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: native, DisableAutoCompact: true}
+			if native {
+				advertiseNativeWebSocketForTest(h)
+			}
 			env := newResponsesTransportBenchmarkEnvWithHandler(b, h)
 			conn := dialResponsesTransportWebSocket(b, newResponsesTransportWebSocketDialer(b, env.proxyServer), env.webSocketURL)
 			defer func() { _ = conn.Close() }()

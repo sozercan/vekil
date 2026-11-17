@@ -62,6 +62,10 @@ type responsesNativeUpstream struct {
 	requestID  string
 	turn       *responsesNativeTurn
 	closed     bool
+	// httpPinned records that a turn already went over the HTTP bridge. The
+	// session keeps HTTP from then on: HTTP history lives in the proxy, and a
+	// native connection opened later would see only the new input.
+	httpPinned bool
 	done       chan struct{}
 }
 
@@ -76,6 +80,28 @@ func (u *responsesNativeUpstream) started() bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.conn != nil
+}
+
+// keepHTTP pins a not-yet-connected session to the HTTP bridge for its
+// lifetime.
+func (u *responsesNativeUpstream) keepHTTP() {
+	if u == nil {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.conn == nil {
+		u.httpPinned = true
+	}
+}
+
+func (u *responsesNativeUpstream) usesHTTP() bool {
+	if u == nil {
+		return false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.httpPinned
 }
 
 func (u *responsesNativeUpstream) previousResponseID() string {
@@ -182,8 +208,11 @@ func (h *ProxyHandler) maybeRejectNativeResponsesRequest(req *http.Request) *htt
 		u.mu.Unlock()
 		return responsesNativeErrorResponse(req, http.StatusConflict, errResponsesNativeClosed.Error())
 	}
-	started, binding, credential := u.conn != nil, u.binding, u.credential
+	started, binding, credential, httpPinned := u.conn != nil, u.binding, u.credential, u.httpPinned
 	u.mu.Unlock()
+	if httpPinned {
+		return nil
+	}
 	if !known || provider.kind != string(providerTypeCopilot) {
 		if started {
 			return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model")
@@ -255,11 +284,15 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 	if rejected := h.maybeRejectNativeResponsesRequest(req); rejected != nil {
 		return rejected, true, nil
 	}
+	if marker.upstream.usesHTTP() {
+		return nil, false, nil
+	}
 	provider, known := providerRouteFromRequest(req)
 	if !known || provider.kind != string(providerTypeCopilot) {
 		if marker.upstream.started() {
 			return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model"), true, nil
 		}
+		marker.upstream.keepHTTP()
 		return nil, false, nil
 	}
 	if !marker.upstream.started() {
@@ -269,6 +302,7 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 				logger.F("model", responsesNativeRequestModel(req)),
 				logger.F("reason", reason),
 			)
+			marker.upstream.keepHTTP()
 			return nil, false, nil
 		}
 	}

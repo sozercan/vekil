@@ -1997,6 +1997,9 @@ func (s *responsesWebSocketSession) nativeInputLimitsApply(h *ProxyHandler, mode
 	if s.nativeUpstream.started() {
 		return true
 	}
+	if s.nativeUpstream.usesHTTP() {
+		return false
+	}
 	if route, known := h.resolveModelRouteForRequest(model, providerEndpointResponses); known && route != nil {
 		if h.conversationMigrationEnabled(route) {
 			// Protected turns always use the HTTP bridge, including after a

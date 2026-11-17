@@ -78,7 +78,9 @@ For explicit routes this is the target's `upstream_model`, not the public route
 ID. Copilot models without that entry, such as ones listing only `/responses`
 or `/chat/completions`, keep the HTTP bridge and its input limits. If Vekil has
 not loaded the provider's catalog yet, the first turn waits for one bounded
-catalog fetch; when capability is still unknown, the session uses HTTP. The
+catalog fetch; when capability is still unknown, the session uses HTTP. Once a
+session sends a turn over HTTP it stays on HTTP, even if a later catalog
+refresh advertises the model, because its history is held by the proxy. The
 per-turn debug log `responses websocket request completed` reports
 `transport` (`native` or `http`) and, for native sessions, the handshake's
 GitHub `upstream_request_id`.

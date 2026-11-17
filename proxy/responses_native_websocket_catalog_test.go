@@ -223,3 +223,60 @@ func TestResponsesNativeWebSocketExplicitRouteUsesTargetUpstreamModel(t *testing
 		})
 	}
 }
+
+func TestResponsesNativeWebSocketHTTPStartedSessionStaysHTTP(t *testing.T) {
+	upstream := &nativeGateTestUpstream{postInputItems: make(chan int, 3)}
+	h := newTestProxyHandler(t, upstream.handler(t))
+	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true, DisableAutoCompact: true, TurnStateDelta: true}
+	h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", false)}, true)
+
+	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
+	defer func() { _ = conn.Close() }()
+	request := newResponsesWebSocketCreateRequest([]any{map[string]string{"role": "user", "content": "first"}})
+	request["model"] = "gpt-5.4"
+	for turn := 1; turn <= 3; turn++ {
+		if turn == 2 {
+			// A later catalog refresh advertises the model mid-session.
+			h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", true)}, true)
+		}
+		if err := conn.WriteJSON(request); err != nil {
+			t.Fatal(err)
+		}
+		frame := mustReadWebSocketJSONSkipMetadata(t, conn)
+		if frame["type"] != "response.completed" {
+			t.Fatalf("turn %d = %#v", turn, frame)
+		}
+		request["previous_response_id"] = websocketResponseID(t, frame)
+		request["input"] = []any{map[string]string{"role": "user", "content": "next"}}
+	}
+
+	if upstream.upgrades.Load() != 0 || upstream.posts.Load() != 3 {
+		t.Fatalf("transport: upgrades=%d posts=%d, want HTTP only", upstream.upgrades.Load(), upstream.posts.Load())
+	}
+	// Without an upstream turn-state header the HTTP bridge replays the full
+	// proxy-held history on every turn.
+	for i, want := range []int{1, 3, 5} {
+		if got := <-upstream.postInputItems; got != want {
+			t.Fatalf("HTTP turn %d input items = %d, want %d", i+1, got, want)
+		}
+	}
+}
+
+func TestResponsesNativeWebSocketHTTPStartedSessionKeepsHTTPInputLimits(t *testing.T) {
+	h := &ProxyHandler{}
+	h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", true)}, true)
+	request, err := parseResponsesWebSocketCreateRequest([]byte(`{"type":"response.create","model":"gpt-5.4","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Input = make([]json.RawMessage, responsesNativeMaxPendingItems+1)
+	upstream := newResponsesNativeUpstream(context.Background())
+	session := &responsesWebSocketSession{nativeUpstream: upstream}
+	if _, err := session.planRequest(h, request); err == nil {
+		t.Fatal("advertised model skipped native input limits")
+	}
+	upstream.keepHTTP()
+	if _, err := session.planRequest(h, request); err != nil {
+		t.Fatalf("HTTP-started session received native input limits: %v", err)
+	}
+}
