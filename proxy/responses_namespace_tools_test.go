@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -272,5 +273,93 @@ func TestCopilotNamespaceSSEContentTypeIsCaseInsensitive(t *testing.T) {
 	}
 	if strings.Contains(string(got), alias) || !strings.Contains(string(got), `"namespace":"shell"`) {
 		t.Fatalf("SSE event not restored: %s", got)
+	}
+}
+
+func TestCopilotNamespaceAcceptsOptionalFunctionFields(t *testing.T) {
+	catalog := `[{"type":"function","name":"noargs"},{"type":"function","name":"nullargs","parameters":null,"strict":null},{"type":"namespace","name":"shell","tools":[{"type":"function","name":"bare"},{"type":"function","name":"loose","parameters":{"type":"object"},"strict":null}]}]`
+	raw := []byte(`{"model":"grok-4.7","tools":` + catalog + `,"input":[{"type":"additional_tools","tools":` + catalog + `}]}`)
+	body, tr, err := translateCopilotNamespaceTools(raw)
+	if err != nil {
+		t.Fatalf("valid optional fields rejected: %v", err)
+	}
+	if len(tr.tools) != 4 {
+		t.Fatalf("tools=%d", len(tr.tools))
+	}
+	var root struct {
+		Tools []map[string]json.RawMessage `json:"tools"`
+		Input []struct {
+			Tools []map[string]json.RawMessage `json:"tools"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatal(err)
+	}
+	alias := func(name, namespace string) string {
+		return policyResponsesStableToolAlias(policyResponsesToolDescriptor{Kind: "function", Name: name, Namespace: namespace})
+	}
+	for label, tools := range map[string][]map[string]json.RawMessage{"top-level": root.Tools, "additional_tools": root.Input[0].Tools} {
+		byName := make(map[string]map[string]json.RawMessage, len(tools))
+		for _, tool := range tools {
+			byName[rawJSONString(tool["name"])] = tool
+		}
+		check := func(name string, wantParams, wantStrict string) {
+			t.Helper()
+			tool, ok := byName[name]
+			if !ok {
+				t.Fatalf("%s: alias %q missing from %v", label, name, tools)
+			}
+			for field, want := range map[string]string{"parameters": wantParams, "strict": wantStrict} {
+				got, present := tool[field]
+				if want == "" {
+					if present {
+						t.Errorf("%s: %s gained %s=%s", label, name, field, got)
+					}
+				} else if string(got) != want {
+					t.Errorf("%s: %s %s=%s, want %s", label, name, field, got, want)
+				}
+			}
+		}
+		check(alias("noargs", ""), "", "")
+		check(alias("nullargs", ""), "null", "null")
+		check(alias("bare", "shell"), "", "")
+		check(alias("loose", "shell"), `{"type":"object"}`, "null")
+	}
+}
+
+func TestCopilotNamespaceSSEFailsClosedOnOversizedEvents(t *testing.T) {
+	tr, alias := newNamespaceTestTranslation(t)
+	first := fmt.Sprintf("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc-1\",\"call_id\":\"call-1\",\"name\":%q,\"arguments\":\"\"}}\n\n", alias)
+	call := fmt.Sprintf(`{"type":"function_call","id":"fc-1","call_id":"call-1","name":%q,"arguments":%q}`, alias, strings.Repeat("x", openAIStreamScannerMaxBuffer))
+	for name, oversized := range map[string]string{
+		"long line":  "data: {\"type\":\"response.output_item.done\",\"item\":" + call + "}\n\n",
+		"many lines": "data: {\"type\":\"response.output_item.done\",\n" + strings.Repeat("data: \n", openAIStreamScannerMaxBuffer/7+1) + "data: \"item\":" + fmt.Sprintf(`{"type":"function_call","name":%q}`, alias) + "}\n\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(first + oversized + first))}
+			req := httptest.NewRequest(http.MethodPost, "/responses", nil)
+			req = req.WithContext(context.WithValue(req.Context(), responsesNamespaceContextKey{}, tr))
+			restoreCopilotNamespaceResponse(req, resp)
+			got, err := io.ReadAll(resp.Body)
+			if !errors.Is(err, errResponsesSSEEventTooLarge) {
+				t.Fatalf("err=%v, want errResponsesSSEEventTooLarge", err)
+			}
+			if strings.Contains(string(got), alias) {
+				t.Fatal("unrewritten alias exposed to client")
+			}
+			if !strings.Contains(string(got), `"namespace":"shell"`) {
+				t.Fatalf("events before the oversized one were not delivered: %.200s", got)
+			}
+		})
+	}
+
+	// Requests without tool aliases leave responses untouched.
+	empty := &responsesNamespaceTranslation{tools: make(policyResponsesToolMap)}
+	body := io.NopCloser(strings.NewReader(first))
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body}
+	req := httptest.NewRequest(http.MethodPost, "/responses", nil)
+	restoreCopilotNamespaceResponse(req.WithContext(context.WithValue(req.Context(), responsesNamespaceContextKey{}, empty)), resp)
+	if resp.Body != body {
+		t.Fatal("response without aliases was wrapped")
 	}
 }

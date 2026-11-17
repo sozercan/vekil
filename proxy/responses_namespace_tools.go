@@ -42,18 +42,35 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 		return alias, nil
 	}
 	flatten := func(raw json.RawMessage) (json.RawMessage, error) {
-		parsed, err := parsePolicyResponsesTools(raw)
+		normalized, optionals := normalizeNativeResponsesToolOptionals(raw)
+		parsed, err := parsePolicyResponsesTools(normalized)
 		if err != nil {
 			return nil, fmt.Errorf("only function tools are supported for Copilot Grok: %w; disable hosted web search in the client and use a function-based search integration", err)
 		}
+		if optionals != nil && len(optionals) != len(parsed) {
+			return nil, errors.New("tool catalog normalization did not match parsed function tools")
+		}
 		out := make([]map[string]any, 0, len(parsed))
-		for _, tool := range parsed {
+		for i, tool := range parsed {
 			alias, err := register(tool.descriptor)
 			if err != nil {
 				return nil, err
 			}
-			item := map[string]any{"type": "function", "name": alias, "description": tool.description, "parameters": tool.parameters}
-			if tool.strict != nil {
+			var opt nativeResponsesToolOptionals
+			if optionals != nil {
+				opt = optionals[i]
+			}
+			item := map[string]any{"type": "function", "name": alias, "description": tool.description}
+			switch {
+			case opt.parametersOmitted:
+			case opt.parametersNull:
+				item["parameters"] = nil
+			default:
+				item["parameters"] = tool.parameters
+			}
+			if opt.strictNull {
+				item["strict"] = nil
+			} else if tool.strict != nil {
 				item["strict"] = *tool.strict
 			}
 			out = append(out, item)
@@ -136,6 +153,71 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 	}
 	out, err := json.Marshal(root)
 	return out, tr, err
+}
+
+// nativeResponsesToolOptionals records optional native Responses function
+// fields that the shared policy parser does not accept as written, so the
+// flattened catalog can forward them exactly as the client sent them.
+type nativeResponsesToolOptionals struct {
+	parametersOmitted bool
+	parametersNull    bool
+	strictNull        bool
+}
+
+// normalizeNativeResponsesToolOptionals adapts native Responses function tools
+// (top-level or namespace children) for parsePolicyResponsesTools without
+// relaxing that parser's contract: omitted or null parameters parse as an
+// empty schema and a null strict parses as unset. It returns one entry per
+// function tool in parser order, or nil when raw is not a well-formed catalog,
+// leaving the parser to report the error.
+func normalizeNativeResponsesToolOptionals(raw json.RawMessage) (json.RawMessage, []nativeResponsesToolOptionals) {
+	var tools []map[string]json.RawMessage
+	if json.Unmarshal(raw, &tools) != nil || tools == nil {
+		return raw, nil
+	}
+	isNull := func(v json.RawMessage) bool { return bytes.Equal(bytes.TrimSpace(v), []byte("null")) }
+	var optionals []nativeResponsesToolOptionals
+	normalize := func(tool map[string]json.RawMessage) {
+		var opt nativeResponsesToolOptionals
+		if params, ok := tool["parameters"]; !ok {
+			opt.parametersOmitted = true
+			tool["parameters"] = json.RawMessage(`{}`)
+		} else if isNull(params) {
+			opt.parametersNull = true
+			tool["parameters"] = json.RawMessage(`{}`)
+		}
+		if strict, ok := tool["strict"]; ok && isNull(strict) {
+			opt.strictNull = true
+			delete(tool, "strict")
+		}
+		optionals = append(optionals, opt)
+	}
+	for _, tool := range tools {
+		if tool == nil {
+			return raw, nil
+		}
+		switch rawJSONString(tool["type"]) {
+		case "function":
+			normalize(tool)
+		case "namespace":
+			var children []map[string]json.RawMessage
+			if json.Unmarshal(tool["tools"], &children) != nil {
+				return raw, nil
+			}
+			for _, child := range children {
+				if child == nil || rawJSONString(child["type"]) != "function" {
+					return raw, nil
+				}
+				normalize(child)
+			}
+			tool["tools"], _ = json.Marshal(children)
+		}
+	}
+	out, err := json.Marshal(tools)
+	if err != nil {
+		return raw, nil
+	}
+	return out, optionals
 }
 
 // Rewrite only protocol-owned call fields. Tool arguments, output strings,
@@ -254,11 +336,13 @@ func restoreCopilotNamespaceResponse(req *http.Request, resp *http.Response) {
 		return
 	}
 	tr, _ := req.Context().Value(responsesNamespaceContextKey{}).(*responsesNamespaceTranslation)
-	if tr == nil {
+	if tr == nil || len(tr.tools) == 0 {
 		return
 	}
 	if isEventStreamContentType(resp.Header.Get("Content-Type")) {
-		wrapResponsesSSEBody(resp, func(raw []byte) ([]byte, bool) { return rewriteResponsesSSEEventData(raw, tr.restore) })
+		// Fail closed: an unrewritten event would expose aliases the client
+		// cannot map back to its declared tools.
+		wrapResponsesSSEBodyFailClosed(resp, func(raw []byte) ([]byte, bool) { return rewriteResponsesSSEEventData(raw, tr.restore) })
 	} else {
 		resp.Body = &responsesNamespaceJSONBody{ReadCloser: resp.Body, tr: tr}
 		resp.Header.Del("Content-Length")
