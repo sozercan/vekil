@@ -3630,7 +3630,12 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 	return nil, fmt.Errorf("model route %q has no eligible target", route.public.id)
 }
 
-func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *routeSendObservation) (*http.Response, error) {
+func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *routeSendObservation) (result *http.Response, resultErr error) {
+	defer func() {
+		if resultErr == nil {
+			restoreCopilotNamespaceResponse(req, result)
+		}
+	}()
 	if req == nil {
 		return nil, fmt.Errorf("upstream request is required")
 	}
