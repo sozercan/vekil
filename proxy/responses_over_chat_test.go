@@ -796,3 +796,54 @@ func TestResponsesOverChatWebSocketTurnIsRejectedWithoutUpstreamSends(t *testing
 		t.Fatalf("websocket turn reached upstream: chat=%d responses=%d", upstream.chatHits.Load(), upstream.responsesHits.Load())
 	}
 }
+
+func TestResponsesOverChatAcceptsFragmentedToolNames(t *testing.T) {
+	upstream := newROCUpstream(t, rocSSE(t,
+		// The first call's name arrives in two fragments before its arguments.
+		`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_","arguments":""}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"time"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]}}]}`,
+		// The second call's name is fragmented and it never streams arguments
+		// before the next call starts, which also completes its name.
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"get_"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"name":"weather"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"id":"call_c","type":"function","function":{"name":"get_time","arguments":"{}"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		"[DONE]"))
+	h := newROCHandler(t, upstream.server.URL)
+
+	recorder := postROC(t, h, `{"model":"gemini-test","stream":true,"store":false,"parallel_tool_calls":true,"input":"time and weather?",
+		"tools":[{"type":"function","name":"get_time","parameters":{"type":"object"}},{"type":"function","name":"get_weather","parameters":{"type":"object"}}]}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	events := parseROCEvents(t, recorder.Body.String())
+	if terminal := events[len(events)-1]; terminal.Type != "response.completed" {
+		t.Fatalf("terminal event = %s: %v", terminal.Type, terminal.Data)
+	}
+	var added, done []map[string]any
+	for _, event := range events {
+		switch event.Type {
+		case "response.output_item.added":
+			added = append(added, event.Data["item"].(map[string]any))
+		case "response.output_item.done":
+			done = append(done, event.Data["item"].(map[string]any))
+		}
+	}
+	want := []struct{ callID, name, arguments string }{
+		{"call_a", "get_time", `{"city":"Paris"}`},
+		{"call_b", "get_weather", "{}"},
+		{"call_c", "get_time", "{}"},
+	}
+	if len(added) != len(want) || len(done) != len(want) {
+		t.Fatalf("added=%v done=%v", added, done)
+	}
+	for i, call := range want {
+		if added[i]["name"] != call.name || added[i]["call_id"] != call.callID {
+			t.Fatalf("added[%d] = %v, want %+v", i, added[i], call)
+		}
+		if done[i]["name"] != call.name || done[i]["call_id"] != call.callID || done[i]["arguments"] != call.arguments {
+			t.Fatalf("done[%d] = %v, want %+v", i, done[i], call)
+		}
+	}
+}
