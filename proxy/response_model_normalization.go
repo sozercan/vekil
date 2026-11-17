@@ -116,9 +116,8 @@ func validateUnambiguousResponsesJSON(data []byte) error {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	// Unlike configuration diagnostics, this path must not build an ever-longer
-	// path at each nesting level. Those discarded strings cost quadratic space.
-	if err := scanJSONValueForDuplicateKeys(decoder, "", false); err != nil {
+	// Responses validation reports no paths, so it skips segment tracking.
+	if err := scanJSONValueForDuplicateKeys(decoder, false); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); err != io.EOF {
