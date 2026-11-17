@@ -457,3 +457,22 @@ func TestCopilotNamespaceSharesCatalogBudgetAcrossAdditionalTools(t *testing.T) 
 		t.Fatalf("%d-byte request was not bounded: err=%v", len(body), err)
 	}
 }
+
+func TestCopilotNamespaceAcceptsNullFunctionDescription(t *testing.T) {
+	catalog := `[{"type":"function","name":"plain","description":null,"parameters":{}},{"type":"namespace","name":"shell","description":"Shell tools","tools":[{"type":"function","name":"run","description":null,"parameters":{}}]},{"type":"namespace","name":"bare","tools":[{"type":"function","name":"go","description":null,"parameters":{}}]}]`
+	body, _, err := translateCopilotNamespaceTools([]byte(`{"model":"grok-4.7","tools":` + catalog + `}`))
+	if err != nil {
+		t.Fatalf("null description rejected: %v", err)
+	}
+	var root struct {
+		Tools []map[string]json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{"null", `"Shell tools"`, "null"} {
+		if got := string(root.Tools[i]["description"]); got != want {
+			t.Errorf("tools[%d].description=%s, want %s", i, got, want)
+		}
+	}
+}

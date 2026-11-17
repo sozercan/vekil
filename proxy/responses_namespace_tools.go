@@ -69,6 +69,11 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 				opt = optionals[i]
 			}
 			item := map[string]any{"type": "function", "name": alias, "description": tool.description}
+			if opt.descriptionNull && tool.description == "" {
+				// Keep a null description as written unless a namespace
+				// description was folded into this flattened tool.
+				item["description"] = nil
+			}
 			switch {
 			case opt.parametersOmitted:
 			case opt.parametersNull:
@@ -185,12 +190,13 @@ type nativeResponsesToolOptionals struct {
 	parametersOmitted bool
 	parametersNull    bool
 	strictNull        bool
+	descriptionNull   bool
 }
 
 // normalizeNativeResponsesToolOptionals adapts native Responses function tools
 // (top-level or namespace children) for parsePolicyResponsesTools without
 // relaxing that parser's contract: omitted or null parameters parse as an
-// empty schema and a null strict parses as unset. It returns one entry per
+// empty schema, and a null strict or description parses as unset. It returns one entry per
 // function tool in parser order, or nil when raw is not a well-formed catalog,
 // leaving the parser to report the error.
 func normalizeNativeResponsesToolOptionals(raw json.RawMessage) (json.RawMessage, []nativeResponsesToolOptionals) {
@@ -212,6 +218,10 @@ func normalizeNativeResponsesToolOptionals(raw json.RawMessage) (json.RawMessage
 		if strict, ok := tool["strict"]; ok && isNull(strict) {
 			opt.strictNull = true
 			delete(tool, "strict")
+		}
+		if description, ok := tool["description"]; ok && isNull(description) {
+			opt.descriptionNull = true
+			delete(tool, "description")
 		}
 		optionals = append(optionals, opt)
 	}
