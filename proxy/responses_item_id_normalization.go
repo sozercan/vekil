@@ -75,11 +75,16 @@ type responsesSSERewriteBody struct {
 	rawEvent     bool
 	passthrough  bool
 	failClosed   bool
+	failed       bool
 	closeOnce    sync.Once
 	closeErr     error
 }
 
 func (b *responsesSSERewriteBody) Read(p []byte) (int, error) {
+	if b.failed {
+		// A fail-closed failure is terminal; never resume mid-event.
+		return 0, errResponsesSSEEventTooLarge
+	}
 	for len(b.pending) == 0 {
 		if b.pendingErr != nil {
 			err := b.pendingErr
@@ -144,6 +149,7 @@ func (b *responsesSSERewriteBody) readNext() ([]byte, error) {
 			boundary := strings.TrimRight(line, "\r\n") == ""
 			if event.Len() > openAIStreamScannerMaxBuffer {
 				if b.failClosed {
+					b.failed = true
 					return nil, errResponsesSSEEventTooLarge
 				}
 				b.rawEvent = !boundary
@@ -174,6 +180,7 @@ func (b *responsesSSERewriteBody) readNext() ([]byte, error) {
 			}
 			if errors.Is(err, errOpenAISSELineTooLong) {
 				if b.failClosed {
+					b.failed = true
 					return nil, errResponsesSSEEventTooLarge
 				}
 				b.passthrough = true

@@ -350,6 +350,10 @@ func TestCopilotNamespaceSSEFailsClosedOnOversizedEvents(t *testing.T) {
 			if !strings.Contains(string(got), `"namespace":"shell"`) {
 				t.Fatalf("events before the oversized one were not delivered: %.200s", got)
 			}
+			// The failure is terminal; later reads must not resume the stream.
+			if n, err := resp.Body.Read(make([]byte, 1024)); n != 0 || !errors.Is(err, errResponsesSSEEventTooLarge) {
+				t.Fatalf("read after failure n=%d err=%v", n, err)
+			}
 		})
 	}
 
@@ -361,5 +365,45 @@ func TestCopilotNamespaceSSEFailsClosedOnOversizedEvents(t *testing.T) {
 	restoreCopilotNamespaceResponse(req.WithContext(context.WithValue(req.Context(), responsesNamespaceContextKey{}, empty)), resp)
 	if resp.Body != body {
 		t.Fatal("response without aliases was wrapped")
+	}
+}
+
+func TestCopilotNamespaceRestoresSSEEventNameWithoutType(t *testing.T) {
+	tr, alias := newNamespaceTestTranslation(t)
+	call := fmt.Sprintf(`{"type":"function_call","call_id":"call-1","name":%q,"arguments":"{}"}`, alias)
+	stream := fmt.Sprintf("event: response.output_item.added\ndata: {\"item\":%s}\n\nevent: response.completed\ndata: {\"response\":{\"output\":[%s]}}\n\n", call, call)
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(stream))}
+	req := httptest.NewRequest(http.MethodPost, "/responses", nil)
+	restoreCopilotNamespaceResponse(req.WithContext(context.WithValue(req.Context(), responsesNamespaceContextKey{}, tr)), resp)
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), alias) || strings.Count(string(got), `"namespace":"shell"`) != 2 {
+		t.Fatalf("typeless events not restored: %s", got)
+	}
+}
+
+func TestCopilotNamespaceDropsNullReasoningContent(t *testing.T) {
+	raw := []byte(`{"input":[{"type":"reasoning","summary":[],"content":null,"encrypted_content":"opaque"},{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"kept"}]},{"type":"message","role":"user","content":null}]}`)
+	body, _, err := translateCopilotNamespaceTools(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Input []map[string]json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Input[0]["content"]; ok || rawJSONString(got.Input[0]["encrypted_content"]) != "opaque" {
+		t.Fatalf("null reasoning content not dropped: %s", got.Input[0])
+	}
+	if string(got.Input[1]["content"]) != `[{"type":"reasoning_text","text":"kept"}]` {
+		t.Fatalf("reasoning content changed: %s", got.Input[1]["content"])
+	}
+	// Only reasoning items are normalized.
+	if string(got.Input[2]["content"]) != "null" {
+		t.Fatalf("message changed: %s", got.Input[2])
 	}
 }

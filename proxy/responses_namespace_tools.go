@@ -110,6 +110,13 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 				}
 				item["name"], _ = json.Marshal(alias)
 				delete(item, "namespace")
+			case "reasoning":
+				// Codex replays reasoning with "content": null, which Copilot
+				// Grok rejects with a bare 400. Omitting it is equivalent.
+				if !bytes.Equal(bytes.TrimSpace(item["content"]), []byte("null")) {
+					continue
+				}
+				delete(item, "content")
 			default:
 				continue
 			}
@@ -222,7 +229,7 @@ func normalizeNativeResponsesToolOptionals(raw json.RawMessage) (json.RawMessage
 
 // Rewrite only protocol-owned call fields. Tool arguments, output strings,
 // schemas and vendor data must never be searched recursively for aliases.
-func (tr *responsesNamespaceTranslation) restore(data []byte, _ string) ([]byte, bool) {
+func (tr *responsesNamespaceTranslation) restore(data []byte, eventName string) ([]byte, bool) {
 	// Preserve ambiguous bytes for the downstream durable state validator.
 	// Decoding into maps would collapse duplicate keys before it sees them.
 	if validateUnambiguousResponsesJSON(data) != nil {
@@ -303,6 +310,10 @@ func (tr *responsesNamespaceTranslation) restore(data []byte, _ string) ([]byte,
 		toolChoice(obj)
 	}
 	typ := rawJSONString(root["type"])
+	if typ == "" {
+		// SSE framing may carry the event type only in the event: field.
+		typ = eventName
+	}
 	if typ == "response.output_item.added" || typ == "response.output_item.done" {
 		var item map[string]json.RawMessage
 		if json.Unmarshal(root["item"], &item) == nil {
