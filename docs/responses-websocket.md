@@ -44,7 +44,7 @@ staging is still connection-local and is not recoverable after reconnect.
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--responses-ws-enabled` | `RESPONSES_WS_ENABLED` | `false` | Enable the proxy-owned Codex websocket bridge on `GET /v1/responses` |
-| `--responses-ws-native-upstream` | `RESPONSES_WS_NATIVE_UPSTREAM` | `false` | Experimental persistent upstream Copilot Responses websocket; requires the bridge to be enabled |
+| `--responses-ws-native-upstream` | `RESPONSES_WS_NATIVE_UPSTREAM` | `true` | Persistent upstream Copilot Responses websocket for models that advertise it; applies only when the bridge is enabled |
 | `--responses-ws-turn-state-delta` | `RESPONSES_WS_TURN_STATE_DELTA` | `false` | Experimental: if the pinned upstream returns `X-Codex-Turn-State`, try replaying only the newest delta input on the next turn; rejection falls back to full replay on the same target |
 | `--responses-ws-disable-auto-compact` | `RESPONSES_WS_DISABLE_AUTO_COMPACT` | `false` | Disable automatic session-history compaction |
 | `--responses-ws-auto-compact-max-items` | `RESPONSES_WS_AUTO_COMPACT_MAX_ITEMS` | `8` | Auto-compact when history item count exceeds this threshold |
@@ -64,10 +64,11 @@ metadata. `stream_id` fails explicitly because sessions are serialized.
 Multiplexing and request superseding are unsupported. Local `generate: false`
 staging does not dispatch inference.
 
-## Experimental native upstream transport
+## Native upstream transport
 
-With both `--responses-ws-enabled` and `--responses-ws-native-upstream`,
-Copilot-backed sessions can keep one upstream Responses websocket open. After
+When the bridge is enabled, Copilot-backed sessions keep one upstream Responses
+websocket open by default; `--responses-ws-native-upstream=false` keeps every turn
+on upstream HTTP. After
 the first turn, continuations send new input with the last response ID, reducing
 history uploads. Other providers retain the HTTP bridge. This option does not
 enable Azure `/realtime`.
@@ -78,12 +79,31 @@ For explicit routes this is the target's `upstream_model`, not the public route
 ID. Copilot models without that entry, such as ones listing only `/responses`
 or `/chat/completions`, keep the HTTP bridge and its input limits. If Vekil has
 not loaded the provider's catalog yet, the first turn waits for one bounded
-catalog fetch; when capability is still unknown, the session uses HTTP. Once a
-session sends a turn over HTTP it stays on HTTP, even if a later catalog
-refresh advertises the model, because its history is held by the proxy. The
+catalog fetch; when capability is still unknown, the turn uses HTTP. The
 per-turn debug log `responses websocket request completed` reports
-`transport` (`native` or `http`) and, for native sessions, the handshake's
-GitHub `upstream_request_id`.
+`transport` (`native` or `http`) and, for native turns, the handshake's
+GitHub `upstream_request_id`. A debug line `responses websocket using HTTP
+upstream transport` gives the `reason` when a turn that could go native uses
+HTTP.
+
+Vekil keeps the session's full history for native sessions, as it does for the
+HTTP bridge. The native connection only avoids uploading it again: a
+continuation sends the items the connection has not seen plus the new input,
+with the connection's last response ID. Any turn the connection cannot continue
+carries the full history instead, which is valid on either transport:
+
+- the first native turn of a session, including after HTTP turns;
+- after Copilot closes the connection, which it does after 5 minutes without
+  traffic even when pinged, or after a failed turn or credential change; the next
+  turn opens a new connection;
+- a new conversation with another model, which gets its own connection;
+- the turn after a compaction.
+
+A `compaction_trigger` request, which is how Codex's built-in provider asks for
+remote compaction, is summarized from Vekil's copy of the history over HTTP. The
+next turn sends the compacted history to the native connection. The HTTP
+bridge's automatic compaction does not run after native turns: the client
+manages its context, and nothing is re-uploaded that compaction would shrink.
 
 Custom `client_metadata.ws_request_header_<name>` values are forwarded in each
 native turn's `headers`, subject to the header limits above. Credentials,
@@ -91,24 +111,21 @@ provider-managed headers, connection headers, and server-issued continuation
 state are excluded.
 
 The connection stays bound to its source credential, provider, target, and model.
-Refreshing a service token for the same source credential preserves the session;
-changing the source credential closes it and returns a 409 error. New service-token
-caches retain a fingerprint of the issuing credential across restarts. Older caches
-without this metadata remain usable, but their first refresh can require a new
-connection because Vekil cannot verify their issuing credential. Once a create has
-been sent, Vekil does not reconnect, resend it, or migrate the session after failure.
-Recovery requires a new downstream connection with full input.
-Automatic HTTP compaction is disabled after native connection establishment;
-standalone compact and memory endpoints continue to use HTTP.
+Refreshing a service token for the same source credential preserves it. A turn
+for another source credential or target closes it and uses HTTP; a continuation
+that depends on it fails with a 409 error that asks the client to resend. New
+service-token caches retain a fingerprint of the issuing credential across
+restarts. Older caches without this metadata remain usable, but their first
+refresh can require a new connection because Vekil cannot verify their issuing
+credential. Once a create has been sent, Vekil does not resend it or fail over
+after a failure. The failed turn returns an error; the client's next request
+continues from Vekil's history on a new connection.
 
-Native input is limited to 4,096 pending items before dispatch; staged continuations
-also have a 10 MiB limit. Copilot-only and established native sessions enforce
-these bounds during local staging. Mixed routes validate them after target
-selection, so other providers' HTTP-backed sessions retain their input contract.
-Downstream messages retain the 10 MiB limit; upstream messages must fit below
-8 MiB including SSE framing.
-The session remains serialized and honors cancellation, shutdown, provider TLS
-and proxy configuration, and shared admission limits.
+A native frame holds at most 4,096 input items and 10 MiB of input. A turn that
+would exceed either limit uses HTTP with the full history. Downstream messages
+retain the 10 MiB limit; upstream messages must fit below 8 MiB including SSE
+framing. The session remains serialized and honors cancellation, shutdown,
+provider TLS and proxy configuration, and shared admission limits.
 
 Local warm-transport benchmarks with a fixed 400-message history reduced
 continuation uploads from 140,921 bytes to 176 bytes. This measures local

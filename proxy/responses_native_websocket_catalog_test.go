@@ -65,6 +65,15 @@ type nativeGateTestUpstream struct {
 	catalog                   string
 	catalogStatus             int
 	postInputItems            chan int
+	nativeFrames              chan nativeGateFrame
+	// turnState, when set, is returned as X-Codex-Turn-State on HTTP turns.
+	turnState string
+}
+
+// nativeGateFrame is what one native response.create carried.
+type nativeGateFrame struct {
+	inputItems int
+	previousID string
 }
 
 func (u *nativeGateTestUpstream) handler(t *testing.T) http.HandlerFunc {
@@ -86,8 +95,15 @@ func (u *nativeGateTestUpstream) handler(t *testing.T) http.HandlerFunc {
 			u.upgrades.Add(1)
 			defer func() { _ = conn.Close() }()
 			for turn := 1; ; turn++ {
-				if _, _, err := conn.ReadMessage(); err != nil {
+				var create struct {
+					Input              []json.RawMessage `json:"input"`
+					PreviousResponseID string            `json:"previous_response_id"`
+				}
+				if err := conn.ReadJSON(&create); err != nil {
 					return
+				}
+				if u.nativeFrames != nil {
+					u.nativeFrames <- nativeGateFrame{len(create.Input), create.PreviousResponseID}
 				}
 				if err := conn.WriteJSON(map[string]any{"type": "response.completed", "response": map[string]any{"id": fmt.Sprintf("resp-native-%d", turn), "output": []any{}}}); err != nil {
 					return
@@ -101,6 +117,9 @@ func (u *nativeGateTestUpstream) handler(t *testing.T) http.HandlerFunc {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			if u.postInputItems != nil {
 				u.postInputItems <- len(body.Input)
+			}
+			if u.turnState != "" {
+				w.Header().Set("X-Codex-Turn-State", u.turnState)
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http-%d\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\n", turn)
@@ -143,20 +162,6 @@ func TestResponsesNativeWebSocketUsesHTTPForUnadvertisedModel(t *testing.T) {
 	// The HTTP bridge keeps session history, so the second turn replays it.
 	if first, second := <-upstream.postInputItems, <-upstream.postInputItems; first != 1 || second != 3 {
 		t.Fatalf("HTTP input items = %d then %d, want 1 then 3", first, second)
-	}
-}
-
-func TestResponsesNativeWebSocketHTTPOnlyModelKeepsHTTPInputLimits(t *testing.T) {
-	h := &ProxyHandler{}
-	h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", false)}, true)
-	request, err := parseResponsesWebSocketCreateRequest([]byte(`{"type":"response.create","model":"gpt-5.4","input":[]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Input = make([]json.RawMessage, responsesNativeMaxPendingItems+1)
-	session := &responsesWebSocketSession{nativeUpstream: newResponsesNativeUpstream(context.Background())}
-	if _, err := session.planRequest(h, request); err != nil {
-		t.Fatalf("HTTP-only model received native input limits: %v", err)
 	}
 }
 
@@ -224,8 +229,8 @@ func TestResponsesNativeWebSocketExplicitRouteUsesTargetUpstreamModel(t *testing
 	}
 }
 
-func TestResponsesNativeWebSocketHTTPStartedSessionStaysHTTP(t *testing.T) {
-	upstream := &nativeGateTestUpstream{postInputItems: make(chan int, 3)}
+func TestResponsesNativeWebSocketHTTPStartedSessionSwitchesWithFullHistory(t *testing.T) {
+	upstream := &nativeGateTestUpstream{postInputItems: make(chan int, 1), nativeFrames: make(chan nativeGateFrame, 2)}
 	h := newTestProxyHandler(t, upstream.handler(t))
 	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true, DisableAutoCompact: true, TurnStateDelta: true}
 	h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", false)}, true)
@@ -250,33 +255,77 @@ func TestResponsesNativeWebSocketHTTPStartedSessionStaysHTTP(t *testing.T) {
 		request["input"] = []any{map[string]string{"role": "user", "content": "next"}}
 	}
 
-	if upstream.upgrades.Load() != 0 || upstream.posts.Load() != 3 {
-		t.Fatalf("transport: upgrades=%d posts=%d, want HTTP only", upstream.upgrades.Load(), upstream.posts.Load())
+	if upstream.posts.Load() != 1 || upstream.upgrades.Load() != 1 {
+		t.Fatalf("transport: posts=%d upgrades=%d, want one HTTP turn then one native connection", upstream.posts.Load(), upstream.upgrades.Load())
 	}
-	// Without an upstream turn-state header the HTTP bridge replays the full
-	// proxy-held history on every turn.
-	for i, want := range []int{1, 3, 5} {
-		if got := <-upstream.postInputItems; got != want {
-			t.Fatalf("HTTP turn %d input items = %d, want %d", i+1, got, want)
-		}
+	if got := <-upstream.postInputItems; got != 1 {
+		t.Fatalf("HTTP turn input items = %d, want 1", got)
+	}
+	// The first native turn replays the proxy's history (user, assistant,
+	// user); the next continues the connection with only the new input.
+	if got := <-upstream.nativeFrames; got != (nativeGateFrame{inputItems: 3}) {
+		t.Fatalf("first native turn = %+v, want full history without a previous response", got)
+	}
+	if got := <-upstream.nativeFrames; got != (nativeGateFrame{inputItems: 1, previousID: "resp-native-1"}) {
+		t.Fatalf("second native turn = %+v, want a one-item continuation", got)
 	}
 }
 
-func TestResponsesNativeWebSocketHTTPStartedSessionKeepsHTTPInputLimits(t *testing.T) {
-	h := &ProxyHandler{}
-	h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", true)}, true)
-	request, err := parseResponsesWebSocketCreateRequest([]byte(`{"type":"response.create","model":"gpt-5.4","input":[]}`))
-	if err != nil {
+func TestResponsesNativeWebSocketOversizedFullHistoryUsesHTTP(t *testing.T) {
+	upstream := &nativeGateTestUpstream{}
+	h := newTestProxyHandler(t, upstream.handler(t))
+	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true, DisableAutoCompact: true}
+	advertiseNativeWebSocketForTest(h)
+
+	input := make([]any, responsesNativeMaxPendingItems+1)
+	for i := range input {
+		input[i] = map[string]string{"role": "user", "content": "x"}
+	}
+	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
+	defer func() { _ = conn.Close() }()
+	if err := conn.WriteJSON(newResponsesWebSocketCreateRequest(input)); err != nil {
 		t.Fatal(err)
 	}
-	request.Input = make([]json.RawMessage, responsesNativeMaxPendingItems+1)
-	upstream := newResponsesNativeUpstream(context.Background())
-	session := &responsesWebSocketSession{nativeUpstream: upstream}
-	if _, err := session.planRequest(h, request); err == nil {
-		t.Fatal("advertised model skipped native input limits")
+	if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "response.completed" {
+		t.Fatalf("oversized turn = %#v", frame)
 	}
-	upstream.keepHTTP()
-	if _, err := session.planRequest(h, request); err != nil {
-		t.Fatalf("HTTP-started session received native input limits: %v", err)
+	if upstream.upgrades.Load() != 0 || upstream.posts.Load() != 1 {
+		t.Fatalf("transport: upgrades=%d posts=%d, want HTTP for history beyond native limits", upstream.upgrades.Load(), upstream.posts.Load())
+	}
+}
+
+func TestResponsesNativeWebSocketTurnStateDeltaStaysOnHTTP(t *testing.T) {
+	upstream := &nativeGateTestUpstream{postInputItems: make(chan int, 2), turnState: "opaque-turn-state"}
+	h := newTestProxyHandler(t, upstream.handler(t))
+	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true, DisableAutoCompact: true, TurnStateDelta: true}
+	h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", false)}, true)
+
+	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
+	defer func() { _ = conn.Close() }()
+	request := newResponsesWebSocketCreateRequest([]any{map[string]string{"role": "user", "content": "first"}})
+	request["model"] = "gpt-5.4"
+	for turn := 1; turn <= 2; turn++ {
+		if turn == 2 {
+			// The model becomes native-eligible while the session holds HTTP
+			// turn state.
+			h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", true)}, true)
+		}
+		if err := conn.WriteJSON(request); err != nil {
+			t.Fatal(err)
+		}
+		frame := mustReadWebSocketJSONSkipMetadata(t, conn)
+		if frame["type"] != "response.completed" {
+			t.Fatalf("turn %d = %#v", turn, frame)
+		}
+		request["previous_response_id"] = websocketResponseID(t, frame)
+		request["input"] = []any{map[string]string{"role": "user", "content": "next"}}
+	}
+	// The second body is a one-item turn-state delta: it must stay on HTTP,
+	// where the turn state carries the earlier context.
+	if upstream.upgrades.Load() != 0 || upstream.posts.Load() != 2 {
+		t.Fatalf("transport: upgrades=%d posts=%d, want the turn-state delta on HTTP", upstream.upgrades.Load(), upstream.posts.Load())
+	}
+	if first, second := <-upstream.postInputItems, <-upstream.postInputItems; first != 1 || second != 1 {
+		t.Fatalf("HTTP input items = %d then %d, want a turn-state delta", first, second)
 	}
 }

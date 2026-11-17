@@ -22,20 +22,25 @@ import (
 
 const responsesNativeMaxPendingItems = 4096
 
-var errResponsesNativeClosed = errors.New("native upstream websocket is closed; reconnect with full input")
+var errResponsesNativeClosed = errors.New("native upstream websocket closed; resend the turn to continue from the proxy's history")
 
 type responsesNativeRequestContextKey struct{}
 
 // This marker belongs to one client turn. Compaction and compatibility helpers
 // receive the original context, so they cannot advance the native connection.
 type responsesNativeRequest struct {
-	upstream           *responsesNativeUpstream
-	model              string
+	upstream *responsesNativeUpstream
+	model    string
+	// delta marks a body holding only what the live native conversation lacks;
+	// it continues from previousResponseID and has no HTTP form. Otherwise the
+	// body carries the full history and may use either transport.
+	delta              bool
 	previousResponseID string
 	headers            http.Header
 	inputItems         int
 	inputBytes         int
-	stagedInput        bool
+	// dispatched records that the turn was sent on the native connection.
+	dispatched atomic.Bool
 }
 
 type responsesNativeFrame struct {
@@ -58,15 +63,13 @@ type responsesNativeUpstream struct {
 	binding    string
 	credential [32]byte
 	model      string
-	responseID string
-	requestID  string
-	turn       *responsesNativeTurn
-	closed     bool
-	// httpPinned records that a turn already went over the HTTP bridge. The
-	// session keeps HTTP from then on: HTTP history lives in the proxy, and a
-	// native connection opened later would see only the new input.
-	httpPinned bool
-	done       chan struct{}
+	// publicModel is the client-facing model the connection was opened for.
+	publicModel string
+	responseID  string
+	requestID   string
+	turn        *responsesNativeTurn
+	closed      bool
+	done        chan struct{}
 }
 
 func newResponsesNativeUpstream(ctx context.Context) *responsesNativeUpstream {
@@ -82,26 +85,24 @@ func (u *responsesNativeUpstream) started() bool {
 	return u.conn != nil
 }
 
-// keepHTTP pins a not-yet-connected session to the HTTP bridge for its
-// lifetime.
-func (u *responsesNativeUpstream) keepHTTP() {
-	if u == nil {
-		return
-	}
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if u.conn == nil {
-		u.httpPinned = true
-	}
-}
-
-func (u *responsesNativeUpstream) usesHTTP() bool {
+func (u *responsesNativeUpstream) isClosed() bool {
 	if u == nil {
 		return false
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	return u.httpPinned
+	return u.closed
+}
+
+// continuation reports the conversation an open connection can continue: its
+// last response and the client-facing model it serves.
+func (u *responsesNativeUpstream) continuation() (responseID, publicModel string, open bool) {
+	if u == nil {
+		return "", "", false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.responseID, u.publicModel, u.conn != nil && !u.closed
 }
 
 func (u *responsesNativeUpstream) previousResponseID() string {
@@ -204,7 +205,9 @@ func (h *ProxyHandler) maybeRejectNativeResponsesRequest(req *http.Request) *htt
 // selectNativeResponsesTransport makes one transport decision for a physical
 // request. native is true only when every native validation passed for that
 // same decision, so a concurrent catalog update cannot skip the native input
-// limits. reason explains a catalog-based HTTP decision for logging.
+// limits. A full-history turn falls back to HTTP whenever native cannot carry
+// it; a delta continues the live connection or is rejected, because it has no
+// HTTP form. reason explains an HTTP decision for logging.
 func (h *ProxyHandler) selectNativeResponsesTransport(req *http.Request) (rejected *http.Response, native bool, reason string) {
 	marker, _ := req.Context().Value(responsesNativeRequestContextKey{}).(*responsesNativeRequest)
 	if marker == nil || marker.upstream == nil {
@@ -212,21 +215,40 @@ func (h *ProxyHandler) selectNativeResponsesTransport(req *http.Request) (reject
 	}
 	u := marker.upstream
 	provider, known := providerRouteFromRequest(req)
+	copilot := known && provider.kind == string(providerTypeCopilot)
 	u.mu.Lock()
-	if u.closed {
-		u.mu.Unlock()
-		return responsesNativeErrorResponse(req, http.StatusConflict, errResponsesNativeClosed.Error()), false, ""
-	}
-	started, binding, credential, httpPinned := u.conn != nil, u.binding, u.credential, u.httpPinned
+	closed, started, binding, credential := u.closed, u.conn != nil, u.binding, u.credential
 	u.mu.Unlock()
-	if httpPinned {
+	sameConnection := copilot && binding == responsesNativeRequestBinding(req, provider.id, marker.model)
+	sameCredential := credential == responsesNativeRequestCredential(req)
+
+	if marker.delta {
+		switch {
+		case closed || !started || !sameConnection:
+			u.close()
+			return responsesNativeErrorResponse(req, http.StatusConflict, errResponsesNativeClosed.Error()), false, ""
+		case !sameCredential:
+			u.close()
+			return responsesNativeErrorResponse(req, http.StatusConflict, "native upstream websocket credential changed; resend the turn to continue from the proxy's history"), false, ""
+		case marker.inputItems > responsesNativeMaxPendingItems:
+			return responsesNativeErrorResponse(req, http.StatusBadRequest, "websocket input exceeds session item limit"), false, ""
+		case marker.inputBytes > maxRequestBodySize:
+			return responsesNativeErrorResponse(req, http.StatusBadRequest, "staged websocket input exceeds session limits"), false, ""
+		}
+		if _, err := responsesNativeTurnHeaders(marker.headers); err != nil {
+			return responsesNativeErrorResponse(req, http.StatusBadRequest, err.Error()), false, ""
+		}
+		return nil, true, ""
+	}
+
+	if closed || !copilot {
 		return nil, false, ""
 	}
-	if !known || provider.kind != string(providerTypeCopilot) {
-		if started {
-			return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model"), false, ""
-		}
-		return nil, false, ""
+	if started && (!sameConnection || !sameCredential) {
+		// The connection serves another target, model or credential. This turn
+		// uses HTTP; the session opens a new connection for the next one.
+		u.close()
+		return nil, false, responsesNativeDeclinedConnectionMismatch
 	}
 	if !started {
 		// Only models whose catalog entry advertises ws:/responses open a native
@@ -235,27 +257,15 @@ func (h *ProxyHandler) selectNativeResponsesTransport(req *http.Request) (reject
 			return nil, false, reason
 		}
 	}
-	if started && binding != responsesNativeRequestBinding(req, provider.id, marker.model) {
-		return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model"), false, ""
-	}
-	if started && credential != responsesNativeRequestCredential(req) {
-		u.close()
-		return responsesNativeErrorResponse(req, http.StatusConflict, "native upstream websocket credential changed; reconnect with full input"), false, ""
-	}
-	// Validate only after selecting native transport. Other providers keep the
-	// HTTP bridge's input contract even when native transport is enabled.
-	if marker.inputItems > responsesNativeMaxPendingItems {
-		return responsesNativeErrorResponse(req, http.StatusBadRequest, "websocket input exceeds session item limit"), false, ""
-	}
-	if marker.stagedInput && marker.inputBytes > maxRequestBodySize {
-		return responsesNativeErrorResponse(req, http.StatusBadRequest, "staged websocket input exceeds session limits"), false, ""
+	if marker.inputItems > responsesNativeMaxPendingItems || marker.inputBytes > maxRequestBodySize {
+		return nil, false, responsesNativeDeclinedInputTooLarge
 	}
 	if _, err := responsesNativeTurnHeaders(marker.headers); err != nil {
-		return responsesNativeErrorResponse(req, http.StatusBadRequest, err.Error()), false, ""
+		return nil, false, responsesNativeDeclinedTurnHeaders
 	}
 	if !started {
 		if _, _, _, err := h.prepareResponsesNativeDial(req); err != nil {
-			return responsesNativeErrorResponse(req, http.StatusBadRequest, err.Error()), false, ""
+			return nil, false, responsesNativeDeclinedDialUnavailable
 		}
 	}
 	return nil, true, ""
@@ -303,7 +313,6 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 				logger.F("reason", reason),
 			)
 		}
-		marker.upstream.keepHTTP()
 		return nil, false, nil
 	}
 	if req.Body == nil {
@@ -374,7 +383,7 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 			_ = conn.Close()
 			return nil, true, context.Canceled
 		}
-		u.conn, u.binding, u.model, u.credential, u.requestID = conn, binding, model, credential, requestID
+		u.conn, u.binding, u.model, u.publicModel, u.credential, u.requestID = conn, binding, model, marker.model, credential, requestID
 		u.mu.Unlock()
 		go u.readPump(conn)
 	}
@@ -411,6 +420,7 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 		// Once a frame write starts, delivery is ambiguous on any failure.
 		trace.WroteHeaders()
 	}
+	marker.dispatched.Store(true)
 	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
 		u.close()
 	}

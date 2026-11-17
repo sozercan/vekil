@@ -261,8 +261,8 @@ measured:
 
 Both endpoints are local deterministic fixtures. These numbers cover warm
 transport and history construction; they do not establish live provider latency,
-quota changes, model performance, or reconnect behavior. The native transport
-remains opt-in, and its [session limits](responses-websocket.md#experimental-native-upstream-transport)
+quota changes, model performance, or reconnect behavior. The native transport's
+[session limits](responses-websocket.md#native-upstream-transport)
 are part of the compatibility contract.
 
 ## Policy evaluation and release evidence

@@ -360,16 +360,17 @@ func TestServeFlagsResponsesWebSocketCanBeEnabled(t *testing.T) {
 }
 
 func TestServeFlagsResponsesWebSocketNativeUpstream(t *testing.T) {
-	t.Setenv("RESPONSES_WS_NATIVE_UPSTREAM", "false")
+	t.Setenv("RESPONSES_WS_NATIVE_UPSTREAM", "")
 	defaults := parseServeFlagsForTest(t)
-	if defaults.responsesWebSocketConfig().NativeUpstream {
-		t.Fatal("native upstream websocket should be disabled by default")
+	if !defaults.responsesWebSocketConfig().NativeUpstream {
+		t.Fatal("native upstream websocket should be enabled by default")
 	}
-	t.Setenv("RESPONSES_WS_NATIVE_UPSTREAM", "true")
+	t.Setenv("RESPONSES_WS_NATIVE_UPSTREAM", "false")
 	configured := parseServeFlagsForTest(t)
-	if !configured.responsesWebSocketConfig().NativeUpstream {
+	if configured.responsesWebSocketConfig().NativeUpstream {
 		t.Fatal("native upstream websocket did not use environment configuration")
 	}
+	t.Setenv("RESPONSES_WS_NATIVE_UPSTREAM", "true")
 	override := parseServeFlagsForTest(t, "--responses-ws-native-upstream=false")
 	if override.responsesWebSocketConfig().NativeUpstream {
 		t.Fatal("native upstream websocket flag did not override environment configuration")

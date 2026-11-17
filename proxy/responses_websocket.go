@@ -235,24 +235,31 @@ type responsesWebSocketSession struct {
 	historyItems               []json.RawMessage
 	historyBytes               int
 	nativeUpstream             *responsesNativeUpstream
-	nativeResetPending         bool
-	toolContexts               *ToolExecutionContextStore
-	toolScope                  string
-	handlerDone                chan struct{}
-	handlerDoneOnce            sync.Once
-	writeWait                  time.Duration
-	pingPeriod                 time.Duration
-	pongWait                   time.Duration
-	terminalObservationWait    time.Duration
-	inflightMu                 sync.Mutex
-	inflightCancel             context.CancelFunc
-	inflightGen                uint64
-	inflightCancelHolds        int
-	closing                    bool
-	closeCause                 responsesWebSocketCloseCause
-	closeSequence              uint64
-	closeBarrier               *responsesWebSocketCloseBarrier
-	socketClosed               bool
+	// nativeBase is how many leading historyItems the conversation on
+	// nativeBaseUpstream already holds, ending at that connection's last
+	// response. It stays valid only while that connection is open and the
+	// history is only appended to.
+	nativeBase         int
+	nativeBaseUpstream *responsesNativeUpstream
+	// nativeTurn is the native marker of the current attempt, if one was built.
+	nativeTurn              *responsesNativeRequest
+	toolContexts            *ToolExecutionContextStore
+	toolScope               string
+	handlerDone             chan struct{}
+	handlerDoneOnce         sync.Once
+	writeWait               time.Duration
+	pingPeriod              time.Duration
+	pongWait                time.Duration
+	terminalObservationWait time.Duration
+	inflightMu              sync.Mutex
+	inflightCancel          context.CancelFunc
+	inflightGen             uint64
+	inflightCancelHolds     int
+	closing                 bool
+	closeCause              responsesWebSocketCloseCause
+	closeSequence           uint64
+	closeBarrier            *responsesWebSocketCloseBarrier
+	socketClosed            bool
 }
 
 type responsesWebSocketRequestPlan struct {
@@ -265,6 +272,12 @@ type responsesWebSocketRequestPlan struct {
 	compactionTrigger    bool
 	conversationSourceID string
 	conversationComplete bool
+	// nativeDelta continues the live native conversation from nativePreviousID
+	// with only nativeDeltaSegments. Any other turn carries the full history,
+	// which is valid on either transport.
+	nativeDelta         bool
+	nativePreviousID    string
+	nativeDeltaSegments [][]json.RawMessage
 }
 
 type responsesWebSocketRequestMetrics struct {
@@ -328,6 +341,9 @@ type responsesWebSocketHistoryCompaction struct {
 }
 
 func (p responsesWebSocketRequestPlan) upstreamSegments() [][]json.RawMessage {
+	if p.nativeDelta {
+		return p.nativeDeltaSegments
+	}
 	if p.useTurnStateDelta {
 		return [][]json.RawMessage{p.currentInput}
 	}
@@ -1551,9 +1567,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 
 	if request.Generate != nil && !*request.Generate {
-		if s.nativeUpstream != nil && request.PreviousResponseID == "" {
-			s.nativeResetPending = true
-		}
 		responseID := "vekil-ws-" + uuid.NewString()
 		s.rememberPlannedResponse(plan, responseID, nil)
 		s.logRequestMetrics(h, request, responseID, metrics)
@@ -1861,15 +1874,15 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		recordTurn(http.StatusOK, streamResult.usage)
 		return nil
 	}
-	if s.nativeUpstream.started() {
-		// The upstream connection owns completed history. Only locally staged
-		// generate:false input is retained between native turns.
-		s.lastResponseID = streamResult.responseID
-		s.lastSignature = plan.signature
-		s.historyItems = nil
-		s.historyBytes = 0
-		s.nativeResetPending = false
-		s.nativeUpstream.rememberResponse(streamResult.responseID)
+	if native := s.dispatchedNativeTurn(); native != nil {
+		// The proxy keeps the full history although the upstream connection also
+		// holds it, so a closed connection, a compaction or a model switch can
+		// continue by replaying it. Native turns skip the HTTP bridge's
+		// auto-compaction and turn state.
+		s.rememberPlannedResponse(plan, streamResult.responseID, streamResult.outputItems)
+		s.nativeBase = len(s.historyItems)
+		s.nativeBaseUpstream = native.upstream
+		native.upstream.rememberResponse(streamResult.responseID)
 		recordTurn(http.StatusOK, streamResult.usage)
 		s.logRequestMetrics(h, request, streamResult.responseID, metrics)
 		return nil
@@ -1878,6 +1891,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	if metrics.pendingCompactedHistory != nil {
 		s.historyItems = cloneRawMessages(metrics.pendingCompactedHistory)
 		s.historyBytes = rawMessagesSize(s.historyItems)
+		s.nativeBaseUpstream = nil
 	}
 	if pendingExplicitTurnState != "" {
 		s.turnState = pendingExplicitTurnState
@@ -1923,13 +1937,9 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 		compactionChecked: true,
 		compactionTrigger: responsesInputContainsCompactionTrigger(request.Input),
 	}
-	nativeInputLimits := s.nativeInputLimitsApply(h, request.Model)
-	if s.nativeUpstream.started() && plan.hasCompactionTrigger() {
-		return responsesWebSocketRequestPlan{}, fmt.Errorf("compaction_trigger is unavailable on a native upstream websocket; compact over HTTP and reconnect with full input")
-	}
-	if nativeInputLimits && len(request.Input) > responsesNativeMaxPendingItems {
-		return responsesWebSocketRequestPlan{}, fmt.Errorf("websocket input exceeds session item limit")
-	}
+	// Each plan starts a new attempt with a usable native connection slot.
+	s.nativeTurn = nil
+	s.renewNativeUpstream(request.Model)
 	route, known := h.resolveModelRouteForRequest(request.Model, providerEndpointResponses)
 	migration := known && h.conversationMigrationEnabled(route)
 	if migration {
@@ -1977,12 +1987,7 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 		plan.currentInput = append(plan.currentInput, request.Input...)
 		plan.fullReplaySegments = [][]json.RawMessage{plan.currentInput}
 	}
-	if nativeInputLimits {
-		if len(s.historyItems)+len(request.Input) > responsesNativeMaxPendingItems || rawMessageSegmentsSize(plan.fullReplaySegments...) > maxRequestBodySize {
-			return responsesWebSocketRequestPlan{}, fmt.Errorf("staged websocket input exceeds session limits")
-		}
-	}
-	if s.nativeUpstream.started() {
+	if s.planNativeDelta(&plan, request) {
 		return plan, nil
 	}
 	cfg := h.responsesWebSocketConfig()
@@ -1990,57 +1995,51 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	return plan, nil
 }
 
-func (s *responsesWebSocketSession) nativeInputLimitsApply(h *ProxyHandler, model string) bool {
-	if s.nativeUpstream == nil || h == nil {
+// planNativeDelta continues the live native conversation with only the history
+// it lacks plus the new input. Every other turn carries the full history.
+func (s *responsesWebSocketSession) planNativeDelta(plan *responsesWebSocketRequestPlan, request *responsesWebSocketCreateRequest) bool {
+	u := s.nativeUpstream
+	if u == nil || u != s.nativeBaseUpstream || plan.resetHistory || plan.hasCompactionTrigger() || s.nativeBase > len(s.historyItems) {
 		return false
 	}
-	if s.nativeUpstream.started() {
-		return true
-	}
-	if s.nativeUpstream.usesHTTP() {
+	previousID, model, open := u.continuation()
+	if !open || previousID == "" || model != request.Model {
 		return false
 	}
-	if route, known := h.resolveModelRouteForRequest(model, providerEndpointResponses); known && route != nil {
-		if h.conversationMigrationEnabled(route) {
-			// Protected turns always use the HTTP bridge, including after a
-			// switch to Copilot with NativeUpstream enabled for other routes.
-			return false
-		}
-		if s.explicitTargetID != "" {
-			target, ok := route.targetByID(s.explicitTargetID)
-			return ok && h.copilotTargetAdvertisesNativeWebSocket(target.provider, target.upstreamModel)
-		}
-		targets := route.targets
-		if route.policy.mode == routeModePrimaryOnly && len(targets) > 0 {
-			targets = targets[:1]
-		}
-		for _, target := range targets {
-			if !h.copilotTargetAdvertisesNativeWebSocket(target.provider, target.upstreamModel) {
-				// Mixed routes and HTTP-only Copilot models validate again after
-				// target selection. A possible native fallback must not constrain
-				// an HTTP-backed primary.
-				return false
-			}
-		}
-		return len(targets) > 0
+	missing := s.historyItems[s.nativeBase:]
+	if len(missing)+len(request.Input) > responsesNativeMaxPendingItems || rawMessageSegmentsSize(missing, request.Input) > maxRequestBodySize {
+		// Too large for one native frame. The full history then uses HTTP.
+		return false
 	}
-	provider, owner, _ := h.resolveProviderModelForRequest(model, providerEndpointResponses)
-	upstreamModel := owner.upstreamModel
-	if upstreamModel == "" {
-		upstreamModel = model
-	}
-	return h.copilotTargetAdvertisesNativeWebSocket(provider, upstreamModel)
+	plan.nativeDelta = true
+	plan.nativePreviousID = previousID
+	plan.nativeDeltaSegments = [][]json.RawMessage{missing, request.Input}
+	return true
 }
 
-// copilotTargetAdvertisesNativeWebSocket is the planning-time view of native
-// eligibility. It never refreshes the catalog; an unknown capability keeps HTTP
-// limits, and dispatch revalidates native limits if it does select native.
-func (h *ProxyHandler) copilotTargetAdvertisesNativeWebSocket(provider *providerRuntime, upstreamModel string) bool {
-	if provider == nil || provider.kind != providerTypeCopilot {
-		return false
+// renewNativeUpstream replaces a closed native connection, or one opened for
+// another model, so an eligible turn can open a new one. The turn then carries
+// the full history from the proxy's copy.
+func (s *responsesWebSocketSession) renewNativeUpstream(model string) {
+	u := s.nativeUpstream
+	if u == nil || u.ctx.Err() != nil {
+		return
 	}
-	advertised, _ := h.copilotNativeWS.lookup(provider.id, upstreamModel)
-	return advertised
+	if _, publicModel, open := u.continuation(); open && publicModel != model {
+		u.close()
+	}
+	if u.isClosed() {
+		s.nativeUpstream = newResponsesNativeUpstream(u.ctx)
+	}
+}
+
+// dispatchedNativeTurn returns the current attempt's marker when it was sent
+// on the native connection.
+func (s *responsesWebSocketSession) dispatchedNativeTurn() *responsesNativeRequest {
+	if s.nativeTurn != nil && s.nativeTurn.dispatched.Load() {
+		return s.nativeTurn
+	}
+	return nil
 }
 
 func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, plan responsesWebSocketRequestPlan, metrics *responsesWebSocketRequestMetrics) (*http.Response, bool, bool, error) {
@@ -2048,9 +2047,17 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 		resp, err := s.postConversationCreateRequest(h, ctx, request, plan)
 		return resp, false, false, err
 	}
-	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta)
-	if s.nativeUpstream.started() {
-		return resp, request.PreviousResponseID != "" && !s.nativeResetPending, false, err
+	native := &plan
+	if plan.useTurnStateDelta {
+		// A turn-state delta holds only the new input and depends on HTTP
+		// continuation state, so it has no native form.
+		native = nil
+	}
+	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta, native)
+	if plan.nativeDelta || s.dispatchedNativeTurn() != nil {
+		// Native turns never take the HTTP bridge's turn-state or compaction
+		// retries; a native delta has no HTTP form.
+		return resp, plan.nativeDelta, false, err
 	}
 	if err != nil || resp == nil {
 		return resp, plan.useTurnStateDelta, false, err
@@ -2083,7 +2090,7 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 		logger.F("delta_attempted", true),
 		logger.F("delta_fallback", true),
 	)
-	resp, err = s.postCreateRequestSegments(h, ctx, request, plan.fullReplaySegments, false)
+	resp, err = s.postCreateRequestSegments(h, ctx, request, plan.fullReplaySegments, false, nil)
 	if err != nil || resp == nil {
 		return resp, true, true, err
 	}
@@ -2091,7 +2098,9 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 	return resp, true, true, err
 }
 
-func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, inputSegments [][]json.RawMessage, includeTurnState bool) (*http.Response, error) {
+// postCreateRequestSegments sends one upstream attempt. A non-nil native plan
+// lets the attempt use the native connection; HTTP bridge retries pass nil.
+func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, inputSegments [][]json.RawMessage, includeTurnState bool, native *responsesWebSocketRequestPlan) (*http.Response, error) {
 	bodyBytes, err := request.upstreamBody(inputSegments...)
 	if err != nil {
 		return nil, err
@@ -2129,18 +2138,16 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 		}
 		return compactionResp, err
 	}
-	if s.nativeUpstream != nil {
-		previousID := ""
-		if request.PreviousResponseID != "" && !s.nativeResetPending {
-			previousID = s.nativeUpstream.previousResponseID()
-		}
+	if native != nil && s.nativeUpstream != nil {
 		marker := &responsesNativeRequest{
-			upstream: s.nativeUpstream, model: request.Model, previousResponseID: previousID, headers: headers,
-			inputBytes: rawMessageSegmentsSize(inputSegments...), stagedInput: request.PreviousResponseID != "",
+			upstream: s.nativeUpstream, model: request.Model, headers: headers,
+			delta: native.nativeDelta, previousResponseID: native.nativePreviousID,
+			inputBytes: rawMessageSegmentsSize(inputSegments...),
 		}
 		for _, segment := range inputSegments {
 			marker.inputItems += len(segment)
 		}
+		s.nativeTurn = marker
 		ctx = context.WithValue(ctx, responsesNativeRequestContextKey{}, marker)
 	}
 	resp, err := h.postResponsesWithHeadersForModel(ctx, bodyBytes, headers, request.Model)
@@ -2266,6 +2273,7 @@ func (s *responsesWebSocketSession) rememberResponse(resetHistory bool, response
 	if resetHistory {
 		s.historyItems = nil
 		s.historyBytes = 0
+		s.nativeBaseUpstream = nil
 	}
 	s.historyItems = append(s.historyItems, currentInput...)
 	s.historyItems = append(s.historyItems, outputItems...)
@@ -2419,7 +2427,7 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 			logger.F("tail_attempts", len(keepTailSchedule)),
 		)
 
-		retryResp, retryErr := s.postCreateRequestSegments(h, ctx, request, [][]json.RawMessage{compactedHistory, request.Input}, false)
+		retryResp, retryErr := s.postCreateRequestSegments(h, ctx, request, [][]json.RawMessage{compactedHistory, request.Input}, false, nil)
 		if retryErr != nil {
 			h.log.Debug("responses websocket 413 retry request failed", logger.F("keep_tail", keepTail), logger.Err(retryErr))
 			return lastResp, nil
@@ -2488,6 +2496,7 @@ func (s *responsesWebSocketSession) compactHistory(h *ProxyHandler, ctx context.
 	}
 	s.historyItems = compacted
 	s.historyBytes = rawMessagesSize(compacted)
+	s.nativeBaseUpstream = nil
 	return result, true, nil
 }
 
@@ -2562,14 +2571,14 @@ func (s *responsesWebSocketSession) compactHistoryItemsWithKeepTail(h *ProxyHand
 }
 
 func (s *responsesWebSocketSession) logRequestMetrics(h *ProxyHandler, request *responsesWebSocketCreateRequest, responseID string, metrics responsesWebSocketRequestMetrics) {
-	transport := "http"
-	if s.nativeUpstream.started() {
-		transport = "native"
+	transport, upstreamRequestID := "http", ""
+	if native := s.dispatchedNativeTurn(); native != nil {
+		transport, upstreamRequestID = "native", native.upstream.upstreamRequestID()
 	}
 	h.log.Debug("responses websocket request completed",
 		logger.F("model", request.Model),
 		logger.F("transport", transport),
-		logger.F("upstream_request_id", s.nativeUpstream.upstreamRequestID()),
+		logger.F("upstream_request_id", upstreamRequestID),
 		logger.F("previous_response_id", request.PreviousResponseID),
 		logger.F("response_id", responseID),
 		logger.F("delta_attempted", metrics.deltaAttempted),
@@ -2762,9 +2771,7 @@ func (s *responsesWebSocketSession) streamUpstreamResponseWithRequest(h *ProxyHa
 				if h != nil {
 					h.maybeRewriteOrCaptureToolCommandItem(s.ctx, event.Item, s.toolContexts, s.toolScope, false)
 				}
-				if !s.nativeUpstream.started() {
-					result.outputItems = append(result.outputItems, cloneRawMessage(event.Item))
-				}
+				result.outputItems = append(result.outputItems, cloneRawMessage(event.Item))
 			}
 		case "response.completed", "response.incomplete", "response.cancelled", "response.canceled":
 			return errResponsesWebSocketStreamTerminal
