@@ -106,6 +106,11 @@ func (c *taskUsageCollector) snapshot() taskUsageSnapshot {
 func taskUsageEndpoint(req *http.Request) string {
 	if req != nil {
 		if endpoint, ok := req.Context().Value(taskInferenceEndpointContextKey{}).(string); ok {
+			if endpoint == copilotEndpointDecisions {
+				// Decisions responses report input_tokens/output_tokens usage,
+				// which the SystemOne usage parser reads.
+				return providerEndpointSystemOne
+			}
 			return endpoint
 		}
 	}
