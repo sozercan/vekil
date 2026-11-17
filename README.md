@@ -16,8 +16,6 @@ Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatibl
 
 Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Azure OpenAI, or send Gemini-CLI traffic through any OpenAI-compatible upstream — all without touching client config. Swap providers behind the proxy; your tools never notice.
 
-> **Looking for free models?** Vekil can route to OpenCode Zen's free tier with no signup — [see how](docs/provider-routing.md#opencode-zen-free-tier). It is a shared, rate-limited trial tier (models rotate; not for sensitive prompts).
-
 ## Features
 
 - **Anthropic Messages API** — drop-in compatible with Claude clients
@@ -31,28 +29,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 
 ## Quick Start
 
-Try Vekil with OpenCode Zen's free models without creating an account or a
-local config file:
-
-```bash
-docker run --rm -p 127.0.0.1:1337:1337 \
-  ghcr.io/sozercan/vekil:latest \
-  --providers-config \
-  https://raw.githubusercontent.com/sozercan/vekil/main/examples/opencode-zen-free.yaml
-```
-
-In another terminal, inspect the available public model IDs:
-
-```bash
-curl -s http://127.0.0.1:1337/v1/models
-```
-
-The config URL is fetched once at startup. Pin the URL to a Vekil commit instead
-of `main` for reproducible deployments. Zen's free tier is shared and
-rate-limited, its models rotate, and data handling varies by promotion; do not
-send sensitive prompts. See [OpenCode Zen Free Tier](docs/provider-routing.md#opencode-zen-free-tier).
-
-For zero-config GitHub Copilot mode, persist Vekil's authentication state:
+Run Vekil in zero-config GitHub Copilot mode and persist its authentication state:
 
 ```bash
 mkdir -p ~/.config/vekil

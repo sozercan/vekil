@@ -67,21 +67,22 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--port-file", required=True)
 parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--port", type=int, default=0)
-parser.add_argument("--canary-status", type=int, default=200)
-parser.add_argument("--canary-status-sequence", default="")
-parser.add_argument("--canary-message", default="")
-parser.add_argument("--canary-error-type", default="")
-parser.add_argument("--canary-bad-shape", action="store_true")
-parser.add_argument("--hang-chat", action="store_true")
+parser.add_argument("--gemini-model", action="store_true")
 parser.add_argument("--compact-status", type=int, default=200)
 parser.add_argument("--compact-code", default="")
 parser.add_argument("--replay-status", type=int, default=200)
 parser.add_argument("--replay-code", default="")
 args = parser.parse_args()
 
-MODEL = "deepseek-v4-flash-free"
-CANARY_STATUSES = [int(value) for value in args.canary_status_sequence.split(",") if value] or [args.canary_status]
-canary_index = 0
+MODELS = [
+    {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
+    {"id": "gpt-5.6-luna-utility", "supported_endpoints": ["/responses"]},
+    {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
+    {"id": "claude-sonnet-5", "supported_endpoints": ["/chat/completions"]},
+    {"id": "claude-haiku-5.5", "supported_endpoints": ["/chat/completions"]},
+]
+if args.gemini_model:
+    MODELS.append({"id": "gpt-4.1", "supported_endpoints": ["/chat/completions"]})
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -105,51 +106,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"status": "ready"})
             return
         if self.path == "/v1/models":
-            self.send_json(200, {"data": [
-                {"id": MODEL, "supported_endpoints": ["/chat/completions", "/responses"]},
-                {"id": "mimo-v2.5-free", "supported_endpoints": ["/chat/completions"]},
-                {"id": "hy3-free", "supported_endpoints": ["/chat/completions"]},
-                {"id": "gpt-5.4", "supported_endpoints": ["/responses"]},
-                {"id": "gpt-5.6-luna-utility", "supported_endpoints": ["/responses"]},
-                {"id": "muse-spark-1.2-contributor-free", "supported_endpoints": ["/responses"]},
-                {"id": "claude-sonnet-4.6", "supported_endpoints": ["/chat/completions"]},
-                {"id": "claude-sonnet-5", "supported_endpoints": ["/chat/completions"]},
-                {"id": "claude-haiku-5.5", "supported_endpoints": ["/chat/completions"]},
-            ]})
+            self.send_json(200, {"data": MODELS})
             return
         self.send_json(404, {"error": {"message": "not found"}})
 
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
         body = self.rfile.read(length) if length else b""
-        if self.path == "/v1/chat/completions":
-            if args.hang_chat:
-                time.sleep(300)
-                return
-            try:
-                model = json.loads(body).get("model")
-            except (AttributeError, json.JSONDecodeError):
-                model = None
-            if model in {"gpt-5.4", "muse-spark-1.2-contributor-free"}:
-                self.send_json(400, {
-                    "error": {"message": f"model {model} does not support /chat/completions"},
-                })
-                return
-            global canary_index
-            status = CANARY_STATUSES[min(canary_index, len(CANARY_STATUSES) - 1)]
-            canary_index += 1
-            message = args.canary_message or f"mock HTTP {status}"
-            if status == 200 and not args.canary_bad_shape:
-                self.send_json(200, {
-                    "model": MODEL,
-                    "choices": [{"message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
-                })
-            else:
-                error = {"message": message}
-                if args.canary_error_type:
-                    error["type"] = args.canary_error_type
-                self.send_json(status, {"error": error})
-            return
         if self.path == "/v1/responses/compact":
             if args.compact_status != 200:
                 self.send_json(args.compact_status, {
@@ -217,36 +180,18 @@ wait_for_file() {
 
 start_mock_server() {
   local case_dir="$1"
-  local status="${2:-200}"
-  local sequence="${3:-}"
-  local message="${4:-}"
-  local bad_shape="${5:-0}"
-  local hang_chat="${6:-0}"
-  local compact_status="${7:-200}"
-  local compact_code="${8:-}"
-  local replay_status="${9:-200}"
-  local replay_code="${10:-}"
+  local compact_status="${2:-200}"
+  local compact_code="${3:-}"
+  local replay_status="${4:-200}"
+  local replay_code="${5:-}"
   local port_file="${case_dir}/port"
   local args=(
     --port-file "${port_file}"
-    --canary-status "${status}"
     --compact-status "${compact_status}"
     --replay-status "${replay_status}"
   )
-  if [[ -n "${sequence}" ]]; then
-    args+=(--canary-status-sequence "${sequence}")
-  fi
-  if [[ -n "${message}" ]]; then
-    args+=(--canary-message "${message}")
-  fi
-  if [[ -n "${MOCK_CANARY_ERROR_TYPE:-}" ]]; then
-    args+=(--canary-error-type "${MOCK_CANARY_ERROR_TYPE}")
-  fi
-  if [[ "${bad_shape}" == "1" ]]; then
-    args+=(--canary-bad-shape)
-  fi
-  if [[ "${hang_chat}" == "1" ]]; then
-    args+=(--hang-chat)
+  if [[ "${MOCK_GEMINI_MODEL:-0}" == "1" ]]; then
+    args+=(--gemini-model)
   fi
   if [[ -n "${compact_code}" ]]; then
     args+=(--compact-code "${compact_code}")
@@ -269,18 +214,6 @@ start_mock_server() {
   server_ports+=("${MOCK_SERVER_PORT}")
 }
 
-write_fake_clients() {
-  local bin_dir="$1"
-  local copilot_mode="$2"
-  local claude_mode="$3"
-  local gemini_mode="$4"
-  mkdir -p "${bin_dir}"
-
-  write_fake_client "${bin_dir}/copilot" "${copilot_mode}"
-  write_fake_client "${bin_dir}/claude" "${claude_mode}"
-  write_fake_client "${bin_dir}/gemini" "${gemini_mode}"
-}
-
 write_fake_client() {
   local path="$1"
   local mode="$2"
@@ -290,22 +223,11 @@ write_fake_client() {
 #!/usr/bin/env bash
 set -euo pipefail
 mode=${mode_q}
-fixture_output() {
-  local arg
-  for arg in "\$@"; do
-    if [[ "\${arg}" =~ (ZX_[A-Z]+_LEFT\|ZX_[A-Z]+_RIGHT) ]]; then
-      printf '%s' "\${BASH_REMATCH[1]}"
-      return 0
-    fi
-  done
-  if [[ -f left.txt && -f right.txt ]]; then
-    printf '%s|%s' "\$(cat left.txt)" "\$(cat right.txt)"
-    return 0
-  fi
-  printf 'fake client received neither a direct Zen sentinel nor file fixtures\n' >&2
-  return 98
-}
-expected="\$(fixture_output "\$@")"
+if [[ ! -f left.txt || ! -f right.txt ]]; then
+  printf 'fake client found no left.txt/right.txt fixtures in %s\n' "\${PWD}" >&2
+  exit 98
+fi
+expected="\$(cat left.txt)|\$(cat right.txt)"
 left="\${expected%%|*}"
 right="\${expected#*|}"
 case "\${mode}" in
@@ -347,46 +269,6 @@ PY_WRAPPED_OUTPUT
     printf '|'
     jq -cn --arg output "\${right}" '{output: \$output}'
     ;;
-  exit42)
-    exit 42
-    ;;
-  fail-once)
-    state_dir="\${FAKE_CLI_STATE_DIR:?}"
-    mkdir -p "\${state_dir}"
-    state_file="\${state_dir}/\$(basename "\$0")"
-    count=0
-    [[ ! -f "\${state_file}" ]] || count="\$(cat "\${state_file}")"
-    count=\$((count + 1))
-    printf '%s
-' "\${count}" > "\${state_file}"
-    if [[ "\${count}" -eq 1 ]]; then
-      exit 42
-    fi
-    printf '%s\n' "\${expected}"
-    ;;
-  fail-first-model)
-    state_file="\$(dirname "\$0")/.\$(basename "\$0").first-model-seen"
-    if [[ ! -e "\${state_file}" ]]; then
-      : > "\${state_file}"
-      printf '%s\n' "\${left}"
-      exit 0
-    fi
-    printf '%s\n' "\${expected}"
-    ;;
-  exit-first-model)
-    state_file="\$(dirname "\$0")/.\$(basename "\$0").first-model-seen"
-    if [[ ! -e "\${state_file}" ]]; then
-      : > "\${state_file}"
-      exit 42
-    fi
-    printf '%s\n' "\${expected}"
-    ;;
-  fork-sleeper)
-    sleep 300 &
-    child=\$!
-    printf '%s\n' "\${child}" > "\${FAKE_CLI_CHILD_PID_FILE:?}"
-    exit 42
-    ;;
   *)
     printf 'unknown fake client mode: %s\n' "\${mode}" >&2
     exit 99
@@ -398,7 +280,11 @@ EOF_CLIENT
 
 write_fake_default_smoke_clients() {
   local bin_dir="$1"
+  local gemini_mode="${2:-}"
   mkdir -p "${bin_dir}"
+  if [[ -n "${gemini_mode}" ]]; then
+    write_fake_client "${bin_dir}/gemini" "${gemini_mode}"
+  fi
 
   cat > "${bin_dir}/codex" <<'EOF_CODEX'
 #!/usr/bin/env bash
@@ -645,283 +531,47 @@ except OSError:
 PY_PORT_CHECK
 }
 
-common_zen_env() {
-  local smoke_dir="$1"
-  local port="$2"
-  local fake_bin="$3"
-  printf '%s\0' \
-    "PATH=${fake_bin}:${ORIGINAL_PATH}" \
-    "SMOKE_PROVIDER=zen" \
-    "START_PROXY=0" \
-    "PROXY_HOST=127.0.0.1" \
-    "PROXY_PORT=${port}" \
-    "LIVE_CLI_SMOKE_DIR=${smoke_dir}" \
-    "SMOKE_STARTUP_TIMEOUT_SECONDS=2" \
-    "SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1" \
-    "SMOKE_CURL_MAX_TIME_SECONDS=2" \
-    "SMOKE_CLI_TIMEOUT_SECONDS=2"
-}
-
-run_zen_case_expect_success() {
-  local name="$1"
-  local copilot_mode="$2"
-  local claude_mode="$3"
-  local gemini_mode="$4"
-  local case_dir="${TMP_ROOT}/setup/${name}"
-  start_mock_server "${case_dir}/server" 200
+# Copilot-mode harness run with Gemini enabled (the mock lists gpt-4.1) and a
+# fake Gemini CLI emitting <gemini_mode>-shaped output for the file fixture.
+run_gemini_case() {
+  local expectation="$1"
+  local name="$2"
+  local gemini_mode="$3"
+  local case_dir="${TMP_ROOT}/setup/${name//[^a-zA-Z0-9_.-]/_}"
+  MOCK_GEMINI_MODEL=1 start_mock_server "${case_dir}/server"
   local port="${MOCK_SERVER_PORT}"
-  local fake_bin="${case_dir}/bin"
-  write_fake_clients "${fake_bin}" "${copilot_mode}" "${claude_mode}" "${gemini_mode}"
-  local smoke_dir="${case_dir}/smoke"
-  local env_args=()
-  while IFS= read -r -d '' item; do env_args+=("${item}"); done < <(common_zen_env "${smoke_dir}" "${port}" "${fake_bin}")
-  expect_success "${name}" 8 env "${env_args[@]}" "${REPO_ROOT}/scripts/live-cli-smoke.sh"
-}
-
-run_zen_case_expect_failure() {
-  local name="$1"
-  local status="$2"
-  local copilot_mode="$3"
-  local claude_mode="$4"
-  local gemini_mode="$5"
-  local message="${6:-}"
-  local bad_shape="${7:-0}"
-  local case_dir="${TMP_ROOT}/setup/${name}"
-  local port
-  start_mock_server "${case_dir}/server" "${status}" "" "${message}" "${bad_shape}"
-  port="${MOCK_SERVER_PORT}"
-  local fake_bin="${case_dir}/bin"
-  write_fake_clients "${fake_bin}" "${copilot_mode}" "${claude_mode}" "${gemini_mode}"
-  local smoke_dir="${case_dir}/smoke"
-  local env_args=()
-  while IFS= read -r -d '' item; do env_args+=("${item}"); done < <(common_zen_env "${smoke_dir}" "${port}" "${fake_bin}")
-  expect_hard_failure "${name}" 8 env "${env_args[@]}" "${REPO_ROOT}/scripts/live-cli-smoke.sh"
-}
-
-run_zen_classification_case() {
-  local name="$1"
-  local status="$2"
-  local message="$3"
-  local bad_shape="$4"
-  local case_dir="${TMP_ROOT}/setup/${name}"
-  local port
-  start_mock_server "${case_dir}/server" "${status}" "" "${message}" "${bad_shape}"
-  port="${MOCK_SERVER_PORT}"
-  write_fake_clients "${case_dir}/bin" pass pass pass
-
-  expect_hard_failure "${name} via CLI harness" 8 \
-    env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
-      PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" LIVE_CLI_SMOKE_DIR="${case_dir}/cli-smoke" \
-      SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
-      "${REPO_ROOT}/scripts/live-cli-smoke.sh"
-
-  mkdir -p "${case_dir}/raw-smoke"
-  expect_hard_failure_with_stderr "${name} via raw Zen smoke" 8 '^FAIL[[:space:]]+' \
-    env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" \
-      LIVE_ZEN_SMOKE_DIR="${case_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
-      SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
+  write_fake_default_smoke_clients "${case_dir}/bin" "${gemini_mode}"
+  local cmd=(
+    env PATH="${case_dir}/bin:${ORIGINAL_PATH}" START_PROXY=0
+    PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" LIVE_CLI_SMOKE_DIR="${case_dir}/smoke"
+    FAKE_CLAUDE_CAPTURE_DIR="${case_dir}/capture" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2
+    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
+  )
+  if [[ "${expectation}" == "reject" ]]; then
+    expect_hard_failure_with_stderr "${name}" 8 'gemini smoke output mismatch' "${cmd[@]}"
+    return
+  fi
+  if expect_success "${name}" 8 "${cmd[@]}"; then
+    if grep -q '^==> Running Gemini smoke with model gpt-4\.1$' \
+      "${TMP_ROOT}/cases/${name//[^a-zA-Z0-9_.-]/_}/stderr"; then
+      record_success "${name} exercised Gemini"
+    else
+      record_failure "${name} exercised Gemini" "harness skipped the Gemini client"
+    fi
+  fi
 }
 
 log "Running deterministic smoke reliability regressions"
 
-zen_parser_dir="${TMP_ROOT}/setup/zen-free-label-parser"
-mkdir -p "${zen_parser_dir}"
-cat > "${zen_parser_dir}/zen.mdx" <<'EOF_ZEN_DOC'
-## Endpoints
-
-| Model | Model ID | Endpoint | AI SDK Package |
-| ----- | -------- | -------- | -------------- |
-| Paid Model | paid-model | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
-| Big Pickle | big-pickle | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
-| Ox Alpha Free | x-preview-f-free | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
-| Muse Spark Free | muse-spark-free | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
-| Jev Free | jev-free | `https://opencode.ai/zen/v1/systemone` | - |
-
-## Pricing
-
-| Model | Input | Output | Cached Read | Cached Write |
-| ----- | ----- | ------ | ----------- | ------------ |
-| Paid Model | $1.00 | $2.00 | - | - |
-| Big Pickle | Free | Free | Free | - |
-| Ox Alpha Free | Free | Free | Free | - |
-| Muse Spark Free | Free | Free | Free | - |
-| Jev Free | Free | Free | - | - |
-
-### Retirement dates
-
-| Model | Date |
-| ----- | ---- |
-| Big Pickle | August 31, 2026 |
-EOF_ZEN_DOC
-cat > "${zen_parser_dir}/expected.tsv" <<'EOF_ZEN_EXPECTED'
-big-pickle	Big Pickle	/chat/completions
-x-preview-f-free	Ox Alpha Free	/chat/completions
-muse-spark-free	Muse Spark Free	/responses
-jev-free	Jev Free	/systemone
-EOF_ZEN_EXPECTED
-if "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
-  "${zen_parser_dir}/zen.mdx" > "${zen_parser_dir}/actual.tsv" \
-  && cmp -s "${zen_parser_dir}/expected.tsv" "${zen_parser_dir}/actual.tsv"; then
-  record_success "Zen free-label parser joins pricing labels to endpoint aliases"
-else
-  record_failure "Zen free-label parser joins pricing labels to endpoint aliases" \
-    "$(diff -u "${zen_parser_dir}/expected.tsv" "${zen_parser_dir}/actual.tsv" 2>&1 || true)"
-fi
-
-cat > "${zen_parser_dir}/missing-endpoint.mdx" <<'EOF_ZEN_MISSING'
-## Endpoints
-
-| Model | Model ID | Endpoint | AI SDK Package |
-| ----- | -------- | -------- | -------------- |
-| Paid Model | paid-model | `https://opencode.ai/zen/v1/responses` | `@ai-sdk/openai` |
-
-## Pricing
-
-| Model | Input | Output | Cached Read | Cached Write |
-| ----- | ----- | ------ | ----------- | ------------ |
-| Missing Free Model | Free | Free | Free | - |
-EOF_ZEN_MISSING
-expect_hard_failure_with_stderr "Zen free-label parser rejects an unmapped free label" 4 \
-  'free pricing label has no endpoint-table entry: Missing Free Model' \
-  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
-  "${zen_parser_dir}/missing-endpoint.mdx"
-
-cat > "${zen_parser_dir}/duplicate-pricing-label.mdx" <<'EOF_ZEN_DUPLICATE'
-## Endpoints
-
-| Model | Model ID | Endpoint | AI SDK Package |
-| ----- | -------- | -------- | -------------- |
-| Ambiguous Model | ambiguous-model | `https://opencode.ai/zen/v1/chat/completions` | `@ai-sdk/openai-compatible` |
-
-## Pricing
-
-| Model | Input | Output | Cached Read | Cached Write |
-| ----- | ----- | ------ | ----------- | ------------ |
-| Ambiguous Model | $1.00 | $2.00 | - | - |
-| Ambiguous Model | Free | Free | Free | - |
-EOF_ZEN_DUPLICATE
-expect_hard_failure_with_stderr "Zen free-label parser rejects paid/free duplicate labels" 4 \
-  'duplicate pricing label: Ambiguous Model' \
-  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
-  "${zen_parser_dir}/duplicate-pricing-label.mdx"
-
-cat > "${zen_parser_dir}/render-config.yaml" <<'EOF_ZEN_RENDER_CONFIG'
-header: preserved
-provider:
-    # BEGIN GENERATED: OpenCode Zen free models
-    models:
-      - public_id: stale-model
-        endpoints:
-          - /chat/completions
-    # END GENERATED: OpenCode Zen free models
-footer: preserved
-EOF_ZEN_RENDER_CONFIG
-cat > "${zen_parser_dir}/expected-config.yaml" <<'EOF_ZEN_EXPECTED_CONFIG'
-header: preserved
-provider:
-    # BEGIN GENERATED: OpenCode Zen free models
-    models:
-      - public_id: "big-pickle"
-        endpoints:
-          - /chat/completions
-      - public_id: "muse-spark-free"
-        endpoints:
-          - /responses
-      - public_id: "x-preview-f-free"
-        endpoints:
-          - /chat/completions
-    # END GENERATED: OpenCode Zen free models
-footer: preserved
-EOF_ZEN_EXPECTED_CONFIG
-zen_render_outputs="${zen_parser_dir}/render-outputs"
-: > "${zen_render_outputs}"
-if GITHUB_OUTPUT="${zen_render_outputs}" \
-  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
-  "${zen_parser_dir}/zen.mdx" "${zen_parser_dir}/render-config.yaml" \
-  && cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" \
-  && grep -Fxq 'changed=true' "${zen_render_outputs}"; then
-  record_success "Zen config updater skips classifiers and sorts public endpoints"
-else
-  record_failure "Zen config updater skips classifiers and sorts public endpoints" \
-    "$(diff -u "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" 2>&1 || true)"
-fi
-
-: > "${zen_render_outputs}"
-if GITHUB_OUTPUT="${zen_render_outputs}" \
-  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
-  "${zen_parser_dir}/zen.mdx" "${zen_parser_dir}/render-config.yaml" \
-  && cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml" \
-  && grep -Fxq 'changed=false' "${zen_render_outputs}"; then
-  record_success "Zen config updater is idempotent"
-else
-  record_failure "Zen config updater is idempotent" "second render changed the generated config"
-fi
-
-cat > "${zen_parser_dir}/messages-free.mdx" <<'EOF_ZEN_MESSAGES'
-## Endpoints
-
-| Model | Model ID | Endpoint | AI SDK Package |
-| ----- | -------- | -------- | -------------- |
-| Claude Free | claude-free | `https://opencode.ai/zen/v1/messages` | `@ai-sdk/anthropic` |
-
-## Pricing
-
-| Model | Input | Output | Cached Read | Cached Write |
-| ----- | ----- | ------ | ----------- | ------------ |
-| Claude Free | Free | Free | Free | - |
-EOF_ZEN_MESSAGES
-expect_hard_failure_with_stderr "Zen config updater rejects endpoints outside openai-compatible routing" 4 \
-  'unsupported endpoint for openai-compatible Zen example: claude-free -> /messages' \
-  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
-  "${zen_parser_dir}/messages-free.mdx" "${zen_parser_dir}/render-config.yaml"
-
-cat > "${zen_parser_dir}/systemone-free.mdx" <<'EOF_ZEN_SYSTEMONE'
-## Endpoints
-
-| Model | Model ID | Endpoint | AI SDK Package |
-| ----- | -------- | -------- | -------------- |
-| Jev 1.13 Free | jev-1.13-free | `https://opencode.ai/zen/v1/systemone` | - |
-
-## Pricing
-
-| Model | Input | Output | Cached Read | Cached Write |
-| ----- | ----- | ------ | ----------- | ------------ |
-| Jev 1.13 Free | Free | Free | - | - |
-EOF_ZEN_SYSTEMONE
-printf '%s\n' $'jev-1.13-free\tJev 1.13 Free\t/systemone' > "${zen_parser_dir}/systemone-expected.tsv"
-if "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
-  "${zen_parser_dir}/systemone-free.mdx" > "${zen_parser_dir}/systemone-actual.tsv" \
-  && cmp -s "${zen_parser_dir}/systemone-expected.tsv" "${zen_parser_dir}/systemone-actual.tsv"; then
-  record_success "Zen free-label parser retains SystemOne catalog metadata"
-else
-  record_failure "Zen free-label parser retains SystemOne catalog metadata" \
-    "$(diff -u "${zen_parser_dir}/systemone-expected.tsv" "${zen_parser_dir}/systemone-actual.tsv" 2>&1 || true)"
-fi
-expect_hard_failure_with_stderr "Zen config updater rejects a classifier-only catalog" 4 \
-  'no OpenCode Zen free Chat or Responses models were parsed' \
-  "${REPO_ROOT}/scripts/update-opencode-zen-free-config.sh" \
-  "${zen_parser_dir}/systemone-free.mdx" "${zen_parser_dir}/render-config.yaml"
-if cmp -s "${zen_parser_dir}/expected-config.yaml" "${zen_parser_dir}/render-config.yaml"; then
-  record_success "Zen classifier-only catalog preserves the existing config"
-else
-  record_failure "Zen classifier-only catalog preserves the existing config" "config changed after rejected update"
-fi
-
-sed 's@/systemone@/unknown-evaluation@g' "${zen_parser_dir}/systemone-free.mdx" \
-  > "${zen_parser_dir}/unknown-endpoint.mdx"
-expect_hard_failure_with_stderr "Zen free-label parser rejects unknown evaluation endpoints" 4 \
-  'unsupported endpoint for Jev 1.13 Free: https://opencode.ai/zen/v1/unknown-evaluation' \
-  "${REPO_ROOT}/scripts/parse-opencode-zen-free-models.sh" \
-  "${zen_parser_dir}/unknown-endpoint.mdx"
-
 claude_contract_dir="${TMP_ROOT}/setup/claude-defaults-and-model-preference"
-start_mock_server "${claude_contract_dir}/server" 200
+start_mock_server "${claude_contract_dir}/server"
 claude_contract_port="${MOCK_SERVER_PORT}"
 write_fake_default_smoke_clients "${claude_contract_dir}/bin"
 claude_capture_dir="${claude_contract_dir}/capture"
 if expect_success "Claude subprocess defaults and model preference" 8 \
   env -u CLAUDE_CODE_DISABLE_ADVISOR_TOOL \
-    PATH="${claude_contract_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=copilot START_PROXY=0 \
+    PATH="${claude_contract_dir}/bin:${ORIGINAL_PATH}" START_PROXY=0 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${claude_contract_port}" \
     LIVE_CLI_SMOKE_DIR="${claude_contract_dir}/smoke" \
     FAKE_CLAUDE_CAPTURE_DIR="${claude_capture_dir}" \
@@ -1019,26 +669,20 @@ fi
 # A stale healthy process must not satisfy readiness after the spawned proxy loses
 # the bind race and exits.
 case_dir="${TMP_ROOT}/setup/stale-listener"
-start_mock_server "${case_dir}/server" 200
+start_mock_server "${case_dir}/server"
 port="${MOCK_SERVER_PORT}"
-write_fake_clients "${case_dir}/bin" pass pass pass
+write_fake_default_smoke_clients "${case_dir}/bin"
 write_bind_failure_proxy "${case_dir}/bind-fail-proxy"
 expect_hard_failure "stale healthy listener while spawned proxy bind fails" 6 \
-  env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=1 \
+  env PATH="${case_dir}/bin:${ORIGINAL_PATH}" START_PROXY=1 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" PROXY_BIN="${case_dir}/bind-fail-proxy" \
-    PROVIDERS_CONFIG="${REPO_ROOT}/examples/opencode-zen-free.yaml" \
-    LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
+    PROXY_TOKEN_DIR="${case_dir}/token" LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" \
+    FAKE_CLAUDE_CAPTURE_DIR="${case_dir}/capture" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=1 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
-# The lightweight raw Zen and compact smoke scripts enforce the same spawned-PID
-# ownership rule rather than trusting the stale server.
-expect_hard_failure "raw Zen rejects stale healthy listener" 6 \
-  env START_PROXY=1 PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" \
-    PROXY_BIN="${case_dir}/bind-fail-proxy" PROVIDERS_CONFIG="${REPO_ROOT}/examples/opencode-zen-free.yaml" \
-    LIVE_ZEN_SMOKE_DIR="${case_dir}/raw-zen" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
-    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=1 \
-    "${REPO_ROOT}/scripts/live-zen-smoke.sh"
+# The compact smoke script enforces the same spawned-PID ownership rule rather
+# than trusting the stale server.
 expect_hard_failure "compact smoke rejects stale healthy listener" 6 \
   env START_PROXY=1 PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" \
     PROXY_BIN="${case_dir}/bind-fail-proxy" LIVE_COMPACT_SMOKE_DIR="${case_dir}/compact" \
@@ -1047,20 +691,20 @@ expect_hard_failure "compact smoke rejects stale healthy listener" 6 \
     "${REPO_ROOT}/scripts/live-compact-smoke.sh"
 
 # With no caller-supplied port, a successfully spawned proxy gets an isolated
-# non-default/non-legacy port and cleanup releases it.
+# non-default port and cleanup releases it.
 auto_dir="${TMP_ROOT}/setup/auto-port"
-write_fake_clients "${auto_dir}/bin" pass pass pass
+write_fake_default_smoke_clients "${auto_dir}/bin"
 write_healthy_proxy "${auto_dir}/healthy-proxy"
 if expect_success "auto port is isolated and released" 10 \
-  env PATH="${auto_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=1 \
-    PROXY_HOST=127.0.0.1 PROXY_BIN="${auto_dir}/healthy-proxy" \
-    PROVIDERS_CONFIG="${REPO_ROOT}/examples/opencode-zen-free.yaml" \
-    LIVE_CLI_SMOKE_DIR="${auto_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=3 \
-    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
+  env PATH="${auto_dir}/bin:${ORIGINAL_PATH}" START_PROXY=1 \
+    PROXY_HOST=127.0.0.1 PROXY_BIN="${auto_dir}/healthy-proxy" PROXY_TOKEN_DIR="${auto_dir}/token" \
+    LIVE_CLI_SMOKE_DIR="${auto_dir}/smoke" FAKE_CLAUDE_CAPTURE_DIR="${auto_dir}/capture" \
+    SMOKE_STARTUP_TIMEOUT_SECONDS=3 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
   auto_stderr="${TMP_ROOT}/cases/auto_port_is_isolated_and_released/stderr"
   auto_port="$(sed -nE 's/.*Starting proxy at http:\/\/127\.0\.0\.1:([0-9]+).*/\1/p' "${auto_stderr}" | head -1)"
-  if [[ -z "${auto_port}" || "${auto_port}" == "1337" || "${auto_port}" == "8899" ]]; then
+  if [[ -z "${auto_port}" || "${auto_port}" == "1337" ]]; then
     record_failure "auto port selection" "unexpected selected port ${auto_port:-<missing>}"
   elif port_accepts_tcp "${auto_port}"; then
     record_failure "auto port cleanup" "port ${auto_port} still accepts TCP after script exit"
@@ -1068,7 +712,6 @@ if expect_success "auto port is isolated and released" 10 \
     record_success "auto port selection and cleanup verification"
   fi
 fi
-
 mixed_compact_dir="${TMP_ROOT}/setup/mixed-log-compact"
 write_healthy_proxy "${mixed_compact_dir}/healthy-proxy"
 if expect_success "compact listener tolerates mixed JSON and plain-text logs" 10 \
@@ -1080,113 +723,25 @@ if expect_success "compact listener tolerates mixed JSON and plain-text logs" 10
 fi
 
 compact_quota_dir="${TMP_ROOT}/setup/compact-quota"
-start_mock_server "${compact_quota_dir}/server" 200 "" "" 0 0 402 quota_exceeded
+start_mock_server "${compact_quota_dir}/server" 402 quota_exceeded
 expect_exit_code "compact smoke reports exact Copilot quota exhaustion" 8 75 \
   env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
     LIVE_COMPACT_SMOKE_DIR="${compact_quota_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
 
 compact_unknown_402_dir="${TMP_ROOT}/setup/compact-unknown-402"
-start_mock_server "${compact_unknown_402_dir}/server" 200 "" "" 0 0 402 payment_required
+start_mock_server "${compact_unknown_402_dir}/server" 402 payment_required
 expect_exit_code "compact smoke keeps unknown HTTP 402 errors hard" 8 1 \
   env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
     LIVE_COMPACT_SMOKE_DIR="${compact_unknown_402_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
 
 replay_quota_dir="${TMP_ROOT}/setup/replay-quota"
-start_mock_server "${replay_quota_dir}/server" 200 "" "" 0 0 200 "" 402 quota_exceeded
+start_mock_server "${replay_quota_dir}/server" 200 "" 402 quota_exceeded
 expect_exit_code "compact replay keeps quota errors hard" 8 1 \
   env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${MOCK_SERVER_PORT}" \
     LIVE_COMPACT_SMOKE_DIR="${replay_quota_dir}/smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
     SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-compact-smoke.sh"
-
-mixed_raw_dir="${TMP_ROOT}/setup/mixed-log-raw-zen"
-write_healthy_proxy "${mixed_raw_dir}/healthy-proxy"
-if expect_success "raw Zen listener tolerates mixed JSON and plain-text logs" 10 \
-  env START_PROXY=1 PROXY_HOST=127.0.0.1 PROXY_BIN="${mixed_raw_dir}/healthy-proxy" \
-    PROVIDERS_CONFIG="${REPO_ROOT}/examples/opencode-zen-free.yaml" \
-    LIVE_ZEN_SMOKE_DIR="${mixed_raw_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=3 \
-    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 \
-    "${REPO_ROOT}/scripts/live-zen-smoke.sh"; then
-  :
-fi
-
-neutral_dir="${TMP_ROOT}/setup/neutral-before-client"
-start_mock_server "${neutral_dir}/server" 429
-neutral_port="${MOCK_SERVER_PORT}"
-write_fake_clients "${neutral_dir}/bin" exit42 exit42 exit42
-expect_success "neutral skip only before any client is exercised" 8 \
-  env PATH="${neutral_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
-    PROXY_HOST=127.0.0.1 PROXY_PORT="${neutral_port}" LIVE_CLI_SMOKE_DIR="${neutral_dir}/smoke" \
-    SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
-    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
-    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
-
-free_filter_dir="${TMP_ROOT}/setup/free-label-filter"
-start_mock_server "${free_filter_dir}/server" 200
-free_filter_port="${MOCK_SERVER_PORT}"
-write_fake_clients "${free_filter_dir}/bin" pass pass pass
-printf '%s\n' \
-  $'mimo-v2.5-free\tMiMo V2.5 Free\t/chat/completions' \
-  $'muse-spark-1.2-contributor-free\tMuse Spark Free\t/responses' \
-  $'jev-1.13-free\tJev 1.13 Free\t/systemone' \
-  > "${free_filter_dir}/free-models.tsv"
-free_filter_name="Zen candidates honor parsed free labels"
-if expect_success "${free_filter_name}" 8 \
-  env PATH="${free_filter_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
-    PROXY_HOST=127.0.0.1 PROXY_PORT="${free_filter_port}" \
-    LIVE_CLI_SMOKE_DIR="${free_filter_dir}/smoke" \
-    ZEN_FREE_MODELS_FILE="${free_filter_dir}/free-models.tsv" \
-    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
-    "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
-  free_filter_stderr="${TMP_ROOT}/cases/${free_filter_name//[^a-zA-Z0-9_.-]/_}/stderr"
-  if grep -q '^==> Zen candidate models: mimo-v2\.5-free$' "${free_filter_stderr}" \
-    && ! grep -q '^==> Zen candidate models: .*hy3-free' "${free_filter_stderr}" \
-    && ! grep -q '^==> Zen candidate models: .*muse-spark' "${free_filter_stderr}"; then
-    record_success "Zen candidate filtering requires current Free and Chat labels"
-  else
-    record_failure "Zen candidate filtering requires current Free and Chat labels" \
-      "$(cat "${free_filter_stderr}" 2>/dev/null || true)"
-  fi
-fi
-
-no_free_intersection_dir="${TMP_ROOT}/setup/no-free-label-intersection"
-start_mock_server "${no_free_intersection_dir}/server" 200
-no_free_intersection_port="${MOCK_SERVER_PORT}"
-write_fake_clients "${no_free_intersection_dir}/bin" pass pass pass
-printf 'x-preview-f-free\tOx Alpha Free\t/chat/completions\n' \
-  > "${no_free_intersection_dir}/free-models.tsv"
-expect_hard_failure_with_stderr "Zen smoke rejects a stale example with no free-label intersection" 8 \
-  'the Zen example exposes no model currently carrying Free price labels' \
-  env PATH="${no_free_intersection_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
-    PROXY_HOST=127.0.0.1 PROXY_PORT="${no_free_intersection_port}" \
-    LIVE_CLI_SMOKE_DIR="${no_free_intersection_dir}/smoke" \
-    ZEN_FREE_MODELS_FILE="${no_free_intersection_dir}/free-models.tsv" \
-    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
-    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
-
-retry_dir="${TMP_ROOT}/setup/second-canary-transient"
-retry_sequence="200,429,200,200,429,200,200,429,200"
-start_mock_server "${retry_dir}/server" 200 "${retry_sequence}"
-retry_port="${MOCK_SERVER_PORT}"
-write_fake_clients "${retry_dir}/bin" fail-once fail-once fail-once
-expect_success "second canary transient permits retry but every client still passes" 12 \
-  env PATH="${retry_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
-    PROXY_HOST=127.0.0.1 PROXY_PORT="${retry_port}" LIVE_CLI_SMOKE_DIR="${retry_dir}/smoke" \
-    FAKE_CLI_STATE_DIR="${retry_dir}/state" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
-    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
-    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
-
-wrapped_gemini_dir="${TMP_ROOT}/setup/gemini-wrapped-direct-output"
-start_mock_server "${wrapped_gemini_dir}/server" 200
-wrapped_gemini_port="${MOCK_SERVER_PORT}"
-write_fake_clients "${wrapped_gemini_dir}/bin" pass pass wrapped-output
-expect_success "Gemini wrapped outputs normalize to exact direct-prompt text" 10 \
-  env PATH="${wrapped_gemini_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
-    PROXY_HOST=127.0.0.1 PROXY_PORT="${wrapped_gemini_port}" \
-    LIVE_CLI_SMOKE_DIR="${wrapped_gemini_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
-    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
-    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
 wrapped_escape_dir="${TMP_ROOT}/setup/gemini-wrapped-json-escaping"
 mkdir -p "${wrapped_escape_dir}/bin" "${wrapped_escape_dir}/case"
@@ -1215,131 +770,43 @@ else
   record_failure "Gemini wrapped Read output escaping" "generated wrapper was not valid compact JSON"
 fi
 
-run_zen_classification_case "canary 404 plus transient text is hard" 404 \
-  "service temporarily unavailable" 0
-run_zen_classification_case "canary 400 unknown error is hard" 400 \
-  "invalid request" 0
-run_zen_classification_case "canary 401 model unavailable is hard" 401 \
-  "Model is unavailable." 0
-run_zen_classification_case "canary 200 bad shape plus transient text is hard" 200 \
-  "service temporarily unavailable" 1
-
-unavailable_model_dir="${TMP_ROOT}/setup/unavailable-zen-model"
-unavailable_model_message="Error from provider (Console): Upstream request failed: Model is unavailable."
-start_mock_server "${unavailable_model_dir}/cli-server" 200 "400,200" "${unavailable_model_message}"
-unavailable_model_cli_port="${MOCK_SERVER_PORT}"
-write_fake_clients "${unavailable_model_dir}/bin" pass pass pass
-expect_success "listed Zen model unavailable falls through to another model" 8 \
-  env PATH="${unavailable_model_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
-    PROXY_HOST=127.0.0.1 PROXY_PORT="${unavailable_model_cli_port}" \
-    LIVE_CLI_SMOKE_DIR="${unavailable_model_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
-    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
-    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
-start_mock_server "${unavailable_model_dir}/raw-server" 200 "400,200" "${unavailable_model_message}"
-unavailable_model_raw_port="${MOCK_SERVER_PORT}"
-mkdir -p "${unavailable_model_dir}/raw-smoke"
-expect_success "raw Zen smoke treats listed model unavailability as transient" 8 \
-  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${unavailable_model_raw_port}" \
-    LIVE_ZEN_SMOKE_DIR="${unavailable_model_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
-    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
-
-removed_model_dir="${TMP_ROOT}/setup/removed-zen-model"
-start_mock_server "${removed_model_dir}/server" 401 "" "Model deepseek-v4-flash-free is not supported"
-removed_model_port="${MOCK_SERVER_PORT}"
-write_fake_clients "${removed_model_dir}/bin" pass pass pass
-expect_success "removed Zen model is a neutral pre-client transient" 8 \
-  env PATH="${removed_model_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
-    PROXY_HOST=127.0.0.1 PROXY_PORT="${removed_model_port}" \
-    LIVE_CLI_SMOKE_DIR="${removed_model_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
-    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
-    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
-mkdir -p "${removed_model_dir}/raw-smoke"
-expect_hard_failure_with_stderr "removed Zen model is transient in raw smoke" 8 \
-  '^TRANSIENT[[:space:]].*message:Model deepseek-v4-flash-free is not supported' \
-  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${removed_model_port}" \
-    LIVE_ZEN_SMOKE_DIR="${removed_model_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
-    SMOKE_CURL_MAX_TIME_SECONDS=2 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
-
-# OpenCode restricts its free tier to the OpenCode client. The exact FreeTierError
-# must neutral-skip after one canary and before any client runs (exit42 clients
-# would fail the harness if invoked); the same text without that type stays hard.
-free_tier_message="Error from provider (Console): OpenCode's free tier can only be used from within OpenCode"
-free_tier_dir="${TMP_ROOT}/setup/zen-free-tier-client-restricted"
-MOCK_CANARY_ERROR_TYPE=FreeTierError start_mock_server "${free_tier_dir}/server" 403 "" "${free_tier_message}"
-free_tier_port="${MOCK_SERVER_PORT}"
-write_fake_clients "${free_tier_dir}/bin" exit42 exit42 exit42
-free_tier_case="Zen free-tier client restriction is a neutral pre-client skip"
-if expect_success "${free_tier_case}" 8 \
-  env PATH="${free_tier_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
-    PROXY_HOST=127.0.0.1 PROXY_PORT="${free_tier_port}" \
-    LIVE_CLI_SMOKE_DIR="${free_tier_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
-    SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
-    "${REPO_ROOT}/scripts/live-cli-smoke.sh"; then
-  free_tier_stderr="${TMP_ROOT}/cases/${free_tier_case//[^a-zA-Z0-9_.-]/_}/stderr"
-  if grep -Fq 'NEUTRAL SKIP: OpenCode Zen restricts its free tier to the OpenCode client' "${free_tier_stderr}" \
-    && [[ "$(grep -c 'refused by provider policy' "${free_tier_stderr}")" -eq 1 ]]; then
-    record_success "Zen free-tier restriction stops after one canary"
-  else
-    record_failure "Zen free-tier restriction stops after one canary" "missing skip reason or more than one refused canary"
-    cat "${free_tier_stderr}" >&2 || true
-  fi
-fi
-run_zen_case_expect_failure "Zen free-tier text without FreeTierError type is hard" 403 pass pass pass \
-  "${free_tier_message}"
-
-hanging_chat_dir="${TMP_ROOT}/setup/hanging-chat-canary"
-start_mock_server "${hanging_chat_dir}/server" 200 "" "" 0 1
-hanging_chat_port="${MOCK_SERVER_PORT}"
-write_fake_clients "${hanging_chat_dir}/bin" pass pass pass
-expect_hard_failure_with_stderr "hanging chat canary is hard via CLI harness" 8 'curl-exit-28' \
-  env PATH="${hanging_chat_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
-    PROXY_HOST=127.0.0.1 PROXY_PORT="${hanging_chat_port}" \
-    LIVE_CLI_SMOKE_DIR="${hanging_chat_dir}/cli-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
-    SMOKE_CURL_MAX_TIME_SECONDS=1 SMOKE_CLI_TIMEOUT_SECONDS=2 \
-    "${REPO_ROOT}/scripts/live-cli-smoke.sh"
-mkdir -p "${hanging_chat_dir}/raw-smoke"
-expect_hard_failure_with_stderr "hanging chat canary is hard via raw Zen smoke" 8 \
-  '^FAIL[[:space:]]+.*curl-exit-28' \
-  env START_PROXY=0 PROXY_HOST=127.0.0.1 PROXY_PORT="${hanging_chat_port}" \
-    LIVE_ZEN_SMOKE_DIR="${hanging_chat_dir}/raw-smoke" SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
-    SMOKE_CURL_MAX_TIME_SECONDS=1 "${REPO_ROOT}/scripts/live-zen-smoke.sh"
-
-run_zen_case_expect_success "Gemini strict JSON wrapper around complete result normalizes to exact text" pass pass json-wrapped-whole
-run_zen_case_expect_success "Gemini strict JSON wrapper sequence normalizes to exact text" pass pass json-wrapped
-run_zen_case_expect_success "model-specific output mismatch falls through to another candidate" fail-first-model fail-first-model fail-first-model
-run_zen_case_expect_failure "client process failure does not fall through to another model" 200 pass exit-first-model pass
-run_zen_case_expect_failure "Gemini dangling JSON wrapper separator is rejected" 200 pass pass json-wrapped-trailing-separator
-run_zen_case_expect_failure "Gemini three-wrapper sequence is rejected" 200 pass pass json-wrapped-three
-
-run_zen_case_expect_failure "canary 200 plus CLI exit 42" 200 exit42 exit42 exit42
-run_zen_case_expect_failure "canary 404 is a hard failure" 404 pass pass pass
-run_zen_case_expect_failure "one client pass cannot mask another failure" 200 pass exit42 pass
-
+run_gemini_case accept "Gemini plain text output passes" pass
+run_gemini_case accept "Gemini wrapped Read outputs normalize to exact text" wrapped-output
+run_gemini_case accept "Gemini strict JSON wrapper around complete result normalizes to exact text" json-wrapped-whole
+run_gemini_case accept "Gemini strict JSON wrapper sequence normalizes to exact text" json-wrapped
+run_gemini_case reject "Gemini dangling JSON wrapper separator is rejected" json-wrapped-trailing-separator
+run_gemini_case reject "Gemini three-wrapper sequence is rejected" json-wrapped-three
 # A listener that accepts TCP but never answers HTTP must hit the script's own
 # bounded startup deadline, not the outer test watchdog.
 case_dir="${TMP_ROOT}/setup/never-responds"
-write_fake_clients "${case_dir}/bin" pass pass pass
+write_fake_default_smoke_clients "${case_dir}/bin"
 write_hanging_proxy "${case_dir}/hanging-proxy"
-port_file="${case_dir}/chosen-port"
 expect_hard_failure "accepts TCP but never responds exits within deadline" 7 \
-  env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=1 \
-    PROXY_HOST=127.0.0.1 PROXY_BIN="${case_dir}/hanging-proxy" \
-    PROVIDERS_CONFIG="${REPO_ROOT}/examples/opencode-zen-free.yaml" \
-    LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
-    SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=1 SMOKE_CLI_TIMEOUT_SECONDS=1 \
+  env PATH="${case_dir}/bin:${ORIGINAL_PATH}" START_PROXY=1 \
+    PROXY_HOST=127.0.0.1 PROXY_BIN="${case_dir}/hanging-proxy" PROXY_TOKEN_DIR="${case_dir}/token" \
+    LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" FAKE_CLAUDE_CAPTURE_DIR="${case_dir}/capture" \
+    SMOKE_STARTUP_TIMEOUT_SECONDS=2 SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 \
+    SMOKE_CURL_MAX_TIME_SECONDS=1 SMOKE_CLI_TIMEOUT_SECONDS=1 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
 # A failed CLI may fork; the smoke harness must reap the entire process group.
 case_dir="${TMP_ROOT}/setup/fork-sleeper"
-start_mock_server "${case_dir}/server" 200
+start_mock_server "${case_dir}/server"
 port="${MOCK_SERVER_PORT}"
-write_fake_clients "${case_dir}/bin" fork-sleeper pass pass
+write_fake_default_smoke_clients "${case_dir}/bin"
+cat > "${case_dir}/bin/codex" <<'EOF_FORK_CODEX'
+#!/usr/bin/env bash
+sleep 300 &
+printf '%s\n' "$!" > "${FAKE_CLI_CHILD_PID_FILE:?}"
+exit 42
+EOF_FORK_CODEX
+chmod +x "${case_dir}/bin/codex"
 child_pid_file="${case_dir}/child.pid"
 expect_hard_failure_with_stderr "fake CLI forks sleeper" 8 \
-  'remained reachable after CLI exited 42; refusing candidate fallback for client failure' \
-  env PATH="${case_dir}/bin:${ORIGINAL_PATH}" SMOKE_PROVIDER=zen START_PROXY=0 \
+  'Codex CLI failed or timed out' \
+  env PATH="${case_dir}/bin:${ORIGINAL_PATH}" START_PROXY=0 \
     PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" LIVE_CLI_SMOKE_DIR="${case_dir}/smoke" \
-    FAKE_CLI_CHILD_PID_FILE="${child_pid_file}" SMOKE_STARTUP_TIMEOUT_SECONDS=2 \
+    FAKE_CLI_CHILD_PID_FILE="${child_pid_file}" FAKE_CLAUDE_CAPTURE_DIR="${case_dir}/capture" \
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=2 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 if [[ ! -s "${child_pid_file}" ]]; then
@@ -1354,7 +821,6 @@ else
     record_success "fake CLI forks sleeper cleanup"
   fi
 fi
-
 stop_mock_servers
 mock_server_leaks=0
 for pid in "${server_pids[@]:-}"; do

@@ -524,21 +524,11 @@ providers:
           - /responses
 ```
 
-#### OpenCode Zen Free Tier
+#### OpenCode Zen
 
-OpenCode Zen is an OpenAI-compatible gateway at `https://opencode.ai/zen/v1`. Its free models can be reached anonymously with the literal sentinel key `public` (the same value the opencode client sends when no real key is configured). No signup, OAuth, or token refresh is involved, so this maps directly onto an `openai-compatible` provider with `auth_type: bearer` and `api_key: public`. Use the ready-to-run [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml); its marked model block is generated from OpenCode's current endpoint and pricing tables rather than duplicated here.
+OpenCode Zen is an OpenAI-compatible gateway. Configure it as an `openai-compatible` provider with a static key from [opencode.ai/auth](https://opencode.ai/auth) (for example `api_key_env: OPENCODE_API_KEY`). Take each model's base URL and native endpoint from OpenCode's current model documentation, and list only those endpoints under `endpoints`. Do not infer `/responses` from the model family or from client compatibility. Under `model_discovery: static`, only the listed `models:` entries are routable. To opt into specific discovered IDs instead, use `model_discovery: openai` with `include_models`.
 
-Operational notes for the free tier:
-
-- Use `model_discovery: static`, not `openai`. Dynamic discovery lists the full Zen catalog, including paid models that reject the `public` key with `401`, and there is no cost-based filter (only `include_models`/`exclude_models`). Static discovery also skips the upstream readiness probe.
-- Do not set `default: true`. Under static discovery, unlisted models return `400`, so making this the catch-all only risks routing unknown models to a revocable trial gateway.
-- The free set rotates and individual promotions end without notice. Removed models have returned `401` messages such as `Free promotion has ended for <model>` and `Model <model> is not supported`. Re-check the live set before relying on it: `curl -s https://opencode.ai/zen/v1/models -H 'authorization: Bearer public'`.
-- `public` is a shared anonymous credential, rate-limited server-side per IP. It suits personal, low-volume use, not fan-out or automation.
-- Data handling varies by promotion. Ox Alpha's provider is documented as zero-retention with no training use, while other free models may retain prompts or use them for improvement. Check the current Zen terms before routing proprietary or sensitive prompts.
-- `/responses` support is per model. The generated example copies each free model's documented native endpoint and does not infer `/responses` from model family or client compatibility.
-- Client compatibility: Claude Code (`/v1/messages`) and Gemini CLI translate to `/chat/completions` and work against the free tier. The GitHub Copilot CLI works in offline BYOK mode with `COPILOT_PROVIDER_WIRE_API=completions`. OpenAI Codex CLI requires a model advertising native `/responses`; with the generated example, `muse-spark-1.2-contributor-free` is routed directly to Zen's `/responses` endpoint. Codex cannot use the Chat-only free entries through its Responses wire API, and the automated Zen CLI smoke remains intentionally Chat-oriented.
-
-For the full (paid) Zen catalog or higher limits, sign in at [opencode.ai/auth](https://opencode.ai/auth) and swap `api_key: public` for `api_key_env: OPENCODE_API_KEY` (still a static key, still no refresh). Swapping the key alone is not enough to route paid models: under `model_discovery: static` only the listed `models:` entries are routable, so add each paid model's `public_id` (and `endpoints`) you want to use, or switch to `model_discovery: openai` with `include_models` to opt into specific discovered paid IDs. Validate the free tier end to end with [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) (a quick `curl`/`jq` check), or with the CLI-driven [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow described in [Development](development.md#live-opencode-zen-cli-smoke-workflow).
+Vekil no longer ships an anonymous free-tier example. Since September 2026, OpenCode has limited its free models to the OpenCode client. Other clients using the shared `public` key get HTTP 403 `FreeTierError` or HTTP 429 `FreeUsageLimitError` ("Free models work in OpenCode"), even though `/models` still lists the free IDs. Vekil does not impersonate the OpenCode client.
 
 Anthropic-compatible providers with native Messages support, including Wafer, OpenRouter, and DeepSeek-style Messages endpoints, should not advertise OpenAI routes:
 
