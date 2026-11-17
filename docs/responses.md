@@ -81,7 +81,8 @@ Websocket bridge behavior:
 
 The default websocket bridge adapts upstream HTTP `/responses`. The separate
 `--responses-ws-native-upstream` option enables experimental persistent Copilot
-Responses connections with stricter recovery limits. It does not enable Azure
+Responses connections, which continue from Vekil's session history when a
+connection closes. It does not enable Azure
 `/realtime`. See [native transport limits](responses-websocket.md#experimental-native-upstream-transport).
 
 For a schema-version-2 route, the first provider-backed websocket turn may use safe precommit failover. Once that target is exposed, the session pins to the exact route/target; later turns, delta/full replay, and auto-compaction remain on it, and an unavailable pinned target fails closed. Cross-target session migration is not implemented. Drain sessions before a version-1 or older-binary rollback.

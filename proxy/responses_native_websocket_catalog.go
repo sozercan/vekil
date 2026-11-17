@@ -66,10 +66,15 @@ func (c *copilotNativeWebSocketCatalog) lookup(providerID, model string) (advert
 	return entries[strings.TrimSpace(model)], true
 }
 
+// Reasons a turn that could use the native connection is sent over HTTP.
 const (
 	responsesNativeDeclinedModelUnknown       = "model_unknown"
 	responsesNativeDeclinedCatalogUnavailable = "catalog_unavailable"
 	responsesNativeDeclinedNotAdvertised      = "model_not_advertised"
+	responsesNativeDeclinedConnectionMismatch = "connection_mismatch"
+	responsesNativeDeclinedInputTooLarge      = "input_too_large"
+	responsesNativeDeclinedTurnHeaders        = "turn_headers"
+	responsesNativeDeclinedDialUnavailable    = "dial_unavailable"
 )
 
 // responsesNativeModelEligible decides whether a not-yet-connected session may
