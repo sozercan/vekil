@@ -72,6 +72,19 @@ the first turn, continuations send new input with the last response ID, reducing
 history uploads. Other providers retain the HTTP bridge. This option does not
 enable Azure `/realtime`.
 
+A session opens a native connection only when the Copilot catalog entry for the
+selected target's upstream model lists `ws:/responses` in `supported_endpoints`.
+For explicit routes this is the target's `upstream_model`, not the public route
+ID. Copilot models without that entry, such as ones listing only `/responses`
+or `/chat/completions`, keep the HTTP bridge and its input limits. If Vekil has
+not loaded the provider's catalog yet, the first turn waits for one bounded
+catalog fetch; when capability is still unknown, the session uses HTTP. Once a
+session sends a turn over HTTP it stays on HTTP, even if a later catalog
+refresh advertises the model, because its history is held by the proxy. The
+per-turn debug log `responses websocket request completed` reports
+`transport` (`native` or `http`) and, for native sessions, the handshake's
+GitHub `upstream_request_id`.
+
 Custom `client_metadata.ws_request_header_<name>` values are forwarded in each
 native turn's `headers`, subject to the header limits above. Credentials,
 provider-managed headers, connection headers, and server-issued continuation

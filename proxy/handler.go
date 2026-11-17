@@ -294,6 +294,7 @@ type ProxyHandler struct {
 	retryBaseDelay                   time.Duration
 	models                           modelsCache
 	chatRoutes                       chatRouteDiscoveryCache
+	copilotNativeWS                  copilotNativeWebSocketCatalog
 	chatPolicyPlanner                chatPolicyPlanner
 	policyRoutingController          policyRoutingController
 	policyPreflightStateMu           sync.Mutex

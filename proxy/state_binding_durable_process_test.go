@@ -37,6 +37,9 @@ func TestDurableStateBarrierChild(t *testing.T) {
 	h, _ := durableWireHandler(t, s, p)
 	h.auth = auth.NewTestAuthenticatorWithResponsesToken("ghu_synthetic-source", "synthetic-responses-token")
 	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: native}
+	if native {
+		advertiseNativeWebSocketForTest(h)
+	}
 	barrier := func() error {
 		fmt.Println("barrier")
 		select {} // Parent kills this exact child; no commit/exposure can advance.

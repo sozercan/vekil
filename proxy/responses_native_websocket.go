@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sozercan/vekil/logger"
 )
 
 const responsesNativeMaxPendingItems = 4096
@@ -58,8 +59,13 @@ type responsesNativeUpstream struct {
 	credential [32]byte
 	model      string
 	responseID string
+	requestID  string
 	turn       *responsesNativeTurn
 	closed     bool
+	// httpPinned records that a turn already went over the HTTP bridge. The
+	// session keeps HTTP from then on: HTTP history lives in the proxy, and a
+	// native connection opened later would see only the new input.
+	httpPinned bool
 	done       chan struct{}
 }
 
@@ -76,6 +82,28 @@ func (u *responsesNativeUpstream) started() bool {
 	return u.conn != nil
 }
 
+// keepHTTP pins a not-yet-connected session to the HTTP bridge for its
+// lifetime.
+func (u *responsesNativeUpstream) keepHTTP() {
+	if u == nil {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.conn == nil {
+		u.httpPinned = true
+	}
+}
+
+func (u *responsesNativeUpstream) usesHTTP() bool {
+	if u == nil {
+		return false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.httpPinned
+}
+
 func (u *responsesNativeUpstream) previousResponseID() string {
 	if u == nil {
 		return ""
@@ -83,6 +111,17 @@ func (u *responsesNativeUpstream) previousResponseID() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.responseID
+}
+
+// upstreamRequestID is the GitHub request ID of the websocket handshake, which
+// identifies the upstream connection in Copilot diagnostics.
+func (u *responsesNativeUpstream) upstreamRequestID() string {
+	if u == nil {
+		return ""
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.requestID
 }
 
 func (u *responsesNativeUpstream) rememberResponse(id string) {
@@ -158,49 +197,68 @@ func (u *responsesNativeUpstream) readPump(conn *websocket.Conn) {
 // Reject an unusable session before admission and physical-send reservation.
 // Provider model rewrites are checked again at dispatch after request encoding.
 func (h *ProxyHandler) maybeRejectNativeResponsesRequest(req *http.Request) *http.Response {
+	rejected, _, _ := h.selectNativeResponsesTransport(req)
+	return rejected
+}
+
+// selectNativeResponsesTransport makes one transport decision for a physical
+// request. native is true only when every native validation passed for that
+// same decision, so a concurrent catalog update cannot skip the native input
+// limits. reason explains a catalog-based HTTP decision for logging.
+func (h *ProxyHandler) selectNativeResponsesTransport(req *http.Request) (rejected *http.Response, native bool, reason string) {
 	marker, _ := req.Context().Value(responsesNativeRequestContextKey{}).(*responsesNativeRequest)
 	if marker == nil || marker.upstream == nil {
-		return nil
+		return nil, false, ""
 	}
 	u := marker.upstream
 	provider, known := providerRouteFromRequest(req)
 	u.mu.Lock()
 	if u.closed {
 		u.mu.Unlock()
-		return responsesNativeErrorResponse(req, http.StatusConflict, errResponsesNativeClosed.Error())
+		return responsesNativeErrorResponse(req, http.StatusConflict, errResponsesNativeClosed.Error()), false, ""
 	}
-	started, binding, credential := u.conn != nil, u.binding, u.credential
+	started, binding, credential, httpPinned := u.conn != nil, u.binding, u.credential, u.httpPinned
 	u.mu.Unlock()
+	if httpPinned {
+		return nil, false, ""
+	}
 	if !known || provider.kind != string(providerTypeCopilot) {
 		if started {
-			return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model")
+			return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model"), false, ""
 		}
-		return nil
+		return nil, false, ""
+	}
+	if !started {
+		// Only models whose catalog entry advertises ws:/responses open a native
+		// connection; others keep the HTTP bridge and its input contract.
+		if eligible, reason := h.responsesNativeModelEligible(req, provider.id); !eligible {
+			return nil, false, reason
+		}
 	}
 	if started && binding != responsesNativeRequestBinding(req, provider.id, marker.model) {
-		return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model")
+		return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model"), false, ""
 	}
 	if started && credential != responsesNativeRequestCredential(req) {
 		u.close()
-		return responsesNativeErrorResponse(req, http.StatusConflict, "native upstream websocket credential changed; reconnect with full input")
+		return responsesNativeErrorResponse(req, http.StatusConflict, "native upstream websocket credential changed; reconnect with full input"), false, ""
 	}
 	// Validate only after selecting native transport. Other providers keep the
 	// HTTP bridge's input contract even when native transport is enabled.
 	if marker.inputItems > responsesNativeMaxPendingItems {
-		return responsesNativeErrorResponse(req, http.StatusBadRequest, "websocket input exceeds session item limit")
+		return responsesNativeErrorResponse(req, http.StatusBadRequest, "websocket input exceeds session item limit"), false, ""
 	}
 	if marker.stagedInput && marker.inputBytes > maxRequestBodySize {
-		return responsesNativeErrorResponse(req, http.StatusBadRequest, "staged websocket input exceeds session limits")
+		return responsesNativeErrorResponse(req, http.StatusBadRequest, "staged websocket input exceeds session limits"), false, ""
 	}
 	if _, err := responsesNativeTurnHeaders(marker.headers); err != nil {
-		return responsesNativeErrorResponse(req, http.StatusBadRequest, err.Error())
+		return responsesNativeErrorResponse(req, http.StatusBadRequest, err.Error()), false, ""
 	}
 	if !started {
 		if _, _, _, err := h.prepareResponsesNativeDial(req); err != nil {
-			return responsesNativeErrorResponse(req, http.StatusBadRequest, err.Error())
+			return responsesNativeErrorResponse(req, http.StatusBadRequest, err.Error()), false, ""
 		}
 	}
-	return nil
+	return nil, true, ""
 }
 
 func responsesNativeRequestBinding(req *http.Request, providerID, model string) string {
@@ -232,14 +290,20 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 	if !ok || marker == nil || marker.upstream == nil {
 		return nil, false, nil
 	}
-	if rejected := h.maybeRejectNativeResponsesRequest(req); rejected != nil {
+	rejected, native, reason := h.selectNativeResponsesTransport(req)
+	if rejected != nil {
 		return rejected, true, nil
 	}
-	provider, known := providerRouteFromRequest(req)
-	if !known || provider.kind != string(providerTypeCopilot) {
-		if marker.upstream.started() {
-			return responsesNativeErrorResponse(req, http.StatusBadRequest, "native upstream websocket is pinned to its provider and model"), true, nil
+	provider, _ := providerRouteFromRequest(req)
+	if !native {
+		if reason != "" {
+			h.log.Debug("responses websocket using HTTP upstream transport",
+				logger.F("provider", provider.id),
+				logger.F("model", responsesNativeRequestModel(req)),
+				logger.F("reason", reason),
+			)
 		}
+		marker.upstream.keepHTTP()
 		return nil, false, nil
 	}
 	if req.Body == nil {
@@ -293,9 +357,16 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 			}
 			return nil, true, err
 		}
+		requestID := ""
 		if handshake != nil {
 			copyCopilotDiagnosticHeaders(responseHeaders, handshake.Header)
+			requestID = boundedSingleHeaderValue(handshake.Header, "X-Github-Request-Id")
 		}
+		h.log.Debug("responses websocket native upstream connected",
+			logger.F("provider", provider.id),
+			logger.F("model", model),
+			logger.F("upstream_request_id", requestID),
+		)
 		conn.SetReadLimit(openAIStreamScannerMaxBuffer - 64)
 		u.mu.Lock()
 		if u.closed || u.ctx.Err() != nil {
@@ -303,7 +374,7 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 			_ = conn.Close()
 			return nil, true, context.Canceled
 		}
-		u.conn, u.binding, u.model, u.credential = conn, binding, model, credential
+		u.conn, u.binding, u.model, u.credential, u.requestID = conn, binding, model, credential, requestID
 		u.mu.Unlock()
 		go u.readPump(conn)
 	}
