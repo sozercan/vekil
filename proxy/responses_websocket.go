@@ -2047,7 +2047,13 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 		resp, err := s.postConversationCreateRequest(h, ctx, request, plan)
 		return resp, false, false, err
 	}
-	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta, &plan)
+	native := &plan
+	if plan.useTurnStateDelta {
+		// A turn-state delta holds only the new input and depends on HTTP
+		// continuation state, so it has no native form.
+		native = nil
+	}
+	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta, native)
 	if plan.nativeDelta || s.dispatchedNativeTurn() != nil {
 		// Native turns never take the HTTP bridge's turn-state or compaction
 		// retries; a native delta has no HTTP form.

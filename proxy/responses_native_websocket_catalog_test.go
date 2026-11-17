@@ -66,6 +66,8 @@ type nativeGateTestUpstream struct {
 	catalogStatus             int
 	postInputItems            chan int
 	nativeFrames              chan nativeGateFrame
+	// turnState, when set, is returned as X-Codex-Turn-State on HTTP turns.
+	turnState string
 }
 
 // nativeGateFrame is what one native response.create carried.
@@ -115,6 +117,9 @@ func (u *nativeGateTestUpstream) handler(t *testing.T) http.HandlerFunc {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			if u.postInputItems != nil {
 				u.postInputItems <- len(body.Input)
+			}
+			if u.turnState != "" {
+				w.Header().Set("X-Codex-Turn-State", u.turnState)
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http-%d\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\n", turn)
@@ -286,5 +291,41 @@ func TestResponsesNativeWebSocketOversizedFullHistoryUsesHTTP(t *testing.T) {
 	}
 	if upstream.upgrades.Load() != 0 || upstream.posts.Load() != 1 {
 		t.Fatalf("transport: upgrades=%d posts=%d, want HTTP for history beyond native limits", upstream.upgrades.Load(), upstream.posts.Load())
+	}
+}
+
+func TestResponsesNativeWebSocketTurnStateDeltaStaysOnHTTP(t *testing.T) {
+	upstream := &nativeGateTestUpstream{postInputItems: make(chan int, 2), turnState: "opaque-turn-state"}
+	h := newTestProxyHandler(t, upstream.handler(t))
+	h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: true, DisableAutoCompact: true, TurnStateDelta: true}
+	h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", false)}, true)
+
+	conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), nil)
+	defer func() { _ = conn.Close() }()
+	request := newResponsesWebSocketCreateRequest([]any{map[string]string{"role": "user", "content": "first"}})
+	request["model"] = "gpt-5.4"
+	for turn := 1; turn <= 2; turn++ {
+		if turn == 2 {
+			// The model becomes native-eligible while the session holds HTTP
+			// turn state.
+			h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", true)}, true)
+		}
+		if err := conn.WriteJSON(request); err != nil {
+			t.Fatal(err)
+		}
+		frame := mustReadWebSocketJSONSkipMetadata(t, conn)
+		if frame["type"] != "response.completed" {
+			t.Fatalf("turn %d = %#v", turn, frame)
+		}
+		request["previous_response_id"] = websocketResponseID(t, frame)
+		request["input"] = []any{map[string]string{"role": "user", "content": "next"}}
+	}
+	// The second body is a one-item turn-state delta: it must stay on HTTP,
+	// where the turn state carries the earlier context.
+	if upstream.upgrades.Load() != 0 || upstream.posts.Load() != 2 {
+		t.Fatalf("transport: upgrades=%d posts=%d, want the turn-state delta on HTTP", upstream.upgrades.Load(), upstream.posts.Load())
+	}
+	if first, second := <-upstream.postInputItems, <-upstream.postInputItems; first != 1 || second != 1 {
+		t.Fatalf("HTTP input items = %d then %d, want a turn-state delta", first, second)
 	}
 }
