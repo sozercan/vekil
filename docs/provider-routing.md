@@ -508,7 +508,7 @@ providers:
     chat_completions_path: /v1/chat/completions
 ```
 
-OpenAI-compatible providers with validated Responses support, including OpenCode Zen/Go models documented for Responses, should opt in per model:
+OpenAI-compatible providers with validated Responses support should opt in per model:
 
 ```yaml
 providers:
@@ -523,12 +523,6 @@ providers:
         endpoints:
           - /responses
 ```
-
-#### OpenCode Zen
-
-OpenCode Zen is an OpenAI-compatible gateway. Configure it as an `openai-compatible` provider with a static key from [opencode.ai/auth](https://opencode.ai/auth) (for example `api_key_env: OPENCODE_API_KEY`). Take each model's base URL and native endpoint from OpenCode's current model documentation, and list only those endpoints under `endpoints`. Do not infer `/responses` from the model family or from client compatibility. Under `model_discovery: static`, only the listed `models:` entries are routable. To opt into specific discovered IDs instead, use `model_discovery: openai` with `include_models`.
-
-Vekil no longer ships an anonymous free-tier example. Since September 2026, OpenCode has limited its free models to the OpenCode client. Other clients using the shared `public` key get HTTP 403 `FreeTierError` or HTTP 429 `FreeUsageLimitError` ("Free models work in OpenCode"), even though `/models` still lists the free IDs. Vekil does not impersonate the OpenCode client.
 
 Anthropic-compatible providers with native Messages support, including Wafer, OpenRouter, and DeepSeek-style Messages endpoints, should not advertise OpenAI routes:
 
