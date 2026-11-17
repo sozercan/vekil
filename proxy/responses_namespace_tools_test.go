@@ -371,7 +371,7 @@ func TestCopilotNamespaceSSEFailsClosedOnOversizedEvents(t *testing.T) {
 func TestCopilotNamespaceRestoresSSEEventNameWithoutType(t *testing.T) {
 	tr, alias := newNamespaceTestTranslation(t)
 	call := fmt.Sprintf(`{"type":"function_call","call_id":"call-1","name":%q,"arguments":"{}"}`, alias)
-	stream := fmt.Sprintf("event: response.output_item.added\ndata: {\"item\":%s}\n\nevent: response.completed\ndata: {\"response\":{\"output\":[%s]}}\n\n", call, call)
+	stream := fmt.Sprintf("event: response.output_item.added\ndata: {\"item\":%s}\n\nevent: response.function_call_arguments.done\ndata: {\"item_id\":\"fc-1\",\"name\":%q,\"arguments\":\"{}\"}\n\nevent: response.completed\ndata: {\"response\":{\"output\":[%s]}}\n\n", call, alias, call)
 	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(stream))}
 	req := httptest.NewRequest(http.MethodPost, "/responses", nil)
 	restoreCopilotNamespaceResponse(req.WithContext(context.WithValue(req.Context(), responsesNamespaceContextKey{}, tr)), resp)
@@ -379,7 +379,7 @@ func TestCopilotNamespaceRestoresSSEEventNameWithoutType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(got), alias) || strings.Count(string(got), `"namespace":"shell"`) != 2 {
+	if strings.Contains(string(got), alias) || strings.Count(string(got), `"namespace":"shell"`) != 3 {
 		t.Fatalf("typeless events not restored: %s", got)
 	}
 }

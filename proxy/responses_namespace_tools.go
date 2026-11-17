@@ -253,7 +253,7 @@ func (tr *responsesNamespaceTranslation) restore(data []byte, eventName string) 
 		return true
 	}
 	call := func(item map[string]json.RawMessage) {
-		if typ := rawJSONString(item["type"]); typ != "function_call" && typ != "response.function_call_arguments.done" {
+		if rawJSONString(item["type"]) != "function_call" {
 			return
 		}
 		restoreName(item)
@@ -331,7 +331,9 @@ func (tr *responsesNamespaceTranslation) restore(data []byte, eventName string) 
 			}
 		}
 	} else if typ == "response.function_call_arguments.done" {
-		call(root)
+		// The dispatched type may come from the SSE event name, so do not
+		// require the payload's own type field here.
+		restoreName(root)
 	} else if typ == "" || typ == "response" {
 		response(root)
 	}
