@@ -29,8 +29,11 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 	if err := json.Unmarshal(body, &root); err != nil {
 		return nil, nil, err
 	}
-	if err := rejectDuplicateJSONMappingKeys(body); err != nil {
-		return nil, nil, err
+	// Use the path-free scan: the config-diagnostics variant builds a path at
+	// every nesting level, which costs quadratic memory on client-supplied
+	// schemas that are deep but small.
+	if err := validateUnambiguousResponsesJSON(body); err != nil {
+		return nil, nil, fmt.Errorf("invalid ambiguous JSON request: %w", err)
 	}
 	tr := &responsesNamespaceTranslation{tools: make(policyResponsesToolMap), catalog: root["tools"]}
 	register := func(d policyResponsesToolDescriptor) (string, error) {

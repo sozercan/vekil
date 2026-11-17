@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -405,5 +406,28 @@ func TestCopilotNamespaceDropsNullReasoningContent(t *testing.T) {
 	// Only reasoning items are normalized.
 	if string(got.Input[2]["content"]) != "null" {
 		t.Fatalf("message changed: %s", got.Input[2])
+	}
+}
+
+func TestCopilotNamespaceDeepSchemaValidationIsLinear(t *testing.T) {
+	// Deep but small client schemas must not trigger the quadratic,
+	// path-building duplicate-key scan (~456 MiB at this depth).
+	const depth = 9000
+	schema := strings.Repeat(`{"properties":`, depth) + `{}` + strings.Repeat(`}`, depth)
+	body := []byte(`{"model":"grok-4.7","tools":[{"type":"namespace","name":"shell","tools":[{"type":"function","name":"run","parameters":` + schema + `}]}]}`)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if _, _, err := translateCopilotNamespaceTools(body); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+		t.Fatalf("translation allocated %d MiB for a %d KiB request", allocated>>20, len(body)>>10)
+	}
+
+	duplicate := []byte(`{"model":"grok-4.7","tools":[{"type":"function","name":"run","parameters":{"type":"object","type":"string"}}]}`)
+	if _, _, err := translateCopilotNamespaceTools(duplicate); err == nil || !strings.Contains(err.Error(), "duplicate mapping key") {
+		t.Fatalf("duplicate keys not rejected: %v", err)
 	}
 }
