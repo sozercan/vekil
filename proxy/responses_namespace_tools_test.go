@@ -431,3 +431,29 @@ func TestCopilotNamespaceDeepSchemaValidationIsLinear(t *testing.T) {
 		t.Fatalf("duplicate keys not rejected: %v", err)
 	}
 }
+
+func TestCopilotNamespaceSharesCatalogBudgetAcrossAdditionalTools(t *testing.T) {
+	// Each catalog stays within the policy parser's per-catalog description
+	// budget, but namespace descriptions are copied into every child.
+	desc := strings.Repeat("d", 60<<10)
+	children := make([]string, 0, 170)
+	for i := 0; i < 170; i++ {
+		children = append(children, fmt.Sprintf(`{"type":"function","name":"f%d","parameters":{}}`, i))
+	}
+	catalog := `[{"type":"namespace","name":"n","description":"` + desc + `","tools":[` + strings.Join(children, ",") + `]}]`
+	build := func(catalogs int) []byte {
+		items := make([]string, catalogs)
+		for i := range items {
+			items[i] = `{"type":"additional_tools","tools":` + catalog + `}`
+		}
+		return []byte(`{"model":"grok-4.7","input":[` + strings.Join(items, ",") + `]}`)
+	}
+	if out, _, err := translateCopilotNamespaceTools(build(1)); err != nil || len(out) < 8<<20 {
+		t.Fatalf("single catalog: len=%d err=%v", len(out), err)
+	}
+	body := build(8)
+	_, _, err := translateCopilotNamespaceTools(body)
+	if err == nil || !strings.Contains(err.Error(), "tool catalogs exceed") {
+		t.Fatalf("%d-byte request was not bounded: err=%v", len(body), err)
+	}
+}

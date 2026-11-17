@@ -44,6 +44,11 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 		tr.tools[alias] = d
 		return alias, nil
 	}
+	// The policy parser budgets each catalog independently, and flattening
+	// copies a namespace description into every child. Share one budget
+	// across all catalogs so many small additional_tools items cannot
+	// amplify a request into an arbitrarily large upstream body.
+	translatedCatalogBytes := 0
 	flatten := func(raw json.RawMessage) (json.RawMessage, error) {
 		normalized, optionals := normalizeNativeResponsesToolOptionals(raw)
 		parsed, err := parsePolicyResponsesTools(normalized)
@@ -78,7 +83,15 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 			}
 			out = append(out, item)
 		}
-		return json.Marshal(out)
+		value, err := json.Marshal(out)
+		if err != nil {
+			return nil, err
+		}
+		if len(value) > maxLargeRequestBodySize-translatedCatalogBytes {
+			return nil, fmt.Errorf("translated Copilot Grok tool catalogs exceed %d bytes", maxLargeRequestBodySize)
+		}
+		translatedCatalogBytes += len(value)
+		return value, nil
 	}
 	if raw, ok := root["tools"]; ok {
 		value, err := flatten(raw)
