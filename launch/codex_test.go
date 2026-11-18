@@ -59,7 +59,7 @@ func TestCodexAdapterPrepare(t *testing.T) {
 	if strings.Contains(joined, "test-token-placeholder") {
 		t.Fatal("Codex argv exposed the local proxy token")
 	}
-	providerID := codexProviderID("test-token-placeholder")
+	providerID := codexProviderID
 	for _, want := range []string{
 		`model_provider="` + providerID + `"`,
 		`model_providers.` + providerID + `.base_url="http://127.0.0.1:43210/v1"`,
@@ -144,7 +144,7 @@ func TestCodexAdapterPrepareWithoutModelUsesCodexDefault(t *testing.T) {
 		t.Fatalf("EnvSet[%q] = %q", codexLocalTokenEnv, got)
 	}
 
-	providerID := codexProviderID("test-token-placeholder")
+	providerID := codexProviderID
 	for _, want := range []string{
 		`model_provider="` + providerID + `"`,
 		`model_providers.` + providerID + `.name="Vekil"`,
@@ -166,6 +166,61 @@ func TestCodexAdapterPrepareWithoutModelUsesCodexDefault(t *testing.T) {
 	}
 	if !reflect.DeepEqual(prepared.Args[len(prepared.Args)-3:], []string{"exec", "--ephemeral", "hello"}) {
 		t.Fatalf("forwarded args changed: %#v", prepared.Args)
+	}
+}
+
+func TestCodexAdapterProviderIDIsStableAcrossLaunches(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable(): %v", err)
+	}
+	prepare := func(baseURL, token string) PreparedProcess {
+		t.Helper()
+		prepared, err := (CodexAdapter{}).Prepare(PrepareInput{
+			BaseURL:       baseURL,
+			Binary:        binary,
+			ForwardedArgs: []string{"exec", "resume", "--last"},
+			LocalToken:    token,
+			DryRun:        true,
+		})
+		if err != nil {
+			t.Fatalf("Prepare() error = %v", err)
+		}
+		return prepared
+	}
+	providerArgs := func(args []string) []string {
+		var out []string
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "model_provider=") || strings.HasPrefix(arg, "model_providers.") {
+				out = append(out, arg)
+			}
+		}
+		return out
+	}
+
+	first := prepare("http://127.0.0.1:43210/", "first-launch-token")
+	second := prepare("http://127.0.0.1:54321/", "second-launch-token")
+
+	// Codex refuses to resume a session whose recorded model_provider is no
+	// longer configured, so every launch must register the same provider ID.
+	for _, prepared := range []PreparedProcess{first, second} {
+		if !containsString(prepared.Args, `model_provider="vekil_launch"`) {
+			t.Fatalf("Codex args missing stable provider: %#v", prepared.Args)
+		}
+	}
+	firstIDs := strings.Join(providerArgs(first.Args), "\n")
+	secondIDs := strings.ReplaceAll(strings.Join(providerArgs(second.Args), "\n"), "54321", "43210")
+	if firstIDs != secondIDs {
+		t.Fatalf("provider overrides differ across launches:\n%s\n---\n%s", firstIDs, secondIDs)
+	}
+	for _, prepared := range []PreparedProcess{first, second} {
+		joined := strings.Join(prepared.Args, "\n")
+		if strings.Contains(joined, "launch-token") {
+			t.Fatalf("Codex argv exposed the local proxy token: %#v", prepared.Args)
+		}
+	}
+	if first.EnvSet[codexLocalTokenEnv] != "first-launch-token" || second.EnvSet[codexLocalTokenEnv] != "second-launch-token" {
+		t.Fatalf("per-launch token not carried in %s: %#v / %#v", codexLocalTokenEnv, first.EnvSet, second.EnvSet)
 	}
 }
 
@@ -338,7 +393,7 @@ func TestCodexAdapterPreservesForegroundContinuationArgs(t *testing.T) {
 			if !containsAdjacent(prepared.Args, "-m", "gpt-public") {
 				t.Fatalf("Codex args did not preserve the managed model: %#v", prepared.Args)
 			}
-			providerID := codexProviderID("test-token-placeholder")
+			providerID := codexProviderID
 			if !containsString(prepared.Args, `model_provider="`+providerID+`"`) {
 				t.Fatalf("Codex args did not preserve the managed provider: %#v", prepared.Args)
 			}
