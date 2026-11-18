@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -794,5 +795,273 @@ func TestResponsesOverChatWebSocketTurnIsRejectedWithoutUpstreamSends(t *testing
 	}
 	if upstream.chatHits.Load() != 0 || upstream.responsesHits.Load() != 0 {
 		t.Fatalf("websocket turn reached upstream: chat=%d responses=%d", upstream.chatHits.Load(), upstream.responsesHits.Load())
+	}
+}
+
+func TestResponsesOverChatAcceptsFragmentedToolNames(t *testing.T) {
+	upstream := newROCUpstream(t, rocSSE(t,
+		// The first call's name arrives in two fragments before its arguments.
+		`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_","arguments":""}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"time"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]}}]}`,
+		// The second call's name is fragmented and it never streams arguments.
+		// Another call starting says nothing about its name, so it is exposed
+		// only at the successful finish, after the third call.
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"get_"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"name":"weather"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"id":"call_c","type":"function","function":{"name":"get_time","arguments":"{}"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		"[DONE]"))
+	h := newROCHandler(t, upstream.server.URL)
+
+	recorder := postROC(t, h, `{"model":"gemini-test","stream":true,"store":false,"parallel_tool_calls":true,"input":"time and weather?",
+		"tools":[{"type":"function","name":"get_time","parameters":{"type":"object"}},{"type":"function","name":"get_weather","parameters":{"type":"object"}}]}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	events := parseROCEvents(t, recorder.Body.String())
+	if terminal := events[len(events)-1]; terminal.Type != "response.completed" {
+		t.Fatalf("terminal event = %s: %v", terminal.Type, terminal.Data)
+	}
+	var added, done []map[string]any
+	for _, event := range events {
+		switch event.Type {
+		case "response.output_item.added":
+			added = append(added, event.Data["item"].(map[string]any))
+		case "response.output_item.done":
+			done = append(done, event.Data["item"].(map[string]any))
+		}
+	}
+	want := []struct{ callID, name, arguments string }{
+		{"call_a", "get_time", `{"city":"Paris"}`},
+		{"call_c", "get_time", "{}"},
+		{"call_b", "get_weather", "{}"},
+	}
+	if len(added) != len(want) || len(done) != len(want) {
+		t.Fatalf("added=%v done=%v", added, done)
+	}
+	for i, call := range want {
+		if added[i]["name"] != call.name || added[i]["call_id"] != call.callID {
+			t.Fatalf("added[%d] = %v, want %+v", i, added[i], call)
+		}
+		if done[i]["name"] != call.name || done[i]["call_id"] != call.callID || done[i]["arguments"] != call.arguments {
+			t.Fatalf("done[%d] = %v, want %+v", i, done[i], call)
+		}
+	}
+}
+
+// rocDoneItems returns the items carried by output_item.done events.
+func rocDoneItems(t *testing.T, events []rocEvent) []map[string]any {
+	t.Helper()
+	var done []map[string]any
+	for _, event := range events {
+		if event.Type == "response.output_item.done" {
+			done = append(done, event.Data["item"].(map[string]any))
+		}
+	}
+	return done
+}
+
+func TestResponsesOverChatNameCompletesOnlyByOwnArgumentsOrFinish(t *testing.T) {
+	tools := `[{"type":"function","name":"get","parameters":{"type":"object"}},
+		{"type":"function","name":"get_time","parameters":{"type":"object"}},
+		{"type":"function","name":"get_weather","parameters":{"type":"object"}}]`
+	tests := []struct {
+		name   string
+		chunks []string
+		want   []string
+	}{
+		{
+			name: "another call index does not complete an earlier name",
+			chunks: []string{
+				`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"time","arguments":"{}"}}]}}]}`,
+			},
+			want: []string{"get_weather", "get_time"},
+		},
+		{
+			name: "a declared prefix is not published before its name completes",
+			chunks: []string{
+				`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"_time","arguments":"{}"}}]}}]}`,
+			},
+			want: []string{"get_weather", "get_time"},
+		},
+		{
+			name: "text does not complete a pending name",
+			chunks: []string{
+				`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{"content":"checking"}}]}`,
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"time","arguments":"{}"}}]}}]}`,
+			},
+			want: []string{"message", "get_time"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chunks := append(append([]string{}, tt.chunks...), `{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`, "[DONE]")
+			upstream := newROCUpstream(t, rocSSE(t, chunks...))
+			h := newROCHandler(t, upstream.server.URL)
+			recorder := postROC(t, h, `{"model":"gemini-test","stream":true,"store":false,"parallel_tool_calls":true,"input":"go","tools":`+tools+`}`)
+			events := parseROCEvents(t, recorder.Body.String())
+			if terminal := events[len(events)-1]; terminal.Type != "response.completed" {
+				t.Fatalf("terminal event = %s: %v", terminal.Type, terminal.Data)
+			}
+			var got []string
+			lastIndex := -1.0
+			for _, event := range events {
+				if event.Type != "response.output_item.added" {
+					continue
+				}
+				if index := event.Data["output_index"].(float64); index <= lastIndex {
+					t.Fatalf("output_index %v is not monotonic after %v", index, lastIndex)
+				} else {
+					lastIndex = index
+				}
+				item := event.Data["item"].(map[string]any)
+				if item["type"] == "message" {
+					got = append(got, "message")
+				} else {
+					got = append(got, item["name"].(string))
+				}
+			}
+			if strings.Join(got, ",") != strings.Join(tt.want, ",") {
+				t.Fatalf("added items = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResponsesOverChatMalformedChunksFailBeforeExecutableCalls(t *testing.T) {
+	tests := map[string]string{
+		"undecodable chunk":       `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":`,
+		"wrongly typed arguments": `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":123}}]}}]}`,
+	}
+	for name, malformed := range tests {
+		t.Run(name, func(t *testing.T) {
+			upstream := newROCUpstream(t, rocSSE(t,
+				`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_time","arguments":""}}]}}]}`,
+				malformed,
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+				"[DONE]"))
+			h := newROCHandler(t, upstream.server.URL)
+			tools := `[{"type":"function","name":"get_time","parameters":{"type":"object"}}]`
+
+			recorder := postROC(t, h, `{"model":"gemini-test","stream":true,"store":false,"input":"time?","tools":`+tools+`}`)
+			events := parseROCEvents(t, recorder.Body.String())
+			terminal := events[len(events)-1]
+			if terminal.Type != "response.failed" {
+				t.Fatalf("terminal event = %s: %s", terminal.Type, recorder.Body.String())
+			}
+			if code := terminal.Data["response"].(map[string]any)["error"].(map[string]any)["code"]; code != "invalid_upstream_stream" {
+				t.Fatalf("error code = %v", code)
+			}
+			if done := rocDoneItems(t, events); len(done) != 0 {
+				t.Fatalf("malformed stream exposed executable items: %v", done)
+			}
+
+			recorder = postROC(t, h, `{"model":"gemini-test","store":false,"input":"time?","tools":`+tools+`}`)
+			if recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "invalid_upstream_stream") {
+				t.Fatalf("non-streaming status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestResponsesOverChatStreamedItemsReplayVerbatim(t *testing.T) {
+	first := rocSSE(t,
+		`{"choices":[{"index":0,"delta":{"role":"assistant","content":"Looking it up."}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_time","arguments":"{}"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		"[DONE]")
+	second := rocSSE(t, `{"choices":[{"index":0,"delta":{"role":"assistant","content":"It is noon."}}]}`, rocStop, "[DONE]")
+	var turns atomic.Int32
+	upstream := newROCUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if turns.Add(1) == 1 {
+			first(w, r)
+			return
+		}
+		second(w, r)
+	})
+	h := newROCHandler(t, upstream.server.URL)
+	tools := `[{"type":"function","name":"get_time","parameters":{"type":"object"}}]`
+	recorder := postROC(t, h, `{"model":"gemini-test","stream":true,"store":false,"input":"time?","tools":`+tools+`}`)
+	events := parseROCEvents(t, recorder.Body.String())
+	done := rocDoneItems(t, events)
+	if len(done) != 2 {
+		t.Fatalf("done items = %v", done)
+	}
+	for _, item := range done {
+		for key := range item {
+			if strings.ContainsRune(key, 0) {
+				t.Fatalf("streamed item carries private key %q: %v", key, item)
+			}
+		}
+	}
+	final := events[len(events)-1].Data["response"].(map[string]any)["output"].([]any)
+	if len(final) != 2 || final[0].(map[string]any)["type"] != "message" || final[1].(map[string]any)["type"] != "function_call" {
+		t.Fatalf("final output = %v", final)
+	}
+
+	// A full-history client replays the streamed items as input.
+	input := []any{map[string]any{"type": "message", "role": "user", "content": "time?"}}
+	for _, item := range done {
+		input = append(input, item)
+	}
+	input = append(input, map[string]any{"type": "function_call_output", "call_id": "call_a", "output": "noon"})
+	payload, err := json.Marshal(map[string]any{"model": "gemini-test", "store": false, "input": input, "tools": json.RawMessage(tools)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder = postROC(t, h, string(payload))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("replay status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestResponsesOverChatRejectsInternalRouteOptIn(t *testing.T) {
+	light := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	powerful := newPolicyIntegrationUpstream(t, policyClassifierSignals{})
+	_, err := NewProxyHandler(nil, logger.NewWithWriter(logger.LevelError, io.Discard),
+		WithProvidersConfig(policyIntegrationConfig(light.server.URL, powerful.server.URL, policyConfigModeOff)),
+		WithPolicyRoutingMode(PolicyRoutingModeOff),
+		WithResponsesOverChatModels("light-route"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "names an internal route") {
+		t.Fatalf("NewProxyHandler() error = %v, want internal route rejection", err)
+	}
+}
+
+func TestResponsesOverChatRequireNativeChatRefusesResponsesBackendBeforeDispatch(t *testing.T) {
+	// Admission saw a native Chat model; by execution the catalog lists it as
+	// Responses-only. The guard must refuse without any upstream send.
+	var chatSends, responsesSends atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case providerEndpointModels:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"flipped","object":"model","owned_by":"copilot","supported_endpoints":["/responses"],"capabilities":{"supports":{"tool_calls":true}}}]}`)
+			return
+		case providerEndpointChatCompletions:
+			chatSends.Add(1)
+		case providerEndpointResponses:
+			responsesSends.Add(1)
+		}
+		http.Error(w, "unexpected", http.StatusTeapot)
+	}))
+	defer server.Close()
+	h := newROCHandler(t, server.URL)
+
+	body := []byte(`{"model":"flipped","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	mode := parseOpenAIChatCompletionsMode(body)
+	_, err := h.executeRoutedChatCompletions(context.Background(), body, mode, chatExecutionOptions{RequireNativeChat: true}, "flipped")
+	var executionErr *chatExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Code != "native_chat_backend_unavailable" {
+		t.Fatalf("error = %v, want native_chat_backend_unavailable", err)
+	}
+	if chatSends.Load() != 0 || responsesSends.Load() != 0 {
+		t.Fatalf("guard dispatched upstream: chat=%d responses=%d", chatSends.Load(), responsesSends.Load())
 	}
 }

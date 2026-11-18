@@ -59,6 +59,24 @@ type chatExecutionOptions struct {
 	// Set by the Anthropic surfaces only. See responsesChatRequestOptions; it also lets
 	// replay IDs continue on native Chat when the target has no Responses backend.
 	DegradeUnrestorableReplay bool
+	// RequireNativeChat refuses, before any upstream send, a request whose route
+	// resolves to a Responses backend at execution time. Responses-over-Chat
+	// sets it so a concurrent catalog refresh cannot turn an admitted native
+	// Chat request into an upstream /responses inference.
+	RequireNativeChat bool
+}
+
+// nativeChatBackendRequiredError is returned when RequireNativeChat finds that
+// the route no longer resolves to native Chat. The model's catalog changed
+// between admission and execution; a retry is admitted afresh.
+func nativeChatBackendRequiredError() *chatExecutionError {
+	return &chatExecutionError{
+		StatusCode:    http.StatusServiceUnavailable,
+		Type:          "server_error",
+		Code:          "native_chat_backend_unavailable",
+		Message:       "The model no longer resolves to a native Chat Completions backend; retry the request.",
+		staticMessage: true,
+	}
 }
 
 type chatExecutionResult struct {
