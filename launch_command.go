@@ -58,6 +58,11 @@ type launchTargetSpec struct {
 	installHelp   string
 	requiresModel bool
 	adapter       launch.Adapter
+	// responsesClient marks agents that speak /v1/responses. With
+	// Responses-over-Chat opt-ins they must pin --model: the adapter's
+	// restrictions are derived from the pinned model's metadata, and an
+	// agent-chosen model would skip them.
+	responsesClient bool
 }
 
 func launchTarget(name string) (launchTargetSpec, bool) {
@@ -71,10 +76,11 @@ func launchTarget(name string) (launchTargetSpec, bool) {
 		}, true
 	case "codex":
 		return launchTargetSpec{
-			name:        "codex",
-			displayName: "Codex CLI",
-			installHelp: "install Codex CLI",
-			adapter:     launch.CodexAdapter{},
+			name:            "codex",
+			displayName:     "Codex CLI",
+			installHelp:     "install Codex CLI",
+			adapter:         launch.CodexAdapter{},
+			responsesClient: true,
 		}, true
 	case "copilot":
 		return launchTargetSpec{
@@ -172,6 +178,9 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	}
 	if target.requiresModel && strings.TrimSpace(*model) == "" {
 		return opts, fmt.Errorf("--model is required")
+	}
+	if target.responsesClient && strings.TrimSpace(*responsesOverChatModels) != "" && strings.TrimSpace(*model) == "" {
+		return opts, fmt.Errorf("--model is required with --responses-over-chat-models (or RESPONSES_OVER_CHAT_MODELS) so %s runs with the adapter's restrictions; pass --model with an opted-in model, or clear the opt-in list", target.displayName)
 	}
 	portNumber, err := strconv.Atoi(strings.TrimSpace(*port))
 	if err != nil || portNumber < 0 || portNumber > 65535 {

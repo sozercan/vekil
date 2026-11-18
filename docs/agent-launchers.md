@@ -131,7 +131,7 @@ normal global policy-controller startup behavior.
 | `--startup-timeout DURATION` | Maximum startup/authentication/readiness time. |
 | `--streaming-upstream-timeout DURATION` | Upstream streaming timeout. |
 | `--policy-routing config|off|observe|enforce` | Policy-routing mode. `config` follows YAML profile modes and is the default; other values apply a process-wide safety ceiling. |
-| `--responses-over-chat-models IDS` | Comma-separated Chat-only public model IDs the launch proxy may serve on `/v1/responses` ([Responses-over-Chat](responses.md#responses-compatibility-over-a-native-chat-model-responses-over-chat)). Also read from `RESPONSES_OVER_CHAT_MODELS`. Off by default. |
+| `--responses-over-chat-models IDS` | Comma-separated Chat-only public model IDs the launch proxy may serve on `/v1/responses` ([Responses-over-Chat](responses.md#responses-compatibility-over-a-native-chat-model-responses-over-chat)). Also read from `RESPONSES_OVER_CHAT_MODELS`. Off by default. A Codex launch with a non-empty list requires `--model`. |
 | `--proxy-log PATH` | New JSON proxy log path; existing files and links are rejected. |
 | `--dry-run` | Print the child-process plan without starting a proxy or agent. Static model metadata is resolved; catalog-only metadata is marked unresolved. |
 | `--no-summary` | Suppress the end-of-session request/token summary. |
@@ -351,6 +351,9 @@ vekil launch codex --model gemini-3.8-flash --responses-over-chat-models gemini-
 ```
 
 Without the opt-in the launcher refuses a Chat-only model and names the flag.
+With an opt-in list, a Codex launch must also pass `--model`: the restrictions
+below come from the pinned model's metadata, so letting Codex choose its own
+model would skip them.
 With it, the launch proxy marks the model with
 `vekil_responses_compatibility: "responses_over_chat"` in `/v1/models` while its
 native `supported_endpoints` stays `["/chat/completions"]`, and the launcher
