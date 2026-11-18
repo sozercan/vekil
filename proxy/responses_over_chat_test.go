@@ -1065,3 +1065,182 @@ func TestResponsesOverChatRequireNativeChatRefusesResponsesBackendBeforeDispatch
 		t.Fatalf("guard dispatched upstream: chat=%d responses=%d", chatSends.Load(), responsesSends.Load())
 	}
 }
+
+func TestResponsesOverChatConcatenatesRepeatedNameFragments(t *testing.T) {
+	upstream := newROCUpstream(t, rocSSE(t,
+		`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"get"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}`,
+		// A repeat of the complete name after announcement is tolerated.
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"getget"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		"[DONE]"))
+	h := newROCHandler(t, upstream.server.URL)
+	tools := `[{"type":"function","name":"get","parameters":{"type":"object"}},{"type":"function","name":"getget","parameters":{"type":"object"}}]`
+	recorder := postROC(t, h, `{"model":"gemini-test","stream":true,"store":false,"input":"go","tools":`+tools+`}`)
+	events := parseROCEvents(t, recorder.Body.String())
+	if terminal := events[len(events)-1]; terminal.Type != "response.completed" {
+		t.Fatalf("terminal event = %s: %v", terminal.Type, terminal.Data)
+	}
+	done := rocDoneItems(t, events)
+	if len(done) != 1 || done[0]["name"] != "getget" {
+		t.Fatalf("done items = %v, want one getget call", done)
+	}
+}
+
+func TestResponsesOverChatFinalOutputWithTextAfterCallReplays(t *testing.T) {
+	first := rocSSE(t,
+		`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_time","arguments":"{}"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"Checking the clock."}}]}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		"[DONE]")
+	second := rocSSE(t, `{"choices":[{"index":0,"delta":{"role":"assistant","content":"It is noon."}}]}`, rocStop, "[DONE]")
+	var turns atomic.Int32
+	upstream := newROCUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if turns.Add(1) == 1 {
+			first(w, r)
+			return
+		}
+		second(w, r)
+	})
+	h := newROCHandler(t, upstream.server.URL)
+	tools := `[{"type":"function","name":"get_time","parameters":{"type":"object"}}]`
+
+	recorder := postROC(t, h, `{"model":"gemini-test","store":false,"input":"time?","tools":`+tools+`}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Output []json.RawMessage `json:"output"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Output) != 2 || !strings.Contains(string(response.Output[0]), `"function_call"`) || !strings.Contains(string(response.Output[1]), `"message"`) {
+		t.Fatalf("output = %s, want [function_call, message]", recorder.Body.String())
+	}
+
+	input := []json.RawMessage{json.RawMessage(`{"type":"message","role":"user","content":"time?"}`)}
+	input = append(input, response.Output...)
+	input = append(input, json.RawMessage(`{"type":"function_call_output","call_id":"call_a","output":"noon"}`))
+	payload, err := json.Marshal(map[string]any{"model": "gemini-test", "store": false, "input": input, "tools": json.RawMessage(tools)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder = postROC(t, h, string(payload))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("replay status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	messages := upstream.lastChatBody()["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("replayed Chat messages = %v", messages)
+	}
+	assistant := messages[1].(map[string]any)
+	if assistant["role"] != "assistant" || assistant["content"] != "Checking the clock." || len(assistant["tool_calls"].([]any)) != 1 {
+		t.Fatalf("assistant turn = %v, want text plus one tool call", assistant)
+	}
+	if tool := messages[2].(map[string]any); tool["role"] != "tool" || tool["tool_call_id"] != "call_a" {
+		t.Fatalf("tool message = %v", tool)
+	}
+}
+
+func TestPolicyResponsesContractKeepsRejectingInterleavedAssistantText(t *testing.T) {
+	body := []byte(`{"model":"m","store":false,"tools":[{"type":"function","name":"get_time","parameters":{"type":"object"}}],"input":[
+		{"type":"message","role":"user","content":"time?"},
+		{"type":"function_call","call_id":"call_a","name":"get_time","arguments":"{}"},
+		{"type":"message","role":"assistant","content":"Checking."},
+		{"type":"function_call_output","call_id":"call_a","output":"noon"}]}`)
+	if _, err := translatePolicyResponsesRequestToChat(body); err == nil || !strings.Contains(err.Error(), "missing a following function_call_output") {
+		t.Fatalf("policy translation error = %v, want unchanged call-sequence rejection", err)
+	}
+	if _, err := translateResponsesRequestToChat(body, responsesOverChatTranslationContract); err != nil {
+		t.Fatalf("Responses-over-Chat translation error = %v", err)
+	}
+}
+
+func TestResponsesOverChatClientCancelRecords499(t *testing.T) {
+	t.Run("stream", func(t *testing.T) {
+		upstream := newROCUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			writeROCChunk(t, w, `{"choices":[{"index":0,"delta":{"role":"assistant","content":"first"}}]}`)
+			select {
+			case <-r.Context().Done():
+			case <-time.After(10 * time.Second):
+			}
+		})
+		h := newROCHandler(t, upstream.server.URL)
+		summaries := make(chan *RequestSummary, 1)
+		returned := make(chan struct{})
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer close(returned)
+			ctx, summary := WithRequestSummary(r.Context())
+			summaries <- summary
+			h.HandleResponses(w, r.WithContext(ctx))
+		}))
+		defer proxy.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		request, _ := http.NewRequestWithContext(ctx, http.MethodPost, proxy.URL, strings.NewReader(`{"model":"gemini-test","input":"hi","stream":true}`))
+		resp, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader := bufio.NewReader(resp.Body)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("stream ended early: %v", err)
+			}
+			if strings.Contains(line, `"delta":"first"`) {
+				break
+			}
+		}
+		cancel()
+		_ = resp.Body.Close()
+		select {
+		case <-returned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("handler did not return after the client canceled")
+		}
+		if got := (<-summaries).FailureStatus(); got != 499 {
+			t.Fatalf("summary failure status = %d, want 499", got)
+		}
+	})
+
+	t.Run("non-stream", func(t *testing.T) {
+		started := make(chan struct{})
+		upstream := newROCUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			writeROCChunk(t, w, `{"choices":[{"index":0,"delta":{"role":"assistant","content":"first"}}]}`)
+			close(started)
+			select {
+			case <-r.Context().Done():
+			case <-time.After(10 * time.Second):
+			}
+		})
+		h := newROCHandler(t, upstream.server.URL)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gemini-test","input":"hi"}`)).WithContext(ctx)
+		recorder := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			h.HandleResponses(recorder, request)
+		}()
+		<-started
+		// Let the adapter reach the stream read; an earlier cancel takes the
+		// pre-response path, which also answers 499.
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("handler did not return after the client canceled")
+		}
+		if recorder.Code != 499 || recorder.Body.Len() != 0 {
+			t.Fatalf("status = %d body=%q, want bare 499", recorder.Code, recorder.Body.String())
+		}
+	})
+}

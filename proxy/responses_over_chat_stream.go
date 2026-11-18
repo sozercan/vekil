@@ -77,7 +77,6 @@ type responsesOverChatMessage struct {
 // returns only the final object, which is how non-streaming requests are served.
 type responsesOverChatStream struct {
 	w        http.ResponseWriter
-	ctx      context.Context
 	response responsesOverChatResponse
 	config   policyResponsesResponseConfig
 	tools    policyResponsesToolMap
@@ -308,14 +307,20 @@ func (s *responsesOverChatStream) applyToolCallDelta(delta models.OpenAIToolCall
 		}
 		call.callID = id
 	}
-	if name := delta.Function.Name; name != "" && name != call.chatName {
+	if name := delta.Function.Name; name != "" {
 		if call.added {
-			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream changed a tool name after the call started"}
-		}
-		// Some providers fragment names; identical repeats are ignored above.
-		call.chatName += name
-		if len(call.chatName) > policyResponsesMaxToolNameLen {
-			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned an oversized tool name"}
+			// Once a call is announced its identity is fixed; a repeat of the
+			// complete name is tolerated, anything else is a change.
+			if name != call.chatName {
+				return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream changed a tool name after the call started"}
+			}
+		} else {
+			// Before announcement every fragment is part of the name, including
+			// one equal to the prefix so far ("get" + "get" is "getget").
+			call.chatName += name
+			if len(call.chatName) > policyResponsesMaxToolNameLen {
+				return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned an oversized tool name"}
+			}
 		}
 	}
 	if fragment := delta.Function.Arguments; fragment != "" {
@@ -646,6 +651,16 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 	switch {
 	case consumeErr != nil && errors.Is(consumeErr, errChatStreamClientWriteFailed):
 		// The client is gone; nothing further can be delivered.
+		return
+	case consumeErr != nil && r.Context().Err() != nil:
+		// The client left first and the cancellation hook stopped the upstream
+		// read. Record the client abort as 499, as the pre-response path does,
+		// rather than an upstream failure, and write nothing to the departed
+		// client beyond the status when nothing was committed yet.
+		observeResponseFailureStatus(r.Context(), 499)
+		if !committed {
+			w.WriteHeader(499)
+		}
 		return
 	case consumeErr != nil:
 		if lifecycle.suppressTransportCancellation(committed) {
