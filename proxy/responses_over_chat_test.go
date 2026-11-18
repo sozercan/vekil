@@ -1311,3 +1311,63 @@ func TestResponsesOverChatClientWriteFailureRecords499(t *testing.T) {
 		})
 	}
 }
+
+func TestResponsesOverChatOmitsToolChoiceWithoutTools(t *testing.T) {
+	// Codex's local compaction turn sends tool_choice with no tools; Copilot
+	// Chat rejects any tool_choice that has no tools beside it.
+	for _, tc := range []struct{ name, fields string }{
+		{"auto with empty tools", `"tools":[],"tool_choice":"auto"`},
+		{"none with empty tools", `"tools":[],"tool_choice":"none"`},
+		{"auto without tools", `"tool_choice":"auto"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := newROCUpstream(t, rocSSE(t, `{"choices":[{"index":0,"delta":{"role":"assistant","content":"summary"}}]}`, rocStop, "[DONE]"))
+			h := newROCHandler(t, upstream.server.URL)
+			recorder := postROC(t, h, `{"model":"gemini-test","stream":true,"input":"summarize",`+tc.fields+`}`)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+			}
+			events := parseROCEvents(t, recorder.Body.String())
+			if terminal := events[len(events)-1]; terminal.Type != "response.completed" {
+				t.Fatalf("terminal = %s", terminal.Type)
+			}
+			upstream.mu.Lock()
+			defer upstream.mu.Unlock()
+			if len(upstream.chatBodies) != 1 {
+				t.Fatalf("chat sends = %d", len(upstream.chatBodies))
+			}
+			for _, field := range []string{"tool_choice", "tools"} {
+				if value, ok := upstream.chatBodies[0][field]; ok {
+					t.Fatalf("upstream Chat body carries %s=%v without tools", field, value)
+				}
+			}
+		})
+	}
+
+	t.Run("required without tools still fails locally", func(t *testing.T) {
+		upstream := newROCUpstream(t, rocSSE(t, rocStop, "[DONE]"))
+		h := newROCHandler(t, upstream.server.URL)
+		recorder := postROC(t, h, `{"model":"gemini-test","input":"go","tools":[],"tool_choice":"required"}`)
+		if recorder.Code != http.StatusBadRequest || upstream.chatHits.Load() != 0 {
+			t.Fatalf("status = %d chat sends = %d body=%s", recorder.Code, upstream.chatHits.Load(), recorder.Body.String())
+		}
+	})
+}
+
+func TestPolicyResponsesContractKeepsToolChoiceWithoutTools(t *testing.T) {
+	body := []byte(`{"model":"m","store":false,"input":"summarize","tools":[],"tool_choice":"auto"}`)
+	policy, err := translatePolicyResponsesRequestToChat(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(policy.Body), `"tool_choice":"auto"`) {
+		t.Fatalf("policy Chat body changed: %s", policy.Body)
+	}
+	adapter, err := translateResponsesRequestToChat(body, responsesOverChatTranslationContract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(adapter.Body), "tool_choice") {
+		t.Fatalf("Responses-over-Chat Chat body kept tool_choice: %s", adapter.Body)
+	}
+}

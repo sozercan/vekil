@@ -124,6 +124,11 @@ type responsesChatTranslationContract struct {
 	// before call-sequence validation. Adapters whose own output can place
 	// assistant text after a call set it so that output replays as input.
 	coalesceAssistantToolTurns bool
+	// omitToolChoiceWithoutTools drops a tool_choice of "auto" or "none" when
+	// no tools are declared. Both are no-ops without tools, and some Chat
+	// upstreams reject any tool_choice that has no tools beside it. Codex
+	// sends that shape for its local compaction turn.
+	omitToolChoiceWithoutTools bool
 }
 
 // policyResponsesTranslationContract is the semantic-policy Responses ingress
@@ -237,6 +242,9 @@ func translateResponsesRequestToChat(body []byte, contract responsesChatTranslat
 	chatToolChoice, err := translatePolicyResponsesToolChoice(toolChoice, aliases)
 	if err != nil {
 		return policyResponsesChatRequest{}, err
+	}
+	if contract.omitToolChoiceWithoutTools && len(chatTools) == 0 && toolChoice.descriptor == nil && (toolChoice.mode == "auto" || toolChoice.mode == "none") {
+		chatToolChoice = nil
 	}
 	callableTools := policyResponsesCallableTools(parsedTools, aliases, toolChoice)
 
