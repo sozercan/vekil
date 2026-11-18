@@ -650,7 +650,9 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 	var final responsesOverChatResponse
 	switch {
 	case consumeErr != nil && errors.Is(consumeErr, errChatStreamClientWriteFailed):
-		// The client is gone; nothing further can be delivered.
+		// The client is gone; nothing further can be delivered. Record the abort
+		// so the committed 200 is not counted as a success.
+		observeResponseFailureStatus(r.Context(), 499)
 		return
 	case consumeErr != nil && r.Context().Err() != nil:
 		// The client left first and the cancellation hook stopped the upstream
@@ -681,6 +683,7 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 	default:
 		final, failure = state.finish()
 		if failure != nil && failure.code == "client_write_failed" {
+			observeResponseFailureStatus(r.Context(), 499)
 			return
 		}
 	}
@@ -704,11 +707,19 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 		writeOpenAIErrorWithDetails(w, status, failure.message, openAIErrorTypeForHTTPStatus(status), "", failure.code)
 		return
 	}
+	if final.Status == "incomplete" {
+		// The HTTP status is 200 either way, so record the truncated turn the
+		// way the native Responses stream tap records response.incomplete.
+		observeResponseFailureStatus(r.Context(), http.StatusConflict)
+	}
 	if state.streaming() {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(final); err != nil && h.log != nil {
-		h.log.Debug("failed to write Responses-over-Chat result", logger.Err(err))
+	if err := json.NewEncoder(w).Encode(final); err != nil {
+		observeResponseFailureStatus(r.Context(), 499)
+		if h.log != nil {
+			h.log.Debug("failed to write Responses-over-Chat result", logger.Err(err))
+		}
 	}
 }

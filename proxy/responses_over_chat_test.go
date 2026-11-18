@@ -1244,3 +1244,70 @@ func TestResponsesOverChatClientCancelRecords499(t *testing.T) {
 		}
 	})
 }
+
+func postROCWithSummary(t *testing.T, h *ProxyHandler, w http.ResponseWriter, body string) *RequestSummary {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	ctx, summary := WithRequestSummary(request.Context())
+	h.HandleResponses(w, request.WithContext(ctx))
+	return summary
+}
+
+func TestResponsesOverChatRecordsIncompleteTurnsAsFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, finish string
+		want         int
+	}{
+		{"completed", "stop", 0},
+		{"length", "length", http.StatusConflict},
+		{"content filter", "content_filter", http.StatusConflict},
+	} {
+		for _, stream := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s stream=%v", tc.name, stream), func(t *testing.T) {
+				upstream := newROCUpstream(t, rocSSE(t,
+					`{"choices":[{"index":0,"delta":{"role":"assistant","content":"partial"}}]}`,
+					fmt.Sprintf(`{"choices":[{"index":0,"delta":{},"finish_reason":%q}]}`, tc.finish),
+					"[DONE]"))
+				h := newROCHandler(t, upstream.server.URL)
+				recorder := httptest.NewRecorder()
+				summary := postROCWithSummary(t, h, recorder, fmt.Sprintf(`{"model":"gemini-test","stream":%v,"input":"go"}`, stream))
+				if recorder.Code != http.StatusOK {
+					t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+				}
+				if got := summary.FailureStatus(); got != tc.want {
+					t.Fatalf("summary failure status = %d, want %d", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
+type rocFailingWriter struct {
+	header http.Header
+}
+
+func (w *rocFailingWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+func (w *rocFailingWriter) WriteHeader(int)           {}
+func (w *rocFailingWriter) Write([]byte) (int, error) { return 0, errors.New("client gone") }
+func (w *rocFailingWriter) Flush()                    {}
+
+func TestResponsesOverChatClientWriteFailureRecords499(t *testing.T) {
+	for _, stream := range []bool{true, false} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			upstream := newROCUpstream(t, rocSSE(t,
+				`{"choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}]}`,
+				rocStop,
+				"[DONE]"))
+			h := newROCHandler(t, upstream.server.URL)
+			summary := postROCWithSummary(t, h, &rocFailingWriter{}, fmt.Sprintf(`{"model":"gemini-test","stream":%v,"input":"go"}`, stream))
+			if got := summary.FailureStatus(); got != 499 {
+				t.Fatalf("summary failure status = %d, want 499", got)
+			}
+		})
+	}
+}
