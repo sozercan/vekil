@@ -257,54 +257,76 @@ const responsesCompatibilityCatalogField = "vekil_responses_compatibility"
 // for the process lifetime, so the annotated body can share the normal
 // /v1/models cache and refresh cycle.
 func (h *ProxyHandler) annotateResponsesOverChatCatalog(body []byte) ([]byte, map[string]struct{}) {
-	if h == nil || len(h.responsesOverChatModels) == 0 {
+	if h == nil || (len(h.responsesOverChatModels) == 0 && !bytes.Contains(body, []byte(responsesCompatibilityCatalogField))) {
 		return body, nil
 	}
-	var catalog struct {
-		Object string            `json:"object"`
-		Data   []json.RawMessage `json:"data"`
-	}
+	// Keep every other top-level catalog field intact.
+	var catalog map[string]json.RawMessage
 	if json.Unmarshal(body, &catalog) != nil {
 		return body, nil
 	}
+	var data []json.RawMessage
+	if json.Unmarshal(catalog["data"], &data) != nil {
+		return body, nil
+	}
+	changed := false
 	annotated := make(map[string]struct{})
-	for index, raw := range catalog.Data {
-		var entry struct {
-			ID                 string   `json:"id"`
-			SupportedEndpoints []string `json:"supported_endpoints"`
-		}
-		if json.Unmarshal(raw, &entry) != nil || !h.responsesOverChatOptedIn(entry.ID) {
-			continue
-		}
-		if _, policy := h.policyPublicModelID(entry.ID); policy || len(entry.SupportedEndpoints) == 0 {
-			// An entry without endpoint metadata is treated as native everywhere.
-			continue
-		}
-		mode, _ := classifyResponsesCompatibility(
-			supportsEndpoint(entry.SupportedEndpoints, providerEndpointChatCompletions),
-			supportsEndpoint(entry.SupportedEndpoints, providerEndpointResponses),
-			responsesOverChatCapabilitiesFromRaw(raw))
-		if mode != responsesExecutionOverChat {
-			continue
-		}
+	for index, raw := range data {
 		var fields map[string]json.RawMessage
 		if json.Unmarshal(raw, &fields) != nil {
 			continue
 		}
-		fields[responsesCompatibilityCatalogField] = json.RawMessage(`"` + responsesExecutionOverChat.String() + `"`)
+		// The marker is this proxy's own decision. Merged upstream metadata may
+		// carry one (for example from a chained Vekil), so strip it from every
+		// entry and add it back only for an eligible local opt-in.
+		_, hadMarker := fields[responsesCompatibilityCatalogField]
+		delete(fields, responsesCompatibilityCatalogField)
+		var entry struct {
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		}
+		_ = json.Unmarshal(raw, &entry)
+		eligible := false
+		if h.responsesOverChatOptedIn(entry.ID) && len(entry.SupportedEndpoints) > 0 {
+			// An entry without endpoint metadata is treated as native everywhere.
+			if _, policy := h.policyPublicModelID(entry.ID); !policy {
+				mode, _ := classifyResponsesCompatibility(
+					supportsEndpoint(entry.SupportedEndpoints, providerEndpointChatCompletions),
+					supportsEndpoint(entry.SupportedEndpoints, providerEndpointResponses),
+					responsesOverChatCapabilitiesFromRaw(raw))
+				eligible = mode == responsesExecutionOverChat
+			}
+		}
+		if eligible {
+			fields[responsesCompatibilityCatalogField] = json.RawMessage(`"` + responsesExecutionOverChat.String() + `"`)
+		}
+		if !eligible && !hadMarker {
+			continue
+		}
 		rewritten, err := json.Marshal(fields)
 		if err != nil {
 			continue
 		}
-		catalog.Data[index] = rewritten
-		annotated[strings.TrimSpace(entry.ID)] = struct{}{}
+		data[index] = rewritten
+		changed = true
+		if eligible {
+			annotated[strings.TrimSpace(entry.ID)] = struct{}{}
+		}
 	}
-	if len(annotated) == 0 {
+	if !changed {
 		return body, nil
 	}
+	rawData, err := json.Marshal(data)
+	if err != nil {
+		return body, nil
+	}
+	catalog["data"] = rawData
 	rewritten, err := json.Marshal(catalog)
 	if err != nil {
 		return body, nil
+	}
+	if len(annotated) == 0 {
+		annotated = nil
 	}
 	return rewritten, annotated
 }

@@ -125,3 +125,51 @@ func TestClassifyResponsesCompatibilityTable(t *testing.T) {
 		}
 	}
 }
+
+func TestResponsesOverChatCatalogStripsUpstreamMarkers(t *testing.T) {
+	// A chained or misconfigured upstream may already carry the marker. Only
+	// this proxy's own eligible opt-ins may keep it.
+	body := []byte(`{"object":"list","etag":"kept","data":[
+		{"id":"gpt-native","supported_endpoints":["/chat/completions","/responses"],"vekil_responses_compatibility":"responses_over_chat"},
+		{"id":"not-opted","supported_endpoints":["/chat/completions"],"vekil_responses_compatibility":"responses_over_chat"},
+		{"id":"gemini-test","supported_endpoints":["/chat/completions"],"capabilities":{"supports":{"tool_calls":true}}}]}`)
+	assertMarkers := func(t *testing.T, h *ProxyHandler, want map[string]bool) {
+		t.Helper()
+		rewritten, annotated := h.annotateResponsesOverChatCatalog(body)
+		var catalog struct {
+			Etag string                       `json:"etag"`
+			Data []map[string]json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(rewritten, &catalog); err != nil {
+			t.Fatal(err)
+		}
+		if catalog.Etag != "kept" {
+			t.Fatalf("top-level fields were dropped: %s", rewritten)
+		}
+		for _, entry := range catalog.Data {
+			var id string
+			_ = json.Unmarshal(entry["id"], &id)
+			_, marked := entry[responsesCompatibilityCatalogField]
+			if marked != want[id] {
+				t.Fatalf("%s marked=%v, want %v: %s", id, marked, want[id], rewritten)
+			}
+			if _, inSet := annotated[id]; inSet != want[id] {
+				t.Fatalf("%s annotated=%v, want %v", id, inSet, want[id])
+			}
+		}
+	}
+
+	t.Run("no opt-in", func(t *testing.T) {
+		h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture"), logger.NewWithWriter(logger.LevelError, io.Discard))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(h.BeginShutdown)
+		assertMarkers(t, h, map[string]bool{})
+	})
+	t.Run("ineligible opt-in", func(t *testing.T) {
+		upstream := newROCUpstream(t, rocSSE(t, rocStop, "[DONE]"))
+		h := newROCHandler(t, upstream.server.URL)
+		assertMarkers(t, h, map[string]bool{"gemini-test": true})
+	})
+}
