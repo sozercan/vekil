@@ -45,6 +45,7 @@ var responsesOverChatTranslationContract = responsesChatTranslationContract{
 	// The adapter streams text after an announced call as a later message
 	// item, so its own completed output must replay as input.
 	coalesceAssistantToolTurns: true,
+	omitToolChoiceWithoutTools: true,
 }
 
 // WithResponsesOverChatModels opts the listed public model IDs into
