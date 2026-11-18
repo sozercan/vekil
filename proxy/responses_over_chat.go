@@ -84,7 +84,15 @@ func (h *ProxyHandler) validateResponsesOverChatModels() error {
 		if _, policy := h.policyPublicModelID(model); policy {
 			return fmt.Errorf("responses-over-chat model %q is a policy model; policy models already serve /v1/responses through their own adapter", model)
 		}
-		if route, known := h.resolveModelRouteForRequest(model, providerEndpointChatCompletions); known && route != nil && !route.legacy {
+		route, known := h.resolveModelRouteForRequest(model, providerEndpointChatCompletions)
+		if !known {
+			// Public resolution never returns internal routes, so check the
+			// operational route IDs only after public IDs and aliases miss.
+			if internal, ok := h.providerSetup().lookupTerminalRoute(model); ok && internal != nil && !internal.isPublic() {
+				return fmt.Errorf("responses-over-chat model %q names an internal route", model)
+			}
+		}
+		if known && route != nil && !route.legacy {
 			if !route.isPublic() {
 				return fmt.Errorf("responses-over-chat model %q names an internal route", model)
 			}
@@ -332,7 +340,11 @@ func (h *ProxyHandler) handleResponsesOverChat(w http.ResponseWriter, r *http.Re
 	}
 	publicModel := explicitRoutePublicModel(route, compat.publicModel)
 
-	result, err := h.executeRoutedChatCompletions(upstreamCtx, chatBody, mode, chatExecutionOptions{}, requestedModel)
+	// Legacy routes are resolved again at execution. Pin execution to native
+	// Chat so a concurrent catalog refresh cannot dispatch an upstream
+	// /responses inference that admission never approved. The stream_options
+	// retry below reuses the native route it was given.
+	result, err := h.executeRoutedChatCompletions(upstreamCtx, chatBody, mode, chatExecutionOptions{RequireNativeChat: true}, requestedModel)
 	if err != nil {
 		h.writeResponsesOverChatExecutionError(w, r, upstreamCtx, err)
 		return

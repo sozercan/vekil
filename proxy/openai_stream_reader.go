@@ -204,6 +204,23 @@ func parseOpenAIStreamError(eventType, data string) (*openAIStreamError, bool) {
 // expected [DONE] sentinel. Multi-line SSE data fields are joined according to
 // the SSE event model before JSON decoding.
 func consumeOpenAIStreamChunks(r io.Reader, onChunk func(models.OpenAIStreamChunk) bool) (bool, error) {
+	return consumeOpenAIStreamChunksWithDecodeMode(r, onChunk, false)
+}
+
+// errOpenAIStreamMalformedChunk reports an SSE data payload that is not a
+// decodable OpenAI Chat stream chunk.
+var errOpenAIStreamMalformedChunk = errors.New("upstream sent a malformed Chat stream chunk")
+
+// consumeOpenAIStreamChunksStrict is consumeOpenAIStreamChunks for adapters
+// that must not act on a partial view of the stream: a data payload that fails
+// to decode, including a wrongly typed field, stops the scan with
+// errOpenAIStreamMalformedChunk instead of being skipped. Blank payloads are
+// still ignored.
+func consumeOpenAIStreamChunksStrict(r io.Reader, onChunk func(models.OpenAIStreamChunk) bool) (bool, error) {
+	return consumeOpenAIStreamChunksWithDecodeMode(r, onChunk, true)
+}
+
+func consumeOpenAIStreamChunksWithDecodeMode(r io.Reader, onChunk func(models.OpenAIStreamChunk) bool, strict bool) (bool, error) {
 	reader := bufio.NewReaderSize(r, openAIStreamScannerInitialBuffer)
 
 	sawDone := false
@@ -221,6 +238,10 @@ func consumeOpenAIStreamChunks(r io.Reader, onChunk func(models.OpenAIStreamChun
 
 		var chunk models.OpenAIStreamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			if strict && strings.TrimSpace(data) != "" {
+				streamReadErr = errOpenAIStreamMalformedChunk
+				return false
+			}
 			return true
 		}
 

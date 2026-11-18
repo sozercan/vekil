@@ -58,6 +58,14 @@ type responsesOverChatToolCall struct {
 	descriptor  policyResponsesToolDescriptor
 }
 
+// responsesOverChatFinishedItem pairs a completed output item with its output
+// index. The index orders the final output and is never part of the item, so
+// items emitted in output_item.done can be replayed verbatim as input.
+type responsesOverChatFinishedItem struct {
+	outputIndex int
+	item        map[string]any
+}
+
 type responsesOverChatMessage struct {
 	itemID      string
 	outputIndex int
@@ -85,7 +93,7 @@ type responsesOverChatStream struct {
 	sawRefusal   bool
 	calls        map[int]*responsesOverChatToolCall
 	callOrder    []int
-	finished     []map[string]any
+	finished     []responsesOverChatFinishedItem
 	finishReason string
 	usage        *models.OpenAIUsage
 	copilotUsage json.RawMessage
@@ -242,18 +250,9 @@ func (s *responsesOverChatStream) closeMessage(status string) error {
 		return err
 	}
 	item := map[string]any{"id": message.itemID, "type": "message", "status": status, "role": "assistant", "content": []any{part}}
-	s.finished = append(s.finished, withOutputIndex(item, message.outputIndex))
+	s.finished = append(s.finished, responsesOverChatFinishedItem{outputIndex: message.outputIndex, item: item})
 	return s.emit("response.output_item.done", map[string]any{"output_index": message.outputIndex, "item": item})
 }
-
-// withOutputIndex records the index for ordering final output; the private key
-// is stripped before serialization.
-func withOutputIndex(item map[string]any, index int) map[string]any {
-	item[responsesOverChatOutputIndexKey] = index
-	return item
-}
-
-const responsesOverChatOutputIndexKey = "\x00output_index"
 
 func (s *responsesOverChatStream) toolCallFor(delta models.OpenAIToolCall) (*responsesOverChatToolCall, error) {
 	index := -1
@@ -300,10 +299,6 @@ func (s *responsesOverChatStream) applyToolCallDelta(delta models.OpenAIToolCall
 	if err != nil {
 		return err
 	}
-	// A delta for another call means every earlier call's name is complete.
-	if err := s.promoteNamedToolCalls(call); err != nil {
-		return err
-	}
 	if id := strings.TrimSpace(delta.ID); id != "" {
 		if call.callID != "" && call.callID != id {
 			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream changed a tool-call ID mid-stream"}
@@ -338,26 +333,13 @@ func (s *responsesOverChatStream) applyToolCallDelta(delta models.OpenAIToolCall
 			call.pending.WriteString(fragment)
 		}
 	}
-	// Providers may fragment the name across deltas, so the call is validated
-	// and exposed only once its name is known to be complete: when its
-	// arguments start, another call or text begins, or the stream finishes.
+	// Providers may fragment the name across deltas, and activity on another
+	// call index or text says nothing about this call's name. The call is
+	// validated and exposed only once its own arguments start, or at a
+	// successful finish. Output indexes follow exposure order, so they stay
+	// monotonic even when a later Chat index is exposed first.
 	if !call.added && call.callID != "" && call.chatName != "" && call.pending.Len() > 0 {
 		return s.addToolCall(call)
-	}
-	return nil
-}
-
-// promoteNamedToolCalls exposes pending calls, other than except, whose
-// identity is known. It runs when later output proves their names are complete.
-func (s *responsesOverChatStream) promoteNamedToolCalls(except *responsesOverChatToolCall) error {
-	for _, index := range s.callOrder {
-		call := s.calls[index]
-		if call == except || call.added || call.callID == "" || call.chatName == "" {
-			continue
-		}
-		if err := s.addToolCall(call); err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -432,11 +414,8 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream sent output after its finish reason"}
 		}
 		if text != "" {
-			// Text ends any pending call's name. Text after a function call
-			// opens a new message item, so output indexes stay monotonic.
-			if err := s.promoteNamedToolCalls(nil); err != nil {
-				return err
-			}
+			// Text after a function call opens a new message item, so output
+			// indexes stay monotonic.
 			if err := s.appendText(text); err != nil {
 				return err
 			}
@@ -446,10 +425,8 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned a non-text refusal"}
 		}
 		if refusal != "" {
-			if err := s.promoteNamedToolCalls(nil); err != nil {
-				return err
-			}
-			if s.anyToolCallAdded() {
+			// Any started call, exposed or still pending, conflicts with a refusal.
+			if len(s.callOrder) > 0 {
 				return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned a refusal together with function calls"}
 			}
 			s.sawRefusal = true
@@ -468,15 +445,6 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 		}
 	}
 	return nil
-}
-
-func (s *responsesOverChatStream) anyToolCallAdded() bool {
-	for _, index := range s.callOrder {
-		if s.calls[index].added {
-			return true
-		}
-	}
-	return false
 }
 
 // finish validates the terminal Chat state and emits the terminal Responses
@@ -570,7 +538,7 @@ func (s *responsesOverChatStream) finish() (responsesOverChatResponse, *response
 				return fail(asResponsesOverChatFailure(err))
 			}
 			item := s.functionCallItem(call, "completed", arguments)
-			s.finished = append(s.finished, withOutputIndex(item, call.outputIndex))
+			s.finished = append(s.finished, responsesOverChatFinishedItem{outputIndex: call.outputIndex, item: item})
 			if err := s.emit("response.output_item.done", map[string]any{"output_index": call.outputIndex, "item": item}); err != nil {
 				return fail(asResponsesOverChatFailure(err))
 			}
@@ -578,18 +546,10 @@ func (s *responsesOverChatStream) finish() (responsesOverChatResponse, *response
 	}
 	// A truncated turn never exposes its partial function calls as output; Codex
 	// would otherwise dispatch incomplete JSON.
-	sort.SliceStable(s.finished, func(i, j int) bool {
-		return s.finished[i][responsesOverChatOutputIndexKey].(int) < s.finished[j][responsesOverChatOutputIndexKey].(int)
-	})
+	sort.SliceStable(s.finished, func(i, j int) bool { return s.finished[i].outputIndex < s.finished[j].outputIndex })
 	output := make([]map[string]any, 0, len(s.finished))
-	for _, item := range s.finished {
-		clean := make(map[string]any, len(item))
-		for key, value := range item {
-			if key != responsesOverChatOutputIndexKey {
-				clean[key] = value
-			}
-		}
-		output = append(output, clean)
+	for _, finished := range s.finished {
+		output = append(output, finished.item)
 	}
 	s.response.Output = output
 	final := s.snapshot(status)
@@ -656,8 +616,10 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 	}
 	if consumeErr == nil {
 		// A missing [DONE] after a finish reason is tolerated; a stream that ends
-		// before any finish reason fails in finish().
-		_, readErr := consumeOpenAIStreamChunks(lifecycleBody, func(chunk models.OpenAIStreamChunk) bool {
+		// before any finish reason fails in finish(). Malformed chunks fail the
+		// turn: skipping one could turn a corrupted argument delta into an
+		// executable call with different arguments.
+		_, readErr := consumeOpenAIStreamChunksStrict(lifecycleBody, func(chunk models.OpenAIStreamChunk) bool {
 			if aggregator != nil {
 				addChatStreamChunkForToolCapture(aggregator, chunk)
 			}
@@ -696,6 +658,8 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 		switch {
 		case errors.As(consumeErr, &streamErr):
 			failure = &responsesOverChatFailure{status: streamErr.httpStatus(), code: firstNonEmpty(streamErr.Code, "upstream_error"), message: streamErr.Error()}
+		case errors.Is(consumeErr, errOpenAIStreamMalformedChunk):
+			failure = &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: consumeErr.Error()}
 		default:
 			failure = asResponsesOverChatFailure(consumeErr)
 		}

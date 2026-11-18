@@ -1424,6 +1424,11 @@ func (h *ProxyHandler) executeChatCompletionsForRequestedModel(ctx context.Conte
 	if route, err = h.resolveReplayChatBackend(route, body, options.DegradeUnrestorableReplay); err != nil {
 		return chatExecutionResult{}, err
 	}
+	if options.RequireNativeChat && route.backend != chatBackendNativeChat {
+		requiredErr := nativeChatBackendRequiredError()
+		attachChatExecutionErrorRoute(requiredErr, route)
+		return chatExecutionResult{}, requiredErr
+	}
 
 	var result chatExecutionResult
 	if route.backend == chatBackendNativeChat {
@@ -1456,6 +1461,11 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 		return chatExecutionResult{}, err
 	}
 	if endpoint == providerEndpointResponses {
+		if options.RequireNativeChat {
+			requiredErr := nativeChatBackendRequiredError()
+			attachExplicitChatExecutionErrorRoute(requiredErr, operation.route, targetBinding{}, endpoint, chatBackendResponses)
+			return chatExecutionResult{}, requiredErr
+		}
 		return h.executeExplicitResponsesChat(ctx, operation.route, body, requestedModel, options)
 	}
 
