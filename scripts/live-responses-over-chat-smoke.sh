@@ -47,7 +47,11 @@ cleanup() {
 trap cleanup EXIT
 
 log "starting isolated proxy on ${BASE} (opt-in: ${MODEL})"
-"${PROXY_BIN}" --host 127.0.0.1 --port "${PORT}" --log-level warn \
+# The smoke's loopback requests carry no inbound credential, so an inherited
+# INBOUND_AUTH_TOKEN would make this private proxy answer 401 before any
+# adapter turn runs.
+env -u INBOUND_AUTH_TOKEN \
+  "${PROXY_BIN}" --host 127.0.0.1 --port "${PORT}" --log-level warn \
   --state-bindings-mode memory \
   --responses-over-chat-models "${MODEL}" >"${WORK_DIR}/proxy.log" 2>&1 &
 PROXY_PID=$!
