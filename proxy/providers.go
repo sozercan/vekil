@@ -946,7 +946,10 @@ func (h *ProxyHandler) validateDynamicExplicitRouteTargets(setup *providerSetup,
 			}
 		}
 	}
-	return nil
+	// Publish discovered routing hints through a new immutable route snapshot.
+	setup.modelsMu.Lock()
+	defer setup.modelsMu.Unlock()
+	return setup.routeRegistry().setCopilotResponsesPreferences(provider.id, available)
 }
 
 func (h *ProxyHandler) explicitRouteWithinDynamicValidationScope(setup *providerSetup, routeID string) bool {
@@ -3400,6 +3403,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			baseRaw := merged.raw
 			if merged.disabled != models[index].disabled && !merged.disabled {
 				baseRaw = raw
+				merged.preferResponses = false
 			}
 			// The image limit follows the published entry; when that entry declares none,
 			// a limit another entry for the same ID declares still applies.
@@ -3408,7 +3412,12 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			} else {
 				merged.maxPromptImages = max(merged.maxPromptImages, providerModelMaxPromptImagesFromRaw(raw))
 			}
-			merged.preferResponses = providerModelPrefersResponsesFromRaw(baseRaw)
+			// The published vendor wins; enabled duplicates can fill a missing vendor signal.
+			if providerModelVendorFromRaw(baseRaw) != "" {
+				merged.preferResponses = providerModelPrefersResponsesFromRaw(baseRaw)
+			} else if !disabled {
+				merged.preferResponses = merged.preferResponses || providerModelPrefersResponsesFromRaw(raw)
+			}
 			merged.raw = mergeProviderModelRaw(baseRaw, merged.supportedEndpoints)
 			models[index] = merged
 			continue
@@ -3478,18 +3487,22 @@ func providerModelMaxPromptImagesFromRaw(raw json.RawMessage) int {
 // (such as mai-code-2*) while serving them only on /responses, whereas Google/Anthropic/OpenAI
 // dual-endpoint or native-Chat entries retain Vekil's native /chat/completions preference.
 func providerModelPrefersResponsesFromRaw(raw json.RawMessage) bool {
-	var parsed struct {
-		Vendor string `json:"vendor"`
-	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(parsed.Vendor)) {
+	switch providerModelVendorFromRaw(raw) {
 	case "microsoft", "experimental":
 		return true
 	default:
 		return false
 	}
+}
+
+func providerModelVendorFromRaw(raw json.RawMessage) string {
+	var parsed struct {
+		Vendor string `json:"vendor"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(parsed.Vendor))
 }
 
 func openRouterModelSupportsTools(supportedParams []string) bool {

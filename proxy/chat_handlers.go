@@ -1036,11 +1036,22 @@ func explicitChatExecutionEndpoint(route *modelRoute, body []byte, degradeReplay
 	}
 	replay := chatRequestContainsResponsesReplayID(body)
 	hasResponses := explicitRouteHasChatBackend(route, providerEndpointResponses)
+	// One backend covers the ordered targets, including a Copilot failover target.
+	preferResponses := false
+	for _, target := range route.targets {
+		if target.provider != nil && target.provider.kind == providerTypeCopilot &&
+			target.preferResponses && target.provider.supportsEndpoint(providerEndpointResponses) {
+			preferResponses = true
+			break
+		}
+	}
 	switch {
 	case replay && hasResponses:
 		return providerEndpointResponses, false, nil
 	case replay && !degradeReplay:
 		return "", false, missingResponsesChatReplayError()
+	case hasResponses && preferResponses:
+		return providerEndpointResponses, false, nil
 	case explicitRouteHasChatBackend(route, providerEndpointChatCompletions):
 		return providerEndpointChatCompletions, replay, nil
 	case hasResponses:

@@ -24,6 +24,7 @@ type compiledPolicyProfile struct {
 	lightweight *modelRoute
 	powerful    *modelRoute
 	classifier  *modelRoute
+	routes      *modelRouteRegistry
 
 	baselineTier    policyTier
 	unavailableTier policyTier
@@ -71,10 +72,16 @@ func (p *compiledPolicyProfile) routeForTier(tier policyTier) *modelRoute {
 	if p == nil {
 		return nil
 	}
+	route := p.lightweight
 	if tier == policyTierPowerful {
-		return p.powerful
+		route = p.powerful
 	}
-	return p.lightweight
+	if route != nil && p.routes != nil {
+		if current, ok := p.routes.lookupTerminalRoute(route.public.routeID); ok {
+			return current
+		}
+	}
+	return route
 }
 
 func (p *compiledPolicyProfile) reasoningEffortForTier(tier policyTier) string {
@@ -174,6 +181,7 @@ func newChatPolicyRoutingController(h *ProxyHandler, cfg ProvidersConfig, global
 			return nil, configPathError(fmt.Sprintf("policy_profiles[%d].classifier", index), "%v", err)
 		}
 		profile := &compiledPolicyProfile{
+			routes:               setup.routeRegistry(),
 			config:               clonePolicyProfileConfig(profileCfg),
 			entry:                clonePublicModelEntry(entry),
 			lightweight:          lightweight,
@@ -498,7 +506,7 @@ func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profi
 		return nil
 	}
 	seen := make(map[string]struct{}, 2)
-	for _, route := range []*modelRoute{profile.lightweight, profile.powerful} {
+	for _, route := range []*modelRoute{profile.routeForTier(policyTierLightweight), profile.routeForTier(policyTierPowerful)} {
 		if route == nil {
 			continue
 		}
@@ -507,7 +515,11 @@ func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profi
 			continue
 		}
 		seen[routeID] = struct{}{}
-		if explicitRouteHasChatBackend(route, providerEndpointChatCompletions) || !explicitRouteHasChatBackend(route, providerEndpointResponses) {
+		endpoint, _, err := explicitChatExecutionEndpoint(route, nil, false)
+		if err != nil {
+			return err
+		}
+		if endpoint != providerEndpointResponses {
 			continue
 		}
 		// nil logger: a validation preflight re-translates, so its degrade is logged by the real pass.
@@ -902,13 +914,8 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 	if !ok || target.provider == nil {
 		return nil, fmt.Errorf("classifier route %q has no target", route.public.routeID)
 	}
-	endpoint := providerEndpointChatCompletions
-	if !route.supportsEndpoint(endpoint) && route.supportsEndpoint(providerEndpointResponses) {
-		endpoint = providerEndpointResponses
-	}
 	newClassifier := newPolicyHTTPClassifier
 	if target.provider.kind == providerTypeTypeSafeCompatible {
-		endpoint = providerEndpointSystemOne
 		newClassifier = newPolicyTypeSafeClassifier
 	}
 	options := policyHTTPClassifierOptions{
@@ -920,7 +927,21 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 	}
 	return newClassifier(options, func(ctx context.Context, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
 		ctx = withTaskInferenceKind(ctx, taskClassifier)
-		owner := providerModelFromRouteTarget(route, target)
+		// Deferred discovery can publish the vendor hint after this adapter is built.
+		dispatchRoute := route
+		if current, ok := h.providerSetup().lookupTerminalRoute(route.public.routeID); ok {
+			dispatchRoute = current
+		}
+		target, _ := dispatchRoute.primaryTarget()
+		endpoint := providerEndpointSystemOne
+		if target.provider.kind != providerTypeTypeSafeCompatible {
+			var err error
+			endpoint, _, err = explicitChatExecutionEndpoint(dispatchRoute, nil, false)
+			if err != nil {
+				return policyClassifierHTTPResponse{}, err
+			}
+		}
+		owner := providerModelFromRouteTarget(dispatchRoute, target)
 		prepared := body
 		var err error
 		if endpoint != providerEndpointSystemOne {
@@ -936,7 +957,7 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 
 		var response policyClassifierHTTPResponse
 		if endpoint == providerEndpointResponses {
-			response, err = h.sendPolicyClassifierOverResponses(ctx, route, target, owner, prepared, headers)
+			response, err = h.sendPolicyClassifierOverResponses(ctx, dispatchRoute, target, owner, prepared, headers)
 		} else {
 			response, err = h.sendPolicyClassifierJSON(ctx, target, owner, endpoint, prepared, headers)
 		}

@@ -40,6 +40,7 @@ type targetBinding struct {
 	upstreamModelJSON json.RawMessage
 	wirePolicy        providerRequestPolicy
 	legacyOwner       providerModel
+	preferResponses   bool
 }
 
 type routePolicy struct {
@@ -313,6 +314,49 @@ func (r *modelRouteRegistry) addLegacyProvider(provider *providerRuntime, models
 	}
 	next.legacyByProvider[provider.id] = compiled
 	next.legacyOrder = append(next.legacyOrder, compiled...)
+	if err := rebuildPublicModelEntrySnapshot(next); err != nil {
+		return err
+	}
+	r.snapshot.Store(next)
+	return nil
+}
+
+// setCopilotResponsesPreferences binds catalog hints without changing endpoint allowlists
+// or mutating routes already captured by an in-flight operation. The caller holds modelsMu.
+func (r *modelRouteRegistry) setCopilotResponsesPreferences(providerID string, models map[string]providerModel) error {
+	current := r.load()
+	if current == nil {
+		return fmt.Errorf("model route registry is not initialized")
+	}
+	next := cloneRouteRegistrySnapshot(current, 0)
+	changed := false
+	for index, route := range current.explicit {
+		if route == nil {
+			continue
+		}
+		updated := *route
+		updated.targets = append([]targetBinding(nil), route.targets...)
+		routeChanged := false
+		for i, target := range updated.targets {
+			if target.provider == nil || target.provider.kind != providerTypeCopilot || target.provider.id != providerID {
+				continue
+			}
+			model, ok := models[strings.TrimSpace(target.upstreamModel)]
+			prefer := ok && model.preferResponses && supportsEndpoint(model.supportedEndpoints, providerEndpointResponses)
+			if target.preferResponses != prefer {
+				updated.targets[i].preferResponses = prefer
+				routeChanged = true
+			}
+		}
+		if routeChanged {
+			next.explicit[index] = &updated
+			next.byRouteID[route.public.routeID] = &updated
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
 	if err := rebuildPublicModelEntrySnapshot(next); err != nil {
 		return err
 	}
@@ -604,6 +648,7 @@ func providerModelFromRouteTarget(route *modelRoute, target targetBinding) provi
 		dropSamplingParams:     route.public.policy.dropSamplingParams,
 		dropStopSequences:      route.public.policy.dropStopSequences,
 		useMaxCompletionTokens: target.wirePolicy.useMaxCompletionTokens,
+		preferResponses:        target.preferResponses,
 		raw:                    append(json.RawMessage(nil), route.public.raw...),
 	}
 	if target.provider != nil {
