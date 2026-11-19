@@ -286,10 +286,74 @@ func TestPolicyCopilotDualEndpointLocalReplayStaysOnResponses(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if err := h.WaitLifecycleWorkers(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			// A refreshed catalog can prefer native Chat for new work while this
+			// in-flight tool turn still requires the locally saved Responses items.
+			setup := h.providerSetup()
+			catalog, err := decodeProviderModelsFromBody(setup.providerByID("copilot"), []byte(`{"data":[
+				{"id":"gpt-5.6-luna","vendor":"OpenAI","supported_endpoints":["/chat/completions","/responses"]},
+				{"id":"gpt-5.6-sol","vendor":"OpenAI","supported_endpoints":["/chat/completions","/responses"]}
+			]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.replaceInstalledProviderModels(setup, map[string][]providerModel{"copilot": catalog}); err != nil {
+				t.Fatal(err)
+			}
+			for _, routeID := range []string{"luna-route", "sol-route"} {
+				route, _ := setup.lookupTerminalRoute(routeID)
+				if endpoint, _, err := explicitChatExecutionEndpoint(route, nil, false); err != nil || endpoint != providerEndpointChatCompletions {
+					t.Fatalf("new work on %s still prefers Responses: endpoint=%s err=%v", routeID, endpoint, err)
+				}
+			}
 			continuation := httptest.NewRecorder()
 			h.HandleOpenAIChatCompletions(continuation, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body))))
 			if continuation.Code != http.StatusOK || !strings.Contains(continuation.Body.String(), "tool result accepted") {
 				t.Fatalf("continuation status=%d body=%s", continuation.Code, continuation.Body.String())
+			}
+			bodies := upstream.responsesBodies()
+			if len(bodies) < 2 {
+				t.Fatalf("missing Responses continuation: %v", bodies)
+			}
+			type replayRequest struct {
+				Input []struct {
+					Type   string `json:"type"`
+					CallID string `json:"call_id"`
+				} `json:"input"`
+			}
+			var restored replayRequest
+			var replayBody string
+			// Observe-mode classifier traffic can arrive asynchronously.
+			for _, body := range bodies {
+				var request replayRequest
+				if err := json.Unmarshal([]byte(body), &request); err != nil {
+					t.Fatal(err)
+				}
+				for _, item := range request.Input {
+					if item.Type == "function_call_output" {
+						restored, replayBody = request, body
+						break
+					}
+				}
+			}
+			if strings.Contains(replayBody, assistant.ToolCalls[0].ID) {
+				t.Fatalf("proxy replay ID reached upstream: %s", replayBody)
+			}
+			var restoredCall, restoredResult bool
+			for _, item := range restored.Input {
+				switch item.Type {
+				case "function_call", "function_call_output":
+					if item.CallID != "call-lookup" {
+						t.Fatalf("upstream call ID was not restored: %s", replayBody)
+					}
+					restoredCall = restoredCall || item.Type == "function_call"
+					restoredResult = restoredResult || item.Type == "function_call_output"
+				}
+			}
+			if !restoredCall || !restoredResult {
+				t.Fatalf("saved tool items were not replayed: %s", replayBody)
 			}
 			_, _, terminals, paths := upstream.snapshot()
 			if len(terminals) != 2 {
