@@ -164,6 +164,8 @@ func TestChooseChatRoute_CopilotDuplicateCatalogEntriesPreferResponses(t *testin
 			advertised := json.RawMessage(`{"id":"mai-code-2","vendor":"` + vendor + `","supported_endpoints":["/chat/completions","/responses"]}`)
 			disabled := json.RawMessage(`{"id":"mai-code-2","vendor":"` + vendor + `","supported_endpoints":["/chat/completions","/responses"],"policy":{"state":"disabled"}}`)
 			google := json.RawMessage(`{"id":"mai-code-2","vendor":"Google"}`)
+			enabledChat := json.RawMessage(`{"id":"mai-code-2","vendor":"` + vendor + `","supported_endpoints":["/chat/completions"]}`)
+			disabledResponses := json.RawMessage(`{"id":"mai-code-2","supported_endpoints":["/responses"],"policy":{"state":"disabled"}}`)
 			for _, tc := range []struct {
 				name        string
 				data        []json.RawMessage
@@ -176,6 +178,8 @@ func TestChooseChatRoute_CopilotDuplicateCatalogEntriesPreferResponses(t *testin
 				{name: "disabled duplicate cannot fill missing vendor", data: []json.RawMessage{omitted, disabled}, wantBackend: chatBackendNativeChat},
 				{name: "enabled entry replaces disabled preference", data: []json.RawMessage{disabled, omitted}, wantBackend: chatBackendNativeChat},
 				{name: "enabled entry replaces disabled vendor", data: []json.RawMessage{disabled, google}, wantBackend: chatBackendNativeChat},
+				{name: "disabled Responses endpoint last", data: []json.RawMessage{enabledChat, disabledResponses}, wantBackend: chatBackendNativeChat},
+				{name: "disabled Responses endpoint first", data: []json.RawMessage{disabledResponses, enabledChat}, wantBackend: chatBackendNativeChat},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					body, err := json.Marshal(map[string]any{"data": tc.data})

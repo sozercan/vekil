@@ -160,7 +160,7 @@ func newCopilotResponsesPolicyUpstreamWithVendor(t *testing.T, signals policyCla
 			if hasToolOutput {
 				text = "tool result accepted"
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			response := map[string]any{
 				"id":         "resp-terminal",
 				"object":     "response",
 				"created_at": int64(2),
@@ -170,7 +170,25 @@ func newCopilotResponsesPolicyUpstreamWithVendor(t *testing.T, signals policyCla
 					"content": []any{map[string]any{"type": "output_text", "text": text}},
 				}},
 				"usage": map[string]any{"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
-			})
+			}
+			if request.Stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				write := func(event string, payload map[string]any) {
+					payload["type"] = event
+					data, _ := json.Marshal(payload)
+					_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+				}
+				write("response.created", map[string]any{"response": map[string]any{"id": "resp-terminal", "created_at": 2, "status": "in_progress", "output": []any{}}})
+				write("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "message", "id": "msg-terminal", "status": "in_progress", "role": "assistant", "content": []any{}}})
+				write("response.content_part.added", map[string]any{"output_index": 0, "content_index": 0, "item_id": "msg-terminal", "part": map[string]any{"type": "output_text", "text": ""}})
+				write("response.output_text.delta", map[string]any{"output_index": 0, "content_index": 0, "item_id": "msg-terminal", "delta": text})
+				write("response.output_text.done", map[string]any{"output_index": 0, "content_index": 0, "item_id": "msg-terminal", "text": text})
+				write("response.content_part.done", map[string]any{"output_index": 0, "content_index": 0, "item_id": "msg-terminal", "part": map[string]any{"type": "output_text", "text": text}})
+				write("response.output_item.done", map[string]any{"output_index": 0, "item": response["output"].([]any)[0]})
+				write("response.completed", map[string]any{"response": response})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(response)
 		default:
 			http.NotFound(w, r)
 		}
@@ -512,9 +530,25 @@ func TestChatRouteExplicitCopilotVendorPreferenceHonorsAllowlist(t *testing.T) {
 			secondaryOnly.targets = append([]targetBinding(nil), route.targets[0], route.targets[0])
 			secondaryOnly.targets[0].preferResponses = false
 			secondaryOnly.targets[1].id = "secondary"
+			secondaryOnly.policy = routePolicy{mode: routeModePriorityFailover, maxTargetAttempts: 2, maxUpstreamSends: 2}
 			endpoint, _, err = explicitChatExecutionEndpoint(&secondaryOnly, nil, false)
 			if err != nil || endpoint != tc.want {
 				t.Fatalf("secondary preference: endpoint=%q err=%v, want %q", endpoint, err, tc.want)
+			}
+			for _, policy := range []routePolicy{
+				{mode: routeModePrimaryOnly, maxTargetAttempts: 2, maxUpstreamSends: 2},
+				{mode: routeModePriorityFailover, maxTargetAttempts: 1, maxUpstreamSends: 2},
+				{mode: routeModePriorityFailover, maxTargetAttempts: 2, maxUpstreamSends: 1},
+			} {
+				secondaryOnly.policy = policy
+				endpoint, _, err = explicitChatExecutionEndpoint(&secondaryOnly, nil, false)
+				want := providerEndpointChatCompletions
+				if !secondaryOnly.supportsEndpoint(want) {
+					want = providerEndpointResponses
+				}
+				if err != nil || endpoint != want {
+					t.Fatalf("unreachable backup: policy=%+v endpoint=%q err=%v, want %q", policy, endpoint, err, want)
+				}
 			}
 			if tc.want == providerEndpointResponses {
 				rec := httptest.NewRecorder()

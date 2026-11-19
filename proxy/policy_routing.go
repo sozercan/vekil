@@ -427,9 +427,10 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		replayRoute, replayTier, replayErr = c.resolvePolicyResponsesReplayRoute(profile, input.OriginalBody, input.CarriedReasoning)
 		if replayErr != nil {
 			baselineRoute := profile.routeForTier(profile.baselineTier)
+			baselineEndpoint, _, _ := explicitChatExecutionEndpoint(baselineRoute, nil, false)
 			downstreamReplayPassthrough = (mode == policyModeOff || mode == policyModeObserve) &&
 				baselineRoute != nil && len(baselineRoute.targets) == 1 &&
-				explicitRouteHasChatBackend(baselineRoute, providerEndpointChatCompletions) &&
+				baselineEndpoint == providerEndpointChatCompletions &&
 				(isMissingResponsesChatReplayError(replayErr) || !explicitRouteHasChatBackend(baselineRoute, providerEndpointResponses))
 			if !downstreamReplayPassthrough {
 				return chatOperationPlan{}, replayErr
@@ -474,11 +475,11 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	}
 	if mode == policyModeOff {
 		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, ActualTier: profile.baselineTier.String()})
-		return c.sealPlan(profile, input, facts, profile.baselineTier, policyDecisionRecord{Category: "baseline", ActualTier: profile.baselineTier}), nil
+		return c.sealPlan(profile, input, facts, profile.baselineTier, policyDecisionRecord{Category: "baseline", ActualTier: profile.baselineTier, DownstreamReplayPassthrough: downstreamReplayPassthrough}), nil
 	}
 	if mode == policyModeObserve {
 		c.launchObservation(ctx, profile, input, facts, bucket)
-		return c.sealPlan(profile, input, facts, profile.baselineTier, policyDecisionRecord{Category: "observe_baseline", ActualTier: profile.baselineTier}), nil
+		return c.sealPlan(profile, input, facts, profile.baselineTier, policyDecisionRecord{Category: "observe_baseline", ActualTier: profile.baselineTier, DownstreamReplayPassthrough: downstreamReplayPassthrough}), nil
 	}
 	return c.enforce(ctx, profile, input, facts, bucket)
 }
@@ -492,7 +493,7 @@ func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profi
 		carried = routeSelectingCarriers(carried)
 		for index, route := range []*modelRoute{profile.lightweight, profile.powerful} {
 			replayRoute := completedReplayRoutes[index]
-			if _, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+			if _, err := translateChatRequestToResponses(applyProviderModelRequestPolicy(body, providerEndpointChatCompletions, providerModel{dropStopSequences: route.public.policy.dropStopSequences}), responsesChatRequestOptions{
 				UpstreamModel:               replayRoute.UpstreamModel,
 				CarriedReasoning:            carried,
 				ReplayStore:                 c.h.responsesChatReplayStore(),
@@ -556,7 +557,7 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 			if upstreamModel == "" {
 				upstreamModel = profile.entry.id
 			}
-			_, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
+			_, err := translateChatRequestToResponses(applyProviderModelRequestPolicy(body, providerEndpointChatCompletions, providerModel{dropStopSequences: candidate.route.public.policy.dropStopSequences}), responsesChatRequestOptions{
 				UpstreamModel:    upstreamModel,
 				CarriedReasoning: carried,
 				ReplayStore:      c.h.responsesChatReplayStore(),

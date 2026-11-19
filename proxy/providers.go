@@ -179,20 +179,21 @@ type providerEndpointPaths struct {
 }
 
 type providerModel struct {
-	publicID               string
-	upstreamModel          string
-	upstreamModelJSON      json.RawMessage
-	providerID             string
-	supportedEndpoints     []string
-	parallelToolCalls      *bool
-	dropSamplingParams     bool
-	dropStopSequences      bool
-	useMaxCompletionTokens bool
-	maxPromptImages        int
-	preferResponses        bool
-	disabled               bool
-	endpointsAdvertised    bool
-	raw                    json.RawMessage
+	publicID                   string
+	upstreamModel              string
+	upstreamModelJSON          json.RawMessage
+	providerID                 string
+	supportedEndpoints         []string
+	parallelToolCalls          *bool
+	dropSamplingParams         bool
+	dropStopSequences          bool
+	useMaxCompletionTokens     bool
+	maxPromptImages            int
+	preferResponses            bool
+	enabledResponsesAdvertised bool
+	disabled                   bool
+	endpointsAdvertised        bool
+	raw                        json.RawMessage
 }
 
 type providerSetup struct {
@@ -605,7 +606,8 @@ func (ps *providerSetup) addProviderModels(providerID string, models []providerM
 	}
 
 	provider := ps.providerByID(providerID)
-	models = filterHiddenProviderModels(provider, filterProviderModels(provider, models))
+	catalog := filterProviderModels(provider, models)
+	models = filterHiddenProviderModels(provider, catalog)
 
 	ps.modelsMu.Lock()
 	defer ps.modelsMu.Unlock()
@@ -624,7 +626,7 @@ func (ps *providerSetup) addProviderModels(providerID string, models []providerM
 			return err
 		}
 	}
-	if err := ps.routes.addLegacyProvider(provider, models); err != nil {
+	if err := ps.routes.addLegacyProvider(provider, catalog); err != nil {
 		return err
 	}
 	ps.models = next
@@ -643,6 +645,10 @@ func (ps *providerSetup) replaceProviderModels(providerID string, models []provi
 }
 
 func (ps *providerSetup) replaceProviderModelsBatch(replacements map[string][]providerModel) error {
+	return ps.replaceProviderModelsAndCatalogs(replacements, replacements)
+}
+
+func (ps *providerSetup) replaceProviderModelsAndCatalogs(replacements, catalogs map[string][]providerModel) error {
 	if ps == nil || len(replacements) == 0 {
 		return nil
 	}
@@ -724,7 +730,7 @@ func (ps *providerSetup) replaceProviderModelsBatch(replacements map[string][]pr
 		}
 		ps.routes = routes
 	}
-	if err := ps.routes.replaceLegacyProviders(ps.providers, ps.providerOrder, filtered); err != nil {
+	if err := ps.routes.replaceLegacyProviders(ps.providers, ps.providerOrder, filtered, catalogs); err != nil {
 		return err
 	}
 	ps.models = next
@@ -858,7 +864,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 	}
 	// Auxiliary models join only after every catalog is registered, so a
 	// later provider's reservation makes them fall back instead of failing.
-	if len(h.auxiliaryModels) > 0 && len(catalogs) > 0 {
+	if len(catalogs) > 0 {
 		if err := h.replaceInstalledProviderModels(setup, catalogs); err != nil {
 			return nil, err
 		}
@@ -946,10 +952,7 @@ func (h *ProxyHandler) validateDynamicExplicitRouteTargets(setup *providerSetup,
 			}
 		}
 	}
-	// Publish discovered routing hints through a new immutable route snapshot.
-	setup.modelsMu.Lock()
-	defer setup.modelsMu.Unlock()
-	return setup.routeRegistry().setCopilotResponsesPreferences(provider.id, available)
+	return nil
 }
 
 func (h *ProxyHandler) explicitRouteWithinDynamicValidationScope(setup *providerSetup, routeID string) bool {
@@ -1153,7 +1156,7 @@ func (h *ProxyHandler) replaceInstalledProviderModels(setup *providerSetup, cata
 	for providerID, models := range catalogs {
 		withAuxiliary[providerID] = h.installedProviderModels(setup, providerID, models)
 	}
-	err := setup.replaceProviderModelsBatch(withAuxiliary)
+	err := setup.replaceProviderModelsAndCatalogs(withAuxiliary, catalogs)
 	if err == nil || len(h.auxiliaryModels) == 0 {
 		return err
 	}
@@ -1161,7 +1164,7 @@ func (h *ProxyHandler) replaceInstalledProviderModels(setup *providerSetup, cata
 	for providerID, models := range catalogs {
 		allowedOnly[providerID] = h.filterAllowedModels(models)
 	}
-	return setup.replaceProviderModelsBatch(allowedOnly)
+	return setup.replaceProviderModelsAndCatalogs(allowedOnly, catalogs)
 }
 
 // allowedRouteTargetsProvider reports whether an allowed explicit route or
@@ -3388,8 +3391,10 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			supportedEndpoints = provider.defaultDynamicModelEndpoints()
 		}
 		disabled := strings.EqualFold(parsed.Policy.State, "disabled")
+		enabledResponses := !disabled && endpointsAdvertised && supportsEndpoint(supportedEndpoints, providerEndpointResponses)
 		if index, duplicate := indexByID[publicID]; duplicate {
 			merged := models[index]
+			merged.enabledResponsesAdvertised = merged.enabledResponsesAdvertised || enabledResponses
 			switch {
 			case merged.endpointsAdvertised && !endpointsAdvertised:
 				// Keep the explicitly advertised endpoint set.
@@ -3425,19 +3430,23 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 
 		indexByID[publicID] = len(models)
 		models = append(models, providerModel{
-			publicID:            publicID,
-			upstreamModel:       publicID,
-			providerID:          provider.id,
-			supportedEndpoints:  supportedEndpoints,
-			parallelToolCalls:   providerModelParallelToolCallsFromRaw(raw),
-			maxPromptImages:     providerModelMaxPromptImagesFromRaw(raw),
-			preferResponses:     providerModelPrefersResponsesFromRaw(raw),
-			disabled:            disabled,
-			endpointsAdvertised: endpointsAdvertised,
-			raw:                 mergeProviderModelRaw(raw, supportedEndpoints),
+			publicID:                   publicID,
+			upstreamModel:              publicID,
+			providerID:                 provider.id,
+			supportedEndpoints:         supportedEndpoints,
+			parallelToolCalls:          providerModelParallelToolCallsFromRaw(raw),
+			maxPromptImages:            providerModelMaxPromptImagesFromRaw(raw),
+			preferResponses:            providerModelPrefersResponsesFromRaw(raw),
+			enabledResponsesAdvertised: enabledResponses,
+			disabled:                   disabled,
+			endpointsAdvertised:        endpointsAdvertised,
+			raw:                        mergeProviderModelRaw(raw, supportedEndpoints),
 		})
 	}
 
+	for i := range models {
+		models[i].preferResponses = models[i].preferResponses && models[i].enabledResponsesAdvertised
+	}
 	return models, nil
 }
 
