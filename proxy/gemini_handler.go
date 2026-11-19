@@ -897,6 +897,16 @@ func (h *ProxyHandler) writeGeminiUpstreamFailure(w http.ResponseWriter, err err
 }
 
 func mapGeminiTransportError(err error) error {
+	var executionErr *chatExecutionError
+	if errors.As(err, &executionErr) {
+		statusCode := chatStreamErrorStatus(executionErr)
+		return &geminiProtocolError{
+			statusCode: statusCode,
+			status:     mapGeminiUpstreamStatus(statusCode),
+			message:    chatStreamErrorMessage(executionErr),
+			cause:      err,
+		}
+	}
 	var upstreamErr *upstreamError
 	if errors.As(err, &upstreamErr) {
 		return &geminiProtocolError{

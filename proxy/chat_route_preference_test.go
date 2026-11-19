@@ -40,7 +40,7 @@ func TestChatRouteCopilotCanonicalRefreshPreservesAdmittedSnapshot(t *testing.T)
 	}))
 	t.Cleanup(front.Close)
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
-		WithCopilotBaseURL(front.URL), WithProvidersConfig(copilotPreferencePublicConfig()), WithAllowedModels("public-mai"))
+		WithCopilotBaseURL(front.URL), WithProvidersConfig(copilotPreferencePublicConfig()), WithAllowedModels("public-mai", "public-mai-20251119"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +49,11 @@ func TestChatRouteCopilotCanonicalRefreshPreservesAdmittedSnapshot(t *testing.T)
 	ctx, admitted, before, err := h.withAdmittedExplicitRouteOperation(t.Context(), t.Context(), "public-mai", providerEndpointChatCompletions)
 	if err != nil || admitted == nil || before.targets[0].preferResponses {
 		t.Fatalf("initial admission: operation=%v err=%v", admitted, err)
+	}
+	const alias = "public-mai-20251119"
+	aliasCtx, _, _, err := h.withAdmittedExplicitRouteOperation(t.Context(), t.Context(), alias, providerEndpointResponses)
+	if err != nil {
+		t.Fatal(err)
 	}
 	vendor.Store("Experimental")
 	rec := httptest.NewRecorder()
@@ -59,6 +64,15 @@ func TestChatRouteCopilotCanonicalRefreshPreservesAdmittedSnapshot(t *testing.T)
 	after, _ := h.providerSetup().lookupTerminalRoute("mai-route")
 	if after == before || !after.targets[0].preferResponses || before.targets[0].preferResponses {
 		t.Fatal("canonical refresh did not publish an independent preference snapshot")
+	}
+	aliasBody := []byte(fmt.Sprintf(`{"model":%q,"input":[{"role":"user","content":"ping"}],"store":false}`, alias))
+	aliasResponse, err := h.postResponsesWithHeadersForModel(aliasCtx, aliasBody, nil, alias)
+	if err != nil {
+		t.Fatalf("admitted alias rejected after refresh: %v", err)
+	}
+	_ = aliasResponse.Body.Close()
+	if aliasResponse.StatusCode != http.StatusOK {
+		t.Fatalf("admitted alias status=%d", aliasResponse.StatusCode)
 	}
 	ctx, reused, captured, err := h.withChatExecutionRoute(ctx, ctx, "public-mai", body, false)
 	if err != nil || reused != admitted || captured != before {
@@ -287,5 +301,135 @@ func TestPolicyCopilotDualEndpointLocalReplayStaysOnResponses(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestChatRouteGeminiReplayErrorsPreserveClientStatus(t *testing.T) {
+	for _, action := range []string{"generateContent", "streamGenerateContent", "countTokens"} {
+		t.Run(action, func(t *testing.T) {
+			upstream := newCopilotResponsesPolicyUpstreamWithVendor(t, policyClassifierSignals{}, "Experimental")
+			cfg := copilotPreferencePublicConfig()
+			cfg.ModelRoutes[0].Endpoints = []string{providerEndpointChatCompletions}
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
+				WithCopilotBaseURL(upstream.server.URL), WithProvidersConfig(cfg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			callID := responsesChatReplayCallIDPrefix + strings.Repeat("A", 22)
+			body := fmt.Sprintf(`{"contents":[
+				{"role":"model","parts":[{"functionCall":{"id":%q,"name":"lookup","args":{}}}]},
+				{"role":"user","parts":[{"functionResponse":{"id":%q,"name":"lookup","response":{"ok":true}}}]}
+			]}`, callID, callID)
+			rec := httptest.NewRecorder()
+			h.HandleGeminiModels(rec, httptest.NewRequest(http.MethodPost, "/v1beta/models/public-mai:"+action, strings.NewReader(body)))
+			var response struct {
+				Error struct {
+					Code    int    `json:"code"`
+					Status  string `json:"status"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if rec.Code != http.StatusBadRequest || response.Error.Code != http.StatusBadRequest ||
+				response.Error.Status != "INVALID_ARGUMENT" || response.Error.Message != missingResponsesChatReplayError().Message {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if rec.Header().Get("X-Vekil-Request-ID") == "" {
+				t.Fatal("client rejection lost its admitted operation ID")
+			}
+			_, _, terminals, paths := upstream.snapshot()
+			if len(terminals) != 0 {
+				t.Fatalf("client rejection dispatched upstream: %v", paths)
+			}
+			for _, path := range paths {
+				if path != providerEndpointModels {
+					t.Fatalf("client rejection dispatched upstream: %v", paths)
+				}
+			}
+		})
+	}
+}
+
+func TestPolicyCopilotRefreshDuringClassificationKeepsValidatedRoutes(t *testing.T) {
+	upstream := newCopilotResponsesPolicyUpstreamWithVendor(t, policyClassifierSignals{
+		TurnType: policyTurnTypeLookup, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow,
+	}, "Experimental")
+	var vendor atomic.Value
+	vendor.Store("OpenAI")
+	var refreshOnClassifier atomic.Bool
+	var nativeCalls atomic.Int32
+	var h *ProxyHandler
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case providerEndpointModels:
+			_, _ = fmt.Fprintf(w, `{"data":[
+				{"id":"gpt-5.6-luna","vendor":%q,"supported_endpoints":["/chat/completions","/responses"]},
+				{"id":"gpt-5.6-sol","vendor":%q,"supported_endpoints":["/chat/completions","/responses"]}
+			]}`, vendor.Load().(string), vendor.Load().(string))
+		case providerEndpointChatCompletions:
+			nativeCalls.Add(1)
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			if _, present := body["stop"]; !present {
+				t.Error("admitted native Chat request lost its stop field")
+			}
+			_, _ = w.Write([]byte(`{"id":"old","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"old snapshot"},"finish_reason":"stop"}]}`))
+		case providerEndpointResponses:
+			if refreshOnClassifier.CompareAndSwap(true, false) {
+				vendor.Store("Experimental")
+				if err := h.ValidateDynamicProviderModels(r.Context()); err != nil {
+					t.Error(err)
+					http.Error(w, "catalog refresh failed", http.StatusInternalServerError)
+					return
+				}
+			}
+			upstream.server.Config.Handler.ServeHTTP(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(front.Close)
+	cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+	for i := 0; i < 2; i++ {
+		cfg.ModelRoutes[i].Endpoints = []string{providerEndpointChatCompletions, providerEndpointResponses}
+	}
+	cfg.PolicyProfiles[0].Classifier.TimeoutMS = 5000
+	var err error
+	h, err = NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
+		WithCopilotBaseURL(front.URL), WithProvidersConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	if err := h.InitializePolicyRouting(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"gpt-5.6-semantic","messages":[{"role":"user","content":"Inspect one function."}],"stop":["done"]}`
+	refreshOnClassifier.Store(true)
+	rec := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "old snapshot") || nativeCalls.Load() != 1 {
+		t.Fatalf("admitted policy request changed backend: status=%d native=%d body=%s", rec.Code, nativeCalls.Load(), rec.Body.String())
+	}
+	_, classified, _, _ := upstream.snapshot()
+	if classified != 2 {
+		t.Fatalf("classifier sends=%d, want preflight plus one classification", classified)
+	}
+	for _, routeID := range []string{"luna-route", "sol-route"} {
+		route, _ := h.providerSetup().lookupTerminalRoute(routeID)
+		if route == nil || !route.targets[0].preferResponses {
+			t.Fatalf("refresh did not update %s", routeID)
+		}
+	}
+	fresh := httptest.NewRecorder()
+	h.HandleOpenAIChatCompletions(fresh, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	_, classifiedAfter, _, _ := upstream.snapshot()
+	if fresh.Code != http.StatusBadRequest || classifiedAfter != classified || nativeCalls.Load() != 1 {
+		t.Fatalf("new Responses request bypassed preflight: status=%d classifiers=%d body=%s", fresh.Code, classifiedAfter, fresh.Body.String())
 	}
 }

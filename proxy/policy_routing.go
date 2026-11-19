@@ -68,20 +68,47 @@ func (p *compiledPolicyProfile) setEffectiveMode(mode policyMode) {
 	}
 }
 
-func (p *compiledPolicyProfile) routeForTier(tier policyTier) *modelRoute {
+// policyTierRoutes is captured from one registry publication before request
+// validation. Classification and plan sealing retain these same immutable routes.
+type policyTierRoutes struct {
+	lightweight *modelRoute
+	powerful    *modelRoute
+}
+
+func (p *compiledPolicyProfile) captureTierRoutes() policyTierRoutes {
 	if p == nil {
-		return nil
+		return policyTierRoutes{}
 	}
-	route := p.lightweight
-	if tier == policyTierPowerful {
-		route = p.powerful
+	routes := policyTierRoutes{lightweight: p.lightweight, powerful: p.powerful}
+	if p.routes == nil {
+		return routes
 	}
-	if route != nil && p.routes != nil {
-		if current, ok := p.routes.lookupTerminalRoute(route.public.routeID); ok {
-			return current
+	snapshot := p.routes.load()
+	if snapshot == nil {
+		return routes
+	}
+	current := func(route *modelRoute) *modelRoute {
+		if route != nil {
+			if updated := snapshot.byRouteID[route.public.routeID]; updated != nil {
+				return updated
+			}
 		}
+		return route
 	}
-	return route
+	routes.lightweight = current(routes.lightweight)
+	routes.powerful = current(routes.powerful)
+	return routes
+}
+
+func (r policyTierRoutes) forTier(tier policyTier) *modelRoute {
+	if tier == policyTierPowerful {
+		return r.powerful
+	}
+	return r.lightweight
+}
+
+func (p *compiledPolicyProfile) routeForTier(tier policyTier) *modelRoute {
+	return p.captureTierRoutes().forTier(tier)
 }
 
 func (p *compiledPolicyProfile) reasoningEffortForTier(tier policyTier) string {
@@ -418,15 +445,16 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		}
 		return chatOperationPlan{}, &providerRequestError{statusCode: http.StatusServiceUnavailable, err: fmt.Errorf("%s for policy model %q", message, entry.id)}
 	}
+	routes := profile.captureTierRoutes()
 	var replayRoute *modelRoute
 	var replayTier policyTier
 	downstreamReplayPassthrough := false
 	containsReplay := chatRequestContainsResponsesReplayID(input.OriginalBody)
 	if containsReplay {
 		var replayErr error
-		replayRoute, replayTier, replayErr = c.resolvePolicyResponsesReplayRoute(profile, input.OriginalBody, input.CarriedReasoning)
+		replayRoute, replayTier, replayErr = c.resolvePolicyResponsesReplayRoute(profile, routes, input.OriginalBody, input.CarriedReasoning)
 		if replayErr != nil {
-			baselineRoute := profile.routeForTier(profile.baselineTier)
+			baselineRoute := routes.forTier(profile.baselineTier)
 			baselineEndpoint, _, _ := explicitChatExecutionEndpoint(baselineRoute, nil, false)
 			downstreamReplayPassthrough = (mode == policyModeOff || mode == policyModeObserve) &&
 				baselineRoute != nil && len(baselineRoute.targets) == 1 &&
@@ -436,7 +464,7 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 				return chatOperationPlan{}, replayErr
 			}
 		}
-		if replayRoute != nil && len(policyCompletedReplayRoutes(profile)) > 0 && !chatRequestHasActiveResponsesPolicyReplay(input.OriginalBody) {
+		if replayRoute != nil && len(policyCompletedReplayRoutes(profile, routes)) > 0 && !chatRequestHasActiveResponsesPolicyReplay(input.OriginalBody) {
 			// The replay remains validated history. A new user task chooses its own
 			// effort once every earlier tool call and assistant turn has finished.
 			replayRoute = nil
@@ -444,7 +472,7 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 		}
 	}
 	if replayRoute == nil && !downstreamReplayPassthrough {
-		if err := c.validateResponsesBackedPolicyRequest(profile, input.OriginalBody, input.CarriedReasoning); err != nil {
+		if err := c.validateResponsesBackedPolicyRequest(profile, routes, input.OriginalBody, input.CarriedReasoning); err != nil {
 			if containsReplay {
 				return chatOperationPlan{}, err
 			}
@@ -471,27 +499,27 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 	bucket := policyTrafficBucket(len(input.OriginalBody), facts.Counts.FunctionTools)
 	if replayRoute != nil {
 		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, ActualTier: replayTier.String()})
-		return c.sealRoutePlan(profile, input, facts, replayRoute, replayTier, policyDecisionRecord{Category: "replay_binding", ActualTier: replayTier}), nil
+		return c.sealRoutePlan(profile, routes, input, facts, replayRoute, replayTier, policyDecisionRecord{Category: "replay_binding", ActualTier: replayTier}), nil
 	}
 	if mode == policyModeOff {
 		c.stats.record(policyStatsObservation{Profile: profile.statsID(), TrafficBucket: bucket, Eligible: true, ActualTier: profile.baselineTier.String()})
-		return c.sealPlan(profile, input, facts, profile.baselineTier, policyDecisionRecord{Category: "baseline", ActualTier: profile.baselineTier, DownstreamReplayPassthrough: downstreamReplayPassthrough}), nil
+		return c.sealPlan(profile, routes, input, facts, profile.baselineTier, policyDecisionRecord{Category: "baseline", ActualTier: profile.baselineTier, DownstreamReplayPassthrough: downstreamReplayPassthrough}), nil
 	}
 	if mode == policyModeObserve {
 		c.launchObservation(ctx, profile, input, facts, bucket)
-		return c.sealPlan(profile, input, facts, profile.baselineTier, policyDecisionRecord{Category: "observe_baseline", ActualTier: profile.baselineTier, DownstreamReplayPassthrough: downstreamReplayPassthrough}), nil
+		return c.sealPlan(profile, routes, input, facts, profile.baselineTier, policyDecisionRecord{Category: "observe_baseline", ActualTier: profile.baselineTier, DownstreamReplayPassthrough: downstreamReplayPassthrough}), nil
 	}
-	return c.enforce(ctx, profile, input, facts, bucket)
+	return c.enforce(ctx, profile, routes, input, facts, bucket)
 }
 
-func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profile *compiledPolicyProfile, body []byte, carried map[string]carriedReplay) error {
+func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profile *compiledPolicyProfile, routes policyTierRoutes, body []byte, carried map[string]carriedReplay) error {
 	if c == nil || c.h == nil || profile == nil {
 		return nil
 	}
-	completedReplayRoutes := policyCompletedReplayRoutes(profile)
+	completedReplayRoutes := policyCompletedReplayRoutes(profile, routes)
 	if len(completedReplayRoutes) > 0 && chatRequestContainsResponsesReplayID(body) {
 		carried = routeSelectingCarriers(carried)
-		for index, route := range []*modelRoute{profile.lightweight, profile.powerful} {
+		for index, route := range []*modelRoute{routes.lightweight, routes.powerful} {
 			replayRoute := completedReplayRoutes[index]
 			if _, err := translateChatRequestToResponses(applyProviderModelRequestPolicy(body, providerEndpointChatCompletions, providerModel{dropStopSequences: route.public.policy.dropStopSequences}), responsesChatRequestOptions{
 				UpstreamModel:               replayRoute.UpstreamModel,
@@ -507,7 +535,7 @@ func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profi
 		return nil
 	}
 	seen := make(map[string]struct{}, 2)
-	for _, route := range []*modelRoute{profile.routeForTier(policyTierLightweight), profile.routeForTier(policyTierPowerful)} {
+	for _, route := range []*modelRoute{routes.forTier(policyTierLightweight), routes.forTier(policyTierPowerful)} {
 		if route == nil {
 			continue
 		}
@@ -531,7 +559,7 @@ func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profi
 	return nil
 }
 
-func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile *compiledPolicyProfile, body []byte, carried map[string]carriedReplay) (*modelRoute, policyTier, error) {
+func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile *compiledPolicyProfile, routes policyTierRoutes, body []byte, carried map[string]carriedReplay) (*modelRoute, policyTier, error) {
 	if c == nil || c.h == nil || profile == nil {
 		return nil, policyTierUnknown, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("policy model does not support Responses replay continuations")}
 	}
@@ -540,8 +568,8 @@ func (c *chatPolicyRoutingController) resolvePolicyResponsesReplayRoute(profile 
 		tier  policyTier
 	}
 	carried = routeSelectingCarriers(carried)
-	completedReplayRoutes := policyCompletedReplayRoutes(profile)
-	candidates := []candidate{{route: profile.lightweight, tier: policyTierLightweight}, {route: profile.powerful, tier: policyTierPowerful}}
+	completedReplayRoutes := policyCompletedReplayRoutes(profile, routes)
+	candidates := []candidate{{route: routes.lightweight, tier: policyTierLightweight}, {route: routes.powerful, tier: policyTierPowerful}}
 	responsesCapable := false
 	var missing error
 	for _, candidate := range candidates {
@@ -619,7 +647,7 @@ func validatePolicyPublicRequestContract(body []byte, contract publicModelContra
 	return nil
 }
 
-func (c *chatPolicyRoutingController) enforce(ctx context.Context, profile *compiledPolicyProfile, input chatPolicyInput, facts policyClassifierFacts, bucket string) (chatOperationPlan, error) {
+func (c *chatPolicyRoutingController) enforce(ctx context.Context, profile *compiledPolicyProfile, routes policyTierRoutes, input chatPolicyInput, facts policyClassifierFacts, bucket string) (chatOperationPlan, error) {
 	classifyCtx, cancel := c.h.newPolicyClassificationContext(ctx, time.Duration(profile.config.Classifier.TimeoutMS)*time.Millisecond)
 	classifyCtx = withPolicyStatsBucket(classifyCtx, bucket)
 	classifyCtx, dispatchEvidence := withPolicyClassifierDispatchEvidence(classifyCtx)
@@ -663,7 +691,7 @@ func (c *chatPolicyRoutingController) enforce(ctx context.Context, profile *comp
 		InputBytes:        len(input.OriginalBody),
 		Truncated:         facts.truncated(),
 	}
-	return c.sealPlan(profile, input, facts, tier, decision), nil
+	return c.sealPlan(profile, routes, input, facts, tier, decision), nil
 }
 
 func (c *chatPolicyRoutingController) launchObservation(ctx context.Context, profile *compiledPolicyProfile, input chatPolicyInput, facts policyClassifierFacts, bucket string) {
@@ -792,8 +820,8 @@ func policyTrafficBucket(requestBytes, tools int) string {
 	return byteBucket + "/" + toolBucket
 }
 
-func (c *chatPolicyRoutingController) sealPlan(profile *compiledPolicyProfile, input chatPolicyInput, facts policyClassifierFacts, tier policyTier, decision policyDecisionRecord) chatOperationPlan {
-	route := profile.routeForTier(tier)
+func (c *chatPolicyRoutingController) sealPlan(profile *compiledPolicyProfile, routes policyTierRoutes, input chatPolicyInput, facts policyClassifierFacts, tier policyTier, decision policyDecisionRecord) chatOperationPlan {
+	route := routes.forTier(tier)
 	contract := copyPublicModelContract(profile.entry.contract)
 	contract.id = profile.entry.id
 	contract.routeID = route.public.routeID
@@ -809,7 +837,7 @@ func (c *chatPolicyRoutingController) sealPlan(profile *compiledPolicyProfile, i
 		Route:                       route,
 		Contract:                    contract,
 		SelectedReasoningEffort:     profile.reasoningEffortForTier(tier),
-		CompletedPolicyReplayRoutes: policyCompletedReplayRoutes(profile),
+		CompletedPolicyReplayRoutes: policyCompletedReplayRoutes(profile, routes),
 		PolicyID:                    profile.config.ID,
 		SelectedTier:                tier,
 		EffectiveMode:               profile.effectiveMode(),
@@ -821,7 +849,7 @@ func (c *chatPolicyRoutingController) sealPlan(profile *compiledPolicyProfile, i
 	})
 }
 
-func (c *chatPolicyRoutingController) sealRoutePlan(profile *compiledPolicyProfile, input chatPolicyInput, facts policyClassifierFacts, route *modelRoute, tier policyTier, decision policyDecisionRecord) chatOperationPlan {
+func (c *chatPolicyRoutingController) sealRoutePlan(profile *compiledPolicyProfile, routes policyTierRoutes, input chatPolicyInput, facts policyClassifierFacts, route *modelRoute, tier policyTier, decision policyDecisionRecord) chatOperationPlan {
 	contract := copyPublicModelContract(profile.entry.contract)
 	contract.id = profile.entry.id
 	contract.routeID = route.public.routeID
@@ -838,7 +866,7 @@ func (c *chatPolicyRoutingController) sealRoutePlan(profile *compiledPolicyProfi
 		Route:                       route,
 		Contract:                    contract,
 		SelectedReasoningEffort:     profile.reasoningEffortForTier(tier),
-		CompletedPolicyReplayRoutes: policyCompletedReplayRoutes(profile),
+		CompletedPolicyReplayRoutes: policyCompletedReplayRoutes(profile, routes),
 		PolicyID:                    profile.config.ID,
 		SelectedTier:                tier,
 		EffectiveMode:               profile.effectiveMode(),

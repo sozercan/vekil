@@ -1114,7 +1114,7 @@ func TestPolicyResponsesReplayPreservesPowerfulTierWhenRoutesShareTerminal(t *te
 		t.Fatal(err)
 	}
 
-	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, body, nil)
+	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, profile.captureTierRoutes(), body, nil)
 	if err != nil {
 		t.Fatalf("resolvePolicyResponsesReplayRoute() error = %v", err)
 	}
