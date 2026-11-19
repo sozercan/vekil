@@ -89,9 +89,16 @@ func TestChatRouteCopilotCanonicalRefreshPreservesAdmittedSnapshot(t *testing.T)
 	if current.targets[0].preferResponses {
 		t.Fatal("explicit validation did not clear the changed preference")
 	}
-	_, reused, captured, err = h.withChatExecutionRoute(secondCtx, secondCtx, "public-mai", body, false)
+	secondCtx, reused, captured, err = h.withChatExecutionRoute(secondCtx, secondCtx, "public-mai", body, false)
 	if err != nil || reused != second || captured != after || !captured.targets[0].preferResponses {
 		t.Fatalf("validation invalidated admitted Responses operation: err=%v", err)
+	}
+	result, err = h.executeRoutedChatCompletions(secondCtx, body, chatCompletionsMode{}, chatExecutionOptions{}, "public-mai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Backend != chatBackendResponses || result.Completion == nil {
+		t.Fatalf("admitted Responses operation result=%+v", result)
 	}
 }
 
@@ -122,32 +129,38 @@ func TestChatRouteFailedCopilotRefreshLeavesPreferenceUnchanged(t *testing.T) {
 }
 
 func TestChatRouteCopilotExplicitGeminiUsesResponses(t *testing.T) {
-	for _, action := range []string{"generateContent", "streamGenerateContent", "countTokens"} {
-		t.Run(action, func(t *testing.T) {
-			upstream := newCopilotResponsesPolicyUpstreamWithVendor(t, policyClassifierSignals{}, "Experimental")
-			h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
-				WithCopilotBaseURL(upstream.server.URL), WithProvidersConfig(copilotPreferencePublicConfig()))
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(h.BeginShutdown)
-			rec := httptest.NewRecorder()
-			h.HandleGeminiModels(rec, httptest.NewRequest(http.MethodPost, "/v1beta/models/public-mai:"+action,
-				strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"ping"}]}]}`)))
-			if rec.Code != http.StatusOK {
-				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-			}
-			if action != "countTokens" && !strings.Contains(rec.Body.String(), "answered by Luna") {
-				t.Fatalf("unexpected generation: %s", rec.Body.String())
-			}
-			if action == "countTokens" && !strings.Contains(rec.Body.String(), `"totalTokens":20`) {
-				t.Fatalf("unexpected count: %s", rec.Body.String())
-			}
-			_, _, terminals, paths := upstream.snapshot()
-			if len(terminals) != 1 || paths[len(paths)-1] != providerEndpointResponses {
-				t.Fatalf("terminals=%v paths=%v", terminals, paths)
-			}
-		})
+	for _, responsesOnly := range []bool{false, true} {
+		for _, action := range []string{"generateContent", "streamGenerateContent", "countTokens"} {
+			t.Run(fmt.Sprintf("%s/responsesOnly=%t", action, responsesOnly), func(t *testing.T) {
+				upstream := newCopilotResponsesPolicyUpstreamWithVendor(t, policyClassifierSignals{}, "Experimental")
+				cfg := copilotPreferencePublicConfig()
+				if responsesOnly {
+					cfg.ModelRoutes[0].Endpoints = []string{providerEndpointResponses}
+				}
+				h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
+					WithCopilotBaseURL(upstream.server.URL), WithProvidersConfig(cfg))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(h.BeginShutdown)
+				rec := httptest.NewRecorder()
+				h.HandleGeminiModels(rec, httptest.NewRequest(http.MethodPost, "/v1beta/models/public-mai:"+action,
+					strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"ping"}]}]}`)))
+				if rec.Code != http.StatusOK {
+					t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+				}
+				if action != "countTokens" && !strings.Contains(rec.Body.String(), "answered by Luna") {
+					t.Fatalf("unexpected generation: %s", rec.Body.String())
+				}
+				if action == "countTokens" && !strings.Contains(rec.Body.String(), `"totalTokens":20`) {
+					t.Fatalf("unexpected count: %s", rec.Body.String())
+				}
+				_, _, terminals, paths := upstream.snapshot()
+				if len(terminals) != 1 || paths[len(paths)-1] != providerEndpointResponses {
+					t.Fatalf("terminals=%v paths=%v", terminals, paths)
+				}
+			})
+		}
 	}
 }
 

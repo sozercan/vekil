@@ -2450,19 +2450,19 @@ func TestHandleGeminiModelsCountTokensRejectsIneligibleExplicitRoute(t *testing.
 			SchemaVersion: ProvidersConfigSchemaVersion2,
 			StateBindings: &StateBindingsConfig{Mode: "memory"},
 			Providers: []ProviderConfig{{
-				ID:      "azure",
-				Type:    string(providerTypeAzureOpenAI),
-				Default: true,
-				BaseURL: upstream.URL + "/openai/v1",
-				APIKey:  "azure-key",
+				ID:       "anthropic",
+				Type:     string(providerTypeAnthropicCompatible),
+				Default:  true,
+				BaseURL:  upstream.URL,
+				AuthType: string(providerAuthTypeNone),
 			}},
 			ModelRoutes: []ModelRouteConfig{{
-				ID:        "responses-route",
+				ID:        "messages-route",
 				PublicID:  "public-model",
-				Endpoints: []string{providerEndpointResponses},
+				Endpoints: []string{providerEndpointMessages},
 				Targets: []ModelRouteTargetConfig{{
 					ID:            "primary",
-					Provider:      "azure",
+					Provider:      "anthropic",
 					UpstreamModel: "physical-model",
 				}},
 			}},
@@ -2503,7 +2503,7 @@ func TestHandleGeminiModelsCountTokensRejectsIneligibleExplicitRoute(t *testing.
 	if got := upstreamCalls.Load(); got != 0 {
 		t.Fatalf("upstream calls = %d, want 0", got)
 	}
-	assertExplicitAdmissionOperationID(t, w, summary, "responses-route")
+	assertExplicitAdmissionOperationID(t, w, summary, "messages-route")
 }
 
 func newGeminiCountTokensRouteTestHandler(t testing.TB, providers []ProviderConfig, targets []ModelRouteTargetConfig, routing ModelRouteRoutingConfig) *ProxyHandler {
