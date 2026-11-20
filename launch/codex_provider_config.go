@@ -42,6 +42,10 @@ func checkCodexLaunchProvider(executable resolvedExecutable, environment []strin
 	if err != nil {
 		return fmt.Errorf("resolve Codex executable path: %w", err)
 	}
+	directory, err = filepath.Abs(directory)
+	if err != nil {
+		return fmt.Errorf("resolve Codex launch directory: %w", err)
+	}
 	args := append(append([]string(nil), executable.prefixArgs...), "app-server")
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Env, cmd.Dir = environment, directory
@@ -73,10 +77,10 @@ func checkCodexLaunchProvider(executable resolvedExecutable, environment []strin
 	stopRead := context.AfterFunc(ctx, func() { _ = stdout.Close() })
 	defer stopRead()
 
-	const request = `{"id":1,"method":"initialize","params":{"clientInfo":{"name":"vekil","version":"0"}}}
+	const initialize = `{"id":1,"method":"initialize","params":{"clientInfo":{"name":"vekil","version":"0"}}}
 {"method":"initialized"}
-{"id":2,"method":"config/read","params":{"includeLayers":false}}
 `
+	request := initialize + `{"id":2,"method":"config/read","params":{"includeLayers":false,"cwd":` + configString(directory) + "}}\n"
 	if _, err := io.WriteString(stdin, request); err != nil {
 		return fmt.Errorf("request Codex configuration: %w", err)
 	}
