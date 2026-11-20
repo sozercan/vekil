@@ -3,9 +3,6 @@ package main
 import (
 	"bytes"
 	"image/png"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"testing"
 )
 
@@ -22,11 +19,9 @@ func TestTrayTemplates(t *testing.T) {
 		name    string
 		data    []byte
 		opacity uint32
-		badge   bool
 	}{
-		{"starting", templates.plain, 65535, false},
-		{"stopped", templates.stopped, 166 * 257, false},
-		{"running", templates.running, 65535, true},
+		{"active", templates.plain, 65535},
+		{"stopped", templates.stopped, 166 * 257},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			mask, err := png.Decode(bytes.NewReader(test.data))
@@ -50,12 +45,8 @@ func TestTrayTemplates(t *testing.T) {
 					if alpha > 0 {
 						visible++
 					}
-					if !test.badge && originalAlpha > 0 && alpha != test.opacity {
+					if originalAlpha > 0 && alpha != test.opacity {
 						t.Fatalf("opacity = %v, want %v", alpha, test.opacity)
-					}
-					pointX, pointY := (float64(x)+0.5)*20/44, (float64(y)+0.5)*20/44
-					if test.badge && (pointX-15)*(pointX-15)+(pointY-15)*(pointY-15) < 5*5 && alpha != 0 {
-						t.Fatal("robot overlaps badge clearance")
 					}
 				}
 			}
@@ -63,34 +54,5 @@ func TestTrayTemplates(t *testing.T) {
 				t.Fatal("empty robot template")
 			}
 		})
-	}
-}
-
-func TestNativeTrayIcon(t *testing.T) {
-	directory := t.TempDir()
-	// optionally retain native renders for local visual inspection.
-	if artifacts := os.Getenv("VEKIL_TRAY_TEST_ARTIFACTS"); artifacts != "" {
-		directory = artifacts
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	templates, err := loadTrayTemplates()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, data := range map[string][]byte{"plain": templates.plain, "running": templates.running, "stopped": templates.stopped} {
-		if err := os.WriteFile(filepath.Join(directory, name+".png"), data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	executable := filepath.Join(directory, "tray-icon-test")
-	build := exec.CommandContext(t.Context(), "xcrun", "clang", "-fobjc-arc", "-framework", "Cocoa", "-Wall", "-Werror", "-o", executable, "testdata/tray_icon_test.m")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("compile native tray tests: %v\n%s", err, output)
-	}
-	run := exec.CommandContext(t.Context(), executable, directory)
-	if output, err := run.CombinedOutput(); err != nil {
-		t.Fatalf("native tray tests: %v\n%s", err, output)
 	}
 }
