@@ -179,19 +179,21 @@ type providerEndpointPaths struct {
 }
 
 type providerModel struct {
-	publicID               string
-	upstreamModel          string
-	upstreamModelJSON      json.RawMessage
-	providerID             string
-	supportedEndpoints     []string
-	parallelToolCalls      *bool
-	dropSamplingParams     bool
-	dropStopSequences      bool
-	useMaxCompletionTokens bool
-	maxPromptImages        int
-	disabled               bool
-	endpointsAdvertised    bool
-	raw                    json.RawMessage
+	publicID                   string
+	upstreamModel              string
+	upstreamModelJSON          json.RawMessage
+	providerID                 string
+	supportedEndpoints         []string
+	parallelToolCalls          *bool
+	dropSamplingParams         bool
+	dropStopSequences          bool
+	useMaxCompletionTokens     bool
+	maxPromptImages            int
+	preferResponses            bool
+	enabledResponsesAdvertised bool
+	disabled                   bool
+	endpointsAdvertised        bool
+	raw                        json.RawMessage
 }
 
 type providerSetup struct {
@@ -604,7 +606,8 @@ func (ps *providerSetup) addProviderModels(providerID string, models []providerM
 	}
 
 	provider := ps.providerByID(providerID)
-	models = filterHiddenProviderModels(provider, filterProviderModels(provider, models))
+	catalog := filterProviderModels(provider, models)
+	models = filterHiddenProviderModels(provider, catalog)
 
 	ps.modelsMu.Lock()
 	defer ps.modelsMu.Unlock()
@@ -623,7 +626,7 @@ func (ps *providerSetup) addProviderModels(providerID string, models []providerM
 			return err
 		}
 	}
-	if err := ps.routes.addLegacyProvider(provider, models); err != nil {
+	if err := ps.routes.addLegacyProvider(provider, catalog); err != nil {
 		return err
 	}
 	ps.models = next
@@ -642,6 +645,10 @@ func (ps *providerSetup) replaceProviderModels(providerID string, models []provi
 }
 
 func (ps *providerSetup) replaceProviderModelsBatch(replacements map[string][]providerModel) error {
+	return ps.replaceProviderModelsAndCatalogs(replacements, replacements)
+}
+
+func (ps *providerSetup) replaceProviderModelsAndCatalogs(replacements, catalogs map[string][]providerModel) error {
 	if ps == nil || len(replacements) == 0 {
 		return nil
 	}
@@ -723,7 +730,7 @@ func (ps *providerSetup) replaceProviderModelsBatch(replacements map[string][]pr
 		}
 		ps.routes = routes
 	}
-	if err := ps.routes.replaceLegacyProviders(ps.providers, ps.providerOrder, filtered); err != nil {
+	if err := ps.routes.replaceLegacyProviders(ps.providers, ps.providerOrder, filtered, catalogs); err != nil {
 		return err
 	}
 	ps.models = next
@@ -857,7 +864,7 @@ func (h *ProxyHandler) buildConfiguredProviderSetupWithDynamicValidation(ctx con
 	}
 	// Auxiliary models join only after every catalog is registered, so a
 	// later provider's reservation makes them fall back instead of failing.
-	if len(h.auxiliaryModels) > 0 && len(catalogs) > 0 {
+	if len(catalogs) > 0 {
 		if err := h.replaceInstalledProviderModels(setup, catalogs); err != nil {
 			return nil, err
 		}
@@ -1149,7 +1156,7 @@ func (h *ProxyHandler) replaceInstalledProviderModels(setup *providerSetup, cata
 	for providerID, models := range catalogs {
 		withAuxiliary[providerID] = h.installedProviderModels(setup, providerID, models)
 	}
-	err := setup.replaceProviderModelsBatch(withAuxiliary)
+	err := setup.replaceProviderModelsAndCatalogs(withAuxiliary, catalogs)
 	if err == nil || len(h.auxiliaryModels) == 0 {
 		return err
 	}
@@ -1157,7 +1164,7 @@ func (h *ProxyHandler) replaceInstalledProviderModels(setup *providerSetup, cata
 	for providerID, models := range catalogs {
 		allowedOnly[providerID] = h.filterAllowedModels(models)
 	}
-	return setup.replaceProviderModelsBatch(allowedOnly)
+	return setup.replaceProviderModelsAndCatalogs(allowedOnly, catalogs)
 }
 
 // allowedRouteTargetsProvider reports whether an allowed explicit route or
@@ -2858,7 +2865,11 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 // common path does not need a per-attempt header-map clone. Client.Do adds jar
 // cookies to the request header, so clients with a cookie jar retain isolation.
 func (h *ProxyHandler) newProviderJSONInferenceRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string, owners ...providerModel) (*http.Request, error) {
-	body, err := applyAnthropicChatCacheControl(ctx, provider, path, body)
+	ctx, body, err := prepareCopilotNamespaceTools(ctx, provider, path, body)
+	if err != nil {
+		return nil, err
+	}
+	body, err = applyAnthropicChatCacheControl(ctx, provider, path, body)
 	if err != nil {
 		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
@@ -3056,6 +3067,7 @@ func (h *ProxyHandler) fetchProviderModels(ctx context.Context, provider *provid
 		if err != nil {
 			return providerModelsFetchResult{}, err
 		}
+		h.copilotNativeWS.record(provider.id, models, strings.TrimSpace(rawQuery) == "")
 		result.models = filterProviderModels(provider, models)
 		return result, nil
 	case providerTypeOpenAICodex:
@@ -3384,8 +3396,10 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			supportedEndpoints = provider.defaultDynamicModelEndpoints()
 		}
 		disabled := strings.EqualFold(parsed.Policy.State, "disabled")
+		enabledResponses := !disabled && endpointsAdvertised && supportsEndpoint(supportedEndpoints, providerEndpointResponses)
 		if index, duplicate := indexByID[publicID]; duplicate {
 			merged := models[index]
+			merged.enabledResponsesAdvertised = merged.enabledResponsesAdvertised || enabledResponses
 			switch {
 			case merged.endpointsAdvertised && !endpointsAdvertised:
 				// Keep the explicitly advertised endpoint set.
@@ -3399,6 +3413,7 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			baseRaw := merged.raw
 			if merged.disabled != models[index].disabled && !merged.disabled {
 				baseRaw = raw
+				merged.preferResponses = false
 			}
 			// The image limit follows the published entry; when that entry declares none,
 			// a limit another entry for the same ID declares still applies.
@@ -3407,6 +3422,12 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 			} else {
 				merged.maxPromptImages = max(merged.maxPromptImages, providerModelMaxPromptImagesFromRaw(raw))
 			}
+			// The published vendor wins; enabled duplicates can fill a missing vendor signal.
+			if providerModelVendorFromRaw(baseRaw) != "" {
+				merged.preferResponses = providerModelPrefersResponsesFromRaw(baseRaw)
+			} else if !disabled {
+				merged.preferResponses = merged.preferResponses || providerModelPrefersResponsesFromRaw(raw)
+			}
 			merged.raw = mergeProviderModelRaw(baseRaw, merged.supportedEndpoints)
 			models[index] = merged
 			continue
@@ -3414,18 +3435,23 @@ func decodeProviderModelsFromBody(provider *providerRuntime, body []byte) ([]pro
 
 		indexByID[publicID] = len(models)
 		models = append(models, providerModel{
-			publicID:            publicID,
-			upstreamModel:       publicID,
-			providerID:          provider.id,
-			supportedEndpoints:  supportedEndpoints,
-			parallelToolCalls:   providerModelParallelToolCallsFromRaw(raw),
-			maxPromptImages:     providerModelMaxPromptImagesFromRaw(raw),
-			disabled:            disabled,
-			endpointsAdvertised: endpointsAdvertised,
-			raw:                 mergeProviderModelRaw(raw, supportedEndpoints),
+			publicID:                   publicID,
+			upstreamModel:              publicID,
+			providerID:                 provider.id,
+			supportedEndpoints:         supportedEndpoints,
+			parallelToolCalls:          providerModelParallelToolCallsFromRaw(raw),
+			maxPromptImages:            providerModelMaxPromptImagesFromRaw(raw),
+			preferResponses:            providerModelPrefersResponsesFromRaw(raw),
+			enabledResponsesAdvertised: enabledResponses,
+			disabled:                   disabled,
+			endpointsAdvertised:        endpointsAdvertised,
+			raw:                        mergeProviderModelRaw(raw, supportedEndpoints),
 		})
 	}
 
+	for i := range models {
+		models[i].preferResponses = models[i].preferResponses && models[i].enabledResponsesAdvertised
+	}
 	return models, nil
 }
 
@@ -3467,6 +3493,30 @@ func providerModelMaxPromptImagesFromRaw(raw json.RawMessage) int {
 		return 0
 	}
 	return int(limit)
+}
+
+// providerModelPrefersResponsesFromRaw reports whether a discovered Copilot catalog entry's
+// vendor requires preferring /responses when both /chat/completions and /responses are listed.
+// Copilot advertises ["/chat/completions", "/responses"] for Microsoft / Experimental MAI models
+// (such as mai-code-2*) while serving them only on /responses, whereas Google/Anthropic/OpenAI
+// dual-endpoint or native-Chat entries retain Vekil's native /chat/completions preference.
+func providerModelPrefersResponsesFromRaw(raw json.RawMessage) bool {
+	switch providerModelVendorFromRaw(raw) {
+	case "microsoft", "experimental":
+		return true
+	default:
+		return false
+	}
+}
+
+func providerModelVendorFromRaw(raw json.RawMessage) string {
+	var parsed struct {
+		Vendor string `json:"vendor"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(parsed.Vendor))
 }
 
 func openRouterModelSupportsTools(supportedParams []string) bool {

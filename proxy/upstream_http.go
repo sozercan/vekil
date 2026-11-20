@@ -267,6 +267,10 @@ func prepareResolvedProviderRequestBodyWithValidation(
 }
 
 func applyProviderModelRequestPolicy(body []byte, endpoint string, owner providerModel) []byte {
+	// Decisions is a passthrough: the client's fields reach upstream as sent.
+	if endpoint == copilotEndpointDecisions {
+		return body
+	}
 	rewriteMaxTokens := endpoint == providerEndpointChatCompletions && owner.useMaxCompletionTokens
 	dropStopSequences := endpoint == providerEndpointChatCompletions && owner.dropStopSequences
 	if !owner.dropSamplingParams && !dropStopSequences && !rewriteMaxTokens && (owner.parallelToolCalls == nil || *owner.parallelToolCalls) {
@@ -624,7 +628,7 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModelValidation(ctx context
 					// against the sealed policy public identity.
 					resolvedAlias = true
 				}
-			} else if resolved, known := h.resolveModelRouteForRequest(requestedModel, path); known && resolved == route {
+			} else if resolved, known := h.resolveModelRouteForRequest(requestedModel, path); known && sameLogicalExplicitRoute(resolved, route) {
 				// Keep the actual alias as the rewrite source. Using the canonical
 				// public ID here can leave the alias in the immutable request body
 				// when the target upstream model is already canonical.

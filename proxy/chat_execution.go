@@ -330,6 +330,7 @@ func (h *ProxyHandler) retryResolvedNativeChat(ctx context.Context, prior chatEx
 }
 
 func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route resolvedChatRoute, chatBody []byte, options chatExecutionOptions) (chatExecutionResult, error) {
+	chatBody = applyProviderModelRequestPolicy(chatBody, providerEndpointChatCompletions, providerModel{dropStopSequences: route.owner.dropStopSequences})
 	replayRoute := responsesChatReplayRoute{
 		ProviderID:    route.provider.id,
 		PublicModel:   route.publicModel,

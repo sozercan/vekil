@@ -7,14 +7,14 @@ import (
 
 // Only effort changes on one physical upstream can reuse completed tool history.
 // Provider/model changes and routes with failover retain the exact replay binding.
-func policyCompletedReplayRoutes(profile *compiledPolicyProfile) []responsesChatReplayRoute {
+func policyCompletedReplayRoutes(profile *compiledPolicyProfile, routes policyTierRoutes) []responsesChatReplayRoute {
 	if profile == nil || profile.entry == nil || !policyProfileControlsReasoning(profile.config) {
 		return nil
 	}
-	routes := []*modelRoute{profile.lightweight, profile.powerful}
+	candidates := []*modelRoute{routes.lightweight, routes.powerful}
 	tiers := []policyTier{policyTierLightweight, policyTierPowerful}
-	completed := make([]responsesChatReplayRoute, 0, len(routes))
-	for index, route := range routes {
+	completed := make([]responsesChatReplayRoute, 0, len(candidates))
+	for index, route := range candidates {
 		if route == nil || len(route.targets) != 1 || !route.supportsEndpoint(providerEndpointResponses) {
 			return nil
 		}

@@ -5,6 +5,7 @@
 Vekil.app/
 .build/
 .DS_Store
+.idea/
 providers.json
 providers.yaml
 providers.yml

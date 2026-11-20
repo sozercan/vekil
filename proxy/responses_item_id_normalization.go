@@ -25,20 +25,42 @@ func normalizeCopilotResponsesItemIDs(resp *http.Response, endpoint string) {
 	})
 }
 
+// isEventStreamContentType reports whether a Content-Type header names the
+// SSE media type. Media types are case-insensitive and may carry parameters.
+func isEventStreamContentType(header string) bool {
+	contentType, _, _ := strings.Cut(header, ";")
+	return strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
+}
+
+// errResponsesSSEEventTooLarge reports an SSE event that a fail-closed
+// rewriter could not buffer and therefore could not rewrite.
+var errResponsesSSEEventTooLarge = errors.New("responses SSE event exceeds rewrite buffer limit")
+
 // wrapResponsesSSEBody rewrites each successful Responses SSE event in place.
 // Oversized events and lines pass through unchanged.
 func wrapResponsesSSEBody(resp *http.Response, rewriteEvent func([]byte) ([]byte, bool)) {
+	wrapResponsesSSEBodyMode(resp, rewriteEvent, false)
+}
+
+// wrapResponsesSSEBodyFailClosed is wrapResponsesSSEBody for rewrites that
+// must not be skipped: an oversized event or line ends the stream with
+// errResponsesSSEEventTooLarge instead of passing through unrewritten.
+func wrapResponsesSSEBodyFailClosed(resp *http.Response, rewriteEvent func([]byte) ([]byte, bool)) {
+	wrapResponsesSSEBodyMode(resp, rewriteEvent, true)
+}
+
+func wrapResponsesSSEBodyMode(resp *http.Response, rewriteEvent func([]byte) ([]byte, bool), failClosed bool) {
 	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
 		return
 	}
-	contentType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
-	if !strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream") {
+	if !isEventStreamContentType(resp.Header.Get("Content-Type")) {
 		return
 	}
 	resp.Body = &responsesSSERewriteBody{
 		source:       resp.Body,
 		reader:       bufio.NewReaderSize(resp.Body, openAIStreamScannerInitialBuffer),
 		rewriteEvent: rewriteEvent,
+		failClosed:   failClosed,
 	}
 	resp.Header.Del("Content-Length")
 	resp.ContentLength = -1
@@ -52,11 +74,17 @@ type responsesSSERewriteBody struct {
 	pendingErr   error
 	rawEvent     bool
 	passthrough  bool
+	failClosed   bool
+	failed       bool
 	closeOnce    sync.Once
 	closeErr     error
 }
 
 func (b *responsesSSERewriteBody) Read(p []byte) (int, error) {
+	if b.failed {
+		// A fail-closed failure is terminal; never resume mid-event.
+		return 0, errResponsesSSEEventTooLarge
+	}
 	for len(b.pending) == 0 {
 		if b.pendingErr != nil {
 			err := b.pendingErr
@@ -120,6 +148,10 @@ func (b *responsesSSERewriteBody) readNext() ([]byte, error) {
 			_, _ = event.WriteString(line)
 			boundary := strings.TrimRight(line, "\r\n") == ""
 			if event.Len() > openAIStreamScannerMaxBuffer {
+				if b.failClosed {
+					b.failed = true
+					return nil, errResponsesSSEEventTooLarge
+				}
 				b.rawEvent = !boundary
 				if errors.Is(err, errOpenAISSELineTooLong) {
 					b.passthrough = true
@@ -147,6 +179,10 @@ func (b *responsesSSERewriteBody) readNext() ([]byte, error) {
 				return event.Bytes(), io.EOF
 			}
 			if errors.Is(err, errOpenAISSELineTooLong) {
+				if b.failClosed {
+					b.failed = true
+					return nil, errResponsesSSEEventTooLarge
+				}
 				b.passthrough = true
 				return event.Bytes(), nil
 			}

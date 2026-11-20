@@ -39,7 +39,7 @@ func newPolicyResponsesInterruptionFixture(t *testing.T) policyResponsesInterrup
 		t.Fatal(err)
 	}
 	profile := h.policyRoutingController.(*chatPolicyRoutingController).profiles["semantic-policy"]
-	routes := policyCompletedReplayRoutes(profile)
+	routes := policyCompletedReplayRoutes(profile, profile.captureTierRoutes())
 	if len(routes) != 2 {
 		t.Fatalf("fixture completed replay routes = %+v, want both tiers", routes)
 	}

@@ -32,6 +32,7 @@ func dashboardURL() string {
 var (
 	proxyLifecycle menubarProxyLifecycle
 	authenticator  *auth.Authenticator
+	sessionUIMu    sync.Mutex
 
 	// Menu items kept at package level so helpers can update them.
 	mAuthMenu        *systray.MenuItem
@@ -87,8 +88,7 @@ func main() {
 }
 
 func onReady() {
-	systray.SetIcon(iconOff)
-	systray.SetTooltip("Vekil - Stopped")
+	refreshTrayStatus()
 
 	mAuthMenu = systray.AddMenuItem("GitHub Auth: Not Signed In", "GitHub authentication")
 	mSignInGitHub = mAuthMenu.AddSubMenuItem("Sign In with GitHub", "Sign in through GitHub in your browser and let Vekil manage the token")
@@ -210,7 +210,7 @@ func startProxy() {
 		return
 	}
 
-	setProxyStartingUI()
+	refreshSessionUI()
 	authn := authenticator
 	go func() {
 		// Reload on every start so edits to the saved providers config apply
@@ -416,11 +416,13 @@ func completeProxyStartup(generation uint64, result proxyStartResult) {
 		return
 	}
 
-	mToggle.SetTitle("Stop Vekil")
-	systray.SetIcon(iconOn)
-	systray.SetTooltip("Vekil - Running on :1337")
 	refreshSessionUI()
 	log.Info("proxy started")
+	go func(current menubarProxyServer) {
+		if err := <-current.Done(); err != nil {
+			stopPublishedProxy(current)
+		}
+	}(result.server)
 }
 
 func cancelProxyStartup() bool {
@@ -431,47 +433,28 @@ func cancelProxyStartupWithRestart(restart bool) bool {
 	if !proxyLifecycle.cancelStartup(restart) {
 		return false
 	}
-	if mToggle != nil {
-		mToggle.SetTitle("Stopping Vekil…")
-		mToggle.Disable()
-	}
-	if mDashboard != nil {
-		mDashboard.Disable()
-	}
+	refreshSessionUI()
 	return true
-}
-
-func setProxyStartingUI() {
-	mToggle.SetTitle("Cancel Starting Vekil")
-	mToggle.Enable()
-	systray.SetIcon(iconOff)
-	systray.SetTooltip("Vekil - Starting")
-	if mDashboard != nil {
-		mDashboard.Disable()
-	}
-	if mProvidersChoose != nil {
-		mProvidersChoose.Disable()
-	}
-	if mProvidersClear != nil {
-		mProvidersClear.Disable()
-	}
-	setAuthActionsEnabled(false)
 }
 
 func stopProxy() {
 	if cancelProxyStartup() {
 		return
 	}
+	stopPublishedProxy(nil)
+}
 
-	current := proxyLifecycle.detachServer()
+func stopPublishedProxy(expected menubarProxyServer) {
+	current := proxyLifecycle.beginStop(expected)
 	if current == nil {
-		refreshSessionUI()
 		return
 	}
+	refreshSessionUI()
 	if err := stopMenubarProxyServer(current, 10*time.Second); err != nil {
 		log.Error("server stop failed", logger.Err(err))
 	}
 
+	proxyLifecycle.finishStop()
 	refreshSessionUI()
 	log.Info("proxy stopped")
 }
@@ -684,13 +667,11 @@ func applyProvidersConfigPath(path string) error {
 }
 
 func refreshSessionUI() {
-	status := auth.AuthStatus{Source: auth.AuthSourceNone}
-	if authenticator != nil {
-		status = authenticator.Status()
-	}
+	sessionUIMu.Lock()
+	defer sessionUIMu.Unlock()
+	state := refreshTrayStatus()
 
-	starting, canceling := proxyLifecycle.startupState()
-	if starting {
+	if state == trayStarting || state == trayStopping {
 		if mDashboard != nil {
 			mDashboard.Disable()
 		}
@@ -701,21 +682,23 @@ func refreshSessionUI() {
 			mProvidersClear.Disable()
 		}
 		setAuthActionsEnabled(false)
-		if canceling {
+		if state == trayStopping {
 			mToggle.SetTitle("Stopping Vekil…")
 			mToggle.Disable()
-			systray.SetTooltip("Vekil - Stopping")
 		} else {
 			mToggle.SetTitle("Cancel Starting Vekil")
 			mToggle.Enable()
-			systray.SetTooltip("Vekil - Starting")
 		}
 		return
 	}
 
+	status := auth.AuthStatus{Source: auth.AuthSourceNone}
+	if authenticator != nil {
+		status = authenticator.Status()
+	}
 	refreshAuthMenu(status)
 	refreshProvidersMenu()
-	running := proxyLifecycle.isRunning()
+	running := state == trayRunning
 	if mDashboard != nil {
 		if running {
 			mDashboard.Enable()
@@ -726,10 +709,10 @@ func refreshSessionUI() {
 	// Start stays available with an invalid config because it reloads the
 	// config, so fixing the file and starting again recovers.
 	mToggle.Enable()
-	if !running {
+	if running {
+		mToggle.SetTitle("Stop Vekil")
+	} else {
 		mToggle.SetTitle("Start Vekil")
-		systray.SetIcon(iconOff)
-		systray.SetTooltip("Vekil - Stopped")
 	}
 }
 
@@ -859,7 +842,7 @@ func providersRequireGitHubAuth(cfg proxy.ProvidersConfig, err error) bool {
 }
 
 func onExit() {
-	if current := proxyLifecycle.shutdown(); current != nil && current.IsRunning() {
+	if current := proxyLifecycle.shutdown(); current != nil {
 		_ = stopMenubarProxyServer(current, 5*time.Second)
 	}
 }

@@ -31,6 +31,11 @@ type copilotResponsesPolicyUpstream struct {
 
 func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSignals) *copilotResponsesPolicyUpstream {
 	t.Helper()
+	return newCopilotResponsesPolicyUpstreamWithVendor(t, signals, "")
+}
+
+func newCopilotResponsesPolicyUpstreamWithVendor(t *testing.T, signals policyClassifierSignals, vendor string) *copilotResponsesPolicyUpstream {
+	t.Helper()
 	upstream := &copilotResponsesPolicyUpstream{classifierSignals: signals}
 	upstream.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstream.mu.Lock()
@@ -45,11 +50,15 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 			upstream.mu.Lock()
 			upstream.modelRequests++
 			upstream.mu.Unlock()
+			solEndpoints := []string{providerEndpointResponses}
+			if vendor != "" {
+				solEndpoints = []string{providerEndpointChatCompletions, providerEndpointResponses}
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"object": "list",
 				"data": []any{
-					map[string]any{"id": "gpt-5.6-luna", "object": "model", "owned_by": "github-copilot", "supported_endpoints": []string{providerEndpointChatCompletions, providerEndpointResponses}},
-					map[string]any{"id": "gpt-5.6-sol", "object": "model", "owned_by": "github-copilot", "supported_endpoints": []string{providerEndpointResponses}},
+					map[string]any{"id": "gpt-5.6-luna", "object": "model", "owned_by": "github-copilot", "vendor": vendor, "supported_endpoints": []string{providerEndpointChatCompletions, providerEndpointResponses}},
+					map[string]any{"id": "gpt-5.6-sol", "object": "model", "owned_by": "github-copilot", "vendor": vendor, "supported_endpoints": solEndpoints},
 				},
 			})
 		case providerEndpointResponses:
@@ -151,7 +160,7 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 			if hasToolOutput {
 				text = "tool result accepted"
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			response := map[string]any{
 				"id":         "resp-terminal",
 				"object":     "response",
 				"created_at": int64(2),
@@ -161,7 +170,25 @@ func newCopilotResponsesPolicyUpstream(t *testing.T, signals policyClassifierSig
 					"content": []any{map[string]any{"type": "output_text", "text": text}},
 				}},
 				"usage": map[string]any{"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
-			})
+			}
+			if request.Stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				write := func(event string, payload map[string]any) {
+					payload["type"] = event
+					data, _ := json.Marshal(payload)
+					_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+				}
+				write("response.created", map[string]any{"response": map[string]any{"id": "resp-terminal", "created_at": 2, "status": "in_progress", "output": []any{}}})
+				write("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"type": "message", "id": "msg-terminal", "status": "in_progress", "role": "assistant", "content": []any{}}})
+				write("response.content_part.added", map[string]any{"output_index": 0, "content_index": 0, "item_id": "msg-terminal", "part": map[string]any{"type": "output_text", "text": ""}})
+				write("response.output_text.delta", map[string]any{"output_index": 0, "content_index": 0, "item_id": "msg-terminal", "delta": text})
+				write("response.output_text.done", map[string]any{"output_index": 0, "content_index": 0, "item_id": "msg-terminal", "text": text})
+				write("response.content_part.done", map[string]any{"output_index": 0, "content_index": 0, "item_id": "msg-terminal", "part": map[string]any{"type": "output_text", "text": text}})
+				write("response.output_item.done", map[string]any{"output_index": 0, "item": response["output"].([]any)[0]})
+				write("response.completed", map[string]any{"response": response})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(response)
 		default:
 			http.NotFound(w, r)
 		}
@@ -399,6 +426,139 @@ func TestPolicyRoutingUsesCopilotResponsesForClassifierAndTerminalText(t *testin
 	stats := h.policyRoutingController.(*chatPolicyRoutingController).PolicyStatsSnapshot()
 	if len(stats.Profiles) != 1 || stats.Profiles[0].Totals.PhysicalClassifierSends != 2 || stats.Profiles[0].Totals.ActualTiers.Powerful != 1 || stats.Profiles[0].Totals.ClassifierUsage.TotalTokens != 28 {
 		t.Fatalf("policy stats = %+v", stats)
+	}
+}
+
+func TestPolicyRoutingCopilotDualEndpointVendorPreference(t *testing.T) {
+	for _, tc := range []struct {
+		vendor   string
+		deferred bool
+	}{
+		{vendor: "Microsoft"}, {vendor: "Experimental"},
+		{vendor: "Microsoft", deferred: true}, {vendor: "Experimental", deferred: true},
+	} {
+		t.Run(fmt.Sprintf("%s/deferred=%t", tc.vendor, tc.deferred), func(t *testing.T) {
+			upstream := newCopilotResponsesPolicyUpstreamWithVendor(t, policyClassifierSignals{
+				TurnType: policyTurnTypePlanning, CodeScope: policyCodeScopeMultiFile,
+				RiskLevel: policyRiskLevelHigh, RequiresCodebaseContext: true,
+			}, tc.vendor)
+			cfg := directCopilotResponsesPolicyConfig(policyConfigModeEnforce)
+			for i := range cfg.ModelRoutes {
+				cfg.ModelRoutes[i].Endpoints = []string{providerEndpointChatCompletions, providerEndpointResponses}
+			}
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
+				WithCopilotBaseURL(upstream.server.URL), WithProvidersConfig(cfg),
+				WithPolicyRoutingMode(PolicyRoutingModeEnforce), WithDeferredDynamicProviderModelValidation(tc.deferred))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			if tc.deferred {
+				if err := h.ValidateDynamicProviderModels(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.InitializePolicyRouting(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(rec, httptest.NewRequest(http.MethodPost, providerEndpointChatCompletions,
+				strings.NewReader(`{"model":"gpt-5.6-semantic","messages":[{"role":"user","content":"Plan a coordinated multi-file migration."}],"max_completion_tokens":256}`)))
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "answered by Sol") {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			_, classifiers, terminals, paths := upstream.snapshot()
+			if classifiers != 2 || strings.Join(terminals, ",") != "gpt-5.6-sol" {
+				t.Fatalf("classifiers=%d terminals=%v paths=%v", classifiers, terminals, paths)
+			}
+			for _, path := range paths {
+				if path == providerEndpointChatCompletions {
+					t.Fatalf("unexpected native Chat dispatch: %v", paths)
+				}
+			}
+			rejected := httptest.NewRecorder()
+			h.HandleOpenAIChatCompletions(rejected, httptest.NewRequest(http.MethodPost, providerEndpointChatCompletions,
+				strings.NewReader(`{"model":"gpt-5.6-semantic","messages":[{"role":"user","content":"ping"}],"stop":["done"]}`)))
+			_, classifiersAfter, terminalsAfter, _ := upstream.snapshot()
+			if rejected.Code != http.StatusBadRequest || classifiersAfter != classifiers || len(terminalsAfter) != len(terminals) {
+				t.Fatalf("unsupported stop: status=%d classifiers=%d terminals=%v body=%s", rejected.Code, classifiersAfter, terminalsAfter, rejected.Body.String())
+			}
+		})
+	}
+}
+
+func TestChatRouteExplicitCopilotVendorPreferenceHonorsAllowlist(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		endpoints []string
+		want      string
+	}{
+		{name: "dual endpoint", endpoints: []string{providerEndpointChatCompletions, providerEndpointResponses}, want: providerEndpointResponses},
+		{name: "Responses only", endpoints: []string{providerEndpointResponses}, want: providerEndpointResponses},
+		{name: "Chat only", endpoints: []string{providerEndpointChatCompletions}, want: providerEndpointChatCompletions},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := newCopilotResponsesPolicyUpstreamWithVendor(t, policyClassifierSignals{}, "Experimental")
+			cfg := ProvidersConfig{
+				SchemaVersion: 2, StateBindings: &StateBindingsConfig{Mode: "memory"},
+				Providers: []ProviderConfig{{ID: "copilot", Type: "copilot"}},
+				ModelRoutes: []ModelRouteConfig{{
+					ID: "mai-route", PublicID: "public-mai", Endpoints: tc.endpoints,
+					Targets: []ModelRouteTargetConfig{{ID: "primary", Provider: "copilot", UpstreamModel: "gpt-5.6-luna"}},
+				}},
+			}
+			h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture-token"), nil,
+				WithCopilotBaseURL(upstream.server.URL), WithProvidersConfig(cfg),
+				WithDeferredDynamicProviderModelValidation(true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(h.BeginShutdown)
+			before, _ := h.providerSetup().lookupTerminalRoute("mai-route")
+			if err := h.ValidateDynamicProviderModels(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			route, _ := h.providerSetup().lookupTerminalRoute("mai-route")
+			if before.targets[0].preferResponses || !route.targets[0].preferResponses || before == route {
+				t.Fatal("discovery did not publish an independent route snapshot with the preference")
+			}
+			endpoint, _, err := explicitChatExecutionEndpoint(route, nil, false)
+			if err != nil || endpoint != tc.want {
+				t.Fatalf("endpoint=%q err=%v, want %q", endpoint, err, tc.want)
+			}
+			secondaryOnly := *route
+			secondaryOnly.targets = append([]targetBinding(nil), route.targets[0], route.targets[0])
+			secondaryOnly.targets[0].preferResponses = false
+			secondaryOnly.targets[1].id = "secondary"
+			secondaryOnly.policy = routePolicy{mode: routeModePriorityFailover, maxTargetAttempts: 2, maxUpstreamSends: 2}
+			endpoint, _, err = explicitChatExecutionEndpoint(&secondaryOnly, nil, false)
+			if err != nil || endpoint != tc.want {
+				t.Fatalf("secondary preference: endpoint=%q err=%v, want %q", endpoint, err, tc.want)
+			}
+			for _, policy := range []routePolicy{
+				{mode: routeModePrimaryOnly, maxTargetAttempts: 2, maxUpstreamSends: 2},
+				{mode: routeModePriorityFailover, maxTargetAttempts: 1, maxUpstreamSends: 2},
+				{mode: routeModePriorityFailover, maxTargetAttempts: 2, maxUpstreamSends: 1},
+			} {
+				secondaryOnly.policy = policy
+				endpoint, _, err = explicitChatExecutionEndpoint(&secondaryOnly, nil, false)
+				want := providerEndpointChatCompletions
+				if !secondaryOnly.supportsEndpoint(want) {
+					want = providerEndpointResponses
+				}
+				if err != nil || endpoint != want {
+					t.Fatalf("unreachable backup: policy=%+v endpoint=%q err=%v, want %q", policy, endpoint, err, want)
+				}
+			}
+			if tc.want == providerEndpointResponses {
+				rec := httptest.NewRecorder()
+				h.HandleOpenAIChatCompletions(rec, httptest.NewRequest(http.MethodPost, providerEndpointChatCompletions,
+					strings.NewReader(`{"model":"public-mai","messages":[{"role":"user","content":"ping"}]}`)))
+				if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "answered by Luna") {
+					t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+				}
+			}
+		})
 	}
 }
 
@@ -954,7 +1114,7 @@ func TestPolicyResponsesReplayPreservesPowerfulTierWhenRoutesShareTerminal(t *te
 		t.Fatal(err)
 	}
 
-	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, body, nil)
+	route, tier, err := controller.resolvePolicyResponsesReplayRoute(profile, profile.captureTierRoutes(), body, nil)
 	if err != nil {
 		t.Fatalf("resolvePolicyResponsesReplayRoute() error = %v", err)
 	}

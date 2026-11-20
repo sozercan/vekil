@@ -832,6 +832,19 @@ func observeUpstreamHeaders(ctx context.Context, headers http.Header) {
 	}
 }
 
+// observeResponseProvider attributes the summary to the provider that served
+// resp. It can differ from the owner resolved before dispatch when a catalog
+// refresh discovers the model on another provider.
+func observeResponseProvider(ctx context.Context, resp *http.Response) {
+	route, ok := providerRouteFromResponse(resp)
+	if !ok {
+		return
+	}
+	if summary := RequestSummaryFromContext(ctx); summary != nil {
+		summary.setProvider(route.id, route.kind)
+	}
+}
+
 func observeChatExecutionRoute(ctx context.Context, result chatExecutionResult) {
 	summary := RequestSummaryFromContext(ctx)
 	if summary == nil || result.route.provider == nil {
