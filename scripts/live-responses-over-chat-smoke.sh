@@ -48,7 +48,7 @@ trap cleanup EXIT
 
 INBOUND_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 (umask 077; printf 'Authorization: Bearer %s\n' "${INBOUND_TOKEN}" >"${WORK_DIR}/auth.header")
-proxy_curl() { curl -H "@${WORK_DIR}/auth.header" "$@"; }
+proxy_curl() { curl -q --noproxy 127.0.0.1 -H "@${WORK_DIR}/auth.header" "$@"; }
 
 log "starting isolated proxy on ${BASE} (opt-in: ${MODEL})"
 INBOUND_AUTH_TOKEN="${INBOUND_TOKEN}" \
@@ -58,7 +58,7 @@ INBOUND_AUTH_TOKEN="${INBOUND_TOKEN}" \
 PROXY_PID=$!
 
 deadline=$((SECONDS + STARTUP_TIMEOUT))
-until curl -fsS -m 5 "${BASE}/readyz" >/dev/null 2>&1; do
+until proxy_curl -fsS -m 5 "${BASE}/readyz" >/dev/null 2>&1; do
   kill -0 "${PROXY_PID}" 2>/dev/null || { tail -20 "${WORK_DIR}/proxy.log" >&2; die "proxy exited during startup"; }
   (( SECONDS < deadline )) || die "proxy was not ready within ${STARTUP_TIMEOUT}s"
   sleep 1
