@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -39,8 +40,20 @@ const passthroughStreamingRequest = `{"model":"public-model","stream":true,"inpu
 
 func TestResponsesStreamPassthroughOpaque429(t *testing.T) {
 	const canary = "opaque-fixture-marker"
-	for _, delay := range []string{"0", "1", "Fri, 31 Dec 2094 23:59:59 GMT", "", canary} {
-		t.Run(delay, func(t *testing.T) {
+	const date = "Fri, 31 Dec 2094 23:59:59 GMT"
+	for _, timing := range []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"zero", []string{"0"}, []string{"0"}},
+		{"delay", []string{"1"}, []string{"1"}},
+		{"date", []string{date}, []string{date}},
+		{"missing", nil, nil},
+		{"invalid", []string{canary}, nil},
+		{"duplicate", []string{canary, "30", "10"}, []string{"30"}},
+	} {
+		t.Run(timing.name, func(t *testing.T) {
 			var sends atomic.Int32
 			h := passthroughTestHandler(t, true, func(r *http.Request) (*http.Response, error) {
 				sends.Add(1)
@@ -53,8 +66,8 @@ func TestResponsesStreamPassthroughOpaque429(t *testing.T) {
 					"X-Request-Id":        {canary},
 					"X-Codex-Turn-State":  {canary},
 				}
-				if delay != "" {
-					hdr.Set("Retry-After", delay)
+				if len(timing.in) != 0 {
+					hdr["Retry-After"] = timing.in
 				}
 				return routeExecutorTestResponse(r, 429, hdr, canary+"\n"), nil
 			})
@@ -67,11 +80,7 @@ func TestResponsesStreamPassthroughOpaque429(t *testing.T) {
 				body.Error.Message != "Upstream rate limit exceeded." || strings.Contains(w.Body.String(), canary) {
 				t.Fatalf("want one send and fixed JSON rejection, got %d sends, HTTP %d", sends.Load(), w.Code)
 			}
-			wantDelay := delay
-			if wantDelay == canary {
-				wantDelay = ""
-			}
-			if w.Header().Get("Retry-After") != wantDelay ||
+			if !slices.Equal(w.Header().Values("Retry-After"), timing.want) ||
 				strings.Join(w.Header().Values("Retry-After-Ms"), ",") != "45000.5" ||
 				w.Header().Get("X-Ms-Retry-After-Ms") != "10000" {
 				t.Error("did not preserve only the valid delay fields")
@@ -163,9 +172,10 @@ func TestResponsesStreamPassthroughQueuedCancellation(t *testing.T) {
 				}
 			})
 			done := make(chan struct{})
+			var status int
 			go func() {
 				defer close(done)
-				passthroughTestRequest(ctx, h, passthroughStreamingRequest)
+				status = passthroughTestRequest(ctx, h, passthroughStreamingRequest).Code
 			}()
 			defer func() {
 				close(release)
@@ -188,8 +198,34 @@ func TestResponsesStreamPassthroughQueuedCancellation(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("physical request outlived caller while still queued")
 			}
+			if status != 499 {
+				t.Fatalf("want HTTP 499 for caller cancellation, got %d", status)
+			}
 			if sends.Load() != 0 {
 				t.Fatal("queued request dispatched after revocation")
+			}
+		})
+	}
+}
+
+func TestResponsesStreamPassthroughDeadlineAttribution(t *testing.T) {
+	h := &ProxyHandler{log: logger.NewWithWriter(logger.LevelFatal, io.Discard)}
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(t.Context())
+	for _, test := range []struct {
+		name       string
+		cause      error
+		wantStatus int
+	}{
+		{"caller deadline fires upstream first", errResponsesCallerDeadline, 499},
+		{"proxy inference deadline", context.DeadlineExceeded, http.StatusBadGateway},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstream, cancel := context.WithDeadlineCause(t.Context(), time.Now().Add(-time.Second), test.cause)
+			defer cancel()
+			w := httptest.NewRecorder()
+			h.writeResponsesUpstreamRequestFailure(w, request, upstream, "responses", upstream.Err())
+			if w.Code != test.wantStatus {
+				t.Fatalf("want HTTP %d, got %d", test.wantStatus, w.Code)
 			}
 		})
 	}

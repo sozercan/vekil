@@ -503,6 +503,89 @@ model_routes:
 	}
 }
 
+func TestLoadProvidersConfigFileResponsesStreamPassthrough(t *testing.T) {
+	for _, fixture := range []struct{ ext, body string }{
+		{"json", `{
+  "schema_version": 2,
+  "providers": [{"id":"azure","type":"azure-openai","base_url":"https://x.openai.azure.com/openai/v1","api_key":"test-key"}],
+  "model_routes": [{
+    "id":"gpt-route", "public_id":"gpt-public", "endpoints":["/responses"],
+    "targets":[{"id":"primary","provider":"azure","upstream_model":"deployment"}],
+    "responses_stream_passthrough": true
+  }]
+}`},
+		{"yaml", `schema_version: 2
+providers:
+  - id: azure
+    type: azure-openai
+    base_url: https://x.openai.azure.com/openai/v1
+    api_key: test-key
+model_routes:
+  - id: gpt-route
+    public_id: gpt-public
+    endpoints: [/responses]
+    targets:
+      - id: primary
+        provider: azure
+        upstream_model: deployment
+    responses_stream_passthrough: true
+`},
+	} {
+		t.Run(fixture.ext, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "providers."+fixture.ext)
+			if err := os.WriteFile(path, []byte(fixture.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadProvidersConfigFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := &ProxyHandler{}
+			setup, err := h.buildConfiguredProviderSetupWithDynamicValidation(t.Context(), cfg, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			route, ok := setup.lookupRoute("gpt-public")
+			if !ok || !route.responsesStreamPassthrough || route.policy.maxUpstreamSends != 1 {
+				t.Fatal("expected a compiled one-send route with Responses stream passthrough enabled")
+			}
+		})
+	}
+}
+
+func TestValidateModelRoutesResponsesStreamPassthrough(t *testing.T) {
+	const field = "model_routes[0].responses_stream_passthrough"
+	for _, test := range []struct {
+		name   string
+		mutate func(*ProvidersConfig)
+		want   string
+	}{
+		{"schema v1", func(cfg *ProvidersConfig) { cfg.SchemaVersion = 1 }, "model_routes: requires schema_version: 2"},
+		{"non-Azure", func(cfg *ProvidersConfig) {
+			cfg.Providers[0] = ProviderConfig{ID: "azure", Type: "openai-compatible", BaseURL: "https://example.test/v1", AuthType: "none"}
+		}, "responses_stream_passthrough requires an azure-openai target"},
+		{"internal", func(cfg *ProvidersConfig) {
+			cfg.ModelRoutes[0].Exposure = modelRouteExposureInternal
+			cfg.ModelRoutes[0].PublicID = ""
+		}, field},
+		{"mixed endpoints", func(cfg *ProvidersConfig) {
+			cfg.ModelRoutes[0].Endpoints = append(cfg.ModelRoutes[0].Endpoints, providerEndpointChatCompletions)
+		}, field},
+		{"multiple targets", func(cfg *ProvidersConfig) { cfg.ModelRoutes[0].Targets = makeTargets(2) }, field},
+		{"failover", func(cfg *ProvidersConfig) { cfg.ModelRoutes[0].Routing.Mode = string(routeModePriorityFailover) }, field},
+		{"multiple sends", func(cfg *ProvidersConfig) { cfg.ModelRoutes[0].Routing.MaxUpstreamSends = 2 }, field},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validAzureRouteConfig()
+			cfg.ModelRoutes[0].ResponsesStreamPassthrough = true
+			test.mutate(&cfg)
+			if err := ValidateProvidersConfig(cfg); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validation error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestValidateModelRoutesPathSpecificErrors(t *testing.T) {
 	zero := int64(0)
 

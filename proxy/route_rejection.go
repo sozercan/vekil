@@ -40,10 +40,13 @@ func (c *capturedRouteResponse) safePlaintextRateLimit(derivedDelay string) *cap
 			value := strings.TrimSpace(raw)
 			switch name {
 			case "Retry-After":
+				if headers.Get(name) != "" {
+					continue
+				}
 				if value != "" && strings.Trim(value, "0123456789") == "" {
-					headers.Add(name, value)
+					headers.Set(name, value)
 				} else if at, err := http.ParseTime(value); err == nil {
-					headers.Add(name, at.UTC().Format(http.TimeFormat))
+					headers.Set(name, at.UTC().Format(http.TimeFormat))
 				}
 			case "Retry-After-Ms", "X-Ms-Retry-After-Ms":
 				if decimalRetryMilliseconds.MatchString(value) {

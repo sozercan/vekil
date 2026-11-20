@@ -254,11 +254,14 @@ func (h *ProxyHandler) postPreparedResponsesRequestWithValidation(ctx context.Co
 	return h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
 }
 
+var errResponsesCallerDeadline = fmt.Errorf("responses caller deadline: %w", context.DeadlineExceeded)
+
 func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, endpoint string, err error) {
 	if h.handleShutdownError(w, r, upstreamCtx, err) {
 		return
 	}
-	if r != nil && r.Context().Err() != nil && errors.Is(err, context.Canceled) {
+	callerDeadline := upstreamCtx != nil && context.Cause(upstreamCtx) == errResponsesCallerDeadline && errors.Is(err, context.DeadlineExceeded)
+	if callerDeadline || (r != nil && r.Context().Err() != nil && errors.Is(err, context.Canceled)) {
 		// The client closed the request before any provider outcome, for
 		// example by interrupting an agent. Record the client-first abort as
 		// 499, as the websocket bridge does, rather than an upstream failure.
@@ -355,7 +358,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		if deadline, ok := r.Context().Deadline(); ok {
 			var cancelDeadline context.CancelFunc
-			upstreamCtx, cancelDeadline = context.WithDeadline(upstreamCtx, deadline)
+			upstreamCtx, cancelDeadline = context.WithDeadlineCause(upstreamCtx, deadline, errResponsesCallerDeadline)
 			defer cancelDeadline()
 		}
 	}
