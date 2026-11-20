@@ -57,6 +57,8 @@ type modelRoute struct {
 	exposure        string
 	internalPurpose string
 	legacy          bool
+
+	responsesStreamPassthrough bool
 }
 
 func (r *modelRoute) isPublic() bool {

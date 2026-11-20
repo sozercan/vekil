@@ -213,6 +213,23 @@ vekil config validate --live --providers-config /path/to/providers.yaml
 - Explicit routes do not nest the broad legacy same-target transport retry loop inside each target. Version-1 and compiled legacy routes retain their existing retry behavior, and the existing `retries` metric continues to describe those same-target retries.
 - Size `max_upstream_sends` for every reachable child send, not just normal targets. Responses compaction/replay, encrypted-content cleanup, stream-options recovery, and compatibility-model recovery all draw from the same route operation; the route cap can stop them before their own local fanout/recovery limit.
 
+For a client that retries rejected Responses POSTs, `model_routes[].responses_stream_passthrough: true`
+requires a public `/responses`-only route with one `azure-openai` target, `primary_only`
+routing and one upstream send. Opt-in applies to direct HTTP streaming Responses only.
+It preserves upstream HTTP 200 and relays terminal SSE errors, including first-frame
+rate limits, without turning them into retryable HTTP errors. A raw HTTP 429 with
+incomplete or contradictory execution evidence must not authorize client replay.
+When the adapter certifies a complete plaintext 429, the client gets a fixed
+JSON `rate_limit_exceeded` error and validated retry timing instead of the
+upstream text, IDs or arbitrary headers. A normal JSON rejection still goes
+through the durable state checks.
+Direct non-streaming requests and proxy compaction triggers on this route are rejected
+before dispatch. Cancelling the caller also cancels the physical request, so a
+downstream queue observing its context can discard it before dispatch. Cancellation
+does not prove an already-dispatched request was rejected or authorize replay.
+Translated protocols, websocket requests and other routes keep their
+existing behavior. This is not a token budget or an admission guarantee.
+
 One total inference deadline is shared across all attempts. It is not restarted per target, and the initial behavior does not allocate a smaller timeout to a hanging primary. Redirects and implicit transport body replay are disabled for inference sends so the send budget matches actual dispatches and credentials cannot follow redirects.
 
 Explicit Azure routes can retry an authoritative, fully cleaned-up `429` on the same target after a valid provider reset. This includes certified Responses stream admission failures and complete non-streaming `status: "failed"` JSON envelopes within the 4 KiB inspection limit. Neither may contain semantic output or reported usage. HTTP rejection bodies must also pass this check; malformed or duplicate-key JSON, truncated bodies, and read failures cannot authorize another send. Plain-text HTTP `429` admission errors retain their existing retry behavior. The request body and provider-owned state remain intact. An eligible configured failover target takes priority; a pinned operation, `primary_only` route, or last eligible Azure target can instead use remaining sends on its current target. This recovery applies to normal inference attempts, including later pinned websocket turns; it does not add retry loops inside compaction or protocol-recovery child calls. Missing reset data, ambiguous delivery, semantic/tool progress, and an exhausted deadline or send budget prevent another send.

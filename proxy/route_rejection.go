@@ -5,9 +5,61 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
+
+var decimalRetryMilliseconds = regexp.MustCompile(`^\+?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
+
+func (c *capturedRouteResponse) hasPlaintextBody() bool {
+	media, _, _ := strings.Cut(boundedSingleHeaderValue(c.header, "Content-Type"), ";")
+	if !strings.EqualFold(strings.TrimSpace(media), "text/plain") || !utf8.Valid(c.body) {
+		return false
+	}
+	for _, enc := range c.header.Values("Content-Encoding") {
+		if !strings.EqualFold(strings.TrimSpace(enc), "identity") {
+			return false
+		}
+	}
+	return bytes.IndexFunc(c.body, func(r rune) bool {
+		return unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t'
+	}) < 0
+}
+
+// For a certified plaintext 429 only. Construct the client response from
+// scratch: neither opaque text nor provider state or diagnostic headers
+// establish an identity that it is safe to expose.
+func (c *capturedRouteResponse) safePlaintextRateLimit(derivedDelay string) *capturedRouteResponse {
+	headers := http.Header{"Content-Type": {"application/json"}}
+	for name, values := range c.header {
+		name = http.CanonicalHeaderKey(name)
+		for _, raw := range values {
+			value := strings.TrimSpace(raw)
+			switch name {
+			case "Retry-After":
+				if value != "" && strings.Trim(value, "0123456789") == "" {
+					headers.Add(name, value)
+				} else if at, err := http.ParseTime(value); err == nil {
+					headers.Add(name, at.UTC().Format(http.TimeFormat))
+				}
+			case "Retry-After-Ms", "X-Ms-Retry-After-Ms":
+				if decimalRetryMilliseconds.MatchString(value) {
+					headers.Add(name, value)
+				}
+			}
+		}
+	}
+	if headers.Get("Retry-After") == "" && derivedDelay != "" {
+		headers.Set("Retry-After", derivedDelay) // normalized delay-seconds
+	}
+	return &capturedRouteResponse{
+		statusCode: http.StatusTooManyRequests, header: headers, request: c.request,
+		body: []byte(`{"error":{"code":"rate_limit_exceeded","message":"Upstream rate limit exceeded."}}`),
+	}
+}
 
 func routeHTTPRejectionBodyAllowsReplay(response *capturedRouteResponse) bool {
 	if routeResponseBodyAllowsReplay(response.body) {
