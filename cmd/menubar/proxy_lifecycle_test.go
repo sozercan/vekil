@@ -15,6 +15,8 @@ type fakeMenubarProxyServer struct {
 
 func (s *fakeMenubarProxyServer) Start() error { return nil }
 
+func (s *fakeMenubarProxyServer) Done() <-chan error { return nil }
+
 func (s *fakeMenubarProxyServer) UsesCopilot() bool { return s.usesCopilot }
 
 func (s *fakeMenubarProxyServer) ValidateDynamicProviderModels(context.Context) error { return nil }
@@ -40,16 +42,12 @@ func TestMenubarProxyLifecycleCancelStartup(t *testing.T) {
 	if !ok {
 		t.Fatal("beginStartup() = false, want true")
 	}
-	if inFlight, canceled := lifecycle.startupState(); !inFlight || canceled {
-		t.Fatalf("startupState() = (%v, %v), want (true, false)", inFlight, canceled)
-	}
+	checkTrayStatus(t, &lifecycle, trayStarting)
 
 	if !lifecycle.cancelStartup(false) {
 		t.Fatal("cancelStartup() = false, want true")
 	}
-	if inFlight, canceled := lifecycle.startupState(); !inFlight || !canceled {
-		t.Fatalf("startupState() after cancel = (%v, %v), want (true, true)", inFlight, canceled)
-	}
+	checkTrayStatus(t, &lifecycle, trayStopping)
 	select {
 	case <-ctx.Done():
 	case <-t.Context().Done():
@@ -118,9 +116,10 @@ func TestMenubarProxyLifecycleCanceledStartupBlocksReplacementUntilCleanup(t *te
 	if !lifecycle.isRunning() {
 		t.Fatal("current startup did not publish the running server")
 	}
-	if got := lifecycle.detachServer(); got != second {
-		t.Fatalf("detachServer() = %p, want %p", got, second)
+	if got := lifecycle.beginStop(nil); got != second {
+		t.Fatalf("beginStop(nil) = %p, want %p", got, second)
 	}
+	lifecycle.finishStop()
 }
 
 func TestMenubarProxyLifecycleShutdownCancelsStartupAndRejectsCompletion(t *testing.T) {
@@ -151,6 +150,8 @@ type blockingPolicyMenubarServer struct {
 }
 
 func (s *blockingPolicyMenubarServer) Start() error { return nil }
+
+func (s *blockingPolicyMenubarServer) Done() <-chan error { return nil }
 
 func (s *blockingPolicyMenubarServer) UsesCopilot() bool { return false }
 

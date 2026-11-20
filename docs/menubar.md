@@ -34,7 +34,8 @@ Release asset and updater-secret details live in [Development](development.md#re
 ## Menu Features
 
 - start/stop the proxy; while authentication or policy preflight is running, the item changes to **Cancel Starting Vekil** so startup can be aborted without blocking Quit or other tray events
-- status icon and tooltip for running/stopped state
+- on macOS, the robot adapts to light and dark menu bars, including light wallpaper in Dark Mode, and dims when the proxy is stopped
+- tooltip showing whether the local proxy is running, starting, stopping, or stopped
 - **Open Dashboard** — opens the live [traffic dashboard](dashboard.md) in your browser (enabled while Vekil is running)
 - current app version
 - choose and persist a providers config file
