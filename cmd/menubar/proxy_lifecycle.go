@@ -12,6 +12,7 @@ type menubarProxyServer interface {
 	InitializePolicyRouting(context.Context) error
 	Stop(context.Context) error
 	IsRunning() bool
+	Done() <-chan error
 }
 
 type proxyStartupCompletion uint8
@@ -34,6 +35,7 @@ type menubarProxyLifecycle struct {
 	startupCanceled     bool
 	restartAfterStartup bool
 	startupGeneration   uint64
+	stopping            bool
 	shuttingDown        bool
 }
 
@@ -45,14 +47,8 @@ func (l *menubarProxyLifecycle) beginStartup(parent context.Context) (context.Co
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.shuttingDown || l.startupCancel != nil {
+	if l.shuttingDown || l.startupCancel != nil || l.server != nil || l.stopping {
 		return nil, 0, false
-	}
-	if l.server != nil {
-		if l.server.IsRunning() {
-			return nil, 0, false
-		}
-		l.server = nil
 	}
 
 	ctx, cancel := context.WithCancel(parent)
@@ -105,12 +101,6 @@ func (l *menubarProxyLifecycle) finishStartup(generation uint64, started menubar
 	return proxyStartupCurrent, false
 }
 
-func (l *menubarProxyLifecycle) startupState() (inFlight, canceled bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.startupCancel != nil, l.startupCanceled
-}
-
 func (l *menubarProxyLifecycle) isRunning() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -123,13 +113,23 @@ func (l *menubarProxyLifecycle) usesCopilot() bool {
 	return l.server != nil && l.server.UsesCopilot()
 }
 
-func (l *menubarProxyLifecycle) detachServer() menubarProxyServer {
+func (l *menubarProxyLifecycle) beginStop(expected menubarProxyServer) menubarProxyServer {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	current := l.server
+	if current == nil || (expected != nil && current != expected) {
+		return nil
+	}
 	l.server = nil
+	l.stopping = true
 	return current
+}
+
+func (l *menubarProxyLifecycle) finishStop() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.stopping = false
 }
 
 func (l *menubarProxyLifecycle) shutdown() menubarProxyServer {

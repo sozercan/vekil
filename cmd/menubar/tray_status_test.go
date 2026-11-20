@@ -40,10 +40,49 @@ func TestTrayStatusLifecycle(t *testing.T) {
 			checkTrayStatus(t, &lifecycle, want)
 			// repeated session refreshes must not depend on authentication.
 			checkTrayStatus(t, &lifecycle, want)
-			lifecycle.detachServer()
-			checkTrayStatus(t, &lifecycle, trayStopped)
 		})
 	}
+}
+
+func TestTrayStatusWhileServerStops(t *testing.T) {
+	current := &fakeMenubarProxyServer{running: true}
+	lifecycle := menubarProxyLifecycle{server: current}
+	checkTrayStatus(t, &lifecycle, trayRunning)
+	if got := lifecycle.beginStop(nil); got != current {
+		t.Fatalf("beginStop(nil) = %v, want current server", got)
+	}
+	checkTrayStatus(t, &lifecycle, trayStopping)
+	if _, _, ok := lifecycle.beginStartup(t.Context()); ok {
+		t.Fatal("startup accepted before the previous server finished stopping")
+	}
+	if got := lifecycle.beginStop(current); got != nil {
+		t.Fatal("listener exit claimed a server already stopping")
+	}
+	lifecycle.finishStop()
+	checkTrayStatus(t, &lifecycle, trayStopped)
+}
+
+func TestTrayStatusAfterUnexpectedListenerExit(t *testing.T) {
+	exited := &fakeMenubarProxyServer{}
+	lifecycle := menubarProxyLifecycle{server: exited}
+	if _, _, ok := lifecycle.beginStartup(t.Context()); ok {
+		t.Fatal("startup discarded the exited server before cleanup")
+	}
+	if got := lifecycle.beginStop(exited); got != exited {
+		t.Fatalf("beginStop(exited) = %v, want exited server", got)
+	}
+	lifecycle.finishStop()
+	checkTrayStatus(t, &lifecycle, trayStopped)
+
+	_, generation, ok := lifecycle.beginStartup(t.Context())
+	if !ok {
+		t.Fatal("startup rejected after cleanup")
+	}
+	lifecycle.finishStartup(generation, &fakeMenubarProxyServer{running: true})
+	if got := lifecycle.beginStop(exited); got != nil {
+		t.Fatal("stale listener exit claimed the replacement server")
+	}
+	checkTrayStatus(t, &lifecycle, trayRunning)
 }
 
 func TestTrayStatusIgnoresSupersededStartup(t *testing.T) {

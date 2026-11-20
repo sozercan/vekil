@@ -37,6 +37,9 @@ func (l *menubarProxyLifecycle) trayStatus() trayStatus {
 	if l.shuttingDown {
 		return trayStopped
 	}
+	if l.stopping {
+		return trayStopping
+	}
 	if l.startupCancel != nil {
 		if l.startupCanceled {
 			return trayStopping
@@ -49,14 +52,9 @@ func (l *menubarProxyLifecycle) trayStatus() trayStatus {
 	return trayStopped
 }
 
-var trayStatusMu sync.Mutex
 var trayIconWarning sync.Once
 
-func refreshTrayStatus() {
-	// snapshot after acquiring the rendering lock so an older caller cannot
-	// overwrite the icon with a state captured before a newer transition.
-	trayStatusMu.Lock()
-	defer trayStatusMu.Unlock()
+func refreshTrayStatus() trayStatus {
 	status := proxyLifecycle.trayStatus()
 	if err := renderTrayStatus(status); err != nil {
 		trayIconWarning.Do(func() {
@@ -64,4 +62,5 @@ func refreshTrayStatus() {
 		})
 	}
 	systray.SetTooltip(status.tooltip())
+	return status
 }
