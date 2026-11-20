@@ -164,7 +164,7 @@ Chat-compatible public surfaces use a deep Chat execution module at the provider
 
 The implementation boundary is concentrated in `proxy/chat_execution.go`, `proxy/chat_route*.go`, `proxy/chat_over_responses_*.go`, `proxy/responses_chat_*.go`, and `proxy/chat_stream_events.go`. Public-protocol handlers consume canonical Chat results and do not learn Responses item or event shapes.
 
-Native `/chat/completions` is always preferred when a model supports both native endpoints. A Responses-backed Chat request uses a captured immutable provider/model route and low-level `/responses` transport; it never calls the public Responses handler, compaction path, websocket bridge, lineage reset, or Responses optimizer pipeline. Provider model endpoint metadata remains native and is not expanded with emulated Chat support.
+Native `/chat/completions` is preferred when a model supports both native endpoints, except for discovered GitHub Copilot `Microsoft`/`Experimental` catalog entries that advertise `/responses`. A Responses-backed Chat request uses a captured immutable provider/model route and low-level `/responses` transport; it never calls the public Responses handler, compaction path, websocket bridge, lineage reset, or Responses optimizer pipeline. Provider model endpoint metadata remains native and is not expanded with emulated Chat support.
 
 Phase 0 compared two post-Responses-decoding stream transports with 10,000 text deltas and eight interleaved function calls:
 

@@ -340,7 +340,7 @@ configuration migration in either direction. See
 
 ### Native endpoints and Chat compatibility
 
-For canonical Chat requests, Vekil first prefers native `/chat/completions` when both provider policy and the selected model or explicit-route allowlist permit it. If native Chat is unavailable but native `/responses` is allowed, Vekil executes the request through its Chat-over-Responses adapter. This makes these public compatibility surfaces available to a Responses-native model without changing provider ownership:
+For canonical Chat requests, Vekil prefers native `/chat/completions` when both provider policy and the selected model or explicit-route allowlist permit it, except for discovered GitHub Copilot `Microsoft`/`Experimental` catalog entries that advertise `/responses` (see [`POST /v1/chat/completions`](api.md#post-v1chatcompletions-openai)). This preference also applies to pinned explicit-route targets, policy destinations, and policy classifiers, within each route's native endpoint allowlist. If native Chat is unavailable (or bypassed by that Copilot vendor exception) and native `/responses` is allowed, Vekil executes the request through its Chat-over-Responses adapter. This makes these public compatibility surfaces available to a Responses-native model without changing provider ownership:
 
 - `POST /v1/chat/completions`;
 - translated `POST /v1/messages` and `/v1/messages/count_tokens`;

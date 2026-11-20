@@ -8,9 +8,9 @@ For an explicit `model_routes` entry, Vekil returns one proxy-owned `X-Vekil-Req
 
 Schema-v2 policy public IDs use the same bounded canonical Chat policy planner on this endpoint. The translated request must remain text/function-tool compatible; public responses and errors retain the policy ID.
 
-Anthropic Messages compatibility for the supported content and tool subset. Except for direct `anthropic-compatible` forwarding, requests are translated to canonical OpenAI Chat Completions, resolved through the route that owns the selected public model, executed by Vekil's shared Chat layer, and translated back to Anthropic. Native `/chat/completions` is preferred when allowed; otherwise a native `/responses` model is served through Chat-over-Responses. For `anthropic-compatible` providers, Vekil forwards Messages requests directly to the configured `messages_path`. An explicit route can switch only among its ordered equivalent targets and only before an Anthropic protocol preamble or semantic block is committed.
+Anthropic Messages compatibility for the supported content and tool subset. Except for direct `anthropic-compatible` forwarding, requests are translated to canonical OpenAI Chat Completions, resolved through the route that owns the selected public model, executed by Vekil's shared Chat layer, and translated back to Anthropic. Native `/chat/completions` is preferred when allowed (except for discovered GitHub Copilot `Microsoft`/`Experimental` catalog entries that advertise `/responses`; see [`POST /v1/chat/completions`](#post-v1chatcompletions-openai)); otherwise a native `/responses` model is served through Chat-over-Responses. For `anthropic-compatible` providers, Vekil forwards Messages requests directly to the configured `messages_path`. An explicit route can switch only among its ordered equivalent targets and only before an Anthropic protocol preamble or semantic block is committed.
 
-The native-Chat path supports the existing text/image/tool-use subset, system messages, tool choice, stop sequences, extended thinking via `thinking.type: "enabled"`, and streaming Anthropic SSE translation. Extended thinking preserves `max_tokens` as the hard per-response limit. An interleaved thinking budget may exceed that limit only with the exact interleaved-thinking beta, active tools, and omitted or `auto` tool choice; forced `any` or named-tool choices are rejected with thinking. When the selected model is Responses-native, the translated request must also fit the strict [Responses-backed Chat field subset](#responses-backed-chat-request-subset). In particular, non-empty Anthropic `stop_sequences` are rejected because the initial adapter does not emulate stop sequences locally.
+The native-Chat path supports the existing text/image/tool-use subset, system messages, tool choice, stop sequences, extended thinking via `thinking.type: "enabled"`, and streaming Anthropic SSE translation. Extended thinking preserves `max_tokens` as the hard per-response limit. An interleaved thinking budget may exceed that limit only with the exact interleaved-thinking beta, active tools, and omitted or `auto` tool choice; forced `any` or named-tool choices are rejected with thinking. When the selected model is Responses-native, the translated request must also fit the strict [Responses-backed Chat field subset](#responses-backed-chat-request-subset). In particular, non-empty Anthropic `stop_sequences` are rejected because the initial adapter does not emulate stop sequences locally, unless an explicit `drop_stop_sequences: true` Chat policy removes them before conversion.
 
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
@@ -94,7 +94,7 @@ Supported operations:
 - `streamGenerateContent`
 - `countTokens`
 
-Gemini compatibility is a translation layer over canonical Chat Completions. For explicit routes, target selection and any safe failover stay inside the route that owns the requested public model. The translated request may use native `/chat/completions` or native `/responses`, with native Chat preferred when both are available. See [Gemini Compatibility](gemini.md) for the Responses-native restrictions, route commitment rules, ignored fields, explicit `501 UNIMPLEMENTED` cases, validation behavior, and streaming details.
+Gemini compatibility is a translation layer over canonical Chat Completions. For explicit routes, target selection and any safe failover stay inside the route that owns the requested public model. The translated request may use native `/chat/completions` or native `/responses`, following the [`POST /v1/chat/completions` backend selection order](#post-v1chatcompletions-openai). See [Gemini Compatibility](gemini.md) for the Responses-native restrictions, route commitment rules, ignored fields, explicit `501 UNIMPLEMENTED` cases, validation behavior, and streaming details.
 
 ## `POST /v1/chat/completions` (OpenAI)
 
@@ -106,9 +106,10 @@ Physical failover remains inside the selected terminal route. A failed lightweig
 
 Vekil resolves the public model once and chooses its native backend:
 
-1. use native `/chat/completions` when the provider and model allow it;
-2. otherwise use native `/responses` and convert the request and result through the Chat-over-Responses adapter;
-3. reject the request locally when neither native endpoint is allowed.
+1. use native `/responses` when a discovered GitHub Copilot catalog entry with vendor `Microsoft` or `Experimental` explicitly advertises `/responses` (matching VS Code Copilot Chat for models such as `mai-code-2` that list both endpoints while serving only `/responses`);
+2. otherwise use native `/chat/completions` when the provider and model allow it;
+3. otherwise use native `/responses` and convert the request and result through the Chat-over-Responses adapter;
+4. reject the request locally when neither native endpoint is allowed.
 
 Provider policy plus the selected model's or explicit route's native endpoint allowlist control this choice. A `/responses`-only model is served through the adapter rather than probed at an unsupported Chat path; Vekil fails locally with `400` only when neither native endpoint is allowed. Explicit route targets remain ordered and bounded by the route's target-attempt and upstream-send budgets.
 
@@ -145,7 +146,7 @@ Additional rules:
 - `tool_choice` accepts `none`, `auto`, `required`, or a declared named function.
 - Message content supports text and ordered content parts. HTTP(S) images and base64 image data URLs are accepted only in user messages.
 - Only function tools are supported. Hosted Responses tools such as web search, computer use, code execution, image generation, and other non-function tool types are not available through Chat compatibility.
-- Vekil does not implement local stop matching in this release. Non-empty `stop` fails with `400 invalid_request_error`, `param: "stop"`.
+- Vekil does not implement local stop matching in this release. Non-empty `stop` fails with `400 invalid_request_error`, `param: "stop"`. An explicit `drop_stop_sequences: true` Chat policy removes it before Responses conversion, including translated Anthropic `stop_sequences`; direct `/responses` requests are unaffected.
 - Unknown top-level fields and explicitly unsupported subset fields fail with `400 invalid_request_error` and the relevant field in `error.param`.
 - When Chat `store` is omitted or `null`, Vekil sends `store: false` so routing through Responses preserves Chat's non-storage default. An explicit `store: true` is preserved.
 - Vekil internally requests `reasoning.encrypted_content` so storage-disabled reasoning/tool turns remain statelessly replayable; this internal include is not a public Chat field.

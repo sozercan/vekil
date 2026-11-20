@@ -372,8 +372,8 @@ func TestExplicitRouteOperationAdmissionCoversUnsupportedEndpoints(t *testing.T)
 		},
 		{
 			name:         "Gemini",
-			providerKind: providerTypeOpenAICompatible,
-			endpoints:    []string{providerEndpointResponses},
+			providerKind: providerTypeAnthropicCompatible,
+			endpoints:    []string{providerEndpointMessages},
 			path:         "/v1beta/models/public-model:countTokens",
 			body:         `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			handle:       (*ProxyHandler).HandleGeminiModels,
