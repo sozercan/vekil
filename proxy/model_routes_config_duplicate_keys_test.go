@@ -3,6 +3,8 @@ package proxy
 import (
 	"errors"
 	"net/http"
+	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
@@ -66,6 +68,15 @@ func TestRejectDuplicateJSONMappingKeysBoundsNestingDepth(t *testing.T) {
 }
 
 func TestExplicitRouteDeepRequestDuplicateKeyValidationIsLinear(t *testing.T) {
+	const childEnv = "VEKIL_DUPLICATE_KEY_ALLOCATION_TEST_CHILD"
+	if os.Getenv(childEnv) != "1" {
+		child := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestExplicitRouteDeepRequestDuplicateKeyValidationIsLinear$")
+		child.Env = append(child.Environ(), childEnv+"=1")
+		if output, err := child.CombinedOutput(); err != nil {
+			t.Fatalf("isolated duplicate-key allocation test failed: %v\n%s", err, output)
+		}
+		return
+	}
 	h, err := NewProxyHandler(auth.NewTestAuthenticator("test-token"), logger.New(logger.LevelError), WithProvidersConfig(ProvidersConfig{
 		SchemaVersion: 2,
 		StateBindings: &StateBindingsConfig{Mode: "memory"},
