@@ -1,12 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"testing"
 )
 
 func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == "app-server" && os.Getenv("MAIN_LAUNCH_HELPER_TARGET") == "codex" {
+		input := bufio.NewScanner(os.Stdin)
+		for range 3 {
+			if !input.Scan() {
+				os.Exit(1)
+			}
+		}
+		_, _ = fmt.Fprintln(os.Stdout, `{"id":2,"result":{"config":{}}}`)
+		os.Exit(0)
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
 		switch os.Getenv("MAIN_LAUNCH_HELPER_TARGET") {
 		case "codex":

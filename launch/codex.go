@@ -76,6 +76,9 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		if err := validateExecutableVersion(executable, probeEnvironment, "Codex CLI", "codex-cli", minimumVersion{major: 0, minor: 137, patch: 0}); err != nil {
 			return PreparedProcess{}, err
 		}
+		if err := checkCodexLaunchProvider(executable, probeEnvironment, codexConfigDirectory(input.ForwardedArgs)); err != nil {
+			return PreparedProcess{}, err
+		}
 	}
 
 	var catalogPath string
