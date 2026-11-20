@@ -279,8 +279,13 @@ func (h *ProxyHandler) annotateResponsesOverChatCatalog(body []byte) ([]byte, ma
 		// The marker is this proxy's own decision. Merged upstream metadata may
 		// carry one (for example from a chained Vekil), so strip it from every
 		// entry and add it back only for an eligible local opt-in.
-		_, hadMarker := fields[responsesCompatibilityCatalogField]
-		delete(fields, responsesCompatibilityCatalogField)
+		hadMarker := false
+		for key := range fields {
+			if strings.EqualFold(key, responsesCompatibilityCatalogField) {
+				delete(fields, key)
+				hadMarker = true
+			}
+		}
 		var entry struct {
 			ID                 string   `json:"id"`
 			SupportedEndpoints []string `json:"supported_endpoints"`

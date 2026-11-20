@@ -372,6 +372,9 @@ func launchResponsesOverChatOptedIn(optIn string, model launch.ModelInfo) bool {
 	if strings.TrimSpace(model.OwnedBy) == launch.PolicyModelOwner || len(model.SupportedEndpoints) == 0 {
 		return false
 	}
+	if supported := model.Capabilities.Supports.ToolCalls; supported != nil && !*supported {
+		return false
+	}
 	listed := false
 	for _, candidate := range strings.Split(optIn, ",") {
 		if strings.TrimSpace(candidate) == strings.TrimSpace(model.ID) {

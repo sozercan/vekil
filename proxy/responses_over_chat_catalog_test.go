@@ -131,8 +131,8 @@ func TestResponsesOverChatCatalogStripsUpstreamMarkers(t *testing.T) {
 	// this proxy's own eligible opt-ins may keep it.
 	body := []byte(`{"object":"list","etag":"kept","data":[
 		{"id":"gpt-native","supported_endpoints":["/chat/completions","/responses"],"vekil_responses_compatibility":"responses_over_chat"},
-		{"id":"not-opted","supported_endpoints":["/chat/completions"],"vekil_responses_compatibility":"responses_over_chat"},
-		{"id":"gemini-test","supported_endpoints":["/chat/completions"],"capabilities":{"supports":{"tool_calls":true}}}]}`)
+		{"id":"not-opted","supported_endpoints":["/chat/completions"],"VEKIL_RESPONSES_COMPATIBILITY":"responses_over_chat"},
+		{"id":"gemini-test","supported_endpoints":["/chat/completions"],"Vekil_Responses_Compatibility":"untrusted","capabilities":{"supports":{"tool_calls":true}}}]}`)
 	assertMarkers := func(t *testing.T, h *ProxyHandler, want map[string]bool) {
 		t.Helper()
 		rewritten, annotated := h.annotateResponsesOverChatCatalog(body)
@@ -147,6 +147,11 @@ func TestResponsesOverChatCatalogStripsUpstreamMarkers(t *testing.T) {
 			t.Fatalf("top-level fields were dropped: %s", rewritten)
 		}
 		for _, entry := range catalog.Data {
+			for _, variant := range []string{"VEKIL_RESPONSES_COMPATIBILITY", "Vekil_Responses_Compatibility"} {
+				if _, exists := entry[variant]; exists {
+					t.Fatalf("upstream marker spelling %q survived: %s", variant, rewritten)
+				}
+			}
 			var id string
 			_ = json.Unmarshal(entry["id"], &id)
 			_, marked := entry[responsesCompatibilityCatalogField]
@@ -172,4 +177,43 @@ func TestResponsesOverChatCatalogStripsUpstreamMarkers(t *testing.T) {
 		h := newROCHandler(t, upstream.server.URL)
 		assertMarkers(t, h, map[string]bool{"gemini-test": true})
 	})
+}
+
+func TestResponsesOverChatCatalogETagDescribesServedRepresentation(t *testing.T) {
+	const upstreamETag = `"upstream-model-version"`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if validator := r.Header.Get("If-None-Match"); validator != "" && validator != upstreamETag {
+			t.Errorf("sent public validator upstream: %q", validator)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", upstreamETag)
+		if r.Header.Get("If-None-Match") == upstreamETag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = io.WriteString(w, rocCopilotCatalog)
+	}))
+	t.Cleanup(upstream.Close)
+	off, err := NewProxyHandler(auth.NewTestAuthenticator("fixture"), logger.NewWithWriter(logger.LevelError, io.Discard), WithCopilotBaseURL(upstream.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(off.BeginShutdown)
+	on := newROCHandler(t, upstream.URL)
+	get := func(handler *ProxyHandler) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		handler.HandleModels(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		return recorder
+	}
+	plain := get(off)
+	compatible := get(on)
+	if plain.Header().Get("ETag") != upstreamETag || compatible.Header().Get("ETag") == upstreamETag || compatible.Header().Get("ETag") == "" || compatible.Body.String() == plain.Body.String() {
+		t.Fatalf("plain ETag = %q, compatible ETag = %q", plain.Header().Get("ETag"), compatible.Header().Get("ETag"))
+	}
+	if revalidated := get(on); revalidated.Header().Get("ETag") != compatible.Header().Get("ETag") || revalidated.Body.String() != compatible.Body.String() {
+		t.Fatal("upstream revalidation changed the local representation or its ETag")
+	}
 }

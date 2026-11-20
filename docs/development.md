@@ -204,7 +204,7 @@ go test ./proxy/ -run 'ResponsesOverChat|ResponsesTranslationContract|ResponsesC
 go test -race ./proxy/ -run 'ResponsesOverChat' -count=1
 ```
 
-For a live check, run `RESPONSES_OVER_CHAT_SMOKE_MODEL=<approved Chat-only model> scripts/live-responses-over-chat-smoke.sh`. It requires an explicit model (no default), starts a private proxy on a free loopback port with only that model opted in, and runs JSON, SSE, forced namespaced tool, tool-result continuation, and parallel-call turns, printing a redacted summary.
+For a live check, run `RESPONSES_OVER_CHAT_SMOKE_MODEL=<approved Chat-only model> scripts/live-responses-over-chat-smoke.sh`. It requires an explicit model (no default), starts a token-protected proxy on a free loopback port, checks adapter and Codex catalog eligibility before sending inference, and runs JSON, SSE, forced namespaced tool, tool-result continuation, and parallel-call turns, printing a redacted summary.
 
 `proxy/testdata/responses_over_chat/` holds a sanitized Copilot Gemini stream (synthetic IDs and opaque values) that preserves the real chunk shape: complete calls per chunk, `reasoning_opaque`, per-chunk usage, and `copilot_usage`.
 

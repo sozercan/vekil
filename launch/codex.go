@@ -154,6 +154,11 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 			"model endpoint compatibility (/responses) requires live /v1/models metadata",
 		)
 	}
+	if input.DryRun && overChatModel && input.Model.Capabilities.Supports.ToolCalls == nil {
+		prepared.Unresolved = append(prepared.Unresolved,
+			"Responses-over-Chat function-tool support requires live /v1/models metadata",
+		)
+	}
 	return prepared, nil
 }
 
@@ -217,7 +222,8 @@ func validateCodexForwardedArgs(args []string) error {
 }
 
 func isResponsesOverChatModel(model ModelInfo) bool {
-	return strings.TrimSpace(model.ResponsesCompatibility) == ResponsesOverChatCompatibility
+	tools := model.Capabilities.Supports.ToolCalls
+	return strings.TrimSpace(model.ResponsesCompatibility) == ResponsesOverChatCompatibility && (tools == nil || *tools)
 }
 
 func validateChatBackedCodexForwardedArgs(args []string, label string) error {
