@@ -87,8 +87,7 @@ func main() {
 }
 
 func onReady() {
-	systray.SetIcon(iconOff)
-	systray.SetTooltip("Vekil - Stopped")
+	refreshTrayStatus()
 
 	mAuthMenu = systray.AddMenuItem("GitHub Auth: Not Signed In", "GitHub authentication")
 	mSignInGitHub = mAuthMenu.AddSubMenuItem("Sign In with GitHub", "Sign in through GitHub in your browser and let Vekil manage the token")
@@ -416,9 +415,6 @@ func completeProxyStartup(generation uint64, result proxyStartResult) {
 		return
 	}
 
-	mToggle.SetTitle("Stop Vekil")
-	systray.SetIcon(iconOn)
-	systray.SetTooltip("Vekil - Running on :1337")
 	refreshSessionUI()
 	log.Info("proxy started")
 }
@@ -438,14 +434,14 @@ func cancelProxyStartupWithRestart(restart bool) bool {
 	if mDashboard != nil {
 		mDashboard.Disable()
 	}
+	refreshTrayStatus()
 	return true
 }
 
 func setProxyStartingUI() {
 	mToggle.SetTitle("Cancel Starting Vekil")
 	mToggle.Enable()
-	systray.SetIcon(iconOff)
-	systray.SetTooltip("Vekil - Starting")
+	refreshTrayStatus()
 	if mDashboard != nil {
 		mDashboard.Disable()
 	}
@@ -684,6 +680,7 @@ func applyProvidersConfigPath(path string) error {
 }
 
 func refreshSessionUI() {
+	refreshTrayStatus()
 	status := auth.AuthStatus{Source: auth.AuthSourceNone}
 	if authenticator != nil {
 		status = authenticator.Status()
@@ -704,11 +701,9 @@ func refreshSessionUI() {
 		if canceling {
 			mToggle.SetTitle("Stopping Vekil…")
 			mToggle.Disable()
-			systray.SetTooltip("Vekil - Stopping")
 		} else {
 			mToggle.SetTitle("Cancel Starting Vekil")
 			mToggle.Enable()
-			systray.SetTooltip("Vekil - Starting")
 		}
 		return
 	}
@@ -726,10 +721,10 @@ func refreshSessionUI() {
 	// Start stays available with an invalid config because it reloads the
 	// config, so fixing the file and starting again recovers.
 	mToggle.Enable()
-	if !running {
+	if running {
+		mToggle.SetTitle("Stop Vekil")
+	} else {
 		mToggle.SetTitle("Start Vekil")
-		systray.SetIcon(iconOff)
-		systray.SetTooltip("Vekil - Stopped")
 	}
 }
 
