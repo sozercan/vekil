@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -22,7 +23,9 @@ func conversationWebSocketTurn(t *testing.T, conn *websocket.Conn, fields map[st
 		t.Fatal(err)
 	}
 	for {
-		frame := mustReadWebSocketJSONSkipMetadata(t, conn)
+		// Large migration turns include durable history serialization and fsync;
+		// allow that work to complete under race instrumentation as well.
+		frame := mustReadWebSocketJSONSkipMetadata(t, conn, 10*time.Second)
 		if frame["type"] == "response.created" {
 			continue
 		}

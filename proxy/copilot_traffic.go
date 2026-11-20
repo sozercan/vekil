@@ -37,6 +37,8 @@ type copilotCooldownKey struct {
 type copilotInferenceRequest struct {
 	keys     [3]copilotCooldownKey
 	endpoint string
+	// model is the upstream model of the prepared body, after route rewrites.
+	model string
 }
 
 type copilotInferenceRequestContextKey struct{}
@@ -52,7 +54,7 @@ func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, e
 		return req
 	}
 	switch endpoint {
-	case providerEndpointChatCompletions, providerEndpointMessages, providerEndpointResponses:
+	case providerEndpointChatCompletions, providerEndpointMessages, providerEndpointResponses, copilotEndpointDecisions:
 	default:
 		return req
 	}
@@ -79,6 +81,7 @@ func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, e
 			{scope: copilotThrottleIntegration, identity: integration},
 		},
 		endpoint: endpoint,
+		model:    model,
 	}
 	return req.WithContext(context.WithValue(req.Context(), copilotInferenceRequestContextKey{}, metadata))
 }

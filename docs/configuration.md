@@ -145,7 +145,8 @@ At server startup, effective `enforce` profiles must pass live preflight before 
 ## Responses WebSocket Bridge
 
 The Codex-style `GET /v1/responses` websocket bridge is disabled by default.
-When enabled it uses upstream HTTP `/responses` by default. A separate
-`--responses-ws-native-upstream` option enables experimental native Copilot
-connections. See [Responses WebSocket Bridge](responses-websocket.md) for its
-limits, websocket flags, and compaction settings.
+When enabled it keeps native Copilot Responses connections for models that
+advertise them and uses upstream HTTP `/responses` otherwise;
+`--responses-ws-native-upstream=false` uses HTTP for every turn. See
+[Responses WebSocket Bridge](responses-websocket.md) for its limits, websocket
+flags, and compaction settings.

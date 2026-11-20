@@ -6,15 +6,16 @@ import "strings"
 // policy decision. It deliberately excludes request text, tool arguments,
 // classifier output, rationale, credentials, and physical deployment names.
 type policyDecisionRecord struct {
-	Category          string
-	FailureCategory   string
-	ActualTier        policyTier
-	ShadowTier        policyTier
-	ClassifierLatency int64
-	MessageCount      int
-	ToolCount         int
-	InputBytes        int
-	Truncated         bool
+	DownstreamReplayPassthrough bool
+	Category                    string
+	FailureCategory             string
+	ActualTier                  policyTier
+	ShadowTier                  policyTier
+	ClassifierLatency           int64
+	MessageCount                int
+	ToolCount                   int
+	InputBytes                  int
+	Truncated                   bool
 }
 
 // chatOperationPlan is the sealed logical execution snapshot produced before
@@ -160,7 +161,7 @@ func (p chatOperationPlan) allowsResponsesReplayPassthrough() bool {
 	if !p.valid() || len(p.candidates) != 1 {
 		return false
 	}
-	return p.effectiveMode == policyModeOff || p.effectiveMode == policyModeObserve
+	return p.decision.DownstreamReplayPassthrough && (p.effectiveMode == policyModeOff || p.effectiveMode == policyModeObserve)
 }
 
 func (p chatOperationPlan) routeSnapshot() *modelRoute {

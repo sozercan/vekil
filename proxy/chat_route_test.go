@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestChooseChatRoute_KnownChatOnly(t *testing.T) {
 	provider := &providerRuntime{id: "native", kind: providerTypeOpenAICompatible}
@@ -71,6 +74,143 @@ func TestChooseChatRoute_BothPrefersNativeChat(t *testing.T) {
 	}
 	if route.backend != chatBackendNativeChat || route.nativeEndpoint != providerEndpointChatCompletions {
 		t.Fatalf("route = backend %v endpoint %q, want native Chat", route.backend, route.nativeEndpoint)
+	}
+}
+
+func TestChooseChatRoute_CopilotVendorScopedResponsesPreference(t *testing.T) {
+	copilot := &providerRuntime{id: "copilot", kind: providerTypeCopilot}
+	nonCopilot := &providerRuntime{id: "other", kind: providerTypeOpenAICompatible}
+
+	for _, tc := range []struct {
+		name            string
+		provider        *providerRuntime
+		known           bool
+		preferResponses bool
+		endpoints       []string
+		wantBackend     chatBackend
+		wantEndpoint    string
+	}{
+		{
+			name:            "Copilot Experimental dual-endpoint prefers Responses",
+			provider:        copilot,
+			known:           true,
+			preferResponses: true,
+			endpoints:       []string{providerEndpointChatCompletions, providerEndpointResponses},
+			wantBackend:     chatBackendResponses,
+			wantEndpoint:    providerEndpointResponses,
+		},
+		{
+			name:            "Copilot Google/OpenAI dual-endpoint keeps native Chat",
+			provider:        copilot,
+			known:           true,
+			preferResponses: false,
+			endpoints:       []string{providerEndpointChatCompletions, providerEndpointResponses},
+			wantBackend:     chatBackendNativeChat,
+			wantEndpoint:    providerEndpointChatCompletions,
+		},
+		{
+			name:            "Copilot Microsoft Chat-only keeps native Chat",
+			provider:        copilot,
+			known:           true,
+			preferResponses: true,
+			endpoints:       []string{providerEndpointChatCompletions},
+			wantBackend:     chatBackendNativeChat,
+			wantEndpoint:    providerEndpointChatCompletions,
+		},
+		{
+			name:            "Copilot endpoint-less entry keeps native Chat",
+			provider:        copilot,
+			known:           true,
+			preferResponses: true,
+			endpoints:       nil,
+			wantBackend:     chatBackendNativeChat,
+			wantEndpoint:    providerEndpointChatCompletions,
+		},
+		{
+			name:            "Non-Copilot provider keeps native Chat even with preferResponses",
+			provider:        nonCopilot,
+			known:           true,
+			preferResponses: true,
+			endpoints:       []string{providerEndpointChatCompletions, providerEndpointResponses},
+			wantBackend:     chatBackendNativeChat,
+			wantEndpoint:    providerEndpointChatCompletions,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := providerModel{
+				publicID:           "model-under-test",
+				upstreamModel:      "model-under-test",
+				providerID:         tc.provider.id,
+				supportedEndpoints: tc.endpoints,
+				preferResponses:    tc.preferResponses,
+			}
+			route, err := chooseChatRoute(tc.provider, owner, tc.known, owner.publicID)
+			if err != nil {
+				t.Fatalf("chooseChatRoute() error = %v", err)
+			}
+			if route.backend != tc.wantBackend || route.nativeEndpoint != tc.wantEndpoint {
+				t.Fatalf("route = backend %v endpoint %q, want backend %v endpoint %q",
+					route.backend, route.nativeEndpoint, tc.wantBackend, tc.wantEndpoint)
+			}
+		})
+	}
+}
+
+func TestChooseChatRoute_CopilotDuplicateCatalogEntriesPreferResponses(t *testing.T) {
+	provider := &providerRuntime{id: "copilot", kind: providerTypeCopilot}
+	omitted := json.RawMessage(`{"id":"mai-code-2"}`)
+	for _, vendor := range []string{"Microsoft", "Experimental"} {
+		t.Run(vendor, func(t *testing.T) {
+			advertised := json.RawMessage(`{"id":"mai-code-2","vendor":"` + vendor + `","supported_endpoints":["/chat/completions","/responses"]}`)
+			disabled := json.RawMessage(`{"id":"mai-code-2","vendor":"` + vendor + `","supported_endpoints":["/chat/completions","/responses"],"policy":{"state":"disabled"}}`)
+			google := json.RawMessage(`{"id":"mai-code-2","vendor":"Google"}`)
+			enabledChat := json.RawMessage(`{"id":"mai-code-2","vendor":"` + vendor + `","supported_endpoints":["/chat/completions"]}`)
+			disabledResponses := json.RawMessage(`{"id":"mai-code-2","supported_endpoints":["/responses"],"policy":{"state":"disabled"}}`)
+			for _, tc := range []struct {
+				name        string
+				data        []json.RawMessage
+				wantBackend chatBackend
+			}{
+				{name: "vendor first", data: []json.RawMessage{advertised, omitted}, wantBackend: chatBackendResponses},
+				{name: "vendor last", data: []json.RawMessage{omitted, advertised}, wantBackend: chatBackendResponses},
+				{name: "vendor between omitted entries", data: []json.RawMessage{omitted, advertised, omitted}, wantBackend: chatBackendResponses},
+				{name: "published vendor wins", data: []json.RawMessage{google, advertised}, wantBackend: chatBackendNativeChat},
+				{name: "disabled duplicate cannot fill missing vendor", data: []json.RawMessage{omitted, disabled}, wantBackend: chatBackendNativeChat},
+				{name: "enabled entry replaces disabled preference", data: []json.RawMessage{disabled, omitted}, wantBackend: chatBackendNativeChat},
+				{name: "enabled entry replaces disabled vendor", data: []json.RawMessage{disabled, google}, wantBackend: chatBackendNativeChat},
+				{name: "disabled Responses endpoint last", data: []json.RawMessage{enabledChat, disabledResponses}, wantBackend: chatBackendNativeChat},
+				{name: "disabled Responses endpoint first", data: []json.RawMessage{disabledResponses, enabledChat}, wantBackend: chatBackendNativeChat},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					body, err := json.Marshal(map[string]any{"data": tc.data})
+					if err != nil {
+						t.Fatal(err)
+					}
+					models, err := decodeProviderModelsFromBody(provider, body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(models) != 1 {
+						t.Fatalf("decoded %d models, want 1", len(models))
+					}
+					owner := models[0]
+					route, err := chooseChatRoute(provider, owner, true, owner.publicID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					wantEndpoint := providerEndpointChatCompletions
+					if tc.wantBackend == chatBackendResponses {
+						wantEndpoint = providerEndpointResponses
+					}
+					if route.backend != tc.wantBackend || route.nativeEndpoint != wantEndpoint {
+						t.Fatalf("route = backend %v endpoint %q, want backend %v endpoint %q", route.backend, route.nativeEndpoint, tc.wantBackend, wantEndpoint)
+					}
+					if len(owner.supportedEndpoints) != 2 || !supportsEndpoint(owner.supportedEndpoints, providerEndpointChatCompletions) || !supportsEndpoint(owner.supportedEndpoints, providerEndpointResponses) {
+						t.Fatalf("native endpoints = %v, want both advertised endpoints", owner.supportedEndpoints)
+					}
+				})
+			}
+		})
 	}
 }
 

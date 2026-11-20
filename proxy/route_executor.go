@@ -3630,7 +3630,12 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 	return nil, fmt.Errorf("model route %q has no eligible target", route.public.id)
 }
 
-func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *routeSendObservation) (*http.Response, error) {
+func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *routeSendObservation) (result *http.Response, resultErr error) {
+	defer func() {
+		if resultErr == nil {
+			restoreCopilotNamespaceResponse(req, result)
+		}
+	}()
 	if req == nil {
 		return nil, fmt.Errorf("upstream request is required")
 	}
@@ -4073,6 +4078,12 @@ func (h *ProxyHandler) withExplicitRouteOperation(ctx, inbound context.Context, 
 	if !known || route == nil || route.legacy {
 		return ctx, nil, route, nil
 	}
+	if existing != nil {
+		if !sameLogicalExplicitRoute(existing.route, route) {
+			return ctx, nil, route, fmt.Errorf("admitted route does not own model %q", model)
+		}
+		route = existing.route
+	}
 	if !route.supportsEndpoint(endpoint) {
 		return ctx, nil, route, &providerRequestError{
 			statusCode: http.StatusBadRequest,
@@ -4080,9 +4091,6 @@ func (h *ProxyHandler) withExplicitRouteOperation(ctx, inbound context.Context, 
 		}
 	}
 	if existing != nil {
-		if existing.route != route {
-			return ctx, nil, route, fmt.Errorf("route operation for %q cannot execute route %q", existing.route.public.id, route.public.id)
-		}
 		return ctx, existing, route, nil
 	}
 	operation := newRouteOperation(route, inbound)

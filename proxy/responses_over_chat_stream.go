@@ -70,6 +70,14 @@ type responsesOverChatMessage struct {
 	itemID      string
 	outputIndex int
 	text        strings.Builder
+	refusal     bool
+}
+
+func (m *responsesOverChatMessage) contentPart(text string) map[string]any {
+	if m.refusal {
+		return map[string]any{"type": "refusal", "refusal": text}
+	}
+	return map[string]any{"type": "output_text", "text": text, "annotations": []any{}}
 }
 
 // responsesOverChatStream converts canonical Chat stream chunks into Responses
@@ -89,6 +97,7 @@ type responsesOverChatStream struct {
 	writeFailed     bool
 
 	message      *responsesOverChatMessage
+	structured   bool
 	sawRefusal   bool
 	calls        map[int]*responsesOverChatToolCall
 	callOrder    []int
@@ -104,6 +113,12 @@ type responsesOverChatStream struct {
 
 func newResponsesOverChatStream(w http.ResponseWriter, publicModel string, translated policyResponsesChatRequest) *responsesOverChatStream {
 	config := translated.Response
+	var textConfig struct {
+		Format struct {
+			Type string `json:"type"`
+		} `json:"format"`
+	}
+	_ = json.Unmarshal(config.Text, &textConfig)
 	if len(bytes.TrimSpace(config.Tools)) == 0 {
 		config.Tools = json.RawMessage(`[]`)
 	}
@@ -111,10 +126,11 @@ func newResponsesOverChatStream(w http.ResponseWriter, publicModel string, trans
 		config.ToolChoice = json.RawMessage(`"auto"`)
 	}
 	return &responsesOverChatStream{
-		w:      w,
-		config: config,
-		tools:  translated.CallableTools,
-		calls:  make(map[int]*responsesOverChatToolCall),
+		w:          w,
+		config:     config,
+		structured: textConfig.Format.Type == "json_schema" || textConfig.Format.Type == "json_object",
+		tools:      translated.CallableTools,
+		calls:      make(map[int]*responsesOverChatToolCall),
 		response: responsesOverChatResponse{
 			ID:                newPolicyResponsesID("resp"),
 			Object:            "response",
@@ -194,11 +210,16 @@ func (s *responsesOverChatStream) addOutputBytes(n int) error {
 	return nil
 }
 
-func (s *responsesOverChatStream) openMessage() error {
+func (s *responsesOverChatStream) openMessage(refusal bool) error {
 	if s.message != nil {
-		return nil
+		if s.message.refusal == refusal {
+			return nil
+		}
+		if err := s.closeMessage("completed"); err != nil {
+			return err
+		}
 	}
-	s.message = &responsesOverChatMessage{itemID: newPolicyResponsesID("msg"), outputIndex: s.nextOutputIndex}
+	s.message = &responsesOverChatMessage{itemID: newPolicyResponsesID("msg"), outputIndex: s.nextOutputIndex, refusal: refusal}
 	s.nextOutputIndex++
 	if err := s.emit("response.output_item.added", map[string]any{
 		"output_index": s.message.outputIndex,
@@ -208,26 +229,38 @@ func (s *responsesOverChatStream) openMessage() error {
 	}
 	return s.emit("response.content_part.added", map[string]any{
 		"item_id": s.message.itemID, "output_index": s.message.outputIndex, "content_index": 0,
-		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+		"part": s.message.contentPart(""),
 	})
 }
 
-func (s *responsesOverChatStream) appendText(text string) error {
+func (s *responsesOverChatStream) appendText(text string, refusal bool) error {
 	if text == "" {
 		return nil
 	}
 	if err := s.addOutputBytes(len(text)); err != nil {
 		return err
 	}
-	if err := s.openMessage(); err != nil {
+	if err := s.openMessage(refusal); err != nil {
 		return err
 	}
 	s.message.text.WriteString(text)
-	s.markSemantic()
-	return s.emit("response.output_text.delta", map[string]any{
+	eventType := "response.output_text.delta"
+	payload := map[string]any{
 		"item_id": s.message.itemID, "output_index": s.message.outputIndex, "content_index": 0,
-		"delta": text, "logprobs": []any{},
-	})
+		"delta": text,
+	}
+	if refusal {
+		eventType = "response.refusal.delta"
+	} else {
+		payload["logprobs"] = []any{}
+	}
+	if err := s.emit(eventType, payload); err != nil {
+		return err
+	}
+	if s.streaming() {
+		s.markSemantic()
+	}
+	return nil
 }
 
 func (s *responsesOverChatStream) closeMessage(status string) error {
@@ -237,10 +270,17 @@ func (s *responsesOverChatStream) closeMessage(status string) error {
 	message := s.message
 	s.message = nil
 	text := message.text.String()
-	part := map[string]any{"type": "output_text", "text": text, "annotations": []any{}}
-	if err := s.emit("response.output_text.done", map[string]any{
-		"item_id": message.itemID, "output_index": message.outputIndex, "content_index": 0, "text": text, "logprobs": []any{},
-	}); err != nil {
+	part := message.contentPart(text)
+	eventType := "response.output_text.done"
+	payload := map[string]any{"item_id": message.itemID, "output_index": message.outputIndex, "content_index": 0}
+	if message.refusal {
+		eventType = "response.refusal.done"
+		payload["refusal"] = text
+	} else {
+		payload["text"] = text
+		payload["logprobs"] = []any{}
+	}
+	if err := s.emit(eventType, payload); err != nil {
 		return err
 	}
 	if err := s.emit("response.content_part.done", map[string]any{
@@ -367,12 +407,14 @@ func (s *responsesOverChatStream) addToolCall(call *responsesOverChatToolCall) e
 	call.itemID = newPolicyResponsesID("fc")
 	call.outputIndex = s.nextOutputIndex
 	s.nextOutputIndex++
-	s.markSemantic()
 	if err := s.emit("response.output_item.added", map[string]any{
 		"output_index": call.outputIndex,
 		"item":         s.functionCallItem(call, "in_progress", ""),
 	}); err != nil {
 		return err
+	}
+	if s.streaming() {
+		s.markSemantic()
 	}
 	if pending := call.pending.String(); pending != "" {
 		call.pending.Reset()
@@ -415,19 +457,19 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 		if err != nil {
 			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned non-text Chat content"}
 		}
-		if s.finishReason != "" && (text != "" || len(choice.Delta.ToolCalls) > 0) {
+		refusal, _, err := policyResponsesRefusalFromChatContent(choice.Delta.Refusal)
+		if err != nil {
+			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned a non-text refusal"}
+		}
+		if s.finishReason != "" && (text != "" || refusal != "" || len(choice.Delta.ToolCalls) > 0) {
 			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream sent output after its finish reason"}
 		}
 		if text != "" {
 			// Text after a function call opens a new message item, so output
 			// indexes stay monotonic.
-			if err := s.appendText(text); err != nil {
+			if err := s.appendText(text, false); err != nil {
 				return err
 			}
-		}
-		refusal, _, err := policyResponsesRefusalFromChatContent(choice.Delta.Refusal)
-		if err != nil {
-			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned a non-text refusal"}
 		}
 		if refusal != "" {
 			// Any started call, exposed or still pending, conflicts with a refusal.
@@ -435,8 +477,7 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 				return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned a refusal together with function calls"}
 			}
 			s.sawRefusal = true
-			// Codex accepts output_text but not the refusal content variant.
-			if err := s.appendText(refusal); err != nil {
+			if err := s.appendText(refusal, s.structured); err != nil {
 				return err
 			}
 		}
@@ -549,8 +590,17 @@ func (s *responsesOverChatStream) finish() (responsesOverChatResponse, *response
 			}
 		}
 	}
-	// A truncated turn never exposes its partial function calls as output; Codex
-	// would otherwise dispatch incomplete JSON.
+	if status == "incomplete" {
+		for _, index := range s.callOrder {
+			call := s.calls[index]
+			if call.added {
+				s.finished = append(s.finished, responsesOverChatFinishedItem{
+					outputIndex: call.outputIndex,
+					item:        s.functionCallItem(call, status, ""),
+				})
+			}
+		}
+	}
 	sort.SliceStable(s.finished, func(i, j int) bool { return s.finished[i].outputIndex < s.finished[j].outputIndex })
 	output := make([]map[string]any, 0, len(s.finished))
 	for _, finished := range s.finished {
@@ -721,5 +771,9 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 		if h.log != nil {
 			h.log.Debug("failed to write Responses-over-Chat result", logger.Err(err))
 		}
+	} else if len(final.Output) > 0 {
+		state.markSemantic()
+	} else {
+		markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentProtocolFrame)
 	}
 }

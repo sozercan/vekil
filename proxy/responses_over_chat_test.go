@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -435,8 +436,8 @@ func TestResponsesOverChatSanitizedCopilotGeminiFixture(t *testing.T) {
 
 func TestResponsesOverChatLengthTerminationNeverExposesPartialToolCall(t *testing.T) {
 	upstream := newROCUpstream(t, rocSSE(t,
-		`{"choices":[{"index":0,"delta":{"role":"assistant","content":"Working"}}]}`,
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_p","function":{"name":"get_time","arguments":"{\"ci"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"Working"}}]}`,
 		`{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`,
 		"[DONE]"))
 	h := newROCHandler(t, upstream.server.URL)
@@ -455,10 +456,66 @@ func TestResponsesOverChatLengthTerminationNeverExposesPartialToolCall(t *testin
 	if reason := response["incomplete_details"].(map[string]any)["reason"]; reason != "max_output_tokens" {
 		t.Fatalf("incomplete reason = %v", reason)
 	}
-	for _, item := range response["output"].([]any) {
-		if item.(map[string]any)["type"] == "function_call" {
-			t.Fatalf("final output contains a partial function call: %v", response["output"])
+	output := response["output"].([]any)
+	if len(output) != 2 || output[1].(map[string]any)["type"] != "message" {
+		t.Fatalf("final output did not preserve the message index: %v", output)
+	}
+	call := output[0].(map[string]any)
+	if call["type"] != "function_call" || call["status"] != "incomplete" || call["arguments"] != "" {
+		t.Fatalf("final output contains executable or partial arguments: %v", call)
+	}
+	for _, event := range events {
+		if event.Type == "response.output_text.delta" && event.Data["item_id"] != output[1].(map[string]any)["id"] {
+			t.Fatalf("terminal message identity differs from delta: %v", event.Data)
 		}
+	}
+}
+
+func TestResponsesOverChatStructuredOutputPreservesRefusal(t *testing.T) {
+	upstream := newROCUpstream(t, rocSSE(t,
+		`{"choices":[{"index":0,"delta":{"refusal":"Cannot provide that."},"finish_reason":"stop"}]}`,
+		"[DONE]"))
+	h := newROCHandler(t, upstream.server.URL)
+	const body = `{"model":"gemini-test","input":"go","text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object","properties":{},"additionalProperties":false},"strict":true}}}`
+	jsonResponse := postROC(t, h, body)
+	if jsonResponse.Code != http.StatusOK || !strings.Contains(jsonResponse.Body.String(), `"refusal":"Cannot provide that.","type":"refusal"`) {
+		t.Fatalf("structured JSON refusal: %d %s", jsonResponse.Code, jsonResponse.Body.String())
+	}
+	stream := postROC(t, h, `{"stream":true,`+body[1:])
+	var events []string
+	for _, event := range parseROCEvents(t, stream.Body.String()) {
+		events = append(events, event.Type)
+	}
+	if !slices.Contains(events, "response.refusal.delta") || !slices.Contains(events, "response.refusal.done") || slices.Contains(events, "response.output_text.delta") {
+		t.Fatalf("structured refusal events: %v", events)
+	}
+	plain := postROC(t, h, `{"model":"gemini-test","input":"go"}`)
+	if plain.Code != http.StatusOK || !strings.Contains(plain.Body.String(), `"text":"Cannot provide that.","type":"output_text"`) {
+		t.Fatalf("plain JSON refusal: %d %s", plain.Code, plain.Body.String())
+	}
+}
+
+func TestResponsesOverChatKeepsAdmittedNativeChatRoute(t *testing.T) {
+	upstream := newROCUpstream(t, rocSSE(t,
+		`{"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`, "[DONE]"))
+	h := newROCHandler(t, upstream.server.URL)
+	compatibility := h.resolveResponsesCompatibility(t.Context(), "gemini-test")
+	if compatibility.mode != responsesExecutionOverChat || compatibility.nativeChat == nil {
+		t.Fatalf("initial mode = %v, want a captured Chat route", compatibility.mode)
+	}
+	updated := compatibility.nativeChat.owner
+	updated.supportedEndpoints = []string{providerEndpointResponses}
+	if err := h.providerSetup().replaceProviderModels(updated.providerID, []providerModel{updated}); err != nil {
+		t.Fatal(err)
+	}
+	if refreshed := h.resolveResponsesCompatibility(t.Context(), "gemini-test"); refreshed.mode != responsesExecutionNative {
+		t.Fatalf("refreshed mode = %v, want native Responses", refreshed.mode)
+	}
+	body := `{"model":"gemini-test","input":"hi"}`
+	recorder := httptest.NewRecorder()
+	h.handleResponsesOverChat(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)), []byte(body), compatibility)
+	if recorder.Code != http.StatusOK || upstream.chatHits.Load() != 1 || upstream.responsesHits.Load() != 0 {
+		t.Fatalf("in-flight request left the admitted Chat route: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -784,14 +841,19 @@ func TestResponsesOverChatWebSocketTurnIsRejectedWithoutUpstreamSends(t *testing
 	defer func() { _ = conn.Close() }()
 
 	request := newResponsesWebSocketCreateRequest(nil)
-	request["model"] = "gemini-test"
-	if err := conn.WriteJSON(request); err != nil {
-		t.Fatal(err)
-	}
-	payload := mustReadWebSocketJSON(t, conn)
-	encoded, _ := json.Marshal(payload)
-	if payload["type"] != "error" || payload["status_code"] != float64(http.StatusBadRequest) || !strings.Contains(string(encoded), "supports HTTP POST /v1/responses only") {
-		t.Fatalf("websocket response = %s", encoded)
+	for _, test := range []struct{ model, message string }{
+		{"gemini-test", "supports HTTP POST /v1/responses only"},
+		{"chat-no-tools", "model does not advertise function-tool support"},
+	} {
+		request["model"] = test.model
+		if err := conn.WriteJSON(request); err != nil {
+			t.Fatal(err)
+		}
+		payload := mustReadWebSocketJSON(t, conn)
+		encoded, _ := json.Marshal(payload)
+		if payload["type"] != "error" || payload["status_code"] != float64(http.StatusBadRequest) || !strings.Contains(string(encoded), test.message) {
+			t.Fatalf("websocket response = %s, want %q", encoded, test.message)
+		}
 	}
 	if upstream.chatHits.Load() != 0 || upstream.responsesHits.Load() != 0 {
 		t.Fatalf("websocket turn reached upstream: chat=%d responses=%d", upstream.chatHits.Load(), upstream.responsesHits.Load())

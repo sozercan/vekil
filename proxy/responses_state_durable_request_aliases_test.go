@@ -139,6 +139,9 @@ func TestDurableResponsesRequestStateAliasesWebSocket(t *testing.T) {
 				h, _ := durableWireHandler(t, store, provider)
 				h.auth = auth.NewTestAuthenticatorWithResponsesToken("ghu_synthetic-source", "synthetic-responses-token")
 				h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: native}
+				if native {
+					advertiseNativeWebSocketForTest(h)
+				}
 				server := startResponsesWebSocketProxyServer(t, h)
 				conn := mustDialResponsesWebSocket(t, server, nil)
 				defer func() { _ = conn.Close() }()

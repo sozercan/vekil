@@ -297,6 +297,7 @@ type ProxyHandler struct {
 	retryBaseDelay                   time.Duration
 	models                           modelsCache
 	chatRoutes                       chatRouteDiscoveryCache
+	copilotNativeWS                  copilotNativeWebSocketCatalog
 	chatPolicyPlanner                chatPolicyPlanner
 	policyRoutingController          policyRoutingController
 	policyPreflightStateMu           sync.Mutex
@@ -1893,7 +1894,7 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 			}
 			allDynamicProvidersUnchanged = false
 			if canonicalRefresh {
-				refreshedDynamicModels[provider.id] = filterHiddenProviderModels(provider, filterProviderModels(provider, result.models))
+				refreshedDynamicModels[provider.id] = filterProviderModels(provider, result.models)
 			}
 			if result.etag != "" {
 				mergedETag = result.etag
