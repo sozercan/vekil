@@ -144,6 +144,7 @@ func (m responsesExecutionMode) String() string {
 type responsesCompatibility struct {
 	mode        responsesExecutionMode
 	publicModel string
+	nativeChat  *resolvedChatRoute
 	// reason explains an unsupported decision without naming provider internals.
 	reason string
 	// reasoningEfforts are the provider-advertised Chat reasoning_effort values.
@@ -240,6 +241,7 @@ func (h *ProxyHandler) resolveResponsesCompatibility(ctx context.Context, model 
 	}
 	compat.mode = responsesExecutionOverChat
 	compat.reasoningEfforts = caps.reasoningEfforts
+	compat.nativeChat = &route
 	return compat
 }
 
@@ -344,11 +346,15 @@ func (h *ProxyHandler) handleResponsesOverChat(w http.ResponseWriter, r *http.Re
 	}
 	publicModel := explicitRoutePublicModel(route, compat.publicModel)
 
-	// Legacy routes are resolved again at execution. Pin execution to native
-	// Chat so a concurrent catalog refresh cannot dispatch an upstream
-	// /responses inference that admission never approved. The stream_options
-	// retry below reuses the native route it was given.
-	result, err := h.executeRoutedChatCompletions(upstreamCtx, chatBody, mode, chatExecutionOptions{RequireNativeChat: true}, requestedModel)
+	var result chatExecutionResult
+	if compat.nativeChat != nil {
+		result, err = h.executeResolvedNativeChat(upstreamCtx, *compat.nativeChat, chatBody)
+		if err != nil {
+			attachChatExecutionErrorRoute(err, *compat.nativeChat)
+		}
+	} else {
+		result, err = h.executeRoutedChatCompletions(upstreamCtx, chatBody, mode, chatExecutionOptions{RequireNativeChat: true}, requestedModel)
+	}
 	if err != nil {
 		h.writeResponsesOverChatExecutionError(w, r, upstreamCtx, err)
 		return

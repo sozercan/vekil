@@ -1474,14 +1474,17 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			}
 			return err
 		}
-		if h.responsesOverChatOptedIn(request.Model) && h.resolveResponsesCompatibility(s.ctx, request.Model).mode != responsesExecutionNative {
-			// Responses-over-Chat is an HTTP-only adapter. Never forward these turns
-			// to an upstream Responses transport the model does not have.
+		if compatibility := h.resolveResponsesCompatibility(s.ctx, request.Model); compatibility.mode != responsesExecutionNative {
+			model := strings.TrimSpace(request.Model)
+			message := fmt.Sprintf("model %q cannot serve Responses-over-Chat: %s", model, compatibility.reason)
+			if compatibility.mode == responsesExecutionOverChat {
+				message = fmt.Sprintf("model %q is served through Responses-over-Chat, which supports HTTP POST /v1/responses only; disable websockets for this client", model)
+			}
 			err := &providerRequestError{
 				statusCode: http.StatusBadRequest,
-				err:        fmt.Errorf("model %q is served through Responses-over-Chat, which supports HTTP POST %s only; disable websockets for this client", strings.TrimSpace(request.Model), "/v1/responses"),
+				err:        errors.New(message),
 			}
-			s.recordTurnStats(h, strings.TrimSpace(request.Model), "", "", http.StatusBadRequest, responsesUsage{}, nil)
+			s.recordTurnStats(h, model, "", "", http.StatusBadRequest, responsesUsage{}, nil)
 			if writeErr := s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil); writeErr != nil {
 				return writeErr
 			}

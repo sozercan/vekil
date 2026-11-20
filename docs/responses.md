@@ -149,6 +149,8 @@ Tool names are mapped to stable, collision-checked Chat aliases (`vkl1__...`) wh
 
 Gemini thought signatures: Copilot returns an opaque `reasoning_opaque` field alongside Gemini tool calls. Live checks on 2026-11-16 with `gemini-3.8-flash` and `gemini-4-hydrogen` showed Copilot accepts tool-call replay without it, so v1 does not carry it and holds no replay state. If Copilot later requires it, the upstream `400` is returned to the client rather than hidden.
 
+On incomplete turns, announced calls retain their output indexes with status `incomplete` and empty arguments. They never receive `response.output_item.done` and must not be executed. Structured JSON requests preserve upstream refusals as typed `refusal` content rather than reporting refusal prose as JSON output.
+
 ## `POST /v1/responses/compact`
 
 Compatibility shim for environments expecting `/responses/compact`. The proxy rewrites the request into a normal upstream `/responses` call with a compaction prompt, then returns:
