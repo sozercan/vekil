@@ -53,6 +53,7 @@ type ModelCapabilityLimits struct {
 // ModelCapabilitySupports contains advertised client-relevant features.
 type ModelCapabilitySupports struct {
 	ReasoningEffort   []string `json:"reasoning_effort,omitempty"`
+	ToolCalls         *bool    `json:"tool_calls,omitempty"`
 	ParallelToolCalls bool     `json:"parallel_tool_calls,omitempty"`
 	Vision            bool     `json:"vision,omitempty"`
 }

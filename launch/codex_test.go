@@ -537,6 +537,7 @@ func TestCodexAdapterAcceptsResponsesOverChatModelWithAdapterRestrictions(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	toolsSupported := true
 	prepared, err := (CodexAdapter{}).Prepare(PrepareInput{
 		BaseURL: "http://127.0.0.1:43210",
 		Model: ModelInfo{
@@ -546,7 +547,7 @@ func TestCodexAdapterAcceptsResponsesOverChatModelWithAdapterRestrictions(t *tes
 			ResponsesCompatibility: ResponsesOverChatCompatibility,
 			Capabilities: ModelCapabilities{
 				Limits:   ModelCapabilityLimits{MaxPromptTokens: 983040, MaxContextWindowTokens: 1048576},
-				Supports: ModelCapabilitySupports{ReasoningEffort: []string{"low", "medium", "high"}, ParallelToolCalls: true, Vision: true},
+				Supports: ModelCapabilitySupports{ReasoningEffort: []string{"low", "medium", "high"}, ToolCalls: &toolsSupported, ParallelToolCalls: true, Vision: true},
 			},
 		},
 		Binary:        binary,
@@ -622,6 +623,9 @@ func TestCodexAdapterResponsesOverChatModelWithoutReasoningLeavesEffortUnset(t *
 	}
 	if prepared.Cleanup != nil {
 		defer func() { _ = prepared.Cleanup() }()
+	}
+	if len(prepared.Unresolved) != 1 || !strings.Contains(prepared.Unresolved[0], "function-tool support requires live") {
+		t.Fatalf("dry run should leave missing tool metadata unresolved: %v", prepared.Unresolved)
 	}
 	body, err := os.ReadFile(codexCatalogPathFromArgs(t, prepared.Args))
 	if err != nil {

@@ -9,6 +9,8 @@ import (
 )
 
 func TestLaunchResponsesOverChatOptedInMirrorsServerDecision(t *testing.T) {
+	noTools := false
+	supportsTools := true
 	cases := []struct {
 		name  string
 		optIn string
@@ -16,6 +18,8 @@ func TestLaunchResponsesOverChatOptedInMirrorsServerDecision(t *testing.T) {
 		want  bool
 	}{
 		{"chat only listed", "a, gemini", launch.ModelInfo{ID: "gemini", SupportedEndpoints: []string{"/chat/completions"}}, true},
+		{"known tool support", "gemini", launch.ModelInfo{ID: "gemini", SupportedEndpoints: []string{"/chat/completions"}, Capabilities: launch.ModelCapabilities{Supports: launch.ModelCapabilitySupports{ToolCalls: &supportsTools}}}, true},
+		{"known tool rejection", "gemini", launch.ModelInfo{ID: "gemini", SupportedEndpoints: []string{"/chat/completions"}, Capabilities: launch.ModelCapabilities{Supports: launch.ModelCapabilitySupports{ToolCalls: &noTools}}}, false},
 		{"not listed", "other", launch.ModelInfo{ID: "gemini", SupportedEndpoints: []string{"/chat/completions"}}, false},
 		{"native responses stays native", "gpt", launch.ModelInfo{ID: "gpt", SupportedEndpoints: []string{"/chat/completions", "/responses"}}, false},
 		{"no endpoint metadata", "gemini", launch.ModelInfo{ID: "gemini"}, false},

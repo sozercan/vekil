@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -94,10 +95,11 @@ type modelsCache struct {
 }
 
 type cachedModelsResponse struct {
-	body       []byte
-	statusCode int
-	expiry     time.Time
-	etag       string
+	body         []byte
+	statusCode   int
+	expiry       time.Time
+	etag         string
+	responseETag string
 }
 
 type requestBodyError struct {
@@ -1385,8 +1387,8 @@ func copyPassthroughHeaders(dst, src http.Header) {
 
 func writeCachedModelsResponse(w http.ResponseWriter, entry cachedModelsResponse) {
 	w.Header().Set("Content-Type", "application/json")
-	if entry.etag != "" {
-		w.Header().Set("ETag", entry.etag)
+	if etag := firstNonEmpty(entry.responseETag, entry.etag); etag != "" {
+		w.Header().Set("ETag", etag)
 	}
 	w.WriteHeader(entry.statusCode)
 	_, _ = w.Write(entry.body)
@@ -1784,12 +1786,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if etag := entry.etag; etag != "" {
-		w.Header().Set("ETag", etag)
-	}
-	w.WriteHeader(entry.statusCode)
-	_, _ = w.Write(entry.body)
+	writeCachedModelsResponse(w, entry)
 }
 
 func (h *ProxyHandler) refreshModelsCacheVariant(waitCtx context.Context, cacheKey string) modelsCacheFlightResult {
@@ -1933,12 +1930,18 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		return cachedModelsResponse{}, false, err
 	}
 
-	body, responsesOverChat := h.annotateResponsesOverChatCatalog(body)
+	annotated, responsesOverChat := h.annotateResponsesOverChatCatalog(body)
+	representation := transformModelsResponseWithCompatibility(annotated, responsesOverChat)
+	var responseETag string
+	if len(h.responsesOverChatModels) > 0 || !bytes.Equal(body, annotated) {
+		responseETag = fmt.Sprintf(`"vekil-%x"`, sha256.Sum256(representation))
+	}
 	return cachedModelsResponse{
-		body:       transformModelsResponseWithCompatibility(body, responsesOverChat),
-		statusCode: http.StatusOK,
-		expiry:     h.models.nowTime().Add(modelsCacheTTL),
-		etag:       mergedETag,
+		body:         representation,
+		statusCode:   http.StatusOK,
+		expiry:       h.models.nowTime().Add(modelsCacheTTL),
+		etag:         mergedETag,
+		responseETag: responseETag,
 	}, false, nil
 }
 

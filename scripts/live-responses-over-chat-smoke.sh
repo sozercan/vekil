@@ -46,11 +46,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+INBOUND_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+(umask 077; printf 'Authorization: Bearer %s\n' "${INBOUND_TOKEN}" >"${WORK_DIR}/auth.header")
+proxy_curl() { curl -H "@${WORK_DIR}/auth.header" "$@"; }
+
 log "starting isolated proxy on ${BASE} (opt-in: ${MODEL})"
-# The smoke's loopback requests carry no inbound credential, so an inherited
-# INBOUND_AUTH_TOKEN would make this private proxy answer 401 before any
-# adapter turn runs.
-env -u INBOUND_AUTH_TOKEN \
+INBOUND_AUTH_TOKEN="${INBOUND_TOKEN}" \
   "${PROXY_BIN}" --host 127.0.0.1 --port "${PORT}" --log-level warn \
   --state-bindings-mode memory \
   --responses-over-chat-models "${MODEL}" >"${WORK_DIR}/proxy.log" 2>&1 &
@@ -64,11 +65,25 @@ until curl -fsS -m 5 "${BASE}/readyz" >/dev/null 2>&1; do
 done
 
 post() { # name body
-  curl -sS -m "${MAX_TIME}" -o "${WORK_DIR}/$1.out" -D "${WORK_DIR}/$1.headers" -w '%{http_code}' \
+  proxy_curl -sS -m "${MAX_TIME}" -o "${WORK_DIR}/$1.out" -D "${WORK_DIR}/$1.headers" -w '%{http_code}' \
     -H 'Content-Type: application/json' --data-binary "$2" "${BASE}/v1/responses"
 }
 
-curl -fsS -m 30 "${BASE}/v1/models" -o "${WORK_DIR}/models.json"
+proxy_curl -fsS -m 30 "${BASE}/v1/models" -o "${WORK_DIR}/models.json"
+python3 - "${WORK_DIR}/models.json" "${MODEL}" <<'PY'
+import json, sys
+with open(sys.argv[1]) as catalog_file:
+    catalog = json.load(catalog_file)
+model = sys.argv[2]
+entry = next((m for m in catalog.get("data", []) if m.get("id") == model), {})
+codex = next((m for m in catalog.get("models", []) if m.get("slug") == model), {})
+if entry.get("vekil_responses_compatibility") != "responses_over_chat":
+    sys.exit("error: model is not eligible for the Responses-over-Chat adapter")
+if "/responses" in (entry.get("supported_endpoints") or []):
+    sys.exit("error: native supported_endpoints unexpectedly include /responses")
+if codex.get("visibility") != "list":
+    sys.exit("error: Codex projection does not list the model")
+PY
 
 TOOLS='[{"type":"namespace","name":"diag","description":"Diagnostics","tools":[{"type":"function","name":"echo_token","description":"Echo a token","parameters":{"type":"object","properties":{"token":{"type":"string"}},"required":["token"]}}]}]'
 LOOKUP='[{"type":"function","name":"lookup","description":"Look up a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]'
@@ -104,19 +119,6 @@ import json, os, sys
 work, model = sys.argv[1], sys.argv[2]
 statuses = dict(zip(["json", "sse", "tool", "continuation", "parallel"], sys.argv[3:]))
 failures = []
-
-catalog = json.load(open(os.path.join(work, "models.json")))
-entry = next((m for m in catalog.get("data", []) if m.get("id") == model), None)
-codex = next((m for m in catalog.get("models", []) if m.get("slug") == model), None)
-if not entry:
-    failures.append("model missing from /v1/models")
-else:
-    if entry.get("vekil_responses_compatibility") != "responses_over_chat":
-        failures.append("catalog entry is not marked responses_over_chat")
-    if "/responses" in (entry.get("supported_endpoints") or []):
-        failures.append("native supported_endpoints unexpectedly include /responses")
-if not codex or codex.get("visibility") != "list":
-    failures.append("Codex projection does not list the model")
 
 def sse(name):
     events = []
