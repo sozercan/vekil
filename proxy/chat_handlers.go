@@ -1036,11 +1036,34 @@ func explicitChatExecutionEndpoint(route *modelRoute, body []byte, degradeReplay
 	}
 	replay := chatRequestContainsResponsesReplayID(body)
 	hasResponses := explicitRouteHasChatBackend(route, providerEndpointResponses)
+	// One backend covers the ordered targets, including a Copilot failover target.
+	preferResponses := false
+	maxTargets := route.policy.maxTargetAttempts
+	if maxTargets <= 0 {
+		maxTargets = 1
+	}
+	maxSends := route.policy.maxUpstreamSends
+	if maxSends <= 0 {
+		maxSends = maxTargets
+	}
+	reachable := min(len(route.targets), maxTargets, maxSends)
+	if route.policy.mode == routeModePrimaryOnly {
+		reachable = min(reachable, 1)
+	}
+	for _, target := range route.targets[:reachable] {
+		if target.provider != nil && target.provider.kind == providerTypeCopilot &&
+			target.preferResponses && target.provider.supportsEndpoint(providerEndpointResponses) {
+			preferResponses = true
+			break
+		}
+	}
 	switch {
 	case replay && hasResponses:
 		return providerEndpointResponses, false, nil
 	case replay && !degradeReplay:
 		return "", false, missingResponsesChatReplayError()
+	case hasResponses && preferResponses:
+		return providerEndpointResponses, false, nil
 	case explicitRouteHasChatBackend(route, providerEndpointChatCompletions):
 		return providerEndpointChatCompletions, replay, nil
 	case hasResponses:
@@ -1125,9 +1148,10 @@ func (h *ProxyHandler) withAdmittedExplicitRouteOperation(ctx, inbound context.C
 
 	operation := routeOperationFromContext(ctx)
 	if operation != nil {
-		if operation.route != route {
+		if !sameLogicalExplicitRoute(operation.route, route) {
 			return ctx, nil, route, fmt.Errorf("route operation for %q cannot execute route %q", operation.route.public.id, route.public.id)
 		}
+		route = operation.route
 	} else {
 		operation = newRouteOperation(route, inbound)
 		ctx = withRouteOperation(ctx, operation)
@@ -1182,6 +1206,12 @@ func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, mode
 	route, known := h.resolveModelRouteForRequest(model, providerEndpointChatCompletions)
 	if !known || route == nil || route.legacy {
 		return ctx, nil, route, nil
+	}
+	if existing := routeOperationFromContext(ctx); existing != nil {
+		if !sameLogicalExplicitRoute(existing.route, route) {
+			return ctx, nil, route, fmt.Errorf("admitted route does not own model %q", model)
+		}
+		route = existing.route
 	}
 	endpoint, degraded, err := explicitChatExecutionEndpoint(route, body, degradeReplay)
 	if err != nil {
@@ -1241,6 +1271,7 @@ func isMissingResponsesChatReplayError(err error) bool {
 }
 
 func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOperation, route *modelRoute, chatBody []byte, options chatExecutionOptions, log *logger.Logger) (responsesChatRequestPlan, targetBinding, error) {
+	chatBody = applyProviderModelRequestPolicy(chatBody, providerEndpointChatCompletions, providerModel{dropStopSequences: route.public.policy.dropStopSequences})
 	var completedReplayRoutes []responsesChatReplayRoute
 	if plan, planned := operation.policyPlan(); planned {
 		completedReplayRoutes = plan.completedPolicyReplayRouteSnapshot()

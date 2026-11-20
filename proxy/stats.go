@@ -1742,7 +1742,8 @@ func isInferenceRoute(method, path string) bool {
 		switch path {
 		case "/v1/messages",
 			"/v1/chat/completions",
-			"/v1/responses":
+			"/v1/responses",
+			copilotEndpointDecisions:
 			return true
 		}
 		// Gemini routes are registered as path prefixes ({model}:{action}). Track

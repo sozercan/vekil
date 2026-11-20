@@ -272,8 +272,8 @@ measured:
 
 Both endpoints are local deterministic fixtures. These numbers cover warm
 transport and history construction; they do not establish live provider latency,
-quota changes, model performance, or reconnect behavior. The native transport
-remains opt-in, and its [session limits](responses-websocket.md#experimental-native-upstream-transport)
+quota changes, model performance, or reconnect behavior. The native transport's
+[session limits](responses-websocket.md#native-upstream-transport)
 are part of the compatibility contract.
 
 ## Policy evaluation and release evidence
@@ -345,7 +345,7 @@ To publish Sparkle updates, configure both `SPARKLE_PUBLIC_ED_KEY` and `SPARKLE_
 
 ## Live validation cost controls
 
-Live validation runs on pull-request updates with explicit inexpensive model allowlists and usage reporting. The Copilot protocol/CLI and semantic-policy workflows run on same-repository pull requests targeting `main`, weekly, and on manual dispatch. The provider-routing workflow runs on pull requests when its repository configuration is available and can also be dispatched manually. Fork and Dependabot pull requests skip credentialed checks before checkout. Core CI and the credential-free Zen workflow remain automated for all pull requests. Direct-bearer validation remains restricted to the weekly schedule on `main`, and paid checks do not run again on the post-merge push.
+Live validation runs on pull-request updates with explicit inexpensive model allowlists and usage reporting. The Copilot protocol/CLI and semantic-policy workflows run on same-repository pull requests targeting `main`, weekly, and on manual dispatch. The provider-routing workflow runs on pull requests when its repository configuration is available and can also be dispatched manually. Fork and Dependabot pull requests skip credentialed checks before checkout. Core CI remains automated for all pull requests. Direct-bearer validation remains restricted to the weekly schedule on `main`, and paid checks do not run again on the post-merge push.
 
 The Copilot scripts use explicit inexpensive model allowlists. A missing required model or capability fails before inference instead of selecting an arbitrary catalog model. Optional Gemini CLI coverage skips when no approved native-Chat model is listed. The policy workflow uses GPT-4.1 for terminal routes and classification and GPT-4o for failover. A separate GPT-5.6 Luna utility Responses check verifies `low`/`high` effort overrides. Repository model overrides are deliberate wider-coverage choices and must still satisfy endpoint and effort constraints. See [GitHub's current model pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing) before changing them.
 
@@ -475,51 +475,6 @@ Run the true multi-provider harness locally by exporting its variables and secre
 
 ```bash
 scripts/live-policy-routing-smoke.sh
-```
-
-For a credential-free generic-provider check, [`scripts/live-zen-smoke.sh`](../scripts/live-zen-smoke.sh) starts the proxy on a non-default port with [`examples/opencode-zen-free.yaml`](../examples/opencode-zen-free.yaml), waits for `/readyz`, and sends one tiny chat completion per OpenCode Zen free model advertising `/chat/completions`. It needs `curl`, `jq`, and Python for isolated automatic port allocation. Because the Zen free set rotates, the script skips only recognized transient statuses/messages and passes as long as at least one free model responds; unknown statuses and proxy-side faults are hard failures.
-
-## Live OpenCode Zen CLI Smoke Workflow
-
-The [`Live OpenCode Zen Smoke`](../.github/workflows/live-zen-smoke.yaml) workflow runs the **same** `scripts/live-cli-smoke.sh` harness as the Copilot smoke, but in `SMOKE_PROVIDER=zen` mode: it starts vekil with `examples/opencode-zen-free.yaml` (no credentials) and drives real coding-agent CLIs against the OpenCode Zen free tier. Because it needs no secrets, it runs on **every** pull request, **including external-contributor forks**. Paid Copilot checks run separately on same-repository pull requests, weekly schedules, and manual dispatch. It is the only live end-to-end coverage of vekil's generic `openai-compatible` provider routing (config loading, bearer auth, static model catalog, and the per-model endpoint allowlist), which zero-config Copilot startup never exercises.
-
-Before starting Vekil, the workflow fetches OpenCode's published Zen documentation and uses [`scripts/parse-opencode-zen-free-models.sh`](../scripts/parse-opencode-zen-free-models.sh) to join the endpoint and pricing tables by display label. Only rows whose input and output prices are both labeled `Free` are eligible for the smoke. The harness intersects that parsed set with the checked-in static example, so aliases such as Ox Alpha's `x-preview-f-free` do not depend on an ID suffix and models that lose their free label are not exercised anonymously.
-
-CI copies the single-provider example into a temporary config and adds
-`User-Agent: vekil-live-smoke/1` plus one UUID in `x-opencode-session` for the
-smoke run. The stable session header lets the upstream retain routing and cache
-affinity. The generated config is validated offline before the proxy starts.
-
-The separate [`Update OpenCode Zen Free Models`](../.github/workflows/update-opencode-zen-free.yaml) workflow runs daily on trusted `main` code. It resolves OpenCode's mutable `dev` branch to an exact commit, downloads only that revision's `zen.mdx`, and runs [`scripts/update-opencode-zen-free-config.sh`](../scripts/update-opencode-zen-free-config.sh) to replace the marked model block in the example. The renderer sorts IDs, preserves the rest of the file, rejects duplicates, bounds the catalog, and accepts only `/chat/completions` and `/responses`. It skips `/systemone` classifier rows and refuses an update containing no Chat or Responses models. Free `/messages` models require a provider-design change before they can be emitted under `openai-compatible`. Changed output is validated offline and proposed in a signed PR rather than written directly to `main`.
-
-To reproduce an update locally:
-
-```bash
-curl --fail --location \
-  https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx \
-  | scripts/update-opencode-zen-free-config.sh -
-make build
-./vekil config validate --providers-config examples/opencode-zen-free.yaml
-```
-
-The Zen harness runs the **GitHub Copilot CLI** (offline BYOK mode, `COPILOT_PROVIDER_WIRE_API=completions`), **Claude Code**, and **Gemini CLI**. Copilot is required; Claude and Gemini become required gates whenever they are installed. Each client must independently produce its exact client-specific prompt sentinel on at least one reachable candidate—one passing client cannot mask another, and one weak free model cannot fail a client that works through another candidate. Zen uses a direct text-only prompt and selects only configured free models whose parsed and proxy metadata both advertise `/chat/completions`; Responses-only entries remain routable but are not candidates for this shared Chat-oriented harness. The selected free Chat models are not assumed to support reliable coding-tool execution; the credentialed Copilot smoke retains the file-reading fixture that exercises tools.
-
-After Claude Code 2.1.212 regressed headless output, the workflow pins a verified Claude Code version. Move the pin only after the candidate version passes the live smoke.
-
-For each client/model attempt, a bounded raw chat-completions canary runs first:
-
-- Only upstream conditions evidenced by an HTTP response are skippable: an exact listed-model-unavailable HTTP 400, a promotion-ended, exact model-no-longer-supported, rate-limit, or temporary-capacity message on an eligible response, HTTP 408/425/429, or HTTP 5xx. Local curl transport failures and timeouts are hard failures because they can indicate a stuck Vekil handler. Other HTTP 400 responses and unknown statuses, including 404 and 405, are hard failures.
-- After a 200 canary, any CLI nonzero exit, timeout, empty result, or mismatched result gets one bounded second canary on that same model. A recognized transient skips the candidate; a still-reachable but incompatible candidate is recorded and the client must pass another candidate. The job fails if a client exhausts the reachable set without an exact pass.
-- A neutral exit 0 is allowed only when no model was reachable **before any client was exercised**. Once a reachable model has exercised a client, every installed client must pass.
-- Since September 2026, Zen answers anonymous free-tier requests from other clients with HTTP 403 `FreeTierError`: "OpenCode's free tier can only be used from within OpenCode". The first canary that receives this exact type and message ends the run with a neutral skip and a workflow warning before any client runs. Vekil does not impersonate the OpenCode client. While the restriction stands, this workflow provides no live coverage.
-
-OpenAI Codex CLI is intentionally excluded from this Zen harness because its native wire API requires `/responses`, while the shared Copilot/Claude/Gemini matrix deliberately tests `/chat/completions`. Codex can use a configured Zen free model that advertises native `/responses` (currently `muse-spark-1.2-contributor-free`), and Vekil forwards that request directly rather than using Responses-to-Chat translation. Codex remains covered by the Copilot smoke, where it works against the Copilot upstream.
-
-Run it locally after `make build` (requires GitHub Copilot CLI; installed Claude/Gemini CLIs are also enforced):
-
-```bash
-SMOKE_PROVIDER=zen PROVIDERS_CONFIG=examples/opencode-zen-free.yaml \
-  scripts/live-cli-smoke.sh
 ```
 
 ## Live Copilot Direct-Bearer Smoke Workflow

@@ -1,6 +1,6 @@
 # Gemini Compatibility
 
-Gemini endpoints are implemented as a translation layer, not zero-copy passthrough. Requests are translated to canonical OpenAI Chat Completions, resolved through the route that owns the selected public model, executed through native `/chat/completions` or native `/responses`, and translated back into Gemini responses. Native Chat is preferred when both native endpoints are available.
+Gemini endpoints are implemented as a translation layer, not zero-copy passthrough. Requests are translated to canonical OpenAI Chat Completions, resolved through the route that owns the selected public model, executed through native `/chat/completions` or native `/responses`, and translated back into Gemini responses. Native Chat is preferred when both native endpoints are available, except for discovered GitHub Copilot `Microsoft`/`Experimental` catalog entries that advertise `/responses`.
 
 Schema-v2 policy profile IDs are unsupported on Gemini `generateContent`, `streamGenerateContent`, and `countTokens` routes in v1. Policy selection is entered by supported canonical-Chat ingress (OpenAI Chat, translated Anthropic, and bounded stateless Responses), but not by Gemini; use a direct public model/route ID for Gemini. Existing direct Gemini translation and failover behavior below is unchanged.
 

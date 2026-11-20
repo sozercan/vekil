@@ -40,6 +40,7 @@ type targetBinding struct {
 	upstreamModelJSON json.RawMessage
 	wirePolicy        providerRequestPolicy
 	legacyOwner       providerModel
+	preferResponses   bool
 }
 
 type routePolicy struct {
@@ -57,6 +58,11 @@ type modelRoute struct {
 	exposure        string
 	internalPurpose string
 	legacy          bool
+}
+
+func sameLogicalExplicitRoute(a, b *modelRoute) bool {
+	return a != nil && b != nil && !a.legacy && !b.legacy &&
+		a.public.routeID == b.public.routeID && a.public.id == b.public.id
 }
 
 func (r *modelRoute) isPublic() bool {
@@ -281,7 +287,8 @@ func (r *modelRouteRegistry) replaceLegacyProvider(provider *providerRuntime, mo
 		next.legacyOrder = append(next.legacyOrder, cloned...)
 	}
 
-	compiled, err := compileLegacyProviderRoutes(provider, models)
+	applyCopilotResponsesPreferences(next, provider.id, models)
+	compiled, err := compileLegacyProviderRoutes(provider, filterHiddenProviderModels(provider, models))
 	if err != nil {
 		return err
 	}
@@ -307,7 +314,8 @@ func (r *modelRouteRegistry) addLegacyProvider(provider *providerRuntime, models
 	}
 
 	next := cloneRouteRegistrySnapshot(current, len(models))
-	compiled, err := compileLegacyProviderRoutes(provider, models)
+	applyCopilotResponsesPreferences(next, provider.id, models)
+	compiled, err := compileLegacyProviderRoutes(provider, filterHiddenProviderModels(provider, models))
 	if err != nil {
 		return err
 	}
@@ -318,6 +326,41 @@ func (r *modelRouteRegistry) addLegacyProvider(provider *providerRuntime, models
 	}
 	r.snapshot.Store(next)
 	return nil
+}
+
+// applyCopilotResponsesPreferences updates only the unpublished registry snapshot.
+// Catalogs still include hidden pinned models at this boundary.
+func applyCopilotResponsesPreferences(next *modelRouteRegistrySnapshot, providerID string, catalog []providerModel) {
+	models := make(map[string]providerModel, len(catalog))
+	for _, model := range catalog {
+		if !model.disabled {
+			models[strings.TrimSpace(model.upstreamModel)] = model
+			models[strings.TrimSpace(model.publicID)] = model
+		}
+	}
+	for index, route := range next.explicit {
+		if route == nil {
+			continue
+		}
+		updated := *route
+		updated.targets = append([]targetBinding(nil), route.targets...)
+		changed := false
+		for i, target := range updated.targets {
+			if target.provider == nil || target.provider.kind != providerTypeCopilot || target.provider.id != providerID {
+				continue
+			}
+			model, ok := models[strings.TrimSpace(target.upstreamModel)]
+			prefer := ok && model.preferResponses && supportsEndpoint(model.supportedEndpoints, providerEndpointResponses)
+			if target.preferResponses != prefer {
+				updated.targets[i].preferResponses = prefer
+				changed = true
+			}
+		}
+		if changed {
+			next.explicit[index] = &updated
+			next.byRouteID[route.public.routeID] = &updated
+		}
+	}
 }
 
 func cloneRouteRegistrySnapshot(current *modelRouteRegistrySnapshot, extra int) *modelRouteRegistrySnapshot {
@@ -604,6 +647,7 @@ func providerModelFromRouteTarget(route *modelRoute, target targetBinding) provi
 		dropSamplingParams:     route.public.policy.dropSamplingParams,
 		dropStopSequences:      route.public.policy.dropStopSequences,
 		useMaxCompletionTokens: target.wirePolicy.useMaxCompletionTokens,
+		preferResponses:        target.preferResponses,
 		raw:                    append(json.RawMessage(nil), route.public.raw...),
 	}
 	if target.provider != nil {
@@ -612,7 +656,7 @@ func providerModelFromRouteTarget(route *modelRoute, target targetBinding) provi
 	return owner
 }
 
-func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*providerRuntime, providerOrder []string, replacements map[string][]providerModel) error {
+func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*providerRuntime, providerOrder []string, replacements, catalogs map[string][]providerModel) error {
 	if r == nil || len(replacements) == 0 {
 		return nil
 	}
@@ -621,6 +665,9 @@ func (r *modelRouteRegistry) replaceLegacyProviders(providers map[string]*provid
 		return fmt.Errorf("model route registry is not initialized")
 	}
 	next := cloneRouteRegistrySnapshot(current, 0)
+	for providerID, catalog := range catalogs {
+		applyCopilotResponsesPreferences(next, providerID, catalog)
+	}
 	next.legacyOrder = nil
 	next.legacyByProvider = make(map[string][]*modelRoute, len(current.legacyByProvider)+len(replacements))
 

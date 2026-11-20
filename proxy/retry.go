@@ -373,7 +373,12 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 	return nil, lastErr
 }
 
-func (h *ProxyHandler) sendRetryRequest(req *http.Request, inference bool) (*http.Response, error) {
+func (h *ProxyHandler) sendRetryRequest(req *http.Request, inference bool) (result *http.Response, resultErr error) {
+	defer func() {
+		if resultErr == nil {
+			restoreCopilotNamespaceResponse(req, result)
+		}
+	}()
 	if inference {
 		if resp, handled, err := h.maybeSendNativeResponses(req); handled {
 			return resp, err

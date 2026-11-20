@@ -198,6 +198,9 @@ func TestResponsesAttributionWebSocketValidation(t *testing.T) {
 				}
 			})
 			h.responsesWS = ResponsesWebSocketConfig{Enabled: true, NativeUpstream: native, DisableAutoCompact: true}
+			if native {
+				advertiseNativeWebSocketForTest(h)
+			}
 			defer h.BeginShutdown()
 			upgradeHeaders := http.Header{"X-Initiator": {"user"}, "X-Interaction-Id": {"upgrade-interaction"}, "X-Client-Session-Id": {"upgrade-session"}}
 			conn := mustDialResponsesWebSocket(t, startResponsesWebSocketProxyServer(t, h), upgradeHeaders)
