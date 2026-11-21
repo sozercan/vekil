@@ -2131,6 +2131,7 @@ func newRouteAttemptResponseObserver(record *routeAttemptRecord, operation *rout
 		decision:   trace.Decision,
 		upstreamID: boundOperationalStatLabel(trace.UpstreamID),
 		envelope:   newRouteAttemptEnvelopeExtractor(endpoint),
+		sse:        sseDataAccumulator{maxBytes: openAIStreamScannerMaxBuffer},
 	}
 	if operation != nil {
 		observer.inboundCtx = operation.inbound
