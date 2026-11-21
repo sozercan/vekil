@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/sozercan/vekil/auth"
@@ -177,6 +178,37 @@ func TestResponsesOverChatCatalogStripsUpstreamMarkers(t *testing.T) {
 		h := newROCHandler(t, upstream.server.URL)
 		assertMarkers(t, h, map[string]bool{"gemini-test": true})
 	})
+}
+
+func TestResponsesOverChatCatalogStripsAlternateMarkerWithoutOptIn(t *testing.T) {
+	h, err := NewProxyHandler(auth.NewTestAuthenticator("fixture"), logger.NewWithWriter(logger.LevelError, io.Discard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.BeginShutdown)
+	for _, test := range []struct{ name, key string }{
+		{"uppercase", "VEKIL_RESPONSES_COMPATIBILITY"},
+		{"escaped", `\u0076ekil_responses_compatibility`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"data":[{"id":"chat-only","supported_endpoints":["/chat/completions"],"` + test.key + `":"responses_over_chat"}]}`)
+			rewritten, annotated := h.annotateResponsesOverChatCatalog(body)
+			var catalog struct {
+				Data []map[string]json.RawMessage `json:"data"`
+			}
+			if err := json.Unmarshal(rewritten, &catalog); err != nil {
+				t.Fatal(err)
+			}
+			if len(catalog.Data) != 1 || len(annotated) != 0 {
+				t.Fatalf("unexpected catalog or annotation set: %s %v", rewritten, annotated)
+			}
+			for key := range catalog.Data[0] {
+				if strings.EqualFold(key, responsesCompatibilityCatalogField) {
+					t.Fatalf("upstream marker survived: %s", rewritten)
+				}
+			}
+		})
+	}
 }
 
 func TestResponsesOverChatCatalogETagDescribesServedRepresentation(t *testing.T) {
