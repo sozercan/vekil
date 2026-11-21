@@ -223,6 +223,8 @@ The client should restart that assistant tool-call turn rather than attempting t
 
 Schema-v2 policy public IDs are accepted by bounded stateless `POST /v1/responses` compatibility. It requires `store: false` or omitted, rejects `previous_response_id`, accepts text, bounded `text.format` (`text`, `json_object`, or `json_schema`) structured output, and function/namespace-child tools, converts the request to canonical Chat for policy planning, and converts the aggregated Chat result back to Responses JSON/SSE. Completed terminal output must honor required or forced `tool_choice` constraints. Hosted/custom tools, images, the websocket bridge, compact, memory summarization, and native Responses terminal selection remain unsupported for policy IDs. Existing direct Responses behavior is unchanged.
 
+Opted-in Chat-only models (`--responses-over-chat-models`) are accepted on HTTP `POST /v1/responses` through the [Responses-over-Chat](responses.md#responses-compatibility-over-a-native-chat-model-responses-over-chat) adapter: full-history, `store: false`, text and function/namespace-child tools, with incremental SSE. Their native `supported_endpoints` metadata is unchanged, and models with native Responses support keep the native path.
+
 Supported OpenAI/Codex-style routes:
 
 - `POST /v1/responses` — near zero-copy Responses passthrough with proxy-owned compaction item expansion.

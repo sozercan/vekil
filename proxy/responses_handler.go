@@ -331,6 +331,22 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(admissionCtx)
 		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
 	}
+	if h.responsesOverChatOptedIn(requestedModel) {
+		switch compat := h.resolveResponsesCompatibility(r.Context(), requestedModel); compat.mode {
+		case responsesExecutionOverChat:
+			h.handleResponsesOverChat(w, r, bodyBytes, compat)
+			return
+		case responsesExecutionUnsupported:
+			if err := r.Context().Err(); errors.Is(err, context.Canceled) {
+				h.writeResponsesUpstreamRequestFailure(w, r, nil, "responses_admission", err)
+				return
+			}
+			writeOpenAIError(w, http.StatusBadRequest,
+				fmt.Sprintf("model %q is enabled for Responses-over-Chat but cannot use it: %s", requestedModel, compat.reason),
+				"invalid_request_error")
+			return
+		}
+	}
 	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return

@@ -256,6 +256,7 @@ type ProxyHandler struct {
 	providersConfig                  ProvidersConfig
 	allowedModels                    map[string]struct{}
 	auxiliaryModels                  map[string]struct{}
+	responsesOverChatModels          map[string]struct{}
 	providersState                   *providerSetup
 	deferDynamicProviderModelRefresh bool
 	policyRoutingMode                PolicyRoutingMode
@@ -1159,6 +1160,10 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		h.policyPreflightPending.Store(controller.Active())
 	}
 	h.validateInsightModel()
+	if err := h.validateResponsesOverChatModels(); err != nil {
+		h.BeginShutdown()
+		return nil, err
+	}
 	initialized = true
 	return h, nil
 }

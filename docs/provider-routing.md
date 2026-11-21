@@ -366,6 +366,8 @@ For canonical Chat requests, Vekil prefers native `/chat/completions` when both 
 
 This is served compatibility, not native capability metadata. Keep `models[].endpoints` and `model_routes[].endpoints` limited to verified native upstream routes. A Responses-only model or explicit route must remain configured with only `/responses`, and `/v1/models` continues to render only that native endpoint even though Vekil can translate Chat-compatible traffic to it. Do not add `/chat/completions` merely to advertise the adapter. See the [Responses-backed Chat request subset](api.md#responses-backed-chat-request-subset) for the strict translation boundary.
 
+The reverse direction is opt-in. A public model listed in `--responses-over-chat-models` that allows native `/chat/completions` but not `/responses` can serve `POST /v1/responses` through Vekil's [Responses-over-Chat adapter](responses.md#responses-compatibility-over-a-native-chat-model-responses-over-chat). The decision uses the route's validated public endpoint allowlist, so every target in a `priority_failover` route shares one contract; a route that also allows `/responses` stays native. Do not add `/responses` to a Chat-only model's `endpoints` to advertise this adapter.
+
 On an unknown model routed to an unfiltered dynamic provider, the first Chat-compatible request may perform one provider-local model refresh before choosing a backend. Discovery is coalesced per provider, bounded to two seconds, cached for five minutes after success, and backed off for five seconds after failure. It does not require or populate the merged public `/v1/models` cache.
 
 ### Azure-Only Example

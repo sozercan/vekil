@@ -93,6 +93,7 @@ type policyResponsesParsedToolChoice struct {
 type policyResponsesCanonicalChatRequest struct {
 	Model               string                 `json:"model"`
 	Messages            []models.OpenAIMessage `json:"messages"`
+	MaxTokens           *int                   `json:"max_tokens,omitempty"`
 	MaxCompletionTokens *int                   `json:"max_completion_tokens,omitempty"`
 	Temperature         *float64               `json:"temperature,omitempty"`
 	TopP                *float64               `json:"top_p,omitempty"`
@@ -118,7 +119,18 @@ type responsesChatTranslationContract struct {
 	// maxTranslatedBytes bounds the canonical Chat body and flattened tool text.
 	maxTranslatedBytes int
 	// maxInputItems bounds the Responses input array.
-	maxInputItems int
+	maxInputItems      int
+	useLegacyMaxTokens bool
+	// coalesceAssistantToolTurns merges each run of assistant messages and
+	// function calls into one Chat assistant turn (text first, then calls)
+	// before call-sequence validation. Adapters whose own output can place
+	// assistant text after a call set it so that output replays as input.
+	coalesceAssistantToolTurns bool
+	// omitToolChoiceWithoutTools drops a tool_choice of "auto" or "none" when
+	// no tools are declared. Both are no-ops without tools, and some Chat
+	// upstreams reject any tool_choice that has no tools beside it. Codex
+	// sends that shape for its local compaction turn.
+	omitToolChoiceWithoutTools bool
 }
 
 // policyResponsesTranslationContract is the semantic-policy Responses ingress
@@ -233,6 +245,9 @@ func translateResponsesRequestToChat(body []byte, contract responsesChatTranslat
 	if err != nil {
 		return policyResponsesChatRequest{}, err
 	}
+	if contract.omitToolChoiceWithoutTools && len(chatTools) == 0 && toolChoice.descriptor == nil && (toolChoice.mode == "auto" || toolChoice.mode == "none") {
+		chatToolChoice = nil
+	}
 	callableTools := policyResponsesCallableTools(parsedTools, aliases, toolChoice)
 
 	stream, err := policyResponsesBool(root, "stream", false)
@@ -290,6 +305,10 @@ func translateResponsesRequestToChat(body []byte, contract responsesChatTranslat
 		ParallelToolCalls:   parallel,
 		ResponseFormat:      responseFormat,
 		ReasoningEffort:     reasoningEffort,
+	}
+	if contract.useLegacyMaxTokens {
+		canonical.MaxTokens = maxTokens
+		canonical.MaxCompletionTokens = nil
 	}
 	chatBody, err := json.Marshal(canonical)
 	if err != nil {
@@ -533,6 +552,9 @@ func parsePolicyResponsesInput(raw json.RawMessage, contract responsesChatTransl
 		}
 		items = append(items, item)
 	}
+	if contract.coalesceAssistantToolTurns {
+		items = coalesceResponsesAssistantToolTurns(items)
+	}
 	if err := validatePolicyResponsesCallSequence(items); err != nil {
 		return nil, err
 	}
@@ -651,6 +673,56 @@ func validatePolicyResponsesOptionalItemMetadata(object map[string]json.RawMessa
 		}
 	}
 	return nil
+}
+
+// coalesceResponsesAssistantToolTurns rewrites each maximal run of assistant
+// messages and function calls that contains at least one call into a single
+// assistant message followed by the calls in their original order. Chat has
+// one assistant message per turn whose content precedes its tool_calls, so
+// text a Responses model emitted between or after its calls is joined into that
+// content. Runs without calls, other roles and tool outputs are untouched.
+func coalesceResponsesAssistantToolTurns(items []policyResponsesInputItem) []policyResponsesInputItem {
+	isTurnItem := func(item policyResponsesInputItem) bool {
+		return item.kind == "function_call" || (item.kind == "message" && item.role == "assistant")
+	}
+	out := make([]policyResponsesInputItem, 0, len(items))
+	for index := 0; index < len(items); {
+		if !isTurnItem(items[index]) {
+			out = append(out, items[index])
+			index++
+			continue
+		}
+		end := index
+		var texts []string
+		var message *policyResponsesInputItem
+		calls := make([]policyResponsesInputItem, 0, 1)
+		for end < len(items) && isTurnItem(items[end]) {
+			item := items[end]
+			if item.kind == "function_call" {
+				calls = append(calls, item)
+			} else {
+				if message == nil {
+					first := item
+					message = &first
+				}
+				if item.text != "" {
+					texts = append(texts, item.text)
+				}
+			}
+			end++
+		}
+		if len(calls) == 0 {
+			out = append(out, items[index:end]...)
+		} else {
+			if message != nil {
+				message.text = strings.Join(texts, "\n\n")
+				out = append(out, *message)
+			}
+			out = append(out, calls...)
+		}
+		index = end
+	}
+	return out
 }
 
 func validatePolicyResponsesCallSequence(items []policyResponsesInputItem) error {
