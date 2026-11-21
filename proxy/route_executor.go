@@ -2245,6 +2245,9 @@ func (o *routeAttemptResponseObserver) consumeSSELineLocked() bool {
 		}
 		return true
 	}) {
+		if o.observeOverflowedSSEEvent() {
+			return true
+		}
 		o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressUnknown)
 	}
 	return publish

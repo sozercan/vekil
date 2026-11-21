@@ -686,6 +686,38 @@ func TestAcceptedStreamingAttemptRemainsInFlightUntilTerminalEvent(t *testing.T)
 	}
 }
 
+func TestRouteAttemptObservesCumulativelyOversizedResponsesTerminal(t *testing.T) {
+	handler := &ProxyHandler{stats: newStatsCollector()}
+	record := handler.RecordUpstreamAttempt(context.Background(), RouteAttemptObservation{
+		OperationID: "operation-large-terminal", RouteID: "route-large-terminal", TargetID: "target-large-terminal",
+		ProviderID: "provider-large-terminal", ProviderKind: "test", Sequence: 1, AttemptKind: routeAttemptNormal,
+	})
+	trace := routeAttemptTrace{Sequence: 1, StatusCode: http.StatusOK, Delivery: requestDeliveredOrAmbiguous, Decision: routeRetryAccepted}
+	line := "data: " + strings.Repeat(" ", routeAttemptObservationMaxLine/2) + "\n"
+	lines := openAIStreamScannerMaxBuffer/len(line) + 1
+	readers := make([]io.Reader, 0, lines+2)
+	readers = append(readers, strings.NewReader("event: response.completed\ndata: {\n"))
+	for range lines {
+		readers = append(readers, strings.NewReader(line))
+	}
+	readers = append(readers, strings.NewReader(`data: "response":{"id":"resp-large","status":"completed"}}`+"\n\n"))
+	response := observeRouteAttemptResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(io.MultiReader(readers...)),
+	}, record, nil, trace, nil, providerEndpointResponses, true)
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	attempt := routeAttemptBySequence(t, handler.stats.snapshot().RecentAttempts, 1)
+	if attempt.Outcome != routeAttemptOutcomeSucceeded || attempt.SemanticProgress != upstreamProgressTerminalSuccess || !attempt.CleanupComplete {
+		t.Fatalf("oversized terminal attempt = %+v, want succeeded with cleanup complete", attempt)
+	}
+}
+
 func TestStreamingTerminalFailureCannotBeWeakenedByLaterSuccessInSameRead(t *testing.T) {
 	tests := []struct {
 		name             string
