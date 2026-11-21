@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -1896,14 +1897,42 @@ func yamlTopLevelConfigFields(body []byte) (map[string]bool, error) {
 func rejectDuplicateJSONMappingKeys(body []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
-	if err := scanJSONValueForDuplicateKeys(decoder, "", true); err != nil {
+	if err := scanJSONValueForDuplicateKeys(decoder, true); err != nil {
 		return err
 	}
 	return nil
 }
 
-func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string, reportPaths bool) error {
-	token, err := decoder.Token()
+// maxJSONDuplicateKeyScanDepth matches the nesting limit encoding/json
+// enforces in Valid and Unmarshal. Decoder.Token does not enforce it in the
+// legacy decoder (GOEXPERIMENT=nojsonv2), so the scan bounds itself.
+const maxJSONDuplicateKeyScanDepth = 10000
+
+// scanJSONValueForDuplicateKeys rejects duplicate object keys in the next JSON
+// value read from decoder. It runs on client- and upstream-controlled bytes, so
+// its cost must stay linear in the input: with reportPaths, it tracks path
+// segments on a stack and formats the path only when reporting an error,
+// rather than building and retaining a string for every nesting level.
+func scanJSONValueForDuplicateKeys(decoder *json.Decoder, reportPaths bool) error {
+	scanner := jsonDuplicateKeyScanner{decoder: decoder, reportPaths: reportPaths}
+	return scanner.scanValue(0)
+}
+
+type jsonDuplicateKeyScanner struct {
+	decoder     *json.Decoder
+	reportPaths bool
+	path        []jsonPathSegment
+}
+
+// jsonPathSegment is an object key, or an array index when isIndex is set.
+type jsonPathSegment struct {
+	key     string
+	index   int
+	isIndex bool
+}
+
+func (s *jsonDuplicateKeyScanner) scanValue(depth int) error {
+	token, err := s.decoder.Token()
 	if err != nil {
 		return err
 	}
@@ -1911,50 +1940,86 @@ func scanJSONValueForDuplicateKeys(decoder *json.Decoder, path string, reportPat
 	if !isDelimiter {
 		return nil
 	}
+	if depth >= maxJSONDuplicateKeyScanDepth {
+		return configPathError(s.pathString(), "JSON nesting depth exceeds %d", maxJSONDuplicateKeyScanDepth)
+	}
 
 	switch delimiter {
 	case '{':
 		seen := make(map[string]struct{})
-		for decoder.More() {
-			keyToken, err := decoder.Token()
+		for s.decoder.More() {
+			keyToken, err := s.decoder.Token()
 			if err != nil {
 				return err
 			}
 			key, ok := keyToken.(string)
 			if !ok {
-				return fmt.Errorf("%s: JSON mapping key is not a string", path)
+				return fmt.Errorf("%s: JSON mapping key is not a string", s.pathString())
 			}
-			keyPath := path
-			if reportPaths {
-				keyPath = appendConfigObjectPath(path, key)
-			}
+			s.push(jsonPathSegment{key: key})
 			if _, exists := seen[key]; exists {
-				return configPathError(keyPath, "duplicate mapping key %q", key)
+				return configPathError(s.pathString(), "duplicate mapping key %q", key)
 			}
 			seen[key] = struct{}{}
-			if err := scanJSONValueForDuplicateKeys(decoder, keyPath, reportPaths); err != nil {
+			if err := s.scanValue(depth + 1); err != nil {
 				return err
 			}
+			s.pop()
 		}
-		_, err = decoder.Token()
+		_, err = s.decoder.Token()
 		return err
 	case '[':
 		index := 0
-		for decoder.More() {
-			itemPath := path
-			if reportPaths {
-				itemPath = fmt.Sprintf("%s[%d]", path, index)
-			}
-			if err := scanJSONValueForDuplicateKeys(decoder, itemPath, reportPaths); err != nil {
+		for s.decoder.More() {
+			s.push(jsonPathSegment{index: index, isIndex: true})
+			if err := s.scanValue(depth + 1); err != nil {
 				return err
 			}
+			s.pop()
 			index++
 		}
-		_, err = decoder.Token()
+		_, err = s.decoder.Token()
 		return err
 	default:
 		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
 	}
+}
+
+func (s *jsonDuplicateKeyScanner) push(segment jsonPathSegment) {
+	if s.reportPaths {
+		s.path = append(s.path, segment)
+	}
+}
+
+func (s *jsonDuplicateKeyScanner) pop() {
+	if s.reportPaths {
+		s.path = s.path[:len(s.path)-1]
+	}
+}
+
+// pathString formats the current path exactly as repeated
+// appendConfigObjectPath and "%s[%d]" calls would, in one linear pass.
+func (s *jsonDuplicateKeyScanner) pathString() string {
+	var path strings.Builder
+	for _, segment := range s.path {
+		switch {
+		case segment.isIndex:
+			path.WriteByte('[')
+			path.WriteString(strconv.Itoa(segment.index))
+			path.WriteByte(']')
+		case path.Len() == 0:
+			path.WriteString(segment.key)
+		case isSimpleConfigPathKey(segment.key):
+			path.WriteByte('.')
+			path.WriteString(segment.key)
+		default:
+			encoded, _ := json.Marshal(segment.key)
+			path.WriteByte('[')
+			path.Write(encoded)
+			path.WriteByte(']')
+		}
+	}
+	return path.String()
 }
 
 func rejectDuplicateYAMLMappingKeys(body []byte, allowMergeKeys bool) error {

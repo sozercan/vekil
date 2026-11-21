@@ -1,13 +1,18 @@
 package launch
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
 )
 
 const codexLocalTokenEnv = "VEKIL_CODEX_API_KEY"
+
+// codexProviderID is the Codex model provider injected by the launcher. Codex
+// records the provider in each session's metadata and refuses to resume a
+// session whose provider is no longer configured, so the ID must stay stable
+// across launches. The per-launch secret travels only through env_key.
+const codexProviderID = "vekil_launch"
 
 var codexCredentialEnvironment = []string{
 	"AZURE_OPENAI_API_KEY",
@@ -71,6 +76,9 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		if err := validateExecutableVersion(executable, probeEnvironment, "Codex CLI", "codex-cli", minimumVersion{major: 0, minor: 137, patch: 0}); err != nil {
 			return PreparedProcess{}, err
 		}
+		if err := checkCodexLaunchProvider(executable, probeEnvironment, codexConfigDirectory(input.ForwardedArgs)); err != nil {
+			return PreparedProcess{}, err
+		}
 	}
 
 	var catalogPath string
@@ -86,7 +94,7 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		}
 	}
 
-	providerID := codexProviderID(localToken)
+	providerID := codexProviderID
 	args := append([]string(nil), executable.prefixArgs...)
 	overrides := []string{
 		`model_provider=` + configString(providerID),
@@ -138,11 +146,6 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 func configString(value string) string {
 	body, _ := json.Marshal(value)
 	return string(body)
-}
-
-func codexProviderID(localToken string) string {
-	digest := sha256.Sum256([]byte(localToken))
-	return "vekil_launch_" + fmt.Sprintf("%x", digest[:6])
 }
 
 func validateCodexForwardedArgs(args []string) error {

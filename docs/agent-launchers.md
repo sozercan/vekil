@@ -277,8 +277,16 @@ vekil launch codex --model gpt-5.4-mini -- \
 ```
 
 Codex's built-in OpenAI provider does not use a generic base-URL override for
-this flow. Vekil instead injects a transient, per-launch
-`model_providers.<random-id>` definition through Codex `-c` arguments:
+this flow. Vekil instead injects a transient `model_providers.vekil_launch`
+definition through Codex `-c` arguments. The provider ID is the same on every
+launch because Codex records it in session metadata and refuses to resume a
+session whose provider is no longer configured; only the base URL and local
+token change per launch. Sessions created by older versions with a token-derived
+provider ID are not migrated and will not appear in `resume --last` for the
+stable provider. Vekil rejects launches if the effective Codex configuration
+already defines `model_providers.vekil_launch`; rename or remove that entry to
+prevent its settings from merging into the launcher provider. The injected
+definition sets:
 
 - `base_url` points to the ephemeral proxy's `/v1` root;
 - `wire_api="responses"` selects `POST /v1/responses`;
