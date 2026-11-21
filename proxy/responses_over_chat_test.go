@@ -495,6 +495,62 @@ func TestResponsesOverChatStructuredOutputPreservesRefusal(t *testing.T) {
 	}
 }
 
+func TestResponsesOverChatBoundsStructuredOutputItems(t *testing.T) {
+	state := newResponsesOverChatStream(nil, "chat-only", policyResponsesChatRequest{
+		Response: policyResponsesResponseConfig{Text: json.RawMessage(`{"format":{"type":"json_object"}}`)},
+	})
+	for index := 0; index < responsesOverChatMaxOutputItems; index++ {
+		if err := state.appendText("x", index%2 == 1); err != nil {
+			t.Fatalf("append item %d: %v", index, err)
+		}
+	}
+	if err := state.appendText("x", false); err == nil || !strings.Contains(err.Error(), "output item limit") {
+		t.Fatalf("expected output-item limit error, got %v", err)
+	}
+	if len(state.finished) != responsesOverChatMaxOutputItems || state.outputBytes >= responsesOverChatMaxOutputBytes {
+		t.Fatalf("retained items = %d, output bytes = %d", len(state.finished), state.outputBytes)
+	}
+}
+
+func TestResponsesOverChatUsesTargetOutputTokenField(t *testing.T) {
+	for _, test := range []struct {
+		useMaxCompletionTokens bool
+		want, omit             string
+	}{
+		{false, "max_tokens", "max_completion_tokens"},
+		{true, "max_completion_tokens", "max_tokens"},
+	} {
+		t.Run(test.want, func(t *testing.T) {
+			upstream := newROCUpstream(t, rocSSE(t, `{"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`, "[DONE]"))
+			handler, err := NewProxyHandler(auth.NewTestAuthenticator("fixture"), logger.NewWithWriter(logger.LevelError, io.Discard),
+				WithProvidersConfig(ProvidersConfig{Providers: []ProviderConfig{{
+					ID: "fixture", Type: string(providerTypeOpenAICompatible), Default: true, BaseURL: upstream.server.URL, AuthType: "none",
+					Models: []ProviderModelConfig{{
+						PublicID: "chat-only", Endpoints: []string{providerEndpointChatCompletions},
+						UseMaxCompletionTokens: &test.useMaxCompletionTokens,
+					}},
+				}}}), WithResponsesOverChatModels("chat-only"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(handler.BeginShutdown)
+			response := postROC(t, handler, `{"model":"chat-only","input":"go","max_output_tokens":64}`)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+			}
+			upstream.mu.Lock()
+			defer upstream.mu.Unlock()
+			if len(upstream.chatBodies) != 1 {
+				t.Fatalf("Chat sends = %d, want 1", len(upstream.chatBodies))
+			}
+			body := upstream.chatBodies[0]
+			if _, present := body[test.omit]; present || body[test.want] != float64(64) {
+				t.Fatalf("upstream body = %v, want only %s=64", body, test.want)
+			}
+		})
+	}
+}
+
 func TestResponsesOverChatKeepsAdmittedNativeChatRoute(t *testing.T) {
 	upstream := newROCUpstream(t, rocSSE(t,
 		`{"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`, "[DONE]"))

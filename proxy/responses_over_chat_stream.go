@@ -210,6 +210,15 @@ func (s *responsesOverChatStream) addOutputBytes(n int) error {
 	return nil
 }
 
+func (s *responsesOverChatStream) reserveOutputIndex() (int, error) {
+	index := s.nextOutputIndex
+	if index >= responsesOverChatMaxOutputItems {
+		return 0, &responsesOverChatFailure{status: http.StatusBadGateway, code: "response_too_large", message: "upstream response exceeds the Responses-over-Chat output item limit"}
+	}
+	s.nextOutputIndex++
+	return index, nil
+}
+
 func (s *responsesOverChatStream) openMessage(refusal bool) error {
 	if s.message != nil {
 		if s.message.refusal == refusal {
@@ -219,8 +228,11 @@ func (s *responsesOverChatStream) openMessage(refusal bool) error {
 			return err
 		}
 	}
-	s.message = &responsesOverChatMessage{itemID: newPolicyResponsesID("msg"), outputIndex: s.nextOutputIndex, refusal: refusal}
-	s.nextOutputIndex++
+	index, err := s.reserveOutputIndex()
+	if err != nil {
+		return err
+	}
+	s.message = &responsesOverChatMessage{itemID: newPolicyResponsesID("msg"), outputIndex: index, refusal: refusal}
 	if err := s.emit("response.output_item.added", map[string]any{
 		"output_index": s.message.outputIndex,
 		"item":         map[string]any{"id": s.message.itemID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}},
@@ -402,11 +414,14 @@ func (s *responsesOverChatStream) addToolCall(call *responsesOverChatToolCall) e
 	if err := s.closeMessage("completed"); err != nil {
 		return err
 	}
+	index, err := s.reserveOutputIndex()
+	if err != nil {
+		return err
+	}
 	call.descriptor = descriptor
 	call.added = true
 	call.itemID = newPolicyResponsesID("fc")
-	call.outputIndex = s.nextOutputIndex
-	s.nextOutputIndex++
+	call.outputIndex = index
 	if err := s.emit("response.output_item.added", map[string]any{
 		"output_index": call.outputIndex,
 		"item":         s.functionCallItem(call, "in_progress", ""),
