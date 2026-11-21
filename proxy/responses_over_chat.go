@@ -255,7 +255,7 @@ const responsesCompatibilityCatalogField = "vekil_responses_compatibility"
 // for the process lifetime, so the annotated body can share the normal
 // /v1/models cache and refresh cycle.
 func (h *ProxyHandler) annotateResponsesOverChatCatalog(body []byte) ([]byte, map[string]struct{}) {
-	if h == nil || (len(h.responsesOverChatModels) == 0 && !bytes.Contains(body, []byte(responsesCompatibilityCatalogField))) {
+	if h == nil {
 		return body, nil
 	}
 	// Keep every other top-level catalog field intact.
@@ -283,6 +283,9 @@ func (h *ProxyHandler) annotateResponsesOverChatCatalog(body []byte) ([]byte, ma
 				delete(fields, key)
 				hadMarker = true
 			}
+		}
+		if !hadMarker && len(h.responsesOverChatModels) == 0 {
+			continue
 		}
 		var entry struct {
 			ID                 string   `json:"id"`
