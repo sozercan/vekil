@@ -16,7 +16,7 @@ func TestCodexLaunchProviderConfigCheck(t *testing.T) {
 	}{
 		{"unrelated provider", `{"id":2,"result":{"config":{"model_providers":{"other":{}}}}}`, ""},
 		{"reserved provider", `{"id":2,"result":{"config":{"model_providers":{"vekil_launch":{"http_headers":{"Example":"not-for-logs"}}}}}}`, "reserved by Vekil"},
-		{"invalid response", `{"id":2,"error":{"message":"not-for-logs"}}`, "did not return"},
+		{"invalid response", `{"id":2,"error":{"message":"not-for-logs"}}`, "missing effective configuration"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			env := append(os.Environ(), "LAUNCH_TEST_CODEX_CONFIG_RESPONSE="+test.config)

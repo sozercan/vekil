@@ -101,10 +101,10 @@ func checkCodexLaunchProvider(executable resolvedExecutable, environment []strin
 			continue
 		}
 		if reply.Result == nil || reply.Result.Config == nil {
-			return errors.New("Codex did not return its effective configuration")
+			return errors.New("missing effective configuration in Codex response")
 		}
 		if _, exists := reply.Result.Config.Providers[codexProviderID]; exists {
-			return fmt.Errorf("Codex provider %q is reserved by Vekil launch; rename or remove it from Codex configuration", codexProviderID)
+			return fmt.Errorf("provider %q is reserved by Vekil launch; rename or remove it from Codex configuration", codexProviderID)
 		}
 		return nil
 	}
