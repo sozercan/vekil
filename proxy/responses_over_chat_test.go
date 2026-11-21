@@ -1329,6 +1329,34 @@ func TestPolicyResponsesContractKeepsRejectingInterleavedAssistantText(t *testin
 }
 
 func TestResponsesOverChatClientCancelRecords499(t *testing.T) {
+	t.Run("model discovery", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var discoveryHits atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != providerEndpointModels {
+				t.Errorf("unexpected upstream path %q", r.URL.Path)
+				http.NotFound(w, r)
+				return
+			}
+			discoveryHits.Add(1)
+			cancel()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, rocCopilotCatalog)
+		}))
+		defer upstream.Close()
+		h := newROCHandler(t, upstream.URL)
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gemini-test","input":"hi"}`)).WithContext(ctx)
+		recorder := httptest.NewRecorder()
+		h.HandleResponses(recorder, request)
+		if hits := discoveryHits.Load(); hits != 1 {
+			t.Fatalf("model discovery requests = %d, want 1", hits)
+		}
+		if recorder.Code != 499 || recorder.Body.Len() != 0 {
+			t.Fatalf("status = %d body=%q, want bare 499", recorder.Code, recorder.Body.String())
+		}
+	})
+
 	t.Run("stream", func(t *testing.T) {
 		upstream := newROCUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
