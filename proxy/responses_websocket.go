@@ -1474,6 +1474,22 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			}
 			return err
 		}
+		if compatibility := h.resolveResponsesCompatibility(s.ctx, request.Model); compatibility.mode != responsesExecutionNative {
+			model := strings.TrimSpace(request.Model)
+			message := fmt.Sprintf("model %q cannot serve Responses-over-Chat: %s", model, compatibility.reason)
+			if compatibility.mode == responsesExecutionOverChat {
+				message = fmt.Sprintf("model %q is served through Responses-over-Chat, which supports HTTP POST /v1/responses only; disable websockets for this client", model)
+			}
+			err := &providerRequestError{
+				statusCode: http.StatusBadRequest,
+				err:        errors.New(message),
+			}
+			s.recordTurnStats(h, model, "", "", http.StatusBadRequest, responsesUsage{}, nil)
+			if writeErr := s.sendWrappedError(http.StatusBadRequest, err.Error(), "invalid_request_error", nil); writeErr != nil {
+				return writeErr
+			}
+			return err
+		}
 	}
 	s.syncTurnMetadata(request)
 	if request.PreviousResponseID == "" {

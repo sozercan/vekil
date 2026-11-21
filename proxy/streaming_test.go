@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -702,6 +703,38 @@ func TestConsumeOpenAIStreamChunks_MultiLineDataEvent(t *testing.T) {
 	}
 	if content != "Hi" {
 		t.Fatalf("chunk content = %q, want Hi", content)
+	}
+}
+
+func TestConsumeOpenAIStreamChunksStrictBoundsMultilineEvent(t *testing.T) {
+	padding := "data: " + strings.Repeat(" ", openAIStreamScannerMaxBuffer/2) + "\n"
+	input := io.MultiReader(strings.NewReader("data: {\n"), strings.NewReader(padding), strings.NewReader(padding), strings.NewReader("data: }\n\ndata: [DONE]\n\n"))
+	done, err := consumeOpenAIStreamChunksStrict(input, func(models.OpenAIStreamChunk) bool {
+		t.Fatal("oversized SSE event reached the chunk consumer")
+		return false
+	})
+	if done || !errors.Is(err, errOpenAISSEEventTooLong) {
+		t.Fatalf("done = %v, error = %v; want an oversized-event error", done, err)
+	}
+}
+
+func TestSSEDataAccumulatorDiscardsOversizedEventUntilBoundary(t *testing.T) {
+	accumulator := sseDataAccumulator{maxBytes: 16}
+	var observed []string
+	observe := func(_, data string) bool {
+		observed = append(observed, data)
+		return true
+	}
+	if !accumulator.consumeLine("data: first\n", observe) || accumulator.consumeLine("data: second\n", observe) {
+		t.Fatal("expected the second line to exceed the event budget")
+	}
+	for _, line := range []string{"data: discard\n", "\n", "data: next\n", "\n"} {
+		if !accumulator.consumeLine(line, observe) {
+			t.Fatalf("unexpected overflow while consuming %q", line)
+		}
+	}
+	if len(observed) != 1 || observed[0] != "next" {
+		t.Fatalf("observed events = %v, want [next]", observed)
 	}
 }
 

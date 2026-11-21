@@ -13,7 +13,7 @@ model.
 | Target | Model selection | Minimum tested contract | Compatible model endpoint |
 |--------|-----------------|-------------------------|---------------------------|
 | Claude Code | Optional `--model`; otherwise Claude's CLI default | Claude Code 2.1.83+ | `/v1/messages`, `/chat/completions`, or `/responses` |
-| OpenAI Codex CLI | Optional `--model`; otherwise Codex's CLI default | Codex CLI 0.137.0+ | `/responses`, or a policy-owned `/chat/completions` model through bounded stateless compatibility |
+| OpenAI Codex CLI | Optional `--model`; otherwise Codex's CLI default | Codex CLI 0.137.0+ | `/responses`; a policy-owned `/chat/completions` model through bounded stateless compatibility; or an opted-in Chat-only model through [Responses-over-Chat](#chat-only-models-in-codex-responses-over-chat) |
 | GitHub Copilot CLI | `--model` required | GitHub Copilot CLI 1.0.0+ | `/responses` or `/chat/completions` |
 
 ```bash
@@ -131,6 +131,7 @@ normal global policy-controller startup behavior.
 | `--startup-timeout DURATION` | Maximum startup/authentication/readiness time. |
 | `--streaming-upstream-timeout DURATION` | Upstream streaming timeout. |
 | `--policy-routing config|off|observe|enforce` | Policy-routing mode. `config` follows YAML profile modes and is the default; other values apply a process-wide safety ceiling. |
+| `--responses-over-chat-models IDS` | Comma-separated Chat-only public model IDs the launch proxy may serve on `/v1/responses` ([Responses-over-Chat](responses.md#responses-compatibility-over-a-native-chat-model-responses-over-chat)). Also read from `RESPONSES_OVER_CHAT_MODELS`. Off by default. A Codex launch with a non-empty list requires `--model`. |
 | `--proxy-log PATH` | New JSON proxy log path; existing files and links are rejected. |
 | `--dry-run` | Print the child-process plan without starting a proxy or agent. Static model metadata is resolved; catalog-only metadata is marked unresolved. |
 | `--no-summary` | Suppress the end-of-session request/token summary. |
@@ -338,6 +339,33 @@ provider. The selected default must exist in Vekil's global public namespace and
 support `/responses`. Because the launcher cannot know the choice in advance,
 an unknown or incompatible default fails when Codex requests it rather than
 during launcher startup.
+
+### Chat-only models in Codex (Responses-over-Chat)
+
+Codex speaks only the Responses API. To launch it with a model whose provider
+exposes only native Chat Completions, such as a Copilot Gemini model, opt that
+model in explicitly:
+
+```bash
+vekil launch codex --model gemini-3.8-flash --responses-over-chat-models gemini-3.8-flash
+```
+
+Without the opt-in the launcher refuses a Chat-only model and names the flag.
+With an opt-in list, a Codex launch must also pass `--model`: the restrictions
+below come from the pinned model's metadata, so letting Codex choose its own
+model would skip them.
+With it, the launch proxy marks the model with
+`vekil_responses_compatibility: "responses_over_chat"` in `/v1/models` while its
+native `supported_endpoints` stays `["/chat/completions"]`, and the launcher
+applies the same bounded-adapter restrictions as for policy-owned models: HTTP
+streaming only (no websockets), hosted web search, remote compaction, Responses
+Lite, code-only tool modes, and the freeform `apply_patch` tool disabled,
+image input removed from the generated catalog, and no default reasoning level
+unless the provider advertises reasoning efforts (advertised values become the
+picker's choices). Forwarded `--search` and attempts to re-enable those features
+are rejected. Conversations replay full history with `store: false`; a session
+that mixes in history from a native Responses model (for example encrypted
+reasoning items) is rejected rather than silently trimmed.
 
 Foreground `resume`, `fork`, and `exec resume` commands are forwarded.
 Forwarded `-m`/`--model`, `-c`/`--config`, profile, OSS/local-provider, remote,

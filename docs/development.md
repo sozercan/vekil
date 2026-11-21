@@ -195,6 +195,19 @@ go test ./proxy/ -run '^$' -fuzz 'FuzzTranslateChatRequestToResponses' -fuzztime
 
 The focused tests cover native-Chat preference, provider-local cold discovery, strict `MAP`/`LOCAL`/`REJECT` input handling, both minted replay ID shapes, full/reordered/partial parallel tool results, restart/state-loss errors, typed event streaming, Anthropic/Gemini ingress, count-token probes, and dashboard-compatible routing.
 
+### Responses-over-Chat suite
+
+Deterministic fake-upstream coverage for the opt-in Responses-over-Chat adapter (selection, request contract, incremental streaming, tools, explicit-route commitment, websocket rejection) and the shared translation contract:
+
+```bash
+go test ./proxy/ -run 'ResponsesOverChat|ResponsesTranslationContract|ResponsesChatTranslationContract|ToolParserWrapper|PolicyResponses' -count=1
+go test -race ./proxy/ -run 'ResponsesOverChat' -count=1
+```
+
+For a live check, run `RESPONSES_OVER_CHAT_SMOKE_MODEL=<approved Chat-only model> scripts/live-responses-over-chat-smoke.sh`. It requires an explicit model (no default), starts a token-protected proxy on a free loopback port, checks adapter and Codex catalog eligibility before sending inference, and runs JSON, SSE, forced namespaced tool, tool-result continuation, and parallel-call turns, printing a redacted summary.
+
+`proxy/testdata/responses_over_chat/` holds a sanitized Copilot Gemini stream (synthetic IDs and opaque values) that preserves the real chunk shape: complete calls per chunk, `reasoning_opaque`, per-chunk usage, and `copilot_usage`.
+
 ## Benchmarks
 
 ```bash

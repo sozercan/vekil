@@ -93,6 +93,7 @@ type policyResponsesParsedToolChoice struct {
 type policyResponsesCanonicalChatRequest struct {
 	Model               string                 `json:"model"`
 	Messages            []models.OpenAIMessage `json:"messages"`
+	MaxTokens           *int                   `json:"max_tokens,omitempty"`
 	MaxCompletionTokens *int                   `json:"max_completion_tokens,omitempty"`
 	Temperature         *float64               `json:"temperature,omitempty"`
 	TopP                *float64               `json:"top_p,omitempty"`
@@ -104,9 +105,59 @@ type policyResponsesCanonicalChatRequest struct {
 	ReasoningEffort     string                 `json:"reasoning_effort,omitempty"`
 }
 
+// responsesChatTranslationContract bounds one public Responses ingress that is
+// translated to canonical Chat. Each surface owns its limits and the noun used
+// in client-facing validation messages so that, for example, direct
+// Responses-over-Chat errors never describe the request as a policy request.
+type responsesChatTranslationContract struct {
+	// label prefixes size errors ("policy Responses request exceeds ...").
+	label string
+	// subject completes unsupported-feature errors ("... for policy models").
+	subject string
+	// maxRequestBytes bounds the public Responses body and each text field.
+	maxRequestBytes int
+	// maxTranslatedBytes bounds the canonical Chat body and flattened tool text.
+	maxTranslatedBytes int
+	// maxInputItems bounds the Responses input array.
+	maxInputItems      int
+	useLegacyMaxTokens bool
+	// coalesceAssistantToolTurns merges each run of assistant messages and
+	// function calls into one Chat assistant turn (text first, then calls)
+	// before call-sequence validation. Adapters whose own output can place
+	// assistant text after a call set it so that output replays as input.
+	coalesceAssistantToolTurns bool
+	// omitToolChoiceWithoutTools drops a tool_choice of "auto" or "none" when
+	// no tools are declared. Both are no-ops without tools, and some Chat
+	// upstreams reject any tool_choice that has no tools beside it. Codex
+	// sends that shape for its local compaction turn.
+	omitToolChoiceWithoutTools bool
+}
+
+// policyResponsesTranslationContract is the semantic-policy Responses ingress
+// contract. Its limits and messages are part of the policy surface and must not
+// be broadened by other Responses-to-Chat consumers.
+var policyResponsesTranslationContract = responsesChatTranslationContract{
+	label:              "policy",
+	subject:            "policy models",
+	maxRequestBytes:    policyResponsesMaxRequestBytes,
+	maxTranslatedBytes: policyResponsesMaxTranslatedChatBytes,
+	maxInputItems:      policyResponsesMaxInputItems,
+}
+
+func (c responsesChatTranslationContract) unsupported(feature string) string {
+	return feature + " for " + c.subject
+}
+
 func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequest, error) {
-	if len(body) > policyResponsesMaxRequestBytes {
-		return policyResponsesChatRequest{}, newChatInvalidRequest("", fmt.Sprintf("policy Responses request exceeds %d bytes", policyResponsesMaxRequestBytes))
+	return translateResponsesRequestToChat(body, policyResponsesTranslationContract)
+}
+
+// translateResponsesRequestToChat converts one bounded, stateless Responses
+// request into canonical Chat under contract. It performs no routing and no
+// policy classification; callers own execution.
+func translateResponsesRequestToChat(body []byte, contract responsesChatTranslationContract) (policyResponsesChatRequest, error) {
+	if len(body) > contract.maxRequestBytes {
+		return policyResponsesChatRequest{}, newChatInvalidRequest("", fmt.Sprintf("%s Responses request exceeds %d bytes", contract.label, contract.maxRequestBytes))
 	}
 	if err := validatePolicyResponsesJSON(body); err != nil {
 		return policyResponsesChatRequest{}, err
@@ -123,25 +174,25 @@ func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequ
 	if err != nil {
 		return policyResponsesChatRequest{}, err
 	}
-	if err := validatePolicyResponsesStore(root); err != nil {
+	if err := validatePolicyResponsesStore(root, contract); err != nil {
 		return policyResponsesChatRequest{}, err
 	}
 	if _, ok := root["previous_response_id"]; ok {
-		return policyResponsesChatRequest{}, newChatInvalidRequest("previous_response_id", "previous_response_id is not supported for policy models")
+		return policyResponsesChatRequest{}, newChatInvalidRequest("previous_response_id", contract.unsupported("previous_response_id is not supported"))
 	}
 	if err := validatePolicyResponsesBenignMetadata(root); err != nil {
 		return policyResponsesChatRequest{}, err
 	}
 
-	instructions, err := optionalPolicyResponsesText(root, "instructions", policyResponsesMaxRequestBytes)
+	instructions, err := optionalPolicyResponsesText(root, "instructions", contract.maxRequestBytes)
 	if err != nil {
 		return policyResponsesChatRequest{}, err
 	}
-	input, err := parsePolicyResponsesInput(root["input"])
+	input, err := parsePolicyResponsesInput(root["input"], contract)
 	if err != nil {
 		return policyResponsesChatRequest{}, err
 	}
-	parsedTools, err := parsePolicyResponsesTools(root["tools"])
+	parsedTools, err := parseResponsesToolsWithContract(root["tools"], contract)
 	if err != nil {
 		return policyResponsesChatRequest{}, err
 	}
@@ -194,6 +245,9 @@ func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequ
 	if err != nil {
 		return policyResponsesChatRequest{}, err
 	}
+	if contract.omitToolChoiceWithoutTools && len(chatTools) == 0 && toolChoice.descriptor == nil && (toolChoice.mode == "auto" || toolChoice.mode == "none") {
+		chatToolChoice = nil
+	}
 	callableTools := policyResponsesCallableTools(parsedTools, aliases, toolChoice)
 
 	stream, err := policyResponsesBool(root, "stream", false)
@@ -207,7 +261,7 @@ func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequ
 	if maxTokens != nil && *maxTokens < responsesChatMinimumOutputTokens {
 		return policyResponsesChatRequest{}, newChatInvalidRequest(
 			"max_output_tokens",
-			fmt.Sprintf("max_output_tokens must be at least %d for policy models", responsesChatMinimumOutputTokens),
+			contract.unsupported(fmt.Sprintf("max_output_tokens must be at least %d", responsesChatMinimumOutputTokens)),
 		)
 	}
 	temperature, err := policyResponsesFloat(root, "temperature", 0, 2)
@@ -252,12 +306,16 @@ func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequ
 		ResponseFormat:      responseFormat,
 		ReasoningEffort:     reasoningEffort,
 	}
+	if contract.useLegacyMaxTokens {
+		canonical.MaxTokens = maxTokens
+		canonical.MaxCompletionTokens = nil
+	}
 	chatBody, err := json.Marshal(canonical)
 	if err != nil {
 		return policyResponsesChatRequest{}, fmt.Errorf("marshal policy Chat request: %w", err)
 	}
-	if len(chatBody) > policyResponsesMaxTranslatedChatBytes {
-		return policyResponsesChatRequest{}, newChatInvalidRequest("", fmt.Sprintf("translated policy Chat request exceeds %d bytes", policyResponsesMaxTranslatedChatBytes))
+	if len(chatBody) > contract.maxTranslatedBytes {
+		return policyResponsesChatRequest{}, newChatInvalidRequest("", fmt.Sprintf("translated %s Chat request exceeds %d bytes", contract.label, contract.maxTranslatedBytes))
 	}
 	return policyResponsesChatRequest{
 		Body:          chatBody,
@@ -388,20 +446,20 @@ func validatePolicyResponsesTopLevel(root map[string]json.RawMessage) error {
 	return newChatInvalidRequestClientField("", unknown[0], "unsupported JSON field")
 }
 
-func validatePolicyResponsesStore(root map[string]json.RawMessage) error {
+func validatePolicyResponsesStore(root map[string]json.RawMessage, contract responsesChatTranslationContract) error {
 	raw, ok := root["store"]
 	if !ok {
 		return nil
 	}
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return newChatInvalidRequest("store", "store must be false or omitted for policy models")
+		return newChatInvalidRequest("store", contract.unsupported("store must be false or omitted"))
 	}
 	var store bool
 	if err := json.Unmarshal(raw, &store); err != nil {
-		return newChatInvalidRequest("store", "store must be false or omitted for policy models")
+		return newChatInvalidRequest("store", contract.unsupported("store must be false or omitted"))
 	}
 	if store {
-		return newChatInvalidRequest("store", "store must be false or omitted for policy models")
+		return newChatInvalidRequest("store", contract.unsupported("store must be false or omitted"))
 	}
 	return nil
 }
@@ -470,7 +528,7 @@ func validatePolicyResponsesMetadataObject(raw json.RawMessage, param string) er
 	return nil
 }
 
-func parsePolicyResponsesInput(raw json.RawMessage) ([]policyResponsesInputItem, error) {
+func parsePolicyResponsesInput(raw json.RawMessage, contract responsesChatTranslationContract) ([]policyResponsesInputItem, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil, newChatInvalidRequest("input", "input is required and must be a string or array")
@@ -483,16 +541,19 @@ func parsePolicyResponsesInput(raw json.RawMessage) ([]policyResponsesInputItem,
 	if err := json.Unmarshal(raw, &values); err != nil {
 		return nil, newChatInvalidRequest("input", "input must be a string or array")
 	}
-	if len(values) > policyResponsesMaxInputItems {
-		return nil, newChatInvalidRequest("input", fmt.Sprintf("input may contain at most %d items", policyResponsesMaxInputItems))
+	if len(values) > contract.maxInputItems {
+		return nil, newChatInvalidRequest("input", fmt.Sprintf("input may contain at most %d items", contract.maxInputItems))
 	}
 	items := make([]policyResponsesInputItem, 0, len(values))
 	for index, itemRaw := range values {
-		item, err := parsePolicyResponsesInputItem(itemRaw, index)
+		item, err := parsePolicyResponsesInputItem(itemRaw, index, contract)
 		if err != nil {
 			return nil, err
 		}
 		items = append(items, item)
+	}
+	if contract.coalesceAssistantToolTurns {
+		items = coalesceResponsesAssistantToolTurns(items)
 	}
 	if err := validatePolicyResponsesCallSequence(items); err != nil {
 		return nil, err
@@ -500,7 +561,7 @@ func parsePolicyResponsesInput(raw json.RawMessage) ([]policyResponsesInputItem,
 	return items, nil
 }
 
-func parsePolicyResponsesInputItem(raw json.RawMessage, index int) (policyResponsesInputItem, error) {
+func parsePolicyResponsesInputItem(raw json.RawMessage, index int, contract responsesChatTranslationContract) (policyResponsesInputItem, error) {
 	param := fmt.Sprintf("input[%d]", index)
 	object, err := decodeChatJSONObject(raw, param)
 	if err != nil {
@@ -528,7 +589,7 @@ func parsePolicyResponsesInputItem(raw json.RawMessage, index int) (policyRespon
 		if !ok {
 			return policyResponsesInputItem{}, newChatInvalidRequest(param+".content", "message content is required")
 		}
-		text, err := parsePolicyResponsesTextContent(contentRaw, role, param+".content", false)
+		text, err := parsePolicyResponsesTextContent(contentRaw, role, param+".content", false, contract)
 		if err != nil {
 			return policyResponsesInputItem{}, err
 		}
@@ -582,7 +643,7 @@ func parsePolicyResponsesInputItem(raw json.RawMessage, index int) (policyRespon
 		if !ok {
 			return policyResponsesInputItem{}, newChatInvalidRequest(param+".output", "function call output is required")
 		}
-		output, err := parsePolicyResponsesTextContent(outputRaw, "tool", param+".output", true)
+		output, err := parsePolicyResponsesTextContent(outputRaw, "tool", param+".output", true, contract)
 		if err != nil {
 			return policyResponsesInputItem{}, err
 		}
@@ -591,9 +652,9 @@ func parsePolicyResponsesInputItem(raw json.RawMessage, index int) (policyRespon
 		}
 		return policyResponsesInputItem{kind: itemType, callID: callID, text: output, param: param}, nil
 	case "input_image", "image_generation_call":
-		return policyResponsesInputItem{}, newChatInvalidRequest(param+".type", "image input and output items are not supported for policy models")
+		return policyResponsesInputItem{}, newChatInvalidRequest(param+".type", contract.unsupported("image input and output items are not supported"))
 	default:
-		return policyResponsesInputItem{}, newChatInvalidRequest(param+".type", fmt.Sprintf("Responses input item type %q is not supported for policy models", itemType))
+		return policyResponsesInputItem{}, newChatInvalidRequest(param+".type", contract.unsupported(fmt.Sprintf("Responses input item type %q is not supported", itemType)))
 	}
 }
 
@@ -612,6 +673,56 @@ func validatePolicyResponsesOptionalItemMetadata(object map[string]json.RawMessa
 		}
 	}
 	return nil
+}
+
+// coalesceResponsesAssistantToolTurns rewrites each maximal run of assistant
+// messages and function calls that contains at least one call into a single
+// assistant message followed by the calls in their original order. Chat has
+// one assistant message per turn whose content precedes its tool_calls, so
+// text a Responses model emitted between or after its calls is joined into that
+// content. Runs without calls, other roles and tool outputs are untouched.
+func coalesceResponsesAssistantToolTurns(items []policyResponsesInputItem) []policyResponsesInputItem {
+	isTurnItem := func(item policyResponsesInputItem) bool {
+		return item.kind == "function_call" || (item.kind == "message" && item.role == "assistant")
+	}
+	out := make([]policyResponsesInputItem, 0, len(items))
+	for index := 0; index < len(items); {
+		if !isTurnItem(items[index]) {
+			out = append(out, items[index])
+			index++
+			continue
+		}
+		end := index
+		var texts []string
+		var message *policyResponsesInputItem
+		calls := make([]policyResponsesInputItem, 0, 1)
+		for end < len(items) && isTurnItem(items[end]) {
+			item := items[end]
+			if item.kind == "function_call" {
+				calls = append(calls, item)
+			} else {
+				if message == nil {
+					first := item
+					message = &first
+				}
+				if item.text != "" {
+					texts = append(texts, item.text)
+				}
+			}
+			end++
+		}
+		if len(calls) == 0 {
+			out = append(out, items[index:end]...)
+		} else {
+			if message != nil {
+				message.text = strings.Join(texts, "\n\n")
+				out = append(out, *message)
+			}
+			out = append(out, calls...)
+		}
+		index = end
+	}
+	return out
 }
 
 func validatePolicyResponsesCallSequence(items []policyResponsesInputItem) error {
@@ -667,7 +778,7 @@ func validatePolicyResponsesCallSequence(items []policyResponsesInputItem) error
 	return missingOutputError()
 }
 
-func parsePolicyResponsesTextContent(raw json.RawMessage, role, param string, toolOutput bool) (string, error) {
+func parsePolicyResponsesTextContent(raw json.RawMessage, role, param string, toolOutput bool, contract responsesChatTranslationContract) (string, error) {
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return "", newChatInvalidRequest(param, "text content must be a string or array")
 	}
@@ -694,13 +805,13 @@ func parsePolicyResponsesTextContent(raw json.RawMessage, role, param string, to
 			return "", err
 		}
 		if partType == "input_image" || partType == "image_url" {
-			return "", newChatInvalidRequest(partParam+".type", "image content is not supported for policy models")
+			return "", newChatInvalidRequest(partParam+".type", contract.unsupported("image content is not supported"))
 		}
 		if partType == "refusal" && role == "assistant" && !toolOutput {
 			if err := validatePolicyResponsesObjectFields(part, partParam, "type", "refusal"); err != nil {
 				return "", err
 			}
-			refusal, err := requiredPolicyResponsesStringValue(part, "refusal", partParam+".refusal", policyResponsesMaxRequestBytes, true)
+			refusal, err := requiredPolicyResponsesStringValue(part, "refusal", partParam+".refusal", contract.maxRequestBytes, true)
 			if err != nil {
 				return "", err
 			}
@@ -725,7 +836,7 @@ func parsePolicyResponsesTextContent(raw json.RawMessage, role, param string, to
 				return "", newChatInvalidRequest(partParam+".annotations", "only an empty annotations array is supported")
 			}
 		}
-		partText, err := requiredPolicyResponsesStringValue(part, "text", partParam+".text", policyResponsesMaxRequestBytes, true)
+		partText, err := requiredPolicyResponsesStringValue(part, "text", partParam+".text", contract.maxRequestBytes, true)
 		if err != nil {
 			return "", err
 		}
@@ -734,7 +845,13 @@ func parsePolicyResponsesTextContent(raw json.RawMessage, role, param string, to
 	return combined.String(), nil
 }
 
+// parsePolicyResponsesTools parses a Responses tool catalog under the policy
+// contract. Other surfaces call parseResponsesToolsWithContract.
 func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool, error) {
+	return parseResponsesToolsWithContract(raw, policyResponsesTranslationContract)
+}
+
+func parseResponsesToolsWithContract(raw json.RawMessage, contract responsesChatTranslationContract) ([]policyResponsesParsedTool, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil, nil
@@ -747,8 +864,8 @@ func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool
 	flattenedDescriptionBytes := 0
 	appendTool := func(tool policyResponsesParsedTool, namespaceDescription string, namespaceDescriptionBytes int) error {
 		descriptionBytes := policyResponsesCombinedToolDescriptionJSONBytes(namespaceDescription, namespaceDescriptionBytes, tool.description)
-		if descriptionBytes > policyResponsesMaxTranslatedChatBytes-flattenedDescriptionBytes {
-			return newChatInvalidRequest(tool.param+".description", fmt.Sprintf("flattened tool descriptions exceed %d encoded bytes", policyResponsesMaxTranslatedChatBytes))
+		if descriptionBytes > contract.maxTranslatedBytes-flattenedDescriptionBytes {
+			return newChatInvalidRequest(tool.param+".description", fmt.Sprintf("flattened tool descriptions exceed %d encoded bytes", contract.maxTranslatedBytes))
 		}
 		flattenedDescriptionBytes += descriptionBytes
 		tool.description = combinePolicyResponsesToolDescriptions(namespaceDescription, tool.description)
@@ -770,7 +887,7 @@ func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool
 		}
 		switch toolType {
 		case "function":
-			tool, err := parsePolicyResponsesFunctionTool(object, param, "")
+			tool, err := parsePolicyResponsesFunctionTool(object, param, "", contract)
 			if err != nil {
 				return nil, err
 			}
@@ -814,7 +931,7 @@ func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool
 				if childType != "function" {
 					return nil, newChatInvalidRequest(childParam+".type", fmt.Sprintf("namespace child tool type %q is not supported; only function is supported", childType))
 				}
-				child, err := parsePolicyResponsesFunctionTool(childObject, childParam, namespace)
+				child, err := parsePolicyResponsesFunctionTool(childObject, childParam, namespace, contract)
 				if err != nil {
 					return nil, err
 				}
@@ -823,9 +940,9 @@ func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool
 				}
 			}
 		case "custom", "web_search", "web_search_preview", "image_generation", "file_search", "computer_use_preview", "tool_search", "mcp":
-			return nil, newChatInvalidRequest(param+".type", fmt.Sprintf("hosted or custom tool type %q is not supported for policy models", toolType))
+			return nil, newChatInvalidRequest(param+".type", contract.unsupported(fmt.Sprintf("hosted or custom tool type %q is not supported", toolType)))
 		default:
-			return nil, newChatInvalidRequest(param+".type", fmt.Sprintf("tool type %q is not supported for policy models", toolType))
+			return nil, newChatInvalidRequest(param+".type", contract.unsupported(fmt.Sprintf("tool type %q is not supported", toolType)))
 		}
 	}
 	return parsed, nil
@@ -863,7 +980,7 @@ func combinePolicyResponsesToolDescriptions(namespace, child string) string {
 	return namespace + "\n\n" + child
 }
 
-func parsePolicyResponsesFunctionTool(object map[string]json.RawMessage, param, namespace string) (policyResponsesParsedTool, error) {
+func parsePolicyResponsesFunctionTool(object map[string]json.RawMessage, param, namespace string, contract responsesChatTranslationContract) (policyResponsesParsedTool, error) {
 	if err := validatePolicyResponsesObjectFields(object, param, "type", "name", "description", "parameters", "strict", "defer_loading"); err != nil {
 		return policyResponsesParsedTool{}, err
 	}
@@ -891,7 +1008,7 @@ func parsePolicyResponsesFunctionTool(object map[string]json.RawMessage, param, 
 		return policyResponsesParsedTool{}, prefixPolicyResponsesError(err, param)
 	}
 	if deferLoading != nil && *deferLoading {
-		return policyResponsesParsedTool{}, newChatInvalidRequest(param+".defer_loading", "deferred tool loading is not supported for policy models")
+		return policyResponsesParsedTool{}, newChatInvalidRequest(param+".defer_loading", contract.unsupported("deferred tool loading is not supported"))
 	}
 	return policyResponsesParsedTool{
 		descriptor:  policyResponsesToolDescriptor{Name: name, Namespace: namespace, Kind: policyResponsesToolKindFunction},

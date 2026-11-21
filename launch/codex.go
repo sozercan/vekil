@@ -31,8 +31,18 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	model := strings.TrimSpace(input.Model.ID)
 	hasModel := model != ""
 	policyModel := hasModel && strings.TrimSpace(input.Model.OwnedBy) == PolicyModelOwner
+	overChatModel := hasModel && !policyModel && isResponsesOverChatModel(input.Model)
+	// Both are served by Vekil's bounded Responses-to-Chat translation, which
+	// carries only function/namespace tools and full-history turns.
+	chatBacked := policyModel || overChatModel
 	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
-	if hasModel && !policyModel && endpointMetadataKnown && !modelSupportsEndpoint(input.Model, "/responses") {
+	if hasModel && !chatBacked && endpointMetadataKnown && !modelSupportsEndpoint(input.Model, "/responses") {
+		if modelSupportsEndpoint(input.Model, "/chat/completions") {
+			return PreparedProcess{}, fmt.Errorf(
+				"model %q is not Codex-compatible: expected /responses support; to serve this Chat-only model through Vekil's Responses-over-Chat adapter, pass --responses-over-chat-models %s",
+				model, model,
+			)
+		}
 		return PreparedProcess{}, fmt.Errorf(
 			"model %q is not Codex-compatible: expected /responses support",
 			model,
@@ -41,8 +51,12 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if err := validateCodexForwardedArgs(input.ForwardedArgs); err != nil {
 		return PreparedProcess{}, err
 	}
-	if policyModel {
-		if err := validatePolicyCodexForwardedArgs(input.ForwardedArgs); err != nil {
+	if chatBacked {
+		label := "policy-routed models"
+		if overChatModel {
+			label = "Responses-over-Chat models"
+		}
+		if err := validateChatBackedCodexForwardedArgs(input.ForwardedArgs, label); err != nil {
 			return PreparedProcess{}, err
 		}
 	}
@@ -100,10 +114,10 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	if hasModel {
 		overrides = append(overrides, `model_catalog_json=`+configString(catalogPath))
 	}
-	if policyModel {
-		// Policy models are served by Vekil's bounded Responses-to-Chat
-		// compatibility path. Keep Codex on stateless turns and suppress hosted
-		// tools that cannot be represented by the policy Chat contract.
+	if chatBacked {
+		// Policy and Responses-over-Chat models are served by Vekil's bounded
+		// Responses-to-Chat translation. Keep Codex on stateless HTTP turns and
+		// suppress hosted tools that cannot be represented as Chat functions.
 		overrides = append(overrides,
 			`web_search="disabled"`,
 			`features.remote_compaction_v2=false`,
@@ -127,9 +141,14 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		EnvUnset: envUnset,
 		Cleanup:  cleanup,
 	}
-	if hasModel && !policyModel && !endpointMetadataKnown {
+	if hasModel && !chatBacked && !endpointMetadataKnown {
 		prepared.Unresolved = append(prepared.Unresolved,
 			"model endpoint compatibility (/responses) requires live /v1/models metadata",
+		)
+	}
+	if input.DryRun && overChatModel && input.Model.Capabilities.Supports.ToolCalls == nil {
+		prepared.Unresolved = append(prepared.Unresolved,
+			"Responses-over-Chat function-tool support requires live /v1/models metadata",
 		)
 	}
 	return prepared, nil
@@ -199,14 +218,19 @@ func validateCodexForwardedArgs(args []string) error {
 	}
 }
 
-func validatePolicyCodexForwardedArgs(args []string) error {
+func isResponsesOverChatModel(model ModelInfo) bool {
+	tools := model.Capabilities.Supports.ToolCalls
+	return strings.TrimSpace(model.ResponsesCompatibility) == ResponsesOverChatCompatibility && (tools == nil || *tools)
+}
+
+func validateChatBackedCodexForwardedArgs(args []string, label string) error {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
 			break
 		}
 		if arg == "--search" {
-			return fmt.Errorf("codex option %q is not supported for policy-routed models", arg)
+			return fmt.Errorf("codex option %q is not supported for %s", arg, label)
 		}
 
 		var feature string
@@ -226,7 +250,7 @@ func validatePolicyCodexForwardedArgs(args []string) error {
 		switch strings.TrimSpace(feature) {
 		case "remote_compaction_v2", "code_mode", "code_mode_only",
 			"web_search", "web_search_request", "web_search_cached", "standalone_web_search", "search_tool":
-			return fmt.Errorf("codex feature %q cannot be enabled for policy-routed models", feature)
+			return fmt.Errorf("codex feature %q cannot be enabled for %s", feature, label)
 		}
 	}
 	return nil

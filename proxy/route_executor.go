@@ -2131,6 +2131,7 @@ func newRouteAttemptResponseObserver(record *routeAttemptRecord, operation *rout
 		decision:   trace.Decision,
 		upstreamID: boundOperationalStatLabel(trace.UpstreamID),
 		envelope:   newRouteAttemptEnvelopeExtractor(endpoint),
+		sse:        sseDataAccumulator{maxBytes: openAIStreamScannerMaxBuffer},
 	}
 	if operation != nil {
 		observer.inboundCtx = operation.inbound
@@ -2244,6 +2245,9 @@ func (o *routeAttemptResponseObserver) consumeSSELineLocked() bool {
 		}
 		return true
 	}) {
+		if o.observeOverflowedSSEEvent() {
+			return true
+		}
 		o.progress = mergeUpstreamSemanticProgress(o.progress, upstreamProgressUnknown)
 	}
 	return publish

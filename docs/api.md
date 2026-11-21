@@ -70,6 +70,8 @@ A schema-v2 policy profile also appears exactly once, with `id` equal to its `pu
 
 For an explicit route, catalog identity is configuration-owned: temporary target failure does not remove or rewrite the route entry. Endpoint metadata remains **native upstream capability metadata**. A Responses-native model continues to report only `/responses` in `supported_endpoints` even when Vekil serves `/v1/chat/completions`, Anthropic Messages, and Gemini compatibility through Chat-over-Responses.
 
+A model opted in with `--responses-over-chat-models` that classifies as [Responses-over-Chat](responses.md#responses-compatibility-over-a-native-chat-model-responses-over-chat) gains `vekil_responses_compatibility: "responses_over_chat"` in its `data` entry; `supported_endpoints` is unchanged. Its Codex `models` entry is listed (when picker-enabled) with `use_responses_lite: false`, `supports_search_tool: false`, no reasoning summaries, and text-only input. Models that are not opted in, or that have native `/responses`, are unchanged.
+
 The exact catalog still depends on configured routes/providers and dynamic discovery. Query `/v1/models` in your deployment instead of hard-coding one global model list.
 
 ## Policy reasoning effort contract
@@ -222,6 +224,8 @@ The client should restart that assistant tool-call turn rather than attempting t
 ## Responses Compatibility Endpoints
 
 Schema-v2 policy public IDs are accepted by bounded stateless `POST /v1/responses` compatibility. It requires `store: false` or omitted, rejects `previous_response_id`, accepts text, bounded `text.format` (`text`, `json_object`, or `json_schema`) structured output, and function/namespace-child tools, converts the request to canonical Chat for policy planning, and converts the aggregated Chat result back to Responses JSON/SSE. Completed terminal output must honor required or forced `tool_choice` constraints. Hosted/custom tools, images, the websocket bridge, compact, memory summarization, and native Responses terminal selection remain unsupported for policy IDs. Existing direct Responses behavior is unchanged.
+
+Opted-in Chat-only models (`--responses-over-chat-models`) are accepted on HTTP `POST /v1/responses` through the [Responses-over-Chat](responses.md#responses-compatibility-over-a-native-chat-model-responses-over-chat) adapter: full-history, `store: false`, text and function/namespace-child tools, with incremental SSE. Their native `supported_endpoints` metadata is unchanged, and models with native Responses support keep the native path.
 
 Supported OpenAI/Codex-style routes:
 
