@@ -260,7 +260,7 @@ func TestResponsesOverChatStreamsInterleavedNamespacedParallelToolCalls(t *testi
 		writeROCChunk(t, w, `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}`)
 		writeROCChunk(t, w, fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":%q}}]}}]}`, aliasWrite))
 		writeROCChunk(t, w, `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"path\":\"b\"}"}}]}}]}`)
-		writeROCChunk(t, w, `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a\"}"}}]}}]}`)
+		writeROCChunk(t, w, `{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"arguments":"\"a\"}"}}]}}]}`)
 		writeROCChunk(t, w, `{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`)
 		writeROCChunk(t, w, "[DONE]")
 	})
@@ -1116,6 +1116,27 @@ func TestResponsesOverChatMalformedChunksFailBeforeExecutableCalls(t *testing.T)
 				t.Fatalf("non-streaming status=%d body=%s", recorder.Code, recorder.Body.String())
 			}
 		})
+	}
+}
+
+func TestResponsesOverChatAmbiguousToolDeltaFailsBeforeExecutableCalls(t *testing.T) {
+	upstream := newROCUpstream(t, rocSSE(t,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"get_time","arguments":"{}"}},{"index":1,"id":"call_b","function":{"name":"get_time"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{}"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		"[DONE]"))
+	handler := newROCHandler(t, upstream.server.URL)
+	const body = `{"model":"gemini-test","input":"time?","tools":[{"type":"function","name":"get_time","parameters":{"type":"object"}}]}`
+	recorder := postROC(t, handler, `{"stream":true,`+body[1:])
+	events := parseROCEvents(t, recorder.Body.String())
+	if terminal := events[len(events)-1]; terminal.Type != "response.failed" || !strings.Contains(recorder.Body.String(), "ambiguous tool-call delta") {
+		t.Fatalf("unexpected terminal response: %s", recorder.Body.String())
+	}
+	if done := rocDoneItems(t, events); len(done) != 0 {
+		t.Fatalf("ambiguous stream exposed executable items: %v", done)
+	}
+	if recorder := postROC(t, handler, body); recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "ambiguous tool-call delta") {
+		t.Fatalf("non-streaming status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 

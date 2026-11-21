@@ -305,6 +305,10 @@ func (s *responsesOverChatStream) closeMessage(status string) error {
 	return s.emit("response.output_item.done", map[string]any{"output_index": message.outputIndex, "item": item})
 }
 
+func ambiguousResponsesOverChatToolDelta() *responsesOverChatFailure {
+	return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned an ambiguous tool-call delta"}
+}
+
 func (s *responsesOverChatStream) toolCallFor(delta models.OpenAIToolCall) (*responsesOverChatToolCall, error) {
 	index := -1
 	if delta.Index != nil {
@@ -317,13 +321,25 @@ func (s *responsesOverChatStream) toolCallFor(delta models.OpenAIToolCall) (*res
 			}
 		}
 		if index < 0 {
-			index = len(s.callOrder)
-			for s.calls[index] != nil {
-				index++
+			for _, chatIndex := range s.callOrder {
+				if s.calls[chatIndex].callID == "" {
+					if len(s.callOrder) > 1 {
+						return nil, ambiguousResponsesOverChatToolDelta()
+					}
+					index = chatIndex
+				}
+			}
+			if index < 0 {
+				index = len(s.callOrder)
+				for s.calls[index] != nil {
+					index++
+				}
 			}
 		}
-	} else if len(s.callOrder) > 0 {
-		index = s.callOrder[len(s.callOrder)-1]
+	} else if len(s.callOrder) > 1 {
+		return nil, ambiguousResponsesOverChatToolDelta()
+	} else if len(s.callOrder) == 1 {
+		index = s.callOrder[0]
 	} else {
 		index = 0
 	}
@@ -497,6 +513,9 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 			}
 		}
 		for _, delta := range choice.Delta.ToolCalls {
+			if len(choice.Delta.ToolCalls) > 1 && delta.Index == nil && strings.TrimSpace(delta.ID) == "" {
+				return ambiguousResponsesOverChatToolDelta()
+			}
 			if err := s.applyToolCallDelta(delta); err != nil {
 				return err
 			}
@@ -740,7 +759,7 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 		switch {
 		case errors.As(consumeErr, &streamErr):
 			failure = &responsesOverChatFailure{status: streamErr.httpStatus(), code: firstNonEmpty(streamErr.Code, "upstream_error"), message: streamErr.Error()}
-		case errors.Is(consumeErr, errOpenAIStreamMalformedChunk):
+		case errors.Is(consumeErr, errOpenAIStreamMalformedChunk), errors.Is(consumeErr, errOpenAISSEEventTooLong), errors.Is(consumeErr, errOpenAISSELineTooLong):
 			failure = &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: consumeErr.Error()}
 		default:
 			failure = asResponsesOverChatFailure(consumeErr)

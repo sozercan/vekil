@@ -20,6 +20,9 @@ const (
 type sseDataAccumulator struct {
 	eventType string
 	dataLines []string
+	maxBytes  int
+	dataBytes int
+	overflow  bool
 }
 
 func (a *sseDataAccumulator) consumeLine(line string, onData func(string, string) bool) bool {
@@ -27,7 +30,19 @@ func (a *sseDataAccumulator) consumeLine(line string, onData func(string, string
 	if line == "" {
 		return a.dispatch(onData)
 	}
+	if a.overflow {
+		return true
+	}
 	if data, ok := parseSSELine(line); ok {
+		if a.maxBytes > 0 {
+			if len(line)+1 > a.maxBytes-a.dataBytes {
+				clear(a.dataLines)
+				a.dataLines = a.dataLines[:0]
+				a.overflow = true
+				return false
+			}
+			a.dataBytes += len(line) + 1
+		}
 		a.dataLines = append(a.dataLines, data)
 		return true
 	}
@@ -38,6 +53,8 @@ func (a *sseDataAccumulator) consumeLine(line string, onData func(string, string
 }
 
 func (a *sseDataAccumulator) dispatch(onData func(string, string) bool) bool {
+	a.dataBytes = 0
+	a.overflow = false
 	if len(a.dataLines) == 0 {
 		a.eventType = ""
 		return true
@@ -47,6 +64,7 @@ func (a *sseDataAccumulator) dispatch(onData func(string, string) bool) bool {
 		data = strings.Join(a.dataLines, "\n")
 	}
 	eventType := a.eventType
+	clear(a.dataLines)
 	a.dataLines = a.dataLines[:0]
 	a.eventType = ""
 	if onData == nil {
@@ -70,6 +88,7 @@ func parseSSEEventLine(line string) (string, bool) {
 // client and fall back to raw passthrough of the remainder (the bytes are valid,
 // just too large to buffer for parsing) rather than treating it as a failure.
 var errOpenAISSELineTooLong = errors.New("SSE line exceeds maximum buffer")
+var errOpenAISSEEventTooLong = errors.New("SSE event exceeds maximum buffer")
 
 func readOpenAISSELine(reader *bufio.Reader) (string, error) {
 	var line strings.Builder
@@ -226,6 +245,9 @@ func consumeOpenAIStreamChunksWithDecodeMode(r io.Reader, onChunk func(models.Op
 	sawDone := false
 	var streamReadErr error
 	var accumulator sseDataAccumulator
+	if strict {
+		accumulator.maxBytes = openAIStreamScannerMaxBuffer
+	}
 	processData := func(eventType, data string) bool {
 		if data == "[DONE]" {
 			sawDone = true
@@ -252,6 +274,9 @@ func consumeOpenAIStreamChunksWithDecodeMode(r io.Reader, onChunk func(models.Op
 		line, err := readOpenAISSELine(reader)
 		if len(line) > 0 {
 			if !accumulator.consumeLine(line, processData) {
+				if accumulator.overflow {
+					return false, errOpenAISSEEventTooLong
+				}
 				return sawDone, streamReadErr
 			}
 		}
