@@ -46,6 +46,20 @@ func checkCodexLaunchProvider(executable resolvedExecutable, environment []strin
 	if err != nil {
 		return fmt.Errorf("resolve Codex launch directory: %w", err)
 	}
+	for index := len(environment) - 1; index >= 0; index-- {
+		key, home := splitEnvironmentEntry(environment[index])
+		if canonicalEnvironmentKey(key) != "CODEX_HOME" {
+			continue
+		}
+		if home != "" && !filepath.IsAbs(home) {
+			absoluteHome, err := filepath.Abs(home)
+			if err != nil {
+				return fmt.Errorf("resolve Codex home directory: %w", err)
+			}
+			environment = applyEnvironment(environment, nil, map[string]string{"CODEX_HOME": absoluteHome})
+		}
+		break
+	}
 	args := append(append([]string(nil), executable.prefixArgs...), "app-server")
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Env, cmd.Dir = environment, directory

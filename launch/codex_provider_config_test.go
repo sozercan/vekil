@@ -2,6 +2,7 @@ package launch
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -29,6 +30,27 @@ func TestCodexLaunchProviderConfigCheck(t *testing.T) {
 				t.Fatalf("expected a redacted %q error, got %v", test.wantError, err)
 			}
 		})
+	}
+}
+
+func TestCodexProbeKeepsRelativeHomeWhenWorkspaceDiffers(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	launcher, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := applyEnvironment(os.Environ(), nil, map[string]string{
+		"CODEX_HOME":                        "codex-home",
+		"LAUNCH_TEST_CODEX_EXPECT_HOME":     filepath.Join(launcher, "codex-home"),
+		"LAUNCH_TEST_CODEX_CONFIG_RESPONSE": `{"id":2,"result":{"config":{"model_providers":{"vekil_launch":{}}}}}`,
+	})
+	err = checkCodexLaunchProvider(resolvedExecutable{path: executable}, environment, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "reserved by Vekil") {
+		t.Fatalf("expected reserved provider in launcher's Codex home, got %v", err)
 	}
 }
 

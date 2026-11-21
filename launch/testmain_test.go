@@ -12,6 +12,9 @@ import (
 func TestMain(m *testing.M) {
 	if len(os.Args) == 2 && os.Args[1] == "app-server" {
 		if response := os.Getenv("LAUNCH_TEST_CODEX_CONFIG_RESPONSE"); response != "" {
+			if expected := os.Getenv("LAUNCH_TEST_CODEX_EXPECT_HOME"); expected != "" && os.Getenv("CODEX_HOME") != expected {
+				os.Exit(98)
+			}
 			input := bufio.NewScanner(os.Stdin)
 			for range 3 {
 				if !input.Scan() {
