@@ -294,10 +294,6 @@ func writeResponsesOverChatInvalidRequest(w http.ResponseWriter, err error) {
 // the upstream Chat stream into Responses events incrementally.
 func (h *ProxyHandler) handleResponsesOverChat(w http.ResponseWriter, r *http.Request, body []byte, compat responsesCompatibility) {
 	requestedModel := extractResponsesRequestModel(body)
-	if !h.modelAllowedForRequest(requestedModel, providerEndpointResponses) {
-		writeOpenAIError(w, http.StatusBadRequest, modelNotAllowedRequestError(requestedModel).Error(), "invalid_request_error")
-		return
-	}
 	translated, err := translateResponsesRequestToChat(body, responsesOverChatTranslationContract)
 	if err != nil {
 		writeResponsesOverChatInvalidRequest(w, err)
@@ -336,13 +332,10 @@ func (h *ProxyHandler) handleResponsesOverChat(w http.ResponseWriter, r *http.Re
 	stopClientCancellation := context.AfterFunc(r.Context(), upstreamCancel)
 	defer stopClientCancellation()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
-	upstreamCtx, routeOperation, route, err := h.withChatExecutionRoute(upstreamCtx, r.Context(), requestedModel, chatBody, false)
+	upstreamCtx, _, route, err := h.withChatExecutionRoute(upstreamCtx, r.Context(), requestedModel, chatBody, false)
 	if err != nil {
 		h.writeResponsesOverChatExecutionError(w, r, upstreamCtx, err)
 		return
-	}
-	if routeOperation != nil {
-		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
 	}
 	publicModel := explicitRoutePublicModel(route, compat.publicModel)
 
