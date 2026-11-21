@@ -330,6 +330,10 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			h.handleResponsesOverChat(w, r, bodyBytes, compat)
 			return
 		case responsesExecutionUnsupported:
+			if err := r.Context().Err(); errors.Is(err, context.Canceled) {
+				h.writeResponsesUpstreamRequestFailure(w, r, nil, "responses_admission", err)
+				return
+			}
 			writeOpenAIError(w, http.StatusBadRequest,
 				fmt.Sprintf("model %q is enabled for Responses-over-Chat but cannot use it: %s", requestedModel, compat.reason),
 				"invalid_request_error")
