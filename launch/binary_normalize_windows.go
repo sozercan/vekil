@@ -18,7 +18,11 @@ func normalizeResolvedExecutable(path string) (resolvedExecutable, error) {
 	if extension != ".cmd" && extension != ".bat" {
 		return resolvedExecutable{path: path}, nil
 	}
-	body, err := os.ReadFile(path)
+	shimPath, err := filepath.Abs(path)
+	if err != nil {
+		return resolvedExecutable{}, fmt.Errorf("resolve Windows command shim %q: %w", path, err)
+	}
+	body, err := os.ReadFile(shimPath)
 	if err != nil {
 		return resolvedExecutable{}, fmt.Errorf("read Windows command shim %q: %w", path, err)
 	}
@@ -30,12 +34,12 @@ func normalizeResolvedExecutable(path string) (resolvedExecutable, error) {
 		)
 	}
 	relativeScript := strings.ReplaceAll(string(matches[len(matches)-1][1]), `\`, string(filepath.Separator))
-	scriptPath := filepath.Clean(filepath.Join(filepath.Dir(path), relativeScript))
+	scriptPath := filepath.Join(filepath.Dir(shimPath), relativeScript)
 	if _, err := os.Stat(scriptPath); err != nil {
 		return resolvedExecutable{}, fmt.Errorf("resolve npm command shim script %q: %w", scriptPath, err)
 	}
 
-	nodeCandidates := []string{filepath.Join(filepath.Dir(path), "node.exe"), "node.exe", "node"}
+	nodeCandidates := []string{filepath.Join(filepath.Dir(shimPath), "node.exe"), "node.exe", "node"}
 	for _, candidate := range nodeCandidates {
 		if nodePath, err := exec.LookPath(candidate); err == nil {
 			return resolvedExecutable{path: nodePath, prefixArgs: []string{scriptPath}}, nil

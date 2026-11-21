@@ -31,14 +31,17 @@ func TestResolveExecutableUsesPATHEXTAndUnwrapsNPMShim(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 	t.Setenv("PATHEXT", ".CMD;.EXE")
-	got, err := resolveExecutable("", "missing-claude", []string{base})
-	if err != nil {
-		t.Fatalf("resolveExecutable() error = %v", err)
-	}
-	if !strings.EqualFold(got.path, nodePath) {
-		t.Fatalf("resolved path = %q, want %q", got.path, nodePath)
-	}
-	if len(got.prefixArgs) != 1 || !strings.EqualFold(got.prefixArgs[0], scriptPath) {
-		t.Fatalf("prefix args = %#v, want script %q", got.prefixArgs, scriptPath)
+	t.Chdir(dir)
+	for _, override := range []string{"", `.\claude.cmd`} {
+		got, err := resolveExecutable(override, "missing-claude", []string{base})
+		if err != nil {
+			t.Fatalf("resolveExecutable(%q) error = %v", override, err)
+		}
+		if !strings.EqualFold(got.path, nodePath) {
+			t.Fatalf("override %q resolved path = %q, want %q", override, got.path, nodePath)
+		}
+		if len(got.prefixArgs) != 1 || !strings.EqualFold(got.prefixArgs[0], scriptPath) {
+			t.Fatalf("override %q prefix args = %#v, want script %q", override, got.prefixArgs, scriptPath)
+		}
 	}
 }
