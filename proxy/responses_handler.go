@@ -254,11 +254,14 @@ func (h *ProxyHandler) postPreparedResponsesRequestWithValidation(ctx context.Co
 	return h.maybeRetryCompactedResponsesRequest(ctx, observeCtx, req.body, req.extraHeaders, req.upstreamHeaders, resp)
 }
 
+var errResponsesCallerDeadline = fmt.Errorf("responses caller deadline: %w", context.DeadlineExceeded)
+
 func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, endpoint string, err error) {
 	if h.handleShutdownError(w, r, upstreamCtx, err) {
 		return
 	}
-	if r != nil && r.Context().Err() != nil && errors.Is(err, context.Canceled) {
+	callerDeadline := upstreamCtx != nil && context.Cause(upstreamCtx) == errResponsesCallerDeadline && errors.Is(err, context.DeadlineExceeded)
+	if callerDeadline || (r != nil && r.Context().Err() != nil && errors.Is(err, context.Canceled)) {
 		// The client closed the request before any provider outcome, for
 		// example by interrupting an agent. Record the client-first abort as
 		// 499, as the websocket bridge does, rather than an upstream failure.
@@ -282,6 +285,10 @@ func (h *ProxyHandler) writeResponsesUpstreamRequestFailure(w http.ResponseWrite
 	}
 	writeOpenAIUpstreamRequestFailure(w, statusCode, err)
 }
+
+// Only direct HTTP Responses ingress sets this marker. Chat-over-Responses,
+// websocket and proxy-generated calls sharing the route keep their contracts.
+type directResponsesPassthroughKey struct{}
 
 // HandleResponses handles POST /v1/responses by forwarding the request to
 // Copilot's responses endpoint with only auth headers injected.
@@ -340,9 +347,26 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses", err)
 		return
 	}
+	passthrough := routeOperation != nil && routeOperation.route.responsesStreamPassthrough
+	if passthrough {
+		// Non-streamed failed JSON and the proxy's compaction subrequests have
+		// different failure translation rules. Do not silently run either.
+		_, trigger, err := compactTriggerRequestFields(prepared.body)
+		if !prepared.streaming || trigger || err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "this route requires a direct streaming Responses request without a compaction trigger", "invalid_request_error")
+			return
+		}
+		if deadline, ok := r.Context().Deadline(); ok {
+			var cancelDeadline context.CancelFunc
+			upstreamCtx, cancelDeadline = context.WithDeadlineCause(upstreamCtx, deadline, errResponsesCallerDeadline)
+			defer cancelDeadline()
+		}
+	}
 	if routeOperation != nil {
 		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
-		if h.conversationMigrationEnabled(routeOperation.route) {
+		// The passthrough route may be waiting in a downstream admission
+		// queue after local admission. Revoke that physical request too.
+		if passthrough || h.conversationMigrationEnabled(routeOperation.route) {
 			stopCancellation := context.AfterFunc(r.Context(), upstreamCancel)
 			defer stopCancellation()
 			if r.Context().Err() != nil {
@@ -410,6 +434,9 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	// after RoundTrip returns. Detach a borrowed inbound buffer before upstream
 	// code can retain it past this handler's pool release.
 	prepared.body = detachBorrowedRequestBody(prepared.body, pooledBody)
+	if passthrough {
+		upstreamCtx = context.WithValue(upstreamCtx, directResponsesPassthroughKey{}, true)
+	}
 	resp, err := h.postPreparedResponsesRequestWithValidation(upstreamCtx, r.Context(), prepared, requestJSONValid)
 	if err != nil {
 		h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, "responses", err)
@@ -419,7 +446,7 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	observeUpstreamHeaders(r.Context(), resp.Header)
 
 	if prepared.streaming && resp.StatusCode == http.StatusOK {
-		if isExplicitRoutePreparedResponse(resp) {
+		if passthrough || isExplicitRoutePreparedResponse(resp) {
 			forwardExplicitPreparedResponses(h, w, r, resp, upstreamCtx, upstreamCancel, prepared.headerToolScope)
 		} else {
 			peekAndForwardResponses(h, w, r, resp, upstreamCtx, upstreamCancel, prepared.model, prepared.headerToolScope)

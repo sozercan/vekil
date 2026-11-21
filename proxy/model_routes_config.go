@@ -43,6 +43,8 @@ type ModelRouteConfig struct {
 	Targets             []ModelRouteTargetConfig `json:"targets" yaml:"targets"`
 	Routing             ModelRouteRoutingConfig  `json:"routing,omitempty" yaml:"routing,omitempty"`
 
+	ResponsesStreamPassthrough bool `json:"responses_stream_passthrough,omitempty" yaml:"responses_stream_passthrough,omitempty"`
+
 	exposureSet            bool
 	internalPurposeSet     bool
 	publicIDSet            bool
@@ -339,6 +341,9 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 			descriptor, exists := providers[target.Provider]
 			if !exists {
 				return validatedProvidersConfig{}, configPathError(targetPath+".provider", "references unknown provider %q", target.Provider)
+			}
+			if route.ResponsesStreamPassthrough && descriptor.kind != providerTypeAzureOpenAI {
+				return validatedProvidersConfig{}, configPathError(targetPath+".provider", "responses_stream_passthrough requires an azure-openai target")
 			}
 			if descriptor.kind == providerTypeCopilot {
 				if !descriptor.modelFilter.allows(target.UpstreamModel) {
@@ -1107,6 +1112,11 @@ func normalizeAndValidateModelRouteForSchema(route *ModelRouteConfig, path strin
 	if route.Routing.MaxUpstreamSends < route.Routing.MaxTargetAttempts {
 		return configPathError(path+".routing.max_upstream_sends", "must be at least max_target_attempts (%d)", route.Routing.MaxTargetAttempts)
 	}
+	if route.ResponsesStreamPassthrough && (schemaVersion != ProvidersConfigSchemaVersion2 || !isPublic ||
+		len(route.Endpoints) != 1 || route.Endpoints[0] != providerEndpointResponses || len(route.Targets) != 1 ||
+		routeMode(route.Routing.Mode) != routeModePrimaryOnly || route.Routing.MaxUpstreamSends != 1) {
+		return configPathError(path+".responses_stream_passthrough", "requires a public schema-v2 /responses-only route with one primary_only target and one upstream send")
+	}
 	return nil
 }
 
@@ -1300,6 +1310,8 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 			},
 			exposure:        exposure,
 			internalPurpose: routeCfg.InternalPurpose,
+
+			responsesStreamPassthrough: routeCfg.ResponsesStreamPassthrough,
 		})
 	}
 	return routes, nil
@@ -1330,7 +1342,7 @@ var providerModelConfigFields = configFieldSet(
 var modelRouteConfigFields = configFieldSet(
 	"id", "exposure", "internal_purpose", "public_id", "name", "endpoints", "reasoning_effort", "parallel_tool_calls", "vision",
 	"context_window", "model_picker_enabled", "model_picker_category", "drop_sampling_params", "drop_stop_sequences",
-	"targets", "routing",
+	"targets", "routing", "responses_stream_passthrough",
 )
 
 var modelRouteTargetConfigFields = configFieldSet(

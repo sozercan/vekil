@@ -3125,6 +3125,8 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		attemptNow = h.stats.now
 	}
 	kind := routeAttemptKindFromContext(ctx)
+	directStream, _ := ctx.Value(directResponsesPassthroughKey{}).(bool)
+	preserveStream := directStream && route.responsesStreamPassthrough && stream && endpoint == providerEndpointResponses && kind == routeAttemptNormal
 	var failures []routeAttemptFailure
 	retryTargetID := ""
 	for {
@@ -3425,7 +3427,14 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		}
 
 		if stream && resp.StatusCode == http.StatusOK {
-			accepted, streamFailure := h.prepareExplicitResponsesStream(ctx, operation, route, target, resp)
+			// A client that owns retries must see the provider's 200, even
+			// when the very first SSE event reports a rate limit. Leave state
+			// binding, attempt observation and the ordinary SSE relay in place.
+			accepted := resp
+			var streamFailure *routeAttemptFailure
+			if !preserveStream {
+				accepted, streamFailure = h.prepareExplicitResponsesStream(ctx, operation, route, target, resp)
+			}
 			if streamFailure != nil {
 				streamFailure.attribution = attribution
 				if streamFailure.decision == "" {
@@ -3520,17 +3529,23 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				completeCapturedRouteAttempt(attemptRecord, operation, trace, observation, endpoint, captured, false, routeAttemptOutcomeFailed)
 				break
 			}
-			if routeAdapterCertifiesHTTPRejection(target, endpoint, captured) {
+			opaque429 := preserveStream && captured.statusCode == http.StatusTooManyRequests && len(captured.body) > 0 && !json.Valid(captured.body)
+			if routeAdapterCertifiesHTTPRejection(target, endpoint, captured) && (!opaque429 || captured.hasPlaintextBody()) {
 				retryAfter, _ := selectResponsesRetryAfter(captured.header)
 				if target.provider.kind == providerTypeAzureOpenAI {
 					retryAfter = azureRetryAfter(captured.header)
 				}
-				if retryAfter != "" {
+				exposed := captured
+				if opaque429 {
+					// The adapter certified this complete raw plaintext rejection.
+					// Don't hand the opaque body to the durable JSON/state writer.
+					exposed = captured.safePlaintextRateLimit(retryAfter)
+				} else if retryAfter != "" {
 					if _, valid := retryAfterHeaderSeconds(headerGetCI(captured.header, "Retry-After")); !valid {
 						captured.header.Set("Retry-After", retryAfter)
 					}
 				}
-				failure := routeAttemptFailure{response: captured, attribution: attribution, delivery: requestExplicitlyRejected, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, statusCode: captured.statusCode, retryAfter: retryAfter, upstreamID: captured.upstreamID, cleanupDone: true, outcome: routeAttemptOutcomeRejected}
+				failure := routeAttemptFailure{response: exposed, attribution: attribution, delivery: requestExplicitlyRejected, progress: upstreamProgressNone, commitment: downstreamCommitmentNone, statusCode: captured.statusCode, retryAfter: retryAfter, upstreamID: captured.upstreamID, cleanupDone: true, outcome: routeAttemptOutcomeRejected}
 				decision := h.explicitRouteRejectionDecision(ctx, operation, target, endpoint, kind, failure, traffic)
 				failure.decision = decision
 				failures = append(failures, failure)
@@ -3549,7 +3564,7 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			// pre-execution rejection. Return it as an ambiguous terminal response.
 			captured.recordFinalUpstreamID(operation.inbound)
 			capturedObservation = captured
-			unsafeRejection = captured.bodyIncomplete || !routeHTTPRejectionBodyAllowsReplay(captured)
+			unsafeRejection = captured.bodyIncomplete || !routeHTTPRejectionBodyAllowsReplay(captured) || opaque429
 			resp = captured.response()
 		}
 
@@ -3610,6 +3625,10 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			operation.conversation.blocked = true
 			operation.conversation.mu.Unlock()
 			return nil, conversationRequestError(errConversationHistoryUncertain)
+		}
+		if preserveStream && unsafeRejection && resp.StatusCode == http.StatusTooManyRequests {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("upstream HTTP 429 did not establish rejection before execution")
 		}
 		return resp, nil
 	}

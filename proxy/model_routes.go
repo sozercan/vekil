@@ -58,6 +58,8 @@ type modelRoute struct {
 	exposure        string
 	internalPurpose string
 	legacy          bool
+
+	responsesStreamPassthrough bool
 }
 
 func sameLogicalExplicitRoute(a, b *modelRoute) bool {
