@@ -520,8 +520,13 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 				return err
 			}
 		}
-		if choice.FinishReason != nil && s.finishReason == "" {
-			s.finishReason = strings.TrimSpace(*choice.FinishReason)
+		if choice.FinishReason != nil {
+			if reason := strings.TrimSpace(*choice.FinishReason); reason != "" {
+				if s.finishReason != "" && s.finishReason != reason {
+					return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned conflicting Chat finish reasons"}
+				}
+				s.finishReason = reason
+			}
 		}
 	}
 	return nil
