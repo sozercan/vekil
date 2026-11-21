@@ -136,6 +136,25 @@ func TestResponsesChatTranslationContractOwnsLimitsAndMessages(t *testing.T) {
 	requireResponsesTranslationError(t, err, "", fmt.Sprintf("test Responses request exceeds %d bytes", contract.maxRequestBytes))
 }
 
+func TestResponsesChatTranslationContractOwnsTranslatedByteLimits(t *testing.T) {
+	contract := testResponsesChatTranslationContract()
+	contract.maxTranslatedBytes = 100
+
+	t.Run("canonical Chat body", func(t *testing.T) {
+		body := `{"model":"m","input":"` + strings.Repeat("x", 72) + `"}`
+		_, err := translateResponsesRequestToChat([]byte(body), contract)
+		requireResponsesTranslationError(t, err, "", "translated test Chat request exceeds 100 bytes")
+	})
+
+	t.Run("flattened namespace descriptions", func(t *testing.T) {
+		tools := json.RawMessage(`[{"type":"namespace","name":"ns","description":"` + strings.Repeat("x", 60) + `","tools":[` +
+			`{"type":"function","name":"first","parameters":{"type":"object"}},` +
+			`{"type":"function","name":"second","parameters":{"type":"object"}}]}]`)
+		_, err := parseResponsesToolsWithContract(tools, contract)
+		requireResponsesTranslationError(t, err, "tools[0].tools[1].description", "flattened tool descriptions exceed 100 encoded bytes")
+	})
+}
+
 func TestPolicyResponsesToolParserWrapperUsesPolicyContract(t *testing.T) {
 	_, err := parsePolicyResponsesTools(json.RawMessage(`[{"type":"image_generation"}]`))
 	requireResponsesTranslationError(t, err, "tools[0].type", `hosted or custom tool type "image_generation" is not supported for policy models`)
