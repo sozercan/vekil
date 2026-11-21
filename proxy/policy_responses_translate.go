@@ -93,6 +93,7 @@ type policyResponsesParsedToolChoice struct {
 type policyResponsesCanonicalChatRequest struct {
 	Model               string                 `json:"model"`
 	Messages            []models.OpenAIMessage `json:"messages"`
+	MaxTokens           *int                   `json:"max_tokens,omitempty"`
 	MaxCompletionTokens *int                   `json:"max_completion_tokens,omitempty"`
 	Temperature         *float64               `json:"temperature,omitempty"`
 	TopP                *float64               `json:"top_p,omitempty"`
@@ -118,7 +119,8 @@ type responsesChatTranslationContract struct {
 	// maxTranslatedBytes bounds the canonical Chat body and flattened tool text.
 	maxTranslatedBytes int
 	// maxInputItems bounds the Responses input array.
-	maxInputItems int
+	maxInputItems      int
+	useLegacyMaxTokens bool
 	// coalesceAssistantToolTurns merges each run of assistant messages and
 	// function calls into one Chat assistant turn (text first, then calls)
 	// before call-sequence validation. Adapters whose own output can place
@@ -303,6 +305,10 @@ func translateResponsesRequestToChat(body []byte, contract responsesChatTranslat
 		ParallelToolCalls:   parallel,
 		ResponseFormat:      responseFormat,
 		ReasoningEffort:     reasoningEffort,
+	}
+	if contract.useLegacyMaxTokens {
+		canonical.MaxTokens = maxTokens
+		canonical.MaxCompletionTokens = nil
 	}
 	chatBody, err := json.Marshal(canonical)
 	if err != nil {

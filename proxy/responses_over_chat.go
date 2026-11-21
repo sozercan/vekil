@@ -31,6 +31,7 @@ const (
 	responsesOverChatMaxRequestBytes    = maxRequestBodySize
 	responsesOverChatMaxTranslatedBytes = maxRequestBodySize + (maxRequestBodySize / 2)
 	responsesOverChatMaxInputItems      = 16384
+	responsesOverChatMaxOutputItems     = responsesOverChatMaxInputItems
 	// responsesOverChatMaxOutputBytes bounds text plus tool arguments accepted
 	// from one upstream turn before the response is failed.
 	responsesOverChatMaxOutputBytes = maxLargeRequestBodySize
@@ -42,6 +43,7 @@ var responsesOverChatTranslationContract = responsesChatTranslationContract{
 	maxRequestBytes:    responsesOverChatMaxRequestBytes,
 	maxTranslatedBytes: responsesOverChatMaxTranslatedBytes,
 	maxInputItems:      responsesOverChatMaxInputItems,
+	useLegacyMaxTokens: true,
 	// The adapter streams text after an announced call as a later message
 	// item, so its own completed output must replay as input.
 	coalesceAssistantToolTurns: true,
