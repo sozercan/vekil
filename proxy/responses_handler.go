@@ -315,9 +315,16 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		h.handlePolicyResponses(w, r, bodyBytes, publicID)
 		return
 	}
+	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointResponses)
+	if err != nil {
+		h.writeResponsesUpstreamRequestFailure(w, r, nil, "responses_admission", err)
+		return
+	}
+	if admittedOperation != nil {
+		r = r.WithContext(admissionCtx)
+		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
+	}
 	if h.responsesOverChatOptedIn(requestedModel) {
-		// Select the compatibility path before native Responses admission so an
-		// opted-in Chat-only model never reaches the upstream /responses route.
 		switch compat := h.resolveResponsesCompatibility(r.Context(), requestedModel); compat.mode {
 		case responsesExecutionOverChat:
 			h.handleResponsesOverChat(w, r, bodyBytes, compat)
@@ -328,15 +335,6 @@ func (h *ProxyHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 				"invalid_request_error")
 			return
 		}
-	}
-	admissionCtx, admittedOperation, _, err := h.withAdmittedExplicitRouteOperation(r.Context(), r.Context(), requestedModel, providerEndpointResponses)
-	if err != nil {
-		h.writeResponsesUpstreamRequestFailure(w, r, nil, "responses_admission", err)
-		return
-	}
-	if admittedOperation != nil {
-		r = r.WithContext(admissionCtx)
-		w.Header().Set("X-Vekil-Request-ID", admittedOperation.operationID())
 	}
 	if err := h.validateRouteAwareRequestJSON(bodyBytes, requestedModel, providerEndpointResponses); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")

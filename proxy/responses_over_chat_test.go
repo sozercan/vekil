@@ -736,6 +736,37 @@ func newROCExplicitRouteHandler(t *testing.T, primaryURL, secondaryURL string) *
 	return h
 }
 
+func TestResponsesOverChatExplicitRouteValidationKeepsRequestIdentity(t *testing.T) {
+	var sends atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sends.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+	h := newROCExplicitRouteHandler(t, upstream.URL, upstream.URL)
+	for _, test := range []struct{ name, fields, wantError string }{
+		{"translation", `"previous_response_id":"resp_previous"`, "previous_response_id"},
+		{"reasoning", `"reasoning":{"effort":"high"}`, "reasoning.effort"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			summary := postROCWithSummary(t, h, recorder, `{"model":"routed-gemini","input":"hi",`+test.fields+`}`)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), test.wantError) {
+				t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+			}
+			if id := recorder.Header().Get("X-Vekil-Request-ID"); id == "" || id != summary.OperationID() {
+				t.Fatalf("request ID header = %q, summary = %q", id, summary.OperationID())
+			}
+			if got := summary.RouteID(); got != "route-gemini" {
+				t.Fatalf("summary route = %q, want route-gemini", got)
+			}
+		})
+	}
+	if got := sends.Load(); got != 0 {
+		t.Fatalf("upstream sends = %d, want 0", got)
+	}
+}
+
 func TestResponsesOverChatExplicitRouteCommitmentRules(t *testing.T) {
 	const preamble = "data: {\"id\":\"primary\",\"model\":\"physical-primary\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n"
 	const textChunk = "data: {\"id\":\"primary\",\"model\":\"physical-primary\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n"
