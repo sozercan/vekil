@@ -1084,17 +1084,24 @@ func TestResponsesOverChatNameCompletesOnlyByOwnArgumentsOrFinish(t *testing.T) 
 }
 
 func TestResponsesOverChatMalformedChunksFailBeforeExecutableCalls(t *testing.T) {
-	tests := map[string]string{
-		"undecodable chunk":       `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":`,
-		"wrongly typed arguments": `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":123}}]}}]}`,
+	tests := map[string][]string{
+		"undecodable chunk":       {`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":`},
+		"wrongly typed arguments": {`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":123}}]}}]}`},
+		"tool finish before truncation": {
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`,
+		},
+		"truncation before tool finish": {
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`,
+		},
 	}
 	for name, malformed := range tests {
 		t.Run(name, func(t *testing.T) {
-			upstream := newROCUpstream(t, rocSSE(t,
+			chunks := append([]string{
 				`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_time","arguments":""}}]}}]}`,
-				malformed,
-				`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
-				"[DONE]"))
+			}, malformed...)
+			chunks = append(chunks, `{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`, "[DONE]")
+			upstream := newROCUpstream(t, rocSSE(t, chunks...))
 			h := newROCHandler(t, upstream.server.URL)
 			tools := `[{"type":"function","name":"get_time","parameters":{"type":"object"}}]`
 
