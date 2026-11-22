@@ -485,11 +485,10 @@ func TestDoWithRetry_CancelledDuringBackoff(t *testing.T) {
 		client:         server.Client(),
 		copilotURL:     server.URL,
 		log:            logger.New(logger.LevelError),
-		retryBaseDelay: 5 * time.Second, // long enough that cancel fires first
+		retryBaseDelay: 5 * time.Second,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel after a short delay to interrupt the backoff sleep.
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		cancel()

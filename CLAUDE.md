@@ -10,10 +10,12 @@ Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behi
 make build   # build binary
 make test    # go test ./... -count=1
 make vet     # go vet ./...
-make lint    # runs vet
+make lint    # vet + comment ratchet (see docs/development.md)
 ```
 
 Other targets are in the `Makefile`. Scoped suites, race matrices, and benchmark baselines are in [`docs/development.md`](docs/development.md) — load it before running anything narrower than `make test`, because the suite-name regexes are not guessable.
+
+Do not add prose comments to first-party source. Use clear code, tests, or an [ADR](docs/adr/README.md). Required directives are not prose; the lint ratchet allows existing comments but rejects new ones. Use the `delete-comment` skill to continue the audit.
 
 ## Documentation
 

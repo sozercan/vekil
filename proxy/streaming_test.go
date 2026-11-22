@@ -895,7 +895,6 @@ func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 		t.Fatalf("no SSE events parsed from output:\n%s", w.Body.String())
 	}
 
-	// Verify event sequence
 	expectedTypes := []string{
 		"message_start",
 		"content_block_start",
@@ -916,7 +915,6 @@ func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 		}
 	}
 
-	// Verify message_start
 	var msgStart models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[0].Data), &msgStart); err != nil {
 		t.Fatalf("unmarshal message_start: %v", err)
@@ -931,7 +929,6 @@ func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 		t.Errorf("message_start model = %q, want %q", msgStart.Message.Model, "claude-3-sonnet")
 	}
 
-	// Verify content_block_start
 	var cbStart models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[1].Data), &cbStart); err != nil {
 		t.Fatalf("unmarshal content_block_start: %v", err)
@@ -940,7 +937,6 @@ func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 		t.Errorf("content_block_start type = %v, want text", cbStart.ContentBlock)
 	}
 
-	// Verify content_block_delta texts
 	var delta1, delta2 models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[2].Data), &delta1); err != nil {
 		t.Fatalf("unmarshal first content_block_delta: %v", err)
@@ -955,7 +951,6 @@ func TestStreamOpenAIToAnthropic_TextOnly(t *testing.T) {
 		t.Errorf("delta[1] text = %q, want %q", delta2.Delta.Text, " world")
 	}
 
-	// Verify message_delta has stop_reason
 	var msgDelta models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[5].Data), &msgDelta); err != nil {
 		t.Fatalf("unmarshal message_delta: %v", err)
@@ -1049,7 +1044,6 @@ func TestStreamOpenAIToAnthropic_ToolCall(t *testing.T) {
 		}
 	}
 
-	// Verify content_block_start has tool_use type
 	var cbStart models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[1].Data), &cbStart); err != nil {
 		t.Fatalf("unmarshal content_block_start: %v", err)
@@ -1070,7 +1064,6 @@ func TestStreamOpenAIToAnthropic_ToolCall(t *testing.T) {
 		t.Errorf("content_block input = %q, want %q", string(cbStart.ContentBlock.Input), "{}")
 	}
 
-	// Verify content_block_delta has input_json_delta type
 	var delta1 models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[2].Data), &delta1); err != nil {
 		t.Fatalf("unmarshal content_block_delta: %v", err)
@@ -1082,7 +1075,6 @@ func TestStreamOpenAIToAnthropic_ToolCall(t *testing.T) {
 		t.Errorf("delta partial_json = %q, want %q", delta1.Delta.PartialJSON, `{"loc`)
 	}
 
-	// Verify message_delta has tool_use stop reason
 	var msgDelta models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[5].Data), &msgDelta); err != nil {
 		t.Fatalf("unmarshal message_delta: %v", err)
@@ -1096,7 +1088,6 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 	toolCallStop := "tool_calls"
 	idx0, idx1 := 0, 1
 
-	// First tool call start
 	chunk1 := models.OpenAIStreamChunk{
 		ID: "chatcmpl-3", Model: "gpt-4",
 		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
@@ -1105,7 +1096,6 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 			},
 		}}},
 	}
-	// First tool call args
 	chunk2 := models.OpenAIStreamChunk{
 		ID: "chatcmpl-3", Model: "gpt-4",
 		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
@@ -1114,7 +1104,6 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 			},
 		}}},
 	}
-	// Second tool call start
 	chunk3 := models.OpenAIStreamChunk{
 		ID: "chatcmpl-3", Model: "gpt-4",
 		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
@@ -1123,7 +1112,6 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 			},
 		}}},
 	}
-	// Second tool call args
 	chunk4 := models.OpenAIStreamChunk{
 		ID: "chatcmpl-3", Model: "gpt-4",
 		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{
@@ -1170,7 +1158,6 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 		}
 	}
 
-	// Verify first tool call block
 	var cb1 models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[1].Data), &cb1); err != nil {
 		t.Fatalf("unmarshal first tool block: %v", err)
@@ -1182,7 +1169,6 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 		t.Errorf("first tool block index = %v, want 0", cb1.Index)
 	}
 
-	// Verify second tool call block
 	var cb2 models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[3].Data), &cb2); err != nil {
 		t.Fatalf("unmarshal second tool block: %v", err)
@@ -1194,7 +1180,6 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 		t.Errorf("second tool block index = %v, want 1", cb2.Index)
 	}
 
-	// Verify argument deltas go to correct blocks
 	var d1, d2 models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[2].Data), &d1); err != nil {
 		t.Fatalf("unmarshal first arg delta: %v", err)
@@ -1223,7 +1208,6 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 		t.Errorf("second tool stop index = %v, want 1", stop2.Index)
 	}
 
-	// Verify stop reason is tool_use
 	var msgDelta models.AnthropicStreamEvent
 	if err := json.Unmarshal([]byte(events[7].Data), &msgDelta); err != nil {
 		t.Fatalf("unmarshal message_delta: %v", err)
@@ -1755,7 +1739,6 @@ func TestAnthropicRequestDeserialization(t *testing.T) {
 		t.Errorf("thinking = %v", req.Thinking)
 	}
 
-	// Verify translation works
 	oai, err := TranslateAnthropicToOpenAI(&req)
 	if err != nil {
 		t.Fatalf("translation error: %v", err)

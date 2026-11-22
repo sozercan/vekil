@@ -14,36 +14,18 @@ import (
 	"time"
 )
 
-// dashboardAssets holds the embedded browser dashboard (HTML + vendored uPlot).
-//
 //go:embed dashboard
 var dashboardAssets embed.FS
 
 const (
-	// statsRingSeconds is the size of the per-second ring buffer. It is kept a
-	// bit larger than the returned window so reads never collide with a write
-	// at the wrap boundary.
-	statsRingSeconds = 300
-	// statsSeriesSeconds is the length of the time series returned to the
-	// dashboard (most recent N seconds, time-aligned and zero-filled).
+	statsRingSeconds   = 300
 	statsSeriesSeconds = 180
-	// statsTopN caps the number of rows returned per error list (status codes
-	// and error targets).
-	statsTopN = 10
-	// statsBreakdownRows caps the rows returned per model/provider/agent/route
-	// breakdown. It is larger than statsTopN so the dashboard can re-sort or
-	// filter client-side (e.g. rank by errors) and still see rows that fall
-	// outside the top-by-requests.
+	statsTopN          = 10
 	statsBreakdownRows = 25
-	// statsMaxKeys bounds the cardinality of each breakdown map so a client
-	// sending random model names or User-Agents cannot grow memory without
-	// limit. Keys beyond the cap fold into an "other" bucket.
-	statsMaxKeys = 200
-	// statsOtherKey is the catch-all label for overflow breakdown keys.
-	statsOtherKey = "other"
+	statsMaxKeys       = 200
+	statsOtherKey      = "other"
 )
 
-// statsTotals is the cumulative session counters.
 type statsTotals struct {
 	Requests         int64 `json:"requests"`
 	Errors           int64 `json:"errors"`
@@ -52,13 +34,11 @@ type statsTotals struct {
 	TotalTokens      int64 `json:"total_tokens"`
 	CachedTokens     int64 `json:"cached_tokens"`
 	ReasoningTokens  int64 `json:"reasoning_tokens"`
-	// Latency percentiles in milliseconds over a bounded recent sample.
-	LatencyP50 int64 `json:"latency_p50_ms"`
-	LatencyP95 int64 `json:"latency_p95_ms"`
-	LatencyP99 int64 `json:"latency_p99_ms"`
+	LatencyP50       int64 `json:"latency_p50_ms"`
+	LatencyP95       int64 `json:"latency_p95_ms"`
+	LatencyP99       int64 `json:"latency_p99_ms"`
 }
 
-// statsSeriesPoint is one second of traffic in the live time series.
 type statsSeriesPoint struct {
 	T          int64 `json:"t"`
 	Req        int64 `json:"req"`
@@ -67,9 +47,6 @@ type statsSeriesPoint struct {
 	Completion int64 `json:"completion"`
 }
 
-// statsBreakdown is one row in a client-request breakdown. Only the label field
-// relevant to the list is populated (omitempty hides the rest). Route-only
-// failover fields remain omitted from legacy model/provider/agent rows.
 type statsBreakdown struct {
 	Model                string `json:"model,omitempty"`
 	Provider             string `json:"provider,omitempty"`
@@ -86,8 +63,6 @@ type statsBreakdown struct {
 	RouteExhaustions     int64  `json:"route_exhaustions,omitempty"`
 }
 
-// statsTargetBreakdown is one physical-attempt row. Attempts are actual
-// upstream sends, not client requests and not legacy same-target retries.
 type statsTargetBreakdown struct {
 	Route         string          `json:"route,omitempty"`
 	Target        string          `json:"target"`
@@ -98,10 +73,6 @@ type statsTargetBreakdown struct {
 	WastedUsage   statsTokenUsage `json:"wasted_usage"`
 }
 
-// statsTokenUsage is the normalized token shape shared by physical-attempt
-// diagnostics and aggregate physical/wasted accounting. It deliberately uses
-// the public prompt/completion vocabulary so callers can compare it directly
-// with the existing client-request totals without retaining provider payloads.
 type statsTokenUsage struct {
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
@@ -163,60 +134,43 @@ func statsTokenUsageDelta(current, accounted statsTokenUsage) statsTokenUsage {
 	}
 }
 
-// statsErrorRow is one row in the error-by-status or error-by-target lists.
 type statsErrorRow struct {
 	Label string `json:"label"`
 	Count int64  `json:"count"`
 }
 
-// statsSnapshot is the payload served at GET /stats.json.
 type statsSnapshot struct {
-	TaskUsage         taskUsageSnapshot      `json:"task_usage"`
-	UptimeSeconds     int64                  `json:"uptime_seconds"`
-	Inflight          int64                  `json:"inflight"`
-	AuxiliaryInflight int64                  `json:"auxiliary_inflight"`
-	Totals            statsTotals            `json:"totals"`
-	Status            map[string]int64       `json:"status"`
-	StatusCodes       []statsErrorRow        `json:"status_codes"`
-	Errors            []statsErrorRow        `json:"errors"`
-	Series            []statsSeriesPoint     `json:"series"`
-	ByModel           []statsBreakdown       `json:"by_model"`
-	ByProvider        []statsBreakdown       `json:"by_provider"`
-	ByAgent           []statsBreakdown       `json:"by_agent"`
-	ByRoute           []statsBreakdown       `json:"by_route"`
-	ByTarget          []statsTargetBreakdown `json:"by_target"`
-	// PhysicalUsage counts usage reported by explicit-route upstream sends.
-	// WastedUsage is the subset reported by attempts that did not become an
-	// accepted client-visible result. Both ledgers are additive to, and do not
-	// redefine, the legacy client-request totals above.
-	PhysicalUsage statsTokenUsage `json:"physical_usage"`
-	WastedUsage   statsTokenUsage `json:"wasted_usage"`
-	// Route/failover counters are additive to the legacy client-request totals.
-	// Physical attempts and target switches never increment Totals.Requests or
-	// Retries; the latter retains its same-target legacy retry meaning.
-	UpstreamAttempts      int64 `json:"upstream_attempts"`
-	TargetSwitches        int64 `json:"target_switches"`
-	RequestsWithFailover  int64 `json:"requests_with_failover"`
-	SuccessfulFailovers   int64 `json:"successful_failovers"`
-	RouteExhaustions      int64 `json:"route_exhaustions"`
-	StateBindingHits      int64 `json:"state_binding_hits"`
-	StateBindingMisses    int64 `json:"state_binding_misses"`
-	StateBindingEvictions int64 `json:"state_binding_evictions"`
-	// Storage gauges include recovered records and do not reset with traffic.
-	StateBindings stateBindingStatsSnapshot `json:"state_bindings"`
-	// Retries is the total upstream retry attempts and the breakdown by the
-	// status that triggered them (surfaces flakiness the proxy absorbed).
-	Retries       int64           `json:"retries"`
-	RetriesByCode []statsErrorRow `json:"retries_by_code"`
-	// Recent is the most-recent completed requests (newest first) for drill-down.
-	Recent []recentRequest `json:"recent"`
-	// RecentAttempts is a separately bounded, redacted physical-send trace. It
-	// never carries request/response bodies, raw errors, model rewrites, or state.
-	RecentAttempts []recentRouteAttempt `json:"recent_attempts"`
-	// InsightsEnabled reports whether a model is configured for on-demand
-	// LLM-generated insights (drives the dashboard's "Generate insights" button).
-	InsightsEnabled bool                `json:"insights_enabled"`
-	PolicyRouting   policyStatsSnapshot `json:"policy_routing"`
+	TaskUsage             taskUsageSnapshot         `json:"task_usage"`
+	UptimeSeconds         int64                     `json:"uptime_seconds"`
+	Inflight              int64                     `json:"inflight"`
+	AuxiliaryInflight     int64                     `json:"auxiliary_inflight"`
+	Totals                statsTotals               `json:"totals"`
+	Status                map[string]int64          `json:"status"`
+	StatusCodes           []statsErrorRow           `json:"status_codes"`
+	Errors                []statsErrorRow           `json:"errors"`
+	Series                []statsSeriesPoint        `json:"series"`
+	ByModel               []statsBreakdown          `json:"by_model"`
+	ByProvider            []statsBreakdown          `json:"by_provider"`
+	ByAgent               []statsBreakdown          `json:"by_agent"`
+	ByRoute               []statsBreakdown          `json:"by_route"`
+	ByTarget              []statsTargetBreakdown    `json:"by_target"`
+	PhysicalUsage         statsTokenUsage           `json:"physical_usage"`
+	WastedUsage           statsTokenUsage           `json:"wasted_usage"`
+	UpstreamAttempts      int64                     `json:"upstream_attempts"`
+	TargetSwitches        int64                     `json:"target_switches"`
+	RequestsWithFailover  int64                     `json:"requests_with_failover"`
+	SuccessfulFailovers   int64                     `json:"successful_failovers"`
+	RouteExhaustions      int64                     `json:"route_exhaustions"`
+	StateBindingHits      int64                     `json:"state_binding_hits"`
+	StateBindingMisses    int64                     `json:"state_binding_misses"`
+	StateBindingEvictions int64                     `json:"state_binding_evictions"`
+	StateBindings         stateBindingStatsSnapshot `json:"state_bindings"`
+	Retries               int64                     `json:"retries"`
+	RetriesByCode         []statsErrorRow           `json:"retries_by_code"`
+	Recent                []recentRequest           `json:"recent"`
+	RecentAttempts        []recentRouteAttempt      `json:"recent_attempts"`
+	InsightsEnabled       bool                      `json:"insights_enabled"`
+	PolicyRouting         policyStatsSnapshot       `json:"policy_routing"`
 }
 
 type secondBucket struct {
@@ -231,8 +185,8 @@ type breakdownCounter struct {
 	requests             int64
 	tokens               int64
 	errors               int64
-	durMs                int64 // sum of request durations in ms, for avg latency
-	durSamples           int64 // count of requests that contributed a duration (non-stream)
+	durMs                int64
+	durSamples           int64
 	kind                 string
 	targetSwitches       int64
 	requestsWithFailover int64
@@ -250,10 +204,6 @@ type targetAttemptCounter struct {
 	wastedUsage   statsTokenUsage
 }
 
-// statsCollector aggregates per-request traffic in memory for the dashboard.
-// It is written on every tracked request and read by the dashboard poll; the
-// per-second series uses a lazy ring buffer so no background goroutine is
-// needed. The clock is injectable for deterministic tests.
 type statsCollector struct {
 	taskUsage   taskUsageCollector
 	mu          sync.Mutex
@@ -281,28 +231,19 @@ type statsCollector struct {
 	physicalUsage         statsTokenUsage
 	wastedUsage           statsTokenUsage
 
-	// retries counts upstream retry attempts the proxy made (transient 429/503,
-	// transport errors). These are usually invisible to clients because the
-	// retry succeeds, so they surface flakiness that the error counters miss.
 	retries       int64
-	retriesByCode map[int]int64 // upstream status that triggered the retry (0 = transport error)
+	retriesByCode map[int]int64
 
-	// recent is a bounded ring of the most recent completed requests for the
-	// drill-down log. Newest writes overwrite oldest.
 	recent         []recentRequest
 	recentIdx      int
 	recentSize     int
 	recentSequence uint64
 
-	// recentAttempts is an independently bounded physical-send ring. A request
-	// can produce several entries here but still exactly one row in recent.
 	recentAttempts        []recentRouteAttempt
 	recentAttemptIdx      int
 	recentAttemptSize     int
 	recentAttemptSequence uint64
 
-	// latencies is a bounded ring of recent request durations (ms) used to
-	// compute p50/p95/p99 without retaining every sample forever.
 	latencies    []int64
 	latencyIdx   int
 	latencyCount int
@@ -310,7 +251,6 @@ type statsCollector struct {
 	inflight atomic.Int64
 }
 
-// recentRequest is one row in the recent-requests drill-down log.
 type recentRequest struct {
 	recordID          uint64
 	T                 int64  `json:"t"`
@@ -329,14 +269,6 @@ type recentRequest struct {
 	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
 }
 
-// responsesTurnStatsRecord identifies the aggregate buckets updated by one
-// websocket create turn. It lets post-terminal internal compaction add token
-// usage without incrementing request/error counts or attributing the delta to a
-// provider/model that changed after the upstream route was selected.
-// recentRouteAttempt is one production-visible physical-attempt row. The
-// unexported state pointer lets the attempt lifecycle update a still-retained
-// ring row after late route reclassification without exposing or retaining any
-// provider payload.
 type recentRouteAttempt struct {
 	recordID             uint64
 	state                *routeAttemptRecordState
@@ -362,10 +294,6 @@ type recentRouteAttempt struct {
 	ReportedUsage        *statsTokenUsage         `json:"reported_usage,omitempty"`
 }
 
-// routeAttemptRecordState is the mutable accounting handle associated with one
-// dispatched attempt. Updates are idempotent and can enrich a terminal row (for
-// example cleanup completion arriving after the terminal event) without
-// double-counting usage.
 type routeAttemptRecordState struct {
 	mu sync.Mutex
 
@@ -381,9 +309,6 @@ type routeAttemptRecordState struct {
 	traceVersion       uint64
 	publicationVersion uint64
 
-	// published* is guarded by collector.mu rather than state.mu. Publications
-	// carry cumulative accounting snapshots, so a newer publication can safely
-	// subsume an older one that reaches the collector later.
 	publishedVersion  uint64
 	physicalPublished statsTokenUsage
 	wastedPublished   statsTokenUsage
@@ -426,11 +351,8 @@ type responsesTurnStatsRecord struct {
 }
 
 const (
-	// statsLatencySamples bounds the recent-latency reservoir used for percentiles.
-	statsLatencySamples = 2048
-	// statsRecentRequests bounds the recent-requests drill-down log.
-	statsRecentRequests = 80
-	// statsRecentRouteAttempts independently bounds the physical-attempt trace.
+	statsLatencySamples      = 2048
+	statsRecentRequests      = 80
 	statsRecentRouteAttempts = 256
 )
 
@@ -458,8 +380,6 @@ func newStatsCollector() *statsCollector {
 func (c *statsCollector) incInflight() { c.inflight.Add(1) }
 func (c *statsCollector) decInflight() { c.inflight.Add(-1) }
 
-// incRetry records one upstream retry attempt. status is the upstream status
-// that triggered it, or 0 for a transport-level error.
 func (c *statsCollector) incRetry(status int) {
 	c.mu.Lock()
 	c.retries++
@@ -467,9 +387,6 @@ func (c *statsCollector) incRetry(status int) {
 	c.mu.Unlock()
 }
 
-// RouteAttemptObservation identifies one actual physical upstream send. All
-// labels are operational IDs from validated configuration; no upstream model,
-// response ID, state token, raw error, or body content is retained.
 type RouteAttemptObservation struct {
 	OperationID  string
 	RouteID      string
@@ -479,18 +396,11 @@ type RouteAttemptObservation struct {
 	Sequence     int
 	AttemptKind  routeAttemptKind
 
-	// operation and startedAt are route-executor-owned metadata. They stay
-	// unexported so callers cannot inject arbitrary trace state into /stats.json.
 	operation      *routeOperation
 	startedAt      time.Time
 	policyRedacted bool
 }
 
-// RecordUpstreamAttempt records one actual physical upstream dispatch for the
-// route executor. It updates the per-request summary and aggregate attempt
-// counters immediately, then returns a bounded record that the executor can
-// enrich with the normalized outcome once the attempt resolves. Callers that
-// only need the legacy aggregate side effect may ignore the return value.
 func (h *ProxyHandler) RecordUpstreamAttempt(ctx context.Context, attempt RouteAttemptObservation) *routeAttemptRecord {
 	summary := RequestSummaryFromContext(ctx)
 	if publicID := summary.policyPublicIDForStats(); publicID != "" {
@@ -645,10 +555,6 @@ func (r *routeAttemptRecord) complete(completion routeAttemptCompletion) {
 	}
 }
 
-// reconcileTrace applies a route-operation trace mutation directly to the
-// attempt record. Usage deltas remain idempotent in the record state, so a late
-// success-to-failure transition accounts wasted spend exactly once even after
-// the diagnostic ring row has been evicted and without waiting for /stats.json.
 func (r *routeAttemptRecord) reconcileTrace(trace routeAttemptTrace, version uint64) {
 	if r == nil || r.state == nil {
 		return
@@ -719,8 +625,6 @@ func (c *statsCollector) applyRouteAttemptCompletion(state *routeAttemptRecordSt
 	}
 }
 
-// RecordTargetSwitch records selection of a distinct target in the same route.
-// Same-target protocol recovery must not call this API.
 func (h *ProxyHandler) RecordTargetSwitch(ctx context.Context) {
 	if summary := RequestSummaryFromContext(ctx); summary != nil {
 		summary.RecordTargetSwitch()
@@ -731,8 +635,6 @@ func (h *ProxyHandler) RecordTargetSwitch(ctx context.Context) {
 	h.stats.recordTargetSwitch()
 }
 
-// RecordRouteExhaustion records one logical operation that exhausted its
-// eligible route targets. A request summary makes repeated calls idempotent.
 func (h *ProxyHandler) RecordRouteExhaustion(ctx context.Context) {
 	if summary := RequestSummaryFromContext(ctx); summary != nil && !summary.MarkRouteExhausted() {
 		return
@@ -743,21 +645,18 @@ func (h *ProxyHandler) RecordRouteExhaustion(ctx context.Context) {
 	h.stats.recordRouteExhaustion()
 }
 
-// RecordStateBindingHit records a successful exact state-to-target lookup.
 func (h *ProxyHandler) RecordStateBindingHit() {
 	if h != nil && h.stats != nil {
 		h.stats.recordStateBindingEvent(stateBindingHit)
 	}
 }
 
-// RecordStateBindingMiss records an exact state lookup with no live binding.
 func (h *ProxyHandler) RecordStateBindingMiss() {
 	if h != nil && h.stats != nil {
 		h.stats.recordStateBindingEvent(stateBindingMiss)
 	}
 }
 
-// RecordStateBindingEviction records one binding removed by the bounded store.
 func (h *ProxyHandler) RecordStateBindingEviction() {
 	if h != nil && h.stats != nil {
 		h.stats.recordStateBindingEvent(stateBindingEviction)
@@ -778,9 +677,6 @@ func (c *statsCollector) recordUpstreamAttempt(routeID, targetID, providerID, pr
 	c.mu.Unlock()
 }
 
-// recordUpstreamAttemptLocked increments the dispatch ledger and returns the
-// bounded aggregate key used for later physical/wasted usage attribution.
-// Caller must hold c.mu.
 func (c *statsCollector) recordUpstreamAttemptLocked(routeID, targetID, providerID, providerKind string) string {
 	c.upstreamAttempts++
 	if targetID == "" {
@@ -858,7 +754,6 @@ func (c *statsCollector) recordStateBindingEvent(event stateBindingStatsEvent) {
 	}
 }
 
-// record folds one completed HTTP request into the aggregates.
 func (c *statsCollector) record(summary *RequestSummary, status int, userAgent string, dur time.Duration) {
 	d := readSummaryForStats(summary)
 	agent := classifyAgent(userAgent)
@@ -869,15 +764,6 @@ func (c *statsCollector) record(summary *RequestSummary, status int, userAgent s
 	c.recordLocked(d, agent, status, durMs)
 }
 
-// recordResponsesTurn folds one client /v1/responses websocket create turn into
-// the aggregates. The bridge does not flow through the HTTP request middleware
-// (one upgrade serves many turns), so turns are recorded here directly. Internal
-// compaction usage available before the terminal event is folded into usage;
-// post-terminal compaction amends the returned record without another request.
-// status is the client turn outcome (200 for completed,
-// or an upstream error status for failed/non-200) so failures show up in error
-// counts and the recent log. Streamed turns carry no latency sample. Every turn
-// is counted as one request even with zero/absent usage, matching the HTTP path.
 func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, policyPublicID string, operationIDs ...string) responsesTurnStatsRecord {
 	if status == 0 {
 		status = http.StatusOK
@@ -886,9 +772,6 @@ func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel s
 	if len(operationIDs) > 0 {
 		operationID = strings.TrimSpace(operationIDs[0])
 	}
-	// Physical/wasted usage belongs exclusively to explicit-route attempt
-	// records. Legacy websocket turns still contribute to the client request
-	// ledger, but must never synthesize explicit-route physical spend.
 	total := usage.totalTokens()
 	d := summaryStats{
 		model:       boundStatLabel(model),
@@ -896,7 +779,7 @@ func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel s
 		provider:    provider,
 		kind:        kind,
 		endpoint:    "responses_ws",
-		stream:      true, // streamed: excluded from latency
+		stream:      true,
 		prompt:      usage.InputTokens,
 		completion:  usage.OutputTokens,
 		total:       total,
@@ -919,11 +802,6 @@ func (c *statsCollector) recordResponsesTurn(model, provider, kind, agentLabel s
 	return c.recordLocked(d, agent, status, 0)
 }
 
-// addResponsesTurnUsage adds post-terminal internal usage to an already-recorded
-// websocket turn without changing request, error, status, or latency counters.
-// If the time-series or recent-request slot has since wrapped, cumulative and
-// still-addressable breakdown totals remain correct without corrupting a newer
-// slot.
 func (c *statsCollector) addResponsesTurnUsage(record responsesTurnStatsRecord, usage responsesUsage) {
 	if c == nil || !record.valid || usage.isZero() {
 		return
@@ -963,8 +841,6 @@ func (c *statsCollector) addResponsesTurnUsage(record responsesTurnStatsRecord, 
 	}
 }
 
-// recordLocked folds one already-resolved request/turn into the aggregates.
-// Caller must hold c.mu. agent is the already-classified label.
 func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, durMs int64) responsesTurnStatsRecord {
 	sec := c.now().Unix()
 	isErr := status >= http.StatusBadRequest
@@ -999,13 +875,8 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 		}
 	}
 
-	// Latency: only non-streaming requests carry a meaningful end-to-end
-	// duration. A streamed response (SSE chat, or a GET /v1/responses websocket
-	// session) has a wall-clock time dominated by how long the client kept the
-	// connection open, which would poison the percentiles and per-key averages.
 	measureLatency := !d.stream
 	if measureLatency {
-		// Bounded latency reservoir (overwrite oldest once full).
 		c.latencies[c.latencyIdx] = durMs
 		c.latencyIdx = (c.latencyIdx + 1) % len(c.latencies)
 		if c.latencyCount < len(c.latencies) {
@@ -1026,7 +897,6 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 	}
 	providerKey := d.provider
 	if providerKey != "" {
-		// Providers are configured, not client-controlled, so no cap needed.
 		addBreakdown(c.byProvider, providerKey, int64(d.total), d.kind, isErr, durMs, measureLatency)
 	}
 	agentKey := capKey(c.byAgent, agent)
@@ -1047,7 +917,6 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 		}
 	}
 
-	// Append to the recent-requests drill-down ring (newest overwrites oldest).
 	if c.recentSequence == ^uint64(0) {
 		panic("stats recent request sequence exhausted")
 	}
@@ -1085,9 +954,6 @@ func (c *statsCollector) recordLocked(d summaryStats, agent string, status int, 
 	}
 }
 
-// capKey folds an overflow key into the "other" bucket once a map reaches the
-// cardinality cap. Existing keys always pass through, so a bounded set of
-// distinct keys is never disturbed.
 func capKey[V any](m map[string]V, key string) string {
 	if _, ok := m[key]; ok {
 		return key
@@ -1098,9 +964,6 @@ func capKey[V any](m map[string]V, key string) string {
 	return key
 }
 
-// errorTargetLabel names the provider/model an error is attributed to, falling
-// back gracefully when one or both are unknown (e.g. a request rejected before
-// routing resolves a provider).
 func errorTargetLabel(provider, model string) string {
 	switch {
 	case provider != "" && model != "":
@@ -1113,8 +976,6 @@ func errorTargetLabel(provider, model string) string {
 	return "unrouted"
 }
 
-// snapshot builds the dashboard payload: a time-aligned, zero-filled series plus
-// cumulative totals and sorted breakdowns.
 func (c *statsCollector) snapshot() statsSnapshot {
 	now := c.now()
 	nowSec := now.Unix()
@@ -1175,8 +1036,6 @@ func (c *statsCollector) snapshot() statsSnapshot {
 	}
 }
 
-// retriesRows renders the retry-by-status map as sorted rows. Status 0 (a
-// transport-level error) is labeled "transport".
 func retriesRows(m map[int]int64) []statsErrorRow {
 	out := make([]statsErrorRow, 0, len(m))
 	for code, count := range m {
@@ -1198,11 +1057,8 @@ func retriesRows(m map[int]int64) []statsErrorRow {
 	return out
 }
 
-// recentSnapshot returns the recent-requests ring newest-first. Caller holds c.mu.
 func (c *statsCollector) recentSnapshot() []recentRequest {
 	out := make([]recentRequest, 0, c.recentSize)
-	// recentIdx points at the next write slot; walk backwards from the most
-	// recent entry, wrapping around the ring.
 	for i := 0; i < c.recentSize; i++ {
 		idx := (c.recentIdx - 1 - i + len(c.recent)) % len(c.recent)
 		out = append(out, c.recent[idx])
@@ -1210,7 +1066,6 @@ func (c *statsCollector) recentSnapshot() []recentRequest {
 	return out
 }
 
-// recentAttemptsSnapshot returns the physical-attempt ring newest-first. Caller holds c.mu.
 func (c *statsCollector) recentAttemptsSnapshot() []recentRouteAttempt {
 	out := make([]recentRouteAttempt, 0, c.recentAttemptSize)
 	for i := 0; i < c.recentAttemptSize; i++ {
@@ -1262,9 +1117,6 @@ func routeAttemptDiagnosticsCompare(leftOutcome routeAttemptOutcome, leftProgres
 }
 
 func routeAttemptProgressDiagnosticRank(progress upstreamSemanticProgress) int {
-	// Keep this order aligned with mergeUpstreamSemanticProgress: more
-	// conservative evidence of execution must never be replaced by a weaker
-	// preamble or terminal-only trace.
 	switch progress {
 	case upstreamProgressUnknown:
 		return 6
@@ -1294,8 +1146,6 @@ func routeAttemptStatusDiagnosticRank(status int) int {
 	}
 }
 
-// latencyPercentiles returns p50/p95/p99 over the bounded recent-latency
-// reservoir. Caller must hold c.mu.
 func (c *statsCollector) latencyPercentiles() (p50, p95, p99 int64) {
 	if c.latencyCount == 0 {
 		return 0, 0, 0
@@ -1306,8 +1156,6 @@ func (c *statsCollector) latencyPercentiles() (p50, p95, p99 int64) {
 	return percentile(sample, 0.50), percentile(sample, 0.95), percentile(sample, 0.99)
 }
 
-// percentile returns the q-quantile of a pre-sorted slice using
-// nearest-rank. q is in [0,1].
 func percentile(sorted []int64, q float64) int64 {
 	n := len(sorted)
 	if n == 0 {
@@ -1323,8 +1171,6 @@ func percentile(sorted []int64, q float64) int64 {
 	return sorted[rank]
 }
 
-// topStatusCodes returns error status codes (>=400) sorted by count desc, then
-// by code asc for stable ordering.
 func topStatusCodes(m map[int]int64) []statsErrorRow {
 	out := make([]statsErrorRow, 0, len(m))
 	for code, count := range m {
@@ -1342,7 +1188,6 @@ func topStatusCodes(m map[int]int64) []statsErrorRow {
 	return out
 }
 
-// topErrorTargets returns provider/model error attributions sorted by count.
 func topErrorTargets(m map[string]int64) []statsErrorRow {
 	out := make([]statsErrorRow, 0, len(m))
 	for label, count := range m {
@@ -1360,8 +1205,6 @@ func topErrorTargets(m map[string]int64) []statsErrorRow {
 	return out
 }
 
-// topTargetBreakdowns returns physical-attempt rows sorted by attempt count.
-// Both the backing map and returned rows are bounded independently.
 func topTargetBreakdowns(m map[string]*targetAttemptCounter) []statsTargetBreakdown {
 	out := make([]statsTargetBreakdown, 0, len(m))
 	for _, counter := range m {
@@ -1475,17 +1318,9 @@ func topBreakdowns(m map[string]*breakdownCounter, kind string) []statsBreakdown
 	if len(out) <= statsBreakdownRows {
 		return out
 	}
-	// The dashboard re-sorts and filters these rows client-side by errors,
-	// latency, and tokens — not just requests. Truncating to the top-N by
-	// requests alone would drop a low-volume model that holds all the errors, or
-	// the slowest model, from those alternate views. Keep the union of the top-N
-	// by each sort dimension the client offers so every client-side sort sees its
-	// rows, while still bounding the response size.
 	return unionTopBreakdowns(out, statsBreakdownRows)
 }
 
-// sortBreakdownsByRequests orders rows by requests desc, then tokens desc, then
-// label asc, the default order the dashboard shows and a stable tiebreak.
 func sortBreakdownsByRequests(out []statsBreakdown) {
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Requests != out[j].Requests {
@@ -1498,14 +1333,6 @@ func sortBreakdownsByRequests(out []statsBreakdown) {
 	})
 }
 
-// unionTopBreakdowns returns the union of the top-n rows by each metric the
-// dashboard can sort by (requests, tokens, errors, latency) plus route
-// failover signals. The result is
-// deduplicated by label and ordered by the default requests-desc sort, so it is
-// at most 8*n rows but usually far fewer (the same heavy hitters top multiple
-// metrics). Rows with a zero value for a metric never enter that metric's top
-// set, so error/latency dimensions only contribute rows that actually have
-// errors/latency.
 func unionTopBreakdowns(rows []statsBreakdown, n int) []statsBreakdown {
 	if n <= 0 || len(rows) == 0 {
 		return nil
@@ -1531,14 +1358,14 @@ func unionTopBreakdowns(rows []statsBreakdown, n int) []statsBreakdown {
 				break
 			}
 			if metric(r) == 0 {
-				break // sorted desc: no further nonzero rows for this metric
+				break
 			}
 			keep[breakdownLabel(r)] = struct{}{}
 			added++
 		}
 	}
 	result := make([]statsBreakdown, 0, len(keep))
-	for _, r := range rows { // rows is already in requests-desc order
+	for _, r := range rows {
 		if _, ok := keep[breakdownLabel(r)]; ok {
 			result = append(result, r)
 		}
@@ -1560,7 +1387,6 @@ func breakdownLabel(b statsBreakdown) string {
 	return ""
 }
 
-// summaryStats is the subset of a RequestSummary the collector folds in.
 type summaryStats struct {
 	model          string
 	provider       string
@@ -1588,18 +1414,11 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	}
 	summary.mu.Lock()
 	defer summary.mu.Unlock()
-	// model comes from the client request body; bound its length so a client
-	// sending huge distinct model strings cannot bloat the breakdown/recent
-	// stats (the cardinality cap limits count, not size). provider/kind are
-	// configured server-side, so they are trusted.
 	d.model = boundStatLabel(summary.model)
 	d.provider = boundOperationalStatLabel(summary.provider)
 	d.kind = boundOperationalStatLabel(summary.providerKind)
 	d.endpoint = summary.endpoint
 	d.upstreamID = summary.upstreamRequestID
-	// Operational IDs are proxy/configuration derived, but still length-bound in
-	// the recent log and aggregate keys so future callers cannot accidentally
-	// retain or serve unbounded strings.
 	d.operationID = boundOperationalStatLabel(summary.operationID)
 	d.routeID = boundOperationalStatLabel(summary.routeID)
 	d.finalTarget = boundOperationalStatLabel(summary.finalTarget)
@@ -1627,9 +1446,6 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	if d.total == 0 {
 		d.total = d.prompt + d.completion
 	}
-	// Fold in out-of-band internal spend (e.g. a 413-fallback compaction call)
-	// that is tracked separately from the turn usage so it is not clobbered by
-	// the final turn's setOpenAIUsage overwrite.
 	if summary.extraPromptTokens != 0 || summary.extraCompletionTokens != 0 {
 		d.prompt += summary.extraPromptTokens
 		d.completion += summary.extraCompletionTokens
@@ -1644,8 +1460,6 @@ func readSummaryForStats(summary *RequestSummary) summaryStats {
 	return d
 }
 
-// classifyAgent maps a request User-Agent to a friendly client label. Only the
-// label is retained, never the raw User-Agent.
 func classifyAgent(userAgent string) string {
 	ua := strings.TrimSpace(userAgent)
 	if ua == "" {
@@ -1678,17 +1492,10 @@ func classifyAgent(userAgent string) string {
 	return boundStatLabel(token)
 }
 
-// statLabelMaxLen bounds the length of a client-controlled stats label (model
-// name, agent token) so a client cannot retain very large strings in the
-// breakdown/recent stats and have them served back via /stats.json.
 const statLabelMaxLen = 64
 
-// statOperationalLabelMaxLen matches the validated route/target ID limit while
-// keeping operation/configuration-derived labels bounded independently from
-// the stricter client-controlled label limit above.
 const statOperationalLabelMaxLen = 128
 
-// boundStatLabel truncates an over-long label to statLabelMaxLen runes.
 func boundStatLabel(s string) string {
 	return boundStatLabelRunes(s, statLabelMaxLen)
 }
@@ -1718,24 +1525,6 @@ func boundStatLabelRunes(s string, maxLen int) string {
 	return string(r[:maxLen]) + "…"
 }
 
-// isInferenceRoute reports whether method+path is one of the inference /
-// compatibility endpoints whose traffic belongs in the dashboard's LLM-usage
-// metrics. It is an allowlist matched against the server's registered routes, so
-// non-inference requests — GET /v1/models catalog refreshes, the GET
-// /v1/responses websocket upgrade, health/observability probes, and unmatched
-// (404) paths — are excluded by construction rather than by enumerating things
-// to skip. The websocket bridge records each turn directly via
-// RecordResponsesTurn instead of through the middleware.
-//
-// Deliberately excluded even though they are registered routes: token-counting
-// probes (POST /v1/messages/count_tokens, Gemini :countTokens) are non-
-// generating sizing calls that are frequently served from cache or a local
-// estimate with no upstream spend, and the proxy-owned compatibility shims
-// (POST /v1/responses/compact, /v1/memories/trace_summarize) do not surface a
-// single per-request model completion. Tracking any of these would add
-// zero-token requests (and, for count_tokens, latency samples) that skew the
-// dashboard's average-tokens/request and latency metrics. Keep this in sync with
-// the inference routes registered in server/server.go.
 func isInferenceRoute(method, path string) bool {
 	switch method {
 	case http.MethodPost:
@@ -1746,13 +1535,6 @@ func isInferenceRoute(method, path string) bool {
 			copilotEndpointDecisions:
 			return true
 		}
-		// Gemini routes are registered as path prefixes ({model}:{action}). Track
-		// only the generating actions HandleGeminiModels actually serves; the
-		// action is the suffix after the last colon (parseGeminiPath), and
-		// r.URL.Path carries no query string, so a suffix match is exact. This
-		// excludes :countTokens (a sizing probe) and any unsupported/typo action
-		// (e.g. :embedContent, :generateContentt) that the handler rejects with a
-		// 400 before any upstream completion — those must not skew the metrics.
 		if isGeminiModelsPath(path) {
 			return strings.HasSuffix(path, ":generateContent") ||
 				strings.HasSuffix(path, ":streamGenerateContent")
@@ -1763,25 +1545,12 @@ func isInferenceRoute(method, path string) bool {
 	}
 }
 
-// isGeminiModelsPath reports whether path is one of the registered Gemini
-// model-action route prefixes.
 func isGeminiModelsPath(path string) bool {
 	return strings.HasPrefix(path, "/v1beta/models/") ||
 		strings.HasPrefix(path, "/v1/models/") ||
 		strings.HasPrefix(path, "/models/")
 }
 
-// retryStatsTrackedContextKey marks a context that belongs to a tracked
-// inference request, so upstream retries made on its behalf are counted in the
-// dashboard's retry stats. It is a positive allow-marker rather than an
-// exclusion marker because the upstream request context is rebuilt from the
-// detached proxy lifecycle root (newInferenceUpstreamContext), which strips
-// inherited values — an "is this excluded?" marker on the inbound context
-// would simply be lost. The middleware sets it only when TracksRequest is true,
-// and newInferenceUpstreamContext copies it onto the upstream context, so
-// retries from non-tracked callers (the in-process /dashboard/insight call, the
-// GET /v1/models catalog fetch, count-token probes, and the proxy shims) carry
-// no marker and are not counted.
 type retryStatsTrackedContextKey struct{}
 
 func markRetryStatsTracked(ctx context.Context) context.Context {
@@ -1806,11 +1575,6 @@ func isRetryStatsTracked(ctx context.Context) bool {
 	return v
 }
 
-// MarkRetryStatsTrackedIfInference returns a context carrying the retry-stats
-// marker when method+path is a tracked inference route, otherwise the context
-// unchanged. The server middleware calls this on the inbound request context so
-// the marker propagates (via newInferenceUpstreamContext) to the upstream
-// request whose retries should be counted.
 func (h *ProxyHandler) MarkRetryStatsTrackedIfInference(ctx context.Context, method, path string) context.Context {
 	if h == nil || h.stats == nil || !isInferenceRoute(method, path) {
 		return ctx
@@ -1818,14 +1582,6 @@ func (h *ProxyHandler) MarkRetryStatsTrackedIfInference(ctx context.Context, met
 	return markRetryStatsTracked(ctx)
 }
 
-// TracksRequest reports whether requests for the given method+path should be
-// recorded in traffic stats. The server middleware uses this to gate inflight +
-// record. Only inference/compatibility endpoints are tracked (see
-// isInferenceRoute): non-inference traffic such as GET /v1/models, the GET
-// /v1/responses websocket upgrade (one long-lived connection serving many turns,
-// recorded per-turn elsewhere), observability probes, and unmatched 404 paths
-// are excluded so they do not skew request rate, latency percentiles, or average
-// tokens/request.
 func (h *ProxyHandler) TracksRequest(method, path string) bool {
 	if h == nil || h.stats == nil {
 		return false
@@ -1833,21 +1589,18 @@ func (h *ProxyHandler) TracksRequest(method, path string) bool {
 	return isInferenceRoute(method, path)
 }
 
-// IncInflight increments the live in-flight request gauge.
 func (h *ProxyHandler) IncInflight() {
 	if h != nil && h.stats != nil {
 		h.stats.incInflight()
 	}
 }
 
-// DecInflight decrements the live in-flight request gauge.
 func (h *ProxyHandler) DecInflight() {
 	if h != nil && h.stats != nil {
 		h.stats.decInflight()
 	}
 }
 
-// RecordRequest folds one completed request into the traffic stats.
 func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAgent string, dur time.Duration) {
 	if h == nil || h.stats == nil || (summary != nil && summary.StatsSuppressed()) {
 		return
@@ -1855,12 +1608,6 @@ func (h *ProxyHandler) RecordRequest(summary *RequestSummary, status int, userAg
 	h.stats.record(summary, status, userAgent, dur)
 }
 
-// RecordResponsesTurn folds one client /v1/responses websocket create turn into
-// traffic stats. The bridge does not flow through the HTTP request middleware,
-// so turns are recorded directly here. usage includes internal compaction spend
-// accumulated before the terminal outcome; the returned record accepts bounded
-// post-terminal usage amendments without creating synthetic requests. status is
-// the client turn outcome so failed turns appear in error counts.
 func (h *ProxyHandler) RecordResponsesTurn(model, provider, kind, agentLabel string, status int, usage responsesUsage, operationIDs ...string) responsesTurnStatsRecord {
 	if h == nil || h.stats == nil {
 		return responsesTurnStatsRecord{}
@@ -1882,13 +1629,9 @@ func (h *ProxyHandler) AddResponsesTurnUsage(record responsesTurnStatsRecord, us
 	h.stats.addResponsesTurnUsage(record, usage)
 }
 
-// HandleStatsJSON handles GET /stats.json with the current traffic snapshot.
 func (h *ProxyHandler) HandleStatsJSON(w http.ResponseWriter, r *http.Request) {
 	var snap statsSnapshot
 	if h != nil && h.stats != nil {
-		// Sample activity in scheduling order before totals: a client request
-		// can register a detached worker, which can start an upstream send.
-		// Reversing the order can report idle with totals from before that work.
 		inflight := h.stats.inflight.Load()
 		h.lifecycleWorkersMu.Lock()
 		auxiliaryInflight := int64(h.lifecycleWorkersActive)
@@ -1911,20 +1654,15 @@ func (h *ProxyHandler) HandleStatsJSON(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(snap)
 }
 
-// HandleDashboard handles GET /dashboard and serves the embedded dashboard page.
 func (h *ProxyHandler) HandleDashboard(w http.ResponseWriter, r *http.Request) {
 	serveDashboardFile(w, "dashboard/dashboard.html", "text/html; charset=utf-8", false)
 }
 
-// HandleFavicon answers GET /favicon.ico with 204 No Content so a browser
-// opening the dashboard does not generate a 404 (GET /favicon.ico is not an
-// inference route, so it is also excluded from traffic stats).
 func (h *ProxyHandler) HandleFavicon(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// HandleDashboardAsset serves the embedded, vendored dashboard assets (uPlot).
 func (h *ProxyHandler) HandleDashboardAsset(w http.ResponseWriter, r *http.Request) {
 	switch path.Base(r.URL.Path) {
 	case "uPlot.min.js":

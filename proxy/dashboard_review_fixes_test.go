@@ -435,7 +435,6 @@ func TestRequestSummaryFailureStatus(t *testing.T) {
 	if summary.FailureStatus() != http.StatusBadGateway {
 		t.Fatalf("FailureStatus = %d want 502", summary.FailureStatus())
 	}
-	// First one wins; a later status does not overwrite.
 	observeResponseFailureStatus(ctx, http.StatusInternalServerError)
 	if summary.FailureStatus() != http.StatusBadGateway {
 		t.Fatalf("FailureStatus changed to %d, want first-wins 502", summary.FailureStatus())

@@ -653,7 +653,6 @@ func TestSaveAndLoadCopilotToken(t *testing.T) {
 		t.Fatalf("save error: %v", err)
 	}
 
-	// Verify file exists and is valid JSON
 	data, err := os.ReadFile(filepath.Join(dir, "api-key.json"))
 	if err != nil {
 		t.Fatalf("read error: %v", err)
@@ -1189,12 +1188,10 @@ func TestPollForAuthorization_Success(t *testing.T) {
 		case "/login/oauth/access_token":
 			call++
 			if call == 1 {
-				// First call: authorization_pending
 				_ = json.NewEncoder(w).Encode(AccessTokenResponse{
 					Error: "authorization_pending",
 				})
 			} else {
-				// Second call: success
 				_ = json.NewEncoder(w).Encode(AccessTokenResponse{
 					AccessToken: "ghu_success",
 				})
@@ -1248,7 +1245,6 @@ func TestPollForAuthorization_Success(t *testing.T) {
 		t.Errorf("expected direct ghu_success bearer, got %q", a.copilotToken)
 	}
 
-	// Verify access token was saved to disk
 	data, err := os.ReadFile(filepath.Join(dir, "access-token"))
 	if err != nil {
 		t.Fatalf("access-token not saved: %v", err)

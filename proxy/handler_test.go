@@ -615,14 +615,12 @@ func TestHandleReadyz(t *testing.T) {
 
 func TestHandleAnthropicMessages(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		// Verify headers are set
 		if r.Header.Get("Authorization") != "Bearer test-token" {
 			t.Errorf("expected Bearer test-token, got %q", r.Header.Get("Authorization"))
 		}
 		if r.Header.Get("Content-Type") != "application/json" {
 			t.Errorf("expected application/json content-type, got %q", r.Header.Get("Content-Type"))
 		}
-		// Verify the request was translated to OpenAI format with forced streaming
 		var oaiReq models.OpenAIRequest
 		body, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(body, &oaiReq); err != nil {
@@ -2059,7 +2057,6 @@ func TestHandleCompact(t *testing.T) {
 	if len(result.Output) != 2 {
 		t.Fatalf("expected retained message plus compaction item, got %d output items", len(result.Output))
 	}
-	// First item: retained original user message.
 	if result.Output[0].Type != "message" {
 		t.Errorf("expected first item type message, got %q", result.Output[0].Type)
 	}
@@ -2069,7 +2066,6 @@ func TestHandleCompact(t *testing.T) {
 	if len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Text != "Hello" {
 		t.Errorf("expected retained user text in message content, got %+v", result.Output[0].Content)
 	}
-	// Second item: compaction with encrypted_content.
 	if result.Output[1].Type != "compaction" {
 		t.Errorf("expected second item type compaction, got %q", result.Output[1].Type)
 	}
@@ -11561,7 +11557,6 @@ func TestHandleModels(t *testing.T) {
 		if result.Data[0].ID != "gpt-5.4" {
 			t.Errorf("expected first model gpt-5.4, got %q", result.Data[0].ID)
 		}
-		// Verify Codex-compatible models field
 		if len(result.Models) != 2 {
 			t.Fatalf("expected 2 models entries, got %d", len(result.Models))
 		}
@@ -12722,7 +12717,6 @@ func TestOpenAIErrorResponseShape(t *testing.T) {
 		t.Fatalf("unmarshal error object: %v", err)
 	}
 
-	// Check all required fields exist
 	requiredFields := []string{"message", "type", "param", "code"}
 	for _, f := range requiredFields {
 		if _, ok := errObj[f]; !ok {
@@ -12730,7 +12724,6 @@ func TestOpenAIErrorResponseShape(t *testing.T) {
 		}
 	}
 
-	// Check values
 	var msg string
 	if err := json.Unmarshal(errObj["message"], &msg); err != nil {
 		t.Fatalf("json.Unmarshal(message) error = %v", err)
@@ -12762,7 +12755,6 @@ func TestOpenAIChatCompletionsStreaming(t *testing.T) {
 	sseBody := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\ndata: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\ndata: [DONE]\n\n"
 
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		// Verify streaming detection
 		var partial struct {
 			Stream *bool `json:"stream"`
 		}
@@ -12791,13 +12783,11 @@ func TestOpenAIChatCompletionsStreaming(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	// Verify SSE headers
 	ct := resp.Header.Get("Content-Type")
 	if ct != "text/event-stream" {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
 
-	// Verify SSE body is forwarded
 	body, _ := io.ReadAll(resp.Body)
 	bodyStr := string(body)
 	if !strings.Contains(bodyStr, "data: {") {
@@ -13175,7 +13165,6 @@ func TestOpenAIChatCompletionsUpstreamErrorPassthrough(t *testing.T) {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 
-	// Verify the error body is passed through unchanged
 	body, _ := io.ReadAll(resp.Body)
 	var errResp map[string]map[string]interface{}
 	if err := json.Unmarshal(body, &errResp); err != nil {
@@ -13797,7 +13786,6 @@ func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 	resp := w.Result()
 	body, _ := io.ReadAll(resp.Body)
 
-	// Verify passthrough preserved all OpenAI response fields
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -13810,7 +13798,6 @@ func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 		}
 	}
 
-	// Verify object is "chat.completion"
 	var obj string
 	if err := json.Unmarshal(raw["object"], &obj); err != nil {
 		t.Fatalf("json.Unmarshal(object) error = %v", err)
@@ -13819,7 +13806,6 @@ func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 		t.Errorf("object = %q, want chat.completion", obj)
 	}
 
-	// Verify choices structure
 	var choices []map[string]json.RawMessage
 	if err := json.Unmarshal(raw["choices"], &choices); err != nil {
 		t.Fatalf("json.Unmarshal(choices) error = %v", err)
@@ -13833,7 +13819,6 @@ func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 		}
 	}
 
-	// Verify system_fingerprint is preserved
 	if _, ok := raw["system_fingerprint"]; !ok {
 		t.Error("response missing system_fingerprint (should be preserved in passthrough)")
 	}
@@ -13871,7 +13856,6 @@ func TestOpenAIResponsesResponseShape(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	// Verify key Responses API fields are preserved in passthrough
 	for _, f := range []string{"id", "object", "created_at", "status", "model", "output", "usage"} {
 		if _, ok := raw[f]; !ok {
 			t.Errorf("response missing field %q", f)
