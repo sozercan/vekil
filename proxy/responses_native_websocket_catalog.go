@@ -6,24 +6,13 @@ import (
 	"sync"
 )
 
-// providerEndpointResponsesWebSocket is the Copilot catalog entry for native
-// Responses websocket support. It is capability metadata only: Vekil never
-// routes a public request to it.
 const providerEndpointResponsesWebSocket = "ws:/responses"
 
-// copilotNativeWebSocketCatalog records which upstream Copilot models advertise
-// ws:/responses. It is keyed by provider ID and upstream model, and is filled
-// from every fresh catalog fetch before public hiding or allowlist filtering,
-// so explicit-route targets resolve their capability even though their
-// upstream models are hidden from the public catalog.
 type copilotNativeWebSocketCatalog struct {
 	mu        sync.RWMutex
 	providers map[string]map[string]bool
 }
 
-// record stores a fetched catalog. A complete catalog replaces the provider's
-// entry; a partial one (such as a query-filtered fetch) only updates the models
-// it lists.
 func (c *copilotNativeWebSocketCatalog) record(providerID string, models []providerModel, complete bool) {
 	providerID = strings.TrimSpace(providerID)
 	if c == nil || providerID == "" {
@@ -39,8 +28,6 @@ func (c *copilotNativeWebSocketCatalog) record(providerID string, models []provi
 		entries = make(map[string]bool, len(models))
 	}
 	for _, model := range models {
-		// Require positive advertisement: an empty endpoint list means
-		// "unspecified" elsewhere, never websocket support.
 		advertised := model.endpointsAdvertised && supportsEndpoint(model.supportedEndpoints, providerEndpointResponsesWebSocket)
 		for _, id := range []string{model.upstreamModel, model.publicID} {
 			if id = strings.TrimSpace(id); id != "" {
@@ -51,8 +38,6 @@ func (c *copilotNativeWebSocketCatalog) record(providerID string, models []provi
 	c.providers[providerID] = entries
 }
 
-// lookup reports whether model advertises ws:/responses. known is false when
-// no catalog has been recorded for the provider yet.
 func (c *copilotNativeWebSocketCatalog) lookup(providerID, model string) (advertised, known bool) {
 	if c == nil {
 		return false, false
@@ -66,7 +51,6 @@ func (c *copilotNativeWebSocketCatalog) lookup(providerID, model string) (advert
 	return entries[strings.TrimSpace(model)], true
 }
 
-// Reasons a turn that could use the native connection is sent over HTTP.
 const (
 	responsesNativeDeclinedModelUnknown       = "model_unknown"
 	responsesNativeDeclinedCatalogUnavailable = "catalog_unavailable"
@@ -77,11 +61,6 @@ const (
 	responsesNativeDeclinedDialUnavailable    = "dial_unavailable"
 )
 
-// responsesNativeModelEligible decides whether a not-yet-connected session may
-// open a native upstream websocket for this physical request. It uses the
-// actual upstream model in the encoded provider body, after any route rewrite.
-// A cold catalog triggers one bounded, single-flight discovery refresh; when
-// capability stays unknown the session keeps the HTTP bridge.
 func (h *ProxyHandler) responsesNativeModelEligible(req *http.Request, providerID string) (bool, string) {
 	model := responsesNativeRequestModel(req)
 	if model == "" {
@@ -103,8 +82,6 @@ func (h *ProxyHandler) responsesNativeModelEligible(req *http.Request, providerI
 	return true, ""
 }
 
-// responsesNativeRequestModel returns the upstream model of a prepared Copilot
-// inference request, after any route or fallback rewrite.
 func responsesNativeRequestModel(req *http.Request) string {
 	if req == nil {
 		return ""

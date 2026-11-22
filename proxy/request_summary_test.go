@@ -160,8 +160,6 @@ func TestRequestSummaryPolicyIdentityOnlyRedactsTopology(t *testing.T) {
 	summary.setUpstreamRequestID("upstream-request")
 
 	summary.SetPolicyIdentity("coding-economy")
-	// Late error attribution must not reintroduce topology for a request rejected
-	// before any policy decision or terminal send.
 	summary.setProvider("power-provider", "azure-openai")
 	summary.setFinalRouteResult("power-target", "power-provider", "azure-openai", "late-upstream-request")
 	summary.setUpstreamRequestID("late-upstream-request")
@@ -208,8 +206,6 @@ func TestRequestSummarySeparatesLastAttemptFromFinalRouteAttribution(t *testing.
 		t.Fatalf("last attempt = %q/%q/%q, want secondary attribution", lastTarget, lastProvider, lastKind)
 	}
 
-	// The executor can select an earlier, higher-precedence result even though a
-	// later target was dispatched. Canonical attribution must follow that result.
 	summary.setFinalRouteAttribution("target-primary", "provider-primary", "azure-openai")
 	stats := readSummaryForStats(summary)
 	if stats.finalTarget != "target-primary" || stats.provider != "provider-primary" || stats.kind != "azure-openai" {

@@ -11,9 +11,6 @@ import (
 
 const defaultDurableStateBindingMaxEntries = 8 * 1024 * 1024
 
-// StateBindingsConfig controls explicit-route ownership. Schema-v2 routes use
-// durable storage by default; memory explicitly opts out of restart recovery.
-// MaxEntries limits logical records and never reserves their storage in advance.
 type StateBindingsConfig struct {
 	Mode       string `json:"mode,omitempty" yaml:"mode,omitempty"`
 	MaxEntries int    `json:"max_entries,omitempty" yaml:"max_entries,omitempty"`
@@ -22,21 +19,14 @@ type StateBindingsConfig struct {
 	maxEntriesSet bool
 }
 
-// WithStateBindingsConfig supplies optional process overrides. Empty fields
-// follow the providers config. Mode "config" also follows the providers config;
-// mode "memory" overrides a configured durable file without opening it.
 func WithStateBindingsConfig(config StateBindingsConfig) Option {
 	return func(h *ProxyHandler) { h.stateBindingsOverride = config }
 }
 
-// StateBindingsEnvironmentOverrides is shared by the CLI and menubar. Provider
-// config needs no environment settings; these are optional process overrides.
 func StateBindingsEnvironmentOverrides() (StateBindingsConfig, error) {
 	return ParseStateBindingsOverrides(os.Getenv("STATE_BINDINGS_MODE"), os.Getenv("STATE_BINDINGS_FILE"), os.Getenv("STATE_BINDINGS_MAX_ENTRIES"))
 }
 
-// ParseStateBindingsOverrides parses the effective optional flags or environment
-// values. Parse after flag selection so an explicit flag can replace a bad env value.
 func ParseStateBindingsOverrides(mode, file, maxEntries string) (StateBindingsConfig, error) {
 	config := StateBindingsConfig{
 		Mode: strings.TrimSpace(mode),

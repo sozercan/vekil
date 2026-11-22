@@ -19,26 +19,20 @@ import (
 	"github.com/sozercan/vekil/proxy"
 )
 
-// Server encapsulates the HTTP server lifecycle.
 type Server struct {
-	httpServer   *http.Server
-	proxyHandler *proxy.ProxyHandler
-	log          *logger.Logger
-	running      atomic.Bool
-	boundAddr    atomic.Pointer[string]
-	dynamicAddr  bool
-	// stopMu owns the one-shot listener claim and the shutdown claim. Do not
-	// hold it across Listen, logging, or drain waits: Stop keeps its deadline.
-	stopMu       sync.Mutex
-	stopDone     chan struct{}
-	stopErr      error
-	listenerDone chan struct{}
-	cancelListen context.CancelFunc
-	serveDone    chan error
-	listen       func(context.Context, string, string) (net.Listener, error)
-	// A force-closed net/http connection may outlive Shutdown in its handler.
-	// Gate registration before Wait so such handlers (including hijacked ones)
-	// retain generation-owned stores until their actual return.
+	httpServer              *http.Server
+	proxyHandler            *proxy.ProxyHandler
+	log                     *logger.Logger
+	running                 atomic.Bool
+	boundAddr               atomic.Pointer[string]
+	dynamicAddr             bool
+	stopMu                  sync.Mutex
+	stopDone                chan struct{}
+	stopErr                 error
+	listenerDone            chan struct{}
+	cancelListen            context.CancelFunc
+	serveDone               chan error
+	listen                  func(context.Context, string, string) (net.Listener, error)
 	requestHandlersMu       sync.Mutex
 	requestHandlers         sync.WaitGroup
 	requestHandlersDraining bool
@@ -52,66 +46,46 @@ type options struct {
 
 type serverConnContextKey struct{}
 
-// Option customizes server creation.
 type Option func(*options)
 
-// WithInboundAuthToken requires this bearer or x-api-key token on every route
-// except health and readiness probes. Empty keeps the public server behavior.
 func WithInboundAuthToken(token string) Option {
 	return func(o *options) {
 		o.inboundAuthToken = strings.TrimSpace(token)
 	}
 }
 
-// WithProxyOptions forwards proxy-level options to the underlying handler.
 func WithProxyOptions(opts ...proxy.Option) Option {
 	return func(o *options) {
 		o.proxyOptions = append(o.proxyOptions, opts...)
 	}
 }
 
-// WithPolicyRoutingAllowRemoteSingleTenant acknowledges that a policy-routing
-// server bound beyond loopback is operated as a trusted single-tenant service.
 func WithPolicyRoutingAllowRemoteSingleTenant(allow bool) Option {
 	return func(o *options) {
 		o.policyRoutingAllowRemoteSingleTenant = allow
 	}
 }
 
-// WithCopilotHeaderConfig overrides the synthetic Copilot-identifying headers
-// sent on upstream requests.
 func WithCopilotHeaderConfig(cfg proxy.CopilotHeaderConfig) Option {
 	return WithProxyOptions(proxy.WithCopilotHeaderConfig(cfg))
 }
 
-// WithResponsesWebSocketConfig overrides websocket-session handling for
-// GET /v1/responses Codex clients.
 func WithResponsesWebSocketConfig(cfg proxy.ResponsesWebSocketConfig) Option {
 	return WithProxyOptions(proxy.WithResponsesWebSocketConfig(cfg))
 }
 
-// WithStreamingUpstreamTimeout overrides the timeout used for streaming
-// upstream inference requests and derives the server write timeout from it.
 func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	return WithProxyOptions(proxy.WithStreamingUpstreamTimeout(timeout))
 }
 
-// WithCompactUpstreamChunkBytes overrides the initial body size targeted when
-// chunking /v1/responses/compact retries after an upstream 413.
 func WithCompactUpstreamChunkBytes(bytes int) Option {
 	return WithProxyOptions(proxy.WithCompactUpstreamChunkBytes(bytes))
 }
 
-// WithCompactUpstreamChunkConcurrency overrides the maximum number of sibling
-// compact chunks sent concurrently after the first chunk succeeds.
 func WithCompactUpstreamChunkConcurrency(concurrency int) Option {
 	return WithProxyOptions(proxy.WithCompactUpstreamChunkConcurrency(concurrency))
 }
 
-// WithCompactUpstreamMaxAttempts caps the total logical compaction calls the
-// /v1/responses/compact 413 fallback may perform per inbound request. Logical
-// calls can produce extra real upstream POSTs through model fallback or the
-// shared transport-retry policy.
 func WithCompactUpstreamMaxAttempts(max int) Option {
 	return WithProxyOptions(proxy.WithCompactUpstreamMaxAttempts(max))
 }
@@ -240,9 +214,6 @@ func withInboundAuth(next http.Handler, token string) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !requestPassesInboundAuth(r, token) {
-			// Auth sits inside withRequestLog so the rejection is logged, but no inference
-			// handler ran: counting it would let an unauthenticated caller move request-rate,
-			// latency and error dashboards.
 			proxy.RequestSummaryFromContext(r.Context()).SuppressStats()
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -277,8 +248,6 @@ func withProviderValidationGate(next http.Handler, handler startupReadinessGate)
 			case handler.StartupAuthenticationPending():
 				message = "startup authentication pending"
 			case handler.DynamicProviderValidationPending():
-				// Preserve provider-validation precedence when both startup
-				// validations are pending.
 			case handler.PolicyRoutingPreflightPending():
 				message = strings.TrimSpace(handler.PolicyRoutingReadinessDiagnostic())
 				if message == "" {
@@ -313,11 +282,6 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 			defer handler.DecInflight()
 		}
 
-		// Mark the request context so upstream retries made on behalf of a tracked
-		// inference request are counted in retry stats. The mark must be set here
-		// (not derived inside the upstream call) because newInferenceUpstreamContext
-		// rebuilds the upstream context from the detached proxy lifecycle root;
-		// only an explicitly propagated positive marker survives.
 		if handler != nil && admitted && authenticated {
 			ctx = handler.MarkRetryStatsTrackedIfInference(ctx, r.Method, r.URL.Path)
 		}
@@ -341,10 +305,6 @@ func withRequestLog(next http.Handler, log *logger.Logger, handler *proxy.ProxyH
 		if status == 0 {
 			status = http.StatusOK
 		}
-		// A streamed response can fail after its 200 header was committed (e.g. a
-		// /responses turn that emits response.failed/incomplete). The handler
-		// records that out-of-band on the summary; prefer it for stats so the
-		// dashboard does not count a post-commit failure as a success.
 		statsStatus := status
 		if failure := summary.FailureStatus(); failure != 0 {
 			statsStatus = failure
@@ -402,7 +362,6 @@ func servesTrustedBrowserContent(r *http.Request) bool {
 	}
 }
 
-// New creates a Server with routes and timeouts configured.
 func New(authenticator *auth.Authenticator, log *logger.Logger, host, port string, opts ...Option) (*Server, error) {
 	cfg := options{}
 	for _, opt := range opts {
@@ -416,8 +375,6 @@ func New(authenticator *auth.Authenticator, log *logger.Logger, host, port strin
 		return nil, err
 	}
 	if err := validatePolicyRoutingListenHost(host, handler.PolicyRoutingActive(), cfg.policyRoutingAllowRemoteSingleTenant); err != nil {
-		// Nothing has been served yet, but construction may already own durable
-		// storage and lifecycle resources. Drain before releasing the store lock.
 		handler.BeginShutdown()
 		return nil, errors.Join(err, handler.WaitLifecycleWorkers(context.Background()))
 	}
@@ -477,9 +434,6 @@ func (s *Server) withRequestHandlerDrain(next http.Handler) http.Handler {
 		if tracked {
 			defer s.requestHandlers.Done()
 		}
-		// BeginShutdown runs before registration closes. Late requests therefore
-		// reach only withRequestLog's shutdown rejection (or the health probe),
-		// neither of which can access generation-owned continuation stores.
 		next.ServeHTTP(w, r)
 	})
 }
@@ -502,10 +456,6 @@ func isLoopbackListenHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// Start begins listening in a goroutine. It returns an error if the listener
-// cannot be established and shuts down that generation. A concurrent Stop
-// retains its deadline and background-finalization semantics. Create a new
-// Server to retry after a failed start or shutdown.
 func (s *Server) Start() error {
 	s.stopMu.Lock()
 	if s.stopDone != nil || (s.proxyHandler != nil && s.proxyHandler.ShuttingDown()) {
@@ -542,8 +492,6 @@ func (s *Server) Start() error {
 			err = errors.New("server shut down during startup")
 		}
 		if stopping {
-			// Stop already owns finalization and may have returned its deadline.
-			// Closing listenerDone lets that same finalizer finish safely.
 			return err
 		}
 		return errors.Join(err, s.Stop(context.Background()))
@@ -571,8 +519,6 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Done reports the terminal Serve result. It yields nil after a normal
-// shutdown and a non-nil error when the listener stops unexpectedly.
 func (s *Server) Done() <-chan error {
 	if s == nil {
 		return nil
@@ -580,31 +526,24 @@ func (s *Server) Done() <-chan error {
 	return s.serveDone
 }
 
-// ModelUsesCopilot reports whether launcher startup needs Copilot authentication
-// to resolve or collision-check model.
 func (s *Server) ModelUsesCopilot(model string) bool {
 	return s != nil && s.proxyHandler != nil && s.proxyHandler.ModelUsesCopilot(model)
 }
 
-// UsesCopilot reports whether the active serve scope needs Copilot auth.
 func (s *Server) UsesCopilot() bool {
 	return s != nil && s.proxyHandler != nil && s.proxyHandler.UsesCopilot()
 }
 
-// MessagesAliasResolvesTo reports whether a Messages request naming alias is
-// served like one naming model.
 func (s *Server) MessagesAliasResolvesTo(ctx context.Context, alias, model string) bool {
 	return s != nil && s.proxyHandler != nil && s.proxyHandler.MessagesAliasResolvesTo(ctx, alias, model)
 }
 
-// SetStartupAuthenticationPending gates non-health routes while startup auth is in progress.
 func (s *Server) SetStartupAuthenticationPending(pending bool) {
 	if s.proxyHandler != nil {
 		s.proxyHandler.SetStartupAuthenticationPending(pending)
 	}
 }
 
-// ValidateDynamicProviderModels loads deferred dynamic provider catalogs.
 func (s *Server) ValidateDynamicProviderModels(ctx context.Context) error {
 	if s.proxyHandler == nil {
 		return nil
@@ -612,12 +551,10 @@ func (s *Server) ValidateDynamicProviderModels(ctx context.Context) error {
 	return s.proxyHandler.ValidateDynamicProviderModels(ctx)
 }
 
-// DynamicProviderValidationPending reports whether deferred discovery remains.
 func (s *Server) DynamicProviderValidationPending() bool {
 	return s != nil && s.proxyHandler != nil && s.proxyHandler.DynamicProviderValidationPending()
 }
 
-// InitializePolicyRouting performs any configured policy-routing preflight.
 func (s *Server) InitializePolicyRouting(ctx context.Context) error {
 	if s == nil || s.proxyHandler == nil {
 		return nil
@@ -625,7 +562,6 @@ func (s *Server) InitializePolicyRouting(ctx context.Context) error {
 	return s.proxyHandler.InitializePolicyRouting(ctx)
 }
 
-// Stop performs a graceful shutdown of the server.
 func (s *Server) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -693,22 +629,14 @@ func (s *Server) stop(ctx context.Context, listenerDone <-chan struct{}) error {
 	}
 	shutdownErr := s.httpServer.Shutdown(ctx)
 	if shutdownErr != nil {
-		// Shutdown leaves active connections alone after its deadline. Force-close
-		// them so a stalled upload or non-reading downstream cannot survive into a
-		// later server generation (notably in the menubar stop/start flow).
 		forceCloseErr = s.httpServer.Close()
 		if errors.Is(forceCloseErr, http.ErrServerClosed) {
 			forceCloseErr = nil
 		}
 	}
-	// Stop has one owner and caches its result. Keep a single finalizer alive
-	// beyond that caller's deadline: Close does not wait for HTTP handlers, and
-	// a deadline must not leak the store lock once all real work has finished.
 	finalized := make(chan error, 1)
 	go func() {
 		if listenerDone != nil {
-			// Also fence a late Listen result or a Serve goroutine not yet
-			// registered with net/http when Shutdown began.
 			<-listenerDone
 		}
 		s.requestHandlers.Wait()
@@ -730,7 +658,6 @@ func (s *Server) stop(ctx context.Context, listenerDone <-chan struct{}) error {
 	return errors.Join(websocketErr, shutdownErr, forceCloseErr, workerErr)
 }
 
-// IsRunning returns whether the server is currently running.
 func (s *Server) IsRunning() bool {
 	return s.running.Load()
 }
@@ -745,8 +672,6 @@ func (s *Server) listenerLogAddr(boundAddr string) string {
 	return s.httpServer.Addr
 }
 
-// Addr returns the configured listen address, except that a server configured
-// with port 0 reports the actual bound address after Start succeeds.
 func (s *Server) Addr() string {
 	if s != nil && s.dynamicAddr {
 		if boundAddr := s.boundAddr.Load(); boundAddr != nil {

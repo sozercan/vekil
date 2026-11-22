@@ -11,10 +11,6 @@ import (
 
 const privateTempFileAttempts = 100
 
-// writePrivateTempFile writes data to a new owner-only temporary file and
-// returns an idempotent cleanup function. The randomized path is chosen before
-// the platform-specific exclusive create so the file is never opened with a
-// broader intermediate permission set.
 func writePrivateTempFile(prefix string, data []byte) (string, func() error, error) {
 	for range privateTempFileAttempts {
 		random := make([]byte, 16)

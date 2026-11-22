@@ -10,14 +10,14 @@ import subprocess
 import sys
 
 from pygments.lexers import get_lexer_by_name
-from pygments.token import Comment, String
+from pygments.token import Comment, String, Text
 import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
 
 LEXERS = {
     '.css': 'css', '.go': 'go', '.h': 'c', '.html': 'html', '.js': 'javascript',
-    '.json': 'json', '.m': 'objective-c', '.mk': 'make', '.py': 'python', '.sh': 'bash',
+    '.jq': 'jq', '.json': 'json', '.m': 'objective-c', '.mk': 'make', '.py': 'python', '.sh': 'bash',
     '.toml': 'toml', '.yaml': 'yaml', '.yml': 'yaml',
 }
 NAMED_LEXERS = {'.gitignore': 'text', 'go.mod': 'go', 'GNUmakefile': 'make', 'Makefile': 'make', 'makefile': 'make'}
@@ -29,6 +29,16 @@ GO_DIRECTIVE = re.compile(
 )
 GO_NOLINT = re.compile(r'//nolint:[\w-]+(?:,[\w-]+)*')
 HEREDOC = re.compile(r'''<<-?[ \t]*(?P<quote>['"]?)(?P<label>\w+)(?P=quote)''')
+JQ_TOKEN = re.compile(r'"(?:\\[\s\S]|[^"\\])*"|#[^\r\n]*')
+SHELL_SPACE = r'(?:[ \t]|\\\n)+'
+SHELL_WORD = r'''(?:"(?:\\[\s\S]|[^"\\])*"|'[^']*'|[^\s'";&|]+)'''
+JQ_FILTER = re.compile(
+    rf'''(?:^|(?<=\$\()|(?<=[;&|]))[ \t]*(?:(?:if|elif|then|else|!){SHELL_SPACE})?'''
+    rf'''(?P<command>jq){SHELL_SPACE}(?:(?:-[A-Za-z]+|--(?:raw-output|exit-status|'''
+    rf'''compact-output|slurp|null-input|sort-keys)|--arg(?:json)?{SHELL_SPACE}\w+'''
+    rf'''{SHELL_SPACE}{SHELL_WORD}){SHELL_SPACE})*'(?P<program>[^']*)' ''',
+    re.M | re.X,
+)
 MAKE_LINE = re.compile(r'(?:[^\n]*\\\n)*[^\n]+|(?:[^\n]*\\\n)+')
 MAKE_DIRECTIVE = re.compile(r'(?:(?:override|export|private)\s+)*(define|endef)\b')
 MAKE_ASSIGNMENT = re.compile(r'(?:[+?!]|:{1,3})?=')
@@ -123,6 +133,10 @@ def lex_comments(language, source):
     if language == 'text':
         yield from ((match.start(), match.group()) for match in re.finditer(r'^#[^\n]*', source, re.M))
         return
+    if language == 'jq':
+        yield from ((match.start(), match.group()) for match in JQ_TOKEN.finditer(source)
+                    if match.group().startswith('#'))
+        return
     if language == 'make':
         yield from make_comments(source)
         return
@@ -141,7 +155,11 @@ def lex_comments(language, source):
         return
     if not source.endswith('\n'):
         source += '\n'
+    jq_filters = {match.start('command'): match for match in JQ_FILTER.finditer(source)} if language == 'bash' else {}
     for start, kind, value in lexer(language).get_tokens_unprocessed(source):
+        if kind is Text and value == 'jq' and (match := jq_filters.get(start)):
+            yield from ((match.start('program') + offset, text)
+                        for offset, text in lex_comments('jq', match['program']))
         if language == 'bash' and kind is String and (match := HEREDOC.match(value)):
             body_start = value.find('\n') + 1
             body_end = value.rfind('\n') + 1
@@ -284,7 +302,7 @@ def additions(path, before, after):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Enforce a per-file, exact comment-line ratchet.')
+    parser = argparse.ArgumentParser(description='Ban prose comments in first-party source.')
     parser.add_argument('--base', help='Git revision used as the legacy budget or inventory source')
     parser.add_argument('--inventory', action='store_true', help='Print remaining comments and removable line totals')
     args = parser.parse_args()
@@ -308,19 +326,24 @@ def main():
         print(f'{own_lines} comment-only lines; {inline_lines} lines with inline comments', file=sys.stderr)
         return 0
 
-    base = revision(args.base or 'HEAD')
-    changed = paths('diff', '--name-only', '--no-renames', '-z', base, '--') | untracked
-    known = paths('ls-tree', '-r', '--name-only', '-z', base)
+    base = revision(args.base) if args.base else None
+    if base:
+        files = paths('diff', '--name-only', '--no-renames', '-z', base, '--') | untracked
+        known = paths('ls-tree', '-r', '--name-only', '-z', base)
+    else:
+        files = paths('ls-files', '--cached', '-z') | untracked
+        known = set()
+    description = 'new comment' if base else 'comment'
     failures = 0
-    for path in sorted(changed):
+    for path in sorted(files):
         if not source_language(path) or not (after := source_text(path)):
             continue
         before = head_source(base, path) if path in known else ''
         for line in additions(path, before, after):
-            print(f'{path}:{line.number}:{line.column}: new comment: {line.text}', file=sys.stderr)
+            print(f'{path}:{line.number}:{line.column}: {description}: {line.text}', file=sys.stderr)
             failures += 1
     if failures:
-        print(f'{failures} new comment lines; use code or an ADR instead.', file=sys.stderr)
+        print(f'{failures} {description} lines; use code or an ADR instead.', file=sys.stderr)
     return bool(failures)
 
 

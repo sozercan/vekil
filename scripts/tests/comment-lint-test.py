@@ -100,6 +100,24 @@ EOF_PROXY
         result = list(comment_lines('scripts/run.sh', source))
         self.assertEqual([(line.number, line.text, line.inline) for line in result], [(3, '# real comment', True)])
 
+    def test_jq_filters_and_shell_data(self):
+        source = r'''echo jq '# shell data'
+cat <<'DATA'
+jq '# heredoc data'
+DATA
+if jq -e --arg name "${name}" \
+  '.data | map(select(.name == "# literal"))
+   # filter documentation
+   | length # trailing filter text
+  ' input.json; then
+  echo ok
+fi
+'''
+        result = list(comment_lines('scripts/run.sh', source))
+        self.assertEqual([(line.number, line.text, line.inline) for line in result],
+                         [(7, '# filter documentation', False), (8, '# trailing filter text', True)])
+        self.assertEqual(self.texts('program.jq', '"# literal" # actual comment\n'), ['# actual comment'])
+
     def test_workflow_embedded_comments(self):
         source = '''jobs:
   lint:
@@ -145,6 +163,10 @@ EOF_PROXY
             git('init')
             source.write_text('package main\n// legacy\n', encoding='utf-8')
             commit()
+            strict = lint()
+            self.assertEqual(strict.returncode, 1)
+            self.assertIn('main.go:2:1: comment: // legacy', strict.stderr)
+            self.assertEqual(lint('--base', 'HEAD').returncode, 0)
             source.write_text('package main\n', encoding='utf-8')
             self.assertEqual(lint().returncode, 0)
             commit()
@@ -154,8 +176,11 @@ EOF_PROXY
             new.write_text('package main\n// another\n', encoding='utf-8')
             result = lint()
             self.assertEqual(result.returncode, 1)
-            self.assertIn('main.go:2:1: new comment: // legacy', result.stderr)
-            self.assertIn('new.go:2:1: new comment: // another', result.stderr)
+            self.assertIn('main.go:2:1: comment: // legacy', result.stderr)
+            self.assertIn('new.go:2:1: comment: // another', result.stderr)
+            ratchet = lint('--base', 'HEAD')
+            self.assertEqual(ratchet.returncode, 1)
+            self.assertIn('main.go:2:1: new comment: // legacy', ratchet.stderr)
             new.unlink()
             self.assertEqual(lint('--base', 'HEAD^').returncode, 0)
 

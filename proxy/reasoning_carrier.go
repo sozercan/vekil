@@ -20,24 +20,14 @@ import (
 
 const reasoningCarrierPrefix = "vekil1."
 
-// A signature is client input, so a compression bomb is reachable, and one body holds many.
-// The per-carrier cap must cover a group the store itself accepts, or our own decoder
-// rejects a carrier we minted; the request budget is what actually bounds a bomb.
 const (
 	reasoningCarrierMaxDecodedBytes = responsesChatReplayMaxGroupBytes + (1 << 20)
 	reasoningCarrierRequestBudget   = 8 << 20
 	carriedDigestBytes              = 16
 )
 
-// Emit-side cap. Measured on session 4e6e968c: carriers were 78% of a 9.81 MB body at
-// 880 tool turns and 8.9 KB per turn, so the 10 MiB ingress gate closes near turn 940.
-// This is a cumulative wire-byte ceiling: once the client already carries the budget,
-// or the next signature would cross it, no new carrier is emitted. The visible-transcript
-// fallback preserves progress without exporting provider-owned replay mappings.
 const reasoningCarrierInboundBudget = 2 << 20
 
-// What the client already replays. Counted off the wire signatures, so it is the weight
-// that returns on every later request no matter what vekil emits now.
 type carrierInbound struct {
 	Carriers int
 	Bytes    int
@@ -46,17 +36,13 @@ type carrierInbound struct {
 
 func (i carrierInbound) saturated() bool { return i.Bytes >= reasoningCarrierInboundBudget }
 
-// Where the cap is decided and where to say so; the response path has no logger of its own.
 type carrierEmit struct {
 	Inbound carrierInbound
 	Log     *logger.Logger
 }
 
-// Carried, not inferred from item order: positional binding misattaches same-name parallel calls.
 type carriedCall struct {
-	ProxyID string `json:"proxy_id"`
-	// Legacy decode only. Newly emitted carriers clear this field, and restoration never
-	// trusts it: provider-owned call IDs stay in the process-local replay store.
+	ProxyID                  string                              `json:"proxy_id"`
 	UpstreamID               string                              `json:"upstream_id,omitempty"`
 	Name                     string                              `json:"name"`
 	ItemIndex                int                                 `json:"item_index"`
@@ -67,21 +53,15 @@ type carriedCall struct {
 }
 
 type reasoningCarrierPayload struct {
-	Items         []json.RawMessage `json:"items"`
-	Calls         []carriedCall     `json:"calls,omitempty"`
-	TextItemIndex *int              `json:"text_item_index,omitempty"`
-	// Binds a carrier to the route that minted it: Copilot's ciphertext is model-bound,
-	// and on the policy path this re-picks the tier. RouteTag keys that second role;
-	// the digest stays unkeyed so a restart can still restore items.
-	RouteDigest              string `json:"route_digest,omitempty"`
-	RouteTag                 string `json:"route_tag,omitempty"`
-	ProjectionDigest         string `json:"projection_digest,omitempty"`
-	OriginalProjectionDigest string `json:"original_projection_digest,omitempty"`
+	Items                    []json.RawMessage `json:"items"`
+	Calls                    []carriedCall     `json:"calls,omitempty"`
+	TextItemIndex            *int              `json:"text_item_index,omitempty"`
+	RouteDigest              string            `json:"route_digest,omitempty"`
+	RouteTag                 string            `json:"route_tag,omitempty"`
+	ProjectionDigest         string            `json:"projection_digest,omitempty"`
+	OriginalProjectionDigest string            `json:"original_projection_digest,omitempty"`
 }
 
-// A turn's Responses output and bindings, encoded into an Anthropic thinking block's
-// signature so the CLIENT holds it rather than the replay store, whose TTL, eviction
-// and restart each wedge a conversation. Chat has no such field, so it keeps the store.
 type carriedTurn struct {
 	Items              []json.RawMessage
 	Calls              []carriedCall
@@ -92,7 +72,6 @@ type carriedTurn struct {
 	Emit               *carrierEmit
 }
 
-// A carrier needs at least one ordering/reasoning item or visible-call binding.
 func (t carriedTurn) present() bool { return len(t.Items) > 0 || len(t.Calls) > 0 }
 
 type carriedReplay struct {
@@ -114,8 +93,6 @@ func carriedRouteDigest(route responsesChatReplayRoute) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// A carrier is client input, so its route claim is authority only if this process
-// minted the tag. Losing the key on restart fails closed, which is the old 400.
 var reasoningCarrierKey = sync.OnceValue(func() []byte {
 	key := make([]byte, sha256.Size)
 	if _, err := rand.Read(key); err != nil {
@@ -124,13 +101,6 @@ var reasoningCarrierKey = sync.OnceValue(func() []byte {
 	return key
 })
 
-// Per-process key, so a restart invalidates every tag. That costs tier pinning and
-// nothing else: routeSelectingCarriers is the only reader, and it is reached only
-// from the policy path, so the tag is inert unless policy routing is configured.
-//
-// The whole replay payload is authenticated, not just the route digest. Otherwise a
-// client can copy a valid tier tag onto rewritten calls and projection metadata, then
-// use the forged replay shape to make that tier validate without classification.
 func reasoningCarrierRouteTag(payload reasoningCarrierPayload) string {
 	key := reasoningCarrierKey()
 	if key == nil || payload.RouteDigest == "" {
@@ -151,8 +121,6 @@ func reasoningCarrierRouteTagValid(payload reasoningCarrierPayload) bool {
 	return expected != "" && hmac.Equal([]byte(expected), []byte(payload.RouteTag))
 }
 
-// A tier is authority the store used to hold, so only a carrier this process tagged
-// may pick one; an untagged carrier still restores items under a route already decided.
 func routeSelectingCarriers(carried map[string]carriedReplay) map[string]carriedReplay {
 	selecting := make(map[string]carriedReplay, len(carried))
 	for id, replay := range carried {
@@ -166,8 +134,6 @@ func routeSelectingCarriers(carried map[string]carriedReplay) map[string]carried
 	return selecting
 }
 
-// Mirrors responsesChatReplayGroup.matchesProjection: same canonical assistant text,
-// same calls, same order, and the same canonical arguments.
 func carriedProjectionDigest(content []byte, calls []responsesChatReplayProjectedCall) string {
 	argumentDigests := make([][sha256.Size]byte, len(calls))
 	for i, call := range calls {
@@ -197,7 +163,6 @@ func carriedProjectionDigestWithArguments(content []byte, calls []responsesChatR
 	return hex.EncodeToString(sum.Sum(nil)[:carriedDigestBytes])
 }
 
-// A digest is client input that keys a request-scoped map, so drop anything not ours.
 func carriedDigest(value string) string {
 	if len(value) != hex.EncodedLen(carriedDigestBytes) {
 		return ""
@@ -233,8 +198,6 @@ func carriedTurnFromPublished(route responsesChatReplayRoute, outputItems []json
 	return turn
 }
 
-// Debug, not warn: past the budget this is the steady state and fires every tool turn.
-// Counts and sizes only -- a reasoning item is Copilot ciphertext and never logged.
 func logCarrierSuppressed(emit carrierEmit, route responsesChatReplayRoute, dropped []json.RawMessage, calls, candidateBytes int) {
 	if emit.Log == nil {
 		return
@@ -258,9 +221,6 @@ func logCarrierSuppressed(emit carrierEmit, route responsesChatReplayRoute, drop
 	)
 }
 
-// The carrier is visible client state, unlike the process-local replay store. Keep only
-// the opaque reasoning fields and ordering placeholders needed to resume the turn;
-// upstream ids, arguments, content, status and future fields must not become output.
 func clientSafeCarrierItems(items []json.RawMessage) []json.RawMessage {
 	if len(items) == 0 {
 		return nil
@@ -336,8 +296,6 @@ type reasoningCarrierWirePayload struct {
 	OriginalProjectionDigest string          `json:"original_projection_digest"`
 }
 
-// Decode attacker-controlled arrays without first allocating one element per entry.
-// The byte cap bounds inflation; these count caps bound slice/map amplification.
 func decodeBoundedCarrierArray[T any](raw json.RawMessage, maximum int) ([]T, bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -415,8 +373,6 @@ func encodeReasoningCarrier(turn carriedTurn) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Do not emit a carrier our own decoder will reject. The visible transcript remains a
-	// complete recovery path; exporting provider call mappings is not an acceptable fallback.
 	if len(payload) > reasoningCarrierMaxDecodedBytes {
 		if turn.Emit != nil {
 			logCarrierSuppressed(*turn.Emit, turn.Route, turn.Items, len(turn.Calls), len(payload))
@@ -443,7 +399,6 @@ func encodeReasoningCarrier(turn carriedTurn) (string, error) {
 	return signature, nil
 }
 
-// Unusable carriers return false, not error: failing turns lost continuity into a dead conversation.
 func decodeReasoningCarrier(signature string, budget *int) (carriedReplay, bool) {
 	if !strings.HasPrefix(signature, reasoningCarrierPrefix) {
 		return carriedReplay{}, false
@@ -487,7 +442,6 @@ func decodeReasoningCarrier(signature string, budget *int) (carriedReplay, bool)
 	return replay, true
 }
 
-// `thinking` is empty on purpose: the block is transport, not content.
 func reasoningCarrierBlock(turn carriedTurn) (*models.ContentBlock, error) {
 	signature, err := encodeReasoningCarrier(turn)
 	if err != nil || signature == "" {
@@ -496,10 +450,6 @@ func reasoningCarrierBlock(turn carriedTurn) (*models.ContentBlock, error) {
 	return &models.ContentBlock{Type: "thinking", Thinking: stringPtr(""), Signature: signature}, nil
 }
 
-// Keyed by tool_use id, not message index, because clients trim history. Every
-// tool_use in a message maps to that message's carrier: one output array per turn.
-// The budget is charged newest-first, so a long transcript keeps the reasoning that will
-// actually survive the outbound trim; precedence below is still oldest-first.
 func extractCarriedReasoning(messages []models.AnthropicMessage) (carried map[string]carriedReplay, inbound carrierInbound) {
 	carried = make(map[string]carriedReplay)
 	blocksByMessage := make(map[int][]models.ContentBlock, len(messages))
@@ -516,11 +466,6 @@ func extractCarriedReasoning(messages []models.AnthropicMessage) (carried map[st
 		order = append(order, index)
 	}
 
-	// Spend the budget NEWEST-first. Charging oldest-first spent it on turns trimAgedReasoning
-	// then discards on the way out (see agedReasoningToolTurns), so a long transcript could
-	// pay its whole 8 MiB for reasoning that never left the process and send none from the
-	// retained window. Only the ORDER of spending changes here: the precedence below still
-	// runs oldest-first, so which carrier wins an id is exactly what it was.
 	decoded := make(map[int]carriedReplay, len(order))
 	budget := reasoningCarrierRequestBudget
 	for i := len(order) - 1; i >= 0; i-- {
@@ -533,10 +478,8 @@ func extractCarriedReasoning(messages []models.AnthropicMessage) (carried map[st
 			if !strings.HasPrefix(block.Signature, reasoningCarrierPrefix) {
 				continue
 			}
-			// Weighed before the budget decides, so a starved request still reports it all.
 			inbound.Carriers++
 			inbound.Bytes += len(block.Signature)
-			// Charged on the attempt, so corrupt blocks cannot each buy an inflate.
 			if spent {
 				continue
 			}
@@ -548,9 +491,6 @@ func extractCarriedReasoning(messages []models.AnthropicMessage) (carried map[st
 			if replay, ok := decodeReasoningCarrier(block.Signature, &budget); ok {
 				decoded[index] = replay
 			} else if budget <= 0 {
-				// The attempt is charged before it fails, so the carrier that EXHAUSTS
-				// the budget starves as surely as one that found none left. Checking
-				// only before an attempt misses it whenever it is the last carrier.
 				inbound.Starved = true
 			}
 		}
@@ -567,17 +507,11 @@ func extractCarriedReasoning(messages []models.AnthropicMessage) (carried map[st
 				toolUseIDs = append(toolUseIDs, block.ID)
 			}
 		}
-		// A carrier names the calls it covers, so index by its OWN mapping and not only by
-		// tool_use blocks sitting beside it. Parallel calls interleaved with their results
-		// split one logical turn across several wire messages, and the carrier can land in
-		// a message holding no tool_use at all; requiring co-location discarded it and left
-		// those ids unresolvable, which is the wedge this carrier exists to prevent.
 		for id := range replay.Calls {
 			if _, taken := carried[id]; !taken {
 				carried[id] = replay
 			}
 		}
-		// Co-located ids still win: a turn's own carrier is the most specific answer for it.
 		for _, id := range toolUseIDs {
 			carried[id] = replay
 		}
@@ -588,7 +522,6 @@ func extractCarriedReasoning(messages []models.AnthropicMessage) (carried map[st
 	return carried, inbound
 }
 
-// A mixed group hands Copilot a chain that does not match the calls beside it.
 func carriedReplayForCalls(carried map[string]carriedReplay, projected []responsesChatReplayProjectedCall) (carriedReplay, bool) {
 	if len(carried) == 0 || len(projected) == 0 {
 		return carriedReplay{}, false
@@ -618,7 +551,6 @@ func carriedReplayForCalls(carried map[string]carriedReplay, projected []respons
 	return replay, true
 }
 
-// A shape we did not mint, or that the transcript cannot rebuild, restores nothing.
 func carriedItemsWellShaped(items []json.RawMessage) bool {
 	messages := 0
 	messageWithoutLength := false
@@ -758,8 +690,6 @@ func carriedProjectionMatches(replay carriedReplay, content []byte, projected []
 	return originalOK && carriedProjectionDigestWithArguments(content, projected, original) == replay.OriginalProjectionDigest
 }
 
-// The store's binding without the store: route, projection and each call's own minted id
-// must match, and indices mirror Publish. "" means restored, else the guard that refused.
 func carriedRestoredCalls(carried map[string]carriedReplay, projected []responsesChatReplayProjectedCall, route responsesChatReplayRoute, projectionContent json.RawMessage) (responsesChatRestoredCalls, string) {
 	canonicalContent, err := canonicalReplayJSONValue(projectionContent)
 	if err != nil {
@@ -808,10 +738,7 @@ func carriedRestoredCalls(carried map[string]carriedReplay, projected []response
 			upstreamCallID = selfDescribed
 		}
 		calls[i] = responsesChatReplayResolvedCall{
-			ProxyCallID: projectedCall.ID,
-			// Self-describing public IDs recover their upstream mapping. Opaque IDs
-			// still rebuild both sides under the same proxy ID. A legacy carrier's
-			// serialized provider ID remains deliberately ignored.
+			ProxyCallID:     projectedCall.ID,
 			UpstreamCallID:  upstreamCallID,
 			Name:            call.Name,
 			OutputItemIndex: call.ItemIndex,
@@ -865,8 +792,6 @@ func carriedItemHeader(item json.RawMessage) (itemType, callID string) {
 	return strings.TrimSpace(header.Type), strings.TrimSpace(header.CallID)
 }
 
-// A reasoning item keeps only its ciphertext and id -- Copilot's own, and the one thing
-// a transcript cannot rebuild. Text and calls come from the transcript the classifier read.
 func reconstructCarriedRestore(restored responsesChatRestoredCalls, projected []responsesChatReplayProjectedCall, assistantText string) responsesChatRestoredCalls {
 	visible := make(map[string]responsesChatReplayProjectedCall, len(projected))
 	for _, call := range projected {
@@ -885,8 +810,6 @@ func reconstructCarriedRestore(restored responsesChatRestoredCalls, projected []
 		calls[i].OutputItemIndex = len(items)
 		items = append(items, calls[i].OutputItem)
 	}
-	// An ID-only restore has no carrier placeholders. Rebuild the visible text
-	// and complete ordered call projection directly from the client transcript.
 	if len(restored.OutputItems) == 0 {
 		if assistantText != "" {
 			items = appendAssistantHistoryMessage(items, assistantText)
@@ -924,8 +847,6 @@ func reconstructCarriedRestore(restored responsesChatRestoredCalls, projected []
 	return restored
 }
 
-// Legacy carriers have one flattened text slot. Prefer their message placeholder, then the
-// first call, so text that followed a call is not hoisted ahead of it.
 func carriedTextSlot(items []json.RawMessage, callByItemIndex map[int]int) int {
 	firstCall := -1
 	for index, item := range items {
@@ -939,7 +860,6 @@ func carriedTextSlot(items []json.RawMessage, callByItemIndex map[int]int) int {
 	return firstCall
 }
 
-// summary, content and every other field are plain text no policy check ever read.
 func carriedReasoningCiphertext(item json.RawMessage) json.RawMessage {
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(item, &fields) != nil || rawJSONString(fields["encrypted_content"]) == "" {
@@ -973,28 +893,7 @@ func prependCarriedReasoning(resp *models.AnthropicResponse, turn carriedTurn) *
 	return resp
 }
 
-// stripVekilCarrierBlocks removes vekil's own carrier blocks from an Anthropic request body,
-// restoring the transcript to the shape it would have had if vekil had never injected one.
-//
-// A direct Anthropic route is another provider's endpoint. The carrier holds Copilot's opaque
-// reasoning ciphertext and a route tag keyed to this process, and Anthropic validates the
-// signature on thinking blocks it issued -- so forwarding one hands a third party another
-// provider's payload and invites a rejection on a signature Anthropic never wrote. A client
-// that switches models mid-conversation carries ours along without knowing it is ours.
-//
-// Operates on the raw body rather than the parsed request so every field vekil does not model
-// survives untouched. An assistant message left with no content is dropped: it existed only to
-// carry the block, which is exactly the shape the client would have sent without us.
 func stripVekilCarrierBlocks(body []byte) ([]byte, int) {
-	// No raw-bytes prefix scan before the parse, deliberately. A `bytes.Contains`
-	// fast path here was a correctness hole, not an optimization: JSON escapes are
-	// decoded by the parse but invisible to a byte scan, so a signature written as
-	// "\u0076ekil1...." left the raw body without the literal prefix, returned the
-	// body unchanged, and forwarded vekil's own Copilot reasoning to Anthropic --
-	// the exact leak this function exists to prevent. Any cheap pre-check over
-	// unparsed bytes has the same hole, because the escape can move to any
-	// character. The parse below is the only thing that sees what the peer sees,
-	// and the caller unmarshals this body immediately afterwards regardless.
 	root, ok := decodeOrderedRawJSONObject(body)
 	if !ok {
 		return body, 0
@@ -1026,10 +925,6 @@ type orderedRawJSONMember struct {
 	value json.RawMessage
 }
 
-// decodeOrderedRawJSONObject keeps duplicate members and decoded field names.
-// encoding/json maps discard exact duplicates, while struct decoding accepts
-// case-folded and escaped aliases. The direct-forward sanitizer must see the
-// same names without losing any occurrence that an upstream parser may use.
 func decodeOrderedRawJSONObject(raw []byte) ([]orderedRawJSONMember, bool) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	start, err := decoder.Token()

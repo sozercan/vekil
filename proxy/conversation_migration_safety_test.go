@@ -247,8 +247,6 @@ func TestConversationMigrationRejectsRedirects(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(h.HandleResponses))
 				defer server.Close()
 				body := fmt.Sprintf(`{"model":"coding","previous_response_id":"redirect-seed","input":"Continue.","stream":%t}`, stream)
-				// Use a redirect-following client to prove the proxy cannot expose a
-				// Location that replays the protected turn outside its route.
 				response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(body))
 				if err != nil {
 					t.Fatal(err)
@@ -324,8 +322,6 @@ func TestConversationMigrationUsesEachTargetOnceWithSharedBudget(t *testing.T) {
 	if failed.Code < 400 || east.Load() != 2 || west.Load() != 1 || third.Load() != 1 || strings.Contains(failed.Body.String(), `"migration":"completed"`) {
 		t.Fatalf("target repeated or false completion: %d %s east=%d west=%d third=%d", failed.Code, failed.Body.String(), east.Load(), west.Load(), third.Load())
 	}
-	// All sends provably failed before execution. The original branch remains
-	// usable, and a failed switch must not redirect it or retain an uncertainty.
 	outage.Store(false)
 	response := conversationCompleted(t, conversationPOST(t, h, map[string]any{"previous_response_id": "budget-east-1", "input": "Retry after recovery."}, nil), false)
 	if rawJSONString(response["id"]) != "budget-east-3" || bytes.Contains(response["vekil"], []byte("completed")) {
@@ -455,7 +451,6 @@ func TestConversationMigrationSaveFailureAccounting(t *testing.T) {
 					}
 					sends.Add(1)
 					if boundary == "storage" {
-						// Commit the response's ownership proof, then fail its history save.
 						commits := 0
 						h.stateBindings.durable.mu.Lock()
 						h.stateBindings.durable.beforeCommit = func() error {

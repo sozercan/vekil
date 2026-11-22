@@ -24,9 +24,6 @@ func TestDurableStateFilesystemUsesDescriptor(t *testing.T) {
 	if err := checkDurableStateFilesystem(int(file.Fd())); err != nil {
 		t.Fatalf("local file filesystem = %v", err)
 	}
-	// A real unsupported descriptor, without mounting anything or requiring
-	// privileged access. The integration test below also checks each actual
-	// database descriptor, independently of its directory's filesystem.
 	unsupported := "/proc/self/stat"
 	if runtime.GOOS == "darwin" {
 		unsupported = "/dev/null"

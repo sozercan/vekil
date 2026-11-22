@@ -16,15 +16,11 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-// fakeGitHubMCP is a minimal Streamable HTTP MCP server that answers over SSE
-// and enforces the session and header contract Vekil relies on.
 type fakeGitHubMCP struct {
-	t          *testing.T
-	tools      []string
-	initStatus int
-	callResult string
-	// callStarted, when set, is closed when tools/call arrives; the call then
-	// stalls until its request is canceled.
+	t           *testing.T
+	tools       []string
+	initStatus  int
+	callResult  string
 	callStarted chan struct{}
 
 	mu       sync.Mutex
@@ -106,7 +102,6 @@ func (f *fakeGitHubMCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
-	// A notification ahead of the response must be skipped.
 	_, _ = fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n")
 	_, _ = fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}\n\n", message.ID, result)
 }

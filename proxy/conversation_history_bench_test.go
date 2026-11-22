@@ -35,8 +35,6 @@ func BenchmarkConversationHistoryAdmission(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			// Seed valid snapshots in one transaction, then run normal startup
-			// validation. Fixture construction is outside the measured hot path.
 			err = bindings.durable.db.Update(func(tx *bolt.Tx) error {
 				snapshots, index := tx.Bucket(conversationSnapshotsBucket), tx.Bucket(conversationIndexBucket)
 				var total uint64

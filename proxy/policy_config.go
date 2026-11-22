@@ -31,9 +31,6 @@ const (
 	defaultPolicyClassifierObserveSampleRate   = 1.0
 )
 
-// PolicyProfileConfig declares one public semantic-routing policy. Mode and
-// tier values intentionally remain strings here; runtime policy enums and
-// planner state belong to the policy execution module.
 type PolicyProfileConfig struct {
 	ID                  string `json:"id" yaml:"id"`
 	PublicID            string `json:"public_id" yaml:"public_id"`
@@ -58,8 +55,6 @@ type PolicyProfileConfig struct {
 	powerfulNull    bool
 }
 
-// PolicyTierConfig binds one terminal route and its optional policy-owned
-// canonical reasoning effort. Both tiers must configure effort or both omit it.
 type PolicyTierConfig struct {
 	Route           string `json:"route" yaml:"route"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
@@ -68,19 +63,16 @@ type PolicyTierConfig struct {
 	reasoningEffortNull bool
 }
 
-// PolicyClassifierConfig bounds one profile's internal classifier operation.
 type PolicyClassifierConfig struct {
-	Route               string `json:"route" yaml:"route"`
-	Profile             string `json:"profile,omitempty" yaml:"profile,omitempty"`
-	ReasoningEffort     string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
-	TimeoutMS           int    `json:"timeout_ms,omitempty" yaml:"timeout_ms,omitempty"`
-	MaxCompletionTokens int    `json:"max_completion_tokens,omitempty" yaml:"max_completion_tokens,omitempty"`
-	// MaxRequestBytes caps the serialized canonical facts payload. Each
-	// classifier protocol bounds its envelope separately.
-	MaxRequestBytes   int     `json:"max_request_bytes,omitempty" yaml:"max_request_bytes,omitempty"`
-	RecentTurns       int     `json:"recent_turns,omitempty" yaml:"recent_turns,omitempty"`
-	MaxConcurrency    int     `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty"`
-	ObserveSampleRate float64 `json:"observe_sample_rate,omitempty" yaml:"observe_sample_rate,omitempty"`
+	Route               string  `json:"route" yaml:"route"`
+	Profile             string  `json:"profile,omitempty" yaml:"profile,omitempty"`
+	ReasoningEffort     string  `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
+	TimeoutMS           int     `json:"timeout_ms,omitempty" yaml:"timeout_ms,omitempty"`
+	MaxCompletionTokens int     `json:"max_completion_tokens,omitempty" yaml:"max_completion_tokens,omitempty"`
+	MaxRequestBytes     int     `json:"max_request_bytes,omitempty" yaml:"max_request_bytes,omitempty"`
+	RecentTurns         int     `json:"recent_turns,omitempty" yaml:"recent_turns,omitempty"`
+	MaxConcurrency      int     `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty"`
+	ObserveSampleRate   float64 `json:"observe_sample_rate,omitempty" yaml:"observe_sample_rate,omitempty"`
 
 	reasoningEffortSet     bool
 	timeoutMSSet           bool
@@ -99,8 +91,6 @@ type PolicyClassifierConfig struct {
 	observeSampleRateNull   bool
 }
 
-// PolicyDataPolicyConfig records the operator acknowledgements required before
-// bounded request content may be forwarded to the classifier provider.
 type PolicyDataPolicyConfig struct {
 	ContentForwardingAcknowledged bool `json:"content_forwarding_acknowledged" yaml:"content_forwarding_acknowledged"`
 	AllowCrossTrustDomain         bool `json:"allow_cross_trust_domain,omitempty" yaml:"allow_cross_trust_domain,omitempty"`
@@ -509,8 +499,6 @@ func boolConfigValue(value *bool) bool {
 	return value != nil && *value
 }
 
-// SetRecentTurns preserves an explicit zero for programmatic schema-v2
-// configurations. JSON/YAML decoding tracks the same presence automatically.
 func (c *PolicyClassifierConfig) SetRecentTurns(value int) {
 	if c == nil {
 		return
@@ -519,8 +507,6 @@ func (c *PolicyClassifierConfig) SetRecentTurns(value int) {
 	c.recentTurnsSet = true
 }
 
-// SetObserveSampleRate preserves an explicit zero for programmatic schema-v2
-// configurations. JSON/YAML decoding tracks the same presence automatically.
 func (c *PolicyClassifierConfig) SetObserveSampleRate(value float64) {
 	if c == nil {
 		return

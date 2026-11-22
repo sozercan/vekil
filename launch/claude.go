@@ -8,27 +8,14 @@ import (
 	"strings"
 )
 
-// dottedClaudeModelIDRegex matches catalog IDs such as claude-opus-5.5 whose
-// trailing version pair Anthropic spells with a hyphen (claude-opus-5-5).
 var dottedClaudeModelIDRegex = regexp.MustCompile(`^(claude(?:-[^-]+)*)-(\d+)\.(\d+)$`)
 
-// ClaudeAutoModeClassifierModel is the model Claude Code's auto mode uses to
-// approve actions. Claude Code refuses Opus 5.5, Sonnet 5.5 and Opus 5 for
-// that role, so a pinned launch keeps Claude Code's Sonnet 5 default.
 const ClaudeAutoModeClassifierModel = "claude-sonnet-5"
 
-// ClaudeAdapter prepares Claude Code to use Vekil's Anthropic-compatible
-// surface without modifying the user's Claude settings.
 type ClaudeAdapter struct{}
 
 func (ClaudeAdapter) Name() string { return "claude" }
 
-// claudeCodeModelID returns the model ID Claude Code should send. Claude Code
-// shapes requests from Anthropic's model IDs and misreads dotted catalog IDs as
-// older models; for claude-opus-5.5 it then sends thinking.type "disabled" on
-// side queries, which the upstream rejects. The hyphenated spelling is used
-// only when the launch proxy confirms it reaches the same model, because a raw
-// model can own that spelling. Policy IDs resolve only by exact public ID.
 func claudeCodeModelID(input PrepareInput) string {
 	id := strings.TrimSpace(input.Model.ID)
 	if strings.TrimSpace(input.Model.OwnedBy) == PolicyModelOwner || input.RoutesLikeModel == nil {
@@ -73,9 +60,6 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		return PreparedProcess{}, err
 	}
 
-	// Subprocess scrubbing keeps the local proxy token out of tool
-	// subprocesses, but Claude Code then forces the default permission mode.
-	// An explicitly requested mode turns scrubbing off so the mode applies.
 	subprocessScrub := "1"
 	if claudePermissionModeRequested(input.ForwardedArgs) {
 		subprocessScrub = "0"
@@ -147,9 +131,6 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	for _, key := range envUnset {
 		settingsEnv[key] = ""
 	}
-	// Claude settings-file env entries override the process environment. Put
-	// every routing-critical override in the highest-precedence --settings
-	// source so user or project settings cannot redirect the launched session.
 	for key, value := range envSet {
 		settingsEnv[key] = value
 	}
@@ -171,10 +152,6 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		"env":                  settingsEnv,
 		"disableRemoteControl": true,
 	}
-	// Anthropic's hosted web_search tool survives only native Messages
-	// forwarding: Copilot rejects it and Chat translation carries only
-	// function tools. Hide WebSearch elsewhere instead of letting every call
-	// fail; search then comes from Vekil's web search MCP server when available.
 	nativeWebSearch := input.CopilotAbsent && (!hasModel || modelSupportsEndpoint(input.Model, "/v1/messages"))
 	if !nativeWebSearch {
 		settings["permissions"] = map[string][]string{"deny": {"WebSearch"}}
@@ -197,8 +174,6 @@ func (ClaudeAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		}
 		settingsCleanup := cleanup
 		cleanup = func() error { return errors.Join(mcpCleanup(), settingsCleanup()) }
-		// The = form keeps a variadic --mcp-config from consuming forwarded
-		// positional arguments.
 		args = append(args, "--mcp-config="+mcpPath)
 	}
 	args = append(args, input.ForwardedArgs...)
@@ -222,9 +197,6 @@ func (ClaudeAdapter) usesWebSearchMCP() bool { return true }
 
 func (ClaudeAdapter) auxiliaryModels() []string { return []string{ClaudeAutoModeClassifierModel} }
 
-// writeClaudeWebSearchMCPConfig registers the launch proxy's web search MCP
-// server, authenticated with the local proxy token, so the GitHub credential
-// stays inside Vekil.
 func writeClaudeWebSearchMCPConfig(url, localToken string) (string, func() error, error) {
 	config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{
 		"vekil": map[string]any{
@@ -307,8 +279,6 @@ func validateClaudeForwardedArgs(args []string) error {
 	return nil
 }
 
-// claudePermissionModeRequested reports whether args ask Claude Code for a
-// permission mode other than the default.
 func claudePermissionModeRequested(args []string) bool {
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
@@ -322,8 +292,6 @@ func claudePermissionModeRequested(args []string) bool {
 				return true
 			}
 		case claudeOptionRequiresValue(arg) && index+1 < len(args):
-			// Claude Code takes the next argument as this option's value even
-			// when it looks like a flag, so a prompt cannot request a mode.
 			index++
 			if arg == "--permission-mode" && claudeNonDefaultPermissionMode(args[index]) {
 				return true

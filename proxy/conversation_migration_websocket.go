@@ -12,8 +12,6 @@ func (s *responsesWebSocketSession) postConversationCreateRequest(h *ProxyHandle
 	input := [][]json.RawMessage{request.Input}
 	previousID := request.PreviousResponseID
 	if strings.HasPrefix(request.PreviousResponseID, "vekil-ws-") {
-		// generate:false staging remains connection-local and does not claim a
-		// saved generation. Its full input is available on this connection.
 		previousID = ""
 		input = plan.fullReplaySegments
 		if plan.conversationSourceID != "" {
@@ -43,8 +41,6 @@ func (s *responsesWebSocketSession) postConversationCreateRequest(h *ProxyHandle
 	}
 	headers := s.requestHeaders(request, false)
 	if plan.conversationComplete && headerGetCI(headers, "X-Vekil-History-Complete") == "" {
-		// A staged independent import keeps its assertion until generation.
-		// The request planner clears it when the client starts a new chain.
 		headers.Set("X-Vekil-History-Complete", "true")
 	}
 	operation.clientUserAgent = s.userAgent
@@ -55,7 +51,6 @@ func (s *responsesWebSocketSession) postConversationCreateRequest(h *ProxyHandle
 	if err := h.applyExplicitRequestStateBinding(operation, body, headers); err != nil {
 		return nil, err
 	}
-	// Unsupported hosted state leaves the turn unprotected without a conversation.
 	if turn := operation.conversation; turn != nil {
 		turn.bridged = true
 		turn.toolContexts, turn.toolScope = s.toolContexts, s.toolScope

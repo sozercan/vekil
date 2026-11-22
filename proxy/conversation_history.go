@@ -34,20 +34,14 @@ var (
 
 const (
 	maxConversationHistoryItems = 16384
-	conversationPendingBytes    = 32 + 32 + 40 // key, MAC, timestamp and attempt digest
+	conversationPendingBytes    = 32 + 32 + 40
 
-	// Records written before blobs carry their content inline. A distinct
-	// integrity domain keeps those older versions from reading a newer record
-	// as a snapshot with no content.
 	conversationInlineRecordDomain = "conversation-record-v1"
 	conversationRecordDomain       = "conversation-record-v2"
 	conversationBlobDomain         = "conversation-blob-v1"
 	conversationBlobKeyBytes       = 32
 )
 
-// Each immutable snapshot contains all visible history for one completed
-// response. Branches never share a mutable head or redirect an old provider ID.
-// Provider-private reasoning is deliberately absent.
 type conversationSnapshot struct {
 	ResponseID      string            `json:"response_id"`
 	RouteID         string            `json:"route_id"`
@@ -65,10 +59,6 @@ type conversationSnapshot struct {
 	Indexes         [][]byte          `json:"indexes"`
 }
 
-// conversationSnapshotRecord is a snapshot's stored form. Successive snapshots
-// of a conversation repeat nearly all of its items and its whole tool catalog,
-// so each distinct value is stored once as a blob. These fields shadow the
-// snapshot's content fields in JSON and hold the keys of its blobs, in order.
 type conversationSnapshotRecord struct {
 	conversationSnapshot
 	Input           []byte `json:"input"`
@@ -76,33 +66,22 @@ type conversationSnapshotRecord struct {
 	Tools           []byte `json:"tools,omitempty"`
 	AdditionalTools []byte `json:"additional_tools,omitempty"`
 
-	// inline marks a record written before blobs, which holds its own content.
 	inline bool
 }
 
-// encodedConversationSnapshot is a snapshot ready to store.
 type encodedConversationSnapshot struct {
-	value []byte
-	// blobs holds each distinct value the record references, by blob key.
-	blobs map[string][]byte
-	// historyBytes counts the record and every value at each reference: the
-	// size of the complete history the snapshot stands for.
+	value        []byte
+	blobs        map[string][]byte
 	historyBytes int
 }
 
 type conversationHistoryStore struct {
-	d      *durableStateBindings
-	config ConversationMigrationConfig
-	mu     sync.Mutex
-	// active maps the root of each conversation with a turn in progress to
-	// the client thread that sent it.
-	active map[string]string
-	// streaming maps the key of a response an active turn is streaming, and
-	// has not saved yet, to that turn's root.
+	d         *durableStateBindings
+	config    ConversationMigrationConfig
+	mu        sync.Mutex
+	active    map[string]string
 	streaming map[string]string
-	// The single writer rebuilds counts while validating records at startup.
-	// d.mu guards them, and updates publish only after the transaction commits.
-	counts conversationHistoryCounts
+	counts    conversationHistoryCounts
 }
 
 type conversationHistoryCounts struct {
@@ -129,7 +108,6 @@ func newConversationHistoryStore(d *durableStateBindings, config ConversationMig
 				present++
 			}
 		}
-		// A store from before blobs gains the bucket at startup.
 		create = present == 0 || tx.Bucket(conversationBlobsBucket) == nil
 		if present == 0 {
 			if tx.Bucket(conversationBlobsBucket) != nil {
@@ -260,7 +238,6 @@ func (s *conversationHistoryStore) indexKey(routeID, kind, value string) []byte 
 	return key[:]
 }
 
-// branchRoot names the conversation a client thread branches into from root.
 func (s *conversationHistoryStore) branchRoot(root, thread string) string {
 	digest := s.d.digest("conversation-branch-v1", root, thread)
 	return hex.EncodeToString(digest[:])
@@ -297,7 +274,6 @@ func (s *conversationHistoryStore) encode(key []byte, snapshot *conversationSnap
 	blobKeys := func(values ...json.RawMessage) ([]byte, error) {
 		var keys []byte
 		for _, value := range values {
-			// Marshal validates and compacts each value, as the inline form did.
 			content, err := json.Marshal(value)
 			if err != nil {
 				return nil, errConversationHistoryStorage
@@ -337,7 +313,6 @@ func (s *conversationHistoryStore) encode(key []byte, snapshot *conversationSnap
 	return encoded, nil
 }
 
-// decodeRecord authenticates a stored snapshot without reading its blobs.
 func (s *conversationHistoryStore) decodeRecord(key, value []byte) (*conversationSnapshotRecord, error) {
 	if len(key) != 32 || len(value) <= 32 {
 		return nil, errConversationHistoryStorage
@@ -373,7 +348,6 @@ func (s *conversationHistoryStore) decodeRecord(key, value []byte) (*conversatio
 	return record, nil
 }
 
-// load returns a record's complete snapshot, reading every blob it references.
 func (s *conversationHistoryStore) load(blobs *bolt.Bucket, record *conversationSnapshotRecord) (*conversationSnapshot, error) {
 	snapshot := record.conversationSnapshot
 	if record.inline {
@@ -389,12 +363,10 @@ func (s *conversationHistoryStore) load(blobs *bolt.Bucket, record *conversation
 			if content == nil || !s.blobValid(keys[offset:offset+conversationBlobKeyBytes], content) {
 				return nil, errConversationHistoryStorage
 			}
-			// bbolt values are valid only during the transaction.
 			loaded = append(loaded, bytes.Clone(content))
 		}
 		return loaded, nil
 	}
-	// decodeRecord admits at most one key for instructions and tools.
 	value := func(key []byte) (json.RawMessage, error) {
 		loaded, err := values(key)
 		if err != nil || len(loaded) == 0 {
@@ -426,9 +398,6 @@ func (s *conversationHistoryStore) decode(tx *bolt.Tx, key, value []byte) (*conv
 	return s.load(tx.Bucket(conversationBlobsBucket), record)
 }
 
-// put writes a snapshot's record and any blobs not stored yet, and returns the
-// logical bytes they add. A failed capacity check after put rolls them back
-// with the transaction.
 func (s *conversationHistoryStore) put(tx *bolt.Tx, key []byte, snapshot *conversationSnapshot, encoded *encodedConversationSnapshot) (uint64, error) {
 	blobs := tx.Bucket(conversationBlobsBucket)
 	cost := conversationSnapshotCost(snapshot, encoded.value)
@@ -444,8 +413,6 @@ func (s *conversationHistoryStore) put(tx *bolt.Tx, key []byte, snapshot *conver
 	return cost, tx.Bucket(conversationSnapshotsBucket).Put(key, encoded.value)
 }
 
-// eachBlob calls fn with the key of every blob the record references, once
-// per reference.
 func (record *conversationSnapshotRecord) eachBlob(fn func([]byte) error) error {
 	for _, keys := range [][]byte{record.Input, record.AdditionalTools, record.Instructions, record.Tools} {
 		for offset := 0; offset < len(keys); offset += conversationBlobKeyBytes {
@@ -470,12 +437,9 @@ func blobGet(blobs *bolt.Bucket, key []byte) []byte {
 }
 
 func conversationSnapshotCost(snapshot *conversationSnapshot, encoded []byte) uint64 {
-	// Account conservatively for every index, including shared/colliding keys.
-	// These are logical bytes; bbolt pages and transaction overhead are extra.
 	return uint64(len(encoded)+32) + uint64(len(snapshot.Indexes))*64
 }
 
-// conversationBlobCost counts a blob once, however many snapshots share it.
 func conversationBlobCost(content []byte) uint64 {
 	return uint64(len(content) + conversationBlobKeyBytes)
 }
@@ -529,7 +493,6 @@ func (s *conversationHistoryStore) lookupIndexes(keys [][]byte) (*conversationSn
 			if !candidate.hasIndex(key) {
 				return errConversationHistoryStorage
 			}
-			// Input order, rather than issuance time, chooses the branch.
 			chosen = candidate
 		}
 		if chosen == nil {
@@ -542,9 +505,6 @@ func (s *conversationHistoryStore) lookupIndexes(keys [][]byte) (*conversationSn
 	return snapshot, err
 }
 
-// pendingReleasedTo reports whether a pending record admits a turn that
-// continues from source. saveDelivered replaces the attempt digest with the key
-// of the snapshot it saved, so only continuations of those delivered items pass.
 func pendingReleasedTo(value, source []byte) bool {
 	return len(source) == 32 && len(value) == 72 && bytes.Equal(value[40:], source)
 }
@@ -554,28 +514,12 @@ func (s *conversationHistoryStore) acquire(root string) error {
 	return err
 }
 
-// acquireFrom admits a turn sent by the named client thread, whose history
-// continues from the snapshot keyed source, or from no snapshot when source is
-// nil. A pending record admits only a continuation of the snapshot it was
-// released to, unless trusted: the client is known to resend everything it
-// received, so a turn whose history validated cannot hide delivered work.
-// overrode reports that trust admitted the turn.
-//
-// One turn of a conversation runs at a time. While another client thread's
-// turn holds root, a trusted client's turn branches into that thread's own
-// root instead, such as a Codex side conversation or subagent forked from a
-// thread that is still working. Its validated history cannot hide delivered
-// work either, and its own snapshots carry its lineage from there. A retry
-// from the thread before its branch saves history resolves to root again, and
-// reaches the same branch, which is busy or holds that turn's pending record.
-// admitted is the root the turn holds.
 func (s *conversationHistoryStore) acquireFrom(root, thread string, source []byte, trusted bool) (admitted string, overrode bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if thread != "" {
 		branch := s.branchRoot(root, thread)
 		if _, busy := s.active[branch]; busy {
-			// The thread's own turn that branched from root is still active.
 			return "", false, errConversationHistoryBusy
 		}
 		if holder, busy := s.active[root]; busy && trusted && holder != "" && holder != thread {
@@ -594,7 +538,6 @@ func (s *conversationHistoryStore) acquireFrom(root, thread string, source []byt
 		if value == nil {
 			return nil
 		}
-		// Neither the released pointer nor trust may read past a damaged record.
 		if _, err := s.pendingCreated(key, value); err != nil {
 			return err
 		}
@@ -623,8 +566,6 @@ func (s *conversationHistoryStore) release(root string) {
 	s.mu.Unlock()
 }
 
-// markStreaming records that the active turn rooted at root streams the
-// response keyed key, until the turn is released.
 func (s *conversationHistoryStore) markStreaming(root string, key []byte) {
 	s.mu.Lock()
 	if _, ok := s.active[root]; ok {
@@ -633,9 +574,6 @@ func (s *conversationHistoryStore) markStreaming(root string, key []byte) {
 	s.mu.Unlock()
 }
 
-// turnActive reports whether a turn of the conversation rooted at root, or the
-// turn streaming the response keyed key, is still active. Its outcome, and
-// the history it saves, is not known yet.
 func (s *conversationHistoryStore) turnActive(root string, key []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -687,8 +625,6 @@ func (s *conversationHistoryStore) beginAttempt(root, operationID string) error 
 	return s.beginAttemptFrom(root, operationID, nil, false)
 }
 
-// beginAttemptFrom records a turn's attempt. A pending record that admits the
-// turn, as acquireFrom decides, is replaced; any other pending record refuses it.
 func (s *conversationHistoryStore) beginAttemptFrom(root, operationID string, source []byte, trusted bool) error {
 	return s.update(func(tx *bolt.Tx, counts *conversationHistoryCounts) error {
 		pending, snapshots := tx.Bucket(conversationPendingBucket), tx.Bucket(conversationSnapshotsBucket)
@@ -731,16 +667,10 @@ func (s *conversationHistoryStore) clearAttempt(root string) error {
 	})
 }
 
-// save stores a completed turn's snapshot and clears its conversation's
-// attempt marker in the same transaction.
 func (s *conversationHistoryStore) save(snapshot *conversationSnapshot) error {
 	return s.saveSnapshot(snapshot, false)
 }
 
-// saveDelivered stores the items an attempt delivered before the upstream ended
-// it, and keeps the attempt marker pointed at that snapshot: only a turn that
-// continues from those items clears it, never one that branches from earlier
-// history and could repeat a delivered tool call.
 func (s *conversationHistoryStore) saveDelivered(snapshot *conversationSnapshot) error {
 	return s.saveSnapshot(snapshot, true)
 }
@@ -757,8 +687,6 @@ func (s *conversationHistoryStore) saveSnapshot(snapshot *conversationSnapshot, 
 	return s.update(func(tx *bolt.Tx, counts *conversationHistoryCounts) error {
 		snapshots, index, pending := tx.Bucket(conversationSnapshotsBucket), tx.Bucket(conversationIndexBucket), tx.Bucket(conversationPendingBucket)
 		if snapshots.Get(key) != nil {
-			// Keep the pending turn and original history. An upstream ID collision
-			// does not make the shared database unusable.
 			return errConversationHistoryUncertain
 		}
 		rootKey := s.rootKey(snapshot.Root)
@@ -766,7 +694,6 @@ func (s *conversationHistoryStore) saveSnapshot(snapshot *conversationSnapshot, 
 		if existing != nil && len(existing) != 72 {
 			return errConversationHistoryStorage
 		}
-		// Copy the attempt's timestamp before later writes in this transaction.
 		var created []byte
 		if existing != nil {
 			created = append([]byte(nil), existing[32:40]...)
@@ -798,7 +725,6 @@ func (s *conversationHistoryStore) saveSnapshot(snapshot *conversationSnapshot, 
 		}
 		switch {
 		case delivered && created != nil:
-			// Keep the attempt's timestamp for pruning; its digest becomes the key.
 			value := append(created, key...)
 			mac := s.d.digest("conversation-pending-record-v1", string(rootKey), string(value))
 			if err := pending.Put(rootKey, append(mac[:], value...)); err != nil {
@@ -815,9 +741,6 @@ func (s *conversationHistoryStore) saveSnapshot(snapshot *conversationSnapshot, 
 	})
 }
 
-// PruneConversationHistory deletes selected history and unresolved attempts,
-// without changing ownership proof. Serving must be stopped. Freed database
-// pages remain reusable and are not a secure erase of conversation contents.
 func PruneConversationHistory(path string, before time.Time) (removed int, err error) {
 	if before.IsZero() || before.Unix() <= 0 || before.Nanosecond() != 0 || before.After(time.Now()) {
 		return 0, errDurableStateConfig
@@ -842,8 +765,6 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 		if err := s.validate(tx, counts); err != nil {
 			return err
 		}
-		// An unresolved attempt and its source history must be retired together.
-		// Process attempts first so newer pending roots retain all their history.
 		retiredRoots := make(map[string]bool)
 		cursor := pending.Cursor()
 		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
@@ -882,7 +803,6 @@ func PruneConversationHistory(path string, before time.Time) (removed int, err e
 				return nil
 			})
 		}
-		// Blobs live as long as any remaining snapshot references them.
 		if blobs := tx.Bucket(conversationBlobsBucket); blobs != nil {
 			cursor = blobs.Cursor()
 			for key, content := cursor.First(); key != nil; key, content = cursor.Next() {

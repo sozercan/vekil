@@ -128,8 +128,6 @@ func (u *policyTurnsUpstream) snapshot() ([]policyClassifierFacts, []string) {
 	return append([]policyClassifierFacts(nil), u.facts...), append([]string(nil), u.bodies...)
 }
 
-// Exercise the stateless Responses history that Codex sends, including the
-// extra model request after a skill read and old tool groups from both tiers.
 func TestPolicyResponsesIngressReclassifiesCompletedToolTurns(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {

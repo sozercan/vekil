@@ -60,8 +60,6 @@ func taskInferenceKindFromRequest(req *http.Request) taskInferenceKind {
 	return taskInference
 }
 
-// Task usage is an independent physical-send ledger. It includes auxiliary
-// requests and retries without changing client-request or explicit-route stats.
 type taskUsageTotals struct {
 	Sends              int64              `json:"sends"`
 	Completed          int64              `json:"completed"`
@@ -107,8 +105,6 @@ func taskUsageEndpoint(req *http.Request) string {
 	if req != nil {
 		if endpoint, ok := req.Context().Value(taskInferenceEndpointContextKey{}).(string); ok {
 			if endpoint == copilotEndpointDecisions {
-				// Decisions responses report input_tokens/output_tokens usage,
-				// which the SystemOne usage parser reads.
 				return providerEndpointSystemOne
 			}
 			return endpoint
@@ -129,8 +125,6 @@ func taskUsageEndpoint(req *http.Request) string {
 	}
 }
 
-// Begin immediately before the actual transport call, after local admission.
-// finish attaches bounded response observation after header decompression.
 func (h *ProxyHandler) beginTaskInferenceSend(req *http.Request) *taskInferenceSend {
 	if h == nil || h.stats == nil {
 		return nil
@@ -174,10 +168,7 @@ func (s *taskInferenceSend) finishResponse(resp *http.Response, sendErr error) {
 		endpoint, strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream"), nil)
 	state.observer.usageOnly = true
 	state.observer.captureCopilotUsage = true
-	// A finished generation may stop at its output limit without failing the
-	// physical send. Route attempts retain their stricter completion contract.
 	state.observer.acceptIncompleteResponses = true
-	// Chat's [DONE] sentinel does not finish a Responses send.
 	state.observer.requireResponsesTerminal = true
 	state.observer.requireMessageStop = true
 	if !state.observer.streaming && state.observer.envelope != nil {
@@ -194,14 +185,10 @@ func (s *taskInferenceSend) finishResponse(resp *http.Response, sendErr error) {
 	resp.Body = state
 }
 
-// The task ledger needs accounting and terminal events, not the semantic
-// progress used for route retries. Inspect field names without decoding ordinary
-// content/tool deltas. Escaped keys and uncertain shapes retain the full parser.
 func taskUsageStreamEventNeedsInspection(endpoint, eventType, data string) bool {
 	if taskUsageTerminalEvent(endpoint, eventType) {
 		return true
 	}
-	// Keep common small deltas off the heap.
 	var scratch [512]byte
 	payload := append(scratch[:0], data...)
 	object, ok := newRawJSONObjectScanner(payload)
@@ -271,8 +258,6 @@ func (b *taskUsageBody) Read(p []byte) (int, error) {
 	b.mu.Lock()
 	b.activeReads++
 	b.mu.Unlock()
-	// Preserve the underlying Read/Close contract. A synthetic early read
-	// error could signal cleanup completion while the transport is still open.
 	n, err := b.inner.Read(p)
 	if n > 0 {
 		b.observer.observe(p[:n])
@@ -313,8 +298,6 @@ func (b *taskUsageBody) publishObserver() {
 	o := b.observer
 	o.mu.Lock()
 	usage, haveUsage := o.usage, o.haveUsage
-	// A provider cancellation terminal completes a successful HTTP exchange.
-	// Cancellation before a terminal still indicates an interrupted send.
 	terminalCancellation := o.terminal && o.outcome == routeAttemptOutcomeCanceled
 	failed := b.failed || (!terminalCancellation && o.outcome != routeAttemptOutcomeSucceeded && o.outcome != routeAttemptOutcomeInFlight)
 	throttled := b.throttled || o.statusCode == http.StatusTooManyRequests
@@ -325,8 +308,6 @@ func (b *taskUsageBody) publishObserver() {
 		}
 	}
 	if b.nativeCount {
-		// Sizing is not inference usage. A valid count has no Messages
-		// terminal envelope and must not be classified as a failed inference.
 		usage, haveUsage = statsTokenUsage{}, false
 		var count *int64
 		raw, present := o.envelope.field("input_tokens")

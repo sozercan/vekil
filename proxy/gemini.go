@@ -16,9 +16,6 @@ import (
 
 const geminiFunctionCallIDPrefix = "gemini-fc"
 
-// geminiModelAliases maps Gemini CLI internal utility aliases and unsupported
-// Gemini utility model names to concrete Gemini model IDs that Copilot accepts
-// upstream.
 var geminiModelAliases = map[string]string{
 	"chat-compression-3-pro":             "gemini-3-pro-preview",
 	"chat-compression-3-flash":           "gemini-3-flash-preview",

@@ -126,8 +126,6 @@ func TestResponsesNativeWebSocketIncrementalTransport(t *testing.T) {
 			t.Fatalf("native continuation = %s", upstream["previous_response_id"])
 		}
 	}
-	// Local staging must preserve the actual upstream parent without uploading
-	// completed history or sending a generate:false frame to the provider.
 	delete(request, "client_metadata")
 	request["generate"] = false
 	request["previous_response_id"] = "resp-native-2"
@@ -202,7 +200,7 @@ func TestResponsesNativeWebSocketFailureDoesNotResend(t *testing.T) {
 			}
 			frames <- nativeGateFrame{len(create.Input), create.PreviousResponseID}
 			if connection == 1 && turn == 2 {
-				return // Ambiguous delivery after the next create was received.
+				return
 			}
 			_ = conn.WriteJSON(map[string]any{"type": "response.completed", "response": map[string]any{"id": fmt.Sprintf("resp-native-%d-%d", connection, turn), "output": []any{}}})
 		}
@@ -224,8 +222,6 @@ func TestResponsesNativeWebSocketFailureDoesNotResend(t *testing.T) {
 	if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "error" || frame["status_code"] != float64(http.StatusBadGateway) {
 		t.Fatalf("ambiguous native failure = %#v", frame)
 	}
-	// Vekil never resends the failed turn itself. The client's resend opens a
-	// new connection that carries the proxy's history plus the turn.
 	if err := conn.WriteJSON(request); err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +257,6 @@ func TestResponsesNativeWebSocketInvalidTerminalRetiresSession(t *testing.T) {
 						return
 					}
 					frames.Add(1)
-					// Valid JSON and terminal framing, but no resumable response ID.
 					if err := conn.WriteJSON(map[string]any{"type": terminal, "response": map[string]any{"output": []any{}}}); err != nil {
 						return
 					}
@@ -291,7 +286,6 @@ func TestResponsesNativeWebSocketInvalidTerminalRetiresSession(t *testing.T) {
 			if connections.Load() != 1 || frames.Load() != 1 || h.stats.taskUsage.snapshot().Totals.Sends != 1 {
 				t.Fatalf("invalid terminal resent the turn: connections=%d frames=%d task=%+v", connections.Load(), frames.Load(), h.stats.taskUsage.snapshot())
 			}
-			// The client's next turn uses a new connection, not the retired one.
 			if err := conn.WriteJSON(request); err != nil {
 				t.Fatal(err)
 			}
@@ -498,7 +492,6 @@ func TestResponsesNativeWebSocketCredentialBinding(t *testing.T) {
 			t.Fatalf("service-token refresh changed session identity: status=%d body=%s error=%v", resp.StatusCode, body, readErr)
 		}
 	}
-	// A continuation from another account cannot use this connection's state.
 	resp, handled, err := h.maybeSendNativeResponses(newRequest("other-service-token", "source-two", true))
 	if err != nil || !handled || resp == nil {
 		t.Fatalf("changed-source rejection = %v/%v/%v", resp, handled, err)
@@ -513,7 +506,6 @@ func TestResponsesNativeWebSocketCredentialBinding(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("credential change did not close the old upstream session")
 	}
-	// A full-history turn on the retired connection uses HTTP instead.
 	if _, handled, err := h.maybeSendNativeResponses(newRequest("service-token-one", "source-one", false)); handled || err != nil {
 		t.Fatalf("retired connection handled a full turn: handled=%v err=%v", handled, err)
 	}
@@ -568,7 +560,6 @@ func TestResponsesNativeWebSocketOversizedTurnsUseHTTP(t *testing.T) {
 			readTimeout := 2 * time.Second
 			if tc.largeText {
 				text = strings.Repeat("x", maxRequestBodySize/2)
-				// Allow both 5 MiB input passes under race instrumentation.
 				readTimeout = 15 * time.Second
 			}
 			request := newResponsesWebSocketCreateRequest(inputItems(tc.inputCount, text))
@@ -686,7 +677,6 @@ func TestResponsesNativeWebSocketModelChangeOpensNewConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = mustReadWebSocketJSONSkipMetadata(t, conn)
-	// Continuations cannot change the model; a new conversation can.
 	request["model"] = "different-model"
 	request["input"] = []any{map[string]string{"role": "user", "content": "second"}}
 	if err := conn.WriteJSON(request); err != nil {
@@ -695,7 +685,6 @@ func TestResponsesNativeWebSocketModelChangeOpensNewConnection(t *testing.T) {
 	if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "response.completed" {
 		t.Fatalf("model switch = %#v", frame)
 	}
-	// The new model gets its own connection instead of reusing the old one.
 	if first, second := <-frames, <-frames; first != (nativeGateFrame{inputItems: 1}) || second != (nativeGateFrame{inputItems: 1}) || connections.Load() != 2 {
 		t.Fatalf("model switch frames = %+v then %+v on %d connections", first, second, connections.Load())
 	}
@@ -805,9 +794,6 @@ func TestResponsesNativeWebSocketFirstFrameFailureDoesNotFailover(t *testing.T) 
 			defer func() { _ = conn.Close() }()
 			request := newResponsesWebSocketCreateRequest(nil)
 			request["model"] = "public-model"
-			// Each client request sends exactly one native frame to the primary: a
-			// failure neither fails over nor resends, and the next request opens a
-			// new connection.
 			for turn := 1; turn <= 2; turn++ {
 				if err := conn.WriteJSON(request); err != nil {
 					t.Fatal(err)
@@ -849,8 +835,6 @@ func TestResponsesNativeWebSocketUnsupportedDialUsesHTTP(t *testing.T) {
 	if err := conn.WriteJSON(request); err != nil {
 		t.Fatal(err)
 	}
-	// A transport without explicit dial settings cannot open a native
-	// connection, so the full-history turn uses HTTP.
 	if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "response.completed" || sends.Load() != 1 {
 		t.Fatalf("unsupported native transport = %#v sends=%d", frame, sends.Load())
 	}
@@ -876,7 +860,6 @@ func TestResponsesNativeWebSocketCanceledClosesWithUsage(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		// Keep the server open so only the proxy can retire the connection.
 		_, _, _ = conn.ReadMessage()
 	})
 	h.stats = newStatsCollector()
@@ -906,9 +889,6 @@ func TestResponsesNativeWebSocketCanceledClosesWithUsage(t *testing.T) {
 	}
 }
 
-// advertiseNativeWebSocketForTest records catalogs in which the upstream models
-// used by these tests advertise ws:/responses: the legacy "copilot" provider's
-// gpt-5.4 and the explicit-route "primary" provider's deployment-a.
 func advertiseNativeWebSocketForTest(h *ProxyHandler) {
 	for providerID, model := range map[string]string{"copilot": "gpt-5.4", "primary": "deployment-a"} {
 		h.copilotNativeWS.record(providerID, []providerModel{nativeWebSocketTestModel(model, true)}, true)

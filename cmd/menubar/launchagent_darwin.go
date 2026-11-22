@@ -10,8 +10,7 @@ import (
 
 const (
 	launchAgentLabel = "com.vekil.menubar"
-	// Keep this in sync with APP_BUNDLE_ID in the Makefile.
-	appBundleID = launchAgentLabel
+	appBundleID      = launchAgentLabel
 )
 
 const plistHeader = `<?xml version="1.0" encoding="UTF-8"?>
@@ -56,8 +55,6 @@ func launchAgentProgramArguments(executable string) []string {
 	}
 
 	if isAppBundleExecutable(executable) {
-		// Launch the bundle via Launch Services so login items do not pin a
-		// transient App Translocation path or bypass app-bundle semantics.
 		return []string{"/usr/bin/open", "-b", appBundleID}
 	}
 

@@ -8,10 +8,6 @@ import (
 	"time"
 )
 
-// optimizerProcessWaitDelay is a final safety bound for os/exec pipe-copy
-// goroutines. Process-tree cancellation should normally close inherited
-// descriptors immediately; this delay prevents an unexpected descriptor holder
-// from extending an optimizer invocation indefinitely.
 const optimizerProcessWaitDelay = 100 * time.Millisecond
 
 type optimizerProcessController interface {
@@ -20,11 +16,6 @@ type optimizerProcessController interface {
 	close() error
 }
 
-// runOptimizerCommand centralizes the Start/Wait lifecycle for external tool
-// optimizers. Platform controllers contain the entire child process tree, the
-// context cancellation hook terminates that tree, WaitDelay bounds inherited
-// pipe cleanup, and the post-Wait context check rejects results completed after
-// the caller's deadline.
 func runOptimizerCommand(ctx context.Context, cmd *exec.Cmd) (returnErr error) {
 	if cmd == nil {
 		return fmt.Errorf("optimizer command is nil")

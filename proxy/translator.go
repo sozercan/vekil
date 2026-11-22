@@ -15,14 +15,10 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// dateModelRegex strips dated suffixes like -20251001 from model names.
 var dateModelRegex = regexp.MustCompile(`-\d{8}$`)
 
-// claudeNumericVersionRegex matches a trailing Claude numeric version pair while
-// leaving all preceding model-family hyphens untouched.
 var claudeNumericVersionRegex = regexp.MustCompile(`^(claude(?:-[^-]+)*)-(\d+)-(\d+)$`)
 
-// modelAliases maps Anthropic model names to Copilot-compatible names.
 var modelAliases = map[string]string{
 	"claude-haiku-4-5":  "claude-haiku-4.5",
 	"claude-sonnet-4-5": "claude-sonnet-4.5",
@@ -31,21 +27,14 @@ var modelAliases = map[string]string{
 	"claude-opus-4-6":   "claude-opus-4.6",
 }
 
-// NormalizeModelName converts Anthropic model names to Copilot-compatible names.
 func NormalizeModelName(model string) string {
-	// Strip dated suffix (e.g., claude-sonnet-4-20250514 → claude-sonnet-4)
 	normalized := dateModelRegex.ReplaceAllString(model, "")
-	// Check aliases (e.g., claude-haiku-4-5 → claude-haiku-4.5)
 	if alias, ok := modelAliases[normalized]; ok {
 		return alias
 	}
-	// Convert any remaining trailing Claude numeric version pair while preserving
-	// non-version hyphens (e.g., claude-super-long-opus-4-8 →
-	// claude-super-long-opus-4.8). Existing dotted versions do not match.
 	return claudeNumericVersionRegex.ReplaceAllString(normalized, `${1}-${2}.${3}`)
 }
 
-// TranslateAnthropicToOpenAI converts an Anthropic Messages API request to OpenAI Chat Completions format.
 func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIRequest, error) {
 	oaiReq := &models.OpenAIRequest{
 		Model:       NormalizeModelName(req.Model),
@@ -53,7 +42,6 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 		TopP:        req.TopP,
 	}
 
-	// System message
 	if len(req.System) > 0 {
 		sysMsg, err := parseSystemMessage(req.System)
 		if err != nil {
@@ -72,7 +60,6 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 		oaiReq.Messages = append(oaiReq.Messages, message.value)
 	}
 
-	// Tools
 	for _, t := range req.Tools {
 		oaiReq.Tools = append(oaiReq.Tools, models.OpenAITool{
 			Type: "function",
@@ -84,7 +71,6 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 		})
 	}
 
-	// Tool choice
 	if req.ToolChoice != nil {
 		tc, err := translateToolChoice(req.ToolChoice)
 		if err != nil {
@@ -93,7 +79,6 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 		oaiReq.ToolChoice = tc
 	}
 
-	// Parallel tool calls
 	if len(oaiReq.Tools) > 0 && (req.ToolChoice == nil || !strings.EqualFold(strings.TrimSpace(req.ToolChoice.Type), "none")) {
 		parallelToolCalls := true
 		if req.ToolChoice != nil && req.ToolChoice.DisableParallelToolUse != nil && *req.ToolChoice.DisableParallelToolUse {
@@ -102,34 +87,24 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 		oaiReq.ParallelToolCalls = &parallelToolCalls
 	}
 
-	// Claude's nonblank output effort is the Anthropic equivalent of Chat's
-	// reasoning_effort. Preserve it on canonical Chat for direct-route validation;
-	// a mapped policy may later replace it with the selected tier effort.
 	if req.OutputConfig != nil {
 		oaiReq.ReasoningEffort = strings.TrimSpace(req.OutputConfig.Effort)
 	}
 
-	// MaxTokens
 	oaiReq.MaxTokens = req.MaxTokens
 
-	// Anthropic max_tokens is the hard per-response limit, including current-turn
-	// thinking. An interleaved thinking budget may exceed it because that budget
-	// is cumulative across thinking blocks, not because one response may exceed
-	// the caller's max_tokens ceiling.
 	if req.Thinking != nil && req.Thinking.Type == "enabled" && req.MaxTokens != nil {
 		tokens := *req.MaxTokens
 		oaiReq.MaxCompletionTokens = &tokens
 		oaiReq.MaxTokens = nil
 	}
 
-	// Stream
 	if req.Stream {
 		b := true
 		oaiReq.Stream = &b
 		oaiReq.StreamOptions = &models.StreamOptions{IncludeUsage: true}
 	}
 
-	// Stop sequences
 	if len(req.StopSequences) > 0 {
 		stop, err := json.Marshal(req.StopSequences)
 		if err != nil {
@@ -148,7 +123,7 @@ func validateAnthropicOutputConfigEffort(body []byte) error {
 
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(body, &root); err != nil {
-		return nil // The handler reports malformed request JSON before this validation.
+		return nil
 	}
 	rawOutputConfig, ok := root["output_config"]
 	if !ok || bytes.Equal(bytes.TrimSpace(rawOutputConfig), []byte("null")) {
@@ -156,7 +131,7 @@ func validateAnthropicOutputConfigEffort(body []byte) error {
 	}
 	var outputConfig map[string]json.RawMessage
 	if err := json.Unmarshal(rawOutputConfig, &outputConfig); err != nil {
-		return nil // The typed Anthropic decode reports invalid output_config shapes.
+		return nil
 	}
 	rawEffort, ok := outputConfig["effort"]
 	if !ok {
@@ -277,7 +252,6 @@ func shouldMergeSplitAnthropicReplayAssistantTurn(previous, current models.OpenA
 }
 
 func parseSystemMessage(raw json.RawMessage) (*models.OpenAIMessage, error) {
-	// Try string first
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
 		if s == "" {
@@ -287,14 +261,11 @@ func parseSystemMessage(raw json.RawMessage) (*models.OpenAIMessage, error) {
 		return &models.OpenAIMessage{Role: "system", Content: content}, nil
 	}
 
-	// Try array of content blocks
 	var blocks []models.ContentBlock
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return nil, fmt.Errorf("system is neither string nor []ContentBlock: %w", err)
 	}
 
-	// Flattening distinct blocks into Chat's one string welds a heading onto the
-	// previous sentence unless a separator goes between them.
 	var sb strings.Builder
 	for _, b := range blocks {
 		switch b.Type {
@@ -344,9 +315,6 @@ type anthropicCacheBoundary struct {
 	value json.RawMessage
 }
 
-// Image attachments must follow the whole available result run, including runs
-// split over source messages. Completeness remains the selected route's contract:
-// Responses replay can legitimately continue with a nonempty partial result set.
 func projectAnthropicChatMessages(messages []models.AnthropicMessage, preserveCacheControl bool) ([]anthropicChatMessage, error) {
 	var out, pending []anthropicChatMessage
 	var boundaries []anthropicCacheBoundary
@@ -432,9 +400,6 @@ func projectAnthropicChatMessages(messages []models.AnthropicMessage, preserveCa
 	return out, nil
 }
 
-// A legal cut contains all fragments of its source prefix and none from a later
-// source block. Source-ordered cuts permit a linear prefix/suffix sweep even when
-// a request has many hints or deferred attachments.
 func applyAnthropicCacheBoundaries(messages []anthropicChatMessage, boundaries []anthropicCacheBoundary) error {
 	if len(boundaries) == 0 {
 		return nil
@@ -473,8 +438,6 @@ func applyAnthropicCacheBoundaries(messages []anthropicChatMessage, boundaries [
 	return nil
 }
 
-// sameCompactJSON compares two JSON values ignoring insignificant whitespace, so equal hints
-// written with different spacing land on one boundary without conflicting.
 func sameCompactJSON(left, right json.RawMessage) bool {
 	var compactLeft, compactRight bytes.Buffer
 	if json.Compact(&compactLeft, left) != nil || json.Compact(&compactRight, right) != nil {
@@ -664,16 +627,12 @@ func extractToolResultContent(raw json.RawMessage, result int) (string, []models
 			if err != nil {
 				return "", nil, err
 			}
-			// URL sources were checked above. Base64 data is checked without holding its
-			// decoded copy, since every projection of a long history revisits each image.
 			if block.Source.Type == "base64" && !validBase64ImageData(block.Source.Data) {
 				return "", nil, fmt.Errorf("tool_result image requires an HTTP(S) URL or valid base64 image data")
 			}
 			imageIndex++
 			label := fmt.Sprintf("Tool result %d image %d", result, imageIndex)
 			fmt.Fprintf(&output, "[%s]", label)
-			// Only fixed provenance enters user-role content; arbitrary tool text
-			// and client-chosen IDs retain the tool role and its optimizer semantics.
 			preamble := label + " (tool results numbered in conversation order; attachment from tool output):"
 			images = append(images, models.OpenAIContentPart{Type: "text", Text: &preamble}, *part)
 		default:
@@ -683,11 +642,7 @@ func extractToolResultContent(raw json.RawMessage, result int) (string, []models
 	return output.String(), images, nil
 }
 
-// validBase64ImageData reports whether data is standard padded base64, as
-// base64.StdEncoding.DecodeString would, while streaming the decode into io.Discard.
 func validBase64ImageData(data string) bool {
-	// NewDecoder can resume decoding after padding at a read boundary.
-	// Only padding and CR/LF may follow the first '='.
 	if padding := strings.IndexByte(data, '='); padding >= 0 && strings.Trim(data[padding:], "=\r\n") != "" {
 		return false
 	}
@@ -695,8 +650,6 @@ func validBase64ImageData(data string) bool {
 	return err == nil
 }
 
-// validToolResultImageMediaType accepts a bare, lowercased image/<subtype> media type. A
-// parameter, whitespace or an empty subtype would turn the data URL built from it malformed.
 func validToolResultImageMediaType(mediaType string) bool {
 	subtype, ok := strings.CutPrefix(mediaType, "image/")
 	if !ok || subtype == "" {
@@ -771,9 +724,6 @@ type anthropicChatCacheEdit struct {
 	replacement []models.OpenAIMessage
 }
 
-// anthropicChatCachePlan is the part of the cache mapping that depends on the Anthropic
-// request alone. It is built once per request: retries and protocol-recovery sends reuse it
-// instead of re-projecting the whole history, images included, for every physical send.
 type anthropicChatCachePlan struct {
 	canonical []models.OpenAIMessage
 	edits     []anthropicChatCacheEdit
@@ -840,8 +790,6 @@ func buildAnthropicChatCachePlan(req *models.AnthropicRequest) (anthropicChatCac
 	return plan, nil
 }
 
-// Provider-specific cache fields are mapped only after native Chat
-// is selected, preserving strict Responses validation and provider portability.
 func applyAnthropicChatCacheControl(ctx context.Context, provider *providerRuntime, path string, body []byte) ([]byte, error) {
 	if provider == nil || provider.kind != providerTypeCopilot || path != providerEndpointChatCompletions {
 		return body, nil
@@ -875,8 +823,6 @@ func applyAnthropicChatCacheControl(ctx context.Context, provider *providerRunti
 		next := 0
 		for _, edit := range edits {
 			out = append(out, messages[next:edit.index]...)
-			// validateAnthropicCacheProjectionBody has already matched every message's
-			// identity and non-tool content against the canonical projection.
 			var current map[string]json.RawMessage
 			if json.Unmarshal(messages[edit.index], &current) != nil {
 				return nil, fmt.Errorf("native Chat metadata cannot be mapped after message identity changes")
@@ -926,8 +872,6 @@ func applyAnthropicChatCacheControl(ctx context.Context, provider *providerRunti
 func validateAnthropicCacheProjectionBody(messages []json.RawMessage, canonical []models.OpenAIMessage) error {
 	for index, raw := range messages {
 		var current map[string]json.RawMessage
-		// jsonRawString trims, so trim the canonical side too: identity whitespace the
-		// translation forwarded verbatim must not read as a changed message.
 		if json.Unmarshal(raw, &current) != nil || jsonRawString(current["role"]) != strings.TrimSpace(canonical[index].Role) || jsonRawString(current["tool_call_id"]) != strings.TrimSpace(canonical[index].ToolCallID) {
 			return fmt.Errorf("native Chat metadata cannot be mapped after message identity changes")
 		}
@@ -1035,10 +979,6 @@ func nativeChatSystemCacheMessages(raw json.RawMessage) ([]models.OpenAIMessage,
 	return out, nil
 }
 
-// validateNativeChatCacheBlocks checks one message's cache_control placement and reports
-// whether the message may be split at its hints. It also lifts a tool_result's hint from its
-// final nested block onto the tool_result block itself, mutating blocks; callers collecting
-// boundaries read the lifted hints.
 func validateNativeChatCacheBlocks(blocks []models.ContentBlock) (bool, error) {
 	canSplit := true
 	firstPrimary, lastPrimary, firstResult, lastResult := -1, -1, -1, -1
@@ -1089,8 +1029,6 @@ func validateNativeChatCacheBlocks(blocks []models.ContentBlock) (bool, error) {
 			if block.Type != "tool_result" && i != lastPrimary {
 				return false, fmt.Errorf("cache_control cannot split a message containing tool calls or results")
 			}
-			// A source cache boundary cannot cross content already reordered by
-			// the existing call-before-result and result-before-user projection.
 			reordered := false
 			if block.Type == "tool_result" {
 				reordered = hasToolCalls && lastPrimary > i || !hasToolCalls && firstPrimary >= 0 && firstPrimary < i
@@ -1125,7 +1063,6 @@ func translateToolChoice(tc *models.AnthropicToolChoice) (json.RawMessage, error
 	}
 }
 
-// MapStopReason maps an OpenAI finish reason to an Anthropic stop reason.
 func MapStopReason(finishReason *string) string {
 	if finishReason == nil || *finishReason == "" {
 		return "end_turn"
@@ -1163,7 +1100,6 @@ func openAIUsageToAnthropicUsage(usage *models.OpenAIUsage) models.AnthropicUsag
 	}
 }
 
-// TranslateOpenAIToAnthropic translates an OpenAI Chat Completions response to Anthropic Messages format.
 func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *models.AnthropicResponse {
 	id := resp.ID
 	if id == "" {
@@ -1177,8 +1113,6 @@ func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *mode
 		choice := resp.Choices[0]
 		msg := choice.Message
 
-		// Try to extract text content (skip empty/whitespace — Anthropic
-		// rejects text blocks that contain no non-whitespace characters).
 		if len(msg.Content) > 0 {
 			var text string
 			if err := json.Unmarshal(msg.Content, &text); err == nil && strings.TrimSpace(text) != "" {
@@ -1195,7 +1129,6 @@ func TranslateOpenAIToAnthropic(resp *models.OpenAIResponse, model string) *mode
 			}
 		}
 
-		// Add tool_use blocks
 		for _, tc := range msg.ToolCalls {
 			input := json.RawMessage(tc.Function.Arguments)
 			if !json.Valid(input) {

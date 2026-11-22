@@ -34,7 +34,6 @@ const (
 )
 
 func main() {
-	// Dispatch subcommands before falling through to the default server mode.
 	switch commandFromArgs(os.Args) {
 	case cliCommandLogin:
 		runLogin(os.Args[2:])
@@ -656,9 +655,6 @@ func stopServeServer(srv serveLifecycleServer, log *logger.Logger) error {
 	defer cancel()
 
 	err := srv.Stop(ctx)
-	// Keep the startup gate closed until Stop has begun the server's shutdown
-	// admission transition. Clearing it before Stop briefly reopens inference
-	// routes that were intentionally gated while authentication was pending.
 	if gate, ok := srv.(startupAuthenticationGate); ok {
 		gate.SetStartupAuthenticationPending(false)
 	}
@@ -698,7 +694,6 @@ func runServe() {
 		log.Fatal("failed to initialize authenticator", logger.Err(err))
 	}
 	if logWriter != nil {
-		// Error level keeps this actionable prompt visible at every log level.
 		authenticator.DeviceCodePrompt = func(verificationURI, userCode string) {
 			log.Error("GitHub sign-in required: visit the URL and enter the code, or run `vekil login` and restart",
 				logger.F("url", verificationURI), logger.F("code", userCode))
@@ -715,7 +710,6 @@ func runServe() {
 		log,
 		*serve.host,
 		*serve.port,
-		// Read after prepareServeFiles so --env-file overrides the inherited value.
 		server.WithInboundAuthToken(os.Getenv("INBOUND_AUTH_TOKEN")),
 		server.WithStreamingUpstreamTimeout(*serve.streamingUpstreamTimeout),
 		server.WithCopilotHeaderConfig(serve.copilotHeaderConfig()),

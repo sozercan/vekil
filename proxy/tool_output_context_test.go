@@ -12,8 +12,6 @@ func TestToolExecutionContextStoreEvictsByInsertionUpdateOrder(t *testing.T) {
 	store.Put("scope", ToolExecutionContext{CallID: "call-1", ToolName: "shell", OriginalCommand: "one", CreatedAt: createdAt})
 	store.Put("scope", ToolExecutionContext{CallID: "call-2", ToolName: "shell", OriginalCommand: "two", CreatedAt: createdAt.Add(time.Second)})
 
-	// Updating call-1 should make it the newest entry even though its CreatedAt is
-	// still older than call-2. This keeps eviction O(1) by using store order.
 	store.Put("scope", ToolExecutionContext{CallID: "call-1", ToolName: "shell", OriginalCommand: "one updated", CreatedAt: createdAt})
 	store.Put("scope", ToolExecutionContext{CallID: "call-3", ToolName: "shell", OriginalCommand: "three", CreatedAt: createdAt.Add(2 * time.Second)})
 

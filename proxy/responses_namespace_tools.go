@@ -11,9 +11,6 @@ import (
 	"strings"
 )
 
-// Keep this capability rule narrow: endpoint support alone does not imply
-// namespace or hosted-tool support. OpenAI and other Copilot models retain
-// their native request contract.
 func needsCopilotFlatTools(provider *providerRuntime, path string, body []byte) bool {
 	return provider != nil && provider.kind == providerTypeCopilot && path == providerEndpointResponses && strings.HasPrefix(extractRequestModel(body), "grok-")
 }
@@ -29,9 +26,6 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 	if err := json.Unmarshal(body, &root); err != nil {
 		return nil, nil, err
 	}
-	// Use the path-free scan: the config-diagnostics variant builds a path at
-	// every nesting level, which costs quadratic memory on client-supplied
-	// schemas that are deep but small.
 	if err := validateUnambiguousResponsesJSON(body); err != nil {
 		return nil, nil, fmt.Errorf("invalid ambiguous JSON request: %w", err)
 	}
@@ -44,10 +38,6 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 		tr.tools[alias] = d
 		return alias, nil
 	}
-	// The policy parser budgets each catalog independently, and flattening
-	// copies a namespace description into every child. Share one budget
-	// across all catalogs so many small additional_tools items cannot
-	// amplify a request into an arbitrarily large upstream body.
 	translatedCatalogBytes := 0
 	flatten := func(raw json.RawMessage) (json.RawMessage, error) {
 		normalized, optionals := normalizeNativeResponsesToolOptionals(raw)
@@ -70,8 +60,6 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 			}
 			item := map[string]any{"type": "function", "name": alias, "description": tool.description}
 			if opt.descriptionNull && tool.description == "" {
-				// Keep a null description as written unless a namespace
-				// description was folded into this flattened tool.
 				item["description"] = nil
 			}
 			switch {
@@ -117,7 +105,6 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 			}
 			switch rawJSONString(item["type"]) {
 			case "additional_tools":
-				// Responses Lite catalogs are request-scoped; preserve their position.
 				value, err := flatten(item["tools"])
 				if err != nil {
 					return nil, nil, err
@@ -132,8 +119,6 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 				item["name"], _ = json.Marshal(alias)
 				delete(item, "namespace")
 			case "reasoning":
-				// Codex replays reasoning with "content": null, which Copilot
-				// Grok rejects with a bare 400. Omitting it is equivalent.
 				if !bytes.Equal(bytes.TrimSpace(item["content"]), []byte("null")) {
 					continue
 				}
@@ -183,9 +168,6 @@ func translateCopilotNamespaceTools(body []byte) ([]byte, *responsesNamespaceTra
 	return out, tr, err
 }
 
-// nativeResponsesToolOptionals records optional native Responses function
-// fields that the shared policy parser does not accept as written, so the
-// flattened catalog can forward them exactly as the client sent them.
 type nativeResponsesToolOptionals struct {
 	parametersOmitted bool
 	parametersNull    bool
@@ -193,12 +175,6 @@ type nativeResponsesToolOptionals struct {
 	descriptionNull   bool
 }
 
-// normalizeNativeResponsesToolOptionals adapts native Responses function tools
-// (top-level or namespace children) for parsePolicyResponsesTools without
-// relaxing that parser's contract: omitted or null parameters parse as an
-// empty schema, and a null strict or description parses as unset. It returns one entry per
-// function tool in parser order, or nil when raw is not a well-formed catalog,
-// leaving the parser to report the error.
 func normalizeNativeResponsesToolOptionals(raw json.RawMessage) (json.RawMessage, []nativeResponsesToolOptionals) {
 	var tools []map[string]json.RawMessage
 	if json.Unmarshal(raw, &tools) != nil || tools == nil {
@@ -253,11 +229,7 @@ func normalizeNativeResponsesToolOptionals(raw json.RawMessage) (json.RawMessage
 	return out, optionals
 }
 
-// Rewrite only protocol-owned call fields. Tool arguments, output strings,
-// schemas and vendor data must never be searched recursively for aliases.
 func (tr *responsesNamespaceTranslation) restore(data []byte, eventName string) ([]byte, bool) {
-	// Preserve ambiguous bytes for the downstream durable state validator.
-	// Decoding into maps would collapse duplicate keys before it sees them.
 	if validateUnambiguousResponsesJSON(data) != nil {
 		return data, false
 	}
@@ -284,7 +256,6 @@ func (tr *responsesNamespaceTranslation) restore(data []byte, eventName string) 
 		}
 		restoreName(item)
 	}
-	// Echoed choices must reference the restored catalog, not upstream aliases.
 	toolChoice := func(obj map[string]json.RawMessage) {
 		raw := obj["tool_choice"]
 		if len(raw) == 0 || !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
@@ -337,7 +308,6 @@ func (tr *responsesNamespaceTranslation) restore(data []byte, eventName string) 
 	}
 	typ := rawJSONString(root["type"])
 	if typ == "" {
-		// SSE framing may carry the event type only in the event: field.
 		typ = eventName
 	}
 	if typ == "response.output_item.added" || typ == "response.output_item.done" {
@@ -357,8 +327,6 @@ func (tr *responsesNamespaceTranslation) restore(data []byte, eventName string) 
 			}
 		}
 	} else if typ == "response.function_call_arguments.done" {
-		// The dispatched type may come from the SSE event name, so do not
-		// require the payload's own type field here.
 		restoreName(root)
 	} else if typ == "" || typ == "response" {
 		response(root)
@@ -379,8 +347,6 @@ func restoreCopilotNamespaceResponse(req *http.Request, resp *http.Response) {
 		return
 	}
 	if isEventStreamContentType(resp.Header.Get("Content-Type")) {
-		// Fail closed: an unrewritten event would expose aliases the client
-		// cannot map back to its declared tools.
 		wrapResponsesSSEBodyFailClosed(resp, func(raw []byte) ([]byte, bool) { return rewriteResponsesSSEEventData(raw, tr.restore) })
 	} else {
 		resp.Body = &responsesNamespaceJSONBody{ReadCloser: resp.Body, tr: tr}

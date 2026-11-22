@@ -688,8 +688,6 @@ func TestServerBlocksNonHealthRoutesWhileProviderValidationPending(t *testing.T)
 	}
 }
 
-// copilotChatProxyOptionWithModelDiscovery keeps a static Chat route while
-// intentionally exercising the upstream /models lifecycle in server tests.
 func copilotChatProxyOptionWithModelDiscovery(baseURL string) proxy.Option {
 	return proxy.WithProvidersConfig(proxy.ProvidersConfig{Providers: []proxy.ProviderConfig{{
 		ID:             "test-provider",
@@ -862,7 +860,6 @@ func TestRequestLogIncludesSummaryUsageAndUpstreamRequestID(t *testing.T) {
 	}
 }
 
-// A non-2xx must name why: type, code, param and message on the one line.
 func TestRequestLogAtWarnLevelIncludesErrorDetailOnNonSuccess(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("upstream called at %q; the request must be rejected locally", r.URL.Path)
@@ -881,8 +878,6 @@ func TestRequestLogAtWarnLevelIncludesErrorDetailOnNonSuccess(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	// A replay ID on a route that has no /responses endpoint: an invalid request
-	// carrying all four of type, code, param and message.
 	body := `{"model":"gpt-5","messages":[{"role":"assistant","tool_calls":[{"id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_vekil_AAAAAAAAAAAAAAAAAAAAAA","content":"ok"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -914,7 +909,6 @@ func TestRequestLogAtWarnLevelIncludesErrorDetailOnNonSuccess(t *testing.T) {
 	}
 }
 
-// End to end: a relayed upstream error must not put its prose on this line.
 func TestRequestLogWithholdsUpstreamAuthoredErrorMessage(t *testing.T) {
 	const secret = "SSN 123-45-6789 from the user prompt"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -960,8 +954,6 @@ func TestRequestLogWithholdsUpstreamAuthoredErrorMessage(t *testing.T) {
 	}
 }
 
-// A stream truncated after its 200 was committed is still a failure: the wire
-// status stays 200, so only the summary knows the turn did not survive.
 func TestRequestLogWarnsOnPostCommitStreamFailure(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -997,14 +989,11 @@ func TestRequestLogWarnsOnPostCommitStreamFailure(t *testing.T) {
 	if got, ok := entry["status"].(float64); !ok || got != 200 {
 		t.Fatalf("log[status] = %#v, want the committed 200 in %#v", entry["status"], entry)
 	}
-	// The warn is only actionable with the recorded status that explains it; asserting the
-	// level alone would still pass if stats_status silently stopped being emitted.
 	if got, ok := entry["stats_status"].(float64); !ok || got == 200 {
 		t.Fatalf("log[stats_status] = %#v, want the diverging recorded status in %#v", entry["stats_status"], entry)
 	}
 }
 
-// The auth gate rejects before any handler runs; it still has to be logged.
 func TestRequestLogWarnsOnInboundAuthRejection(t *testing.T) {
 	var logs bytes.Buffer
 	srv, err := New(
@@ -1054,14 +1043,6 @@ func requestLogEntryForPath(t *testing.T, logs string, wantMsg, wantPath string)
 	return nil
 }
 
-// TestStreamingChatCompletionsPassthroughThroughServer drives a streaming
-// POST /v1/chat/completions request through the full server stack (so
-// withRequestLog attaches a RequestSummary and the usage callback is non-nil)
-// with tool optimizers disabled. This exercises StreamOpenAIPassthroughWithFinalResponse
-// on its default-config path, where onFinalResponse is nil but onUsage is not.
-// Before the nil-aggregator guard this panicked on the first SSE chunk; this
-// test also asserts the streamed body is forwarded verbatim with a [DONE]
-// sentinel and that streaming usage is recorded in the request log.
 func TestStreamingChatCompletionsPassthroughThroughServer(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {
@@ -1116,8 +1097,6 @@ func TestStreamingChatCompletionsPassthroughThroughServer(t *testing.T) {
 
 	streamed, _ := io.ReadAll(resp.Body)
 	got := string(streamed)
-	// The passthrough must forward every upstream chunk verbatim, including
-	// the terminal [DONE] sentinel, without truncation or panic.
 	for _, want := range []string{"\"content\":\"Hel\"", "\"content\":\"lo\"", "\"finish_reason\":\"stop\"", "data: [DONE]"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("streamed body missing %q; got:\n%s", want, got)
@@ -1135,8 +1114,6 @@ func TestStreamingChatCompletionsPassthroughThroughServer(t *testing.T) {
 	if got, ok := entry["stream"].(bool); !ok || !got {
 		t.Fatalf("log[stream] = %#v, want true", entry["stream"])
 	}
-	// Usage must be observed via the streaming onUsage callback (regression:
-	// the callback was previously wired but never invoked, so these were absent).
 	for key, expected := range map[string]float64{"status": 200, "prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9} {
 		if got, ok := entry[key].(float64); !ok || got != expected {
 			t.Fatalf("log[%s] = %#v, want %v in %#v", key, entry[key], expected, entry)
@@ -2548,9 +2525,6 @@ func (w *blockingStatusWriter) unblock() {
 	w.releaseOnce.Do(func() { close(w.release) })
 }
 
-// Auth runs inside withRequestLog so the rejection is logged. It must not also be counted:
-// an unauthenticated caller reached no inference handler, and letting it move request-rate,
-// latency, error, or live in-flight dashboards hands a stats lever to anyone who can open a socket.
 func TestInboundAuthRejectionIsLoggedButNotCounted(t *testing.T) {
 	var logs bytes.Buffer
 	srv, err := New(
@@ -2605,7 +2579,6 @@ func TestInboundAuthRejectionIsLoggedButNotCounted(t *testing.T) {
 	if rejected.status != http.StatusUnauthorized {
 		t.Fatalf("StatusCode = %d, want 401", rejected.status)
 	}
-	// Guard: if the rejection stopped being logged this test would pass for the wrong reason.
 	if entry := requestLogEntryForPath(t, logs.String(), "request completed", "/v1/chat/completions"); entry["status"].(float64) != 401 {
 		t.Fatalf("the 401 was not logged: %#v", entry)
 	}

@@ -2021,10 +2021,6 @@ func TestHandleResponsesWebSocket_AutoCompactsLongHistory(t *testing.T) {
 		t.Fatalf("expected latest user turn to be preserved, got %q", got)
 	}
 
-	// One websocket response.create is one dashboard request even when the proxy
-	// performs internal auto-compaction. The two client turns report 10+2 and
-	// 20+3 tokens; compaction reports 1000+200 and must be folded into those two
-	// turns without creating a third request.
 	deadlineStats := time.Now().Add(2 * time.Second)
 	for {
 		snap := handler.stats.snapshot()
@@ -2756,9 +2752,6 @@ func TestHandleResponsesWebSocket_CompactsOversizedReplayAndRetries(t *testing.T
 		t.Fatalf("expected retried request to keep latest user turn, got %q", got)
 	}
 
-	// The initial and retried client turns report 5+1 and 8+2 tokens. The
-	// internal 413 compaction reports 700+90 and must be added to the second
-	// client turn without becoming a third dashboard request.
 	deadlineStats := time.Now().Add(2 * time.Second)
 	for {
 		snap := handler.stats.snapshot()
@@ -4076,13 +4069,11 @@ func TestHandleResponsesWebSocket_ResponseFailedKeepsSessionOpen(t *testing.T) {
 		t.Fatalf("failed to write websocket request: %v", err)
 	}
 
-	// Should receive the response.created event.
 	created := mustReadWebSocketJSON(t, conn)
 	if created["type"] != "response.created" {
 		t.Fatalf("expected response.created, got %v", created["type"])
 	}
 
-	// Should receive the response.failed event relayed from upstream.
 	failed := mustReadWebSocketJSON(t, conn)
 	if failed["type"] != "response.failed" {
 		t.Fatalf("expected response.failed, got %v", failed["type"])
@@ -4567,10 +4558,6 @@ func TestHandleResponsesWebSocket_ResponseIncompleteEmptyOutputClearsIncremental
 }
 
 func TestHandleResponsesWebSocket_ResponseFailedOnStalledUpstreamKeepsSessionOpen(t *testing.T) {
-	// Regression test: if upstream emits response.failed and then stalls
-	// (keeps the body open), the proxy should exit the SSE loop immediately
-	// rather than blocking until EOF or the 60-minute timeout, and the
-	// websocket session should remain usable for the next turn.
 	stallReleased := make(chan struct{})
 	var mu sync.Mutex
 	upstreamRequests := 0
@@ -4588,7 +4575,6 @@ func TestHandleResponsesWebSocket_ResponseFailedOnStalledUpstreamKeepsSessionOpe
 			flusher.Flush()
 			_, _ = fmt.Fprint(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-stall\",\"error\":{\"type\":\"server_error\",\"code\":\"context_length_exceeded\",\"message\":\"context too long\"}}}\n\n")
 			flusher.Flush()
-			// Stall: keep the body open until the test signals release.
 			<-stallReleased
 		case 2:
 			_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-after-stall\"}}\n\n")
@@ -4790,9 +4776,6 @@ func TestHandleResponsesWebSocket_RelaysUpstreamHeadersOnSuccess(t *testing.T) {
 		t.Fatalf("failed to write websocket request: %v", err)
 	}
 
-	// First frame: codex.response.metadata with openai-model in lowercase
-	// (the only header the Codex CLI parses from metadata frames via
-	// response_model() using case-insensitive comparison).
 	metadata := mustReadWebSocketJSON(t, conn)
 	if metadata["type"] != "codex.response.metadata" {
 		t.Fatalf("expected codex.response.metadata, got %v", metadata["type"])
@@ -4804,8 +4787,6 @@ func TestHandleResponsesWebSocket_RelaysUpstreamHeadersOnSuccess(t *testing.T) {
 	if got := metaHeaders["openai-model"]; got != "gpt-5.4-actual" {
 		t.Fatalf("expected openai-model header, got %v", got)
 	}
-	// X-Reasoning-Included and X-Models-Etag should NOT be in the metadata
-	// frame — the Codex CLI only reads them from HTTP upgrade headers.
 	if _, found := metaHeaders["X-Reasoning-Included"]; found {
 		t.Fatalf("X-Reasoning-Included should not be in metadata frame")
 	}
@@ -4813,7 +4794,6 @@ func TestHandleResponsesWebSocket_RelaysUpstreamHeadersOnSuccess(t *testing.T) {
 		t.Fatalf("X-Models-Etag should not be in metadata frame")
 	}
 
-	// Remaining frames are the normal SSE stream.
 	created := mustReadWebSocketJSON(t, conn)
 	if created["type"] != "response.created" {
 		t.Fatalf("expected response.created, got %v", created["type"])
@@ -4852,8 +4832,8 @@ func TestHandleResponsesWebSocket_ForwardsOpenAIBetaHeader(t *testing.T) {
 		t.Fatalf("failed to write websocket request: %v", err)
 	}
 
-	_ = mustReadWebSocketJSON(t, conn) // response.created
-	_ = mustReadWebSocketJSON(t, conn) // response.completed
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
 
 	if gotOpenAIBeta != "responses_websockets=2026-02-06" {
 		t.Fatalf("expected OpenAI-Beta header to be forwarded upstream, got %q", gotOpenAIBeta)
@@ -4911,8 +4891,8 @@ func TestHandleResponsesWebSocket_ForwardsSessionAndClientRequestHeaders(t *test
 		t.Fatalf("failed to write websocket request: %v", err)
 	}
 
-	_ = mustReadWebSocketJSON(t, conn) // response.created
-	_ = mustReadWebSocketJSON(t, conn) // response.completed
+	_ = mustReadWebSocketJSON(t, conn)
+	_ = mustReadWebSocketJSON(t, conn)
 
 	if gotLegacySessionID != "conv-legacy-123" {
 		t.Fatalf("expected session_id to be forwarded upstream, got %q", gotLegacySessionID)
@@ -5450,8 +5430,6 @@ func TestHandleResponsesWebSocket_NoPongCancelsStalledInference(t *testing.T) {
 		t.Fatal("timed out waiting for stalled upstream request")
 	}
 
-	// Do not read from the client connection: Gorilla processes server pings and
-	// emits pongs only while a reader is active.
 	select {
 	case <-canceled:
 	case <-time.After(500 * time.Millisecond):
@@ -5700,9 +5678,6 @@ func TestBeginShutdownBeforeWebSocketDrainPreservesGoingAwayClose(t *testing.T) 
 		readDone <- readResult{messageType: messageType, payload: payload, err: err}
 	}()
 
-	// Server.Stop begins lifecycle cancellation before entering the websocket
-	// drain. Give the canceled turn time to unwind so this test catches any
-	// spurious upstream-error frame emitted in that ordering window.
 	handler.BeginShutdown()
 	select {
 	case <-canceled:
@@ -6938,8 +6913,6 @@ func mustReadWebSocketJSON(t *testing.T, conn *websocket.Conn, timeouts ...time.
 	return payload
 }
 
-// mustReadWebSocketJSONSkipMetadata reads the next WebSocket frame, skipping
-// over any synthetic codex.response.metadata frames injected by the proxy.
 func mustReadWebSocketJSONSkipMetadata(t *testing.T, conn *websocket.Conn, timeouts ...time.Duration) map[string]interface{} {
 	t.Helper()
 	for {
@@ -7657,9 +7630,6 @@ func TestHandleResponsesWebSocket_EarlyWriteFailureDrainsLateTerminalBeforeCance
 	_ = serverConn.Close()
 	defer func() { _ = clientConn.Close() }()
 	session := newResponsesWebSocketSession(serverConn, httptest.NewRequest(http.MethodGet, "/v1/responses", nil))
-	// The scanner-limit terminal is expensive under -race. The reader release
-	// controls terminal availability; parsing duration is not the contract
-	// under test.
 	session.terminalObservationWait = 10 * time.Second
 	request := mustParseResponsesWebSocketCreateRequest(t, newResponsesWebSocketCreateRequest(nil))
 
@@ -7720,7 +7690,7 @@ data: {"type":"response.completed","response":{"id":"   ","usage":{"input_tokens
 
 	done := make(chan error, 1)
 	go func() { done <- session.handleCreateRequest(handler, request) }()
-	_ = mustReadWebSocketJSON(t, clientConn) // metadata
+	_ = mustReadWebSocketJSON(t, clientConn)
 	created := mustReadWebSocketJSON(t, clientConn)
 	if created["type"] != "response.created" {
 		t.Fatalf("created frame type = %v, want response.created", created["type"])
@@ -8024,9 +7994,6 @@ func TestHandleResponsesWebSocket_PreservesUpstreamTimeoutTerminalAndReplayState
 			Request: req,
 		}, nil
 	})
-	// Give request construction time to reach the fake transport under -race.
-	// The body still waits for the actual upstream deadline and then delays its
-	// terminal, so this cannot turn into a pre-timeout success.
 	WithStreamingUpstreamTimeout(100 * time.Millisecond)(handler)
 	handler.stats = newStatsCollector()
 	serverConn, clientConn := newResponsesWebSocketConnPair(t)
@@ -8156,8 +8123,7 @@ func TestHandleResponsesWebSocket_OversizedTerminalFailureRetainsUsage(t *testin
 
 	done := make(chan error, 1)
 	go func() { done <- session.handleCreateRequest(handler, request) }()
-	// Allow parsing the oversized payload under race instrumentation.
-	_ = mustReadWebSocketJSON(t, clientConn, 15*time.Second) // metadata
+	_ = mustReadWebSocketJSON(t, clientConn, 15*time.Second)
 	wrapped := mustReadWebSocketJSON(t, clientConn, 15*time.Second)
 	if got := int(wrapped["status_code"].(float64)); got != http.StatusBadGateway {
 		t.Fatalf("wrapped status = %d, want 502", got)

@@ -389,7 +389,6 @@ func TestTranslateAnthropicToOpenAI(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-				// Compare as parsed JSON to avoid key-order issues
 				var gotVal, expectVal interface{}
 				if err := json.Unmarshal(got.ToolChoice, &gotVal); err != nil {
 					t.Fatalf("unmarshal got: %v", err)
@@ -906,8 +905,6 @@ func TestMapStopReason(t *testing.T) {
 	}
 }
 
-// Claude Code sends several system blocks, so this is the normal shape. Raw
-// concatenation welds a heading onto the previous sentence and stops it being one.
 func TestParseSystemMessageJoinsBlocksWithoutWeldingThem(t *testing.T) {
 	raw := json.RawMessage(`[
 		{"type":"text","text":"You are Claude Code, Anthropic's official CLI."},
@@ -952,7 +949,6 @@ func TestParseSystemMessageSkipsEmptyBlocks(t *testing.T) {
 	}
 }
 
-// A second newline at a boundary that already has one invents a paragraph break.
 func TestParseSystemMessageDoesNotDoubleExistingNewlines(t *testing.T) {
 	for _, tc := range []struct {
 		name string

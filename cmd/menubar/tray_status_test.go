@@ -38,7 +38,6 @@ func TestTrayStatusLifecycle(t *testing.T) {
 				want = trayStopped
 			}
 			checkTrayStatus(t, &lifecycle, want)
-			// repeated session refreshes must not depend on authentication.
 			checkTrayStatus(t, &lifecycle, want)
 		})
 	}

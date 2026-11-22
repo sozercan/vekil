@@ -1,5 +1,3 @@
-// Package auth implements GitHub OAuth device code flow authentication and
-// resolves GitHub credentials into Copilot API bearers.
 package auth
 
 import (
@@ -53,18 +51,11 @@ var (
 		"/usr/bin/gh",
 	}
 
-	// ErrNotAuthenticated indicates that no reusable GitHub access token was
-	// available for a token refresh attempt.
 	ErrNotAuthenticated = errors.New("not authenticated")
 
-	// ErrInvalidAccessToken indicates that a stored GitHub access token exists
-	// but can no longer be used for Copilot authentication.
 	ErrInvalidAccessToken = errors.New("invalid access token")
 )
 
-// Authenticator manages GitHub OAuth credentials and Copilot API bearers. It
-// handles the device code flow, legacy token-cache migration, and shared
-// refreshes whose waiters can stop independently when their contexts expire.
 type Authenticator struct {
 	tokenDir                 string
 	accessToken              string
@@ -97,17 +88,11 @@ type Authenticator struct {
 
 	client         *http.Client
 	directClient   *http.Client
-	copilotBaseURL string // legacy exchange base override for tests; defaults to https://api.github.com
-	githubCLIPath  string // optional override for tests; defaults to gh lookup/common paths
+	copilotBaseURL string
+	githubCLIPath  string
 
-	// DisableAutoDeviceFlow prevents refreshToken from falling through to the
-	// interactive device-code flow. When true, callers (e.g. the menubar app)
-	// are expected to drive the flow themselves via RequestDeviceCode /
-	// PollForAuthorization.
 	DisableAutoDeviceFlow bool
 
-	// DeviceCodePrompt, when set, replaces the stderr prompt shown by the
-	// automatic device-code flow, for example to write it to a log file.
 	DeviceCodePrompt func(verificationURI, userCode string)
 }
 
@@ -125,7 +110,6 @@ type authTokenCall struct {
 	envToken   string
 }
 
-// DeviceCodeResponse is the response from GitHub's device code endpoint.
 type DeviceCodeResponse struct {
 	DeviceCode      string `json:"device_code"`
 	UserCode        string `json:"user_code"`
@@ -134,7 +118,6 @@ type DeviceCodeResponse struct {
 	Interval        int    `json:"interval"`
 }
 
-// AccessTokenResponse is the response from GitHub's OAuth access token endpoint.
 type AccessTokenResponse struct {
 	AccessToken      string `json:"access_token"`
 	TokenType        string `json:"token_type"`
@@ -143,8 +126,6 @@ type AccessTokenResponse struct {
 	ErrorDescription string `json:"error_description,omitempty"`
 }
 
-// CopilotTokenResponse is the response from the legacy Copilot token exchange
-// endpoint and the on-disk format of the legacy bearer cache.
 type CopilotTokenResponse struct {
 	Token        string `json:"token"`
 	ExpiresAt    int64  `json:"expires_at"`
@@ -156,14 +137,10 @@ type copilotTokenCache struct {
 	SourceFingerprint string `json:"source_fingerprint,omitempty"`
 }
 
-// AuthPreferences stores explicit authentication preferences shared by the
-// CLI and menubar app.
 type AuthPreferences struct {
 	GitHubCLIAutoSignIn bool `json:"github_cli_auto_sign_in,omitempty"`
 }
 
-// AuthSource identifies the source of the currently usable authentication
-// state.
 type AuthSource string
 
 const (
@@ -173,8 +150,6 @@ const (
 	AuthSourceGitHubCLI AuthSource = "github-cli"
 )
 
-// AuthStatus is a fast snapshot of local authentication state. It never shells
-// out to external tools such as gh.
 type AuthStatus struct {
 	SignedIn             bool
 	Source               AuthSource
@@ -184,8 +159,6 @@ type AuthStatus struct {
 	HasVekilAccessToken  bool
 }
 
-// NewAuthenticator creates an Authenticator that stores tokens in tokenDir.
-// If tokenDir is empty, it defaults to ~/.config/vekil.
 func NewAuthenticator(tokenDir string) (*Authenticator, error) {
 	if tokenDir == "" {
 		tokenDir = defaultTokenDir
@@ -207,14 +180,10 @@ func NewAuthenticator(tokenDir string) (*Authenticator, error) {
 	}, nil
 }
 
-// IsSignedIn reports whether the authenticator has a usable or explicitly
-// configured local authentication source.
 func (a *Authenticator) IsSignedIn() bool {
 	return a.Status().SignedIn
 }
 
-// Status returns a fast snapshot of local authentication state without making
-// network requests or invoking external commands.
 func (a *Authenticator) Status() AuthStatus {
 	status := AuthStatus{
 		Source:              AuthSourceNone,
@@ -270,8 +239,6 @@ func (a *Authenticator) Status() AuthStatus {
 	return status
 }
 
-// hasAccessTokenOnDisk returns true when the access-token file exists and is
-// non-empty. Must NOT be called with the write lock held.
 func (a *Authenticator) hasAccessTokenOnDisk() bool {
 	data, err := os.ReadFile(filepath.Join(a.tokenDir, "access-token"))
 	if err != nil {
@@ -280,9 +247,6 @@ func (a *Authenticator) hasAccessTokenOnDisk() bool {
 	return strings.TrimSpace(string(data)) != ""
 }
 
-// hasValidCopilotTokenOnDisk returns true when the persisted Copilot token file
-// exists, is valid JSON, and has not expired yet. Must NOT be called with the
-// write lock held.
 func (a *Authenticator) hasValidCopilotTokenOnDisk() bool {
 	data, err := os.ReadFile(filepath.Join(a.tokenDir, "api-key.json"))
 	if err != nil {
@@ -297,41 +261,27 @@ func (a *Authenticator) hasValidCopilotTokenOnDisk() bool {
 	return ctResp.Token != "" && time.Now().Unix() < ctResp.ExpiresAt-300
 }
 
-// GetToken returns a usable Copilot API bearer, refreshing it if necessary.
-// It is safe for concurrent use.
 func (a *Authenticator) GetToken(ctx context.Context) (string, error) {
 	credential, err := a.GetCredential(ctx)
 	return credential.Token, err
 }
 
-// GetTokenNonInteractive returns a valid Copilot API token without falling
-// back to the interactive device-code flow.
 func (a *Authenticator) GetTokenNonInteractive(ctx context.Context) (string, error) {
 	credential, err := a.getToken(ctx, false)
 	return credential.Token, err
 }
 
-// GetResponsesToken returns the credential used for Copilot /responses
-// requests. GitHub App user credentials are accepted directly by the catalog
-// and Chat endpoints but require the short-lived Copilot token exchange for
-// Responses. That fallback is cached in memory only and keyed to the active
-// GitHub credential. Other supported credentials remain direct bearers.
 func (a *Authenticator) GetResponsesToken(ctx context.Context) (string, error) {
 	credential, err := a.GetResponsesCredential(ctx)
 	return credential.Token, err
 }
 
-// RefreshTokenNonInteractive reloads existing GitHub authentication without
-// falling back to the interactive device-code flow. Unlike
-// GetTokenNonInteractive, it bypasses any cached Copilot bearer.
 func (a *Authenticator) RefreshTokenNonInteractive(ctx context.Context) (string, error) {
 	envToken, _ := lookupAccessTokenFromEnv()
 	credential, err := a.runSharedRefresh(ctx, envToken, true)
 	return credential.Token, err
 }
 
-// IsInteractiveLoginRequired reports whether resolving the error should fall
-// back to an interactive device-code login flow.
 func IsInteractiveLoginRequired(err error) bool {
 	return errors.Is(err, ErrNotAuthenticated) || errors.Is(err, ErrInvalidAccessToken)
 }
@@ -400,8 +350,6 @@ func (a *Authenticator) executeDeviceCall(call *authTokenCall) {
 	if lockErr := a.acquireDeviceFlow(call.ctx); lockErr != nil {
 		err = lockErr
 	} else {
-		// Another goroutine or process may have completed sign-in while this
-		// call waited for the interactive-login slot.
 		credential, err = a.getToken(call.ctx, false)
 		if err != nil && IsInteractiveLoginRequired(err) && call.ctx.Err() == nil && !a.signingOut.Load() {
 			err = a.deviceCodeFlow(call.ctx)
@@ -750,8 +698,6 @@ func (a *Authenticator) performRefresh(ctx context.Context, envToken string, for
 	}
 
 	if envToken != "" {
-		// Environment-provided access tokens intentionally override any persisted
-		// login state so CI or explicit shell configuration always wins.
 		if a.accessToken != envToken {
 			a.accessToken = envToken
 			a.copilotToken = ""
@@ -770,8 +716,6 @@ func (a *Authenticator) performRefresh(ctx context.Context, envToken string, for
 	return a.credentialLocked(), nil
 }
 
-// useGitHubCredential keeps supported GitHub credentials on the direct path
-// while preserving the legacy exchange for unrecognized older credentials.
 func (a *Authenticator) useGitHubCredential(ctx context.Context, accessToken string, persistLegacyToken bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -829,11 +773,6 @@ func (a *Authenticator) refreshToken(ctx context.Context, allowDeviceFlow bool) 
 		refreshErr = fmt.Errorf("loading access token: %w", err)
 	}
 
-	// If there is no Vekil-managed GitHub token, or the existing token is no
-	// longer usable, try borrowing the active GitHub CLI token before falling
-	// back to the interactive device-code flow. Do not do this after transient
-	// Copilot exchange failures, or after an explicit Vekil sign-out; those
-	// should be surfaced as-is.
 	if refreshErr == nil || IsInteractiveLoginRequired(refreshErr) {
 		if !a.hasSignedOutMarker() && a.isGitHubCLIAutoSignInEnabled() {
 			if err := a.useGitHubCLICopilotToken(ctx); err == nil {
@@ -875,10 +814,6 @@ func (a *Authenticator) releaseDeviceFlow() {
 	<-a.deviceFlowGate
 }
 
-// RequestDeviceCode initiates the GitHub device-code flow by requesting a
-// device code and user code from GitHub. The caller should present the
-// UserCode and VerificationURI to the user, then call PollForAuthorization.
-// No lock is required — only immutable fields (client) are accessed.
 func (a *Authenticator) RequestDeviceCode(ctx context.Context) (*DeviceCodeResponse, error) {
 	data := url.Values{
 		"client_id": {githubClientID},
@@ -904,8 +839,6 @@ func (a *Authenticator) RequestDeviceCode(ctx context.Context) (*DeviceCodeRespo
 	return &dcResp, nil
 }
 
-// PollForAuthorization polls GitHub until the user authorizes the device code,
-// then saves the access token and exchanges it for a Copilot API token.
 func (a *Authenticator) PollForAuthorization(ctx context.Context, dcResp *DeviceCodeResponse) error {
 	if a.signingOut.Load() {
 		return ErrNotAuthenticated
@@ -1020,16 +953,11 @@ func (a *Authenticator) deviceCodeFlow(ctx context.Context) error {
 	return a.pollForAuthorization(ctx, dcResp)
 }
 
-// SignOut clears all authentication state from memory and removes persisted
-// token files from disk. It is safe for concurrent use.
 func (a *Authenticator) SignOut() error {
 	a.signOutMu.Lock()
 	defer a.signOutMu.Unlock()
 
 	a.signingOut.Store(true)
-	// Stop shared work before waiting for the device-flow and state locks. The
-	// generation is advanced only after cleanup so calls created before or during
-	// sign-out cannot publish a token once sign-out has completed.
 	a.cancelSharedAuthCalls()
 
 	if err := a.acquireDeviceFlow(context.Background()); err != nil {
@@ -1068,9 +996,6 @@ func (a *Authenticator) SignOut() error {
 	return nil
 }
 
-// SignInWithGitHubCLI explicitly signs in using the currently authenticated
-// GitHub CLI account. The GitHub CLI token is kept only in memory as a
-// short-lived Copilot bearer token and is never persisted by Vekil.
 func (a *Authenticator) SignInWithGitHubCLI(ctx context.Context) error {
 	if err := a.acquireDeviceFlow(ctx); err != nil {
 		return err
@@ -1128,9 +1053,6 @@ func (a *Authenticator) useGitHubCLICopilotToken(ctx context.Context) error {
 		return err
 	}
 
-	// GitHub CLI credentials stay in memory only. Supported GitHub credential
-	// types are used directly; unknown legacy credentials may still use the
-	// exchange fallback, but its result is not persisted for this source.
 	a.accessToken = ""
 	return nil
 }
@@ -1390,8 +1312,6 @@ func (a *Authenticator) setGitHubCLIAutoSignIn(enabled bool) error {
 	return a.saveAuthPreferences(prefs)
 }
 
-// GitHubCLIAutoSignInEnabled reports whether the user has explicitly opted in
-// to automatic GitHub CLI sign-in. Malformed preferences are treated as false.
 func (a *Authenticator) GitHubCLIAutoSignInEnabled() bool {
 	return a.isGitHubCLIAutoSignInEnabled()
 }
@@ -1475,8 +1395,6 @@ func githubCLIEnvironment() []string {
 		}
 	}
 
-	// Ensure gh never opens an interactive prompt when Vekil is only probing for
-	// an existing CLI login.
 	filtered = append(filtered, "GH_PROMPT_DISABLED=1")
 	return filtered
 }
@@ -1509,8 +1427,6 @@ func (a *Authenticator) loadCopilotToken() error {
 		}
 	}
 	a.copilotToken = ctResp.Token
-	// Older caches have no proven source association. Keep those bearers
-	// isolated instead of assigning them to the current access-token file.
 	a.copilotSourceFingerprint = fingerprint
 	a.tokenExpiry = time.Unix(ctResp.ExpiresAt-300, 0)
 	return nil
@@ -1544,9 +1460,6 @@ func isInvalidAccessTokenDetail(detail string) bool {
 	return strings.Contains(normalized, "invalid access token")
 }
 
-// atomicWriteFile writes data to a temporary file in the same directory as
-// path and then renames it into place, ensuring the target file is never
-// partially written.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")

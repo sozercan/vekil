@@ -13,9 +13,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Install a one-way syscall restriction only in an owned disposable child.
-// This exercises real bbolt page-write/fdatasync errors without touching mounts,
-// a shared filesystem's free space, production processes, or store sync options.
 func durableFixtureFailSyscall(number uint32) error {
 	filter := []unix.SockFilter{
 		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 4},

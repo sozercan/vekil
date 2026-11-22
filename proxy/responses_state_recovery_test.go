@@ -15,9 +15,6 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-// Characterize the existing recovery boundary with state actually exposed by
-// HandleResponses. Every value is synthetic; no client transcript is required.
-// A healthy provider remains available throughout the simulated state loss.
 func TestExplicitResponsesStateLossRejectsContinuationBeforeDispatch(t *testing.T) {
 	fields := []struct {
 		name      string
@@ -73,8 +70,6 @@ func TestExplicitResponsesStateLossRejectsContinuationBeforeDispatch(t *testing.
 							}
 							h, route := explicitRouteTestHandler(t, http.DefaultClient, topology.mode, topology.targets, topology.targets, providers...)
 							h.log = logger.New(logger.LevelFatal)
-							// Small deterministic bounds reproduce production TTL/LRU
-							// behavior without waiting or generating 256K tokens.
 							store, err := newStateBindingStore(stateBindingStoreConfig{maxEntries: 8, ttl: time.Hour, now: clock.Now})
 							if err != nil {
 								t.Fatal(err)
@@ -157,8 +152,6 @@ func TestExplicitResponsesStateLossRejectsContinuationBeforeDispatch(t *testing.
 								t.Fatalf("issuing process stopped accepting its own state: %d", result.Code)
 							}
 						}
-						// New stateless traffic still succeeds: this is a local
-						// continuity failure, not an upstream outage or safety denial.
 						if fresh := request(h, `{"model":"public-model","input":"fresh request"}`, false); fresh.Code != http.StatusOK {
 							t.Fatalf("fresh stateless request = %d: %s", fresh.Code, fresh.Body.String())
 						}

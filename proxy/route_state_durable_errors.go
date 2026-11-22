@@ -10,17 +10,11 @@ import (
 	"strings"
 )
 
-// Failure events can expose turn state inside root or nested error headers,
-// including the headers later projected into websocket error frames. Inspect
-// every raw representation, not just the winning overlay, before emitting it.
 func durableResponsesErrorHeaderState(data []byte) ([]stateBindingToken, error) {
 	var event map[string]json.RawMessage
 	if err := json.Unmarshal(data, &event); err != nil {
 		return nil, err
 	}
-	// Raw JSON is case-sensitive, but websocket structs accept folded aliases.
-	// Either interpretation (including SSE's missing-type fallback) may expose
-	// error headers. Reject aliases that could hide or replace the raw type.
 	_, hasType := event["type"]
 	inspect := !hasType
 	seenType := false
@@ -55,10 +49,6 @@ func durableResponsesErrorHeaderState(data []byte) ([]stateBindingToken, error) 
 	return tokens, nil
 }
 
-// Walk only the fixed error-envelope paths, accepting single folded aliases but
-// rejecting competing spellings. Struct decoding can merge maps or replace
-// fields, and model rewriting can reorder those aliases before projection.
-// Unrelated metadata is not interpreted here.
 func durableResponsesErrorHeaderPath(object map[string]json.RawMessage, path []string) ([]stateBindingToken, error) {
 	if len(path) == 0 {
 		headers := responsesStreamErrorHeaders(responsesWebSocketStreamError{Headers: object})
@@ -90,8 +80,6 @@ func durableResponsesErrorHeaderPath(object map[string]json.RawMessage, path []s
 	return tokens, nil
 }
 
-// Websocket errors flatten header values into one string. Even identical or
-// empty repetitions would create a different token without ownership proof.
 func validateResponsesWebSocketTurnStateHeaders(headers http.Header) error {
 	if len(headers.Values("X-Codex-Turn-State")) > 1 {
 		return errors.New("multiple response error turn-state values")
@@ -109,8 +97,6 @@ func (h *ProxyHandler) bindDurableFinalWebSocketHeaders(info explicitRouteRespon
 	return h.bindDurableFinalHeaders(info, headers)
 }
 
-// Bind only the final projection, using identity captured on its actual request.
-// Native Chat/Messages bodies are not Responses state and are never parsed here.
 func (h *ProxyHandler) bindDurableFinalHeaders(info explicitRouteResponseInfo, headers http.Header) error {
 	if h == nil || h.stateBindings == nil || h.stateBindings.durable == nil {
 		return nil
@@ -128,7 +114,7 @@ func (h *ProxyHandler) bindDurableFinalHeaders(info explicitRouteResponseInfo, h
 func (h *ProxyHandler) prepareDurableFinalResponseHeaders(resp *http.Response) error {
 	info, ok := explicitRouteResponseInfoFromResponse(resp)
 	if !ok {
-		return nil // legacy or synthetic response, not an explicit provider result
+		return nil
 	}
 	if err := h.bindDurableFinalHeaders(info, resp.Header); err != nil {
 		if resp.Body != nil {
@@ -139,8 +125,6 @@ func (h *ProxyHandler) prepareDurableFinalResponseHeaders(resp *http.Response) e
 	return nil
 }
 
-// Normal shim success emits only proxy-owned summaries. Every passthrough,
-// including a final error, must bind any exposed opaque state first.
 func (h *ProxyHandler) writeDurableShimPassthrough(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, resp *http.Response) bool {
 	if h.stateBindings == nil || h.stateBindings.durable == nil {
 		return false
@@ -151,8 +135,6 @@ func (h *ProxyHandler) writeDurableShimPassthrough(w http.ResponseWriter, r *htt
 	}
 	var err error
 	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusResetContent {
-		// These successes cannot carry content, but their headers may still
-		// expose provider state. Commit that proof before writing any headers.
 		if err = h.bindExplicitResponseHeaders(info, resp.Header); err == nil {
 			copyPassthroughHeaders(w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
@@ -170,8 +152,6 @@ func (h *ProxyHandler) writeDurableShimPassthrough(w http.ResponseWriter, r *htt
 	return true
 }
 
-// Classify only local durable-store faults. Missing or mismatched ownership
-// evidence remains a separate request rejection, never a safety verdict.
 func durableStateFailureDetails(err error) (message, code string, ok bool) {
 	if errors.Is(err, errConversationHistoryCapacity) {
 		return errConversationHistoryCapacity.Error(), "conversation_history_capacity_exceeded", true
@@ -199,9 +179,6 @@ func writeDurableStateFailure(w http.ResponseWriter, err error) bool {
 	return true
 }
 
-// A binding reader yields only complete, durably recorded events. On failure
-// the unrecorded frame is withheld, so a bounded error can terminate the stream
-// without leaking its state or claiming the upstream failed or completed.
 func writeDurableStateStreamFailure(w io.Writer, err error) bool {
 	message, code, ok := durableStateFailureDetails(err)
 	if !ok {

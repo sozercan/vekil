@@ -175,8 +175,6 @@ func TestAzureTrafficRecoveryQueueSerializesAndRenews(t *testing.T) {
 		t.Fatal("concurrent recovery send was admitted")
 	default:
 	}
-	// HTTP 200 may still contain a streamed 429. Publish its reset before
-	// releasing the probe so the next caller cannot race the renewed limit.
 	metadata.observe(429, http.Header{"Retry-After": {"10"}})
 	probe.permit.release()
 	waitForAzureTrafficWaiters(t, h, 1)
@@ -210,8 +208,6 @@ func TestAzureTrafficResolvedProbeAdmitsNextCaller(t *testing.T) {
 	probe.holdResponseBody()
 	second := acquireAzureTrafficAsync(h, req)
 	waitForAzureTrafficWaiters(t, h, 1)
-	// Streamed output hands recovery to the next caller while the first
-	// generation's body is still open.
 	probe.resolveProbe()
 	next := receiveAzureTrafficResult(t, second)
 	if next.err != nil || next.blocked != nil || next.permit == nil {
@@ -328,7 +324,6 @@ func TestAzureTrafficBoundsAcrossDeployments(t *testing.T) {
 		waiting = append(waiting, acquireAzureTrafficAsync(h, req))
 	}
 	waitForAzureTrafficWaiters(t, h, len(waiting))
-	// Reuse an existing tracked deployment because the entry table is full.
 	overflow := azureTrafficTestRequest(t, h, ctx, "east", "https://east.example", "deployment-10")
 	overflow.ContentLength = 1
 	_, _, err := h.acquireAzureRouteInference(overflow, false)

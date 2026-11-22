@@ -14,13 +14,8 @@ import (
 
 const scheduledTaskNamePrefix = "Vekil-"
 
-// scheduledTaskServiceBackend registers a logon task that runs as the current
-// user, so Vekil keeps that user's GitHub, Azure CLI, and Codex logins without
-// administrator rights or a stored password.
 type scheduledTaskServiceBackend struct{}
 
-// scheduledTaskName is per user because Task Scheduler names are machine-wide.
-// The account SID stays stable across user renames.
 func scheduledTaskName(deps serviceDeps) (string, error) {
 	sid, err := deps.userID()
 	if err != nil {
@@ -94,7 +89,6 @@ func (b scheduledTaskServiceBackend) register(deps serviceDeps, spec serviceSpec
 }
 
 func (b scheduledTaskServiceBackend) restart(deps serviceDeps) error {
-	// Ending fails when the task is not running, which is fine.
 	_ = b.schtasks(deps, io.Discard, io.Discard, "/End")
 	if err := b.schtasks(deps, deps.stderr, deps.stderr, "/Run"); err != nil {
 		return fmt.Errorf("schtasks /Run failed: %w", err)
@@ -118,15 +112,11 @@ func (scheduledTaskServiceBackend) logsHint(logFile string) string {
 	return "Get-Content -Wait '" + strings.ReplaceAll(logFile, "'", "''") + "'"
 }
 
-// renderScheduledTaskXML starts Vekil at the user's logon with their
-// interactive token. ExecutionTimeLimit PT0S removes Task Scheduler's default
-// 72-hour limit, and the battery settings keep laptops from stopping it.
 func renderScheduledTaskXML(username string, command []string) (string, error) {
 	for _, value := range append([]string{username}, command...) {
 		if err := validateServiceValue(value); err != nil {
 			return "", err
 		}
-		// Task Scheduler expands %VAR% in actions with no escape syntax.
 		if strings.Contains(value, "%") {
 			return "", fmt.Errorf("value %q contains %%, which Task Scheduler would expand", value)
 		}
@@ -178,8 +168,6 @@ func renderScheduledTaskXML(username string, command []string) (string, error) {
 `, nil
 }
 
-// windowsQuoteArg quotes an argument for the Windows command-line parsing
-// rules Go uses to build os.Args.
 func windowsQuoteArg(arg string) string {
 	if arg == "" {
 		return `""`
@@ -208,8 +196,6 @@ func windowsQuoteArg(arg string) string {
 	return b.String()
 }
 
-// encodeUTF16LE matches the encoding declared in the task XML; schtasks
-// reliably accepts UTF-16 with a byte-order mark.
 func encodeUTF16LE(text string) []byte {
 	units := utf16.Encode([]rune(text))
 	out := make([]byte, 2+2*len(units))

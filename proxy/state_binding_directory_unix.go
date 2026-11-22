@@ -10,8 +10,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Only the automatic application-data path creates directories. Explicit file
-// paths retain the requirement for a pre-existing private directory.
 func createPrivateStateDirectory(file string) error {
 	if !filepath.IsAbs(file) || filepath.Clean(file) != file {
 		return errDurableStatePath
@@ -64,7 +62,6 @@ func ensureStateDirectory(dir string, private bool) error {
 	if err := root.Mkdir(name, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return errDurableStatePath
 	}
-	// Sync the exact parent used for mkdir before any new database can be exposed.
 	parentFile, err := root.Open(".")
 	if err != nil {
 		return errDurableStateIO

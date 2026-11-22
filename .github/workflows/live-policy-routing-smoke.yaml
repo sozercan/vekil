@@ -1,15 +1,5 @@
 name: Live Multi-Provider Semantic Policy Routing Smoke
 
-# Optional manual cross-provider coverage for schema-v2 semantic policy routing.
-# The harness generates a temporary policy config, validates the classifier
-# contract, exercises off/observe/enforce behavior against real native-Chat
-# targets, and injects one retry-safe primary failure to verify sealed
-# within-tier failover. Deterministic process/cleanup coverage stays in ci.yaml.
-#
-# Required repository variables and secrets are documented in
-# docs/development.md. The default pull-request gate uses the separate
-# Copilot-backed workflow; this workflow remains manual so operators can verify
-# genuine cross-provider behavior when independent provider credentials exist.
 
 on:
   workflow_dispatch:
@@ -124,10 +114,10 @@ jobs:
             fi
           done
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         if: steps.gate.outputs.run == 'true'
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         if: steps.gate.outputs.run == 'true'
         with:
           go-version-file: go.mod

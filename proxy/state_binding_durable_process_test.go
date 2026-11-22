@@ -18,8 +18,6 @@ import (
 	"github.com/sozercan/vekil/auth"
 )
 
-// This helper runs only in a dedicated test subprocess. The barriers are not
-// configurable in a serving binary and the child inherits no provider secrets.
 func TestDurableStateBarrierChild(t *testing.T) {
 	mode := os.Getenv("VEKIL_TEST_STATE_CHILD")
 	if mode != "barrier" && mode != "serve" {
@@ -42,7 +40,7 @@ func TestDurableStateBarrierChild(t *testing.T) {
 	}
 	barrier := func() error {
 		fmt.Println("barrier")
-		select {} // Parent kills this exact child; no commit/exposure can advance.
+		select {}
 	}
 	if mode == "barrier" {
 		if os.Getenv("VEKIL_TEST_STATE_WINDOW") == "after" {

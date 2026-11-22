@@ -1589,7 +1589,7 @@ func TestPolicyRoutingSharedBreakerStateAppliesToEveryProfile(t *testing.T) {
 		t.Fatalf("second profile status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	after, _ := light.snapshot()
-	if after != before+1 { // baseline terminal only; shared breaker suppresses classifier send.
+	if after != before+1 {
 		t.Fatalf("light requests before/after = %d/%d", before, after)
 	}
 	stats := h.policyRoutingController.(*chatPolicyRoutingController).PolicyStatsSnapshot()

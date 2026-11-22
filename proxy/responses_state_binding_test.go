@@ -340,10 +340,6 @@ func TestHandleResponsesRetainsIdleCodexStateAcrossDefaultChurn(t *testing.T) {
 	idleOwner := stateBindingOwner{routeID: route.public.routeID, targetID: route.targets[0].id}
 	churnOwner := stateBindingOwner{routeID: route.public.routeID, targetID: route.targets[1].id}
 
-	// A resumed Codex thread can replay hundreds of encrypted reasoning items.
-	// Busy local agent hosts can create tens of thousands of unrelated bindings
-	// while that thread is idle, so retain a representative same-day resume set
-	// across a 64K-entry churn window.
 	const idleTokens = 128
 	tokens := make([]stateBindingToken, 0, idleTokens)
 	values := make([]string, 0, idleTokens)

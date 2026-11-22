@@ -17,29 +17,22 @@ import (
 const (
 	policyResponsesToolKindFunction = "function"
 
-	policyResponsesMaxRequestBytes = 1 << 20
-	// Translation adds canonical Chat wrappers and flattened tool aliases. Keep
-	// the public policy ingress at 1 MiB, but allow that already-bounded input to
-	// expand up to the ordinary Chat request ceiling.
+	policyResponsesMaxRequestBytes        = 1 << 20
 	policyResponsesMaxTranslatedChatBytes = maxRequestBodySize
 	policyResponsesMaxJSONDepth           = 128
 	policyResponsesMaxInputItems          = 1024
 	policyResponsesMaxContentParts        = 1024
-	// Responses-backed Chat bridges used by managed Codex launches can accept
-	// Responses-scale catalogs beyond the 128-function native OpenAI/Azure Chat
-	// limit. Operators using narrower native-Chat destinations must constrain the
-	// client catalog to that destination's contract.
-	policyResponsesMaxFunctionTools   = 1024
-	policyResponsesMaxIncludeItems    = 8
-	policyResponsesMaxMetadataEntries = 64
-	policyResponsesMaxMetadataKeyLen  = 256
-	policyResponsesMaxMetadataValue   = 4096
-	policyResponsesMaxToolNameLen     = 512
-	policyResponsesMaxDescriptionLen  = 64 << 10
-	policyResponsesMaxChatToolNameLen = 64
-	policyResponsesMaxSchemaNameLen   = 64
-	policyResponsesAliasPrefix        = "vkl1__"
-	policyResponsesAliasStemLen       = 13
+	policyResponsesMaxFunctionTools       = 1024
+	policyResponsesMaxIncludeItems        = 8
+	policyResponsesMaxMetadataEntries     = 64
+	policyResponsesMaxMetadataKeyLen      = 256
+	policyResponsesMaxMetadataValue       = 4096
+	policyResponsesMaxToolNameLen         = 512
+	policyResponsesMaxDescriptionLen      = 64 << 10
+	policyResponsesMaxChatToolNameLen     = 64
+	policyResponsesMaxSchemaNameLen       = 64
+	policyResponsesAliasPrefix            = "vkl1__"
+	policyResponsesAliasStemLen           = 13
 )
 
 type policyResponsesToolDescriptor struct {
@@ -105,37 +98,17 @@ type policyResponsesCanonicalChatRequest struct {
 	ReasoningEffort     string                 `json:"reasoning_effort,omitempty"`
 }
 
-// responsesChatTranslationContract bounds one public Responses ingress that is
-// translated to canonical Chat. Each surface owns its limits and the noun used
-// in client-facing validation messages so that, for example, direct
-// Responses-over-Chat errors never describe the request as a policy request.
 type responsesChatTranslationContract struct {
-	// label prefixes size errors ("policy Responses request exceeds ...").
-	label string
-	// subject completes unsupported-feature errors ("... for policy models").
-	subject string
-	// maxRequestBytes bounds the public Responses body and each text field.
-	maxRequestBytes int
-	// maxTranslatedBytes bounds the canonical Chat body and flattened tool text.
-	maxTranslatedBytes int
-	// maxInputItems bounds the Responses input array.
-	maxInputItems      int
-	useLegacyMaxTokens bool
-	// coalesceAssistantToolTurns merges each run of assistant messages and
-	// function calls into one Chat assistant turn (text first, then calls)
-	// before call-sequence validation. Adapters whose own output can place
-	// assistant text after a call set it so that output replays as input.
+	label                      string
+	subject                    string
+	maxRequestBytes            int
+	maxTranslatedBytes         int
+	maxInputItems              int
+	useLegacyMaxTokens         bool
 	coalesceAssistantToolTurns bool
-	// omitToolChoiceWithoutTools drops a tool_choice of "auto" or "none" when
-	// no tools are declared. Both are no-ops without tools, and some Chat
-	// upstreams reject any tool_choice that has no tools beside it. Codex
-	// sends that shape for its local compaction turn.
 	omitToolChoiceWithoutTools bool
 }
 
-// policyResponsesTranslationContract is the semantic-policy Responses ingress
-// contract. Its limits and messages are part of the policy surface and must not
-// be broadened by other Responses-to-Chat consumers.
 var policyResponsesTranslationContract = responsesChatTranslationContract{
 	label:              "policy",
 	subject:            "policy models",
@@ -152,9 +125,6 @@ func translatePolicyResponsesRequestToChat(body []byte) (policyResponsesChatRequ
 	return translateResponsesRequestToChat(body, policyResponsesTranslationContract)
 }
 
-// translateResponsesRequestToChat converts one bounded, stateless Responses
-// request into canonical Chat under contract. It performs no routing and no
-// policy classification; callers own execution.
 func translateResponsesRequestToChat(body []byte, contract responsesChatTranslationContract) (policyResponsesChatRequest, error) {
 	if len(body) > contract.maxRequestBytes {
 		return policyResponsesChatRequest{}, newChatInvalidRequest("", fmt.Sprintf("%s Responses request exceeds %d bytes", contract.label, contract.maxRequestBytes))
@@ -675,12 +645,6 @@ func validatePolicyResponsesOptionalItemMetadata(object map[string]json.RawMessa
 	return nil
 }
 
-// coalesceResponsesAssistantToolTurns rewrites each maximal run of assistant
-// messages and function calls that contains at least one call into a single
-// assistant message followed by the calls in their original order. Chat has
-// one assistant message per turn whose content precedes its tool_calls, so
-// text a Responses model emitted between or after its calls is joined into that
-// content. Runs without calls, other roles and tool outputs are untouched.
 func coalesceResponsesAssistantToolTurns(items []policyResponsesInputItem) []policyResponsesInputItem {
 	isTurnItem := func(item policyResponsesInputItem) bool {
 		return item.kind == "function_call" || (item.kind == "message" && item.role == "assistant")
@@ -845,8 +809,6 @@ func parsePolicyResponsesTextContent(raw json.RawMessage, role, param string, to
 	return combined.String(), nil
 }
 
-// parsePolicyResponsesTools parses a Responses tool catalog under the policy
-// contract. Other surfaces call parseResponsesToolsWithContract.
 func parsePolicyResponsesTools(raw json.RawMessage) ([]policyResponsesParsedTool, error) {
 	return parseResponsesToolsWithContract(raw, policyResponsesTranslationContract)
 }
@@ -964,8 +926,6 @@ func policyResponsesCombinedToolDescriptionJSONBytes(namespace string, namespace
 	case child == "":
 		return namespaceBytes
 	default:
-		// Each input length includes its own quotes. The combined string drops two
-		// quote pairs, adds one pair, and encodes the two newlines as \n\n.
 		return namespaceBytes + childBytes + 2
 	}
 }
@@ -1438,12 +1398,6 @@ func validatePolicyResponsesJSON(body []byte) error {
 	return nil
 }
 
-// Every segment walkPolicyResponsesJSON reports is a key from the CLIENT's own JSON -- it
-// walks the request body, so nothing in the path is vekil's to log, not even the parts that
-// spell schema field names. A segment allowlist cannot see that: a key like "user[123456789]"
-// spells an owned root with a numeric subscript and passes on looks alone, which is how nine
-// client-chosen digits reached error_param. The client keeps the whole path, since they wrote
-// it; the summary gets none of it.
 func newPolicyResponsesJSONPathError(path, message string) *chatExecutionError {
 	return newChatInvalidRequestClientField("", path, message)
 }

@@ -14,9 +14,6 @@ type policyTypeSafeQuestion struct {
 	Criteria     map[string]*string `json:"criteria"`
 }
 
-// TypeSafe-compatible endpoints use typed evaluations instead of Chat tools.
-// Keep transport failures, admission, deadlines, and fallbacks in the shared
-// HTTP classifier. Only the request and response formats differ.
 func newPolicyTypeSafeClassifier(options policyHTTPClassifierOptions, send policyClassifierSendFunc) (*policyHTTPClassifier, error) {
 	if options.ReasoningEffort != "" {
 		return nil, fmt.Errorf("TypeSafe classification does not support reasoning_effort")
@@ -50,8 +47,6 @@ func buildPolicyTypeSafeRequest(options policyHTTPClassifierOptions, facts polic
 	if err != nil {
 		return nil, err
 	}
-	// State is embedded JSON. The fixed questions have a separate wire bound,
-	// including the task instructions repeated for each independent question.
 	if len(body) > options.MaxFactsBytes+(32<<10) {
 		return nil, fmt.Errorf("serialized TypeSafe classifier request exceeds wire bound")
 	}
@@ -85,8 +80,6 @@ func policyTypeSafeQuestions() map[string]policyTypeSafeQuestion {
 				criteria[value] = nil
 			}
 		}
-		// Choices preserve the mapper's discrete inputs without treating
-		// probabilities or confidence as a new routing policy.
 		questions[name] = policyTypeSafeQuestion{
 			Type: "choice", Instructions: policyClassifierTaskInstruction + " " + instructions[name], Criteria: criteria,
 		}

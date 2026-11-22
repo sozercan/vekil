@@ -161,8 +161,6 @@ func TestExplicitRouteAzureRefreshesIdentityAfterQueue(t *testing.T) {
 		done <- azureTrafficTestResult{blocked: resp, err: err}
 	}()
 	waitForAzureTrafficWaiters(t, h, 1)
-	// Simulate token expiry while the request is held without sleeping through
-	// a production-length cooldown or changing the credential cache policy.
 	source.mu.Lock()
 	source.cached.ExpiresOn = time.Now().Add(-time.Second)
 	source.mu.Unlock()
@@ -639,7 +637,6 @@ func TestExplicitRouteAzureProbeOutputReleasesQueuedRequest(t *testing.T) {
 		return done
 	}
 	first := execute()
-	// The pipe accepts the preamble only after the probe holds the permit.
 	if _, err := io.WriteString(writer, "data: "+`{"type":"response.created","response":{"id":"resp_probe","status":"in_progress","output":[]}}`+"\n\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -666,7 +663,6 @@ func TestExplicitRouteAzureProbeOutputReleasesQueuedRequest(t *testing.T) {
 			t.Fatalf("probe output: %v after %q", err, streamed.String())
 		}
 	}
-	// The probe's generation is still open; its output released the queue.
 	result := receiveAzureTrafficResult(t, second)
 	if result.err != nil || result.blocked == nil || calls.Load() != 2 {
 		t.Fatalf("queued request = %+v, calls=%d", result, calls.Load())
@@ -718,8 +714,6 @@ func TestExplicitRouteAzureProbeLateThrottleDelaysLaterRequest(t *testing.T) {
 		t.Fatalf("probe = %+v", first)
 	}
 	defer func() { _ = first.blocked.Body.Close() }()
-	// Output released the probe; the throttle after it renews the cooldown
-	// for requests that have not been admitted yet.
 	if _, err := io.Copy(io.Discard, first.blocked.Body); err != nil {
 		t.Fatal(err)
 	}
@@ -909,8 +903,6 @@ func TestExplicitRouteAzureRenewedResetPreservesUpstreamRejection(t *testing.T) 
 }
 
 func TestExplicitRouteAzureConcurrentFailoverExhaustionAndClientRetries(t *testing.T) {
-	// A has already reached West when B consumes its remaining capacity.
-	// East and the final fallback are unavailable throughout the scenario.
 	var eastCalls, westCalls, fallbackCalls atomic.Int32
 	westSelected := make(chan struct{})
 	westConsumed := make(chan struct{})
@@ -1002,8 +994,6 @@ func TestExplicitRouteAzureConcurrentFailoverExhaustionAndClientRetries(t *testi
 		trace[0].StatusCode != 429 || trace[1].StatusCode != 429 || trace[2].StatusCode != 503 {
 		t.Fatalf("unbounded or incorrect failover: sends=%d switches=%d trace=%+v", sends, switches, trace)
 	}
-	// Client retries are distinct operations. They still share deployment
-	// cooldowns, so fresh budgets cannot produce more Azure sends.
 	for range 8 {
 		retried := execute(ctx, "client retry", false)
 		if retried.err != nil || retried.response == nil || retried.response.StatusCode != 503 {

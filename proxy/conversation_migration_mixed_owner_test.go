@@ -15,8 +15,6 @@ import (
 	"testing"
 )
 
-// Copilot issues item IDs, including a hosted search's, as opaque strings of
-// several hundred characters with no prefix.
 func conversationCopilotItemID(kind string) string {
 	return strings.Repeat("7w/qPNfy"+kind+"AczXpeIX80Wsop55Hf+", 12)
 }
@@ -36,8 +34,6 @@ func conversationAzureOutput(region string) []any {
 	}
 }
 
-// conversationClientReplay returns output items as a client resends them.
-// Codex keeps prefixed IDs and drops the rest; other clients keep every ID.
 func conversationClientReplay(items []any, codex bool) []any {
 	replayed := make([]any, 0, len(items))
 	for _, item := range items {
@@ -79,9 +75,6 @@ func conversationSwitchConfig(t *testing.T) *ProvidersConfig {
 	}
 }
 
-// conversationReencryptedStream streams output the way Copilot and Azure do:
-// the encrypted reasoning in each output_item.done event, which clients keep,
-// differs from its copy in response.completed.
 func conversationReencryptedStream(t *testing.T, req *http.Request, id string, output []any) *http.Response {
 	t.Helper()
 	_, _ = io.ReadAll(req.Body)
@@ -103,8 +96,6 @@ func conversationReencryptedStream(t *testing.T, req *http.Request, id string, o
 	return routeExecutorTestResponse(req, http.StatusOK, http.Header{"Content-Type": {"text/event-stream"}}, stream.String())
 }
 
-// conversationSwitchTransport serves east until eastDown is set, then fails
-// east before delivery. West answers its nth request with west.
 func conversationSwitchTransport(t *testing.T, eastDown *atomic.Bool, eastOutput []any, west func(*http.Request, int) *http.Response, westBodies *[]string) http.RoundTripper {
 	return routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if strings.HasSuffix(req.URL.Path, "/models") {
@@ -123,8 +114,6 @@ func conversationSwitchTransport(t *testing.T, eastDown *atomic.Bool, eastOutput
 	})
 }
 
-// conversationWestOutputs answers west's first requests with outputs in order,
-// then with text.
 func conversationWestOutputs(t *testing.T, outputs ...[]any) func(*http.Request, int) *http.Response {
 	return func(req *http.Request, n int) *http.Response {
 		if n <= len(outputs) {
@@ -159,7 +148,6 @@ func TestConversationMigrationContinuesAfterCopilotWebSearchOnNewOwner(t *testin
 				t.Fatalf("switch turn with a Copilot web search was not saved: id=%s vekil=%s", switched["id"], switched["vekil"])
 			}
 
-			// The replay carries east's older reasoning next to west's search.
 			history = append(history, conversationClientReplay(westOutput, tc.codex)...)
 			history = append(history, conversationUserText("Summarize."))
 			next := conversationPOST(t, h, map[string]any{"input": history, "tools": tools, "store": false}, nil)
@@ -203,7 +191,6 @@ func TestConversationMigrationReplaysCopilotWebSearchToAnotherTarget(t *testing.
 			if rawJSONString(response["id"]) != "west-1" || !bytes.Contains(response["vekil"], []byte(`"migration":"completed"`)) {
 				t.Fatalf("web search conversation did not migrate: %s", switched.Body.String())
 			}
-			// Azure rejects a foreign search ID longer than 64 characters.
 			if body := westBodies[0]; !strings.Contains(body, conversationIDLessSearch) ||
 				strings.Contains(body, conversationCopilotItemID("ws")) || strings.Contains(body, "private-east-1") {
 				t.Errorf("migrated request does not carry an ID-less search call: %s", body)
@@ -223,8 +210,6 @@ func TestConversationMigrationForwardsUnsupportedStateOnMigratedOwner(t *testing
 			eastOutput, westOutput := conversationAzureOutput("east"), conversationAzureOutput("west")
 			west := conversationWestOutputs(t, westOutput)
 			if tc.copilot {
-				// Codex drops Copilot's opaque IDs and keeps the streamed reasoning,
-				// so only the thread's visible prefix finds the saved owner.
 				westOutput = []any{
 					map[string]any{"type": "reasoning", "id": conversationCopilotItemID("rs"), "encrypted_content": "private-west-1", "summary": []any{}},
 					map[string]any{"type": "message", "id": conversationCopilotItemID("msg"), "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "West answer."}}},
@@ -248,8 +233,6 @@ func TestConversationMigrationForwardsUnsupportedStateOnMigratedOwner(t *testing
 				t.Fatalf("second turn did not migrate with saved history: id=%s vekil=%s", switched["id"], switched["vekil"])
 			}
 
-			// An image cannot be saved, so this turn runs unprotected. The client still
-			// replays east's older reasoning next to west's.
 			history = append(history, conversationClientReplay(westOutput, true)...)
 			history = append(history, conversationImageMessage())
 			result := conversationPOST(t, h, map[string]any{"input": history, "store": false}, thread)
@@ -264,8 +247,6 @@ func TestConversationMigrationForwardsUnsupportedStateOnMigratedOwner(t *testing
 	}
 }
 
-// conversationEastCounter counts requests that reach east, including failed
-// dials, so a test can prove which target served a turn.
 func conversationEastCounter(inner http.RoundTripper, sends *atomic.Int32) http.RoundTripper {
 	return routeExecutorRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if strings.HasPrefix(req.URL.Host, "east.") && !strings.HasSuffix(req.URL.Path, "/models") {
@@ -299,9 +280,6 @@ func TestConversationMigrationPinsMixedUnprotectedTurnToSavedOwner(t *testing.T)
 	history = append(history, conversationUserText("Continue."))
 	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": history, "store": false}, nil), false)
 
-	// East is available again. West's turn-state header conflicts with east's
-	// reasoning, and west emitted no reasoning, so only the pin keeps the
-	// conversation on west once east's reasoning is dropped.
 	eastDown.Store(false)
 	before := eastSends.Load()
 	history = append(history, conversationClientReplay(westOutput, true)...)
@@ -328,9 +306,6 @@ func TestConversationMigrationKeepsConflictFreeUnprotectedTurnsOnNormalRoute(t *
 	history = append(history, conversationUserText("Continue."))
 	conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": history, "store": false}, thread), false)
 
-	// West emitted no reasoning, so all replayed state belongs to east. Nothing
-	// conflicts, and the unprotected turn keeps ordinary ownership routing to
-	// the recovered east.
 	eastDown.Store(false)
 	history = append(history, conversationText("West answer."), conversationImageMessage())
 	result := conversationPOST(t, h, map[string]any{"input": history, "store": false}, thread)
@@ -349,8 +324,6 @@ func conversationCompactPOST(t *testing.T, h *ProxyHandler, input []any, headers
 	return recorder
 }
 
-// Codex compacts a long thread through /responses/compact with its full
-// history, which after a switch still carries the earlier owner's reasoning.
 func TestConversationMigrationCompactsMigratedConversationOnSavedOwner(t *testing.T) {
 	var eastDown atomic.Bool
 	var eastSends atomic.Int32
@@ -377,7 +350,6 @@ func TestConversationMigrationCompactsMigratedConversationOnSavedOwner(t *testin
 		t.Errorf("west compaction carries the wrong reasoning: %s", westBodies[1])
 	}
 
-	// Codex replaces its history with the compacted output and continues.
 	var compacted struct {
 		Output []any `json:"output"`
 	}
@@ -390,8 +362,6 @@ func TestConversationMigrationCompactsMigratedConversationOnSavedOwner(t *testin
 	}
 }
 
-// Azure rejects Copilot's 428-character IDs, so an unprotected turn on an Azure
-// owner must not forward the IDs a client kept from earlier Copilot output.
 func TestConversationMigrationUnprotectedTurnDropsEarlierOwnerItemIDs(t *testing.T) {
 	var eastDown atomic.Bool
 	var westBodies []string
@@ -447,7 +417,6 @@ func TestReadableConversationHistoryStopsAtUnsupportedItems(t *testing.T) {
 	if len(readable.items) != len(prefix.items) || !conversationHasPrefix(readable.items, prefix.items) {
 		t.Fatalf("readable items = %s, want the canonical prefix %s", readable.items, prefix.items)
 	}
-	// Anchors after the unsupported item still identify saved output.
 	want := append(prefix.anchors, conversationAnchor{"item", "msg_after"})
 	if fmt.Sprint(readable.anchors) != fmt.Sprint(want) {
 		t.Fatalf("readable anchors = %v, want %v", readable.anchors, want)

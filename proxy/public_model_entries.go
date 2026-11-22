@@ -13,9 +13,6 @@ const (
 	publicEntryPolicy
 )
 
-// publicModelEntry is the only client-facing model identity compiled into the
-// routing registries. Static entries bind directly to one terminal route;
-// policy entries carry a normalized profile and a conservative public contract.
 type publicModelEntry struct {
 	id       string
 	kind     publicModelEntryKind
@@ -38,9 +35,6 @@ type publicModelEntryRegistrySnapshot struct {
 	strictAliases bool
 }
 
-// publicModelEntryRegistry is a read-only view over the atomically published
-// route-registry snapshot. Terminal and public identities therefore refresh as
-// one immutable generation.
 type publicModelEntryRegistry struct {
 	routes *modelRouteRegistry
 }
@@ -71,10 +65,6 @@ func (r *publicModelEntryRegistry) lookup(model string) (*publicModelEntry, bool
 	if entry, ok := snapshot.aliases[model]; ok {
 		return entry, true
 	}
-	// Match direct-route resolution: request-side normalization strips dated
-	// suffixes and maps separator variants before the final alias lookup. Policy
-	// entries must use the same public namespace or a normalized policy alias can
-	// fall through to unknown-model/default-provider routing.
 	normalized := NormalizeModelName(model)
 	if normalized != model {
 		if entry, ok := snapshot.byID[normalized]; ok {
@@ -193,18 +183,13 @@ func derivePolicyPublicModelContract(profile PolicyProfileConfig, lightweight, p
 	}
 
 	return publicModelContract{
-		id: profile.PublicID,
-		// The profile id is retained as the catalog owner identity. Policy
-		// execution replaces this with the selected terminal route id in the
-		// sealed operation plan.
+		id:        profile.PublicID,
 		routeID:   profile.ID,
 		name:      profile.Name,
 		endpoints: append([]string(nil), modelCfg.Endpoints...),
 		raw:       raw,
 		policy: providerRequestPolicy{
-			parallelToolCalls: &parallelToolCalls,
-			// Validation requires equal public request semantics today. OR keeps
-			// the derived contract conservative if that invariant is ever relaxed.
+			parallelToolCalls:  &parallelToolCalls,
 			dropSamplingParams: boolConfigValue(lightweight.DropSamplingParams) || boolConfigValue(powerful.DropSamplingParams),
 			dropStopSequences:  boolConfigValue(lightweight.DropStopSequences) || boolConfigValue(powerful.DropStopSequences),
 		},

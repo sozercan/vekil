@@ -27,7 +27,6 @@ func TestStateBindingsCLIOverridePrecedence(t *testing.T) {
 	if err != nil || got.Mode != "memory" || got.MaxEntries != 31 || got.File != file {
 		t.Fatalf("flag overrides = %+v, %v", got, err)
 	}
-	// Parse the selected value, so valid flags can replace invalid environment settings.
 	t.Setenv("STATE_BINDINGS_MAX_ENTRIES", "invalid")
 	if _, err := proxy.StateBindingsEnvironmentOverrides(); err == nil {
 		t.Fatal("invalid environment ignored")

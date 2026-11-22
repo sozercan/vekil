@@ -1,25 +1,3 @@
-# Schema-v2 semantic policy routing for a coding workload.
-#
-# Replace the placeholder URLs and upstream model IDs, then set:
-#   export LIGHTWEIGHT_API_KEY=...
-#   export POWERFUL_API_KEY=...
-#
-# Validate the static contract without contacting inference endpoints:
-#   vekil config validate \
-#     --providers-config examples/policy-routing-coding-economy.yaml
-#
-# Validate classifier auth, forced-tool output, and no-store behavior live:
-#   vekil config validate --live \
-#     --providers-config examples/policy-routing-coding-economy.yaml
-#
-# The default process mode follows the profile's YAML mode. This example sets
-# mode: observe below, so no separate process override is required:
-#   vekil \
-#     --providers-config examples/policy-routing-coding-economy.yaml
-#
-# Policy observe/enforce is v1 single-tenant functionality. Keep the default
-# loopback bind. A remote bind requires an explicit acknowledgement and a
-# trusted external access layer; the acknowledgement does not add auth.
 
 schema_version: 2
 
@@ -29,8 +7,6 @@ providers:
     trust_domain: organization-ai
     base_url: https://lightweight.example.com/v1
     api_key_env: LIGHTWEIGHT_API_KEY
-    # The classifier uses this provider. This declaration means Vekil can send
-    # its supported non-storage option; it is not proof of provider retention.
     classifier_no_store_supported: true
 
   - id: powerful-provider
@@ -40,15 +16,11 @@ providers:
     api_key_env: POWERFUL_API_KEY
 
 model_routes:
-  # Internal destinations prevent clients from requesting a terminal tier
-  # directly. Make a destination public only when bypass is intentional.
   - id: lightweight-route
     exposure: internal
     name: Coding Lightweight
     endpoints:
       - /chat/completions
-    # The route allowlist declares values this terminal can execute. The policy
-    # profile below selects the value for the lightweight tier.
     reasoning_effort:
       - low
       - medium
@@ -75,8 +47,6 @@ model_routes:
     routing:
       mode: primary_only
 
-  # Classifier routes are internal-only auxiliary operations with exactly one
-  # target, one target attempt, and one physical send.
   - id: classifier-route
     exposure: internal
     internal_purpose: policy_classifier
@@ -96,7 +66,6 @@ policy_profiles:
   - id: coding-economy-policy
     public_id: coding-economy
     name: Coding Economy
-    # The default process mode follows this value; an explicit process ceiling may lower it.
     mode: observe
     model_picker_enabled: true
     model_picker_category: versatile
@@ -108,10 +77,6 @@ policy_profiles:
       route: powerful-route
       reasoning_effort: max
 
-    # Optional as a whole. When present, both policy-owned values are required
-    # and must appear in the corresponding terminal route's allowlist. Incoming
-    # client effort is accepted for this mapped profile, then replaced with the
-    # effective tier value (baseline in off/observe; selected/fallback in enforce).
 
     baseline_tier: lightweight
     classifier_unavailable_tier: lightweight
@@ -128,8 +93,6 @@ policy_profiles:
       observe_sample_rate: 1.0
 
     data_policy:
-      # Classifier facts include bounded user/system text. No general redactor
-      # can guarantee that secrets embedded in that content are removed.
       content_forwarding_acknowledged: true
       allow_cross_trust_domain: false
       allow_provider_retention: false

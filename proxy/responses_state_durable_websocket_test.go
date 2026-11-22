@@ -147,8 +147,6 @@ func TestDurableResponsesWebSocketCrashReconnect(t *testing.T) {
 			_ = first.Close()
 			secondURL, killSecond := startDurableWebSocketChild(t, config, upstream.URL, native)
 			defer killSecond()
-			// Connection-local delta lineage is deliberately not recovered. A
-			// reconnect must retain and resend full input; do not silently drop it.
 			invalid := dial(secondURL)
 			request["previous_response_id"] = "resp-durable-fixture"
 			if err := invalid.WriteJSON(request); err != nil {

@@ -34,7 +34,6 @@ func citationTestLookup(ref string) (citationLink, bool) {
 	return link, ok
 }
 
-// citationTestRequestBody holds web_run results in the shape Codex replays.
 func citationTestRequestBody(t *testing.T) []byte {
 	t.Helper()
 	results := "Authorization API 1.0 (https://openid.net/specs/authorization-api-1_0.html)\n" +
@@ -43,7 +42,6 @@ func citationTestRequestBody(t *testing.T) []byte {
 		"PR #831 | orka (https://github.com/orka-agents/orka/pull/831)\n" +
 		"【turn295586view1】 [wordlim: 200] Crawled: today; Content type: text/html; Total lines: 4\n" +
 		"L0: Draft RFC\n"
-	// Codex code mode returns the MCP result as serialized CallToolResult JSON.
 	codeModeResult, err := json.Marshal(map[string]any{"content": []any{map[string]any{
 		"type": "text",
 		"text": "Code mode result (https://example.com/code-mode)\n【turn670467view1】 [wordlim: 200] Total lines: 1\nL0: hi\n",
@@ -51,7 +49,6 @@ func citationTestRequestBody(t *testing.T) []byte {
 	if err != nil {
 		t.Fatalf("Marshal() error = %v", err)
 	}
-	// Serializers such as Python's json.dumps escape the brackets as \u3010.
 	escapedResult := `{"content":[{"type":"text","text":` +
 		strconv.QuoteToASCII("Escaped result (https://example.com/escaped)\n【turn3view0】 Total lines: 1\n") + `}]}`
 	if strings.ContainsRune(escapedResult, '【') {
@@ -141,7 +138,6 @@ func TestRewriteCitationMarkersStreamingMatchesFinal(t *testing.T) {
 			emitted, held, _ = rewriteCitationMarkers(held+chunk, false, citationTestLookup)
 			out += emitted
 		}
-		// The text ends inside a marker, which the final text drops.
 		return out
 	}
 	for _, split := range boundaries {
@@ -310,7 +306,6 @@ func TestNormalizeResponsesCitationMarkersDropsTrailingPartialMarker(t *testing.
 }
 
 func TestMapCitationOffset(t *testing.T) {
-	// Runes 2-4 became one rune and rune 8 became three.
 	edits := []citationEdit{{start: 2, end: 5, length: 1}, {start: 8, end: 9, length: 3}}
 	for _, tt := range []struct {
 		offset, wantStart, wantEnd int
@@ -345,7 +340,7 @@ func citationTestRange(t *testing.T, event sseEvent, path ...string) [2]int {
 }
 
 func TestNormalizeResponsesCitationMarkersRemapsAnnotations(t *testing.T) {
-	marker := "citeturn0search9" // unresolved, so removed
+	marker := "citeturn0search9"
 	link := "[docs](https://docs.example)"
 	full := "Intró " + marker + " see " + link + " end"
 	want := "Intró  see " + link + " end"

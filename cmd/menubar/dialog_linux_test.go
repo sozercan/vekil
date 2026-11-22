@@ -82,9 +82,6 @@ func TestConfirmActionPortalTimeoutDoesNotInvokeFallback(t *testing.T) {
 	fake := newFakePortalConn(":1.3")
 	fake.callFn = func(call fakePortalCall) ([]any, error) {
 		if call.Method == portalNotification+".AddNotification" {
-			// AddNotification succeeds (the notification was shown), and
-			// only then does the caller's context end while still waiting
-			// for an ActionInvoked signal that never arrives.
 			cancelParent()
 		}
 		return nil, nil
@@ -135,10 +132,6 @@ func TestConfirmActionLegacyDismissalDeclines(t *testing.T) {
 	}
 }
 
-// TestWaitForLegacyNotificationActionReturnsQueuedApprovalWhenContextEndsSimultaneously
-// exercises the same ctx.Done()-vs-buffered-signal race as the portal action
-// path. An explicit approval already delivered to the process must win over
-// the shared confirmation deadline, and the notification must not be closed.
 func TestWaitForLegacyNotificationActionReturnsQueuedApprovalWhenContextEndsSimultaneously(t *testing.T) {
 	const notificationID = uint32(42)
 	validActions := map[string]bool{portalActionApprove: true, portalActionDecline: true}
@@ -624,8 +617,6 @@ func TestSharedNotificationConnectionRedialsOnlyAfterGenuineDisconnect(t *testin
 		t.Fatalf("newPortalConn() called %d times on first use, want 1", dialCount)
 	}
 
-	// Simulate the peer genuinely disconnecting: Connected() now reports
-	// false, the only condition production treats as a reason to redial.
 	_ = current.Close()
 
 	showNotification("title", "message")
@@ -660,9 +651,6 @@ func TestSharedConnectionTransientAddNotificationFailureDoesNotDisruptConcurrent
 			})
 			return nil, nil
 		}
-		// The concurrent plain-notification call fails transiently; this
-		// must never disrupt the still-pending confirmation sharing this
-		// connection.
 		confirmSubscribed.Wait()
 		return nil, errors.New("transient add notification failure")
 	}
@@ -694,11 +682,6 @@ func TestConfirmActionAmbiguousAddNotificationTimeoutDeclinesWithoutFallback(t *
 	fake := newFakePortalConn(":1.15")
 	fake.callFn = func(call fakePortalCall) ([]any, error) {
 		if call.Method == portalNotification+".AddNotification" {
-			// AddNotification's own sub-timeout elapsed. context.DeadlineExceeded
-			// is not in the safe "proves not shown" allowlist -- the deadline
-			// can fire after the portal already accepted and displayed the
-			// request -- so this must be an ambiguous delivery failure, not
-			// proof the notification was never shown.
 			return nil, context.DeadlineExceeded
 		}
 		return nil, nil
@@ -789,7 +772,7 @@ func TestChooseProvidersConfigPathMissingURIsInSuccessResponseIsActionable(t *te
 				Sender: portalBusName,
 				Path:   handle,
 				Name:   portalRequestIface + "." + portalResponseName,
-				Body:   []any{uint32(0), map[string]dbus.Variant{}}, // success, but no "uris" key
+				Body:   []any{uint32(0), map[string]dbus.Variant{}},
 			})
 			return []any{handle}, nil
 		}
@@ -851,8 +834,6 @@ func restoreDialogHooks(t *testing.T) {
 	oldNotify := notify
 	oldRunXDGOpen := runXDGOpen
 
-	// Each test case must not observe another test's cached shared
-	// notification connection.
 	resetSharedPortalNotificationConnForTest()
 
 	t.Cleanup(func() {
@@ -864,9 +845,6 @@ func restoreDialogHooks(t *testing.T) {
 	})
 }
 
-// extractHandleToken pulls the handle_token option back out of an OpenFile
-// call's options argument so tests can predict the same request path the
-// portal_linux.go implementation predicted.
 func extractHandleToken(t *testing.T, call fakePortalCall) string {
 	t.Helper()
 	if len(call.Args) < 3 {

@@ -59,7 +59,6 @@ func TestCopilotNamespaceRoundTrip(t *testing.T) {
 					if rawJSONString(body.Choice["name"]) != alias {
 						t.Errorf("choice not translated: %s", body.Choice)
 					}
-					// Alias-looking arguments are opaque and must not be rewritten.
 					call := fmt.Sprintf(`{"type":"function_call","id":"fc-1","call_id":"call-1","name":%q,"arguments":%q}`, alias, `{"name":"`+alias+`"}`)
 					if stream {
 						w.Header().Set("Content-Type", "text/event-stream")
@@ -251,7 +250,6 @@ func TestCopilotNamespaceSSEContentTypeIsCaseInsensitive(t *testing.T) {
 	go func() {
 		_, _ = fmt.Fprintf(pw, "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc-1\",\"call_id\":\"call-1\",\"name\":%q,\"arguments\":\"\"}}\n\n", alias)
 	}()
-	// The stream must deliver events before EOF; the JSON branch would block.
 	done := make(chan struct{})
 	var got []byte
 	var readErr error
@@ -351,14 +349,12 @@ func TestCopilotNamespaceSSEFailsClosedOnOversizedEvents(t *testing.T) {
 			if !strings.Contains(string(got), `"namespace":"shell"`) {
 				t.Fatalf("events before the oversized one were not delivered: %.200s", got)
 			}
-			// The failure is terminal; later reads must not resume the stream.
 			if n, err := resp.Body.Read(make([]byte, 1024)); n != 0 || !errors.Is(err, errResponsesSSEEventTooLarge) {
 				t.Fatalf("read after failure n=%d err=%v", n, err)
 			}
 		})
 	}
 
-	// Requests without tool aliases leave responses untouched.
 	empty := &responsesNamespaceTranslation{tools: make(policyResponsesToolMap)}
 	body := io.NopCloser(strings.NewReader(first))
 	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body}
@@ -403,15 +399,12 @@ func TestCopilotNamespaceDropsNullReasoningContent(t *testing.T) {
 	if string(got.Input[1]["content"]) != `[{"type":"reasoning_text","text":"kept"}]` {
 		t.Fatalf("reasoning content changed: %s", got.Input[1]["content"])
 	}
-	// Only reasoning items are normalized.
 	if string(got.Input[2]["content"]) != "null" {
 		t.Fatalf("message changed: %s", got.Input[2])
 	}
 }
 
 func TestCopilotNamespaceDeepSchemaValidationIsLinear(t *testing.T) {
-	// Deep but small client schemas must not trigger the quadratic,
-	// path-building duplicate-key scan (~456 MiB at this depth).
 	const depth = 9000
 	schema := strings.Repeat(`{"properties":`, depth) + `{}` + strings.Repeat(`}`, depth)
 	body := []byte(`{"model":"grok-4.7","tools":[{"type":"namespace","name":"shell","tools":[{"type":"function","name":"run","parameters":` + schema + `}]}]}`)
@@ -433,8 +426,6 @@ func TestCopilotNamespaceDeepSchemaValidationIsLinear(t *testing.T) {
 }
 
 func TestCopilotNamespaceSharesCatalogBudgetAcrossAdditionalTools(t *testing.T) {
-	// Each catalog stays within the policy parser's per-catalog description
-	// budget, but namespace descriptions are copied into every child.
 	desc := strings.Repeat("d", 60<<10)
 	children := make([]string, 0, 170)
 	for i := 0; i < 170; i++ {

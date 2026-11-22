@@ -6,9 +6,6 @@ import (
 	"strings"
 )
 
-// Per-turn headers are transport metadata, not Responses request fields. Keep
-// them bounded and prevent client metadata from replacing provider credentials
-// or server-issued continuation state.
 func validateResponsesWebSocketHeaders(headers map[string]string) error {
 	if len(headers) > 32 {
 		return fmt.Errorf("headers supports at most 32 entries")

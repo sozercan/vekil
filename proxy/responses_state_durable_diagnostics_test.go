@@ -11,9 +11,6 @@ import (
 	"testing"
 )
 
-// Prior observations are seeded, not inferred from configuration. Reopening
-// exercises the persisted keyed owners; these tests prove rejection diagnostics,
-// while the durable wire/restart suite proves actual issuance and continuation.
 func newDurableDiagnosticStore(t *testing.T) *stateBindingStore {
 	t.Helper()
 	s, config := newDurableStoreFixture(t, 32)
@@ -90,7 +87,6 @@ func TestDurableStateDiagnosticsOrdering(t *testing.T) {
 			}
 		}
 	}
-	// Valid input cannot disguise a failed store as a missing/conflicting token.
 	s.durable.mu.Lock()
 	s.durable.failed = errDurableStateIO
 	s.durable.mu.Unlock()
@@ -160,8 +156,6 @@ func TestDurableResponsesStateDiagnosticsHeadersAndStorage(t *testing.T) {
 					server := startResponsesWebSocketProxyServer(t, h)
 					conn := mustDialResponsesWebSocket(t, server, nil)
 					defer func() { _ = conn.Close() }()
-					// Unknown websocket response IDs are rejected by connection
-					// replay validation before the provider-state store is reached.
 					request := newResponsesWebSocketCreateRequest([]any{map[string]any{"type": "reasoning", "encrypted_content": "opaque-missing"}})
 					request["model"] = "public-ws-model"
 					if err := conn.WriteJSON(request); err != nil {

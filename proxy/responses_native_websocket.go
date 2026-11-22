@@ -26,21 +26,15 @@ var errResponsesNativeClosed = errors.New("native upstream websocket closed; res
 
 type responsesNativeRequestContextKey struct{}
 
-// This marker belongs to one client turn. Compaction and compatibility helpers
-// receive the original context, so they cannot advance the native connection.
 type responsesNativeRequest struct {
-	upstream *responsesNativeUpstream
-	model    string
-	// delta marks a body holding only what the live native conversation lacks;
-	// it continues from previousResponseID and has no HTTP form. Otherwise the
-	// body carries the full history and may use either transport.
+	upstream           *responsesNativeUpstream
+	model              string
 	delta              bool
 	previousResponseID string
 	headers            http.Header
 	inputItems         int
 	inputBytes         int
-	// dispatched records that the turn was sent on the native connection.
-	dispatched atomic.Bool
+	dispatched         atomic.Bool
 }
 
 type responsesNativeFrame struct {
@@ -54,16 +48,13 @@ type responsesNativeTurn struct {
 	once   sync.Once
 }
 
-// One reader handles upstream control frames even between turns. The current
-// turn has a single-frame queue; completed history stays on this connection.
 type responsesNativeUpstream struct {
-	ctx        context.Context
-	mu         sync.Mutex
-	conn       *websocket.Conn
-	binding    string
-	credential [32]byte
-	model      string
-	// publicModel is the client-facing model the connection was opened for.
+	ctx         context.Context
+	mu          sync.Mutex
+	conn        *websocket.Conn
+	binding     string
+	credential  [32]byte
+	model       string
 	publicModel string
 	responseID  string
 	requestID   string
@@ -94,8 +85,6 @@ func (u *responsesNativeUpstream) isClosed() bool {
 	return u.closed
 }
 
-// continuation reports the conversation an open connection can continue: its
-// last response and the client-facing model it serves.
 func (u *responsesNativeUpstream) continuation() (responseID, publicModel string, open bool) {
 	if u == nil {
 		return "", "", false
@@ -114,8 +103,6 @@ func (u *responsesNativeUpstream) previousResponseID() string {
 	return u.responseID
 }
 
-// upstreamRequestID is the GitHub request ID of the websocket handshake, which
-// identifies the upstream connection in Copilot diagnostics.
 func (u *responsesNativeUpstream) upstreamRequestID() string {
 	if u == nil {
 		return ""
@@ -166,8 +153,6 @@ func (u *responsesNativeUpstream) readPump(conn *websocket.Conn) {
 		if json.Unmarshal(payload, &envelope) != nil || envelope.Type == "" || len(envelope.StreamID) > 0 {
 			return
 		}
-		// Compact framing prevents a pretty-printed JSON message from being
-		// mistaken for multiple SSE lines by the shared Responses pipeline.
 		var compact bytes.Buffer
 		if json.Compact(&compact, payload) != nil {
 			return
@@ -195,19 +180,11 @@ func (u *responsesNativeUpstream) readPump(conn *websocket.Conn) {
 	}
 }
 
-// Reject an unusable session before admission and physical-send reservation.
-// Provider model rewrites are checked again at dispatch after request encoding.
 func (h *ProxyHandler) maybeRejectNativeResponsesRequest(req *http.Request) *http.Response {
 	rejected, _, _ := h.selectNativeResponsesTransport(req)
 	return rejected
 }
 
-// selectNativeResponsesTransport makes one transport decision for a physical
-// request. native is true only when every native validation passed for that
-// same decision, so a concurrent catalog update cannot skip the native input
-// limits. A full-history turn falls back to HTTP whenever native cannot carry
-// it; a delta continues the live connection or is rejected, because it has no
-// HTTP form. reason explains an HTTP decision for logging.
 func (h *ProxyHandler) selectNativeResponsesTransport(req *http.Request) (rejected *http.Response, native bool, reason string) {
 	marker, _ := req.Context().Value(responsesNativeRequestContextKey{}).(*responsesNativeRequest)
 	if marker == nil || marker.upstream == nil {
@@ -245,14 +222,10 @@ func (h *ProxyHandler) selectNativeResponsesTransport(req *http.Request) (reject
 		return nil, false, ""
 	}
 	if started && (!sameConnection || !sameCredential) {
-		// The connection serves another target, model or credential. This turn
-		// uses HTTP; the session opens a new connection for the next one.
 		u.close()
 		return nil, false, responsesNativeDeclinedConnectionMismatch
 	}
 	if !started {
-		// Only models whose catalog entry advertises ws:/responses open a native
-		// connection; others keep the HTTP bridge and its input contract.
 		if eligible, reason := h.responsesNativeModelEligible(req, provider.id); !eligible {
 			return nil, false, reason
 		}
@@ -280,8 +253,6 @@ func responsesNativeRequestCredential(req *http.Request) [32]byte {
 	if metadata, ok := req.Context().Value(copilotInferenceRequestContextKey{}).(copilotInferenceRequest); ok {
 		for _, key := range metadata.keys {
 			if key.scope == copilotThrottleAccount {
-				// This identity uses the source credential, so service-token
-				// refreshes keep the same account binding.
 				return key.identity
 			}
 		}
@@ -289,10 +260,6 @@ func responsesNativeRequestCredential(req *http.Request) [32]byte {
 	return sha256.Sum256([]byte(req.Header.Get("Authorization")))
 }
 
-// maybeSendNativeResponses runs after provider resolution, auth, admission and
-// route-send reservation. Its response body reuses the existing stream parsing,
-// target binding and accounting paths. An established connection never retries
-// or migrates, even if an upstream failure precedes visible output.
 func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *http.Response, handled bool, sendErr error) {
 	var receipt *taskInferenceSend
 	defer func() { receipt.finish(response, sendErr) }()
@@ -417,15 +384,12 @@ func (h *ProxyHandler) maybeSendNativeResponses(req *http.Request) (response *ht
 		receipt = h.beginTaskInferenceSend(req)
 	}
 	if trace := httptrace.ContextClientTrace(req.Context()); trace != nil && trace.WroteHeaders != nil {
-		// Once a frame write starts, delivery is ambiguous on any failure.
 		trace.WroteHeaders()
 	}
 	marker.dispatched.Store(true)
 	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
 		u.close()
 	}
-	// A frame-write failure stays on the body path. Returning a transport error
-	// here could authorize another inference attempt after ambiguous delivery.
 	return resp, true, nil
 }
 
@@ -463,8 +427,6 @@ func responsesNativeTurnHeaders(headers http.Header) (map[string]string, error) 
 		if _, hopByHop := hopByHopHeaders[canonical]; hopByHop {
 			continue
 		}
-		// requestHeaders includes custom client metadata accepted by the HTTP
-		// bridge. Preserve it without overriding provider or connection state.
 		switch canonical {
 		case "Authorization", "Api-Key", "X-Api-Key", "Cookie", "Set-Cookie", "Host",
 			"Accept", "Accept-Encoding", "Content-Type", "Content-Length", "Content-Encoding",
@@ -511,7 +473,6 @@ func (h *ProxyHandler) prepareResponsesNativeDial(req *http.Request) (*websocket
 	if dialer.TLSClientConfig == nil {
 		dialer.TLSClientConfig = &tls.Config{}
 	}
-	// The upgrade uses HTTP/1.1 even when ordinary requests negotiate HTTP/2.
 	dialer.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	headers := req.Header.Clone()
 	for name := range headers {
@@ -550,8 +511,6 @@ func (b *responsesNativeBody) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 		var frame responsesNativeFrame
-		// A completed frame wins a subsequent connection close. Providers may
-		// close immediately after publishing an otherwise valid terminal result.
 		select {
 		case frame = <-b.turn.frames:
 		default:

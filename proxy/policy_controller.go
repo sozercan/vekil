@@ -2,9 +2,6 @@ package proxy
 
 import "context"
 
-// policyRoutingController combines the request planner with startup preflight
-// and bounded readiness state. Production installs one immutable controller;
-// focused tests may still inject only the planner seam.
 type policyRoutingController interface {
 	chatPolicyPlanner
 	Active() bool

@@ -8,20 +8,10 @@ import (
 )
 
 const (
-	// policyStatsMaxProfiles matches the schema-v2 policy-profile limit. One
-	// additional fixed "other" row receives observations whose profile label
-	// arrives after the cap, so arbitrary labels cannot grow memory.
-	policyStatsMaxProfiles = 128
-	// policyStatsMaxTrafficBuckets bounds declared request-size/tool-count
-	// buckets independently for every retained profile. One additional fixed
-	// "other" bucket receives overflow.
+	policyStatsMaxProfiles       = 128
 	policyStatsMaxTrafficBuckets = 32
-	// policyStatsLatencySamples bounds the recent classifier-latency reservoir at
-	// the collector, profile, and traffic-bucket levels.
-	policyStatsLatencySamples = 128
-	// Policy IDs and declared traffic-bucket labels are configuration-derived,
-	// but remain bounded and syntax-checked before retention.
-	policyStatsLabelMaxLen = 128
+	policyStatsLatencySamples    = 128
+	policyStatsLabelMaxLen       = 128
 
 	policyStatsOtherProfile           = "other"
 	policyStatsOtherTrafficBucket     = "other"
@@ -73,9 +63,6 @@ const (
 
 const policyStatsMaxClassifierLatencyMs = int64(time.Hour / time.Millisecond)
 
-// policyStatsTokenUsage is classifier-only accounting. It contains numbers
-// reported by the classifier transport and deliberately has no request text,
-// facts, tool arguments, raw output, or rationale fields.
 type policyStatsTokenUsage struct {
 	InputTokens       int64 `json:"input_tokens"`
 	OutputTokens      int64 `json:"output_tokens"`
@@ -113,10 +100,6 @@ func (u *policyStatsTokenUsage) add(other policyStatsTokenUsage) {
 	u.ReasoningTokens = policyStatsSaturatingAdd(u.ReasoningTokens, other.ReasoningTokens)
 }
 
-// policyStatsObservation is one additive, content-free metrics update. Callers
-// may populate a complete request lifecycle in one observation or emit partial
-// observations as stages finish. Every string field is either a bounded label
-// or a fixed enum; unknown enum values never become aggregate keys.
 type policyStatsObservation struct {
 	Profile       string
 	TrafficBucket string
@@ -135,10 +118,6 @@ type policyStatsObservation struct {
 	PhysicalClassifierSends int64
 }
 
-// policyStatsProfileState is a full replacement of the current operational
-// state for one profile. Generation values are retained only when they are
-// bounded hexadecimal hashes; invalid values are discarded rather than being
-// echoed through a future /stats.json response.
 type policyStatsProfileState struct {
 	EffectiveMode  string
 	PreflightState string
@@ -197,8 +176,6 @@ type policyStatsCountSnapshot struct {
 	Count int64  `json:"count"`
 }
 
-// Abstain is a subset of Uncertain: an explicit classifier abstention selects
-// the uncertain fallback and increments both fields.
 type policyStatsClassifierSnapshot struct {
 	Completion  int64 `json:"completion"`
 	Unavailable int64 `json:"unavailable"`
@@ -212,8 +189,6 @@ type policyStatsTierCountsSnapshot struct {
 	Unknown     int64 `json:"unknown"`
 }
 
-// Count is cumulative for the process lifetime. Percentiles use only the
-// bounded RecentSamples reservoir, while average/min/max are cumulative.
 type policyStatsLatencySnapshot struct {
 	Count         int64 `json:"count"`
 	RecentSamples int   `json:"recent_samples"`
@@ -225,9 +200,6 @@ type policyStatsLatencySnapshot struct {
 	P99Ms         int64 `json:"p99_ms"`
 }
 
-// policyStatsCollector is an in-memory, process-lifetime policy metrics
-// collector. A single mutex makes a complete observation atomic across global,
-// profile, and traffic-bucket views and makes snapshots race-safe.
 type policyStatsCollector struct {
 	mu       sync.Mutex
 	totals   policyStatsMetricsCounter
@@ -329,10 +301,6 @@ func newPolicyStatsCollector() *policyStatsCollector {
 	return &policyStatsCollector{profiles: make(map[string]*policyStatsProfileCounter)}
 }
 
-// record atomically adds one content-free observation at the global, profile,
-// and traffic-bucket levels. Empty observations are ignored. Invalid enum
-// strings are ignored or folded into a fixed "other"/"unknown" counter; they
-// are never retained as labels.
 func (c *policyStatsCollector) record(observation policyStatsObservation) {
 	if c == nil {
 		return
@@ -354,9 +322,6 @@ func (c *policyStatsCollector) record(observation policyStatsObservation) {
 	bucket.add(normalized)
 }
 
-// setProfileState replaces the current bounded state for a profile. It may be
-// called before the profile has traffic so preflight and breaker health can be
-// surfaced independently from request metrics.
 func (c *policyStatsCollector) setProfileState(profile string, state policyStatsProfileState) {
 	if c == nil {
 		return
@@ -372,9 +337,6 @@ func (c *policyStatsCollector) setProfileState(profile string, state policyStats
 	c.profileLocked(profile).state = state
 }
 
-// snapshot returns a detached, deterministically ordered view suitable for
-// embedding below /stats.json. No returned slice or value aliases collector
-// state.
 func (c *policyStatsCollector) snapshot() policyStatsSnapshot {
 	if c == nil {
 		return emptyPolicyStatsSnapshot()

@@ -83,8 +83,6 @@ func saveMenubarConfig(cfg menubarConfig) error {
 	if err != nil {
 		return fmt.Errorf("write menubar config %q: %w", path, err)
 	}
-	// Existing installations may have created this file with broader permissions.
-	// Secure the open inode before replacing contents that can include a signed URL.
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
 		return fmt.Errorf("secure menubar config %q: %w", path, err)

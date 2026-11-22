@@ -974,8 +974,6 @@ func TestPolicyResponsesIngressPlannerUnavailableUsesServerError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Deliberately do not initialize policy routing: enforce requests must fail as
-	// transient server unavailability, not as a permanent invalid client request.
 	recorder := httptest.NewRecorder()
 	h.HandleResponses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding-economy","input":"hello","store":false}`)))
 	if recorder.Code != http.StatusServiceUnavailable {

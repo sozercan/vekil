@@ -7,19 +7,14 @@ import (
 	"github.com/google/uuid"
 )
 
-// chatPolicyPlanner is the only policy-routing seam exposed to the OpenAI Chat
-// handler. A zero/invalid plan means the public entry is a direct static model
-// and existing routing should continue unchanged.
 type chatPolicyPlanner interface {
 	Plan(context.Context, chatPolicyInput) (chatOperationPlan, error)
 }
 
 type chatPolicyInput struct {
-	OperationID  string
-	Model        string
-	OriginalBody []byte
-	// FactSourceBytesLimit is non-zero only for a trusted canonical translation
-	// whose public ingress was already checked against the default fact limit.
+	OperationID          string
+	Model                string
+	OriginalBody         []byte
 	FactSourceBytesLimit int
 	CarriedReasoning     map[string]carriedReplay
 }
@@ -51,9 +46,6 @@ func (h *ProxyHandler) planOpenAIChatPolicyWithCarrier(ctx context.Context, mode
 		FactSourceBytesLimit: factSourceBytesLimit,
 		CarriedReasoning:     carried,
 	}
-	// Policy ingress may establish a client-visible request identity before
-	// translation and planning. Reuse it so sampling, route attempts, response
-	// headers, and request summaries all describe the same logical operation.
 	if summary := RequestSummaryFromContext(ctx); summary != nil {
 		input.OperationID = summary.OperationID()
 	}

@@ -47,16 +47,11 @@ func (p *policyAdmissionPool) release() {
 	}
 }
 
-// policyAdmission is scoped to one profile while its global pool may be shared
-// by any number of profile-scoped admission values.
 type policyAdmission struct {
 	global  *policyAdmissionPool
 	profile *policyAdmissionPool
 }
 
-// newPolicyAdmission creates the first profile-scoped admission controller.
-// Additional profiles should use forProfile so they share the same process-wide
-// global pool while retaining independent profile capacity.
 func newPolicyAdmission(globalCap, profileCap int) *policyAdmission {
 	if globalCap <= 0 {
 		globalCap = policyDefaultGlobalConcurrency
@@ -89,8 +84,6 @@ func (a *policyAdmission) tryAcquire() (*policyAdmissionLease, policyClassifierF
 	if a == nil || a.profile == nil || a.global == nil {
 		return nil, policyClassifierFailureInternal
 	}
-	// Acquire the profile slot first as required by the fairness contract. If
-	// global admission fails, release the partial acquisition immediately.
 	if !a.profile.tryAcquire() {
 		return nil, policyClassifierFailureProfileCapacity
 	}
@@ -123,8 +116,6 @@ func deterministicPolicySample(operationID, policyID string, rate float64) bool 
 	writePolicySamplePart(hash, operationID)
 	writePolicySamplePart(hash, policyID)
 	sum := hash.Sum(nil)
-	// Use the top 53 bits so conversion to float64 is exact and the result is
-	// stable across architectures and Go versions.
 	value := binary.BigEndian.Uint64(sum[:8]) >> 11
 	const denominator = float64(uint64(1) << 53)
 	return float64(value)/denominator < rate
@@ -285,9 +276,6 @@ func newPolicyClassifierRuntime(classifier policyClassifier, admission *policyAd
 	return &policyClassifierRuntime{classifier: classifier, admission: admission, breaker: breaker}
 }
 
-// classify performs queue-free admission and breaker accounting around exactly
-// one classifier invocation. Only explicitly typed infrastructure failures may
-// affect shared breaker state.
 func (r *policyClassifierRuntime) classify(ctx context.Context, facts policyClassifierFacts) policyClassifierResult {
 	if ctx == nil {
 		ctx = context.Background()
@@ -327,8 +315,6 @@ func (r *policyClassifierRuntime) classify(ctx context.Context, facts policyClas
 	case err == nil:
 		permit.recordSuccess()
 	case failure.HTTPAccepted:
-		// Any successful 2xx classifier exchange proves route health even when
-		// the model payload is missing, malformed, or explicitly abstains.
 		permit.recordSuccess()
 	case failure.AffectsBreaker:
 		permit.recordFailure(failure)

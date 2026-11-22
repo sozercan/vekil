@@ -42,8 +42,6 @@ func newOptimizerProcessController(cmd *exec.Cmd) (optimizerProcessController, e
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	// Starting suspended closes the assignment race: the optimizer cannot spawn
-	// descendants before it is placed in the kill-on-close Job Object.
 	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED
 	return &windowsOptimizerProcessController{cmd: cmd, job: job}, nil
 }

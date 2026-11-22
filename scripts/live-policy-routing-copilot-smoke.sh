@@ -1,33 +1,5 @@
 #!/usr/bin/env bash
 
-# Copilot-backed entrypoint for the schema-v2 semantic-policy smoke.
-#
-# Production policy profiles can target pinned Copilot models directly. This
-# wrapper still starts a private zero-config Vekil bridge because the shared live
-# harness needs independently controllable static targets, fault injection, and
-# metadata-only capture. It selects live Chat-capable models from the Copilot
-# catalog, presents the bridge to scripts/live-policy-routing-smoke.sh as static
-# targets, then reuses it for Responses-native GPT-5.6 Luna utility low/high effort
-# validation.
-#
-# Required environment:
-#   COPILOT_GITHUB_TOKEN
-#
-# Optional model overrides must name models advertised by the bridge with native
-# /chat/completions support:
-#   LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL
-#   LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL
-#   LIVE_POLICY_ROUTING_COPILOT_POWERFUL_PRIMARY_MODEL
-#   LIVE_POLICY_ROUTING_COPILOT_POWERFUL_SECONDARY_MODEL
-#
-# Additional optional environment:
-#   PROXY_BIN                                  policy proxy binary; default ./vekil
-#   LIVE_POLICY_ROUTING_COPILOT_BRIDGE_BIN     bridge binary; defaults to PROXY_BIN
-#   LIVE_POLICY_ROUTING_HARNESS                delegated harness path
-#   LIVE_POLICY_ROUTING_RESPONSES_EFFORT_HARNESS  delegated Responses effort harness
-#   LIVE_POLICY_ROUTING_SMOKE_DIR              artifact directory
-#   LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=0       delete artifacts after success
-#   SMOKE_*                                     bounded timeout overrides
 
 set -euo pipefail
 
@@ -331,7 +303,6 @@ fetch_copilot_models() {
     [.data[]? | select((.supported_endpoints // []) | length == 0 or index("/chat/completions") != null)]
     | length >= 2
   ' "${BRIDGE_MODELS}" >/dev/null || die "Copilot bridge must advertise two native-Chat models for failover"
-  # Validate the focused check before the broad matrix sends paid requests.
   jq -e --arg model "${RESPONSES_MODEL}" '
     [.data[]?
       | select(.id == $model)
@@ -347,8 +318,6 @@ model_supports_chat() {
   jq -e --arg model "${model}" '
     .data[]?
     | select(.id == $model)
-    # Legacy Copilot Chat models list no endpoints; Vekil treats them as
-    # supporting every endpoint.
     | (.supported_endpoints // []) | length == 0 or index("/chat/completions") != null
   ' "${BRIDGE_MODELS}" >/dev/null
 }
@@ -383,8 +352,6 @@ select_copilot_models() {
     lightweight \
     "${LIVE_POLICY_ROUTING_COPILOT_LIGHTWEIGHT_MODEL:-}" \
     "" gpt-4.1)"
-  # The bounded classifier must emit its function call within 256 tokens.
-  # GPT-5-mini consumed that budget in reasoning; GPT-4.1 does not reason.
   selected_classifier="$(pick_copilot_model \
     classifier \
     "${LIVE_POLICY_ROUTING_COPILOT_CLASSIFIER_MODEL:-}" \
@@ -428,8 +395,6 @@ run_policy_harness() {
   primary_key="$(random_bridge_key)"
   secondary_key="$(random_bridge_key)"
 
-  # Haiku does not support reasoning effort. Omit it from both tiers and test
-  # profile-owned effort separately with the Responses-capable mini model.
   env -u COPILOT_GITHUB_TOKEN \
     -u LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT \
     -u LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT \

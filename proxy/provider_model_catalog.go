@@ -7,10 +7,6 @@ import (
 )
 
 const (
-	// maxProviderModelCatalogBodySize caps successful decoded /models payloads
-	// at 4 MiB. Real provider catalogs are metadata and normally far smaller;
-	// this still allows thousands of entries while bounding allocation after the
-	// HTTP transport has decompressed gzip or other supported encodings.
 	maxProviderModelCatalogBodySize = 4 << 20
 )
 

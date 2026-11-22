@@ -14,9 +14,6 @@ import (
 	"unicode/utf8"
 )
 
-// GPT models trained on ChatGPT browsing sometimes cite with private-use
-// markers such as "\ue200cite\ue202turn3view0\ue201" instead of Markdown.
-// ChatGPT renders them; Responses clients such as Codex print them raw.
 const (
 	citationMarkerStart    = "\ue200"
 	citationMarkerSep      = '\ue202'
@@ -24,12 +21,8 @@ const (
 	citationMarkerMaxBytes = 1024
 )
 
-// citationSourceHeader matches a ChatGPT browsing result header, as returned
-// by Codex's codex_apps web_run tool: "Title (URL)" followed by "【turnNviewN】".
 var citationSourceHeader = regexp.MustCompile(`(?m)^([^\n]*) \((https?://[^\s]+)\)\n【(turn\d+[a-z_]+\d+)】`)
 
-// citationTitleEscaper and citationURLEscaper keep links intact and from
-// splitting a Markdown table cell.
 var (
 	citationTitleEscaper = strings.NewReplacer(`\`, `\\`, "[", `\[`, "]", `\]`, "|", `\|`)
 	citationURLEscaper   = strings.NewReplacer("(", "%28", ")", "%29", "|", "%7C")
@@ -42,8 +35,6 @@ type citationLink struct {
 	url   string
 }
 
-// responsesCitationSources resolves cited ref IDs from browsing results in
-// the request input. It parses the body only once a marker appears.
 type responsesCitationSources struct {
 	once  sync.Once
 	body  []byte
@@ -58,9 +49,6 @@ func withResponsesCitationSources(req *http.Request, path string, body []byte) *
 	return req.WithContext(context.WithValue(req.Context(), responsesCitationSourcesContextKey{}, sources))
 }
 
-// responsesOutputTextMustStayExact reports structured output, which a Markdown
-// link could make invalid JSON, and output logprobs, which describe the
-// original tokens. The byte check keeps large replays from being decoded.
 func responsesOutputTextMustStayExact(body []byte) bool {
 	if !bytes.Contains(body, []byte("json_schema")) && !bytes.Contains(body, []byte("json_object")) &&
 		!bytes.Contains(body, []byte("message.output_text.logprobs")) {
@@ -85,9 +73,6 @@ func responsesOutputTextMustStayExact(body []byte) bool {
 	return json.Unmarshal(request.Include, &include) == nil && slices.Contains(include, "message.output_text.logprobs")
 }
 
-// normalizeResponsesCitationMarkers rewrites cite markers in a successful
-// Responses passthrough stream to Markdown links. Unresolved markers are
-// removed; other private-use markers are left unchanged.
 func normalizeResponsesCitationMarkers(req *http.Request, resp *http.Response) {
 	if req == nil {
 		return
@@ -96,7 +81,6 @@ func normalizeResponsesCitationMarkers(req *http.Request, resp *http.Response) {
 	if sources == nil {
 		return
 	}
-	// The typed Chat adapter consumes Responses events directly.
 	if responsesChat, _ := req.Context().Value(responsesChatStreamContextKey{}).(bool); responsesChat {
 		return
 	}
@@ -162,9 +146,6 @@ func citationToolOutputTexts(raw json.RawMessage) []string {
 	return texts
 }
 
-// appendCitationTexts adds text plus any browsing results JSON-encoded in it.
-// Codex code mode returns MCP results as serialized CallToolResult JSON, and
-// other serializers may escape the brackets as \u3010.
 func appendCitationTexts(texts []string, text string) []string {
 	if !strings.Contains(text, "【turn") && !strings.Contains(text, `\u3010turn`) {
 		return texts
@@ -199,16 +180,10 @@ func appendCitationTexts(texts []string, text string) []string {
 	return texts
 }
 
-// citationEdit records that runes [start, end) of the original text became
-// length runes of rewritten text.
 type citationEdit struct {
 	start, end, length int
 }
 
-// rewriteCitationMarkers replaces complete cite markers in text and reports
-// each replacement. Unless final, a trailing partial marker is returned
-// separately so a stream can hold it until the next delta. A final text drops
-// it like an unresolved marker, so holding never changes the result.
 func rewriteCitationMarkers(text string, final bool, lookup func(string) (citationLink, bool)) (string, string, []citationEdit) {
 	if !strings.Contains(text, citationMarkerStart) {
 		return text, "", nil
@@ -247,9 +222,6 @@ func rewriteCitationMarkers(text string, final bool, lookup func(string) (citati
 	}
 }
 
-// parseCitationMarker reads "\ue200cite(\ue202REF)+\ue201" at the start of
-// text. It reports the marker length when complete, len(text) when text is a
-// bounded prefix of one, and 0 when text cannot start a cite marker.
 func parseCitationMarker(text string) ([]string, int, bool) {
 	rest := text[len(citationMarkerStart):]
 	if !strings.HasPrefix(rest, "cite") {
@@ -259,8 +231,6 @@ func parseCitationMarker(text string) ([]string, int, bool) {
 		return nil, 0, false
 	}
 	var refs []string
-	// refStart is the byte offset of the current ref, or -1 before the first
-	// separator.
 	refStart := -1
 	offset := len(citationMarkerStart) + len("cite")
 	for i, r := range text[offset:] {
@@ -271,7 +241,6 @@ func parseCitationMarker(text string) ([]string, int, bool) {
 		switch {
 		case refStart >= 0 && citationRefRune(r):
 		case refStart == pos:
-			// A separator or end marker needs a nonempty ref before it.
 			return nil, 0, false
 		case r == citationMarkerSep:
 			if refStart >= 0 {
@@ -314,9 +283,6 @@ func formatCitationLinks(refs []string, lookup func(string) (citationLink, bool)
 	return strings.Join(links, ", ")
 }
 
-// mapCitationOffset moves a rune offset in the original text to the rewritten
-// text. An offset inside a replaced marker moves to the replacement's end if
-// it ends a range, else to its start.
 func mapCitationOffset(offset int, edits []citationEdit, rangeEnd bool) int {
 	shift := 0
 	for _, edit := range edits {
@@ -334,9 +300,6 @@ func mapCitationOffset(offset int, edits []citationEdit, rangeEnd bool) int {
 	return offset + shift
 }
 
-// remapCitationAnnotation keeps an annotation's range, such as a url_citation's
-// start_index and end_index, on the same text after markers are rewritten.
-// Offsets are counted in code points.
 func remapCitationAnnotation(raw json.RawMessage, edits []citationEdit) (json.RawMessage, bool) {
 	var annotation map[string]json.RawMessage
 	if len(edits) == 0 || json.Unmarshal(raw, &annotation) != nil || annotation == nil {
@@ -393,8 +356,6 @@ type citationTextKey struct {
 	contentIndex int
 }
 
-// citationTextState tracks one streamed output text. consumed counts the
-// original runes before held, and edits use original-text offsets.
 type citationTextState struct {
 	held     string
 	consumed int
@@ -407,7 +368,6 @@ type responsesCitationRewriter struct {
 }
 
 func (r *responsesCitationRewriter) rewriteEvent(raw []byte) ([]byte, bool) {
-	// Text events always pass so streamed annotation offsets can be remapped.
 	if !containsCitationMarkerStart(raw) && !bytes.Contains(raw, []byte("response.output_text.")) {
 		return raw, false
 	}
@@ -419,7 +379,6 @@ func containsCitationMarkerStart(raw []byte) bool {
 }
 
 func (r *responsesCitationRewriter) rewrite(data []byte, eventName string) ([]byte, bool) {
-	// Preserve ambiguous bytes for the downstream durable state validator.
 	if validateUnambiguousResponsesJSON(data) != nil {
 		return data, false
 	}
@@ -437,7 +396,6 @@ func (r *responsesCitationRewriter) rewrite(data []byte, eventName string) ([]by
 		changed = r.rewriteDelta(event)
 	case "response.output_text.done":
 		if state := r.textState(event); state != nil {
-			// The final text drops a held partial marker too.
 			state.held = ""
 		}
 		_, changed = rewriteCitationJSONString(event, "text", r.sources.lookup)
@@ -517,8 +475,6 @@ func (r *responsesCitationRewriter) rewriteDelta(event map[string]json.RawMessag
 	return true
 }
 
-// remapStreamedAnnotation remaps an annotation with the edits made so far to
-// its output text.
 func (r *responsesCitationRewriter) remapStreamedAnnotation(event map[string]json.RawMessage) bool {
 	state := r.textState(event)
 	if state == nil {

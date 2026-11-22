@@ -14,11 +14,6 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// handlePolicyResponses serves the bounded, stateless Responses compatibility
-// surface used by Responses-only agent clients such as Codex. Policy selection
-// still consumes canonical Chat facts; the selected terminal may execute native
-// Chat or bounded Chat-over-Responses while the public ingress and egress remain
-// Responses.
 func (h *ProxyHandler) handlePolicyResponses(w http.ResponseWriter, r *http.Request, body []byte, canonicalPublicID string) {
 	ensurePolicyLocalRequestIdentity(w, r, canonicalPublicID)
 	requestedModel := extractResponsesRequestModel(body)

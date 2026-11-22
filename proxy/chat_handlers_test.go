@@ -393,7 +393,6 @@ func TestPrepareOpenAIChatCompletionsRequest_ClientStreamGetsIncludeUsage(t *tes
 }
 
 func TestPrepareOpenAIChatCompletionsRequest_ClientStreamOptionsPreserved(t *testing.T) {
-	// Client already set stream_options — we must not clobber it.
 	input := []byte(`{"model":"gpt-4.1","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"hi"}]}`)
 
 	prepared, mode := prepareOpenAIChatCompletionsRequest(input)
@@ -711,10 +710,6 @@ func TestInspectOpenAIChatErrorWithEmbeddedProgressIsNotReplaySafe(t *testing.T)
 	}
 }
 
-// A carrier is vekil's own state and Anthropic is a different provider. Carrier extraction sits
-// AFTER the direct-forward early return, so a client that keeps our thinking block and switches
-// to a natively-Anthropic model used to forward Copilot's reasoning ciphertext -- and a
-// signature Anthropic never issued -- straight to Anthropic.
 func TestHandleAnthropicMessagesDirectStripsVekilCarriers(t *testing.T) {
 	var raw json.RawMessage
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -742,8 +737,6 @@ func TestHandleAnthropicMessagesDirectStripsVekilCarriers(t *testing.T) {
 		t.Fatalf("NewProxyHandler() error = %v", err)
 	}
 
-	// One assistant turn holding a carrier beside real content, and one holding only a carrier
-	// -- the orphan shape a client produces when it splits a parallel group.
 	body := `{"model":"claude-sonnet-5","max_tokens":64,"Messages":[
 		{"role":"user","content":"go"},
 		{"Role":"assistant","Content":[
@@ -769,8 +762,6 @@ func TestHandleAnthropicMessagesDirectStripsVekilCarriers(t *testing.T) {
 	if strings.Contains(string(raw), reasoningCarrierPrefix) {
 		t.Fatalf("a vekil carrier reached Anthropic: %s", string(raw))
 	}
-	// The turn that had real content keeps it; the one that was only a carrier is gone, which
-	// is the transcript the client would have sent if vekil had never injected anything.
 	var forwarded models.AnthropicRequest
 	if err := json.Unmarshal(raw, &forwarded); err != nil {
 		t.Fatal(err)
@@ -781,10 +772,6 @@ func TestHandleAnthropicMessagesDirectStripsVekilCarriers(t *testing.T) {
 	if !strings.Contains(string(forwarded.Messages[1].Content), "working") {
 		t.Fatalf("stripping removed the assistant's real content: %s", string(forwarded.Messages[1].Content))
 	}
-	// Dropping a carrier-only turn can leave two user messages adjacent. That is the shape the
-	// client would have had without vekil's injection, and it is strictly better than the two
-	// alternatives -- forwarding an empty content array, or forwarding our carrier. Like
-	// everything else here it is not asserted against live Anthropic.
 	if forwarded.Messages[2].Role != "user" || forwarded.Messages[3].Role != "user" {
 		t.Fatalf("expected the two trailing user turns to survive: %s", string(raw))
 	}

@@ -15,7 +15,7 @@ SPARKLE_DOWNLOAD_URL := https://github.com/sparkle-project/Sparkle/releases/down
 SPARKLE_FEED_URL ?= https://github.com/sozercan/vekil/releases/latest/download/appcast.xml
 SPARKLE_PUBLIC_ED_KEY ?=
 PYTHON ?= python3
-COMMENT_BASE ?= HEAD
+COMMENT_BASE ?=
 
 .PHONY: build build-app build-tray-linux test-app test compaction-lab vet lint lint-comments clean docker-build docker-build-rtk docker-rtk-e2e
 
@@ -110,7 +110,7 @@ vet:
 lint: vet lint-comments
 
 lint-comments:
-	"$(PYTHON)" scripts/comment-lint.py --base "$(COMMENT_BASE)"
+	"$(PYTHON)" scripts/comment-lint.py $(if $(COMMENT_BASE),--base "$(COMMENT_BASE)")
 
 clean:
 	rm -f $(BINARY) $(TRAY_LINUX_BINARY)

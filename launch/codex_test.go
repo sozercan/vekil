@@ -201,8 +201,6 @@ func TestCodexAdapterProviderIDIsStableAcrossLaunches(t *testing.T) {
 	first := prepare("http://127.0.0.1:43210/", "first-launch-token")
 	second := prepare("http://127.0.0.1:54321/", "second-launch-token")
 
-	// Codex refuses to resume a session whose recorded model_provider is no
-	// longer configured, so every launch must register the same provider ID.
 	for _, prepared := range []PreparedProcess{first, second} {
 		if !containsString(prepared.Args, `model_provider="vekil_launch"`) {
 			t.Fatalf("Codex args missing stable provider: %#v", prepared.Args)

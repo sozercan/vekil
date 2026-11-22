@@ -101,9 +101,6 @@ type startupOperationResult[T any] struct {
 	err   error
 }
 
-// Run starts proxy, validates a requested model when one is provided, prepares
-// the agent process, supervises it, prints a session summary, and tears
-// everything down. An empty model delegates selection to the agent CLI.
 func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (result Result, returnErr error) {
 	if parent == nil {
 		parent = context.Background()
@@ -248,8 +245,6 @@ func Run(parent context.Context, proxy Proxy, adapter Adapter, opts Options) (re
 	var webSearchMCPURL string
 	copilotAbsent := false
 	if consumer, ok := adapter.(webSearchMCPAdapter); ok && consumer.usesWebSearchMCP() {
-		// Search is optional: probe under the run context with the probe's own
-		// timeout so a slow probe cannot spend the startup deadline.
 		probe, probeErr := runStartupOperation(runCtx, proxy.Done(), func(ctx context.Context) (webSearchMCPProbe, error) {
 			return probeWebSearchMCP(ctx, baseURL, localToken), nil
 		})
@@ -454,9 +449,6 @@ func runStartupOperation[T any](
 		var zero T
 		return zero, fmt.Errorf("launch proxy failed before agent start: %w", normalizedProxyDoneError(proxyErr, ok))
 	case <-ctx.Done():
-		// operationCtx is derived from ctx, which is already done. Let the parent
-		// cancellation propagate so a deadline cause is not downgraded to the
-		// explicit context.Canceled produced by cancel().
 		result := <-resultCh
 		if result.err != nil {
 			return result.value, result.err
@@ -551,15 +543,11 @@ func fetchModels(ctx context.Context, baseURL, localToken string) ([]ModelInfo, 
 }
 
 type webSearchMCPProbe struct {
-	url string
-	// copilotAbsent is set only when the proxy answered 404: no Copilot
-	// provider serves this session.
+	url           string
 	copilotAbsent bool
 	err           error
 }
 
-// probeWebSearchMCP asks the launch proxy's web search MCP endpoint for its
-// tools. The URL is set only when tools/list offers web_search.
 func probeWebSearchMCP(ctx context.Context, baseURL, localToken string) webSearchMCPProbe {
 	requestCtx, cancel := context.WithTimeout(ctx, webSearchProbeTimeout)
 	defer cancel()

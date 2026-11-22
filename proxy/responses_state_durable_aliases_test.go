@@ -15,7 +15,6 @@ import (
 func TestDurableResponsesJSONDepthLimit(t *testing.T) {
 	for _, depth := range []int{1000, 9999, 10000, 250000} {
 		t.Run(fmt.Sprint(depth), func(t *testing.T) {
-			// The root Response object consumes one of JSON's 10,000 levels.
 			body := []byte(durableNestedResponseFixture(depth, "0"))
 			err := validateUnambiguousResponsesJSON(body)
 			if (err == nil) != (depth < 10000) {

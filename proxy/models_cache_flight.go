@@ -23,9 +23,6 @@ func (c *modelsCache) nowTime() time.Time {
 	return time.Now()
 }
 
-// doFlight shares one model-catalog refresh per cache key. The leader performs
-// work on its caller-supplied lifecycle context; waiters may stop waiting on
-// their own request context without canceling that shared refresh.
 func (c *modelsCache) doFlight(waitCtx context.Context, key string, fn func() modelsCacheFlightResult) modelsCacheFlightResult {
 	if waitCtx == nil {
 		waitCtx = context.Background()

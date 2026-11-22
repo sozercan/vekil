@@ -2,7 +2,6 @@
 
 set -euo pipefail
 
-# Mock upstream usage must not appear as real live usage in the CI summary.
 unset GITHUB_STEP_SUMMARY
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -32,8 +32,6 @@ type inboundAuthServer struct {
 	logs     func() string
 }
 
-// startInboundAuthServer runs the real binary against a local static provider.
-// Only the supplied environment and an isolated token dir are visible to it.
 func startInboundAuthServer(t *testing.T, binary string, env map[string]string, envFile string) inboundAuthServer {
 	t.Helper()
 	var calls atomic.Int32
@@ -183,8 +181,8 @@ func TestServeInboundAuthTokenFromEnvironment(t *testing.T) {
 		name    string
 		env     map[string]string
 		envFile string
-		token   string // token clients must present; empty means public
-		reject  string // inherited value that must not work
+		token   string
+		reject  string
 	}{
 		{name: "unset"},
 		{name: "whitespace", env: map[string]string{"INBOUND_AUTH_TOKEN": " \t "}},

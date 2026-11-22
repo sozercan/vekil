@@ -38,9 +38,7 @@ type responsesChatJSONEnvelope struct {
 		Type    string `json:"type"`
 		Code    string `json:"code"`
 		Message string `json:"message"`
-		// Copilot puts the offending field here on a terminal failure. Without it a
-		// post-commit failure records a type and a code and no idea where.
-		Param string `json:"param"`
+		Param   string `json:"param"`
 	} `json:"error"`
 	IncompleteDetails *struct {
 		Reason string `json:"reason"`
@@ -96,8 +94,6 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 				if err := validateResponsesChatReasoningStatus(envelope.Status, header.Status); err != nil {
 					return responsesChatJSONResult{}, err
 				}
-				// Hidden from Chat. Exact bytes are retained only when a later
-				// function-call group is published for replay.
 			case "message":
 				if err := validateResponsesChatMessageStatus(envelope.Status, header.Status); err != nil {
 					return responsesChatJSONResult{}, err
@@ -152,8 +148,6 @@ func translateResponsesJSONToChat(body []byte, options responsesChatResponseOpti
 			attachChatExecutionErrorUsage(replayErr, usage)
 			return responsesChatJSONResult{}, replayErr
 		}
-		// Chat-style surfaces intentionally do not run command_rewrite; they preserve
-		// upstream arguments and only capture tool context for later output reduction.
 		publishCalls := make([]responsesChatReplayPublishCall, len(functionCalls))
 		for i, call := range functionCalls {
 			publishCalls[i] = responsesChatReplayPublishCall{

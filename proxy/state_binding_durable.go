@@ -16,11 +16,6 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// DurableStateBindingsConfig enables local, single-writer ownership recovery.
-// Path must name a private file in an existing owner-only directory. MaxEntries
-// limits logical records (including tombstones), NOT database-file bytes.
-// Records never expire automatically. Empty Path uses the private application-data
-// location when MaxEntries is set. An entirely empty option leaves defaults intact.
 type DurableStateBindingsConfig struct {
 	Path       string
 	MaxEntries int
@@ -51,23 +46,16 @@ var durableStateMetadata = []byte("metadata")
 var durableStateRecords = []byte("bindings")
 var durableStateFormat = []byte("vekil-state-v1")
 
-// Fixed records contain outcome, three keyed owner components, issuance time,
-// and a MAC over both the typed key and record. They retain no raw state or
-// account/configuration labels. The MAC detects wrong keys and record corruption.
 const durableStateRecordSize = 1 + 3*sha256.Size + 8 + sha256.Size
 
 type durableStateBindings struct {
-	mu sync.Mutex
-	db *bolt.DB
-	// file is the same descriptor owned and closed by bbolt. It supplies stats
-	// for the open inode even if its original path is renamed or replaced.
-	file       *os.File
-	key        [32]byte
-	maxEntries int
-	now        func() time.Time
-	failed     error
-	// Test barriers surround the real, synchronously committed transaction.
-	// Production never installs hooks or disables bbolt's data/meta syncs.
+	mu           sync.Mutex
+	db           *bolt.DB
+	file         *os.File
+	key          [32]byte
+	maxEntries   int
+	now          func() time.Time
+	failed       error
 	beforeCommit func() error
 	afterCommit  func() error
 }
@@ -100,11 +88,6 @@ func openDurableStateBindingStore(config DurableStateBindingsConfig, allowCreate
 	return &stateBindingStore{durable: d, maxEntries: config.MaxEntries, digestKey: d.key, now: time.Now}, nil
 }
 
-// PruneDurableStateBindings explicitly retires records first issued (or marked
-// conflicting) before the cutoff. It takes the same exclusive process lock as
-// serving, never creates a missing store, and does not shrink the database file.
-// Pruned continuation state becomes unknown. No credentials/providers are loaded.
-// The cutoff must be a whole second, matching the persisted issuance precision.
 func PruneDurableStateBindings(path string, before time.Time) (removed int, err error) {
 	if before.IsZero() || before.Unix() <= 0 || before.Nanosecond() != 0 || before.After(time.Now()) {
 		return 0, errDurableStateConfig
@@ -139,8 +122,6 @@ func PruneDurableStateBindings(path string, before time.Time) (removed int, err 
 }
 
 func (d *durableStateBindings) initialize(created bool) (err error) {
-	// Invalid bbolt pages may panic during validation. Never replace an existing
-	// store with an empty one, or expose a partially validated index.
 	defer func() {
 		if recover() != nil {
 			err = errDurableStateCorrupt
@@ -328,8 +309,6 @@ func (d *durableStateBindings) resolveWithRoute(tokens []stateBindingToken, rout
 			if err != nil {
 				return err
 			}
-			// Check persisted keyed owners inside this same snapshot, before
-			// missing proof can erase a proven route/target disagreement.
 			if next.outcome == stateBindingLookupConflict ||
 				(routeID != "" && next.owner.routeKey != routeKey) ||
 				(pinnedTargetID != "" && next.owner.targetKey != targetKey) ||
@@ -369,9 +348,6 @@ func (d *durableStateBindings) bind(tokens []stateBindingToken, owner stateBindi
 		return stateBindingLookupResult{err: errDurableStateClosed}
 	}
 	result := stateBindingLookupResult{outcome: stateBindingLookupKnown, owner: owner}
-	// Replayed history commonly repeats already committed proof on every event.
-	// With the process lock and d.mu held, a read-only match needs no transaction
-	// write or fsync; only first issuance/collision can change durable authority.
 	unchanged := true
 	err = d.db.View(func(tx *bolt.Tx) error {
 		for _, key := range keys {
@@ -417,15 +393,11 @@ func (d *durableStateBindings) bind(tokens []stateBindingToken, owner stateBindi
 			if err != nil {
 				return err
 			}
-			// Conversation claiming returns the prior exact owner, never a
-			// tombstone, when another request won the atomic bootstrap race.
 			if claim {
 				result = prior
 				return nil
 			}
 			if prior.outcome == stateBindingLookupConflict {
-				// Keep the first conflict time for offline pruning. Reobserving
-				// a tombstone cannot restore authority or refresh its age.
 				hasConflict = true
 				continue
 			}
@@ -446,8 +418,6 @@ func (d *durableStateBindings) bind(tokens []stateBindingToken, owner stateBindi
 				return errDurableStateCapacity
 			}
 			for _, key := range keys {
-				// No TTL refresh is needed; repeated observation preserves the
-				// original issuance time for explicit offline pruning.
 				if records.Get(key) == nil {
 					if err := records.Put(key, d.encode(key, owner, stateBindingLookupKnown, d.now())); err != nil {
 						return err

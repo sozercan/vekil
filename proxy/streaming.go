@@ -32,10 +32,6 @@ func newLifecycleAwareReadCloser(body io.ReadCloser, ctx context.Context) *lifec
 
 func (r *lifecycleAwareReadCloser) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
-	// HTTP/2 response bodies may collapse a request cancel cause to plain
-	// context.Canceled. Consult the request context only for that exact class of
-	// read failure; EOF, resets, and deadlines remain provider failures even if
-	// shutdown races immediately afterward.
 	if lifecycleCancellationAtReadFailure(r.ctx, err) {
 		r.cancellationAtFailure.Store(true)
 	}
@@ -113,7 +109,6 @@ func (w *commitTrackingResponseWriter) Flush() {
 	}
 }
 
-// bufPool reduces GC pressure by reusing bytes.Buffer instances for JSON encoding.
 var bufPool = sync.Pool{
 	New: func() interface{} { return new(bytes.Buffer) },
 }
@@ -128,7 +123,6 @@ func writeSSEEvent(w http.ResponseWriter, eventType string, data interface{}) er
 	if err := enc.Encode(data); err != nil {
 		return err
 	}
-	// Encode adds a trailing newline; trim it for SSE format
 	b := bytes.TrimRight(buf.Bytes(), "\n")
 	_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, b)
 	if err != nil {
@@ -305,8 +299,6 @@ func classifyOpenAIChatChunkProgress(raw map[string]json.RawMessage) upstreamSem
 		}
 	}
 	if usage, ok := raw["usage"]; ok && !rawJSONIsNullOrEmpty(usage) {
-		// A usage frame proves the attempt reached provider-side accounting. Even an
-		// otherwise empty usage-only chunk is therefore beyond a replay-safe preamble.
 		return upstreamProgressTerminalSuccess
 	}
 	if usage, ok := raw["copilot_usage"]; ok && !rawJSONIsNullOrEmpty(usage) {
@@ -361,7 +353,6 @@ func classifyOpenAIChatDeltaProgress(delta map[string]json.RawMessage) upstreamS
 	for key, value := range delta {
 		switch key {
 		case "role":
-			// Role-only chunks are the OpenAI chat preamble equivalent.
 		case "tool_calls", "function_call":
 			if !rawJSONIsNullOrEmpty(value) {
 				progress = mergeUpstreamSemanticProgress(progress, upstreamProgressToolActivity)
@@ -822,7 +813,6 @@ func consumeOpenAIStreamChunksWithProgress(r io.Reader, onChunk func(models.Open
 	return sawDone, progress, nil
 }
 
-// flushWriter wraps an http.ResponseWriter and flushes after every Write.
 type flushWriter struct {
 	w         http.ResponseWriter
 	flusher   http.Flusher
@@ -841,9 +831,6 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	}
 	n, err := fw.w.Write(p)
 	if err != nil {
-		// Record that the failure came from writing to the client (e.g. the client
-		// disconnected) so callers can distinguish a client-side error from an
-		// upstream/source read error on an io.Copy.
 		fw.writeErr = err
 		return n, err
 	}
@@ -853,14 +840,10 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// StreamOpenAIPassthrough streams OpenAI SSE bytes directly to the client.
 func StreamOpenAIPassthrough(w http.ResponseWriter, body io.ReadCloser) {
 	StreamOpenAIPassthroughWithFinalResponse(w, body, nil)
 }
 
-// StreamOpenAIPassthroughWithFinalResponse streams OpenAI SSE lines to the
-// client and optionally invokes onFinalResponse with the complete aggregated
-// OpenAI response after the upstream stream terminates successfully with [DONE].
 func StreamOpenAIPassthroughWithFinalResponse(
 	w http.ResponseWriter,
 	body io.ReadCloser,
@@ -870,13 +853,6 @@ func StreamOpenAIPassthroughWithFinalResponse(
 	streamOpenAIPassthrough(w, body, false, nil, onFinalResponse, nil, false, streamLifecycleHooks{}, onUsageCallbacks...)
 }
 
-// StreamOpenAIPassthroughDroppingInjectedUsage behaves like
-// StreamOpenAIPassthroughWithFinalResponse but omits the upstream's final
-// usage-only chunk (empty choices + non-nil usage) from the client stream while
-// still feeding that usage to the callbacks. It is used when the proxy injected
-// stream_options.include_usage on a client stream that did not opt in, so token
-// stats are captured without forwarding a terminal chunk the client never
-// requested (clients indexing choices[0] on every chunk would otherwise break).
 func StreamOpenAIPassthroughDroppingInjectedUsage(
 	w http.ResponseWriter,
 	body io.ReadCloser,
@@ -886,16 +862,6 @@ func StreamOpenAIPassthroughDroppingInjectedUsage(
 	streamOpenAIPassthrough(w, body, true, nil, onFinalResponse, nil, false, streamLifecycleHooks{}, onUsageCallbacks...)
 }
 
-// StreamOpenAIChatPassthrough forwards an OpenAI chat SSE stream to the client
-// like StreamOpenAIPassthroughWithFinalResponse, additionally invoking onError
-// (with the failure's HTTP status) when a post-commit upstream error event
-// (event: error / data: {"error":...}), an upstream read error, or a premature
-// end is seen, and dropping the proxy-injected usage-only chunk when
-// dropInjectedUsage is set. onError receives the classified status (e.g. 429 for
-// a rate limit) or 502 for a generic transport break. It is the entry point for
-// the client-facing /v1/chat/completions streaming path, where the request must
-// be recorded as a failure if the stream errors after its 200 header was
-// committed. onError is never invoked for a client-side write failure.
 func StreamOpenAIChatPassthrough(
 	w http.ResponseWriter,
 	body io.ReadCloser,
@@ -965,14 +931,6 @@ func streamExplicitRouteOpenAIChatPassthroughWithLifecycle(
 	streamOpenAIPassthrough(w, body, dropInjectedUsage, onError, onFinalResponse, transform, true, lifecycle, onUsageCallbacks...)
 }
 
-// streamOpenAIPassthrough forwards an upstream OpenAI SSE stream to the client.
-// It buffers each SSE event (its raw lines up to and including the terminating
-// blank line) and flushes the event as a unit once complete; SSE clients do not
-// dispatch an event before its blank-line terminator, so this is byte-identical
-// to a line-immediate copy for the client. Buffering by event is what lets the
-// dropInjectedUsage path decide whether to emit an event after parsing it: when
-// set, a usage-only chunk (empty choices + usage) is fed to the usage/final
-// callbacks but not written to the client.
 type openAIStreamDataTransformer func(eventType, data string) (string, bool)
 
 func streamOpenAIPassthrough(
@@ -995,11 +953,6 @@ func streamOpenAIPassthrough(
 		}
 	}()
 	setSSEHeaders(w)
-	// This is a streamed SSE response, so any upstream Content-Length copied by
-	// the caller (via copyPassthroughHeaders) is wrong — and definitely wrong on
-	// the drop-injected-usage path, which writes fewer bytes than the upstream
-	// advertised. Drop it so clients read until EOF instead of hanging on or
-	// truncating at a stale length.
 	w.Header().Del("Content-Length")
 
 	var flusher http.Flusher
@@ -1027,10 +980,6 @@ func streamOpenAIPassthrough(
 			return false
 		}
 
-		// A post-commit upstream error (event: error or data: {"error":...})
-		// arrives after the HTTP 200; surface it so the request is recorded as a
-		// failure even though the client already received a 200 header, with the
-		// error's classified status (e.g. 429 for a rate limit) rather than 502.
 		if streamErr, isErr := parseOpenAIStreamError(eventType, data); isErr {
 			if transformData != nil {
 				if transformed, changed := transformData(eventType, data); changed {
@@ -1071,8 +1020,6 @@ func streamOpenAIPassthrough(
 				if rawJSONIsNullOrEmpty(chunk.CopilotUsage) {
 					dropCurrent = true
 				} else {
-					// Standard usage may be injected for local accounting, but a
-					// shared frame can also carry upstream billing metadata.
 					var payload map[string]json.RawMessage
 					if json.Unmarshal([]byte(data), &payload) == nil {
 						delete(payload, "usage")
@@ -1135,12 +1082,6 @@ streamLoop:
 				reportOversized()
 				return
 			}
-			// A single SSE line exceeded the parse buffer (e.g. a very large
-			// tool-call argument). The returned bytes are valid but the line is
-			// truncated for parsing, so flush everything buffered for this event
-			// plus the partial line and forward the remainder of this event raw.
-			// Once the event boundary arrives, resume parsed event buffering so
-			// later usage-only chunks injected by this proxy can still be dropped.
 			for _, l := range pending {
 				if _, werr := io.WriteString(w, l); werr != nil {
 					return
@@ -1196,9 +1137,6 @@ streamLoop:
 			if err == io.EOF {
 				break
 			}
-			// Any other non-EOF read error after the 200 was committed is a broken
-			// stream (upstream reset / transport error); surface it as a failure
-			// unless an error event already reported a (more specific) status.
 			if lifecycle.suppressTransportCancellation(trackedWriter.committed) {
 				return
 			}
@@ -1214,9 +1152,6 @@ streamLoop:
 		return
 	}
 	if sawDone || sawTerminalError {
-		// Consume the normal HTTP response EOF (including any bytes already held by
-		// reader) before closing so HTTP/1.x keep-alive remains reusable. A held-open
-		// upstream is still bounded by upstreamErrorDetailDrainTimeout.
 		drainReaderAndClose(reader, body)
 		bodyHandled = true
 	}
@@ -1224,8 +1159,6 @@ streamLoop:
 		return
 	}
 	if !sawDone {
-		// The stream ended (EOF) without a [DONE] sentinel: the upstream closed
-		// the connection prematurely, so the client received a truncated stream.
 		if lifecycle.suppressTransportCancellation(trackedWriter.committed) {
 			return
 		}
@@ -1293,11 +1226,6 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 		flusher = f
 	}
 
-	// Tap each SSE frame for Anthropic usage so direct-routed streaming traffic
-	// records tokens. The tap never alters the bytes written to the client. Also
-	// record a failure status when the stream carries an Anthropic error frame or
-	// the upstream read breaks, so a post-commit failure is not counted as a 2xx
-	// success (client-side write failures are excluded — they are client aborts).
 	usage := &anthropicStreamUsageAccumulator{}
 	defer usage.flush(ctx)
 	lifecycle := streamLifecycleHooks{}
@@ -1317,9 +1245,6 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 	}
 
 	if publicModel == "" || publicModel == upstreamModel {
-		// No model rewrite: preserve the original byte-exact, unbounded passthrough
-		// (io.Copy handles SSE lines of any size) while teeing the bytes through a
-		// best-effort usage/error sniffer. The sniffer skips lines it cannot buffer.
 		sniffer := newAnthropicUsageSniffWriter(observeData)
 		fw := &flushWriter{w: w, flusher: flusher}
 		handleLifecycleCancellation := func() bool {
@@ -1333,10 +1258,6 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 			if lifecycle.suppressStats != nil {
 				lifecycle.suppressStats()
 			}
-			// The byte-exact path cannot retract arbitrary partial bytes already sent
-			// to the client. Only append a new SSE event when the stream is currently
-			// at a safe frame boundary; otherwise end the connection without making
-			// the partial frame publishable or adding a contradictory terminal event.
 			if !sniffer.bytesSeen || anthropicSSETailEndsFrame(sniffer.tail) {
 				emitShutdownError()
 			}
@@ -1346,9 +1267,6 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 			if sniffer.sawTerminalEvent {
 				return
 			}
-			// io.Copy failed: distinguish a client-side write error (client gone,
-			// recorded on the flushWriter) from an upstream read break. Only an
-			// upstream read break is an upstream failure.
 			if fw.writeErr == nil && handleLifecycleCancellation() {
 				return
 			}
@@ -1359,8 +1277,6 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 			if handleLifecycleCancellation() {
 				return
 			}
-			// Clean EOF before Anthropic's terminal message_stop means the upstream
-			// stream was truncated even though the transport closed without error.
 			observeResponseFailureStatus(ctx, http.StatusBadGateway)
 		}
 		return
@@ -1425,11 +1341,8 @@ func streamAnthropicPassthroughBody(ctx context.Context, w http.ResponseWriter, 
 			}
 			if ctx.Err() == nil && !clientWriteFailed {
 				if err != io.EOF {
-					// Upstream read error after the 200 was committed: a broken stream.
 					observeResponseFailureStatus(ctx, http.StatusBadGateway)
 				} else if !sawTerminalEvent {
-					// Clean EOF before Anthropic's terminal message_stop is still a
-					// truncated stream.
 					observeResponseFailureStatus(ctx, http.StatusBadGateway)
 				}
 			}
@@ -1448,11 +1361,6 @@ func anthropicStreamDataIsMessageStop(data []byte) bool {
 	return strings.TrimSpace(event.Type) == "message_stop"
 }
 
-// anthropicUsageSniffWriter scans an Anthropic SSE byte stream for usage (and
-// error frames) as it is copied to the client. It buffers a single SSE line at a
-// time and, on each complete data line, feeds the payload to the onData callback.
-// A line longer than the buffer cap is skipped so the sniffer never affects the
-// client copy or grows unbounded.
 type anthropicUsageSniffWriter struct {
 	onData            func([]byte)
 	line              []byte
@@ -1508,7 +1416,6 @@ func (s *anthropicUsageSniffWriter) Write(p []byte) (int, error) {
 			continue
 		}
 		if len(s.line) >= openAIStreamScannerMaxBuffer {
-			// Pathological oversized line: stop buffering it, skip its usage.
 			s.overflow = true
 			s.line = s.line[:0]
 			continue
@@ -1592,17 +1499,10 @@ func splitSSELineEnding(line string) (string, string) {
 	}
 }
 
-// StreamOpenAIToAnthropic translates an OpenAI SSE stream into Anthropic SSE format.
 func StreamOpenAIToAnthropic(w http.ResponseWriter, body io.ReadCloser, model string, requestID string) {
 	StreamOpenAIToAnthropicWithFinalResponse(w, body, model, requestID, nil, nil)
 }
 
-// StreamOpenAIToAnthropicWithFinalResponse translates an OpenAI SSE stream into
-// Anthropic SSE format and optionally invokes onFinalResponse with the complete
-// aggregated OpenAI response after the translated stream finishes successfully.
-// onError, when non-nil, is invoked if the upstream stream errors or ends before
-// [DONE] after the SSE headers were already committed, so the request can be
-// recorded as a failure even though its HTTP status was sent as 200.
 func StreamOpenAIToAnthropicWithFinalResponse(
 	w http.ResponseWriter,
 	body io.ReadCloser,
@@ -1639,9 +1539,6 @@ func streamOpenAIToAnthropicWithLifecycle(
 		if !lifecycle.suppressTransportCancellation(trackedWriter.committed) {
 			return false
 		}
-		// message_start is intentionally eager for Anthropic TTFB. Once it has
-		// committed the stream, shutdown must terminate it with a valid Anthropic
-		// error event rather than attempting an HTTP 503 or leaving it truncated.
 		if trackedWriter.committed && !state.clientWriteFailed {
 			state.emitShutdownError()
 		}
@@ -1672,8 +1569,6 @@ func streamOpenAIToAnthropicWithLifecycle(
 			if !startStream() {
 				return
 			}
-			// A genuine upstream error event/read error: record the classified
-			// failure status (not on a client-side write abort).
 			if onError != nil && !state.clientWriteFailed {
 				onError(streamErr.httpStatus())
 			}
@@ -1693,8 +1588,6 @@ func streamOpenAIToAnthropicWithLifecycle(
 		return
 	}
 	if !sawDone {
-		// The stream stopped before [DONE]. If our writes to the client failed,
-		// this is a client abort, not an upstream failure — do not record it.
 		if handleLifecycleCancellation() {
 			return
 		}
@@ -1717,19 +1610,11 @@ func streamOpenAIToAnthropicWithLifecycle(
 	}
 }
 
-// aggregateStreamToResponse collects an OpenAI SSE stream into a complete
-// OpenAIResponse. This is used when we force streaming to the upstream for
-// reliable parallel tool call support, but the client requested non-streaming.
 func aggregateStreamToResponse(body io.ReadCloser) (*models.OpenAIResponse, error) {
 	response, _, err := aggregateStreamToResponseWithProgress(body)
 	return response, err
 }
 
-// aggregateStreamToResponseWithProgress is the explicit-route aggregation seam.
-// It retains the legacy aggregate result while also reporting whether text,
-// reasoning, tool activity, an unknown event, or a terminal frame was observed
-// before an error. Callers may only switch targets when the returned progress is
-// none or an allowed role/preamble chunk.
 func aggregateStreamToResponseWithProgress(body io.ReadCloser) (*models.OpenAIResponse, upstreamSemanticProgress, error) {
 	return aggregateStreamToResponseWithProgressOptions(body, openAIResponseBuildOptions{})
 }
@@ -1783,10 +1668,7 @@ type anthropicStreamState struct {
 	storedUsage         *models.OpenAIUsage
 	toolCallBlockIndex  map[int]int
 	openToolCallIndexes map[int]struct{}
-	// clientWriteFailed is set when an emit to the client fails (the client
-	// disconnected). It lets the caller distinguish a client-side abort from an
-	// upstream stream failure so the request is not mislabeled as a 502.
-	clientWriteFailed bool
+	clientWriteFailed   bool
 }
 
 func newAnthropicStreamState(w http.ResponseWriter, model string, requestID string) *anthropicStreamState {
@@ -2028,8 +1910,6 @@ func (s *anthropicStreamState) closeOpenToolBlocks() bool {
 			blockIndexes = append(blockIndexes, blockIndex)
 		}
 	}
-	// Sort by Anthropic block index so stop events are emitted in the same
-	// client-visible order as the corresponding block_start events.
 	sort.Ints(blockIndexes)
 
 	for _, blockIndex := range blockIndexes {
@@ -2235,9 +2115,6 @@ func (a *openAIResponseAggregator) choice(index int) *aggregatedOpenAIChoice {
 	return aggChoice
 }
 
-// appendToolCallArguments keeps streamed argument fragments out of the
-// OpenAIToolCall until build time so long tool-call argument streams do not pay
-// repeated string-concatenation copies on every delta.
 func (c *aggregatedOpenAIChoice) appendToolCallArguments(index int, arguments string) {
 	if arguments == "" {
 		return
@@ -2316,17 +2193,11 @@ func convertFinishReason(reason string) string {
 	return MapStopReason(&reason)
 }
 
-// TRAILING, unlike the non-streaming path: the items are only known at response.completed.
 func (s *anthropicStreamState) emitCarriedReasoning(turn carriedTurn) bool {
 	signature, err := encodeReasoningCarrier(turn)
 	if err != nil || signature == "" {
-		return true // nothing to carry, or an encode problem: not fatal to the turn
+		return true
 	}
-	// Both, and in finish()'s order. emitText closes tool blocks and startToolCall closes the
-	// text block, so each of those only ever has one kind open to worry about; the carrier is
-	// the one entry point that can be reached with either. Closing only tools opened this
-	// block INSIDE an open text block, and finish() then stopped the older one after it --
-	// [start:0 start:1 stop:1 stop:0] on the wire, which is not a valid Anthropic stream.
 	if !s.closeTextBlock() {
 		return false
 	}
@@ -2342,7 +2213,6 @@ func (s *anthropicStreamState) emitCarriedReasoning(turn carriedTurn) bool {
 	}) {
 		return false
 	}
-	// Clients ignore extra fields on the start frame, so this must be a delta.
 	if !s.emit("content_block_delta", models.AnthropicStreamEvent{
 		Type:  "content_block_delta",
 		Index: intVal(index),

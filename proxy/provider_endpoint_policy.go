@@ -1,8 +1,5 @@
 package proxy
 
-// providerEndpointPolicy keeps provider-kind endpoint decisions in one module.
-// Routing code should ask providerRuntime for endpoint behavior instead of
-// duplicating provider-type switch statements at each call site.
 type providerEndpointPolicy struct {
 	defaultPaths                 providerEndpointPaths
 	staticModelEndpoints         []string

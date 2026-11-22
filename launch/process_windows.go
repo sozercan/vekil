@@ -123,10 +123,6 @@ func (c *windowsProcessController) signal(os.Signal) error {
 	if c == nil || c.cmd == nil || c.cmd.Process == nil {
 		return os.ErrProcessDone
 	}
-	// Windows cannot direct CTRL_C_EVENT at an arbitrary process group. A
-	// CTRL_BREAK_EVENT targets the CREATE_NEW_PROCESS_GROUP child and gives
-	// Node/Claude a chance to clean up; the Job Object remains the timeout
-	// fallback for processes that do not exit.
 	return windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(c.cmd.Process.Pid))
 }
 
@@ -137,8 +133,6 @@ func (c *windowsProcessController) kill() error {
 	c.mu.Lock()
 	var jobErr error
 	if !c.closed && c.job != 0 {
-		// Keep the Job Object handle protected through termination so close cannot
-		// release or recycle it between the state check and the system call.
 		jobErr = windows.TerminateJobObject(c.job, 1)
 	}
 	c.mu.Unlock()

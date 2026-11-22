@@ -29,9 +29,6 @@ func (c *capturedRouteResponse) hasPlaintextBody() bool {
 	}) < 0
 }
 
-// For a certified plaintext 429 only. Construct the client response from
-// scratch: neither opaque text nor provider state or diagnostic headers
-// establish an identity that it is safe to expose.
 func (c *capturedRouteResponse) safePlaintextRateLimit(derivedDelay string) *capturedRouteResponse {
 	headers := http.Header{"Content-Type": {"application/json"}}
 	for name, values := range c.header {
@@ -56,7 +53,7 @@ func (c *capturedRouteResponse) safePlaintextRateLimit(derivedDelay string) *cap
 		}
 	}
 	if headers.Get("Retry-After") == "" && derivedDelay != "" {
-		headers.Set("Retry-After", derivedDelay) // normalized delay-seconds
+		headers.Set("Retry-After", derivedDelay)
 	}
 	return &capturedRouteResponse{
 		statusCode: http.StatusTooManyRequests, header: headers, request: c.request,
@@ -68,8 +65,6 @@ func routeHTTPRejectionBodyAllowsReplay(response *capturedRouteResponse) bool {
 	if routeResponseBodyAllowsReplay(response.body) {
 		return true
 	}
-	// Preserve HTTP 429 admission errors from plain-text gateway middleware.
-	// JSON or SSE advertised as text still needs the structured safety check.
 	contentType, _, _ := strings.Cut(headerGetCI(response.header, "Content-Type"), ";")
 	if response.statusCode != http.StatusTooManyRequests || !strings.EqualFold(strings.TrimSpace(contentType), "text/plain") {
 		return false
@@ -80,8 +75,6 @@ func routeHTTPRejectionBodyAllowsReplay(response *capturedRouteResponse) bool {
 		!bytes.Contains(body, []byte("event:"))
 }
 
-// A rejection status does not override evidence that the upstream performed
-// work. Inspect the complete bounded envelope before permitting another send.
 func routeResponseBodyAllowsReplay(body []byte) bool {
 	body = bytes.TrimSpace(body)
 	if len(body) == 0 {
@@ -99,8 +92,6 @@ func routeResponseBodyAllowsReplay(body []byte) bool {
 	return routeRejectionValueAllowsReplay(envelope)
 }
 
-// Error details and provider-specific wrappers can nest execution evidence in
-// objects or arrays. Decode once, then inspect every reserved progress key.
 func routeRejectionValueAllowsReplay(value any) bool {
 	switch value := value.(type) {
 	case []any:
@@ -187,9 +178,6 @@ func routeRejectionUsageIsZero(value any) bool {
 	}
 }
 
-// Non-streaming Responses can report admission failures inside HTTP 200 JSON.
-// Only complete, small, replay-safe failures become retryable HTTP errors.
-// Larger bodies and read errors retain their original bytes and transport owner.
 func prepareAzureRouteJSONRejection(resp *http.Response, target targetBinding, traffic azureRouteTraffic) *http.Response {
 	if resp == nil || resp.StatusCode != http.StatusOK || resp.Body == nil ||
 		resp.ContentLength > upstreamErrorDetailMaxBodyBytes ||

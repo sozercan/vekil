@@ -1,18 +1,24 @@
 # Comment audit
 
-The [classification ledger](comment-classifications.tsv) assigns one category to every prose comment in the supported source inventory, including the comments removed in the first cleanup. Executable directives, vendored assets, and text inside data fixtures are outside this audit. Run the inventory in [Development](development.md#lint) to rescan the working tree.
+The [classification ledger](comment-classifications.tsv) accounts for every prose comment in the supported first-party source inventory. Executable directives, vendored assets, and text inside data fixtures are outside this audit. The final inventory is empty; CI enforces the zero baseline. Run the inventory in [Development](development.md#lint) to rescan the working tree.
 
-| Category | Retained blocks | Retained comment lines | Removed comment lines |
+| Category | First cleanup lines | Final cleanup lines | Total comment lines |
 | --- | ---: | ---: | ---: |
-| Tautology | 520 | 668 | 228 |
-| Excuse | 4 | 8 | 13 |
-| Stale | 4 | 14 | 6 |
-| Decision Record | 1,893 | 5,379 | 424 |
-| **Total** | **2,421** | **6,069** | **671** |
+| Tautology | 228 | 667 | 895 |
+| Excuse | 13 | 17 | 30 |
+| Stale | 6 | 14 | 20 |
+| Decision Record | 424 | 5,377 | 5,801 |
+| **Total** | **671** | **6,075** | **6,746** |
 
-The TSV groups adjacent comment-only lines at the same column and records inline comments separately. `start_line`, `end_line`, and `start_column` are 1-based. `retained` locations are in the post-cleanup tree; `removed` locations are at the revision named below. The hash is the first 12 hex characters of SHA-256 over normalized comment text, which helps locate a comment after line numbers shift.
+Both passes removed **6,584 comment-only source lines** and shortened **162 inline lines**. These are gross source counts; the ADRs, ledger, and lint tooling add separate lines.
 
-Evidence is separate from category: `context-checked` means the source context was checked; `rule-assigned` means a code-context or wording rule assigned the label; `provisional` means the best-fit label needs a closer read before acting. Of the retained blocks, 124 are context-checked, 1,492 are rule-assigned, and 805 are provisional. The retained Excuse and Stale labels were checked against the implementation. This classification pass makes no further deletions, issues, or ADR migrations.
+The TSV groups adjacent comment-only lines at the same column and records inline comments separately. `start_line`, `end_line`, and `start_column` are 1-based. `removed` locations refer to the first-cleanup revision below; `final-cleanup` locations refer to `57939d5905190de91a5b76633df6f18bcba22425`. The digest is the first 12 hex characters of SHA-256 over normalized comment text. Use `git show <revision>:<path>` and the recorded range to recover the original wording. The `disposition` column names the related ADR, issue, or deletion action.
+
+## Final Cleanup
+
+The final pass removed 5,941 comment-only lines (including six newly inventoried lines inside literal `jq` filters) and shortened 134 source lines. Lasting rationale was consolidated by topic in the [ADR index](adr/README.md), not reproduced as a second copy of the source. The newly documented compaction publication race is tracked in [#476](https://github.com/sozercan/vekil/issues/476); the WebSocket test timing assumptions and broad control-proxy catches are tracked in [#475](https://github.com/sozercan/vekil/issues/475) and [#474](https://github.com/sozercan/vekil/issues/474), respectively.
+
+Evidence is separate from category: `context-checked` means source context was checked; `rule-assigned` means a code-context or wording rule assigned the label; `provisional` means best fit, not a verified decision. Of the 2,424 final-pass blocks, 130 are context-checked, 1,490 are rule-assigned, and 804 are provisional. The final-pass Excuse and Stale classifications were checked against the implementation. For tentative Decision Records, the disposition points to the related ADR topic, while the immutable source location preserves the detail without asserting it as a design requirement.
 
 ## First Cleanup
 
@@ -23,7 +29,7 @@ The locations below refer to the pre-cleanup revision `d58737123a325d873f633bf28
 | Before cleanup | 6,578 | 162 |
 | After this batch | 5,935 | 134 |
 
-The comment-only column estimates gross source lines that could be shed. Removing inline comments shortens their lines without deleting them; ADRs and lint tooling are separate additions. The first batch deleted 643 comment-only lines and shortened 28 source lines.
+These first-pass counts predate the jq inventory expansion. The batch deleted 643 comment-only lines and shortened 28 source lines.
 
 | Original source | Tautology | Stale | Excuse → issue | Decision → ADR |
 | --- | --- | --- | --- | --- |

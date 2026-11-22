@@ -18,8 +18,6 @@ func (h *ProxyHandler) applyDurableRequestStateBinding(store *stateBindingStore,
 			if err := operation.forcePinnedTarget(target.id); err != nil {
 				return &providerRequestError{statusCode: http.StatusBadRequest, err: errDurableStateIdentity}
 			}
-			// Defer the atomic claim until authentication for the actual request
-			// has resolved. Config labels alone are not durable ownership proof.
 			operation.mu.Lock()
 			token := tokens[0]
 			operation.bootstrapConversation = &token
@@ -93,9 +91,6 @@ func (h *ProxyHandler) validateDurableRequestOwner(req *http.Request, route *mod
 	return identity, nil
 }
 
-// requestIdentity consumes the authenticated request, not a second credential
-// lookup. Short-lived bearer refreshes must not change a stable issuer/account
-// identity. Unsupported or malformed identity evidence fails before dispatch.
 func (d *durableStateBindings) requestIdentity(req *http.Request, route *modelRoute, target targetBinding) ([32]byte, error) {
 	if req == nil || req.URL == nil || target.provider == nil || route == nil {
 		return [32]byte{}, errDurableStateIdentity
@@ -106,7 +101,6 @@ func (d *durableStateBindings) requestIdentity(req *http.Request, route *modelRo
 	endpoint.Host = strings.ToLower(endpoint.Host)
 	endpoint.Fragment = ""
 	endpoint.RawQuery = endpoint.Query().Encode()
-	// Native compact emits state for the same Responses namespace.
 	if strings.HasSuffix(endpoint.Path, "/responses/compact") {
 		endpoint.Path = strings.TrimSuffix(endpoint.Path, "/compact")
 		endpoint.RawPath = ""
@@ -145,8 +139,6 @@ func (d *durableStateBindings) requestIdentity(req *http.Request, route *modelRo
 	default:
 		return [32]byte{}, errDurableStateIdentity
 	}
-	// Provider-owned routing/tenant headers are part of the scope. Do not
-	// include client turn/session IDs or other per-request metadata.
 	names := []string{"OpenAI-Organization", "OpenAI-Project", "ChatGPT-Account-ID", "X-OpenAI-Fedramp"}
 	for name := range p.extraHeaders {
 		rotatingBearer := p.kind == providerTypeCopilot || p.kind == providerTypeOpenAICodex || (p.kind == providerTypeAzureOpenAI && p.azureAuthMode() == providerAuthModeAzureIdentity)

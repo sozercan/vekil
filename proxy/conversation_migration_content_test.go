@@ -53,8 +53,6 @@ func TestConversationMigrationContentContract(t *testing.T) {
 					if tc.allowed {
 						conversationCompleted(t, response, stream)
 					} else {
-						// Unsupported content runs unprotected: the turn completes
-						// normally but nothing is saved for later reconstruction.
 						body := response.Body.String()
 						if response.Code != http.StatusOK || strings.Contains(body, `"history":"saved"`) || !strings.Contains(body, `"status":"completed"`) {
 							t.Fatalf("unsupported content was not forwarded unprotected: %d %s", response.Code, body)

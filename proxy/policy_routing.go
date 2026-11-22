@@ -68,8 +68,6 @@ func (p *compiledPolicyProfile) setEffectiveMode(mode policyMode) {
 	}
 }
 
-// policyTierRoutes is captured from one registry publication before request
-// validation. Classification and plan sealing retain these same immutable routes.
 type policyTierRoutes struct {
 	lightweight *modelRoute
 	powerful    *modelRoute
@@ -465,8 +463,6 @@ func (c *chatPolicyRoutingController) Plan(ctx context.Context, input chatPolicy
 			}
 		}
 		if replayRoute != nil && len(policyCompletedReplayRoutes(profile, routes)) > 0 && !chatRequestHasActiveResponsesPolicyReplay(input.OriginalBody) {
-			// The replay remains validated history. A new user task chooses its own
-			// effort once every earlier tool call and assistant turn has finished.
 			replayRoute = nil
 			replayTier = policyTierUnknown
 		}
@@ -551,7 +547,6 @@ func (c *chatPolicyRoutingController) validateResponsesBackedPolicyRequest(profi
 		if endpoint != providerEndpointResponses {
 			continue
 		}
-		// nil logger: a validation preflight re-translates, so its degrade is logged by the real pass.
 		if _, _, err := c.h.prepareExplicitResponsesChatRequest(nil, route, body, chatExecutionOptions{}, nil); err != nil {
 			return err
 		}
@@ -956,7 +951,6 @@ func newRoutePolicyClassifier(h *ProxyHandler, route *modelRoute, profile Policy
 	}
 	return newClassifier(options, func(ctx context.Context, body []byte, headers http.Header) (policyClassifierHTTPResponse, error) {
 		ctx = withTaskInferenceKind(ctx, taskClassifier)
-		// Deferred discovery can publish the vendor hint after this adapter is built.
 		dispatchRoute := route
 		if current, ok := h.providerSetup().lookupTerminalRoute(route.public.routeID); ok {
 			dispatchRoute = current
@@ -1032,8 +1026,6 @@ func (h *ProxyHandler) sendPolicyClassifierJSON(ctx context.Context, target targ
 	resp, err := h.singleInferenceSend(req, observation)
 	h.finishCopilotInference(req, resp, err, permit)
 	if err != nil {
-		// Only failures proven to occur before any request bytes were written
-		// may affect shared health. Delivery-ambiguous resets stay local.
 		preSend := !observation.wroteHeaders.Load() && !observation.wroteRequest.Load()
 		return policyClassifierHTTPResponse{}, newPolicyClassifierSendError(err, preSend)
 	}
@@ -1114,10 +1106,6 @@ func (h *ProxyHandler) sendPolicyClassifierOverResponses(ctx context.Context, ro
 		ReplayToolDefaults: plan.ReplayToolDefaults,
 	})
 	if err != nil {
-		// The provider accepted and completed the HTTP request, but its terminal
-		// payload could not be represented as canonical Chat. Return an accepted
-		// malformed classifier envelope so policyHTTPClassifier classifies this as
-		// uncertain invalid output rather than as an infrastructure outage.
 		return policyClassifierHTTPResponse{
 			StatusCode: http.StatusOK,
 			Header:     convertedChatSafeHeaders(resp.Header),
@@ -1190,8 +1178,6 @@ func validatePolicyClassifierNoStore(body []byte, provider *providerRuntime) err
 	return nil
 }
 
-// PolicyStatsSnapshot returns a content-free point-in-time snapshot used by the
-// main stats payload and focused tests.
 func (c *chatPolicyRoutingController) PolicyStatsSnapshot() policyStatsSnapshot {
 	if c == nil || c.stats == nil {
 		return emptyPolicyStatsSnapshot()

@@ -18,8 +18,6 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-// conversationSignalWriter records a streamed response and signals once the
-// client has received marker, so a test can interrupt after exposure.
 type conversationSignalWriter struct {
 	mu      sync.Mutex
 	code    int
@@ -55,7 +53,6 @@ func (w *conversationSignalWriter) Write(p []byte) (int, error) {
 		w.once.Do(func() {
 			close(w.matched)
 			if w.onMatch != nil {
-				// Disconnect before the handler can continue past this write.
 				w.onMatch()
 			}
 		})
@@ -63,9 +60,6 @@ func (w *conversationSignalWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// conversationInterruptedPOST streams a turn and disconnects the client once
-// marker has been delivered, or once ready closes when marker is empty, like a
-// user interrupting an agent mid-turn.
 func conversationInterruptedPOST(t *testing.T, h *ProxyHandler, fields map[string]any, headers http.Header, marker string, ready <-chan struct{}) int {
 	t.Helper()
 	fields["model"] = "coding"
@@ -108,7 +102,6 @@ func conversationInterruptedPOST(t *testing.T, h *ProxyHandler, fields map[strin
 	return writer.code
 }
 
-// conversationLogBuffer collects handler logs written from request goroutines.
 type conversationLogBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -167,8 +160,6 @@ func TestConversationMigrationClientInterruptKeepsConversationUsable(t *testing.
 			reasoning := conversationOutputItemDone(t, 0, map[string]any{"id": "rs-interrupted", "type": "reasoning", "encrypted_content": "interrupted-encrypted", "summary": []any{}})
 			message := conversationOutputItemDone(t, 1, map[string]any{"id": "msg-interrupted", "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "Partial answer."}}})
 			call := conversationOutputItemDone(t, 2, map[string]any{"id": "fc-interrupted", "type": "function_call", "status": "completed", "call_id": "call-interrupted", "name": "edit", "arguments": "{}"})
-			// An unfinished message is visible as deltas only; clients do not
-			// keep it. Later events also confirm that earlier items were written.
 			unfinished := []any{
 				conversationInterruptEvent(t, "response.output_text.delta", map[string]any{"item_id": "msg-unfinished", "output_index": 3, "content_index": 0, "delta": "Unfinished"}),
 				conversationInterruptEvent(t, "response.output_text.delta", map[string]any{"item_id": "msg-unfinished", "output_index": 3, "content_index": 0, "delta": " message"}),
@@ -187,12 +178,10 @@ func TestConversationMigrationClientInterruptKeepsConversationUsable(t *testing.
 					parts := []any{conversationLifecycleEvent(t, "response.created", "in_progress", 0)}
 					switch scenario {
 					case "during precommit hold":
-						// Headers arrived, but nothing has been committed downstream.
 						close(held)
 						parts = nil
 					case "before output":
 					case "out of order items":
-						// Parallel items can complete out of output_index order.
 						parts = append(append(parts, reasoning, call, message), unfinished...)
 					case "reasoning only by response ID":
 						parts = append(append(parts, reasoning), unfinished...)
@@ -228,8 +217,6 @@ func TestConversationMigrationClientInterruptKeepsConversationUsable(t *testing.
 			if sends.Load() != 2 {
 				t.Fatalf("interrupted turn sends = %d", sends.Load())
 			}
-			// The client's interrupt is neither an uncertain execution nor an
-			// upstream failure.
 			if recovery := logs.String(); !strings.Contains(recovery, `"outcome":"interrupted"`) || strings.Contains(recovery, `"outcome":"blocked"`) || strings.Contains(recovery, "upstream request failed") {
 				t.Fatalf("interrupt recovery logs: %s", recovery)
 			}
@@ -255,14 +242,11 @@ func TestConversationMigrationClientInterruptKeepsConversationUsable(t *testing.
 			}
 			switch scenario {
 			case "altered items":
-				// Only items Vekil delivered from the owner extend the history.
 				if resumed.Code != http.StatusBadRequest || sends.Load() != 2 || !strings.Contains(resumed.Body.String(), "conversation_history_incomplete") {
 					t.Fatalf("altered interrupted history accepted: %d %s", resumed.Code, resumed.Body.String())
 				}
 				return
 			case "unconfirmed last item":
-				// The final written event may not have reached the client, so it is
-				// not saved as delivered history.
 				if resumed.Code != http.StatusBadRequest || sends.Load() != 2 || !strings.Contains(resumed.Body.String(), "conversation_history_unavailable") {
 					t.Fatalf("unconfirmed item was saved: %d %s", resumed.Code, resumed.Body.String())
 				}
@@ -302,8 +286,6 @@ func TestConversationMigrationInterruptKeepsUncertainTurnsBlocked(t *testing.T) 
 					return conversationResponse(t, req, "seed", conversationText("Known earlier answer.")), nil
 				}
 				if scenario == "upstream reset before client cancel" {
-					// The request may have reached the upstream before the reset,
-					// and the client disconnects just after it.
 					if trace := httptrace.ContextClientTrace(req.Context()); trace != nil {
 						trace.WroteHeaders()
 					}
@@ -312,12 +294,9 @@ func TestConversationMigrationInterruptKeepsUncertainTurnsBlocked(t *testing.T) 
 				}
 				delta := conversationInterruptEvent(t, "response.output_text.delta", map[string]any{"item_id": "msg-1", "output_index": 1, "content_index": 0, "delta": "partial"})
 				if scenario == "upstream cut before client cancel" {
-					// The upstream ends after a tool call's complete arguments, but
-					// before its finished item, without a terminal event.
 					arguments := conversationInterruptEvent(t, "response.function_call_arguments.done", map[string]any{"item_id": "fc-1", "output_index": 0, "arguments": "{}"})
 					return conversationStreamResponse(req, nil, conversationLifecycleEvent(t, "response.created", "in_progress", 0), arguments), nil
 				}
-				// The interrupted response reuses the saved seed response ID.
 				created := conversationInterruptEvent(t, "response.created", map[string]any{"response": map[string]any{"id": "seed", "object": "response", "status": "in_progress", "output": []any{}}})
 				message := conversationOutputItemDone(t, 0, map[string]any{"id": "msg-0", "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "Reused."}}})
 				again := conversationInterruptEvent(t, "response.output_text.delta", map[string]any{"item_id": "msg-1", "output_index": 1, "content_index": 0, "delta": " again"})
@@ -329,7 +308,6 @@ func TestConversationMigrationInterruptKeepsUncertainTurnsBlocked(t *testing.T) 
 			})
 			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
 
-			// The client disconnects only after the proxy observed the outcome.
 			switch scenario {
 			case "upstream reset before client cancel":
 				req := httptest.NewRequestWithContext(inbound, http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"coding","previous_response_id":"seed","input":"Next.","stream":true}`))
@@ -363,7 +341,6 @@ func TestConversationMigrationDeliveryStagingIsBounded(t *testing.T) {
 			next := message(1, strings.Repeat("x", 2048))
 			switch scenario {
 			case "reasoning bytes":
-				// Reasoning is kept only as anchors, which still occupy memory.
 				item, _ := json.Marshal(map[string]any{"type": "reasoning", "encrypted_content": strings.Repeat("e", 2048), "summary": []any{}})
 				next = map[string]json.RawMessage{"output_index": json.RawMessage("1"), "item": item}
 			case "duplicate index":

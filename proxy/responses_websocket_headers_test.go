@@ -65,7 +65,7 @@ func TestResponsesWebSocketPerTurnHeadersAndStringInput(t *testing.T) {
 			t.Fatalf("string input translation = %s", body["input"])
 		}
 		create["previous_response_id"] = "resp-headers"
-		delete(create, "stream") // Omitted and true have identical streaming semantics.
+		delete(create, "stream")
 	}
 }
 

@@ -1,6 +1,6 @@
 ---
 name: delete-comment
-description: Audit and remove legacy prose comments from Vekil. Use for a comment-cleanup batch, including categorizing comments, moving design decisions into ADRs, and tracking implementation shortcuts as issues.
+description: Audit and remove prose comments from Vekil. Use for a comment-cleanup batch, including categorizing comments, moving design decisions into ADRs, and tracking implementation shortcuts as issues.
 ---
 
 # Delete Comment
@@ -14,6 +14,6 @@ Use the setup in [Development](../../../docs/development.md#lint). Save the outp
 | Excuse: explains away an avoidable implementation shortcut | Verify the concrete limitation, look for an existing issue, and record its link or draft a focused issue with acceptance criteria. File a draft only if this run authorizes filing; otherwise leave it ready for review. Delete the comment once the debt is recorded. Do not silently fix the implementation in the cleanup. |
 | Decision Record: preserves a non-obvious invariant, tradeoff, or rejected option | Capture the rationale in the matching [ADR](../../../docs/adr/README.md) or add a numbered one. Update the index, then delete the source comment. |
 
-Leave executable directives, cgo preambles, vendored code, and fixture text intact. Defer any comment you cannot substantiate; do not guess its category or weaken the ratchet. For mixed comments keep the decision rationale or issue context outside source before removing the whole block.
+Leave executable directives, cgo preambles, vendored code, and fixture text intact. For mixed comments keep the decision rationale or issue context outside source before removing the whole block. If a classification is uncertain, mark it as provisional and preserve its exact source location and revision; don't treat an uncertain note as an established design decision.
 
-Record the audited paths and classifications by original location in [the audit log](../../../docs/comment-audit.md). Run `make lint-comments` with the same Python and a base covering the patch. Check that only comments and associated whitespace changed in existing source, then run the affected tests and repeat the inventory. Report removed comment-only lines separately from shortened inline lines, and distinguish audited comments from the grandfathered backlog.
+Record the audited paths, classifications, and ADR or issue references by original location in [the audit log](../../../docs/comment-audit.md). Run `make lint-comments` with the same Python; it requires a zero-prose tree. Use `COMMENT_BASE` only for incremental work on a branch predating the full cleanup. Check that only comments and associated whitespace changed in existing source, then run the affected tests and repeat the inventory. Report removed comment-only lines separately from shortened inline lines.

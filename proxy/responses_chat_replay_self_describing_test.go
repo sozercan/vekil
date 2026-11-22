@@ -193,10 +193,9 @@ func TestSelfDescribingIDDoesNotBypassStoreOrTargetSelection(t *testing.T) {
 	}
 
 	_, err = translateChatRequestToResponses(body, responsesChatRequestOptions{
-		UpstreamModel: route.UpstreamModel,
-		ReplayStore:   selfDescribingTestStore(t),
-		ReplayRoute:   route,
-		// False during exact-target probing and on native Chat/policy paths.
+		UpstreamModel:             route.UpstreamModel,
+		ReplayStore:               selfDescribingTestStore(t),
+		ReplayRoute:               route,
 		DegradeUnrestorableReplay: false,
 	})
 	if !isMissingResponsesChatReplayError(err) {

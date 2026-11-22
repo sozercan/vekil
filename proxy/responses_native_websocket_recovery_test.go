@@ -12,9 +12,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// recoveryTestUpstream is a fake Copilot upstream whose native connections can
-// be closed after a given number of turns, and which serves HTTP /responses
-// posts, including compaction summaries.
 type recoveryTestUpstream struct {
 	upgrades, posts atomic.Int32
 	closeAfterTurns int32
@@ -45,7 +42,6 @@ func (u *recoveryTestUpstream) handler(t *testing.T) http.HandlerFunc {
 			u.postBodies <- body.Input
 			response := fmt.Sprintf(`{"id":"resp-http-%d","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary of earlier work"}]}]}`, turn)
 			if !body.Stream {
-				// Compaction summaries are non-streaming requests.
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = fmt.Fprint(w, response)
 				return
@@ -100,8 +96,6 @@ func recoveryTurn(t *testing.T, conn interface {
 	return id
 }
 
-// readRecoveryTerminal reads frames until a terminal one, skipping the
-// lifecycle events that synthetic compaction responses stream first.
 func readRecoveryTerminal(t *testing.T, conn *websocket.Conn) map[string]any {
 	t.Helper()
 	for {
@@ -128,8 +122,6 @@ func TestResponsesNativeWebSocketCompactionTriggerUsesProxyHistory(t *testing.T)
 
 	recoveryTurn(t, conn, read, request, userItem("first"))
 	recoveryTurn(t, conn, read, request, userItem("second"))
-	// A client compaction (Codex remote compaction) summarizes the proxy's full
-	// history over HTTP instead of being rejected on the native connection.
 	recoveryTurn(t, conn, read, request, map[string]string{"type": "compaction_trigger"})
 	recoveryTurn(t, conn, read, request, userItem("after compaction"))
 
@@ -141,8 +133,6 @@ func TestResponsesNativeWebSocketCompactionTriggerUsesProxyHistory(t *testing.T)
 	if !strings.Contains(string(encoded), "first") || !strings.Contains(string(encoded), "answer 2") {
 		t.Fatalf("compaction did not summarize the full history: %s", encoded)
 	}
-	// The turn after compaction replays the compacted history on the same
-	// connection, starting a new upstream conversation.
 	resumed := <-upstream.frames
 	encoded, _ = json.Marshal(resumed.input)
 	if resumed.connection != 1 || resumed.previousID != "" || !strings.Contains(string(encoded), "summary of earlier work") || !strings.Contains(string(encoded), "after compaction") || strings.Contains(string(encoded), `"first"`) {
@@ -166,13 +156,12 @@ func TestResponsesNativeWebSocketReconnectsAfterUpstreamClose(t *testing.T) {
 
 	recoveryTurn(t, conn, read, request, userItem("first"))
 	recoveryTurn(t, conn, read, request, userItem("second"))
-	// The upstream closes the idle connection between turns.
 	select {
 	case <-upstream.closed:
 	case <-time.After(time.Second):
 		t.Fatal("upstream did not close")
 	}
-	time.Sleep(50 * time.Millisecond) // Let the proxy observe the close.
+	time.Sleep(50 * time.Millisecond)
 	recoveryTurn(t, conn, read, request, userItem("third"))
 	recoveryTurn(t, conn, read, request, userItem("fourth"))
 
@@ -196,14 +185,11 @@ func TestResponsesNativeWebSocketOversizedHistoryStaysOnHTTP(t *testing.T) {
 	request := newResponsesWebSocketCreateRequest(nil)
 
 	recoveryTurn(t, conn, read, request, userItem("first"))
-	// An oversized turn uses HTTP with the full history.
 	big := make([]any, responsesNativeMaxPendingItems+1)
 	for i := range big {
 		big[i] = userItem("x")
 	}
 	recoveryTurn(t, conn, read, request, big...)
-	// A small next turn would have to send the native connection everything it
-	// missed, which is still too large, so it also uses HTTP.
 	recoveryTurn(t, conn, read, request, userItem("small"))
 
 	if first := <-upstream.frames; len(first.input) != 1 {

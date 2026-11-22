@@ -369,18 +369,15 @@ func TestStreamOpenAIPassthroughDroppingInjectedUsage(t *testing.T) {
 	})
 
 	out := w.Body.String()
-	// Content chunk and [DONE] are still forwarded verbatim.
 	if !strings.Contains(out, `"content":"hi"`) {
 		t.Fatalf("content chunk missing from output:\n%s", out)
 	}
 	if !strings.Contains(out, "data: [DONE]") {
 		t.Fatalf("[DONE] missing from output:\n%s", out)
 	}
-	// The injected usage-only chunk must NOT reach the client.
 	if strings.Contains(out, `"total_tokens":10`) || strings.Contains(out, `"usage"`) {
 		t.Fatalf("usage-only chunk leaked to client:\n%s", out)
 	}
-	// But usage must still be captured for stats.
 	if captured == nil || captured.TotalTokens != 10 {
 		t.Fatalf("usage callback = %#v, want total tokens 10", captured)
 	}
@@ -429,9 +426,6 @@ func TestStreamOpenAIPassthroughDroppingInjectedUsageAfterOversizedEvent(t *test
 }
 
 func TestStreamOpenAIPassthroughDroppingInjectedUsage_KeepsUsageWithChoices(t *testing.T) {
-	// A chunk that carries usage AND choices is a normal content chunk (some
-	// upstreams attach usage to the final content delta); it must be forwarded,
-	// only the empty-choices usage-only chunk is dropped.
 	withChoices := models.OpenAIStreamChunk{
 		ID:      "chatcmpl-keep",
 		Object:  "chat.completion.chunk",
@@ -457,10 +451,6 @@ func TestStreamOpenAIPassthroughDroppingInjectedUsage_KeepsUsageWithChoices(t *t
 }
 
 func TestStreamOpenAIPassthroughDropsContentLength(t *testing.T) {
-	// Streamed SSE must not carry a fixed Content-Length: the dropping path writes
-	// fewer bytes than the upstream advertised, and even the plain path is a
-	// chunked stream. Simulate the caller having copied an upstream Content-Length
-	// onto the response, then assert the passthrough strips it.
 	body := buildSSEStream(`{"choices":[{"delta":{"content":"hi"}}]}`, "[DONE]")
 	w := httptest.NewRecorder()
 	w.Header().Set("Content-Length", "9999")
@@ -1120,7 +1110,6 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 			},
 		}}},
 	}
-	// Finish
 	chunk5 := models.OpenAIStreamChunk{
 		ID: "chatcmpl-3", Model: "gpt-4",
 		Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{}, FinishReason: &toolCallStop}},
@@ -1138,12 +1127,12 @@ func TestStreamOpenAIToAnthropic_MultipleToolCalls(t *testing.T) {
 
 	expectedTypes := []string{
 		"message_start",
-		"content_block_start", // tool_use call_1
-		"content_block_delta", // args for call_1
-		"content_block_start", // tool_use call_2
-		"content_block_delta", // args for call_2
-		"content_block_stop",  // close call_1
-		"content_block_stop",  // close call_2
+		"content_block_start",
+		"content_block_delta",
+		"content_block_start",
+		"content_block_delta",
+		"content_block_stop",
+		"content_block_stop",
 		"message_delta",
 		"message_stop",
 	}
@@ -1472,12 +1461,10 @@ func TestStreamMessageDeltaNoTypeField(t *testing.T) {
 	StreamOpenAIToAnthropic(w, body, "claude-test", "msg_test")
 	events := parseSSEEvents(w.Body.String())
 
-	// Find message_delta event
 	var found bool
 	for _, evt := range events {
 		if evt.Event == "message_delta" {
 			found = true
-			// Parse the raw JSON to check the delta doesn't have a "type" field
 			var raw map[string]json.RawMessage
 			if err := json.Unmarshal([]byte(evt.Data), &raw); err != nil {
 				t.Fatalf("unmarshal event data: %v", err)
@@ -1500,8 +1487,6 @@ func TestStreamMessageDeltaNoTypeField(t *testing.T) {
 	}
 }
 
-// TestAnthropicResponseJSONShape validates the non-streaming response matches
-// the exact shape the Anthropic Messages API returns.
 func TestAnthropicResponseJSONShape(t *testing.T) {
 	resp := &models.OpenAIResponse{
 		ID:      "chatcmpl-abc",
@@ -1522,13 +1507,11 @@ func TestAnthropicResponseJSONShape(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	// Parse as generic map to validate exact field presence
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	// Required fields per Anthropic spec
 	requiredFields := []string{"id", "type", "role", "content", "model", "stop_reason", "usage"}
 	for _, f := range requiredFields {
 		if _, ok := raw[f]; !ok {
@@ -1536,7 +1519,6 @@ func TestAnthropicResponseJSONShape(t *testing.T) {
 		}
 	}
 
-	// Validate type is "message"
 	var typ string
 	if err := json.Unmarshal(raw["type"], &typ); err != nil {
 		t.Fatalf("unmarshal type: %v", err)
@@ -1545,7 +1527,6 @@ func TestAnthropicResponseJSONShape(t *testing.T) {
 		t.Errorf("type = %q, want %q", typ, "message")
 	}
 
-	// Validate role is "assistant"
 	var role string
 	if err := json.Unmarshal(raw["role"], &role); err != nil {
 		t.Fatalf("unmarshal role: %v", err)
@@ -1554,7 +1535,6 @@ func TestAnthropicResponseJSONShape(t *testing.T) {
 		t.Errorf("role = %q, want %q", role, "assistant")
 	}
 
-	// Validate content is an array
 	var content []json.RawMessage
 	if err := json.Unmarshal(raw["content"], &content); err != nil {
 		t.Fatalf("content is not an array: %v", err)
@@ -1563,7 +1543,6 @@ func TestAnthropicResponseJSONShape(t *testing.T) {
 		t.Fatalf("expected 1 content block, got %d", len(content))
 	}
 
-	// Validate content block shape
 	var block map[string]json.RawMessage
 	if err := json.Unmarshal(content[0], &block); err != nil {
 		t.Fatalf("unmarshal content block: %v", err)
@@ -1575,7 +1554,6 @@ func TestAnthropicResponseJSONShape(t *testing.T) {
 		t.Error("text content block missing 'text' field")
 	}
 
-	// Validate usage shape
 	var usage map[string]json.RawMessage
 	if err := json.Unmarshal(raw["usage"], &usage); err != nil {
 		t.Fatalf("unmarshal usage: %v", err)
@@ -1588,8 +1566,6 @@ func TestAnthropicResponseJSONShape(t *testing.T) {
 	}
 }
 
-// TestAnthropicStreamEventShapes validates all streaming event types match
-// the exact JSON shapes the Anthropic Messages API returns.
 func TestAnthropicStreamEventShapes(t *testing.T) {
 	stop := "stop"
 	chunk1 := models.OpenAIStreamChunk{
@@ -1614,14 +1590,12 @@ func TestAnthropicStreamEventShapes(t *testing.T) {
 	StreamOpenAIToAnthropic(w, body, "claude-sonnet-4", "msg_123")
 	events := parseSSEEvents(w.Body.String())
 
-	// Validate each event type's JSON shape
 	for _, evt := range events {
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(evt.Data), &raw); err != nil {
 			t.Fatalf("event %q: unmarshal failed: %v", evt.Event, err)
 		}
 
-		// Every event must have a "type" field
 		if _, ok := raw["type"]; !ok {
 			t.Errorf("event %q missing 'type' field", evt.Event)
 		}
@@ -1656,7 +1630,6 @@ func TestAnthropicStreamEventShapes(t *testing.T) {
 			if _, ok := raw["delta"]; !ok {
 				t.Error("content_block_delta missing 'delta'")
 			}
-			// content_block_delta's delta MUST have a "type" field
 			var delta map[string]json.RawMessage
 			if err := json.Unmarshal(raw["delta"], &delta); err != nil {
 				t.Fatalf("content_block_delta.delta unmarshal failed: %v", err)
@@ -1674,7 +1647,6 @@ func TestAnthropicStreamEventShapes(t *testing.T) {
 			if _, ok := raw["delta"]; !ok {
 				t.Error("message_delta missing 'delta'")
 			}
-			// message_delta's delta must NOT have a "type" field
 			var delta map[string]json.RawMessage
 			if err := json.Unmarshal(raw["delta"], &delta); err != nil {
 				t.Fatalf("message_delta.delta unmarshal failed: %v", err)
@@ -1687,15 +1659,11 @@ func TestAnthropicStreamEventShapes(t *testing.T) {
 			}
 
 		case "message_stop":
-			// Just needs "type"
 		}
 	}
 }
 
-// TestAnthropicRequestDeserialization validates that all official Anthropic API
-// request parameters are accepted without error.
 func TestAnthropicRequestDeserialization(t *testing.T) {
-	// Full request with all known Anthropic parameters
 	reqJSON := `{
 		"model": "claude-sonnet-4-20250514",
 		"max_tokens": 1024,
@@ -1748,7 +1716,6 @@ func TestAnthropicRequestDeserialization(t *testing.T) {
 	}
 }
 
-// TestAnthropicRequestDisabledThinking validates disabled thinking is deserialized correctly.
 func TestAnthropicRequestDisabledThinking(t *testing.T) {
 	reqJSON := `{
 		"model": "claude-sonnet-4",
@@ -1768,7 +1735,6 @@ func TestAnthropicRequestDisabledThinking(t *testing.T) {
 	}
 }
 
-// TestAnthropicRequestAdaptiveThinking validates adaptive thinking is deserialized correctly.
 func TestAnthropicRequestAdaptiveThinking(t *testing.T) {
 	reqJSON := `{
 		"model": "claude-opus-4.6",
@@ -1788,7 +1754,6 @@ func TestAnthropicRequestAdaptiveThinking(t *testing.T) {
 	}
 }
 
-// TestAnthropicErrorShape validates the error response matches Anthropic spec.
 func TestAnthropicErrorShape(t *testing.T) {
 	w := httptest.NewRecorder()
 	writeAnthropicError(w, 400, "invalid_request_error", "test error")
@@ -1798,7 +1763,6 @@ func TestAnthropicErrorShape(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	// Must have "type" = "error"
 	var typ string
 	if err := json.Unmarshal(raw["type"], &typ); err != nil {
 		t.Fatalf("type field unmarshal: %v", err)
@@ -1807,7 +1771,6 @@ func TestAnthropicErrorShape(t *testing.T) {
 		t.Errorf("type = %q, want %q", typ, "error")
 	}
 
-	// Must have "error" object with "type" and "message"
 	var errObj map[string]string
 	if err := json.Unmarshal(raw["error"], &errObj); err != nil {
 		t.Fatalf("error field unmarshal: %v", err)
@@ -1820,7 +1783,6 @@ func TestAnthropicErrorShape(t *testing.T) {
 	}
 }
 
-// TestToolChoiceNone validates "none" tool_choice produces correct OpenAI format.
 func TestToolChoiceNone(t *testing.T) {
 	req := &models.AnthropicRequest{
 		Model:      "claude-sonnet-4",
@@ -2149,7 +2111,6 @@ func TestAggregateStreamToResponse_MultipleChoices(t *testing.T) {
 }
 
 func TestAggregateStreamToResponse_InvalidToolArgs(t *testing.T) {
-	// Simulate concatenated JSON objects in tool call arguments (LiteLLM bug #20543).
 	stream := func() io.ReadCloser {
 		return buildSSEStream(
 			`{"id":"c1","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]}}]}`,

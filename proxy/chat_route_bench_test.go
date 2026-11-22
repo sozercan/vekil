@@ -152,10 +152,6 @@ func buildLegacyDirectChatBenchmarkRequest(ctx context.Context, handler *ProxyHa
 	return benchmarkChatRouteBuild{request: req, body: preparedBody}, nil
 }
 
-// buildExplicitPriorityChatBenchmarkRequest mirrors the deterministic,
-// pre-dispatch portion of executeExplicitRouteRequest. It stops before send
-// budgeting, telemetry, httptrace, and http.Client.Do so benchmark results do
-// not include network or scheduler variability.
 func buildExplicitPriorityChatBenchmarkRequest(ctx context.Context, handler *ProxyHandler, body []byte) (benchmarkChatRouteBuild, error) {
 	requestedModel := extractRequestModel(body)
 	route, known := handler.resolveModelRouteForRequest(requestedModel, providerEndpointChatCompletions)
@@ -187,7 +183,6 @@ func buildExplicitPriorityChatBenchmarkRequest(ctx context.Context, handler *Pro
 		targetID:   target.id,
 		providerID: target.provider.id,
 	}))
-	// Explicit route sends disable automatic request replay before dispatch.
 	req.GetBody = nil
 	return benchmarkChatRouteBuild{request: req, body: preparedBody}, nil
 }

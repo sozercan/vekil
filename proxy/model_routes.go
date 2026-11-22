@@ -215,10 +215,6 @@ func (r *modelRouteRegistry) lookupPublicModelEntry(model string) (*publicModelE
 	return r.publicEntries.lookup(model)
 }
 
-// internExactPublicModel returns immutable registry storage for an exact public
-// model ID. Converting raw bytes directly in the map lookup does not allocate;
-// normalized aliases and unknown IDs deliberately retain their owned-string
-// fallback at the request boundary.
 func (ps *providerSetup) internExactPublicModel(raw []byte) (string, bool) {
 	if ps == nil || len(raw) == 0 {
 		return "", false
@@ -247,9 +243,6 @@ func (r *modelRouteRegistry) lookupTerminalRoute(routeID string) (*modelRoute, b
 	return route, ok
 }
 
-// explicitRoutes retains the catalog-facing behavior expected by the existing
-// /v1/models merger. It returns public static routes plus synthetic catalog
-// routes for policy entries, never internal terminal routes.
 func (r *modelRouteRegistry) explicitRoutes() []*modelRoute {
 	if r == nil || r.publicEntries == nil {
 		return nil
@@ -330,8 +323,6 @@ func (r *modelRouteRegistry) addLegacyProvider(provider *providerRuntime, models
 	return nil
 }
 
-// applyCopilotResponsesPreferences updates only the unpublished registry snapshot.
-// Catalogs still include hidden pinned models at this boundary.
 func applyCopilotResponsesPreferences(next *modelRouteRegistrySnapshot, providerID string, catalog []providerModel) {
 	models := make(map[string]providerModel, len(catalog))
 	for _, model := range catalog {
@@ -446,10 +437,6 @@ func addPublicModelEntryToSnapshot(snapshot *publicModelEntryRegistrySnapshot, e
 	strictAliases := snapshot.strictAliases
 	for _, alias := range entry.aliases {
 		if existing, ok := snapshot.aliases[alias]; ok && existing != entry {
-			// Version-1 legacy catalogs historically allow an exact raw model and
-			// its Anthropic-normalized spelling to coexist. Preserve exact-match
-			// precedence only for provider-only snapshots. Version-2/3 snapshots
-			// enforce the global normalized namespace during refresh as well.
 			if strictAliases || !existing.legacy || !entry.legacy {
 				return publicModelEntryCollisionError(alias, existing, entry)
 			}
@@ -513,9 +500,6 @@ func compileLegacyModelRoute(model providerModel, provider *providerRuntime) (*m
 				dropStopSequences:      model.dropStopSequences,
 				useMaxCompletionTokens: model.useMaxCompletionTokens,
 			},
-			// Seal catalog-owned slices and pointers once when the immutable
-			// registry snapshot is built. Request routing can then reuse this
-			// owner without cloning it on every native Chat request.
 			legacyOwner: cloneProviderModelForRoute(model),
 		}},
 		policy: routePolicy{
@@ -552,8 +536,6 @@ func (ps *providerSetup) lookupRouteAlias(publicID string) (*modelRoute, bool) {
 	return registry.lookupAlias(publicID)
 }
 
-// lookupPublicModelEntry resolves exact public IDs and their configured
-// normalized aliases across static and policy entries.
 func (ps *providerSetup) lookupPublicModelEntry(model string) (*publicModelEntry, bool) {
 	registry := ps.routeRegistry()
 	if registry == nil {
@@ -562,9 +544,6 @@ func (ps *providerSetup) lookupPublicModelEntry(model string) (*publicModelEntry
 	return registry.lookupPublicModelEntry(model)
 }
 
-// lookupTerminalRoute resolves an explicit terminal route by operational ID.
-// Internal routes are intentionally available here but never through the
-// client-facing static route resolver.
 func (ps *providerSetup) lookupTerminalRoute(routeID string) (*modelRoute, bool) {
 	registry := ps.routeRegistry()
 	if registry == nil {
@@ -580,10 +559,6 @@ func (h *ProxyHandler) resolveModelRouteForRequest(model, endpoint string) (*mod
 		return route, true
 	}
 	if route, ok := setup.lookupRouteAlias(NormalizeModelName(rawModel)); ok {
-		// Explicit routes reserve their normalized public-model aliases globally,
-		// so every public endpoint must resolve those aliases to the same route.
-		// Legacy provider catalogs keep their historical Messages-only alias
-		// fallback; chat and Responses still require an exact legacy public ID.
 		if !route.legacy || endpoint == providerEndpointMessages {
 			return route, true
 		}
@@ -592,17 +567,11 @@ func (h *ProxyHandler) resolveModelRouteForRequest(model, endpoint string) (*mod
 	return nil, false
 }
 
-// MessagesAliasResolvesTo reports whether a Messages request naming alias is
-// admitted and served by the same public route as one naming model. Launchers
-// use it to confirm an agent-facing spelling of the pinned model, because a
-// raw model that owns the alias spelling takes precedence over normalization.
 func (h *ProxyHandler) MessagesAliasResolvesTo(ctx context.Context, alias, model string) bool {
 	alias, model = strings.TrimSpace(alias), strings.TrimSpace(model)
 	if h == nil || alias == "" || model == "" {
 		return false
 	}
-	// Match HandleAnthropicMessages, which discovers unknown dynamic models
-	// before routing.
 	if provider, _, known := h.resolveProviderModelForRequest(model, providerEndpointMessages); !known && providerUsesDynamicModels(provider) {
 		if err := h.refreshUnknownChatRouteProvider(ctx, provider); err != nil {
 			return false
@@ -766,9 +735,6 @@ func compileLegacyProviderRoutes(provider *providerRuntime, models []providerMod
 	return compiled, nil
 }
 
-// validateRouteAwareRequestJSON keeps strict duplicate-key rejection scoped to
-// proxy-owned explicit routes; legacy and provider-owned requests retain their
-// existing decoder and upstream behavior.
 func (h *ProxyHandler) validateRouteAwareRequestJSON(body []byte, model, endpoint string) error {
 	if h == nil {
 		return nil

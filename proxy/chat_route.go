@@ -14,9 +14,6 @@ const (
 	chatBackendResponses
 )
 
-// resolvedChatRoute is the immutable provider/model/backend snapshot used for
-// one canonical Chat request. The provider runtime is configuration state and
-// the owner is copied so later catalog replacement cannot change this route.
 type resolvedChatRoute struct {
 	provider       *providerRuntime
 	owner          providerModel

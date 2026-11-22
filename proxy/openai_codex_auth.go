@@ -261,9 +261,6 @@ func (a *openAICodexAuth) executeRefresh(
 		}
 	}
 	if processLock != nil {
-		// Releasing/closing the descriptor is post-commit cleanup. Never discard
-		// already persisted or recovered credentials because cleanup reported an
-		// error; closing the descriptor still releases the kernel lock.
 		_ = processLock.release()
 	}
 	if a.beforeRefreshPublish != nil {
@@ -434,19 +431,12 @@ func (a *openAICodexAuth) applyRefresh(
 		if openAICodexNeedsRefresh(currentState.tokens.AccessToken, currentState.lastRefresh, time.Now().UTC()) {
 			return openAICodexCredentials{}, currentState, false, fmt.Errorf("OpenAI Codex auth file %q changed during token refresh and still requires refresh; retry", a.path)
 		}
-		// The authoritative credentials are already fresh. Cleanup/directory-sync
-		// errors must not make current requests fail; the remaining journal is retried
-		// under the process lock on a later load.
 		return openAICodexCredentialsFromTokens(currentState.tokens), currentState, false, nil
 	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return openAICodexCredentials{}, nil, true, err
 		}
-		// The authority may already have rotated the refresh token. Keep the
-		// successfully issued credentials in the process cache even when durable
-		// journal persistence fails, so the running proxy does not immediately lose
-		// the only usable token. A later request retries persistence/refresh.
 		state.sourceDigest = authoritative.digest
 		return openAICodexCredentialsFromTokens(state.tokens), &state, false, nil
 	}
@@ -834,7 +824,6 @@ func (a *openAICodexAuth) persistJournaledRefresh(
 	}
 	if a.beforePersistWrite != nil {
 		if err := a.beforePersistWrite(); err != nil {
-			// The durable journal intentionally remains for recovery on the next load.
 			return nil, err
 		}
 	}
@@ -868,8 +857,6 @@ func (a *openAICodexAuth) persistJournaledRefresh(
 		return nil, fmt.Errorf("chmod refreshed OpenAI Codex auth file %q: %w", a.path, err)
 	}
 	if err := writeOpenAICodexTransactionFile(authoritative.file, targetBody); err != nil {
-		// Leave the journal in place; the next load recognizes and completes a
-		// source, partial-target, or full-target transaction state.
 		return nil, fmt.Errorf("write refreshed OpenAI Codex auth file %q: %w", a.path, err)
 	}
 	same, err := a.authoritativeDescriptorMatchesPath(authoritative)
@@ -1229,11 +1216,8 @@ func (a *openAICodexAuth) recoverJournalLocked() error {
 		}
 		return a.removeJournalDurable()
 	case currentDigest == journal.SourceDigest && bytes.Equal(body, journal.SourceAuthJSON):
-		// Complete the durable transaction below.
 	case len(body) < len(journal.RefreshedAuthJSON) && bytes.Equal(body, journal.RefreshedAuthJSON[:len(body)]):
-		// Truncate-first writes leave only a prefix of the journal target.
 	default:
-		// The path contains unrelated external state. It always wins.
 		return a.removeJournalDurable()
 	}
 

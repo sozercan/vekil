@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 )
 
-// Copilot accounting is reported separately from token usage. Retain only
-// numeric totals, never token-detail model names or provider metadata.
 type copilotUsageTotals struct {
 	TotalNanoAIU int64 `json:"total_nano_aiu"`
 	ComputeUnits int64 `json:"compute_units"`

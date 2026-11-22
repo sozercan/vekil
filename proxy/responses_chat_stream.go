@@ -196,9 +196,6 @@ func (d *responsesChatSSEDecoder) finalize(onMessage func(responsesSSEMessage) e
 		return nil
 	}
 
-	// A final line ending terminates the last SSE field line at EOF even when
-	// the optional blank-line separator is absent. Decode that complete final
-	// event, but still reject an unterminated last line as truncated.
 	last := d.pending[len(d.pending)-1]
 	if last != '\n' && last != '\r' {
 		return newChatServerError("invalid_responses_stream", "upstream returned truncated Responses SSE")
@@ -490,12 +487,6 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 	if named := strings.TrimSpace(msg.event); named != "" && named != eventType {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "Responses SSE event name does not match its JSON type")
 	}
-	// Numeric sequence metadata does not order, deduplicate or reassemble the
-	// stream, so a discontinuity must not discard a structurally valid turn.
-	// Content parts and messages are admitted by their semantic predecessors
-	// below, so visible output never starts out of index order. Within one part,
-	// a dropped, repeated or swapped delta is caught only by the output_text.done
-	// digest, after the deltas before it have been streamed.
 	if s.hasSequence && header.SequenceNumber != s.sequence+1 && !s.sequenceGapLogged {
 		s.sequenceGapLogged = true
 		if s.config.Carrier.Log != nil {
@@ -553,10 +544,8 @@ func (s *responsesChatStreamState) handleMessage(msg responsesSSEMessage) (respo
 		"response.reasoning_text.done":
 		return s.handleReasoningProgress(eventType, []byte(msg.data))
 	case "keepalive":
-		// Copilot Responses upstream emits during long generations; no state carried, drop.
 		return responsesChatStreamTransition{}, nil
 	default:
-		// Log bounded metadata so new event types are diagnosable without exposing payloads.
 		if s.config.Carrier.Log != nil {
 			const maxLoggedEventTypeBytes = 128
 			loggedEventType := eventType
@@ -617,8 +606,6 @@ func (s *responsesChatStreamState) handleReasoningProgress(eventType string, dat
 			return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "reasoning progress event is missing text")
 		}
 	}
-	// Hidden reasoning progress is non-semantic for Chat output. Exact output is
-	// retained only from output_item.done and the terminal response.
 	return responsesChatStreamTransition{}, nil
 }
 
@@ -729,7 +716,6 @@ func (s *responsesChatStreamState) handleOutputItemAdded(data []byte) (responses
 		tool.arguments.WriteString(event.Item.Arguments)
 		s.toolsByIndex[tool.outputIndex] = tool
 	case "reasoning":
-		// Hidden from Chat and retained only from authoritative terminal output.
 	default:
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", fmt.Sprintf("Responses output item type %q is not supported", event.Item.Type))
 	}
@@ -799,8 +785,6 @@ func (s *responsesChatStreamState) handleVisibleTextDelta(data []byte, kind stri
 	if part == nil || part.kind != kind || part.valueDone || part.partDone || !part.matches(event.ItemID, event.OutputIndex, event.ContentIndex) {
 		return responsesChatStreamTransition{}, newChatServerError("invalid_responses_stream", "output text delta correlation is invalid")
 	}
-	// Admit visible output by semantic indexes, not sequence metadata. The first
-	// missing predecessor bounds each scan; the byte count caches admission.
 	if event.Delta != "" && part.bytes == 0 {
 		for index := 0; index < part.contentIndex; index++ {
 			if previous := message.parts[index]; previous == nil || !previous.valueDone {
@@ -1029,8 +1013,6 @@ func (s *responsesChatStreamState) handleOutputItemDone(data []byte) (responsesC
 		}
 		tool.done = true
 	case "reasoning":
-		// Hidden, but completion and terminal-status correlation are still
-		// required before replay state can be published.
 		s.reasoningStatusByIndex[*event.OutputIndex] = strings.TrimSpace(header.Status)
 	default:
 		return responsesChatStreamTransition{}, newChatServerError("unsupported_responses_output", fmt.Sprintf("Responses output item type %q is not supported", header.Type))
@@ -1092,8 +1074,6 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 
 	var assistantText strings.Builder
 	hasRefusal := false
-	// Chat-style surfaces intentionally do not run command_rewrite; they preserve
-	// upstream arguments and only capture tool context for later output reduction.
 	publishCalls := make([]responsesChatReplayPublishCall, 0, len(s.toolsByIndex))
 	for outputIndex, raw := range event.Response.Output {
 		var header struct {
@@ -1215,8 +1195,6 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 			return usageFailureTransition, replayErr
 		}
 		transition.carriedReasoning = carriedTurnFromPublished(s.config.ReplayRoute, event.Response.Output, published, s.config.Carrier)
-		// Emit the stored projection itself, so streamed IDs, names, arguments and
-		// dense indexes are exactly what a later turn must replay.
 		for index, call := range published.Projection.Calls {
 			if call.ID == "" {
 				return responsesChatStreamTransition{}, newChatServerError("responses_replay_state_invalid", "published Responses replay state is incomplete")
@@ -1229,8 +1207,6 @@ func (s *responsesChatStreamState) handleTerminal(data []byte, terminalStatus st
 	}
 
 	chunks = append(chunks, s.finishChunk(finishReason))
-	// Canonical streams carry terminal token usage and billing for aggregation and
-	// accounting. Public adapters decide which fields to expose.
 	chunks = append(chunks, usageFailureTransition.chunks...)
 	s.terminalSeen = true
 	transition.chunks = chunks
@@ -1447,16 +1423,11 @@ func runResponsesChatStream(writer *chatStreamEventWriter, control *responsesCha
 				return err
 			}
 		}
-		// The carrier is trailing client state. If a future terminal transition carries
-		// no chunks of its own, commit and flush the role/chunk path before enqueuing it;
-		// otherwise short precommit responses can put the carrier ahead of visible output.
 		if transition.carriedReasoning.present() && !committed {
 			if err := emitChunks(nil); err != nil {
 				return err
 			}
 		}
-		// Unguarded: the writer owns "worth emitting". An item count here drops a
-		// capped carrier, which holds only its mapping.
 		if err := writer.sendCarriedReasoning(transition.carriedReasoning); err != nil {
 			return err
 		}

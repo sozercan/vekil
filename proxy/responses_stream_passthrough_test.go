@@ -246,8 +246,6 @@ func TestResponsesStreamPassthroughDirectIngressOnly(t *testing.T) {
 			t.Fatalf("unsupported request dispatched: status=%d sends=%d", got, sends.Load())
 		}
 	}
-	// Other consumers of this same route do not carry the direct HTTP
-	// marker. They retain their existing precommit error translation.
 	route, _ := h.resolveModelRouteForRequest("public-model", providerEndpointResponses)
 	resp, err := h.executeExplicitRouteRequest(t.Context(), route, providerEndpointResponses, []byte(passthroughStreamingRequest), nil, "public-model", true)
 	status := routeErrorStatus(err)

@@ -28,8 +28,6 @@ func runState(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	before, err := time.Parse(time.RFC3339, *cutoff)
-	// Reject fractional syntax before Go's parser can silently truncate digits
-	// beyond nanosecond precision. The store records issuance in whole seconds.
 	if err != nil || *path == "" || !*confirm || fs.NArg() != 0 || strings.ContainsAny(*cutoff, ".,") || before.Unix() <= 0 || before.After(time.Now()) {
 		_, _ = fmt.Fprintln(stderr, "pruning requires --file, a past whole-second --before RFC3339 timestamp, and --confirm; affected continuation state will become unknown")
 		return 2

@@ -24,7 +24,6 @@ import (
 func rewriteResponsesChatStreamSequenceNumbers(t *testing.T, fixture []byte, number func(int) int64) []byte {
 	t.Helper()
 	index := 0
-	// Keep every semantic event and all other fixture bytes unchanged.
 	rewritten := regexp.MustCompile(`"sequence_number":-?[0-9]+`).ReplaceAllFunc(fixture, func([]byte) []byte {
 		sequence := number(index)
 		index++
@@ -224,8 +223,6 @@ func TestResponsesChatStream_SequenceGapsRetainValidation(t *testing.T) {
 	}
 }
 
-// A tolerated discontinuity is logged once per stream, so live traffic shows how
-// often upstream numbering skips without one line per event.
 func TestResponsesChatStream_SequenceDiscontinuityLoggedOncePerStream(t *testing.T) {
 	const message = "tolerated upstream Responses sequence discontinuity"
 	fixture := readResponsesChatStreamFixture(t, "stream_text.sse")
@@ -467,8 +464,6 @@ func responsesChatStreamVisibleKindPairs() [][2]string {
 	}
 }
 
-// runFailingResponsesChatStream runs a stream that must fail. A committed stream is consumed to
-// its error; an uncommitted one must not be exposed at all.
 func runFailingResponsesChatStream(t *testing.T, fixture []byte, committed bool) (*responsesChatReplayStore, []models.OpenAIStreamChunk, error) {
 	t.Helper()
 	store := newResponsesChatReplayStore()
@@ -953,7 +948,6 @@ func TestResponsesChatStream_UnknownEventLogsOnlyBoundedMetadata(t *testing.T) {
 				Carrier:          carrierEmit{Log: logger.NewWithWriter(logger.LevelInfo, &logs)},
 			})
 			if err == nil {
-				// Large events cross the precommit byte limit before their type is known.
 				err = consumeChatStreamEvents(stream, nil, nil)
 			}
 			var executionErr *chatExecutionError
@@ -1001,9 +995,6 @@ func TestResponsesChatStream_UnknownEventLogsOnlyBoundedMetadata(t *testing.T) {
 	}
 }
 
-// TestResponsesChatStream_KeepaliveIsDroppedBetweenRealEvents: Copilot
-// emits `event: keepalive` during long generations; the case arm drops
-// it and lets the surrounding text still assemble.
 func TestResponsesChatStream_KeepaliveIsDroppedBetweenRealEvents(t *testing.T) {
 	fixture := []byte("event: response.created\n" +
 		`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_ka","created_at":1700000003,"status":"in_progress"}}` + "\n\n" +

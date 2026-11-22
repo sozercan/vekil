@@ -12,29 +12,6 @@ import (
 	"testing"
 )
 
-// Three separate leaks of client data into error_param have come from the same
-// shape: a name obtained from the CLIENT's own JSON object, handed to
-// newChatInvalidRequest, which cannot tell where its param came from. Each was
-// fixed by hand and the next one was written anyway, so this is the tripwire
-// rather than a fourth round of care.
-//
-// The rule: a value derived from a client-supplied map key must go through
-// newChatInvalidRequestClientField -- which keeps the full path for the client
-// and records only the trusted parent.
-//
-// An earlier version of this test tracked only DIRECT use of the range variable
-// (a bare identifier, or one inside a `+`). That missed the pattern the
-// validators actually use, which launders the key through a slice:
-//
-//	for field := range root {            // field is the client's key
-//	    unknown = append(unknown, field) // taint moves to the slice
-//	}
-//	return newChatInvalidRequest(unknown[0], ...) // and back out by index
-//
-// Reverting a call site to exactly that left the old test green. Taint is now
-// propagated to a fixpoint through assignment and append, and a call is an
-// offence if ANY tainted name appears anywhere in its param expression --
-// index, slice, concatenation or Sprintf argument alike.
 func TestClientKeysDoNotReachNewChatInvalidRequest(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -91,7 +68,6 @@ func TestClientKeysDoNotReachNewChatInvalidRequest(t *testing.T) {
 		})
 	}
 
-	// Without this the test passes trivially the day someone renames the constructor.
 	if checked == 0 {
 		t.Fatal("scanned no newChatInvalidRequest call in a function handling client keys; this test no longer checks anything")
 	}
@@ -100,17 +76,6 @@ func TestClientKeysDoNotReachNewChatInvalidRequest(t *testing.T) {
 	}
 }
 
-// clientTaintedNames returns every local binding in fn that can hold a
-// client-chosen map key, propagated to a fixpoint. Bindings, rather than names,
-// matter because separate range statements commonly reuse names such as index.
-//
-// The seed is the KEY of a range over anything not provably a slice, whether or
-// not the range also binds a value. That is fail-closed on purpose: proving map-ness instead missed
-// `object, err := decodeChatJSONObject(raw, param)`, where the map arrives from
-// a call and no literal names it. The slice exemption is what keeps
-// `fmt.Sprintf("messages[%d]", i)` quiet -- an integer index is vekil's own
-// structure, not the client's spelling, and flagging it produced 40 false
-// positives in an earlier version. Measured at zero false positives here.
 func clientTaintedNames(fn *ast.FuncDecl, bindings *types.Info) map[types.Object]bool {
 	slices := sliceTypedNames(fn, bindings)
 	tainted := map[types.Object]bool{}
@@ -119,12 +84,6 @@ func clientTaintedNames(fn *ast.FuncDecl, bindings *types.Info) map[types.Object
 		if !ok {
 			return true
 		}
-		// Over a map the key is the client's field name; over a slice it is an
-		// integer index. Binding the map value as a second range variable does not
-		// change the key's provenance. FAIL CLOSED: taint unless the operand is
-		// provably a slice. Requiring proof of map-ness instead is what let the
-		// `object, err := decodeChatJSONObject(raw, param)` shape through -- the
-		// map arrives from a call, so no literal or make() names it.
 		if src, ok := rng.X.(*ast.Ident); ok && slices[bindings.ObjectOf(src)] {
 			return true
 		}
@@ -139,9 +98,6 @@ func clientTaintedNames(fn *ast.FuncDecl, bindings *types.Info) map[types.Object
 	if len(tainted) == 0 {
 		return nil
 	}
-	// Fixpoint: any assignment whose right-hand side mentions a tainted name
-	// taints its left-hand side. That covers `unknown = append(unknown, field)`,
-	// `field := unknown[0]`, and any chain built from those.
 	for changed := true; changed; {
 		changed = false
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
@@ -178,10 +134,7 @@ func typeInfoForFiles(fset *token.FileSet, files []*ast.File) *types.Info {
 	}
 	config := types.Config{
 		Importer: importer.Default(),
-		// The test needs only local binding identity. Package-level type errors
-		// are covered by the normal build and test gates and should not stop this
-		// syntactic policy scan from inspecting the rest of the package.
-		Error: func(error) {},
+		Error:    func(error) {},
 	}
 	_, _ = config.Check("github.com/sozercan/vekil/proxy", fset, files, info)
 	return info
@@ -235,11 +188,6 @@ func TestClientTaintedNamesClassifiesTwoVariableRanges(t *testing.T) {
 	}
 }
 
-// sliceTypedNames returns the names in fn provably holding a slice or array:
-// variadic and slice parameters, `make([]T, ...)`, slice composite literals, and
-// `var x []T`. Anything not on this list is treated as possibly a map, because a
-// missed map key is a leak while a spurious integer index is only noise a
-// reviewer resolves once.
 func sliceTypedNames(fn *ast.FuncDecl, bindings *types.Info) map[types.Object]bool {
 	names := map[types.Object]bool{}
 	markType := func(idents []*ast.Ident, typ ast.Expr) {
@@ -302,9 +250,6 @@ func isSliceValued(expr ast.Expr) bool {
 	return false
 }
 
-// taintedIdentIn reports the first tainted binding appearing anywhere in expr.
-// Whole-expression search is the point: `unknown[0]`, `unknown[i]`, `p + unknown[0]`
-// and `fmt.Sprintf("%s", unknown[0])` are the same leak wearing different syntax.
 func taintedIdentIn(expr ast.Expr, tainted map[types.Object]bool, bindings *types.Info) *ast.Ident {
 	var found *ast.Ident
 	ast.Inspect(expr, func(n ast.Node) bool {

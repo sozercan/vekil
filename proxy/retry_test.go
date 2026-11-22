@@ -550,7 +550,6 @@ func TestDoWithRetry_RespectsRetryAfter(t *testing.T) {
 	if calls.Load() != 2 {
 		t.Errorf("expected 2 calls, got %d", calls.Load())
 	}
-	// Retry-After: 1 means at least 1 second of delay.
 	if elapsed < 900*time.Millisecond {
 		t.Errorf("expected at least ~1s delay from Retry-After, got %v", elapsed)
 	}
@@ -1302,8 +1301,6 @@ func TestDoWithRetryAccountsPendingOnlyAfterClientDo(t *testing.T) {
 		case <-secondAttempt:
 			h.BeginShutdown()
 		case <-writer.started:
-			// Old behavior logged before Client.Do. Release it after cancellation so
-			// the test can observe the incorrect retry count instead of deadlocking.
 			h.BeginShutdown()
 			writer.releaseWrite()
 		case <-time.After(time.Second):

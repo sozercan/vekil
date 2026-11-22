@@ -105,10 +105,10 @@ func TestBuildPolicyClassifierFactsExtractsBoundedSafeProjection(t *testing.T) {
 }
 
 func TestBuildPolicyClassifierFactsUTF8SafePerFieldCaps(t *testing.T) {
-	anchor := strings.Repeat("界", 900)  // 2700 bytes
-	task := strings.Repeat("🙂", 1100)   // 4400 bytes
-	recent := strings.Repeat("é", 900)  // 1800 bytes
-	toolName := strings.Repeat("λ", 80) // 160 bytes
+	anchor := strings.Repeat("界", 900)
+	task := strings.Repeat("🙂", 1100)
+	recent := strings.Repeat("é", 900)
+	toolName := strings.Repeat("λ", 80)
 	body := marshalPolicyFactTestBody(t, map[string]any{
 		"messages": []any{
 			map[string]any{"role": "system", "content": anchor},
@@ -214,8 +214,6 @@ func TestBuildPolicyClassifierFactsRoutesCurrentTaskDespiteClippedSetup(t *testi
 			if !facts.Truncation.Anchors || !facts.Truncation.RecentMessages {
 				t.Fatalf("setup/history clipping not reported: %+v", facts.Truncation)
 			}
-			// Even a simple classifier result must stay conservative when the
-			// current task itself is incomplete, while setup clipping is normal.
 			signals := policyClassifierSignals{TurnType: policyTurnTypeChitchat, CodeScope: policyCodeScopeNone, RiskLevel: policyRiskLevelLow}
 			if got := mapPolicySignals(signals, facts); got != tc.want {
 				t.Fatalf("tier = %s, want %s", got, tc.want)

@@ -93,8 +93,6 @@ func TestDurableResponsesErrorHeaderCaseAliases(t *testing.T) {
 							if err != nil {
 								t.Fatal(err)
 							}
-							// Keep raw bytes and wait for the separately projected error,
-							// not merely the preceding provider error event.
 							exposed += string(raw)
 							var envelope struct {
 								Status  int               `json:"status_code"`
@@ -175,8 +173,6 @@ func TestDurableResponsesCommittedErrorEventHeaders(t *testing.T) {
 					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 						sends.Add(1)
 						w.Header().Set("Content-Type", "text/event-stream")
-						// Actual semantic progress prevents either preparation layer
-						// from discarding the failure as a precommit rejection.
 						_, _ = io.WriteString(w, responsesRouteSSE("response.output_text.delta", `{"type":"response.output_text.delta","delta":"fixture progress"}`)+responsesRouteSSE(strings.Split(kind, "-")[0], durableFailureEvent(kind, values)))
 					}))
 					defer upstream.Close()
@@ -284,9 +280,6 @@ func TestDurableResponsesTranslatedWebSocketErrorHeaders(t *testing.T) {
 			s.durable.beforeCommit = func() error {
 				commits++
 				if commits == 1 {
-					// The first route preparation times out without semantic data.
-					// Its real header commit releases the upstream, so the second
-					// preparation layer sees the failure and projects error headers.
 					close(accepted)
 					return nil
 				}

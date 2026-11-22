@@ -120,8 +120,6 @@ func testDurableStateStopTimeoutEventuallyReleasesLock(t *testing.T, transport s
 			t.Fatal(dialErr)
 		}
 		defer func() { _ = conn.Close() }()
-		// The bridge obtains and binds real upstream HTTP Responses state;
-		// this case specifically covers the hijacked client handler's teardown.
 		if err := conn.WriteJSON(map[string]any{"type": "response.create", "model": "public-model", "input": "fixture"}); err != nil {
 			t.Fatal(err)
 		}
@@ -147,9 +145,6 @@ func testDurableStateStopTimeoutEventuallyReleasesLock(t *testing.T, transport s
 	case <-time.After(2 * time.Second):
 		t.Fatal("real request did not reach its handler-teardown barrier")
 	}
-	// This barrier is inside the real request-log middleware, after the actual
-	// Responses writer committed ownership. Closing the HTTP connection (or
-	// hijacking it for a websocket) cannot prove return from a blocked log sink.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	err = srv.Stop(ctx)
 	cancel()
@@ -162,8 +157,6 @@ func testDurableStateStopTimeoutEventuallyReleasesLock(t *testing.T, transport s
 	} else if !strings.Contains(openErr.Error(), "already in use") {
 		t.Fatalf("replacement before drain = %v", openErr)
 	}
-	// All later callers keep the original Stop result; no retry may be required
-	// to release resources once the old generation actually finishes.
 	var waiters sync.WaitGroup
 	for range 8 {
 		waiters.Go(func() {
@@ -262,8 +255,6 @@ func TestDurableStateConstructorFailureReleasesLock(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "non-loopback") {
 		t.Fatalf("constructor = %v, want late listen-host rejection", err)
 	}
-	// The second constructor must acquire the same store, without serving or
-	// contacting the example providers. A leaked descriptor would hold its lock.
 	srv, err := New(auth.NewTestAuthenticator("synthetic-token"), logger.New(logger.LevelFatal), "127.0.0.1", "0", opts)
 	if err != nil {
 		t.Fatal(err)
@@ -312,8 +303,6 @@ func TestDurableStateListenFailureReleasesLock(t *testing.T) {
 	if srv.IsRunning() {
 		t.Fatal("failed listener marked server running")
 	}
-	// No explicit Stop or GC may be needed before the replacement acquires
-	// the same existing file. This is a real TCP collision and bbolt lock.
 	replacement, err := newServer("0")
 	if err != nil {
 		t.Fatalf("replacement after listen failure = %v", err)
@@ -406,9 +395,6 @@ func TestDurableStateStopDuringListenRetainsLockUntilCleanup(t *testing.T) {
 			if startErr == nil {
 				t.Error("Start succeeded after Stop had claimed the generation")
 			}
-			// Listen's context governs name resolution, not the returned socket;
-			// a numeric address may still bind after cancellation. Preserve an
-			// actual listener error, and close every late successful listener.
 			if barrier.listenErr != nil && !errors.Is(startErr, barrier.listenErr) {
 				t.Errorf("Listen error lost: %v, want %v", startErr, barrier.listenErr)
 			}
@@ -425,8 +411,6 @@ func TestDurableStateStopDuringListenRetainsLockUntilCleanup(t *testing.T) {
 					t.Error("late listener was not closed")
 				}
 			}
-			// The original timed-out Stop owns one background finalizer. It must
-			// release the store after real listener cleanup without another Stop.
 			deadline := time.Now().Add(2 * time.Second)
 			for {
 				replacement, openErr := newServer()

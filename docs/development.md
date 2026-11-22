@@ -301,29 +301,30 @@ After the release gate passes, require at least 5,000 completed observations per
 python3 -m venv .build/comment-lint
 .build/comment-lint/bin/python -m pip install -r scripts/comment-lint-requirements.txt
 make lint PYTHON=.build/comment-lint/bin/python
-make lint-comments PYTHON=.build/comment-lint/bin/python COMMENT_BASE="$(git merge-base HEAD origin/main)"
+make lint-comments PYTHON=.build/comment-lint/bin/python
 ```
 
-The comment ratchet prohibits new or rewritten prose comments in first-party
-source; use clear names, tests, or an [ADR](adr/README.md) instead. It compares
-each file's exact comment-line counts by text (ignoring surrounding whitespace)
-against a Git base. A comment can't be replaced with different prose or copied
-to another file under the old allowance. Once its deletion lands, reintroducing
-it fails. CI compares the PR merge result with its base commit, or a push with
-the previous tip. Locally the default base is `HEAD` for uncommitted changes;
-pass `COMMENT_BASE` to review committed changes too.
+The comment ratchet reached zero. Lint now checks the full first-party source
+tree, including unchanged tracked files and non-ignored untracked files, for
+prose comments. Use clear names, tests, or an [ADR](adr/README.md) instead.
+
+For an older branch with a legacy backlog, pass `COMMENT_BASE=<revision>` to
+compare each file's exact comment-line counts against that Git revision. This
+allows deletions but not replacements or copies. CI always uses the full-tree
+check, not a legacy allowance.
 
 The lexer covers Go (including tests and `go.mod`), shell, Python, Objective-C/C
 headers, HTML with inline JavaScript/CSS, standalone JS/CSS, YAML/JSON/TOML,
-Makefiles with tab-prefixed recipes, Dockerfiles, and `.gitignore`. It also checks GitHub Actions `run`
-scripts and shell heredocs identifiable as Python or shell. Arbitrary string
+Makefiles with tab-prefixed recipes, Dockerfiles, `.gitignore`, and jq. It also
+checks GitHub Actions `run` scripts, literal jq filters in shell commands, and
+shell heredocs identifiable as Python or shell. Arbitrary string
 literals, data fixtures, docs, and the vendored uPlot assets are not prose
 source. Keep machine-consumed syntax such as Go build tags/embeds, the cgo
 preamble, shebangs, and bare named `//nolint:` directives intact. Prose after a
 named `//nolint:` directive still counts.
 
 Use `.build/comment-lint/bin/python scripts/comment-lint.py --inventory` to
-list the remaining work with source locations and count comment-only versus
+list any prose comments with source locations and count comment-only versus
 inline lines. Use `$delete-comment` in Codex or `/delete-comment` in Claude Code
 to repeat the review workflow in this repository.
 

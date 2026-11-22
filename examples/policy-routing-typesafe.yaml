@@ -1,12 +1,3 @@
-# Jev classifies requests for two Copilot terminal models.
-# Authenticate Copilot with "vekil login" and export TYPESAFE_API_KEY.
-#
-# Validate offline:
-#   vekil config validate --providers-config examples/policy-routing-typesafe.yaml
-# Validate the classifier with a fixed fixture:
-#   vekil config validate --live --providers-config examples/policy-routing-typesafe.yaml
-# Run in observe mode:
-#   vekil --providers-config examples/policy-routing-typesafe.yaml
 
 schema_version: 2
 
@@ -19,7 +10,6 @@ providers:
     base_url: https://api.typesafe.ai/v1
     api_key_env: TYPESAFE_API_KEY
     trust_domain: typesafe
-    # Optional path override; appended to base_url.
     systemone_path: /systemone
 
 model_routes:
@@ -72,8 +62,6 @@ policy_profiles:
       timeout_ms: 3000
       max_request_bytes: 16000
     data_policy:
-      # Bounded request content goes to the separate classifier provider.
       content_forwarding_acknowledged: true
       allow_cross_trust_domain: true
-      # The TypeSafe protocol has no request-level non-storage control.
       allow_provider_retention: true

@@ -33,7 +33,6 @@ func TestReasoningCarrierRoundTrip(t *testing.T) {
 	if len(replay.Items) != len(items) {
 		t.Fatalf("item count = %d, want %d", len(replay.Items), len(items))
 	}
-	// encrypted_content stays exact; visible items keep only reconstruction metadata.
 	want := []json.RawMessage{
 		items[0],
 		json.RawMessage(`{"type":"function_call"}`),
@@ -59,8 +58,6 @@ func TestReasoningCarrierEmptyInputProducesNoBlock(t *testing.T) {
 	}
 }
 
-// The decoder must never fail the request: a signature may be foreign, stale,
-// truncated or hostile, and rejecting would recreate the wedge.
 func TestReasoningCarrierRejectsGarbageWithoutErroring(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -83,10 +80,7 @@ func TestReasoningCarrierRejectsGarbageWithoutErroring(t *testing.T) {
 	}
 }
 
-// A signature is attacker-reachable, so an inflate bomb is too. Over-cap carriers
-// are dropped, which after a restart is the wedge again: pin the cap itself.
 func TestReasoningCarrierBoundsDecompression(t *testing.T) {
-	// Random filler, so flate cannot shrink it into a different test.
 	carrierOfDecodedSize := func(t *testing.T, delta int) string {
 		t.Helper()
 		overhead := len(`{"items":[{"type":"reasoning","encrypted_content":""}]}`)
@@ -107,9 +101,6 @@ func TestReasoningCarrierBoundsDecompression(t *testing.T) {
 		return signature
 	}
 
-	// Bounded by what it protects, not by a number that drifts with it: at least a group
-	// the store will publish, or we mint carriers we reject; and well under the request
-	// budget, which is what actually bounds a decompression bomb.
 	if reasoningCarrierMaxDecodedBytes < responsesChatReplayMaxGroupBytes ||
 		reasoningCarrierMaxDecodedBytes > reasoningCarrierRequestBudget/2 {
 		t.Fatalf("cap = %d bytes, outside [%d, %d]", reasoningCarrierMaxDecodedBytes,
@@ -131,7 +122,6 @@ func TestReasoningCarrierBlockShape(t *testing.T) {
 	if block.Type != "thinking" {
 		t.Fatalf("type = %v, want thinking", block.Type)
 	}
-	// Empty thinking text is deliberate: the carrier shows the user nothing new.
 	if block.Thinking == nil || *block.Thinking != "" {
 		t.Fatalf("thinking = %v, want a present empty string", block.Thinking)
 	}
@@ -140,8 +130,6 @@ func TestReasoningCarrierBlockShape(t *testing.T) {
 	}
 }
 
-// Compression does not rescue size -- encrypted_content is ciphertext -- and the
-// signature rides in every later request, so pin the growth RATE, not a total.
 func TestReasoningCarrierSizeGrowsWithCiphertext(t *testing.T) {
 	item := func() json.RawMessage {
 		buf := make([]byte, 1572)
@@ -227,7 +215,6 @@ func TestExtractCarriedReasoningIsPerTurn(t *testing.T) {
 	}
 }
 
-// Absence, not an error: that is what lets the caller fall through to the store.
 func TestExtractCarriedReasoningToleratesTranscriptsWithoutCarriers(t *testing.T) {
 	cases := []struct {
 		name string
@@ -254,8 +241,6 @@ func TestExtractCarriedReasoningToleratesTranscriptsWithoutCarriers(t *testing.T
 	}
 }
 
-// A bare thinking block never replayed a turn, so its items must not escape.
-// Paired with a real turn, or the "no carrier" early return masks it.
 func TestExtractCarriedReasoningIgnoresCarrierWithoutToolUse(t *testing.T) {
 	block := func(t *testing.T, id string) *models.ContentBlock {
 		t.Helper()
@@ -290,8 +275,6 @@ func TestExtractCarriedReasoningIgnoresCarrierWithoutToolUse(t *testing.T) {
 	}
 }
 
-// The digest binds a carrier to the route that minted it: Copilot's ciphertext is
-// model-bound, and it is also how a continuation is matched back to its own tier.
 func TestCarrierRouteDigestRejectsAnotherRoute(t *testing.T) {
 	minted := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-5.6-sol", RouteID: "sol-route", PolicyTier: "powerful"}
 	other := minted
@@ -319,9 +302,6 @@ func TestCarrierRouteDigestRejectsAnotherRoute(t *testing.T) {
 	}
 }
 
-// Assert on the MARSHALLED BYTES. A struct round-trip cannot see a field that
-// omitempty deleted on the way out, which is how {"type":"thinking",
-// "signature":...} shipped and killed clients on i.thinking.length.
 func TestCarrierBlockKeepsThinkingOnTheWire(t *testing.T) {
 	block, err := reasoningCarrierBlock(carriedTurn{Items: sampleReasoningItems()})
 	if err != nil {
@@ -345,9 +325,6 @@ func TestCarrierBlockKeepsThinkingOnTheWire(t *testing.T) {
 	}
 }
 
-// Non-carrier blocks must NOT gain the field: Anthropic does not send
-// `thinking` on a text block, which is why this is a pointer rather than
-// dropping omitempty.
 func TestNonCarrierBlocksOmitThinkingOnTheWire(t *testing.T) {
 	text := "hello"
 	for _, block := range []models.ContentBlock{
@@ -364,11 +341,6 @@ func TestNonCarrierBlocksOmitThinkingOnTheWire(t *testing.T) {
 	}
 }
 
-// The budget is spent newest-first, so a long transcript drops its OLDEST carriers. That is
-// the right end to drop from twice over: the newest turns are the ones whose store group is
-// most likely still live, and trimAgedReasoning discards the oldest turns' reasoning on the
-// way out anyway -- spending the budget there paid for bytes that never left the process.
-// Crossing the budget is still reported rather than silent.
 func TestCarrierBudgetSpendsOnTheTurnsThatSurviveTheTrim(t *testing.T) {
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public"}
 	message := func(index int) models.AnthropicMessage {
@@ -414,16 +386,12 @@ func TestCarrierBudgetSpendsOnTheTurnsThatSurviveTheTrim(t *testing.T) {
 	}
 }
 
-// A group the store accepts must mint a carrier the decoder accepts. When these drifted
-// apart, a 1-2 MiB turn published fine, minted a carrier vekil itself rejected, and
-// wedged once the store forgot it -- the exact failure the carrier exists to prevent.
 func TestCarrierDecodesEveryGroupTheStoreWillPublish(t *testing.T) {
 	if reasoningCarrierMaxDecodedBytes <= responsesChatReplayMaxGroupBytes {
 		t.Fatalf("decode cap %d does not cover a publishable group of %d",
 			reasoningCarrierMaxDecodedBytes, responsesChatReplayMaxGroupBytes)
 	}
 
-	// A turn at the store's ceiling, incompressible so the cap is exercised on real bytes.
 	ciphertext := make([]byte, responsesChatReplayMaxGroupBytes)
 	for i := range ciphertext {
 		ciphertext[i] = byte(i*31 + i/251)
@@ -444,8 +412,6 @@ func TestCarrierDecodesEveryGroupTheStoreWillPublish(t *testing.T) {
 	}
 }
 
-// A payload beyond the decoder's safety cap is omitted rather than replaced with a
-// client-held provider mapping.
 func TestCarrierPastTheCapIsNotEmitted(t *testing.T) {
 	ciphertext := make([]byte, reasoningCarrierMaxDecodedBytes)
 	for i := range ciphertext {
@@ -466,8 +432,6 @@ func TestCarrierPastTheCapIsNotEmitted(t *testing.T) {
 	}
 }
 
-// The store and route nearly every carrier test needs. Three call sites had already drifted
-// apart before this existed; a shared fixture is how they stay comparable.
 func newCarrierReplayFixture(t *testing.T) (*responsesChatReplayStore, responsesChatReplayRoute) {
 	t.Helper()
 	store := newResponsesChatReplayStore()
@@ -475,8 +439,6 @@ func newCarrierReplayFixture(t *testing.T) (*responsesChatReplayStore, responses
 	return store, responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
 }
 
-// decodeReasoningCarrier never errors -- it returns false -- so an unchecked call reads as
-// success and asserts on a zero value. This makes the check impossible to forget.
 func mustDecodeCarrier(t *testing.T, signature string) carriedReplay {
 	t.Helper()
 	decoded, ok := decodeReasoningCarrier(signature, nil)
@@ -486,9 +448,6 @@ func mustDecodeCarrier(t *testing.T, signature string) carriedReplay {
 	return decoded
 }
 
-// The budget is charged before the decode fails, so the carrier that exhausts it never
-// reached the pre-attempt check that sets Starved -- and if it is the LAST carrier, no
-// later iteration sets it either. Continuity is then lost with no warning at all.
 func TestCarrierExhaustingTheBudgetSaysSoEvenWhenItIsLast(t *testing.T) {
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public"}
 	message := func(index int) models.AnthropicMessage {
@@ -514,10 +473,6 @@ func TestCarrierExhaustingTheBudgetSaysSoEvenWhenItIsLast(t *testing.T) {
 		return models.AnthropicMessage{Role: "assistant", Content: blocks}
 	}
 
-	// The count is load-bearing, in BOTH directions. Below 10 the budget is never
-	// exhausted and nothing starves; at 11 it is exhausted BEFORE the last carrier, so
-	// the pre-attempt check sets the flag and this test would pass with the bug back.
-	// Only 10 lands the exhaustion ON the final carrier, which is the gap.
 	var messages []models.AnthropicMessage
 	for i := 0; i < 10; i++ {
 		messages = append(messages, message(i))
@@ -529,16 +484,13 @@ func TestCarrierExhaustingTheBudgetSaysSoEvenWhenItIsLast(t *testing.T) {
 	}
 }
 
-// The wedge arrived in production with no way to tell WHICH guard rejected the carrier:
-// the reason was computed and dropped. It must name the guard, and never carry content.
 func TestCarrierWedgeNamesTheGuardThatRejectedIt(t *testing.T) {
 	store, route := newCarrierReplayFixture(t)
 	var logs bytes.Buffer
 	options := responsesChatRequestOptions{
-		Log:         logger.NewWithWriter(logger.LevelWarn, &logs),
-		ReplayStore: store,
-		ReplayRoute: route,
-		// Deliberately empty: the client sent no carrier for these calls at all.
+		Log:              logger.NewWithWriter(logger.LevelWarn, &logs),
+		ReplayStore:      store,
+		ReplayRoute:      route,
 		CarriedReasoning: nil,
 	}
 	projected := []responsesChatReplayProjectedCall{
@@ -554,7 +506,6 @@ func TestCarrierWedgeNamesTheGuardThatRejectedIt(t *testing.T) {
 	if !strings.Contains(out, `"tool_calls":1`) {
 		t.Fatalf("wedge log lost the call count: %s", out)
 	}
-	// The projection is prompt data; only vekil's own enumerations may be logged.
 	for _, leak := range []string{"secret-path", "file_path", "call_vekil_absent"} {
 		if strings.Contains(out, leak) {
 			t.Fatalf("wedge log leaked request content %q: %s", leak, out)
@@ -562,10 +513,6 @@ func TestCarrierWedgeNamesTheGuardThatRejectedIt(t *testing.T) {
 	}
 }
 
-// Interleaved parallel calls split one logical turn across several wire messages, and the
-// carrier can land in a message holding no tool_use at all. Requiring co-location discarded
-// it, leaving those ids unresolvable -- measured on a real 1190-message session where 10 of
-// 711 ids were orphaned this way and wedged the conversation permanently.
 func TestOrphanedCarrierStillResolvesTheCallsItNames(t *testing.T) {
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
 	signature, err := encodeReasoningCarrier(carriedTurn{
@@ -577,8 +524,6 @@ func TestOrphanedCarrierStillResolvesTheCallsItNames(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 
-	// The tool_use rides in ONE assistant message; the carrier lands in a LATER assistant
-	// message with no tool_use beside it -- exactly the interleaved-parallel shape.
 	toolOnly, err := json.Marshal([]models.ContentBlock{
 		{Type: "tool_use", ID: "call_vekil_orphan", Name: "TaskOutput", Input: json.RawMessage(`{}`)},
 	})
@@ -606,9 +551,6 @@ func TestOrphanedCarrierStillResolvesTheCallsItNames(t *testing.T) {
 	}
 }
 
-// A turn can call a tool and THEN speak. The flattened text has one slot to go back into, so
-// it goes where the turn first spoke -- and that must be the message, not the call, or the
-// replay hoists the text above a call upstream had already emitted and inverts the turn.
 func TestCarriedRestoreKeepsTextAfterACallThatPrecededIt(t *testing.T) {
 	call := json.RawMessage(`{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}","status":"completed"}`)
 	message := json.RawMessage(`{"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"spoken"}]}`)
@@ -616,7 +558,7 @@ func TestCarriedRestoreKeepsTextAfterACallThatPrecededIt(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		items     []json.RawMessage
-		wantFirst string // "call" or "text": whichever upstream emitted first
+		wantFirst string
 	}{
 		{"call then message", []json.RawMessage{call, message}, "call"},
 		{"message then call", []json.RawMessage{message, call}, "text"},
@@ -647,7 +589,6 @@ func TestCarriedRestoreKeepsTextAfterACallThatPrecededIt(t *testing.T) {
 				"spoken",
 			)
 
-			// The rebuilt text item carries no "type", so it is identified by its content.
 			gotFirst := ""
 			for _, item := range out.OutputItems {
 				itemType, _ := carriedItemHeader(item)

@@ -124,8 +124,6 @@ func TestDurableFinalErrorHeaders(t *testing.T) {
 						want = http.StatusBadGateway
 					}
 					if surface == "websocket-rejected-stream" {
-						// The executor reduces this precommit rejection to a typed
-						// failure, discarding its headers before the websocket writer.
 						want = http.StatusTooManyRequests
 					}
 					status, exposed := invokeFinalHeaderSurface(t, h, surface, "")
@@ -169,8 +167,6 @@ func TestDurableFinalErrorHeaders(t *testing.T) {
 						continued := continueFinalHeader(h, "turn-error-fixture")
 						wantStatus, wantSends := upstreamStatus, int32(2)
 						if surface == "chat" {
-							// Native Chat headers belong to the Chat endpoint. They
-							// cannot authorize cross-endpoint Responses continuation.
 							wantStatus, wantSends = http.StatusBadRequest, 1
 						}
 						if continued.Code != wantStatus || sends.Load() != wantSends {
@@ -222,8 +218,6 @@ func TestDurableFinalErrorHeadersSelectExactIssuer(t *testing.T) {
 					t.Fatalf("final header: status=%d sends=%d/%d exposed=%s", status, firstSends.Load(), secondSends.Load(), exposed)
 				}
 				if wantStatus == http.StatusTooManyRequests {
-					// These consumers reduce exhausted rejections to typed errors,
-					// discarding both attempts' headers. Nothing should be bound.
 					if strings.Contains(exposed, "turn-fixture") || s.stats().entries != 0 {
 						t.Fatal("discarded rejection header was exposed or bound")
 					}

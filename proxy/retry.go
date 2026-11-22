@@ -27,7 +27,6 @@ const (
 	maxRetryAfterDuration           = time.Duration(1<<63 - 1)
 )
 
-// retryable returns true for status codes that warrant a retry.
 func retryable(statusCode int) bool {
 	switch statusCode {
 	case http.StatusRequestTimeout,
@@ -35,19 +34,18 @@ func retryable(statusCode int) bool {
 		http.StatusBadGateway,
 		http.StatusServiceUnavailable,
 		http.StatusGatewayTimeout,
-		529, // Anthropic overloaded_error
-		520, // Cloudflare: web server returned an unknown error
-		521, // Cloudflare: web server is down
-		522, // Cloudflare: connection timed out
-		523, // Cloudflare: origin is unreachable
-		524, // Cloudflare: a timeout occurred
-		530: // Cloudflare: origin DNS / origin error
+		529,
+		520,
+		521,
+		522,
+		523,
+		524,
+		530:
 		return true
 	}
 	return false
 }
 
-// backoff returns the delay for the given attempt (0-indexed) with jitter.
 func backoff(base time.Duration, attempt int) time.Duration {
 	if base <= 0 {
 		base = time.Nanosecond
@@ -75,8 +73,6 @@ func backoff(base time.Duration, attempt int) time.Duration {
 	return delay + time.Duration(rand.Int64N(int64(jitterBound)))
 }
 
-// parseRetryAfter extracts a delay from a Retry-After header value.
-// It supports both delay-seconds ("120") and HTTP-date values.
 func parseRetryAfter(value string) (time.Duration, bool) {
 	return parseRetryAfterAt(value, time.Now())
 }
@@ -112,9 +108,6 @@ func retryAfterDurationFromSeconds(seconds int64) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// A reset beyond the request deadline is useful to the caller, but cannot
-// schedule another attempt within this operation. Callers without a deadline
-// retain a bounded wait instead of sleeping for an account's multi-day reset.
 func retryDelayFitsBudget(ctx context.Context, delay time.Duration) bool {
 	if ctx.Err() != nil {
 		return false
@@ -159,20 +152,10 @@ func durationSecondsCeil(delay time.Duration) int64 {
 	return seconds
 }
 
-// drainAndClose discards up to 4 KB from the body before closing it so that
-// HTTP/2 streams are cleanly consumed and the underlying connection can be
-// reused instead of being reset. The read is time-bounded because a response
-// body can yield a short prefix and then stall indefinitely.
 func drainAndClose(body io.ReadCloser) {
 	_ = captureAndDrainResponseBody(body, upstreamErrorDetailMaxBodyBytes, 0)
 }
 
-// drainReaderAndClose consumes reader through EOF before closing body so an
-// HTTP/1.x transport can reuse a normally completed response connection. If the
-// reader stalls, the existing upstream-body timeout closes it and lets the
-// caller return without waiting indefinitely. The reader may wrap body (for
-// example, a bufio.Reader with already-buffered bytes), so callers must pass the
-// reader they were actively consuming rather than body directly.
 func drainReaderAndClose(reader io.Reader, body io.ReadCloser) {
 	if body == nil {
 		return
@@ -189,8 +172,6 @@ func drainReaderAndClose(reader io.Reader, body io.ReadCloser) {
 
 	timedOut := make(chan struct{})
 	timer := time.AfterFunc(upstreamErrorDetailDrainTimeout, func() {
-		// Signal first so a pathological Close implementation cannot extend the
-		// caller-visible timeout. net/http response bodies unblock Read on Close.
 		close(timedOut)
 		closeBody()
 	})
@@ -209,16 +190,10 @@ func drainReaderAndClose(reader io.Reader, body io.ReadCloser) {
 	}
 }
 
-// doWithRetry executes an HTTP request with retry on transient failures.
-// The reqFactory is called on each attempt to produce a fresh request body.
 func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*http.Response, error) {
 	return h.doWithRetryMode(reqFactory, false)
 }
 
-// doInferenceWithRetry preserves the inference dispatch contract that one
-// reserved attempt produces one physical send. It therefore bypasses
-// http.Client redirect handling and sends through the configured transport
-// directly; catalog and auxiliary requests keep ordinary Client behavior.
 func (h *ProxyHandler) doInferenceWithRetry(reqFactory func() (*http.Request, error)) (*http.Response, error) {
 	return h.doWithRetryMode(reqFactory, true)
 }
@@ -347,7 +322,6 @@ func (h *ProxyHandler) doWithRetryMode(reqFactory func() (*http.Request, error),
 			if !retryDelayFitsBudget(req.Context(), delay) {
 				return resp, nil
 			}
-			// Drain and close body before retry to allow connection reuse.
 			drainAndClose(resp.Body)
 			if req.Context().Err() != nil {
 				return nil, upstreamErr
@@ -478,8 +452,6 @@ func providerGzipReaderPoolGet(body io.Reader) (*gzip.Reader, error) {
 }
 
 func providerGzipReaderPoolPut(reader *gzip.Reader) {
-	// Reset against a flate.Reader so gzip does not allocate a bufio.Reader,
-	// and so the pooled reader does not retain the completed response body.
 	var empty flate.Reader = providerGzipEOFReader{}
 	_ = reader.Reset(empty)
 	providerGzipReaderPool.Put(reader)
@@ -585,13 +557,6 @@ func contextTerminationMatches(ctx context.Context, err error) bool {
 }
 
 func (h *ProxyHandler) logRetryAttempt(ctx context.Context, attempt int, status int, retryAfter string, delay time.Duration, err error) {
-	// Count a retry only when it was made on behalf of a tracked inference
-	// request. The upstream request context carries the retry-stats marker iff
-	// the middleware set it for a tracked route and newInferenceUpstreamContext
-	// propagated it; non-tracked callers (the in-process /dashboard/insight call,
-	// the GET /v1/models catalog fetch, count-token probes, the proxy shims)
-	// build their upstream context without the marker, so their retries are not
-	// folded into the dashboard's retry stats.
 	if h != nil && h.stats != nil && isRetryStatsTracked(ctx) {
 		h.stats.incRetry(status)
 	}
@@ -644,8 +609,6 @@ func permanentTransportError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "unsupported protocol scheme")
 }
 
-// sleepWithContext blocks for the given duration or until the context is done,
-// whichever comes first. It returns the context error if cancelled.
 func sleepWithContext(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -680,13 +643,6 @@ type responseBodyReadProgress struct {
 	captureComplete bool
 }
 
-// captureAndDrainResponseBody captures up to captureBytes and then drains up to
-// drainBytes more before closing the body. It returns as soon as capture is
-// complete, EOF is reached, or the timeout expires; any remaining bounded drain
-// continues asynchronously so normal short responses can still leave their
-// connection reusable. Progress is sent as owned byte slices so a timed-out
-// caller can safely return the short prefix already received while Close
-// interrupts a stalled Read.
 func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes int) []byte {
 	if body == nil {
 		return nil
@@ -706,8 +662,6 @@ func captureAndDrainResponseBody(body io.ReadCloser, captureBytes, drainBytes in
 
 	timedOut := make(chan struct{})
 	timer := time.AfterFunc(upstreamErrorDetailDrainTimeout, func() {
-		// Signal first so a pathological Close implementation cannot extend the
-		// caller-visible bound. net/http response bodies unblock Read on Close.
 		close(timedOut)
 		closeBody()
 	})

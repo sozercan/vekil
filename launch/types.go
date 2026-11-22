@@ -1,4 +1,3 @@
-// Package launch starts a short-lived Vekil proxy and runs an agent CLI against it.
 package launch
 
 import (
@@ -8,10 +7,8 @@ import (
 	"time"
 )
 
-// PolicyModelOwner is the /v1/models owner for policy-routing public IDs.
 const PolicyModelOwner = "vekil-policy"
 
-// ModelInfo is the launcher-relevant subset of one /v1/models entry.
 type ModelInfo struct {
 	ID                               string            `json:"id"`
 	Name                             string            `json:"name,omitempty"`
@@ -23,15 +20,12 @@ type ModelInfo struct {
 	EffectiveContextWindowPercentage int64             `json:"effective_context_window_percent,omitempty"`
 }
 
-// ModelCapabilities contains the bounded model metadata launchers can use to
-// configure client-side context, output, reasoning, and tool behavior.
 type ModelCapabilities struct {
 	Family   string                  `json:"family,omitempty"`
 	Limits   ModelCapabilityLimits   `json:"limits,omitempty"`
 	Supports ModelCapabilitySupports `json:"supports,omitempty"`
 }
 
-// ModelCapabilityLimits contains advertised token limits.
 type ModelCapabilityLimits struct {
 	MaxContextWindowTokens int64 `json:"max_context_window_tokens,omitempty"`
 	MaxPromptTokens        int64 `json:"max_prompt_tokens,omitempty"`
@@ -42,51 +36,35 @@ type ModelCapabilityLimits struct {
 	MaxOutputTokens        int64 `json:"max_output_tokens,omitempty"`
 }
 
-// ModelCapabilitySupports contains advertised client-relevant features.
 type ModelCapabilitySupports struct {
 	ReasoningEffort   []string `json:"reasoning_effort,omitempty"`
 	ParallelToolCalls bool     `json:"parallel_tool_calls,omitempty"`
 	Vision            bool     `json:"vision,omitempty"`
 }
 
-// PrepareInput contains the resolved values an agent adapter needs to construct
-// its child process. BaseURL is the root Vekil URL without a trailing slash.
-// Model is zero-valued when selection is delegated to the agent CLI.
 type PrepareInput struct {
-	BaseURL       string
-	Model         ModelInfo
-	Binary        string
-	ForwardedArgs []string
-	LocalToken    string
-	SensitiveEnv  []string
-	Environment   []string
-	NoProxy       string
-	// WebSearchMCPURL is the launch proxy's web search MCP endpoint, set only
-	// when the proxy confirmed the tool is available.
+	BaseURL         string
+	Model           ModelInfo
+	Binary          string
+	ForwardedArgs   []string
+	LocalToken      string
+	SensitiveEnv    []string
+	Environment     []string
+	NoProxy         string
 	WebSearchMCPURL string
-	// CopilotAbsent is set when the launch proxy confirmed that no Copilot
-	// provider serves the session.
-	CopilotAbsent bool
-	// RoutesLikeModel reports whether a Messages request naming alias reaches
-	// the selected model. It is nil when no live proxy can answer.
+	CopilotAbsent   bool
 	RoutesLikeModel func(alias string) bool
 	DryRun          bool
 }
 
-// webSearchMCPAdapter is implemented by adapters that register Vekil's web
-// search MCP endpoint with their agent; the launcher probes it only for them.
 type webSearchMCPAdapter interface {
 	usesWebSearchMCP() bool
 }
 
-// auxiliaryModelAdapter is implemented by adapters whose agent calls models
-// beside the pinned one, such as Claude Code's auto-mode classifier.
 type auxiliaryModelAdapter interface {
 	auxiliaryModels() []string
 }
 
-// AuxiliaryModels returns the models adapter's agent calls beside the pinned
-// model. A launch proxy admits them only through providers already in scope.
 func AuxiliaryModels(adapter Adapter) []string {
 	if auxiliary, ok := adapter.(auxiliaryModelAdapter); ok {
 		return auxiliary.auxiliaryModels()
@@ -94,15 +72,10 @@ func AuxiliaryModels(adapter Adapter) []string {
 	return nil
 }
 
-// messagesAliasProxy is implemented by launch proxies that can confirm an
-// alternate spelling of the pinned model is served like the model itself.
 type messagesAliasProxy interface {
 	MessagesAliasResolvesTo(ctx context.Context, alias, model string) bool
 }
 
-// PreparedProcess is an agent-specific process plan. EnvSet and EnvUnset are
-// applied over a sanitized copy of the parent environment immediately before
-// the child is started.
 type PreparedProcess struct {
 	Path       string
 	Args       []string
@@ -112,15 +85,11 @@ type PreparedProcess struct {
 	Cleanup    func() error
 }
 
-// Adapter prepares one supported agent CLI for a Vekil-backed launch.
 type Adapter interface {
 	Name() string
 	Prepare(PrepareInput) (PreparedProcess, error)
 }
 
-// Proxy is the lifecycle surface the launcher needs from a ready-capable Vekil
-// server. Start must return only after startup authentication and dynamic model
-// validation have completed.
 type Proxy interface {
 	Start(context.Context) error
 	Addr() string
@@ -128,7 +97,6 @@ type Proxy interface {
 	Stop(context.Context) error
 }
 
-// Options configures one launcher run.
 type Options struct {
 	Model            string
 	Binary           string
@@ -150,9 +118,6 @@ type Options struct {
 	NoSummary        bool
 }
 
-// Result is the completed launcher outcome. A non-zero child exit is represented
-// by ExitCode rather than an error so callers can preserve the agent's status.
-// Model is zero-valued when the agent CLI selected its own model.
 type Result struct {
 	ExitCode int
 	BaseURL  string

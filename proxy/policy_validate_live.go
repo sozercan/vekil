@@ -8,9 +8,6 @@ import (
 	"github.com/sozercan/vekil/auth"
 )
 
-// ValidateProvidersConfigFileLive performs ordinary structural validation and
-// then executes the same classifier capability preflight used by server startup.
-// Profiles configured off remain offline; observe/enforce profiles are probed.
 func ValidateProvidersConfigFileLive(ctx context.Context, path string) error {
 	cfg, err := LoadProvidersConfigFile(path)
 	if err != nil {
@@ -22,12 +19,8 @@ func ValidateProvidersConfigFileLive(ctx context.Context, path string) error {
 	}
 	h, err := NewProxyHandler(authenticator, nil,
 		WithProvidersConfig(cfg),
-		// A classifier preflight neither issues nor resumes provider state and
-		// must be able to run while the serving proxy holds its durable lock.
 		WithStateBindingsConfig(StateBindingsConfig{Mode: "memory"}),
 		WithPolicyRoutingMode(PolicyRoutingModeEnforce),
-		// Live validation is deliberately limited to classifier protocol
-		// preflight; unrelated dynamic provider catalogs remain offline.
 		WithDeferredDynamicProviderModelValidation(true),
 	)
 	if err != nil {
