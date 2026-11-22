@@ -34,7 +34,6 @@
 # than the product default 1337.
 #
 # Optional environment:
-#   PROXY_BIN                                  default: ./vekil
 #   LIVE_POLICY_ROUTING_PUBLIC_MODEL           default: vekil-live-semantic
 #   LIVE_POLICY_ROUTING_SMOKE_DIR               explicit artifact directory
 #   LIVE_POLICY_ROUTING_TMP_PARENT              artifact parent
@@ -1224,10 +1223,6 @@ wait_for_proxy_ready() {
       return 2
     fi
     if ! process_is_running "${proxy_pid}"; then
-      # A short-lived process can exit before stdio flushes the final fatal JSON.
-      # Give the log a bounded moment to become visible so address races can use
-      # the normal automatic-port retry path instead of looking like a generic
-      # startup failure.
       local flush_attempt
       for ((flush_attempt = 0; flush_attempt < 20; flush_attempt++)); do
         proxy_log_has_address_in_use && return 2

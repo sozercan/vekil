@@ -89,7 +89,6 @@ func TestInsightGateSingleFlight(t *testing.T) {
 	if !ok {
 		t.Fatal("first acquire should succeed")
 	}
-	// Second acquire while the first is still active is rejected.
 	if ok2, reason := g.tryAcquire(); ok2 || reason == "" {
 		t.Fatalf("concurrent acquire should be rejected, got ok=%v reason=%q", ok2, reason)
 	}

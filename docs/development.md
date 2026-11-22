@@ -298,9 +298,32 @@ After the release gate passes, require at least 5,000 completed observations per
 ## Lint
 
 ```bash
-go vet ./...
-make lint
+python3 -m venv .build/comment-lint
+.build/comment-lint/bin/python -m pip install -r scripts/comment-lint-requirements.txt
+make lint PYTHON=.build/comment-lint/bin/python
+make lint-comments PYTHON=.build/comment-lint/bin/python COMMENT_BASE="$(git merge-base HEAD origin/main)"
 ```
+
+The comment ratchet prohibits new or rewritten prose comments in first-party
+source; use clear names, tests, or an [ADR](adr/README.md) instead. It compares
+each file's exact comment-line counts by text (ignoring surrounding whitespace)
+against a Git base. A comment can't be replaced with different prose or copied
+to another file under the old allowance. Once its deletion lands, reintroducing
+it fails. CI compares the PR merge result with its base commit, or a push with
+the previous tip. Locally the default base is `HEAD` for uncommitted changes;
+pass `COMMENT_BASE` to review committed changes too.
+
+The lexer covers Go (including tests and `go.mod`), shell, Python, Objective-C/C
+headers, HTML with inline JavaScript/CSS, standalone JS/CSS, YAML/JSON/TOML,
+Makefiles, Dockerfiles, and `.gitignore`. It also checks GitHub Actions `run`
+scripts and shell heredocs identifiable as Python or shell. Arbitrary string
+literals, data fixtures, docs, and the vendored uPlot assets are not prose
+source. Keep machine-consumed syntax such as Go build tags/embeds, the cgo
+preamble, and shebangs intact.
+
+Use `.build/comment-lint/bin/python scripts/comment-lint.py --inventory` to
+list the remaining work with source locations and count comment-only versus
+inline lines. The repository's `delete-comment` skill runs the review workflow.
 
 ## CI
 

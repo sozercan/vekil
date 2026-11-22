@@ -55,9 +55,6 @@ spec:
             - name: token-cache
               mountPath: /home/nonroot/.config/vekil
       volumes:
-        # Example-only ephemeral cache: it survives a container restart in this
-        # Pod, but not Pod replacement/rescheduling. Use a PVC or inject
-        # COPILOT_GITHUB_TOKEN from a Secret for persistent production auth.
         - name: token-cache
           emptyDir: {}
 ---

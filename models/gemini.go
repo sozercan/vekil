@@ -2,8 +2,6 @@ package models
 
 import "encoding/json"
 
-// GeminiGenerateContentRequest is the supported subset of the Gemini
-// generateContent request shape.
 type GeminiGenerateContentRequest struct {
 	Model             string                  `json:"model,omitempty"`
 	SystemInstruction *GeminiContent          `json:"systemInstruction,omitempty"`
@@ -15,16 +13,13 @@ type GeminiGenerateContentRequest struct {
 	SafetySettings    json.RawMessage         `json:"safetySettings,omitempty"`
 }
 
-// GeminiCountTokensRequest reuses the supported generateContent subset.
 type GeminiCountTokensRequest = GeminiGenerateContentRequest
 
-// GeminiContent is a role-tagged list of content parts.
 type GeminiContent struct {
 	Role  string       `json:"role,omitempty"`
 	Parts []GeminiPart `json:"parts,omitempty"`
 }
 
-// GeminiPart is the supported subset of Gemini content parts.
 type GeminiPart struct {
 	Text                *string                 `json:"text,omitempty"`
 	Thought             *bool                   `json:"thought,omitempty"`
@@ -37,20 +32,17 @@ type GeminiPart struct {
 	CodeExecutionResult json.RawMessage         `json:"codeExecutionResult,omitempty"`
 }
 
-// GeminiInlineData is a base64-encoded inline media blob.
 type GeminiInlineData struct {
 	MimeType string `json:"mimeType"`
 	Data     string `json:"data"`
 }
 
-// GeminiFunctionCall is a model-issued function call.
 type GeminiFunctionCall struct {
 	ID   string          `json:"id,omitempty"`
 	Name string          `json:"name"`
 	Args json.RawMessage `json:"args,omitempty"`
 }
 
-// GeminiFunctionResponse is a user-supplied tool result.
 type GeminiFunctionResponse struct {
 	ID       string          `json:"id,omitempty"`
 	Name     string          `json:"name"`
@@ -58,7 +50,6 @@ type GeminiFunctionResponse struct {
 	Parts    json.RawMessage `json:"parts,omitempty"`
 }
 
-// GeminiTool is the supported subset of Gemini tool declarations.
 type GeminiTool struct {
 	FunctionDeclarations  []GeminiFunctionDeclaration `json:"functionDeclarations,omitempty"`
 	GoogleSearch          json.RawMessage             `json:"googleSearch,omitempty"`
@@ -70,7 +61,6 @@ type GeminiTool struct {
 	EnterpriseWebSearch   json.RawMessage             `json:"enterpriseWebSearch,omitempty"`
 }
 
-// GeminiFunctionDeclaration is a tool schema declaration.
 type GeminiFunctionDeclaration struct {
 	Name                 string          `json:"name"`
 	Description          string          `json:"description,omitempty"`
@@ -78,18 +68,15 @@ type GeminiFunctionDeclaration struct {
 	ParametersJSONSchema json.RawMessage `json:"parametersJsonSchema,omitempty"`
 }
 
-// GeminiToolConfig configures tool selection.
 type GeminiToolConfig struct {
 	FunctionCallingConfig *GeminiFunctionCallingConfig `json:"functionCallingConfig,omitempty"`
 }
 
-// GeminiFunctionCallingConfig is the supported function-calling subset.
 type GeminiFunctionCallingConfig struct {
 	Mode                 string   `json:"mode,omitempty"`
 	AllowedFunctionNames []string `json:"allowedFunctionNames,omitempty"`
 }
 
-// GeminiGenerationConfig controls sampling and structured output.
 type GeminiGenerationConfig struct {
 	Temperature        *float64        `json:"temperature,omitempty"`
 	TopP               *float64        `json:"topP,omitempty"`
@@ -112,20 +99,17 @@ type GeminiGenerationConfig struct {
 	Logprobs           json.RawMessage `json:"logprobs,omitempty"`
 }
 
-// GeminiGenerateContentResponse is the supported Gemini response envelope.
 type GeminiGenerateContentResponse struct {
 	Candidates    []GeminiCandidate    `json:"candidates,omitempty"`
 	UsageMetadata *GeminiUsageMetadata `json:"usageMetadata,omitempty"`
 }
 
-// GeminiCandidate is a single candidate in a Gemini response.
 type GeminiCandidate struct {
 	Content      *GeminiContent `json:"content,omitempty"`
 	FinishReason string         `json:"finishReason,omitempty"`
 	Index        *int           `json:"index,omitempty"`
 }
 
-// GeminiUsageMetadata holds token usage for Gemini responses.
 type GeminiUsageMetadata struct {
 	PromptTokenCount     int                       `json:"promptTokenCount,omitempty"`
 	CandidatesTokenCount int                       `json:"candidatesTokenCount,omitempty"`
@@ -133,24 +117,20 @@ type GeminiUsageMetadata struct {
 	PromptTokensDetails  []GeminiTokenCountDetails `json:"promptTokensDetails,omitempty"`
 }
 
-// GeminiTokenCountDetails is a modality-specific token count.
 type GeminiTokenCountDetails struct {
 	Modality   string `json:"modality"`
 	TokenCount int    `json:"tokenCount"`
 }
 
-// GeminiCountTokensResponse is the supported countTokens response shape.
 type GeminiCountTokensResponse struct {
 	TotalTokens         int                       `json:"totalTokens"`
 	PromptTokensDetails []GeminiTokenCountDetails `json:"promptTokensDetails,omitempty"`
 }
 
-// GeminiErrorResponse is the Google-style error envelope.
 type GeminiErrorResponse struct {
 	Error GeminiError `json:"error"`
 }
 
-// GeminiError contains the Gemini error body.
 type GeminiError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`

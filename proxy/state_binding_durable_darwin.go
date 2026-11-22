@@ -15,9 +15,6 @@ func checkDurableStateFilesystem(fd int) error {
 	if !durableStateFilesystemSupported(fs) {
 		return errDurableStatePlatform
 	}
-	// bbolt calls os.File.Sync for both data and metadata commits. On Darwin,
-	// Go uses F_FULLFSYNC but may fall back to fsync on unsupported storage.
-	// Verify full-sync support on each actual descriptor before bbolt opens it.
 	if err := syncDurableStateDirectory(fd); err != nil {
 		if err == unix.ENOTSUP || err == unix.EINVAL {
 			return errDurableStatePlatform
@@ -41,13 +38,7 @@ func syncDurableStateDirectory(fd int) error {
 }
 
 func checkDurableStatePermissions(fd int) error {
-	// Darwin ACLs can grant access independently of 0700/0600 mode bits. Require
-	// an absent ACL on both the private directory and the database descriptor.
-	// x/sys has no fgetattrlist wrapper; the stable Darwin syscall avoids a
-	// path lookup and keeps CGO-disabled builds supported.
 	attrs := unix.Attrlist{Bitmapcount: unix.ATTR_BIT_MAP_COUNT, Commonattr: unix.ATTR_CMN_EXTENDED_SECURITY}
-	// An absent ACL returns only this attribute-reference header. REPORT_FULLSIZE
-	// makes a nonempty ACL exceed it even though we need not read its entries.
 	var result struct {
 		length uint32
 		offset int32
