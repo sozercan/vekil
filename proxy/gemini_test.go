@@ -217,6 +217,92 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("model role function response becomes tool message", func(t *testing.T) {
+		req := &models.GeminiGenerateContentRequest{
+			Contents: []models.GeminiContent{
+				{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("Read word.txt")}}},
+				{
+					Role: "model",
+					Parts: []models.GeminiPart{
+						{FunctionCall: &models.GeminiFunctionCall{ID: "call-read", Name: "read_file", Args: json.RawMessage(`{"path":"word.txt"}`)}, ThoughtSignature: "sig"},
+					},
+				},
+				{
+					Role: "model",
+					Parts: []models.GeminiPart{
+						{FunctionResponse: &models.GeminiFunctionResponse{ID: "call-read", Name: "read_file", Response: json.RawMessage(`{"output":"hello"}`)}},
+					},
+				},
+			},
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		if len(got.Messages) != 3 {
+			t.Fatalf("len(Messages) = %d, want 3", len(got.Messages))
+		}
+		if got.Messages[1].Role != "assistant" || len(got.Messages[1].ToolCalls) != 1 || got.Messages[1].ToolCalls[0].ID != "call-read" {
+			t.Fatalf("Messages[1] = %#v, want assistant tool call call-read", got.Messages[1])
+		}
+		if got.Messages[2].Role != "tool" || got.Messages[2].ToolCallID != "call-read" {
+			t.Fatalf("Messages[2] = %#v, want tool result for call-read", got.Messages[2])
+		}
+		var result string
+		if err := json.Unmarshal(got.Messages[2].Content, &result); err != nil {
+			t.Fatalf("decode tool result: %v", err)
+		}
+		if result != `{"output":"hello"}` {
+			t.Errorf("tool result = %q, want %q", result, `{"output":"hello"}`)
+		}
+	})
+
+	t.Run("model role calls and responses in one content keep order", func(t *testing.T) {
+		req := &models.GeminiGenerateContentRequest{
+			Contents: []models.GeminiContent{
+				{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("Search twice")}}},
+				{
+					Role: "model",
+					Parts: []models.GeminiPart{
+						{Text: stringPtr("Searching.")},
+						{FunctionCall: &models.GeminiFunctionCall{Name: "search", Args: json.RawMessage(`{"q":"a"}`)}},
+						{FunctionCall: &models.GeminiFunctionCall{Name: "search", Args: json.RawMessage(`{"q":"b"}`)}},
+						{FunctionResponse: &models.GeminiFunctionResponse{Name: "search", Response: json.RawMessage(`{"ok":1}`)}},
+						{FunctionResponse: &models.GeminiFunctionResponse{Name: "search", Response: json.RawMessage(`{"ok":2}`)}},
+						{Text: stringPtr("Both done.")},
+					},
+				},
+			},
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		wantRoles := []string{"user", "assistant", "tool", "tool", "assistant"}
+		if len(got.Messages) != len(wantRoles) {
+			t.Fatalf("len(Messages) = %d, want %d: %#v", len(got.Messages), len(wantRoles), got.Messages)
+		}
+		for i, role := range wantRoles {
+			if got.Messages[i].Role != role {
+				t.Fatalf("Messages[%d].Role = %q, want %q", i, got.Messages[i].Role, role)
+			}
+		}
+		calls := got.Messages[1].ToolCalls
+		if len(calls) != 2 {
+			t.Fatalf("len(ToolCalls) = %d, want 2", len(calls))
+		}
+		if got.Messages[2].ToolCallID != calls[0].ID || got.Messages[3].ToolCallID != calls[1].ID {
+			t.Errorf("tool result IDs = %q, %q, want %q, %q", got.Messages[2].ToolCallID, got.Messages[3].ToolCallID, calls[0].ID, calls[1].ID)
+		}
+		if string(got.Messages[1].Content) != `"Searching."` || string(got.Messages[4].Content) != `"Both done."` {
+			t.Errorf("assistant contents = %s, %s", got.Messages[1].Content, got.Messages[4].Content)
+		}
+	})
+
 	t.Run("user inline image becomes multimodal content array", func(t *testing.T) {
 		req := &models.GeminiGenerateContentRequest{
 			Contents: []models.GeminiContent{{
@@ -1009,6 +1095,21 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			pathModel:  "gemini-2.5-pro",
 			wantCode:   http.StatusBadRequest,
 			wantStatus: "INVALID_ARGUMENT",
+		},
+		{
+			name: "unmatched model role function response",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{
+					Role: "model",
+					Parts: []models.GeminiPart{{
+						FunctionResponse: &models.GeminiFunctionResponse{Name: "search", Response: json.RawMessage(`{"ok":true}`)},
+					}},
+				}},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    `contents[0].parts[0].functionResponse: functionResponse for "search" does not match any prior functionCall`,
 		},
 		{
 			name: "unknown function response id with explicit history",
