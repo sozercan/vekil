@@ -115,7 +115,9 @@ code_mode_only = false
 codex -p vekil-gemini
 ```
 
-The saved entry comes from the provider's `/v1/models` `models` array, where an opted-in model is listed with Responses Lite, hosted search, and reasoning summaries disabled, no freeform `apply_patch` tool, text-only input, and reasoning levels from the provider's metadata. Its `data` entry carries `vekil_responses_compatibility: "responses_over_chat"` and keeps the native `supported_endpoints`. `model_catalog_json` replaces Codex's catalog only for this profile; save the entry again after upgrading Vekil. Codex binds each session to its provider ID, so keep `vekil-chat` stable to resume sessions. The Codex desktop app has not yet been verified with this adapter; settings it applies to every model of a provider, rather than per model, must be set on this separate provider.
+The saved entry comes from the provider's `/v1/models` `models` array, where an opted-in model is listed with Responses Lite, hosted search, and reasoning summaries disabled, no freeform `apply_patch` tool, text-only input, and reasoning levels from the provider's metadata. Its `data` entry carries `vekil_responses_compatibility: "responses_over_chat"` and keeps the native `supported_endpoints`. `model_catalog_json` replaces Codex's catalog only for this profile; save the entry again after upgrading Vekil. Codex binds each session to its provider ID, so keep `vekil-chat` stable to resume sessions. Settings Codex applies to every model of a provider, rather than per model, must be set on this separate provider.
+
+The Codex desktop app has been verified with this adapter: model selection, tool round trips, follow-up turns, resume after relaunch, and local compaction. In that run the profile's settings were placed at the top level of `config.toml` in a separate Codex home, and the app was started with `open -n -a ChatGPT --env CODEX_HOME=<dir>`, so the normal Codex setup was untouched. Selecting a profile from within the desktop app was not tested.
 
 ## GitHub Copilot CLI
 
