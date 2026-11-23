@@ -626,7 +626,7 @@ func TestCodexAdapterAcceptsResponsesOverChatModelWithAdapterRestrictions(t *tes
 			t.Fatalf("Responses-over-Chat Codex args missing %q: %#v", want, prepared.Args)
 		}
 	}
-	if !containsString(prepared.Args, `model_providers.`+codexProviderID("token")+`.supports_websockets=false`) {
+	if !containsString(prepared.Args, `model_providers.`+codexProviderID+`.supports_websockets=false`) {
 		t.Fatalf("websockets were not disabled: %#v", prepared.Args)
 	}
 	if !containsAdjacent(prepared.Args, "-m", "gemini-test") {
