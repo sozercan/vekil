@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sozercan/vekil/auth"
 	"github.com/sozercan/vekil/logger"
@@ -213,6 +215,7 @@ func TestResponsesOverChatCatalogStripsAlternateMarkerWithoutOptIn(t *testing.T)
 
 func TestResponsesOverChatCatalogETagDescribesServedRepresentation(t *testing.T) {
 	const upstreamETag = `"upstream-model-version"`
+	var notModified atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if validator := r.Header.Get("If-None-Match"); validator != "" && validator != upstreamETag {
 			t.Errorf("sent public validator upstream: %q", validator)
@@ -220,6 +223,7 @@ func TestResponsesOverChatCatalogETagDescribesServedRepresentation(t *testing.T)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("ETag", upstreamETag)
 		if r.Header.Get("If-None-Match") == upstreamETag {
+			notModified.Add(1)
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
@@ -245,7 +249,26 @@ func TestResponsesOverChatCatalogETagDescribesServedRepresentation(t *testing.T)
 	if plain.Header().Get("ETag") != upstreamETag || compatible.Header().Get("ETag") == upstreamETag || compatible.Header().Get("ETag") == "" || compatible.Body.String() == plain.Body.String() {
 		t.Fatalf("plain ETag = %q, compatible ETag = %q", plain.Header().Get("ETag"), compatible.Header().Get("ETag"))
 	}
-	if revalidated := get(on); revalidated.Header().Get("ETag") != compatible.Header().Get("ETag") || revalidated.Body.String() != compatible.Body.String() {
+
+	// Expire the canonical entry so the next request revalidates upstream
+	// instead of being served from the cache.
+	on.models.mu.Lock()
+	entry := on.models.entries[""]
+	entry.expiry = time.Now().Add(-time.Minute)
+	on.models.entries[""] = entry
+	on.models.mu.Unlock()
+	before := notModified.Load()
+	revalidated := get(on)
+	if got := notModified.Load() - before; got != 1 {
+		t.Fatalf("upstream 304 revalidations = %d, want 1", got)
+	}
+	if revalidated.Header().Get("ETag") != compatible.Header().Get("ETag") || revalidated.Body.String() != compatible.Body.String() {
 		t.Fatal("upstream revalidation changed the local representation or its ETag")
+	}
+	on.models.mu.RLock()
+	refreshed := on.models.entries[""]
+	on.models.mu.RUnlock()
+	if refreshed.etag != upstreamETag || !time.Now().Before(refreshed.expiry) {
+		t.Fatalf("canonical entry after 304: etag=%q expiry=%v, want upstream ETag and extended TTL", refreshed.etag, refreshed.expiry)
 	}
 }
