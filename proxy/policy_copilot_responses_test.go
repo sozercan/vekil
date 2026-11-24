@@ -63,8 +63,6 @@ func newCopilotResponsesPolicyUpstreamWithVendor(t *testing.T, signals policyCla
 			})
 		case providerEndpointResponses:
 			defer func() { _ = r.Body.Close() }()
-			// Read-and-restore: the decode below and every existing assertion still see an
-			// untouched body, so recording is invisible to the tests already using this fixture.
 			raw, readErr := io.ReadAll(r.Body)
 			if readErr != nil {
 				http.Error(w, readErr.Error(), http.StatusBadRequest)
@@ -235,8 +233,6 @@ func (u *copilotResponsesPolicyUpstream) snapshot() (int, int, []string, []strin
 	return u.modelRequests, u.classifierRequests, append([]string(nil), u.terminalModels...), append([]string(nil), u.paths...)
 }
 
-// Counts and model names cannot answer "did the reasoning actually travel" -- the question
-// every carrier continuation test was silently NOT asking. Bodies can.
 func (u *copilotResponsesPolicyUpstream) responsesBodies() []string {
 	u.mu.Lock()
 	defer u.mu.Unlock()

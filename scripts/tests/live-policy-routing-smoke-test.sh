@@ -28,8 +28,6 @@ PUBLIC_MODEL="vekil-local-policy-smoke"
 LIGHTWEIGHT_REASONING_EFFORT="low"
 POWERFUL_REASONING_EFFORT="max"
 CLASSIFIER_DROP_SAMPLING_PARAMS="true"
-# Omitted mode mirrors the Copilot matrix, including Haiku sometimes following
-# the parallel task text and adding fetch_* calls to its classifier response.
 CLASSIFIER_EXTRA_TOOL_CALLS="false"
 
 log() {
@@ -840,8 +838,6 @@ main() {
   assert_wrapper_ports
   assert_ports_released
 
-  # A rejected parallel-tools classifier response moves that terminal request
-  # from the lightweight tier to the powerful primary.
   local fallback_log='parallel tools classifier returned extra tool calls; Vekil rejected its output and used the uncertain tier'
   if [[ "${CLASSIFIER_EXTRA_TOOL_CALLS}" == "true" ]]; then
     grep -Fq "${fallback_log}" "${HARNESS_STDERR}" || fail "harness did not accept the proven classifier tool-call deviation"

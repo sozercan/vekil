@@ -16,8 +16,6 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-// Only listener handoff is paused. Successful binds and close operations still
-// cross the real TCP boundary; the production Start/Stop transitions are used.
 type startupListenBarrier struct {
 	entered    chan struct{}
 	release    chan struct{}
@@ -47,8 +45,6 @@ func (b *startupListenBarrier) listen(ctx context.Context, network, addr string)
 	}
 	ln, err := (&net.ListenConfig{}).Listen(ctx, network, addr)
 	if call != 1 {
-		// A broken owner transition must fail an assertion, not panic later
-		// by having two Serve goroutines close the same public Done channel.
 		if ln != nil {
 			_ = ln.Close()
 		}

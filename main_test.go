@@ -155,7 +155,6 @@ func TestGetEnvInt(t *testing.T) {
 func TestGetEnvWarnsOnInvalidValue(t *testing.T) {
 	const envKey = "TEST_WARN_VAR"
 
-	// Capture stderr to verify warning is emitted.
 	old := os.Stderr
 	r, w, _ := os.Pipe()
 	os.Stderr = w
@@ -481,7 +480,7 @@ func TestServeUntilContextDoneCancelsActiveUpstreamWork(t *testing.T) {
 	}
 
 	start := time.Now()
-	cancel() // signal.NotifyContext uses the same cancellation path for SIGTERM.
+	cancel()
 	select {
 	case <-serveExited:
 	case <-time.After(time.Second):
@@ -2643,7 +2642,7 @@ func TestAgentLaunchProxySkipsCopilotForPolicyModel(t *testing.T) {
 	if called {
 		t.Fatal("policy model triggered Copilot authentication")
 	}
-	resp, err := http.Get("http://" + runtime.Addr() + "/readyz") //nolint:gosec // loopback test server
+	resp, err := http.Get("http://" + runtime.Addr() + "/readyz") //nolint:gosec
 	if err != nil {
 		t.Fatalf("GET /readyz: %v", err)
 	}
@@ -2775,7 +2774,7 @@ func TestAgentLaunchProxySkipsCopilotForKnownNonCopilotModel(t *testing.T) {
 	}
 	baseURL := "http://" + runtime.Addr()
 	for _, path := range []string{"/readyz", "/v1/models"} {
-		resp, err := http.Get(baseURL + path) //nolint:gosec // loopback test server
+		resp, err := http.Get(baseURL + path) //nolint:gosec
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}

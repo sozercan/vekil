@@ -149,8 +149,6 @@ func TestRejectedPolicySurfacesKeepStatsOnPublicPolicyIdentity(t *testing.T) {
 	}
 }
 
-// newStatsRequestSummary builds a populated RequestSummary using the in-package
-// setters, as handlers do at runtime.
 func newStatsRequestSummary(model, provider, kind string, prompt, completion, total int) *RequestSummary {
 	s := &RequestSummary{}
 	s.setRoute("/v1/chat/completions", model, false)
@@ -237,7 +235,6 @@ func TestStatsCollectorErrorClassification(t *testing.T) {
 
 	snap := c.snapshot()
 
-	// Exact status codes, sorted by count desc.
 	if len(snap.StatusCodes) != 2 {
 		t.Fatalf("status codes rows: got %d want 2 (%+v)", len(snap.StatusCodes), snap.StatusCodes)
 	}
@@ -248,7 +245,6 @@ func TestStatsCollectorErrorClassification(t *testing.T) {
 		t.Fatalf("second status code: got %+v want 503 x1", snap.StatusCodes[1])
 	}
 
-	// Error targets attribute provider/model.
 	if len(snap.Errors) != 2 {
 		t.Fatalf("error targets: got %d want 2 (%+v)", len(snap.Errors), snap.Errors)
 	}
@@ -256,7 +252,6 @@ func TestStatsCollectorErrorClassification(t *testing.T) {
 		t.Fatalf("top error target: got %+v", snap.Errors[0])
 	}
 
-	// Per-model error counts surface in the breakdown rows.
 	var claude statsBreakdown
 	for _, m := range snap.ByModel {
 		if m.Model == "claude-sonnet-4.5" {
@@ -273,13 +268,11 @@ func TestStatsCollectorLatencyPercentiles(t *testing.T) {
 	fixed := time.Unix(1_700_000_000, 0)
 	c.now = func() time.Time { return fixed }
 
-	// 100 requests with durations 1..100 ms.
 	for i := 1; i <= 100; i++ {
 		c.record(newStatsRequestSummary("m", "p", "k", 1, 1, 2), 200, "curl/8", time.Duration(i)*time.Millisecond)
 	}
 
 	snap := c.snapshot()
-	// Nearest-rank on a sorted 1..100 sample.
 	if got := snap.Totals.LatencyP50; got < 49 || got > 52 {
 		t.Fatalf("p50: got %d want ~50", got)
 	}
@@ -290,7 +283,6 @@ func TestStatsCollectorLatencyPercentiles(t *testing.T) {
 		t.Fatalf("p99: got %d want ~99", got)
 	}
 
-	// Per-model average latency surfaces in the breakdown (mean of 1..100 = 50).
 	if len(snap.ByModel) != 1 || snap.ByModel[0].AvgMs < 49 || snap.ByModel[0].AvgMs > 51 {
 		t.Fatalf("avg ms: got %+v want ~50", snap.ByModel)
 	}
@@ -301,7 +293,6 @@ func TestStatsCollectorCapsCardinality(t *testing.T) {
 	fixed := time.Unix(1_700_000_000, 0)
 	c.now = func() time.Time { return fixed }
 
-	// Far more distinct agents than the cap; memory must stay bounded.
 	for i := 0; i < statsMaxKeys*3; i++ {
 		ua := "agent-" + strconv.Itoa(i) + "/1.0"
 		c.record(newStatsRequestSummary("m", "p", "k", 1, 1, 2), 200, ua, time.Millisecond)
@@ -310,11 +301,10 @@ func TestStatsCollectorCapsCardinality(t *testing.T) {
 	c.mu.Lock()
 	agents := len(c.byAgent)
 	c.mu.Unlock()
-	if agents > statsMaxKeys+1 { // +1 for the "other" bucket
+	if agents > statsMaxKeys+1 {
 		t.Fatalf("byAgent cardinality unbounded: got %d want <= %d", agents, statsMaxKeys+1)
 	}
 
-	// The overflow bucket must exist and carry the spillover.
 	c.mu.Lock()
 	other := c.byAgent[statsOtherKey]
 	c.mu.Unlock()
@@ -328,7 +318,7 @@ func TestStatsCollectorRetries(t *testing.T) {
 	c.incRetry(429)
 	c.incRetry(429)
 	c.incRetry(503)
-	c.incRetry(0) // transport error
+	c.incRetry(0)
 
 	snap := c.snapshot()
 	if snap.Retries != 4 {
@@ -337,7 +327,6 @@ func TestStatsCollectorRetries(t *testing.T) {
 	if len(snap.RetriesByCode) == 0 || snap.RetriesByCode[0].Label != "429" || snap.RetriesByCode[0].Count != 2 {
 		t.Fatalf("top retry code: got %+v want 429x2", snap.RetriesByCode)
 	}
-	// Transport errors are labeled, not shown as "0".
 	var sawTransport bool
 	for _, r := range snap.RetriesByCode {
 		if r.Label == "transport" {
@@ -357,7 +346,6 @@ func TestStatsCollectorRecentRing(t *testing.T) {
 	fixed := time.Unix(1_700_000_000, 0)
 	c.now = func() time.Time { return fixed }
 
-	// Record more than the ring holds; only the newest statsRecentRequests survive.
 	total := statsRecentRequests + 20
 	for i := 0; i < total; i++ {
 		s := newStatsRequestSummary("m"+strconv.Itoa(i), "copilot", "copilot", 10, 5, 15)
@@ -368,11 +356,9 @@ func TestStatsCollectorRecentRing(t *testing.T) {
 	if len(snap.Recent) != statsRecentRequests {
 		t.Fatalf("recent len: got %d want %d", len(snap.Recent), statsRecentRequests)
 	}
-	// Newest first: the last-recorded model should be at index 0.
 	if snap.Recent[0].Model != "m"+strconv.Itoa(total-1) {
 		t.Fatalf("newest-first: got %q want %q", snap.Recent[0].Model, "m"+strconv.Itoa(total-1))
 	}
-	// Oldest retained is total-statsRecentRequests.
 	if snap.Recent[len(snap.Recent)-1].Model != "m"+strconv.Itoa(total-statsRecentRequests) {
 		t.Fatalf("oldest retained: got %q", snap.Recent[len(snap.Recent)-1].Model)
 	}
@@ -414,7 +400,6 @@ func TestStatsCollectorBreakdowns(t *testing.T) {
 	if len(snap.ByModel) != 2 {
 		t.Fatalf("by_model rows: got %d want 2", len(snap.ByModel))
 	}
-	// Sorted desc by requests: claude (2) first.
 	if snap.ByModel[0].Model != "claude-sonnet-4.5" || snap.ByModel[0].Requests != 2 {
 		t.Fatalf("top model: got %+v", snap.ByModel[0])
 	}
@@ -432,18 +417,13 @@ func TestStatsCollectorBreakdowns(t *testing.T) {
 }
 
 func TestTopBreakdownsPreservesAlternateSortRows(t *testing.T) {
-	// statsBreakdownRows+ heavy hitters by requests, plus one low-request model
-	// that holds all the errors and one that is by far the slowest. The dashboard
-	// re-sorts these rows client-side by errors/latency, so both outliers must
-	// survive truncation even though they rank low by request count.
 	m := make(map[string]*breakdownCounter)
 	for i := 0; i < statsBreakdownRows+5; i++ {
 		m[fmt.Sprintf("busy-%02d", i)] = &breakdownCounter{
-			requests: int64(1000 - i), // all rank above the outliers by requests
+			requests: int64(1000 - i),
 			tokens:   int64(1000 - i),
 		}
 	}
-	// Low request count → ranked well outside the top-N by requests.
 	m["rare-but-broken"] = &breakdownCounter{requests: 1, tokens: 1, errors: 999}
 	m["rare-but-slow"] = &breakdownCounter{requests: 1, tokens: 1, durMs: 9_000_000, durSamples: 1}
 
@@ -467,7 +447,6 @@ func TestTopBreakdownsPreservesAlternateSortRows(t *testing.T) {
 	if slow.AvgMs != 9_000_000 {
 		t.Fatalf("slow model avg ms: got %d want 9000000", slow.AvgMs)
 	}
-	// Default order is still requests-desc (the busiest model leads).
 	if rows[0].Model != "busy-00" {
 		t.Fatalf("default order should be requests-desc, got leader %q", rows[0].Model)
 	}
@@ -502,10 +481,8 @@ func TestStatsCollectorSeriesZeroFill(t *testing.T) {
 	cur := base
 	c.now = func() time.Time { return cur }
 
-	// Two requests at t0.
 	c.record(newStatsRequestSummary("m", "p", "k", 5, 5, 10), 200, "curl/8", 0)
 	c.record(newStatsRequestSummary("m", "p", "k", 5, 5, 10), 200, "curl/8", 0)
-	// One request 3 seconds later (a 2-second gap in between).
 	cur = base.Add(3 * time.Second)
 	c.record(newStatsRequestSummary("m", "p", "k", 1, 1, 2), 200, "curl/8", 0)
 
@@ -532,7 +509,6 @@ func TestStatsCollectorSeriesZeroFill(t *testing.T) {
 	if p, ok := byT[base.Add(3*time.Second).Unix()]; !ok || p.Req != 1 {
 		t.Fatalf("t+3 bucket: got %+v ok=%v want req=1", p, ok)
 	}
-	// Series must be time-ordered ascending and contiguous by 1s.
 	for i := 1; i < len(snap.Series); i++ {
 		if snap.Series[i].T != snap.Series[i-1].T+1 {
 			t.Fatalf("series not contiguous at %d: %d then %d", i, snap.Series[i-1].T, snap.Series[i].T)
@@ -621,7 +597,6 @@ func TestHandleDashboardAsset(t *testing.T) {
 		}
 	}
 
-	// Unknown asset → 404.
 	req := httptest.NewRequest(http.MethodGet, "/dashboard/evil.js", nil)
 	w := httptest.NewRecorder()
 	h.HandleDashboardAsset(w, req)
@@ -638,7 +613,6 @@ func TestTracksRequest(t *testing.T) {
 			t.Errorf("expected POST %s to be tracked", p)
 		}
 	}
-	// Gemini generate verbs are prefix-registered; track them.
 	geminiPrefixes := []string{"/v1beta/models/gemini-2.5-pro:generateContent", "/v1/models/gemini-2.5-pro:streamGenerateContent", "/models/gemini-2.5-pro:generateContent"}
 	for _, p := range geminiPrefixes {
 		if !h.TracksRequest(http.MethodPost, p) {
@@ -651,42 +625,29 @@ func TestTracksRequest(t *testing.T) {
 			t.Errorf("expected %s to be skipped", p)
 		}
 	}
-	// Token-counting probes and proxy-owned shims are non-generating or have no
-	// single per-request completion, so they are excluded from LLM-usage stats
-	// even though they are registered POST routes (tracking them would add
-	// zero-token requests that skew avg-tokens/request and latency).
 	nonInference := []string{"/v1/messages/count_tokens", "/v1/responses/compact", "/v1/memories/trace_summarize"}
 	for _, p := range nonInference {
 		if h.TracksRequest(http.MethodPost, p) {
 			t.Errorf("expected POST %s (non-generating / shim) to be skipped", p)
 		}
 	}
-	// Gemini :countTokens is the sizing probe — skipped — while the generate
-	// verbs above stay tracked, even though all three share the same path prefix.
 	geminiCount := []string{"/v1beta/models/gemini-2.5-pro:countTokens", "/v1/models/gemini-2.5-pro:countTokens", "/models/gemini-2.5-pro:countTokens"}
 	for _, p := range geminiCount {
 		if h.TracksRequest(http.MethodPost, p) {
 			t.Errorf("expected POST %s (gemini countTokens) to be skipped", p)
 		}
 	}
-	// Unsupported or typoed Gemini actions hit the registered handler but 400
-	// before any upstream completion, so they must not be folded into stats —
-	// only the two generating actions are tracked, by explicit suffix.
 	geminiNonGenerating := []string{
 		"/v1beta/models/gemini-2.5-pro:embedContent",
 		"/v1/models/gemini-2.5-pro:batchEmbedContents",
-		"/models/gemini-2.5-pro:generateContentt", // typo
-		"/v1beta/models/gemini-2.5-pro",           // no action
+		"/models/gemini-2.5-pro:generateContentt",
+		"/v1beta/models/gemini-2.5-pro",
 	}
 	for _, p := range geminiNonGenerating {
 		if h.TracksRequest(http.MethodPost, p) {
 			t.Errorf("expected POST %s (non-generating gemini action) to be skipped", p)
 		}
 	}
-	// GET /v1/models (catalog refresh) is not inference traffic — excluded so it
-	// doesn't skew latency/avg-tokens. GET /v1/responses is the websocket-bridge
-	// upgrade — excluded so it doesn't pin inflight or poison latency; POST
-	// /v1/responses stays tracked.
 	if h.TracksRequest(http.MethodGet, "/v1/models") {
 		t.Error("expected GET /v1/models (catalog) to be skipped")
 	}
@@ -696,15 +657,11 @@ func TestTracksRequest(t *testing.T) {
 	if !h.TracksRequest(http.MethodPost, "/v1/responses") {
 		t.Error("expected POST /v1/responses to be tracked")
 	}
-	// Unmatched/typoed paths (which the mux 404s) must not be folded into stats.
 	if h.TracksRequest(http.MethodPost, "/v1/typo") || h.TracksRequest(http.MethodGet, "/totally/unknown") {
 		t.Error("expected unmatched paths to be skipped")
 	}
 }
 
-// TestStatsCollectorStreamExcludedFromLatency verifies that streaming requests
-// (whose wall-clock is dominated by how long the client held the connection)
-// do not pollute the latency percentiles or per-breakdown average latency.
 func TestStatsCollectorStreamExcludedFromLatency(t *testing.T) {
 	c := newStatsCollector()
 	fixed := time.Unix(1_700_000_000, 0)
@@ -712,7 +669,7 @@ func TestStatsCollectorStreamExcludedFromLatency(t *testing.T) {
 
 	streamSummary := func(model string) *RequestSummary {
 		s := &RequestSummary{}
-		s.setRoute("/v1/chat/completions", model, true) // stream = true
+		s.setRoute("/v1/chat/completions", model, true)
 		s.setProvider("copilot", "copilot")
 		return s
 	}
@@ -723,30 +680,21 @@ func TestStatsCollectorStreamExcludedFromLatency(t *testing.T) {
 		return s
 	}
 
-	// One fast non-stream request and one 10-minute stream on the same model.
 	c.record(nonStream("m"), 200, "curl/8", 50*time.Millisecond)
 	c.record(streamSummary("m"), 200, "curl/8", 10*time.Minute)
 
 	snap := c.snapshot()
-	// Percentiles must reflect only the 50ms sample, not the 600000ms stream.
 	if snap.Totals.LatencyP95 > 100 {
 		t.Fatalf("stream duration leaked into p95: got %d ms (want ~50)", snap.Totals.LatencyP95)
 	}
-	// Per-model avg should also exclude the stream sample.
 	if len(snap.ByModel) != 1 || snap.ByModel[0].AvgMs > 100 {
 		t.Fatalf("stream duration leaked into per-model avg_ms: %+v", snap.ByModel)
 	}
-	// But both requests are still counted.
 	if snap.ByModel[0].Requests != 2 {
 		t.Fatalf("expected both requests counted, got %d", snap.ByModel[0].Requests)
 	}
 }
 
-// TestNonStreamingPassthroughRecordsUsage is a regression test for a bug where
-// the near-zero-copy OpenAI chat passthrough branch (non-streaming, no tools)
-// never recorded token usage, leaving the dashboard's tokens/sec at zero for
-// the most common request shape. The response must stay byte-for-byte identical
-// while usage is sniffed into the RequestSummary.
 func TestNonStreamingPassthroughRecordsUsage(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		resp := models.OpenAIResponse{
@@ -763,7 +711,6 @@ func TestNonStreamingPassthroughRecordsUsage(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	// Non-streaming, no tools => the passthrough branch.
 	body := `{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -777,13 +724,11 @@ func TestNonStreamingPassthroughRecordsUsage(t *testing.T) {
 		t.Fatalf("status: got %d want 200", w.Result().StatusCode)
 	}
 
-	// Usage landed in the summary.
 	d := readSummaryForStats(summary)
 	if d.prompt != 123 || d.completion != 77 || d.total != 200 {
 		t.Fatalf("usage not recorded from passthrough: prompt=%d completion=%d total=%d", d.prompt, d.completion, d.total)
 	}
 
-	// Response body still carries the upstream usage block (not stripped).
 	var got models.OpenAIResponse
 	respBody, _ := io.ReadAll(w.Result().Body)
 	if err := json.Unmarshal(respBody, &got); err != nil {

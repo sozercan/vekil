@@ -107,16 +107,9 @@ func (c *unixProcessController) waitInteractive() commandOutcome {
 			if err := c.setForeground(c.parentPgrp); err != nil {
 				return commandOutcome{code: 1, err: fmt.Errorf("restore terminal after agent stop: %w", err)}
 			}
-			// Stop Vekil's shell-visible job. When the shell resumes it with fg,
-			// execution continues here, the child group regains the terminal, and
-			// every process in that group receives SIGCONT.
 			if err := syscall.Kill(0, status.StopSignal()); err != nil {
 				return commandOutcome{code: 1, err: fmt.Errorf("suspend launcher job: %w", err)}
 			}
-			// Resume once before and once after the terminal handoff. If the
-			// process wakes while still in the background, a blocking terminal read
-			// can immediately stop it with SIGTTIN; the second SIGCONT resumes it
-			// after it owns the terminal.
 			_ = signalUnixGroup(pid, syscall.SIGCONT)
 			if err := c.setForeground(pid); err != nil {
 				return commandOutcome{code: 1, err: fmt.Errorf("restore agent terminal after continue: %w", err)}
@@ -169,8 +162,6 @@ func (c *unixProcessController) close() error {
 			c.closeErr = terminateUnixGroup(c.childPgrp)
 		}
 		if c.interactive {
-			// Best effort: some Darwin terminals return EPERM after the child
-			// group disappears even though the shell regains control correctly.
 			_ = c.setForeground(c.parentPgrp)
 			signal.Reset(syscall.SIGTTOU)
 		}
@@ -204,9 +195,6 @@ func signalUnixGroup(pgid int, sig syscall.Signal) error {
 }
 
 func terminateUnixGroup(pgid int) error {
-	// Unix launcher containment is process-group scoped. A descendant that
-	// deliberately creates a new session or process group is outside this
-	// portable boundary; adapters separately reject known detached agent modes.
 	if err := signalUnixGroup(pgid, syscall.SIGTERM); err != nil {
 		return err
 	}

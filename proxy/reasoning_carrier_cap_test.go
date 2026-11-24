@@ -22,11 +22,8 @@ import (
 
 const carrierCapCiphertext = "OPAQUE-CIPHERTEXT"
 
-// The reasoning ciphertext stream_reasoning_tool_call.sse ships alongside its tool call.
 const carrierFixtureCiphertext = "synthetic_encrypted_content_not_replayable"
 
-// capFixture publishes one tool turn and returns the route, its output items and the
-// publication, i.e. everything the emit side holds when it mints a carrier.
 func capFixture(t *testing.T, store *responsesChatReplayStore) (responsesChatReplayRoute, []json.RawMessage, responsesChatReplayPublished) {
 	t.Helper()
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public", UpstreamModel: "gpt-upstream"}
@@ -52,8 +49,6 @@ func atBudget() carrierEmit {
 	return carrierEmit{Inbound: carrierInbound{Carriers: 291, Bytes: reasoningCarrierInboundBudget}}
 }
 
-// carrierPayloadBytes inflates a signature back to the bytes that were marshalled into
-// it. Everything asserted about a capped carrier is asserted on these, not on a struct.
 func carrierPayloadBytes(t *testing.T, signature string) []byte {
 	t.Helper()
 	if !strings.HasPrefix(signature, reasoningCarrierPrefix) {
@@ -72,8 +67,6 @@ func carrierPayloadBytes(t *testing.T, signature string) []byte {
 	return payload
 }
 
-// emittedSignature mints through the client-facing path, so what is asserted is the
-// signature the client would actually store, read off the marshalled response.
 func emittedSignature(t *testing.T, turn carriedTurn) string {
 	t.Helper()
 	resp := prependCarriedReasoning(&models.AnthropicResponse{
@@ -93,8 +86,6 @@ func emittedSignature(t *testing.T, turn carriedTurn) string {
 	return blocks[0].Signature
 }
 
-// The wire budget is cumulative. Once it is saturated, or the next complete carrier
-// would cross it, the response must not add another client-held blob.
 func TestCarrierBudgetSuppressesNewCarrier(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
@@ -115,9 +106,6 @@ func TestCarrierBudgetSuppressesNewCarrier(t *testing.T) {
 	}
 }
 
-// After store loss, the carrier restores only the reasoning ciphertext and ordering.
-// Both sides of the visible call/result pair are rebuilt under the public opaque ID;
-// the provider-owned ID never leaves process-local replay state.
 func TestCarrierRebuildsAForgottenTurnWithOpaqueCallID(t *testing.T) {
 	minting := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = minting.Close() })
@@ -155,7 +143,6 @@ func TestCarrierRebuildsAForgottenTurnWithOpaqueCallID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A store that never saw the group is exactly the state that used to wedge.
 	forgotten := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = forgotten.Close() })
 	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
@@ -274,8 +261,6 @@ func TestCarrierPreservesTextAfterCallOrder(t *testing.T) {
 	}
 }
 
-// Below the budget the carrier keeps ciphertext and bindings but no hidden reasoning text.
-// The expected wire shape is written out so field or envelope drift remains visible.
 func TestCarrierBelowBudgetIsByteIdentical(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
@@ -323,13 +308,8 @@ func TestCarrierBelowBudgetIsByteIdentical(t *testing.T) {
 	}
 }
 
-// sha256("provider-a\x00gpt-public\x00gpt-upstream\x00\x00")[:8], capFixture's route under
-// a build of 623d890. A constant, so renaming what feeds the digest fails here.
 const precapFixtureRouteDigest = "e6a4db7f32a55779"
 
-// The projection digest and envelope, restated rather than called: sha256 over the projected
-// content and each id/name/canonical-argument digest behind a NUL, then flate
-// BestCompression, raw-url base64, prefix.
 func precapProjectionDigest(projection responsesChatReplayAssistantProjection) string {
 	sum := sha256.New()
 	sum.Write(projection.Content)
@@ -365,8 +345,6 @@ func precapCarrierSignature(t *testing.T, payload string) string {
 	return "vekil1." + base64.RawURLEncoding.EncodeToString(compressed.Bytes())
 }
 
-// A silent degrade is the failure mode this project keeps paying for, so the cap says
-// what it dropped -- and says it in counts and bytes, never in ciphertext or prompt text.
 func TestCarrierSuppressionIsLogged(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
@@ -412,8 +390,6 @@ func TestCarrierSuppressionIsLogged(t *testing.T) {
 	}
 }
 
-// Ballast the client replays. Only the prefix and length reach the counter, so this need
-// not decode -- which also proves the weight is counted, not inferred from a decode.
 func carrierBallastSignature(size int) string {
 	return reasoningCarrierPrefix + strings.Repeat("A", size-len(reasoningCarrierPrefix))
 }
@@ -438,9 +414,6 @@ func anthropicCarrierBallastRequest(t *testing.T, stream bool, ballast int) stri
 	return string(body)
 }
 
-// A client builds a thinking block from frames, so assert on frames: a start whose type
-// is thinking and whose thinking field is present, then the signature as a delta at the
-// same index. Each of those three has shipped broken and passed a struct-level test.
 func carrierThinkingBlockFrames(t *testing.T, body string) {
 	t.Helper()
 	start, delta := -1, -1
@@ -481,8 +454,6 @@ func carrierThinkingBlockFrames(t *testing.T, body string) {
 	}
 }
 
-// The carrier as the client receives it. Streaming builds a thinking block from frames;
-// the aggregate path returns one block in the JSON body. Both are wire bytes.
 func carrierFromAnthropicTurn(t *testing.T, stream bool, body string) (string, bool) {
 	t.Helper()
 	if stream {
@@ -519,8 +490,6 @@ func carrierFromAnthropicTurn(t *testing.T, stream bool, body string) (string, b
 	return "", false
 }
 
-// A declared model_routes deployment reaches the same emit site down a different execution
-// path, so the cap has to be wired on both. Same public id, so the request body is shared.
 func newDeclaredRouteTestHandler(t *testing.T, baseURL string) *ProxyHandler {
 	t.Helper()
 	h, err := NewProxyHandler(
@@ -546,9 +515,6 @@ func newDeclaredRouteTestHandler(t *testing.T, baseURL string) *ProxyHandler {
 	return h
 }
 
-// ~89% of real traffic is streaming, so drive both response modes and both route shapes.
-// Below the ceiling a complete private carrier reaches the client; at the ceiling no new
-// carrier is emitted at all.
 func TestCarrierBudgetAppliedOnEveryClientPath(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_reasoning_tool_call.sse")
 	if err != nil {
@@ -628,12 +594,8 @@ func TestCarrierBudgetAppliedOnEveryClientPath(t *testing.T) {
 	}
 }
 
-// The cap can only fire on what the counter sees, and the counter's only input is the
-// request body. Count off decoded wire bytes and assert both halves: the arithmetic, and
-// that the same count is what flips the decision.
 func TestInboundCarrierBytesAreCountedFromTheWire(t *testing.T) {
 	carrier := carrierBallastSignature(4096)
-	// A client's own thinking signature, which vekil never minted.
 	foreign := "ErUBCkYIBRgCKkBhbnRocm9waWMtc2lnbmF0dXJl"
 	body, err := json.Marshal(map[string]any{
 		"model": "gpt-public", "max_tokens": 16,
@@ -646,7 +608,6 @@ func TestInboundCarrierBytesAreCountedFromTheWire(t *testing.T) {
 			map[string]any{"role": "assistant", "content": []any{
 				map[string]any{"type": "redacted_thinking", "thinking": "", "signature": carrier},
 			}},
-			// A user turn is not the client replaying what vekil emitted.
 			map[string]any{"role": "user", "content": []any{
 				map[string]any{"type": "thinking", "thinking": "", "signature": carrier},
 			}},

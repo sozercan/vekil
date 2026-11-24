@@ -22,9 +22,6 @@ func (turn trimmableTurn) items() []json.RawMessage {
 	return append(append(append([]json.RawMessage{}, turn.reasoning...), turn.call), turn.tail...)
 }
 
-// Reasoning items per turn vary, so "newest 100 tool turns" cannot pass as "newest 100
-// reasoning items"; prose and user messages sit between turns, so a tool turn cannot pass
-// as any assistant message. Both distinctions are the point of the window.
 func publishTrimmableTurns(t *testing.T, store *responsesChatReplayStore, route responsesChatReplayRoute, count int, carrier bool) ([]json.RawMessage, []trimmableTurn, map[string]carriedReplay) {
 	t.Helper()
 	messages := make([]json.RawMessage, 0, count*4)
@@ -117,7 +114,6 @@ func publishTrimmableTurns(t *testing.T, store *responsesChatReplayStore, route 
 	return messages, turns, carried
 }
 
-// The store and the carrier are the two reasoning sources and both reach the same trim.
 func trimmableTurnsUpstreamInput(t *testing.T, count int, carrier bool, options *responsesChatRequestOptions) ([]byte, []trimmableTurn) {
 	t.Helper()
 	store, route := newCarrierReplayFixture(t)
@@ -128,8 +124,6 @@ func trimmableTurnsUpstreamInput(t *testing.T, count int, carrier bool, options 
 	options.UpstreamModel = "gpt-upstream"
 	options.ReplayRoute = route
 	if carrier {
-		// Production sets both and the store answers first, so the carrier only ever runs
-		// behind a store that has already lost the group: wire one that never held it.
 		expired := newResponsesChatReplayStore()
 		t.Cleanup(func() { _ = expired.Close() })
 		options.CarriedReasoning, options.ReplayStore = carried, expired
@@ -157,8 +151,6 @@ func forEachReasoningSource(t *testing.T, run func(t *testing.T, carrier bool)) 
 	}
 }
 
-// 250 turns sits inside block 2, so the cutoff is a flat 100 turns and 150 are retained:
-// the window is N..2N-1, not N.
 func TestTranslateChatMessagesToResponsesDropsReasoningOlderThanRetainedToolTurns(t *testing.T) {
 	forEachReasoningSource(t, func(t *testing.T, carrier bool) {
 		aged := reasoningToolTurnBlock
@@ -192,8 +184,6 @@ func TestTranslateChatMessagesToResponsesKeepsToolCallsAtEveryAge(t *testing.T) 
 	})
 }
 
-// The whole upstream input, byte for byte: below the first block jump the trim must splice
-// exactly what it spliced before it existed, and say nothing.
 func TestTranslateChatMessagesToResponsesLeavesRetainedToolTurnsByteIdentical(t *testing.T) {
 	forEachReasoningSource(t, func(t *testing.T, carrier bool) {
 		for _, count := range []int{reasoningToolTurnBlock, 2*reasoningToolTurnBlock - 1} {
@@ -220,12 +210,7 @@ func TestTranslateChatMessagesToResponsesLeavesRetainedToolTurnsByteIdentical(t 
 	})
 }
 
-// Every request in a block must extend the previous one byte for byte; the cutoff, and so
-// the array, may only move where the block does.
 func TestTranslateChatMessagesToResponsesKeepsUpstreamInputPrefixStableWithinBlock(t *testing.T) {
-	// Block 2 is the first jump, where the earlier array is still untrimmed; block 3 is the
-	// steady state, where the cutoff is indexed on both sides. Step 7 is a client resuming
-	// several turns on, where a jump need not land on a multiple of the block.
 	sweeps := []struct{ first, last, step int }{
 		{2*reasoningToolTurnBlock - 10, 2*reasoningToolTurnBlock + 15, 1},
 		{3*reasoningToolTurnBlock - 10, 3*reasoningToolTurnBlock + 15, 1},
@@ -241,9 +226,6 @@ func TestTranslateChatMessagesToResponsesKeepsUpstreamInputPrefixStableWithinBlo
 					ReplayRoute:   route,
 				}
 				if carrier {
-					// Use one forgotten store for every prefix. A growing real transcript
-					// reuses the opaque IDs it was originally handed; reminting each prefix
-					// would make byte-prefix comparison meaningless.
 					expired := newResponsesChatReplayStore()
 					t.Cleanup(func() { _ = expired.Close() })
 					options.CarriedReasoning = carried
@@ -263,18 +245,12 @@ func TestTranslateChatMessagesToResponsesKeepsUpstreamInputPrefixStableWithinBlo
 						t.Fatal(err)
 					}
 					if previous != nil {
-						// "[a,b]" extends to "[a,b,c]": drop the close, require the separator, so a
-						// break can only land where a whole new item starts.
 						want := append(append([]byte{}, previous[:len(previous)-1]...), ',')
 						extends := bytes.HasPrefix(encoded, want)
-						// Derived here rather than from agedReasoningToolTurns, so a cutoff that
-						// slid again would be caught instead of agreed with.
 						held := previousCount/reasoningToolTurnBlock == count/reasoningToolTurnBlock
 						if extends != held {
 							t.Fatalf("turns %d -> %d: extends previous = %v, want %v", previousCount, count, extends, held)
 						}
-						// A break must be the cutoff dropping a block of reasoning; one that grew
-						// the array is some other divergence wearing the same shape.
 						if !held && len(encoded) >= len(previous) {
 							t.Fatalf("turns %d -> %d: array grew %d -> %d, want a drop", previousCount, count, len(previous), len(encoded))
 						}
@@ -286,8 +262,6 @@ func TestTranslateChatMessagesToResponsesKeepsUpstreamInputPrefixStableWithinBlo
 	})
 }
 
-// Two properties the marshaled arrays cannot show: the cutoff never indexes past the turns
-// it was given, and it is a function of the block rather than of the exact count.
 func TestAgedReasoningToolTurnsHoldsStillWithinBlock(t *testing.T) {
 	for _, count := range []int{0, 1, 99, 100, 199, 200, 201, 299, 300, 1516} {
 		aged := agedReasoningToolTurns(count)

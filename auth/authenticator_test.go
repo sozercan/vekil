@@ -37,7 +37,6 @@ func TestGetToken_RefreshesExpiredToken(t *testing.T) {
 	defer server.Close()
 
 	dir := t.TempDir()
-	// Write access token to disk so refreshToken finds it
 	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("valid-access-token"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +652,6 @@ func TestSaveAndLoadCopilotToken(t *testing.T) {
 		t.Fatalf("save error: %v", err)
 	}
 
-	// Verify file exists and is valid JSON
 	data, err := os.ReadFile(filepath.Join(dir, "api-key.json"))
 	if err != nil {
 		t.Fatalf("read error: %v", err)
@@ -808,7 +806,6 @@ func TestIsSignedIn_WithDiskCopilotToken(t *testing.T) {
 
 func TestSignOut_ClearsTokens(t *testing.T) {
 	dir := t.TempDir()
-	// Write both token files
 	if err := os.WriteFile(filepath.Join(dir, "access-token"), []byte("ghu_xxxx"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -828,7 +825,6 @@ func TestSignOut_ClearsTokens(t *testing.T) {
 		t.Fatalf("SignOut error: %v", err)
 	}
 
-	// Memory cleared
 	if a.accessToken != "" {
 		t.Errorf("accessToken not cleared: %q", a.accessToken)
 	}
@@ -839,7 +835,6 @@ func TestSignOut_ClearsTokens(t *testing.T) {
 		t.Errorf("tokenExpiry not cleared: %v", a.tokenExpiry)
 	}
 
-	// Disk cleared
 	if _, err := os.Stat(filepath.Join(dir, "access-token")); !os.IsNotExist(err) {
 		t.Error("access-token file still exists")
 	}
@@ -857,7 +852,6 @@ func TestSignOut_ClearsTokens(t *testing.T) {
 func TestSignOut_Idempotent(t *testing.T) {
 	dir := t.TempDir()
 	a := &Authenticator{tokenDir: dir}
-	// Calling SignOut when no files exist should not error
 	if err := a.SignOut(); err != nil {
 		t.Fatalf("SignOut on empty dir should not error: %v", err)
 	}
@@ -887,12 +881,9 @@ func TestRequestDeviceCode(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// We need to override the deviceCodeURL for testing. Since it's a const,
-	// we create a custom HTTP client that redirects to our test server.
 	a := &Authenticator{
 		client: server.Client(),
 	}
-	// We'll use a transport that rewrites the URL to our test server.
 	a.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		req.URL, _ = url.Parse(server.URL + req.URL.Path)
 		return http.DefaultTransport.RoundTrip(req)
@@ -996,7 +987,6 @@ func TestRequestDeviceCode_DoesNotRetryWithoutLoopbackProxy(t *testing.T) {
 	}
 }
 
-// roundTripFunc adapts a function to http.RoundTripper.
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -1189,12 +1179,10 @@ func TestPollForAuthorization_Success(t *testing.T) {
 		case "/login/oauth/access_token":
 			call++
 			if call == 1 {
-				// First call: authorization_pending
 				_ = json.NewEncoder(w).Encode(AccessTokenResponse{
 					Error: "authorization_pending",
 				})
 			} else {
-				// Second call: success
 				_ = json.NewEncoder(w).Encode(AccessTokenResponse{
 					AccessToken: "ghu_success",
 				})
@@ -1248,7 +1236,6 @@ func TestPollForAuthorization_Success(t *testing.T) {
 		t.Errorf("expected direct ghu_success bearer, got %q", a.copilotToken)
 	}
 
-	// Verify access token was saved to disk
 	data, err := os.ReadFile(filepath.Join(dir, "access-token"))
 	if err != nil {
 		t.Fatalf("access-token not saved: %v", err)
@@ -1289,7 +1276,7 @@ func TestPollForAuthorization_Cancelled(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+	cancel()
 
 	dcResp := &DeviceCodeResponse{
 		DeviceCode: "dc_cancel",
@@ -2146,8 +2133,6 @@ func TestRefreshTokenNonInteractiveDoesNotJoinCachedLookup(t *testing.T) {
 		copilotBaseURL: server.URL,
 	}
 
-	// Hold the state lock so the regular lookup publishes its in-flight call
-	// before it can return the cached token.
 	a.mu.Lock()
 	cachedResult := make(chan struct {
 		token string

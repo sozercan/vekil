@@ -15,9 +15,6 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// responsesOverChatResponse is the Responses object emitted by the
-// Responses-over-Chat adapter. Usage is null when the upstream reported none;
-// the adapter never invents token counts.
 type responsesOverChatResponse struct {
 	ID                string                        `json:"id"`
 	Object            string                        `json:"object"`
@@ -35,9 +32,6 @@ type responsesOverChatResponse struct {
 	Error             any                           `json:"error"`
 }
 
-// responsesOverChatFailure is a terminal failure discovered after the upstream
-// accepted the request. Before any byte is written it becomes an HTTP error;
-// afterwards it becomes a response.failed event.
 type responsesOverChatFailure struct {
 	status  int
 	code    string
@@ -58,9 +52,6 @@ type responsesOverChatToolCall struct {
 	descriptor  policyResponsesToolDescriptor
 }
 
-// responsesOverChatFinishedItem pairs a completed output item with its output
-// index. The index orders the final output and is never part of the item, so
-// items emitted in output_item.done can be replayed verbatim as input.
 type responsesOverChatFinishedItem struct {
 	outputIndex int
 	item        map[string]any
@@ -80,9 +71,6 @@ func (m *responsesOverChatMessage) contentPart(text string) map[string]any {
 	return map[string]any{"type": "output_text", "text": text, "annotations": []any{}}
 }
 
-// responsesOverChatStream converts canonical Chat stream chunks into Responses
-// events as they arrive. With a nil writer it runs the same validation and
-// returns only the final object, which is how non-streaming requests are served.
 type responsesOverChatStream struct {
 	w        http.ResponseWriter
 	response responsesOverChatResponse
@@ -188,8 +176,6 @@ func (s *responsesOverChatStream) snapshot(status string) responsesOverChatRespo
 	return snapshot
 }
 
-// start writes response.created and response.in_progress. It is called only
-// after the upstream accepted the request.
 func (s *responsesOverChatStream) start() error {
 	if s.started {
 		return nil
@@ -377,14 +363,10 @@ func (s *responsesOverChatStream) applyToolCallDelta(delta models.OpenAIToolCall
 	}
 	if name := delta.Function.Name; name != "" {
 		if call.added {
-			// Once a call is announced its identity is fixed; a repeat of the
-			// complete name is tolerated, anything else is a change.
 			if name != call.chatName {
 				return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream changed a tool name after the call started"}
 			}
 		} else {
-			// Before announcement every fragment is part of the name, including
-			// one equal to the prefix so far ("get" + "get" is "getget").
 			call.chatName += name
 			if len(call.chatName) > policyResponsesMaxToolNameLen {
 				return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned an oversized tool name"}
@@ -406,19 +388,12 @@ func (s *responsesOverChatStream) applyToolCallDelta(delta models.OpenAIToolCall
 			call.pending.WriteString(fragment)
 		}
 	}
-	// Providers may fragment the name across deltas, and activity on another
-	// call index or text says nothing about this call's name. The call is
-	// validated and exposed only once its own arguments start, or at a
-	// successful finish. Output indexes follow exposure order, so they stay
-	// monotonic even when a later Chat index is exposed first.
 	if !call.added && call.callID != "" && call.chatName != "" && call.pending.Len() > 0 {
 		return s.addToolCall(call)
 	}
 	return nil
 }
 
-// addToolCall exposes a call once its identity is known. Codex only executes a
-// call on output_item.done, which is emitted after a successful finish.
 func (s *responsesOverChatStream) addToolCall(call *responsesOverChatToolCall) error {
 	descriptor, known := s.tools[strings.TrimSpace(call.chatName)]
 	if !known {
@@ -468,7 +443,6 @@ func (s *responsesOverChatStream) functionCallItem(call *responsesOverChatToolCa
 	return item
 }
 
-// consume applies one canonical Chat stream chunk.
 func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error {
 	if chunk.Usage != nil {
 		usage := *chunk.Usage
@@ -496,14 +470,11 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 			return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream sent output after its finish reason"}
 		}
 		if text != "" {
-			// Text after a function call opens a new message item, so output
-			// indexes stay monotonic.
 			if err := s.appendText(text, false); err != nil {
 				return err
 			}
 		}
 		if refusal != "" {
-			// Any started call, exposed or still pending, conflicts with a refusal.
 			if len(s.callOrder) > 0 {
 				return &responsesOverChatFailure{status: http.StatusBadGateway, code: "invalid_upstream_stream", message: "upstream returned a refusal together with function calls"}
 			}
@@ -532,9 +503,6 @@ func (s *responsesOverChatStream) consume(chunk models.OpenAIStreamChunk) error 
 	return nil
 }
 
-// finish validates the terminal Chat state and emits the terminal Responses
-// event. It returns the final response, or a failure when the upstream turn
-// cannot be represented honestly as completed or incomplete.
 func (s *responsesOverChatStream) finish() (responsesOverChatResponse, *responsesOverChatFailure) {
 	if s.usage != nil {
 		usage := policyResponsesUsageFromChat(s.usage)
@@ -551,8 +519,6 @@ func (s *responsesOverChatStream) finish() (responsesOverChatResponse, *response
 		}
 		executable = true
 	case "stop":
-		// Gemini through Copilot may report stop for a turn that ends in function
-		// calls. Complete calls are still the model's answer.
 		executable = len(s.callOrder) > 0
 		if !executable && s.config.RequiresToolCall {
 			return fail(&responsesOverChatFailure{status: http.StatusBadGateway, code: "tool_call_required", message: "model stopped without the function call required by tool_choice"})
@@ -668,7 +634,6 @@ func asResponsesOverChatFailure(err error) *responsesOverChatFailure {
 	return &responsesOverChatFailure{status: http.StatusBadGateway, code: "server_error", message: err.Error()}
 }
 
-// fail emits response.failed after the stream was committed.
 func (s *responsesOverChatStream) fail(failure *responsesOverChatFailure) error {
 	response := s.snapshot("failed")
 	if s.usage != nil {
@@ -680,8 +645,6 @@ func (s *responsesOverChatStream) fail(failure *responsesOverChatFailure) error 
 	return s.emit("response.failed", map[string]any{"response": response})
 }
 
-// streamResponsesOverChat consumes the native Chat SSE body and writes either
-// incremental Responses SSE or one final Responses JSON object.
 func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, resp *http.Response, translated policyResponsesChatRequest, publicModel, toolScope string) {
 	lifecycleBody := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
 	defer func() { _ = lifecycleBody.Close() }()
@@ -709,10 +672,6 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 		consumeErr = err
 	}
 	if consumeErr == nil {
-		// A missing [DONE] after a finish reason is tolerated; a stream that ends
-		// before any finish reason fails in finish(). Malformed chunks fail the
-		// turn: skipping one could turn a corrupted argument delta into an
-		// executable call with different arguments.
 		_, readErr := consumeOpenAIStreamChunksStrict(lifecycleBody, func(chunk models.OpenAIStreamChunk) bool {
 			if aggregator != nil {
 				addChatStreamChunkForToolCapture(aggregator, chunk)
@@ -739,15 +698,9 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 	var final responsesOverChatResponse
 	switch {
 	case consumeErr != nil && errors.Is(consumeErr, errChatStreamClientWriteFailed):
-		// The client is gone; nothing further can be delivered. Record the abort
-		// so the committed 200 is not counted as a success.
 		observeResponseFailureStatus(r.Context(), 499)
 		return
 	case consumeErr != nil && r.Context().Err() != nil:
-		// The client left first and the cancellation hook stopped the upstream
-		// read. Record the client abort as 499, as the pre-response path does,
-		// rather than an upstream failure, and write nothing to the departed
-		// client beyond the status when nothing was committed yet.
 		observeResponseFailureStatus(r.Context(), 499)
 		if !committed {
 			w.WriteHeader(499)
@@ -797,8 +750,6 @@ func (h *ProxyHandler) streamResponsesOverChat(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if final.Status == "incomplete" {
-		// The HTTP status is 200 either way, so record the truncated turn the
-		// way the native Responses stream tap records response.incomplete.
 		observeResponseFailureStatus(r.Context(), http.StatusConflict)
 	}
 	if state.streaming() {

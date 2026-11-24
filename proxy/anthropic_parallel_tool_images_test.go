@@ -148,8 +148,6 @@ func TestAnthropicParallelToolResultImagesPreserveChatHistory(t *testing.T) {
 					if err := json.Unmarshal(last.Content, &blocks); err != nil {
 						t.Fatal(err)
 					}
-					// Claude Code puts all result blocks before same-turn image
-					// companions; transcript row boundaries are not API turns.
 					for page := 1; page <= 3; page++ {
 						caption := fmt.Sprintf("[Image: synthetic page %d, displayed at 2000x1000]\n", page)
 						blocks = append(blocks, models.ContentBlock{Type: "text", Text: &caption})

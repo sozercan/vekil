@@ -14,8 +14,6 @@ import (
 	"testing"
 )
 
-// The upstream completion as Azure emits it: the search action carries result
-// sources and the cited text carries annotations.
 func conversationWebSearchOutput() []any {
 	return []any{
 		map[string]any{"type": "reasoning", "id": "rs_east1", "encrypted_content": "private-east-1", "summary": []any{}},
@@ -27,8 +25,6 @@ func conversationWebSearchOutput() []any {
 	}
 }
 
-// The same turn as Codex replays it on the next request: prefixed IDs kept,
-// unknown action fields and annotations dropped, encrypted reasoning retained.
 func conversationWebSearchCodexReplay() []any {
 	return []any{
 		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Find the docs."}}},
@@ -106,7 +102,6 @@ func TestConversationMigrationReplaysWebSearchToDeclaredTargets(t *testing.T) {
 			}
 			second := conversationPOST(t, h, fields, http.Header{"X-Codex-Turn-State": {"turn-east-1"}})
 			if !tc.declared {
-				// West never declared web search, so it cannot replay the call.
 				if second.Code < 400 || west.Load() != 0 {
 					t.Fatalf("migrated web search history to an undeclared target: %d %s west=%d", second.Code, second.Body.String(), west.Load())
 				}
@@ -121,8 +116,6 @@ func TestConversationMigrationReplaysWebSearchToDeclaredTargets(t *testing.T) {
 					t.Errorf("reconstructed history is missing %s", want)
 				}
 			}
-			// Saved history matches what Codex replays: no citations, no result
-			// sources, and none of east's private state.
 			for _, unwanted := range []string{"url_citation", "sources", "private-east", "previous_response_id", "msg_east1"} {
 				if strings.Contains(westBody, unwanted) {
 					t.Errorf("reconstructed history carries %s", unwanted)
@@ -171,13 +164,11 @@ func TestConversationMigrationForwardsUnsupportedStateUnprotected(t *testing.T) 
 				if _, err := h.conversationHistory.lookupResponse("azure", "unprotected"); !errors.Is(err, errConversationHistoryMissing) {
 					t.Fatalf("unprotected completion was saved: %v", err)
 				}
-				// The unprotected completion has no history to continue from.
 				missing := conversationPOST(t, h, map[string]any{"previous_response_id": "unprotected", "input": "More."}, nil)
 				if missing.Code != 400 || !strings.Contains(missing.Body.String(), "conversation_history_unavailable") {
 					t.Fatalf("continuation from an unprotected completion: %d %s", missing.Code, missing.Body.String())
 				}
 			}
-			// The known outcome leaves the saved seed usable for later branches.
 			conversationCompleted(t, conversationPOST(t, h, map[string]any{"previous_response_id": "seed", "input": "Branch."}, nil), false)
 		})
 	}

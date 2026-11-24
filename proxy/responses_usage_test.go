@@ -28,7 +28,6 @@ func TestResponsesUsageToOpenAIUsage(t *testing.T) {
 }
 
 func TestResponsesUsageTotalDerived(t *testing.T) {
-	// total_tokens omitted upstream → derived from input+output.
 	u := responsesUsage{InputTokens: 70, OutputTokens: 30}
 	if got := u.toOpenAIUsage(); got.TotalTokens != 100 {
 		t.Fatalf("derived total: got %d want 100", got.TotalTokens)
@@ -65,11 +64,9 @@ func TestSniffResponsesUsageBody(t *testing.T) {
 	if u.InputTokensDetails.CachedTokens != 60 || u.OutputTokensDetails.ReasoningTokens != 15 {
 		t.Fatalf("sniff details: %+v", u)
 	}
-	// No usage → zero (and isZero true).
 	if got := sniffResponsesUsageBody([]byte(`{"id":"x"}`)); !got.isZero() {
 		t.Fatalf("expected zero usage, got %+v", got)
 	}
-	// Malformed JSON → zero, no panic.
 	if got := sniffResponsesUsageBody([]byte(`not json`)); !got.isZero() {
 		t.Fatalf("expected zero on bad json, got %+v", got)
 	}
@@ -104,7 +101,6 @@ func TestObserveResponsesUsageWritesSummary(t *testing.T) {
 	if d.prompt != 200 || d.completion != 80 || d.total != 280 {
 		t.Fatalf("usage not recorded into summary: prompt=%d completion=%d total=%d", d.prompt, d.completion, d.total)
 	}
-	// Zero usage must not overwrite.
 	ctx2, summary2 := WithRequestSummary(context.Background())
 	observeResponsesUsage(ctx2, responsesUsage{})
 	if d2 := readSummaryForStats(summary2); d2.prompt != 0 || d2.total != 0 {
@@ -130,7 +126,6 @@ func TestRecordResponsesTurn(t *testing.T) {
 	if snap.Totals.CachedTokens != 20 || snap.Totals.ReasoningTokens != 10 {
 		t.Fatalf("detail totals: cached=%d reasoning=%d", snap.Totals.CachedTokens, snap.Totals.ReasoningTokens)
 	}
-	// Stream turn → no latency sample.
 	if snap.Totals.LatencyP50 != 0 {
 		t.Fatalf("bridge turn should not contribute latency, got p50=%d", snap.Totals.LatencyP50)
 	}
@@ -143,8 +138,6 @@ func TestRecordResponsesTurn(t *testing.T) {
 	if len(snap.ByProvider) != 1 || snap.ByProvider[0].Provider != "codex" {
 		t.Fatalf("by_provider: %+v", snap.ByProvider)
 	}
-	// A zero-usage turn is still counted as a request (matching the HTTP path),
-	// just with zero tokens.
 	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 200, responsesUsage{}, "")
 	after := c.snapshot()
 	if after.Totals.Requests != 2 {
@@ -155,9 +148,6 @@ func TestRecordResponsesTurn(t *testing.T) {
 	}
 }
 
-// TestRecordResponsesTurnCountsFailures covers that a websocket-bridge turn that
-// failed before producing usage (e.g. upstream response.failed → 502) is still
-// recorded, and lands in the error counts so the dashboard reflects it.
 func TestRecordResponsesTurnCountsFailures(t *testing.T) {
 	c := newStatsCollector()
 	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", http.StatusBadGateway, responsesUsage{}, "")
@@ -172,7 +162,6 @@ func TestRecordResponsesTurnCountsFailures(t *testing.T) {
 	if snap.Status["5xx"] != 1 {
 		t.Fatalf("failed turn should land in 5xx status class: got %+v", snap.Status)
 	}
-	// Default status 0 is treated as a successful (200) turn, not an error.
 	c.recordResponsesTurn("gpt-5.4-codex", "codex", "openai-codex", "Codex CLI", 0, responsesUsage{}, "")
 	snap2 := c.snapshot()
 	if snap2.Totals.Errors != 1 {

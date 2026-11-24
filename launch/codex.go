@@ -8,10 +8,6 @@ import (
 
 const codexLocalTokenEnv = "VEKIL_CODEX_API_KEY"
 
-// codexProviderID is the Codex model provider injected by the launcher. Codex
-// records the provider in each session's metadata and refuses to resume a
-// session whose provider is no longer configured, so the ID must stay stable
-// across launches. The per-launch secret travels only through env_key.
 const codexProviderID = "vekil_launch"
 
 var codexCredentialEnvironment = []string{
@@ -27,7 +23,6 @@ var codexCredentialEnvironment = []string{
 	"OPENAI_PROJECT_ID",
 }
 
-// CodexAdapter prepares OpenAI Codex CLI to use Vekil's Responses API.
 type CodexAdapter struct{}
 
 func (CodexAdapter) Name() string { return "codex" }
@@ -37,8 +32,6 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	hasModel := model != ""
 	policyModel := hasModel && strings.TrimSpace(input.Model.OwnedBy) == PolicyModelOwner
 	overChatModel := hasModel && !policyModel && isResponsesOverChatModel(input.Model)
-	// Both are served by Vekil's bounded Responses-to-Chat translation, which
-	// carries only function/namespace tools and full-history turns.
 	chatBacked := policyModel || overChatModel
 	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
 	if hasModel && !chatBacked && endpointMetadataKnown && !modelSupportsEndpoint(input.Model, "/responses") {
@@ -129,9 +122,6 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 		overrides = append(overrides, `model_catalog_json=`+configString(catalogPath))
 	}
 	if chatBacked {
-		// Policy and Responses-over-Chat models are served by Vekil's bounded
-		// Responses-to-Chat translation. Keep Codex on stateless HTTP turns and
-		// suppress hosted tools that cannot be represented as Chat functions.
 		overrides = append(overrides,
 			`web_search="disabled"`,
 			`features.remote_compaction_v2=false`,
@@ -210,11 +200,8 @@ func validateCodexForwardedArgs(args []string) error {
 	}
 	switch positionals[0] {
 	case "exec", "e":
-		// Normal exec and exec resume remain attached to the managed child.
 		return nil
 	case "resume", "fork":
-		// Interactive resume and fork remain attached to the managed child.
-		// Remote variants are rejected above.
 		return nil
 	case "review":
 		return nil
@@ -246,7 +233,7 @@ func validateChatBackedCodexForwardedArgs(args []string, label string) error {
 		switch {
 		case arg == "--enable":
 			if i+1 >= len(args) {
-				return nil // validateCodexForwardedArgs reports the missing value.
+				return nil
 			}
 			i++
 			feature = args[i]

@@ -38,21 +38,16 @@ func TestDesktopEntryEscapesExecPath(t *testing.T) {
 }
 
 func TestInstallRemoveLaunchAgent(t *testing.T) {
-	// Cannot use t.Parallel() because t.Setenv modifies process environment.
 
-	// Use a temporary directory as XDG_CONFIG_HOME so we don't touch the
-	// real autostart directory.
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmpDir)
 
 	expectedPath := filepath.Join(tmpDir, "autostart", autostartFilename)
 
-	// Should not be installed initially.
 	if isLaunchAgentInstalled() {
 		t.Fatal("expected launch agent to not be installed initially")
 	}
 
-	// Install.
 	if err := installLaunchAgent(); err != nil {
 		t.Fatalf("installLaunchAgent() error = %v", err)
 	}
@@ -74,7 +69,6 @@ func TestInstallRemoveLaunchAgent(t *testing.T) {
 		t.Fatalf("desktop file missing Type=Application:\n%s", content)
 	}
 
-	// Remove.
 	if err := removeLaunchAgent(); err != nil {
 		t.Fatalf("removeLaunchAgent() error = %v", err)
 	}
@@ -83,7 +77,6 @@ func TestInstallRemoveLaunchAgent(t *testing.T) {
 		t.Fatal("expected launch agent to not be installed after removal")
 	}
 
-	// Removing again should not error.
 	if err := removeLaunchAgent(); err != nil {
 		t.Fatalf("removeLaunchAgent() second call error = %v", err)
 	}

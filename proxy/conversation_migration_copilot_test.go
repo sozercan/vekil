@@ -140,8 +140,6 @@ func TestConversationMigrationCopilotPreservesHistoryAndReconnect(t *testing.T) 
 			turn(map[string]any{"previous_response_id": "east-2", "input": "Continue after the Azure outage."})
 			followup := any("Stay on Copilot.")
 			if protocol == "websocket" {
-				// The HTTP bridge must not inherit native Copilot's 4096-item
-				// limit after migration, even when native transport is enabled.
 				items := make([]any, responsesNativeMaxPendingItems+1)
 				for i := range items {
 					items[i] = map[string]any{"role": "user", "content": "Stay on Copilot."}
@@ -291,9 +289,6 @@ func TestConversationMigrationCopilotFullHistoryReconnect(t *testing.T) {
 			}, headers), false)
 			stopConversationAPIHandler(t, h)
 			h, _ = newConversationAPIHandler(t, transport, &cfg)
-			// Copilot's streamed item ID can differ from the terminal response's
-			// saved ID. The retained Azure anchor must not hide a newer exact
-			// full-history match within this conversation and client scope.
 			replayed := conversationText("Saved Copilot answer.")
 			replayed["id"] = "copilot-stream-item-1"
 			input := []any{initial, eastOutput, continuation, replayed, map[string]any{"role": "user", "content": "Continue on Copilot."}}
@@ -412,8 +407,6 @@ func TestConversationMigrationCopilotCooldownVerifiesOwner(t *testing.T) {
 			h, _ := newConversationAPIHandler(t, transport, &cfg)
 			h.auth = auth.NewTestAuthenticatorWithResponsesToken("ghu_original-source", "first-bearer")
 			conversationCompleted(t, conversationPOST(t, h, map[string]any{"input": "Seed."}, nil), false)
-			// Integration cooldowns span credentials, so a changed source must
-			// be rejected before local admission can cause cross-provider replay.
 			h.copilotTraffic.observeThrottle(copilotTrafficTestMetadata(t, captured), 429, "60", []byte(`{"error":{"code":"integration_rate_limited"}}`))
 			source := "ghu_original-source"
 			if changed {

@@ -15,8 +15,6 @@ func checkDurableStateFilesystem(fd int) error {
 	}
 }
 
-// Linux's ACL mask is reflected in the group mode bits. The shared 0700/0600
-// checks therefore exclude access by named ACL users and groups as well.
 func checkDurableStatePermissions(int) error { return nil }
 
 func syncDurableStateDirectory(fd int) error {

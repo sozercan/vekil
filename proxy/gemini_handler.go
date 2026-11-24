@@ -16,9 +16,7 @@ import (
 )
 
 const (
-	geminiCountTokensCacheTTL = 60 * time.Second
-	// geminiCountTokensCacheMaxEntries bounds unique countTokens payloads while
-	// retaining ample reuse for active client sessions.
+	geminiCountTokensCacheTTL        = 60 * time.Second
 	geminiCountTokensCacheMaxEntries = 1024
 )
 
@@ -40,8 +38,6 @@ type geminiCountTokensCacheEntry struct {
 	sequence uint64
 }
 
-// HandleGeminiModels routes Gemini-native model actions to the corresponding
-// translation handler.
 func (h *ProxyHandler) HandleGeminiModels(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
 	model, action, err := parseGeminiPath(r.URL.Path)
@@ -130,11 +126,6 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	}
 	streamUsageInjected := false
 	if forceStream || stream {
-		// Force-streamed or client-streamed: request a usage chunk so the
-		// request records tokens (the usage callback on the stream branch reads
-		// it). The translated Gemini stream consumes the OpenAI usage chunk, so
-		// it is not forwarded raw to the client. A strict OpenAI-compatible
-		// provider may reject stream_options; retry once without it on 400.
 		oaiReq.StreamOptions = &models.StreamOptions{IncludeUsage: true}
 		streamUsageInjected = true
 	}
@@ -225,8 +216,6 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		if resp.StatusCode != http.StatusOK {
 			defer func() { _ = resp.Body.Close() }()
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			// A native Chat route never reaches canonicalizeResponsesChatHTTPError, so
-			// result.upstreamError is empty and this body is the only thing that says why.
 			observeUpstreamErrorDetail(r.Context(), resp.StatusCode, errBody)
 			detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
 			h.log.Error("upstream error",
@@ -305,9 +294,6 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		resp := result.Response
 		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		// Same gap as the branch above: observeUpstreamErrorClassifiers already ran, but a
-		// native Chat route left it nothing to record. setErrorDetail is first-wins, so a
-		// Responses-backed route that already classified keeps what it had.
 		observeUpstreamErrorDetail(r.Context(), resp.StatusCode, errBody)
 		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
 		h.log.Error("upstream error",
@@ -354,11 +340,6 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 				status = streamErr.StatusCode
 				message = streamErr.Message
 				observeOpenAIUsage(r.Context(), streamErr.Usage)
-				// Usage and status alone left a `response.failed` here logging
-				// stats_status with no error_type/code/param, while the OpenAI and
-				// Anthropic stream paths recorded all three. setErrorDetail is
-				// first-wins, so observing here cannot clobber a classifier the
-				// upstream boundary already recorded.
 				observeChatExecutionError(r.Context(), streamErr)
 			} else {
 				var nativeStreamErr *openAIStreamError
@@ -546,8 +527,6 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	_ = json.NewEncoder(w).Encode(result)
 }
 
-// geminiCountTokensSelectedTargetID mirrors the next target dispatch would choose
-// without consuming any route-attempt budget.
 func geminiCountTokensSelectedTargetID(route *modelRoute, operation *routeOperation) string {
 	if route == nil || route.legacy || operation == nil {
 		return ""
@@ -559,8 +538,6 @@ func geminiCountTokensSelectedTargetID(route *modelRoute, operation *routeOperat
 	return targets[0].id
 }
 
-// geminiCountTokensRouteCacheKey preserves the legacy request-only key while
-// isolating explicit-route entries by their physical tokenizer/model owner.
 func geminiCountTokensRouteCacheKey(requestKey string, route *modelRoute, targetID string) (string, bool) {
 	if route == nil || route.legacy {
 		return requestKey, true
@@ -726,9 +703,6 @@ func (h *ProxyHandler) runGeminiCountTokensProbeWithContext(upstreamCtx, observa
 }
 
 func copyOpenAIRequestForGeminiCountTokensProbe(baseReq *models.OpenAIRequest) *models.OpenAIRequest {
-	// The probe path only replaces top-level fields below (streaming, token
-	// limits, and temperature). Shared slices/raw messages remain read-only, so a
-	// struct copy avoids the JSON round-trip deep clone on every countTokens miss.
 	if baseReq == nil {
 		return &models.OpenAIRequest{}
 	}

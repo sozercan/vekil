@@ -52,7 +52,6 @@ def capture(base_url):
     if base_url:
         try:
             with urlopen(base_url.rstrip("/") + "/stats.json", timeout=1) as response:
-                # Never retain the catalog, identities, or request content in stats.
                 body = response.read(2 * 1024 * 1024 + 1)
                 if len(body) > 2 * 1024 * 1024:
                     raise ValueError("usage response too large")

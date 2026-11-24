@@ -54,14 +54,10 @@ func TestRejectDuplicateJSONMappingKeysBoundsNestingDepth(t *testing.T) {
 		{name: "paths", fn: rejectDuplicateJSONMappingKeys},
 		{name: "path-free", fn: validateUnambiguousResponsesJSON},
 	} {
-		// Far deeper than the limit: the scan must stop at the bound rather
-		// than recurse once per byte of client- or upstream-controlled input.
 		if err := scan.fn(nested(1 << 20)); err == nil {
 			t.Fatalf("%s: over-deep JSON accepted", scan.name)
 		}
 	}
-	// The jsonv2-backed decoder reports the same bound itself; the scanner's own
-	// check is what enforces it under GOEXPERIMENT=nojsonv2.
 	if err := rejectDuplicateJSONMappingKeys(nested(maxJSONDuplicateKeyScanDepth + 1)); err == nil {
 		t.Fatalf("depth %d accepted", maxJSONDuplicateKeyScanDepth+1)
 	}
@@ -91,8 +87,6 @@ func TestExplicitRouteDeepRequestDuplicateKeyValidationIsLinear(t *testing.T) {
 	}
 	defer h.BeginShutdown()
 
-	// Deep but small explicit-route requests must not make the duplicate-key
-	// scan build and retain a path string per nesting level (~456 MiB here).
 	const depth = 9000
 	request := func(leaf string) []byte {
 		schema := strings.Repeat(`{"properties":`, depth) + leaf + strings.Repeat(`}`, depth)

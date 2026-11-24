@@ -76,8 +76,6 @@ func saveConversationHistoryStorageSnapshot(t *testing.T, history *conversationH
 	}
 }
 
-// conversationHistoryStorageUsage returns the committed logical bytes and the
-// number of stored blobs.
 func conversationHistoryStorageUsage(t *testing.T, history *conversationHistoryStore) (total uint64, blobs int) {
 	t.Helper()
 	if err := history.d.db.View(func(tx *bolt.Tx) error {
@@ -151,7 +149,6 @@ func TestConversationHistoryStorageStoresRepeatedContentOnce(t *testing.T) {
 	if firstBlobs != 4 {
 		t.Fatalf("first snapshot stored %d blobs, want its two items, instructions and tools", firstBlobs)
 	}
-	// A later turn repeats the whole earlier history, instructions and tools.
 	second := conversationHistoryStorageSnapshot(history, "shared-second", first.Root, now)
 	second.Input = append(cloneRawMessages(first.Input), second.Input...)
 	saveConversationHistoryStorageSnapshot(t, history, second)
@@ -173,7 +170,6 @@ func TestConversationHistoryStorageStoresRepeatedContentOnce(t *testing.T) {
 func TestConversationHistoryStorageReadsInlineSnapshots(t *testing.T) {
 	bindings, history, file := newConversationHistoryStorageFixture(t, ConversationMigrationConfig{})
 	cutoff := time.Date(2020, 1, 1, 0, 0, 1, 0, time.UTC)
-	// Earlier versions stored each snapshot's content inline, without blobs.
 	inline := conversationHistoryStorageSnapshot(history, "inline-first", "inline-root", cutoff.Add(-time.Second))
 	key := history.responseKey(inline.RouteID, inline.ResponseID)
 	raw, err := json.Marshal(inline)
@@ -233,7 +229,6 @@ func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t 
 	if err := history.saveDelivered(delivered); err != nil {
 		t.Fatal(err)
 	}
-	// The released marker survives a reopen and its integrity check.
 	closeDurableStoreFixture(t, bindings)
 	_, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
 	requireConversationHistoryStorageSnapshot(t, retained, delivered)
@@ -252,8 +247,6 @@ func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t 
 	if retained.counts.pending != 1 {
 		t.Fatalf("pending attempts = %d, want the continuation's alone", retained.counts.pending)
 	}
-	// The continuation now owns an ordinary marker, which only a trusted
-	// client passes and replaces.
 	if _, _, err := retained.acquireFrom(parent.Root, "", deliveredKey, false); !errors.Is(err, errConversationHistoryUncertain) {
 		t.Fatalf("continuation marker admitted another turn: %v", err)
 	}
@@ -268,8 +261,6 @@ func TestConversationHistoryStorageDeliveredSnapshotAdmitsOnlyItsContinuation(t 
 		t.Fatalf("pending attempts = %d after a trusted replacement", retained.counts.pending)
 	}
 	retained.release(parent.Root)
-	// A damaged record that still names the delivered snapshot admits neither
-	// its continuation nor a trusted client.
 	redelivered := conversationHistoryStorageSnapshot(retained, "response-redelivered", parent.Root, now)
 	redeliveredKey := retained.responseKey(redelivered.RouteID, redelivered.ResponseID)
 	if err := retained.saveDelivered(redelivered); err != nil {
@@ -434,7 +425,7 @@ func TestConversationHistoryStorageCountsFollowCommittedRecords(t *testing.T) {
 				if history.counts != before {
 					t.Error("quota counts were published before commit")
 				}
-				return errConversationHistoryCapacity // abort without poisoning the store
+				return errConversationHistoryCapacity
 			}
 			mutate := func() error {
 				switch operation {
@@ -528,7 +519,6 @@ func TestConversationHistoryStorageCorruptionIsPreserved(t *testing.T) {
 						content[0] ^= 1
 						return blobs.Put(key, content)
 					}
-					// Keep the count consistent so only the missing blob is wrong.
 					if err := snapshots.SetSequence(snapshots.Sequence() - conversationBlobCost(content)); err != nil {
 						return err
 					}
@@ -597,8 +587,6 @@ func TestConversationHistoryStorageAdmissionAndCancellation(t *testing.T) {
 		t.Fatalf("concurrent admissions = %d, want 1", acquired)
 	}
 	history.release("contended-root")
-	// An attempt Vekil ends without delivering anything is settled; one it
-	// blocked as uncertain keeps its marker.
 	for _, state := range []string{"undispatched", "dispatched", "blocked"} {
 		root := "cancelled-" + state
 		if err := history.acquire(root); err != nil {
@@ -633,8 +621,6 @@ func TestConversationHistoryStorageBranchesAnotherClientThread(t *testing.T) {
 	if root, _, err := history.acquireFrom("main-root", "main", nil, true); err != nil || root != "main-root" {
 		t.Fatalf("first admission = %q, %v", root, err)
 	}
-	// The same thread, an unrecognized client, a turn without a thread and a
-	// turn of an unnamed holder all wait.
 	for _, attempt := range []struct {
 		root, thread string
 		trusted      bool
@@ -652,8 +638,6 @@ func TestConversationHistoryStorageBranchesAnotherClientThread(t *testing.T) {
 	} else {
 		history.release(other)
 	}
-	// A retry from the side thread resolves to the main conversation again. It
-	// waits for the side turn, including after the main turn ends.
 	for _, root := range []string{branch, "main-root"} {
 		if _, _, err := history.acquireFrom(root, "side", nil, true); !errors.Is(err, errConversationHistoryBusy) {
 			t.Fatalf("side retry on %q = %v, want busy", root, err)
@@ -663,7 +647,6 @@ func TestConversationHistoryStorageBranchesAnotherClientThread(t *testing.T) {
 	if _, _, err := history.acquireFrom("main-root", "side", nil, true); !errors.Is(err, errConversationHistoryBusy) {
 		t.Fatalf("side retry after the main turn = %v, want busy", err)
 	}
-	// The side turn's unresolved attempt stays reachable from a later retry.
 	if err := history.beginAttempt(branch, "side-operation"); err != nil {
 		t.Fatal(err)
 	}
@@ -697,7 +680,6 @@ func TestConversationHistoryStoragePrunePreservesOwnership(t *testing.T) {
 			t.Fatal(result.err)
 		}
 	}
-	// A clock regression must not let pruning an older intent retain its root.
 	bindings.durable.now = func() time.Time { return cutoff.Add(-time.Second) }
 	if err := history.beginAttempt(retired.Root, "old-unresolved-operation"); err != nil {
 		t.Fatal(err)
@@ -723,7 +705,6 @@ func TestConversationHistoryStoragePrunePreservesOwnership(t *testing.T) {
 		t.Fatalf("offline prune = %d, %v", removed, err)
 	}
 	reopened, retained := reopenConversationHistoryStorageFixture(t, file, history.config)
-	// Pruning keeps the shared blobs and the kept replies, not the pruned replies.
 	if _, blobs := conversationHistoryStorageUsage(t, retained); blobs != 5 {
 		t.Fatalf("prune kept %d blobs, want 5", blobs)
 	}
@@ -752,7 +733,7 @@ func TestConversationHistoryStoragePrunePreservesOwnership(t *testing.T) {
 	if err := retained.acquire(kept.Root); !errors.Is(err, errConversationHistoryUncertain) {
 		t.Fatalf("prune removed an intent at the cutoff: %v", err)
 	}
-	retained.config.MaxSnapshots = 3 // two retained snapshots and one pending turn
+	retained.config.MaxSnapshots = 3
 	if err := retained.beginAttempt("after-prune", "after-prune-operation"); !errors.Is(err, errConversationHistoryCapacity) {
 		t.Fatalf("pruned counts did not retain pending capacity: %v", err)
 	}
@@ -771,7 +752,6 @@ func TestConversationHistoryStoragePrunePreservesOwnership(t *testing.T) {
 	}
 }
 
-// The parent kills only this disposable child. It inherits no provider secrets.
 func TestConversationHistoryStorageChild(t *testing.T) {
 	window := os.Getenv("VEKIL_TEST_CONVERSATION_HISTORY_CHILD")
 	if window == "" {

@@ -10,10 +10,12 @@ Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behi
 make build   # build binary
 make test    # go test ./... -count=1
 make vet     # go vet ./...
-make lint    # runs vet
+make lint    # vet + prose-comment ban (see docs/development.md)
 ```
 
 Other targets are in the `Makefile`. Scoped suites, race matrices, and benchmark baselines are in [`docs/development.md`](docs/development.md) — load it before running anything narrower than `make test`, because the suite-name regexes are not guessable.
+
+Do not add prose comments to first-party source. Use clear code, tests, or an [ADR](docs/adr/README.md). Lint permits required directives and exact release labels on SHA-pinned GitHub Actions. Use the `delete-comment` skill to audit branches that still contain prose comments.
 
 ## Documentation
 
@@ -72,7 +74,7 @@ When adding `proxy/*.go`, follow the nearest existing responsibility and naming 
 
 ## CI
 
-[`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) is the deterministic core CI workflow; `golangci-lint` runs with `only-new-issues: true`. Live provider smokes remain separate so the core workflow does not depend on provider credentials or availability.
+[`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) is the deterministic core CI workflow; `golangci-lint` reports findings on changed lines. Live provider smokes remain separate so the core workflow does not depend on provider credentials or availability.
 
 Never switch a live smoke workflow to `pull_request_target`. Credentialed smokes must never execute pull-request-controlled code or data in a privileged context, and credential-free smokes do not need the privileged base-repository context.
 

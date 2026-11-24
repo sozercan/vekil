@@ -56,7 +56,6 @@ func defaultServiceDeps() serviceDeps {
 			}
 			return current.Username, nil
 		},
-		// On Windows, Uid is the account SID.
 		userID: func() (string, error) {
 			current, err := user.Current()
 			if err != nil {
@@ -94,18 +93,13 @@ func defaultServiceDeps() serviceDeps {
 	}
 }
 
-// serviceBackend manages the per-user OS integration that starts Vekil in the
-// background: a systemd user unit, a launchd agent, or a logon scheduled task.
 type serviceBackend interface {
 	tool() string
-	// registerFlags adds platform-only install flags.
 	registerFlags(fs *flag.FlagSet)
 	preflight(deps serviceDeps) error
-	// defaultLogFile returns "" when the platform captures stderr itself.
 	defaultLogFile(deps serviceDeps) (string, error)
 	location(deps serviceDeps) (string, error)
 	installed(deps serviceDeps) (bool, error)
-	// register writes and registers the definition without restarting it.
 	register(deps serviceDeps, spec serviceSpec) error
 	restart(deps serviceDeps) error
 	remove(deps serviceDeps) error
@@ -277,16 +271,12 @@ func runServiceInstall(args []string, deps serviceDeps, backend serviceBackend) 
 		return 1
 	}
 
-	// Capture PATH before applying the env file; the service applies the file
-	// itself at startup, so its PATH override still wins there.
 	path := deps.getenv("PATH")
 	envFile, envCreated, envVars, err := prepareServiceEnvFile(deps, explicit[serveEnvFileFlag])
 	if err != nil {
 		_, _ = fmt.Fprintf(deps.stderr, "error: %v\n", err)
 		return 1
 	}
-	// Validate with the environment the service will see, so provider
-	// secrets that live only in the env file count.
 	for _, kv := range envVars {
 		if err := deps.setenv(kv[0], kv[1]); err != nil {
 			_, _ = fmt.Fprintf(deps.stderr, "error: env file %s: set %s: %v\n", envFile, kv[0], err)
@@ -349,9 +339,6 @@ func runServiceInstall(args []string, deps serviceDeps, backend serviceBackend) 
 	return 0
 }
 
-// serviceServerArgs returns the explicitly set server flags in a stable order.
-// Shell environment defaults are intentionally not captured; the service reads
-// environment variables from its env file instead.
 func serviceServerArgs(flags *flag.FlagSet) ([]string, map[string]string, error) {
 	explicit := map[string]string{}
 	var visitErr error
@@ -399,8 +386,6 @@ func isRemoteProvidersConfigSource(source string) bool {
 	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
-// validateServiceValue rejects values that cannot be written safely into a
-// unit, plist, or task definition.
 func validateServiceValue(value string) error {
 	for _, r := range value {
 		if r < 0x20 || r == 0x7f {
@@ -421,8 +406,6 @@ const serviceEnvFileTemplate = `# Environment for the Vekil background service, 
 # LOG_LEVEL=debug
 `
 
-// prepareServiceEnvFile creates the default env file when no explicit one is
-// given, then parses the file the service will load.
 func prepareServiceEnvFile(deps serviceDeps, explicitPath string) (string, bool, [][2]string, error) {
 	path := explicitPath
 	created := false
@@ -431,7 +414,6 @@ func prepareServiceEnvFile(deps serviceDeps, explicitPath string) (string, bool,
 		if err != nil {
 			return "", false, nil, fmt.Errorf("resolve home directory: %w", err)
 		}
-		// Matches the default token directory so all Vekil user state stays together.
 		path = filepath.Join(home, ".config", "vekil", serviceEnvFileName)
 		if created, err = ensureServiceEnvFile(path); err != nil {
 			return "", false, nil, err
@@ -479,8 +461,6 @@ func warnIfServiceLacksCopilotLogin(deps serviceDeps, tokenDir, envFile string, 
 		_, _ = fmt.Fprintf(deps.stderr, "warning: could not check GitHub login: %v\n", err)
 		return
 	}
-	// A shell COPILOT_GITHUB_TOKEN does not reach the service, so only the env
-	// file's token, saved credentials, and opted-in GitHub CLI reuse count.
 	if status.HasVekilAccessToken || (status.GitHubCLIAutoSignIn && !status.SignedOut) {
 		return
 	}

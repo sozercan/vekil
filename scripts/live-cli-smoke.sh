@@ -182,8 +182,6 @@ run_with_deadline() {
   else
     rc=$?
   fi
-  # A CLI may exit while leaving descendants behind. Reap the entire dedicated
-  # group before returning so one test cannot leak work into the next one.
   if process_group_is_alive "${pgid}"; then
     terminate_process_group "" "${pgid}"
   fi
@@ -283,8 +281,6 @@ model_supports_endpoint() {
     .data[]?
     | select(.id == $model)
     | (.supported_endpoints // [])
-    # Legacy Copilot Chat models list no endpoints; Vekil treats them as
-    # supporting every endpoint.
     | (length == 0 or index($endpoint) != null)
   ' "${MODELS_JSON}" >/dev/null
 }
@@ -330,8 +326,6 @@ write_case_files() {
   local right_value="ZX_${fixture_name}_RIGHT"
 
   mkdir -p "${case_dir}"
-  # Keep fixtures newline-free so exact-output assertions compare only the
-  # requested payload, not editor-added file terminators.
   printf '%s' "${left_value}" > "${case_dir}/left.txt"
   printf '%s' "${right_value}" > "${case_dir}/right.txt"
   printf '%s|%s' "${left_value}" "${right_value}"
@@ -353,12 +347,6 @@ read_normalized_output() {
   awk 'NF { gsub(/\r/, "", $0); printf "%s", $0 }' "$1"
 }
 
-# Recent Gemini CLI versions may render Read results as strict
-# {"output":"..."} objects even when text output was requested. Accept either
-# one wrapper around the complete result or the exact two-wrapper sequence for
-# this smoke's two-part fixture. Leave every other shape unchanged so malformed JSON,
-# extra fields, unwrapped text, and unexpected commentary still fail the exact
-# assertion.
 read_gemini_normalized_output() {
   local path="$1"
   local python_bin
@@ -478,8 +466,6 @@ wait_for_ready() {
       --connect-timeout "${SMOKE_CURL_CONNECT_TIMEOUT_SECONDS}" \
       --max-time "${SMOKE_READINESS_REQUEST_MAX_TIME_SECONDS}" \
       "${PROXY_BASE_URL}/readyz" > "${SMOKE_DIR}/readyz.json" 2>/dev/null; then
-      # Check again after the HTTP response. This prevents a stale listener from
-      # satisfying readiness while the process we launched exits concurrently.
       assert_spawned_proxy_alive
       proxy_log_has_expected_listener || {
         dump_proxy_log
@@ -541,11 +527,6 @@ run_claude_command() {
   local output_file="$3"
   local model="$4"
   cd "${case_dir}"
-  # This baseline compatibility smoke does not exercise Claude's experimental
-  # Advisor Tool, whose beta header is not accepted by the Copilot endpoint.
-  # Use Anthropic's version spelling for Claude models so Claude recognizes
-  # their capabilities; Vekil normalizes it back to the Copilot catalog ID.
-  # Other models keep their catalog ID. File reads need no thinking.
   if [[ "${model}" == claude-* ]]; then
     model="${model//./-}"
   fi
@@ -659,7 +640,6 @@ main() {
 
   fetch_models
 
-  # Deliberate allowlists: catalog changes must not silently increase spend.
   CODEX_MODEL="$(pick_model "Codex/OpenAI" /responses gpt-5.6-luna-utility)"
   CLAUDE_MODEL="$(pick_model "Claude" /chat/completions claude-haiku-5.5)"
   GEMINI_MODEL="$(pick_optional_gemini_model gpt-4.1 gpt-4o)"

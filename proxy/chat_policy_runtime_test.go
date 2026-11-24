@@ -32,11 +32,9 @@ func TestDeterministicPolicySample(t *testing.T) {
 		}
 	}
 
-	// Length-prefixing makes ambiguous concatenations distinct inputs.
 	ambiguousA := deterministicPolicySample("ab", "c", 0.5)
 	ambiguousB := deterministicPolicySample("a", "bc", 0.5)
 	if ambiguousA == ambiguousB {
-		// A single threshold can collide by chance, so compare a set of rates.
 		sameAtAllRates := true
 		for _, rate := range []float64{0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9} {
 			if deterministicPolicySample("ab", "c", rate) != deterministicPolicySample("a", "bc", rate) {
@@ -91,7 +89,6 @@ func TestPolicyAdmissionNonBlockingProfileAndGlobalCaps(t *testing.T) {
 		t.Fatalf("other profile admission = (%v, %q), want global capacity", lease, failure)
 	}
 	profileOneLease.release()
-	// The failed global acquisition must have released its partial profile slot.
 	if lease, failure := otherProfile.tryAcquire(); failure != policyClassifierFailureNone {
 		t.Fatalf("other profile admission after global release = %q", failure)
 	} else {
@@ -168,8 +165,6 @@ func TestPolicyBreakerThresholdCooldownAndHalfOpen(t *testing.T) {
 		t.Fatal("second half-open probe admitted")
 	}
 
-	// A neutral/content-dependent outcome does not change health; it only
-	// releases the one-probe gate so another probe may run.
 	halfOpen.releaseNeutral()
 	halfOpen, ok = breaker.tryAcquire()
 	if !ok || !halfOpen.halfOpen {
@@ -299,8 +294,6 @@ func TestPolicyBreakerOnlyInfrastructureFailuresAffectState(t *testing.T) {
 		permit, _ := breaker.tryAcquire()
 		permit.recordFailure(infra)
 	}
-	// Timeout, malformed output, abstention, and user validation are neutral and
-	// do not reset or increment the consecutive infrastructure counter.
 	for _, neutral := range []policyClassifierFailure{
 		{Category: policyClassifierFailureTimeout},
 		{Category: policyClassifierFailureInvalidOutput, HTTPAccepted: false},
@@ -319,7 +312,6 @@ func TestPolicyBreakerOnlyInfrastructureFailuresAffectState(t *testing.T) {
 		t.Fatal("fifth infrastructure failure did not open after neutral outcomes")
 	}
 
-	// A healthy HTTP exchange closes even when the semantic payload was invalid.
 	now = now.Add(policyBreakerCooldown)
 	probe, ok := breaker.tryAcquire()
 	if !ok {
@@ -362,7 +354,6 @@ func TestPolicyClassifierRuntimeAdmissionBreakerAndCategories(t *testing.T) {
 	if result.Category != policyClassifierResultUncertain || result.Failure.Category != policyClassifierFailureInvalidOutput {
 		t.Fatalf("semantic classify = %#v", result)
 	}
-	// Semantic uncertainty counted as a healthy exchange and did not open.
 	classifier.err = nil
 	result = runtime.classify(context.Background(), policyClassifierFacts{})
 	if result.Category != policyClassifierResultClassified {

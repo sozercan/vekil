@@ -14,8 +14,7 @@ import (
 
 const (
 	launchdServiceLabel = "com.sertacozercan.vekil"
-	// The tray app's Launch at Login agent; see cmd/menubar/launchagent_darwin.go.
-	launchdTrayLabel = "com.vekil.menubar"
+	launchdTrayLabel    = "com.vekil.menubar"
 )
 
 type launchdServiceBackend struct{}
@@ -106,7 +105,6 @@ func (b launchdServiceBackend) restart(deps serviceDeps) error {
 	if err != nil {
 		return err
 	}
-	// Unloading fails when the agent is not loaded yet, which is fine.
 	_ = deps.run(io.Discard, io.Discard, "launchctl", "unload", path)
 	if err := deps.run(deps.stderr, deps.stderr, "launchctl", "load", "-w", path); err != nil {
 		return fmt.Errorf("launchctl load -w %s failed: %w", path, err)
@@ -136,9 +134,6 @@ func (launchdServiceBackend) logsHint(logFile string) string {
 	return "tail -f " + shellQuoteIfNeeded(logFile)
 }
 
-// renderLaunchdPlist keeps the agent alive after failures, like systemd's
-// Restart=on-failure. Vekil writes its own rotating log; launchdLog only
-// captures output written before that file opens, such as crashes.
 func renderLaunchdPlist(command []string, path, launchdLog string) (string, error) {
 	values := append(append([]string{}, command...), path, launchdLog)
 	for _, value := range values {

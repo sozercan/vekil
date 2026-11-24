@@ -130,6 +130,8 @@ providers:
 
 See [`examples/anthropic-with-insights.yaml`](../examples/anthropic-with-insights.yaml) for a complete example. When `insight_model` is unset the button is hidden and `GET /stats.json` reports `insights_enabled: false`.
 
+To run the example, export `ANTHROPIC_API_KEY`, start `vekil --providers-config examples/anthropic-with-insights.yaml`, and open the local `/dashboard` to generate insights. The example maps the public ID `claude-opus-4.8` to the upstream model `claude-opus-4-8`.
+
 Notes:
 
 - **Opt-in.** No model is called unless you configure one. The button does not appear otherwise. The model must be servable through native Chat or Chat-over-Responses; native `/v1/models` endpoint metadata is not expanded just for insights.

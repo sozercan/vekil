@@ -20,27 +20,18 @@ const responsesChatMinimumOutputTokens = 16
 type responsesChatStreamContextKey struct{}
 
 type chatExecutionError struct {
-	StatusCode int
-	Type       string
-	Code       string
-	Param      string
-	Message    string
-	Headers    http.Header
-	Usage      *models.OpenAIUsage
-	route      resolvedChatRoute
-	// Upstream prose quotes the request back, so only vekil's own Message is loggable.
+	StatusCode       int
+	Type             string
+	Code             string
+	Param            string
+	Message          string
+	Headers          http.Header
+	Usage            *models.OpenAIUsage
+	route            resolvedChatRoute
 	upstreamAuthored bool
-	// vekil authored this, but interpolated client text into it: an unknown field's NAME
-	// becomes the param, an unsupported value is echoed into the message. Neither is ours.
-	clientDerived bool
-	// The parent path vekil built, without the client's field name appended.
-	safeParam string
-	// The Message is a compile-time constant with nothing interpolated, so it is vekil's own
-	// words and safe to log. Default is CLOSED: every other message is dropped. Validators
-	// interpolate client values ("Responses input item type %q is not supported") and
-	// upstream prose quotes the request back, so opting in per constructor is what keeps a
-	// newly added validator from silently putting request content in the logs.
-	staticMessage bool
+	clientDerived    bool
+	safeParam        string
+	staticMessage    bool
 }
 
 func (e *chatExecutionError) Error() string {
@@ -56,19 +47,10 @@ type chatExecutionOptions struct {
 	ResponsesUsageOnly           bool
 	CarriedReasoning             map[string]carriedReplay
 	CarrierInbound               carrierInbound
-	// Set by the Anthropic surfaces only. See responsesChatRequestOptions; it also lets
-	// replay IDs continue on native Chat when the target has no Responses backend.
-	DegradeUnrestorableReplay bool
-	// RequireNativeChat refuses, before any upstream send, a request whose route
-	// resolves to a Responses backend at execution time. Responses-over-Chat
-	// sets it so a concurrent catalog refresh cannot turn an admitted native
-	// Chat request into an upstream /responses inference.
-	RequireNativeChat bool
+	DegradeUnrestorableReplay    bool
+	RequireNativeChat            bool
 }
 
-// nativeChatBackendRequiredError is returned when RequireNativeChat finds that
-// the route no longer resolves to native Chat. The model's catalog changed
-// between admission and execution; a retry is admitted afresh.
 func nativeChatBackendRequiredError() *chatExecutionError {
 	return &chatExecutionError{
 		StatusCode:    http.StatusServiceUnavailable,
@@ -80,18 +62,16 @@ func nativeChatBackendRequiredError() *chatExecutionError {
 }
 
 type chatExecutionResult struct {
-	Response         *http.Response
-	Completion       *models.OpenAIResponse
-	CompletionBody   []byte
-	CarriedReasoning carriedTurn
-	Stream           *chatStreamEventStream
-	Headers          http.Header
-	Usage            *models.OpenAIUsage
-	IncludeUsage     bool
-	Backend          chatBackend
-	route            resolvedChatRoute
-	// Reduced from an upstream non-2xx body, which the surfaces see as a successful
-	// result. Rides here because the boundary that read it had no request summary.
+	Response             *http.Response
+	Completion           *models.OpenAIResponse
+	CompletionBody       []byte
+	CarriedReasoning     carriedTurn
+	Stream               *chatStreamEventStream
+	Headers              http.Header
+	Usage                *models.OpenAIUsage
+	IncludeUsage         bool
+	Backend              chatBackend
+	route                resolvedChatRoute
 	upstreamError        upstreamErrorClassifiers
 	upstreamErrorCapture *upstreamErrorClassifierCapture
 }
@@ -103,7 +83,6 @@ func (r chatExecutionResult) observeUpstreamError(ctx context.Context) {
 	}
 }
 
-// Non-streaming Anthropic is force-streamed, so its carrier lands on the stream.
 func (r chatExecutionResult) carrier() carriedTurn {
 	if r.CarriedReasoning.present() {
 		return r.CarriedReasoning
@@ -118,11 +97,6 @@ func (h *ProxyHandler) executeChatCompletions(ctx context.Context, chatBody []by
 	return h.executeChatCompletionsForRequestedModel(ctx, chatBody, options, extractRequestModel(chatBody))
 }
 
-// resolveReplayChatBackend pins replay IDs to Responses, the only backend through which this
-// process can restore the hidden output behind them. A known model whose catalog or
-// configuration offers no Responses backend never will; with degrade the IDs continue verbatim
-// on its native Chat backend instead, where only a downstream Vekil bridge that minted them
-// could restore them. An unknown model is no such proof: its catalog may only be unreachable.
 func (h *ProxyHandler) resolveReplayChatBackend(route resolvedChatRoute, chatBody []byte, degrade bool) (resolvedChatRoute, error) {
 	if route.backend == chatBackendResponses || !chatRequestContainsResponsesReplayID(chatBody) {
 		return route, nil
@@ -140,9 +114,6 @@ func (h *ProxyHandler) resolveReplayChatBackend(route resolvedChatRoute, chatBod
 	}
 }
 
-// This process cannot restore the hidden reasoning behind replay IDs it forwards to native
-// Chat, and nothing client-visible says so, so each continuation is logged. Route identity
-// only -- never call IDs or content.
 func (h *ProxyHandler) logNativeChatReplayDegrade(providerID, model, routeID string) {
 	if h == nil || h.log == nil {
 		return
@@ -172,9 +143,6 @@ func rawJSONFieldsExactOrFold(object map[string]json.RawMessage, name string) []
 }
 
 func chatRequestContainsResponsesReplayID(body []byte) bool {
-	// Replay IDs are proxy-owned and always carry this literal prefix. Avoid
-	// decoding the full message tree on ordinary Chat requests, which make up the
-	// overwhelmingly common native-Chat path.
 	if !bytes.Contains(body, []byte(responsesChatReplayCallIDPrefix)) && !bytes.Contains(body, []byte(`\u`)) {
 		return false
 	}
@@ -328,9 +296,6 @@ func (r *upstreamErrorClassifyingReadCloser) Close() error {
 	return r.ReadCloser.Close()
 }
 
-// captureNativeChatHTTPErrorClassifiers observes a bounded prefix only while the response
-// body is naturally consumed. It must not read here: status and headers should be available
-// to the client even when a short chunked error body is slow or never closes.
 func captureNativeChatHTTPErrorClassifiers(resp *http.Response) *upstreamErrorClassifierCapture {
 	if resp == nil || resp.Body == nil || resp.StatusCode < http.StatusBadRequest {
 		return nil
@@ -355,14 +320,13 @@ func (h *ProxyHandler) executeResolvedResponsesChat(ctx context.Context, route r
 		UpstreamModel: route.upstreamModel,
 	}
 	plan, err := translateChatRequestToResponses(chatBody, responsesChatRequestOptions{
-		UpstreamModel:       route.upstreamModel,
-		CarriedReasoning:    options.CarriedReasoning,
-		ReplayStore:         h.responsesChatReplayStore(),
-		ReplayRoute:         replayRoute,
-		Log:                 h.log,
-		MinimumOutputTokens: options.ResponsesMinimumOutputTokens,
-		DropSamplingParams:  options.ResponsesDropSamplingParams,
-		// No candidate loop here, so the terminal translate is also the only one.
+		UpstreamModel:             route.upstreamModel,
+		CarriedReasoning:          options.CarriedReasoning,
+		ReplayStore:               h.responsesChatReplayStore(),
+		ReplayRoute:               replayRoute,
+		Log:                       h.log,
+		MinimumOutputTokens:       options.ResponsesMinimumOutputTokens,
+		DropSamplingParams:        options.ResponsesDropSamplingParams,
 		DegradeUnrestorableReplay: options.DegradeUnrestorableReplay,
 	})
 	if err != nil {
@@ -474,10 +438,6 @@ func parseResponsesChatErrorDetails(status int, body []byte) responsesChatErrorD
 			Param   json.RawMessage `json:"param"`
 		} `json:"error"`
 	}
-	// Copilot's Responses endpoint answers with the classifiers at the TOP level --
-	// {"code":"invalid_request_body","message":...} -- with no `error` wrapper. Probed
-	// against the live API; parsing only the nested form lost `code` for the very
-	// provider this path serves.
 	var flat struct {
 		Message string          `json:"message"`
 		Type    string          `json:"type"`
@@ -535,15 +495,6 @@ func responsesChatExecutionErrorFromUpstream(err error) error {
 	}
 }
 
-// canonicalizeResponsesChatHTTPError rewrites an upstream non-2xx into vekil's canonical
-// envelope and returns the classifiers reduced from the body it consumed.
-//
-// It returns them rather than recording them because this runs on the lifecycle-rooted
-// upstream context, which deliberately carries no request summary (see
-// newInferenceUpstreamContextFrom). A non-2xx reaches the Chat surfaces as a SUCCESSFUL
-// chatExecutionResult, so no execution error is built and nothing else records WHY the turn
-// failed -- and this is the only place that sees the body. The caller carries them to a
-// surface holding the inbound context.
 func canonicalizeResponsesChatHTTPError(resp *http.Response, safeHeaders http.Header) (upstreamErrorClassifiers, error) {
 	if resp == nil || resp.Body == nil {
 		return upstreamErrorClassifiers{}, fmt.Errorf("upstream Responses error body is unavailable")
@@ -741,11 +692,6 @@ func chatExecutionErrorFromStreamTermination(err error) *chatExecutionError {
 	return &chatExecutionError{StatusCode: http.StatusBadGateway, Type: "server_error", Code: "responses_stream_failed", Message: err.Error(), upstreamAuthored: true}
 }
 
-// Same as newChatInvalidRequest for a field the CLIENT named. The client-facing Param keeps
-// the full path -- they already know their own key -- but the summary records only
-// parentParam, which vekil built. Splitting the joined path on its last dot at log time does
-// NOT work: a JSON key may itself contain dots, so "metadata.customer_ssn.value" is
-// indistinguishable from a genuine two-level path and half the key survives.
 func newChatInvalidRequestClientField(parentParam, clientField, message string) *chatExecutionError {
 	param := clientField
 	if parentParam != "" {

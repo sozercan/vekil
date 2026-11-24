@@ -22,20 +22,9 @@ const (
 	responsesPrecommitQuotaHoldTimeout     = 10 * time.Second
 	responsesPeekReadChunkSize             = 4 * 1024
 	responsesPeekCancellationGrace         = 10 * time.Millisecond
-	// responsesFailureTapMaxBuffer bounds how much of an in-flight SSE event the
-	// failure tap buffers while waiting for its delimiter. It matches the
-	// supported Responses scanner limit so every accepted terminal event is fully
-	// parsed before it can affect status. Larger events retain best-effort usage
-	// only and are treated as over-limit/truncated rather than reconstructed from
-	// unvalidated fragments.
-	responsesFailureTapMaxBuffer = openAIStreamScannerMaxBuffer
-	// responsesFailureTapOverflowTail is the trailing window retained when a
-	// single SSE event overflows the buffer. A streamed response.completed embeds
-	// its (small) usage object near the end of the event, so retaining the tail
-	// lets a later chunk complete the "usage":{...} object for sniffing instead of
-	// dropping it. 64 KiB comfortably holds a usage object plus surrounding JSON.
-	responsesFailureTapOverflowTail = 64 * 1024
-	responsesFailureLogMessageLimit = 256
+	responsesFailureTapMaxBuffer           = openAIStreamScannerMaxBuffer
+	responsesFailureTapOverflowTail        = 64 * 1024
+	responsesFailureLogMessageLimit        = 256
 )
 
 type responsesPeekDecision int
@@ -94,11 +83,6 @@ type responsesSSEParser struct {
 	sawUnsafeProgress bool
 }
 
-// responsesTerminalObserver incrementally inspects committed Responses SSE
-// without rescanning an incomplete event on every transport chunk. It buffers at
-// at most the normal WebSocket stream parser's event limit and keeps a bounded
-// tail so a larger response.completed can still publish terminal identity and
-// usage without retaining the full model output.
 type responsesTerminalObserver struct {
 	headers       http.Header
 	peekState     *responsesPeekState
@@ -256,14 +240,8 @@ func (o *responsesTerminalObserver) finishEvent(explicitBoundary bool) {
 		return
 	}
 	if o.overflow {
-		// Fragment recovery is best-effort metadata only. Without the complete JSON
-		// payload, even an explicit SSE boundary cannot make the event authoritative.
-		// The normal websocket scanner will report an over-limit stream error. Usage
-		// after a real boundary remains billable evidence and is retained separately.
 		o.rememberOverflowEvent(o.usageTail)
 		if isResponsesTerminalType(o.overflowEvent.Type) {
-			// Status remains non-authoritative without the full JSON, but terminal
-			// usage is still billable evidence whether EOF or a blank line ended it.
 			o.peekState.publishRecoveredUsage(o.overflowEvent.Response.Usage)
 		}
 	} else if len(o.data) > 0 || strings.TrimSpace(o.event) != "" {
@@ -570,10 +548,6 @@ func responsesStreamEventError(event responsesWebSocketStreamEvent) responsesWeb
 	if strings.TrimSpace(event.Type) != "error" {
 		return event.Response.Error
 	}
-	// Canonical Responses error events carry code/message at the event root,
-	// while Azure Foundry can wrap richer details and headers in an `error`
-	// object. Start with the canonical shape and overlay any nested extension so
-	// both forms retain their diagnostics.
 	result := responsesWebSocketStreamError{
 		Code:    event.Code,
 		Message: event.Message,
@@ -610,8 +584,6 @@ func mergeResponsesStreamErrorHeaders(root, nested map[string]json.RawMessage) m
 		}
 	}
 	add(root)
-	// Nested Foundry metadata is the more specific representation and only
-	// replaces root values with the same case-insensitive header name.
 	add(nested)
 	return merged
 }
@@ -839,9 +811,6 @@ func (b *responsesPreparedBody) Read(p []byte) (int, error) {
 
 func (b *responsesPreparedBody) Close() error {
 	b.closeOnce.Do(func() {
-		// Closing the reader is required in addition to aborting the upstream.
-		// A committed pump may already be blocked inside pw.Write, where it cannot
-		// observe abortCh until the reader side is closed.
 		if b.reader != nil {
 			b.closeErr = b.reader.CloseWithError(context.Canceled)
 		}
@@ -890,8 +859,6 @@ func newResponsesPreparedStreamConfigured(resp *http.Response, maxPeekBytes int,
 		observeOnlyOnce.Do(func() { close(observeOnlyCh) })
 	}
 
-	// The pump keeps classifying events after the decision while callers add
-	// headers to resp, so it reads its own copy.
 	headers := resp.Header.Clone()
 	doneCh := make(chan struct{})
 	go func() {
@@ -1033,9 +1000,6 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	if hasResult && result.failure != nil {
 		h.observeCopilotResponseFailure(resp.Request, *result.failure, responsesFailureHeaders(*result.failure, resp.Header))
 	}
-	// Inbound cancellation owns the downstream response even if the peek pump
-	// publishes a simultaneous passthrough decision. Do not race a 200 header
-	// against a client that has already gone away.
 	if r.Context().Err() != nil {
 		prepared.abort()
 		return
@@ -1068,9 +1032,6 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 			terminal.decision = responsesPeekDecisionPassthrough
 			result, hasResult = terminal, true
 		case hasOutcome && !outcome.lifecycleCanceledAtFailure:
-			// The read ended independently before shutdown won the race. Commit the
-			// prepared stream so EOF/reset and any semantic event retain provider
-			// accounting instead of becoming a local 503.
 		case hasOutcome && outcome.lifecycleCanceledAtFailure:
 			prepared.abort()
 			lifecycle.suppressKnownTransportCancellation(false)
@@ -1120,9 +1081,6 @@ func peekAndForwardResponsesWithConfig(h *ProxyHandler, w http.ResponseWriter, r
 	if hasResult && result.failure != nil && result.decision == responsesPeekDecisionPassthrough {
 		logResponsesPrecommitFailOpen(h, result.failure, model, responsesFailureHeaders(*result.failure, resp.Header))
 	}
-	// The committed HTTP path has its own bounded failure tap. Stop the
-	// speculative observer here so large response.completed payloads are not
-	// buffered twice for the remainder of the stream.
 	prepared.stopTerminalObservation()
 	resp = prepared.commitResponse()
 	copyPassthroughHeaders(w.Header(), resp.Header)
@@ -1164,15 +1122,9 @@ func prepareResponsesStreamAttemptWithGrace(h *ProxyHandler, waitCtx, streamCtx 
 				prepared.abort()
 				return nil, &terminal, resp.Header.Clone(), nil
 			}
-			// Upstream timeout/shutdown lost the await race to an authoritative
-			// terminal event. Commit the prepared body so the websocket bridge can
-			// forward the original bytes and run normal session finalization.
 			return prepared.commitResponse(), &terminal, nil, nil
 		}
 		if hasOutcome && isIndependentResponsesPeekOutcome(outcome) {
-			// The upstream body independently reached EOF or a transport reset while
-			// cancellation was winning the await race. Preserve that provider outcome
-			// on the prepared body instead of replacing it with local cancellation.
 			return prepared.commitResponse(), nil, nil, nil
 		}
 		prepared.abort()
@@ -1185,8 +1137,6 @@ func prepareResponsesStreamAttemptWithGrace(h *ProxyHandler, waitCtx, streamCtx 
 			terminal.decision = responsesPeekDecisionPassthrough
 			result, hasResult = terminal, true
 		case hasOutcome && isIndependentResponsesPeekOutcome(outcome):
-			// Preserve the independently-ended prepared stream; handleCreateRequest
-			// will classify it after consuming the pipe.
 		case hasOutcome && outcome.lifecycleCanceledAtFailure:
 			prepared.abort()
 			return nil, nil, nil, streamCtx.Err()
@@ -1230,9 +1180,6 @@ func (h *ProxyHandler) prepareResponsesStreamWithGrace(waitCtx, streamCtx contex
 		logResponsesPrecommitFailOpen(h, result.failure, model, headers)
 	}
 	if result.terminal != nil {
-		// A cancellation race can salvage an authoritative terminal event after the
-		// prepared response has already been aborted. Propagate it even without resp
-		// so the production websocket wrapper can retain terminal accounting.
 		return resp, result, translatedHeaders, nil
 	}
 	return resp, nil, nil, nil
@@ -1271,9 +1218,6 @@ func runResponsesPeekPump(body io.ReadCloser, pw *io.PipeWriter, headers http.He
 
 		select {
 		case <-abortCh:
-			// The abort function closes the upstream body. Wait for the read pump
-			// to observe that close before publishing cleanup completion so a new
-			// route target cannot overlap the abandoned attempt.
 			for range chunkCh {
 			}
 			_ = pw.CloseWithError(context.Canceled)
@@ -1352,8 +1296,6 @@ func responsesOutputHasProgress(raw json.RawMessage) bool {
 		return false
 	}
 	var items []json.RawMessage
-	// Decoding into a slice accepts only null or an array. Any other shape or
-	// malformed JSON is ambiguous progress and must suppress replay/failover.
 	if err := json.Unmarshal(bytes.TrimSpace(raw), &items); err != nil {
 		return true
 	}
@@ -1379,11 +1321,6 @@ func inspectResponsesPeekMessages(parser *responsesSSEParser, headers http.Heade
 			classified.precommitReplaySafe = routeResponseBodyAllowsReplay([]byte(msg.data))
 		}
 		if classified.eventOutputProgress || classified.eventUsageProgress {
-			// Output and usage on any parsed event, including a nominal preamble,
-			// prove or ambiguously suggest semantic progress. Another target must
-			// not be attempted. Usage carried by the terminal failure itself still
-			// permits HTTP error translation; embedded output does not, because
-			// translation would drop client-visible model output.
 			parser.sawUnsafeProgress = true
 		}
 		if classified.eventOutputProgress {
@@ -1505,8 +1442,6 @@ func writePrefixAndDrainResponsesStream(pw *io.PipeWriter, prefix []byte, chunkC
 }
 
 func classifyResponsesPeekMessage(msg responsesSSEMessage, headers http.Header) peekResult {
-	// Decoding can overwrite earlier usage or output under duplicate keys.
-	// Preserve ambiguous raw events and prevent them from authorizing replay.
 	if rejectDuplicateJSONMappingKeys([]byte(msg.data)) != nil {
 		return peekResult{decision: responsesPeekDecisionPassthrough}
 	}
@@ -1562,14 +1497,6 @@ func classifyResponsesPeekEvent(event responsesWebSocketStreamEvent, eventName s
 	return result
 }
 
-// shouldHoldResponsesPrecommitPreamble keeps Azure/compatible streaming
-// responses uncommitted when their headers already report exhausted quota.
-// These upstreams can emit response.created and then fail the stream a few
-// hundred milliseconds later with response.failed. Waiting within the existing
-// precommit timeout lets the proxy translate that terminal event into HTTP 429
-// so clients can apply their normal Retry-After behavior. Healthy streams and
-// providers without exhausted-quota headers retain the low-latency first-event
-// passthrough path.
 func shouldHoldResponsesPrecommitPreamble(headers http.Header) bool {
 	return responsesQuotaEvidence(headers)
 }
@@ -1606,9 +1533,6 @@ func classifyResponsesFailure(event responsesWebSocketStreamEvent, headers http.
 		if errType == "server_error" {
 			return http.StatusInternalServerError, "server_error", true
 		}
-		// A top-level Responses error event is terminal even when a provider uses an
-		// unknown type/code. Translate it before commit rather than returning HTTP
-		// 200 for a stream that can never produce response.completed.
 		return http.StatusBadGateway, "server_error", true
 	}
 
@@ -1697,10 +1621,6 @@ func normalizePositiveDecimal(value string) (string, bool) {
 	return value[firstNonZero:], true
 }
 
-// incrementPositiveDecimal adds one without converting an unbounded upstream
-// value into a machine or arbitrary-precision integer. The returned decimal
-// requires at most one allocation, which is unavoidable when a carry changes
-// its digits.
 func incrementPositiveDecimal(value string) string {
 	carryIndex := len(value) - 1
 	for carryIndex >= 0 && value[carryIndex] == '9' {
@@ -1825,8 +1745,6 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 		return "", ""
 	}
 
-	// This value is forwarded to the client. Keep the proxy's bounded internal
-	// sleep policy separate so an authoritative provider delay is never shortened.
 	if seconds, ok := decimalMillisecondsToRetryAfterSeconds(headerGetCI(headers, "retry-after-ms")); ok {
 		return seconds, "retry-after-ms"
 	}
@@ -1856,10 +1774,6 @@ func selectResponsesRetryAfter(headers http.Header) (string, string) {
 	return "", ""
 }
 
-// isClientWriteError reports whether an io.Copy error originated from writing to
-// the client (the flushWriter destination) rather than from reading the upstream
-// source. A client-side write error (the client disconnected) is not an upstream
-// failure and must not be recorded as one.
 func isClientWriteError(fw *flushWriter, err error) bool {
 	if fw == nil || err == nil {
 		return false
@@ -1903,13 +1817,6 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 			}
 			return
 		}
-		// The HTTP 200 was already committed, so the client receives a truncated
-		// stream when the upstream SSE connection resets or the pipe closes with
-		// an error before a response.failed/incomplete event. Only record an
-		// upstream failure for an actual upstream/transport error — a client
-		// disconnect or cancellation (ctx cancelled, or a write error forwarding
-		// to a gone client) is not an upstream failure and must not pollute the
-		// dashboard error rate.
 		if !tap.completedCleanly() && lifecycle.suppressTransportCancellation(true) {
 			return
 		}
@@ -1937,9 +1844,6 @@ func streamResponsesPipeWithFailureLog(ctx context.Context, h *ProxyHandler, w h
 	}
 }
 
-// writeResponsesFailedEvent ends a committed stream with a terminal
-// response.failed. Codex ignores top-level error events and would report only
-// a closed stream.
 func writeResponsesFailedEvent(w io.Writer, code, message string) {
 	data, _ := json.Marshal(map[string]any{"type": "response.failed", "response": map[string]any{
 		"object": "response", "status": "failed", "output": []any{},
@@ -1948,8 +1852,6 @@ func writeResponsesFailedEvent(w io.Writer, code, message string) {
 	_, _ = io.WriteString(w, "event: response.failed\ndata: "+string(data)+"\n\n")
 }
 
-// writeFailedAfterError follows a forwarded terminal error event with a
-// response.failed carrying the same failure.
 func (t *responsesFailureTap) writeFailedAfterError(w io.Writer) {
 	if t == nil || t.terminalError == nil {
 		return
@@ -1959,11 +1861,6 @@ func (t *responsesFailureTap) writeFailedAfterError(w io.Writer) {
 	writeResponsesFailedEvent(w, code, message)
 }
 
-// responsesFailedEventError returns the response.failed code and message for a
-// terminal error event. Copilot reports OpenAI's cybersecurity flag as
-// content_filter, which Codex retries; cyber_policy makes it terminal. Copilot
-// also wraps the upstream error JSON in its own error chain, so the inner
-// message is used when it decodes.
 func responsesFailedEventError(streamErr responsesWebSocketStreamError) (string, string) {
 	code, message := strings.TrimSpace(streamErr.Code), strings.TrimSpace(streamErr.Message)
 	if !strings.EqualFold(code, "content_filter") || !strings.Contains(strings.ToLower(message), "cybersecurity risk") {
@@ -2091,10 +1988,6 @@ func (p *responsesSSEParser) finalizeEOF() {
 	if p == nil || p.done || len(p.pending) == 0 {
 		return
 	}
-	// The streaming consumer dispatches a final SSE event at EOF even if the
-	// provider omits the conventional blank-line delimiter. Add only parser-local
-	// framing so the pre-commit classifier follows the same rule without changing
-	// the raw bytes later forwarded on a fail-open path.
 	if p.pending[len(p.pending)-1] == '\n' {
 		p.pending = append(p.pending, '\n')
 		return
@@ -2177,38 +2070,22 @@ func nextResponsesSSEMessage(buf []byte, allowBOM bool) (responsesSSEMessage, in
 type responsesUpstreamRequestContextKey struct{}
 
 type responsesFailureTap struct {
-	h                   *ProxyHandler
-	upstreamHeaders     http.Header
-	ctx                 context.Context
-	store               *ToolExecutionContextStore
-	scope               string
-	responseScope       string
-	parser              responsesSSEParser
-	pendingBoundaryTail []byte
-	// overflowed is set while a single SSE event has exceeded the buffer cap, so
-	// later writes keep best-effort extracting terminal details from the rolling
-	// tail after the normal parser buffer is dropped.
-	overflowed bool
-	// overflowActive remains true while forwarding the rest of an overflowed event.
-	// It is cleared only after that event's explicit blank-line boundary is seen.
-	overflowActive bool
-	// overflowEvent retains the terminal type plus bounded usage/failure details
-	// recovered from the prefix before overflow and the rolling tail afterward.
-	overflowEvent        responsesWebSocketStreamEvent
-	overflowBoundaryTail []byte
-	// overflowUsageRecorded avoids re-observing the same partial usage on every
-	// subsequent write while the oversized event is still in flight.
+	h                     *ProxyHandler
+	upstreamHeaders       http.Header
+	ctx                   context.Context
+	store                 *ToolExecutionContextStore
+	scope                 string
+	responseScope         string
+	parser                responsesSSEParser
+	pendingBoundaryTail   []byte
+	overflowed            bool
+	overflowActive        bool
+	overflowEvent         responsesWebSocketStreamEvent
+	overflowBoundaryTail  []byte
 	overflowUsageRecorded bool
-	// usageTail is a bounded rolling window of the most recent raw stream bytes.
-	usageTail []byte
-	// terminalSeen is set after a parsed terminal Responses event. A clean EOF
-	// before a terminal response means the committed stream was
-	// truncated and should not be counted as a successful 200.
-	terminalSeen bool
-	// terminalError holds the last terminal event's error when that event was a
-	// top-level `error`, so the committed pipe can follow it with
-	// response.failed. Any later terminal event clears it.
-	terminalError *responsesWebSocketStreamError
+	usageTail             []byte
+	terminalSeen          bool
+	terminalError         *responsesWebSocketStreamError
 }
 
 func newResponsesFailureTap(ctx context.Context, h *ProxyHandler, upstreamHeaders http.Header, store *ToolExecutionContextStore, scope string) *responsesFailureTap {
@@ -2237,14 +2114,9 @@ func (t *responsesFailureTap) Write(p []byte) (int, error) {
 }
 
 func (t *responsesFailureTap) finalizeEOF() {
-	// A pending terminal error still finalizes, so an unterminated terminal
-	// event after it clears the error instead of getting a duplicate failure.
 	if t == nil || (t.terminalSeen && t.terminalError == nil) || t.overflowActive {
 		return
 	}
-	// A valid final SSE event is dispatched at EOF even when the provider omits
-	// the conventional blank-line delimiter. Add parser-only framing and route the
-	// event through the same terminal/accounting path without altering wire bytes.
 	t.parser.finalizeEOF()
 	for {
 		msg, ok := t.parser.nextSemantic()
@@ -2270,9 +2142,6 @@ func (t *responsesFailureTap) writeChunk(p []byte) {
 		return
 	}
 
-	// Maintain a small rolling tail independent of the SSE parser so terminal
-	// type, failure details, and usage can be recovered after an oversized event
-	// forces the normal parser buffer to be dropped.
 	t.appendUsageTail(p)
 	t.parser.push(p)
 
@@ -2292,9 +2161,6 @@ func (t *responsesFailureTap) writeChunk(p []byte) {
 			break
 		}
 		if boundaryEnd > responsesFailureTapMaxBuffer {
-			// The first complete event itself exceeds the supported parser limit.
-			// Recover usage from that event only, discard its unvalidated status,
-			// then continue parsing any following event bytes from the same write.
 			overflowEvent := append([]byte(nil), t.parser.pending[:boundaryEnd]...)
 			remainder := append([]byte(nil), t.parser.pending[boundaryEnd:]...)
 			t.overflowed = true
@@ -2336,8 +2202,6 @@ func (t *responsesFailureTap) startOverflowFromPending() {
 	if t == nil || len(t.parser.pending) == 0 {
 		return
 	}
-	// The current event exceeded the limit before its delimiter arrived. Retain
-	// only bounded usage hints and let later writes locate the boundary.
 	t.overflowed = true
 	t.overflowActive = true
 	t.rememberOverflowEvent(t.parser.pending)
@@ -2348,8 +2212,6 @@ func (t *responsesFailureTap) startOverflowFromPending() {
 	t.pendingBoundaryTail = nil
 }
 
-// appendUsageTail keeps the last responsesFailureTapOverflowTail bytes of the raw
-// stream in t.usageTail for best-effort usage recovery from oversized events.
 func (t *responsesFailureTap) appendUsageTail(p []byte) {
 	t.usageTail = append(t.usageTail, p...)
 	if len(t.usageTail) > responsesFailureTapOverflowTail {
@@ -2357,12 +2219,6 @@ func (t *responsesFailureTap) appendUsageTail(p []byte) {
 	}
 }
 
-// sniffUsageFromOverflow extracts a usage object from a partially-buffered SSE
-// event that is about to be dropped for exceeding the buffer cap. It scans for
-// the last "usage":{...} object in the buffer (the completed event carries usage
-// after its output) and records it. It runs once per turn — once usage is
-// observed onto the summary, a later real terminal event would just re-observe
-// the same value. Best-effort: any parse failure is ignored.
 func (t *responsesFailureTap) rememberOverflowEvent(buf []byte) {
 	if t == nil {
 		return
@@ -2391,11 +2247,6 @@ func (t *responsesFailureTap) finishOverflowEvent() {
 		return
 	}
 	t.rememberOverflowEvent(t.usageTail)
-	// HTTP is a passthrough surface: an explicit, bounded SSE event name plus its
-	// blank-line boundary is authoritative framing even when the JSON body is too
-	// large for accounting inspection. Do not synthesize detailed provider status
-	// from fragments; completed remains successful, while failure terminals retain
-	// a conservative 502 plus best-effort usage.
 	switch t.overflowEvent.Type {
 	case "response.completed", "response.cancelled", "response.canceled":
 		t.terminalSeen = true
@@ -2502,12 +2353,6 @@ func (t *responsesFailureTap) maybeProcess(msg responsesSSEMessage) {
 			streamErr := responsesStreamEventError(event)
 			t.terminalError = &streamErr
 		}
-		// Record token usage from every terminal event. Failed and incomplete
-		// responses can still carry billable partial usage. This is best-effort: a
-		// response.completed larger than responsesFailureTapMaxBuffer is dropped
-		// by the tap before its delimiter, in which case usage is simply not
-		// recorded for that turn (it degrades to zero rather than erroring). The
-		// usage payload is small in practice (~hundreds of bytes).
 		observeResponsesUsage(t.ctx, event.Response.Usage)
 	}
 	t.maybeCaptureToolCommand(eventName, event)
@@ -2518,9 +2363,6 @@ func (t *responsesFailureTap) completedCleanly() bool {
 	if t == nil {
 		return true
 	}
-	// Oversized terminals become authoritative only after finishOverflowEvent sees
-	// their explicit blank-line boundary and routes the retained event through the
-	// normal terminal classifier.
 	return t.terminalSeen
 }
 
@@ -2553,13 +2395,6 @@ func (t *responsesFailureTap) maybeLog(eventName string, event responsesWebSocke
 	if eventName != "response.failed" && eventName != "response.incomplete" && eventName != "error" {
 		return
 	}
-	// The HTTP 200 was already committed before this post-commit failure event,
-	// so the stats middleware would otherwise record the turn as a success.
-	// Record an out-of-band failure status on the request summary so the
-	// dashboard reflects the failure, mirroring how the websocket bridge maps the
-	// same failure terminal into an errored turn. Classify the event so
-	// rate limits (429) and overloads (503) keep their exact status rather than
-	// all collapsing to bad-gateway.
 	failureHeaders := responsesFailureHeaders(event, t.upstreamHeaders)
 	if upstreamRequest, _ := t.ctx.Value(responsesUpstreamRequestContextKey{}).(*http.Request); upstreamRequest != nil {
 		t.h.observeCopilotResponseFailure(upstreamRequest, event, failureHeaders)

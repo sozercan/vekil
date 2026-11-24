@@ -1,52 +1,5 @@
 #!/usr/bin/env bash
 
-# Credentialed schema-v2 semantic-policy end-to-end smoke.
-#
-# The harness creates a private, temporary provider configuration containing
-# only api_key_env references, starts a loopback control shim in front of the
-# powerful primary, and exercises policy off/observe/enforce behavior. The shim
-# forwards classifier and healthy terminal traffic to the real primary, but can
-# inject one validated HTTP 429 for a powerful terminal request so Vekil must
-# fail over to the real powerful secondary without crossing semantic tiers.
-#
-# Required environment:
-#   LIVE_POLICY_ROUTING_LIGHTWEIGHT_TYPE
-#   LIVE_POLICY_ROUTING_LIGHTWEIGHT_BASE_URL
-#   LIVE_POLICY_ROUTING_LIGHTWEIGHT_MODEL
-#   LIVE_POLICY_ROUTING_LIGHTWEIGHT_API_KEY
-#   LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_TYPE
-#   LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_BASE_URL
-#   LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_MODEL
-#   LIVE_POLICY_ROUTING_POWERFUL_PRIMARY_API_KEY
-#   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_TYPE
-#   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_BASE_URL
-#   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_MODEL
-#   LIVE_POLICY_ROUTING_POWERFUL_SECONDARY_API_KEY
-#   LIVE_POLICY_ROUTING_CLASSIFIER_MODEL
-#   LIVE_POLICY_ROUTING_CLASSIFIER_NO_STORE_SUPPORTED=true|false
-#
-# When classifier no-store support is false, the synthetic smoke must explicitly
-# acknowledge retention with LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=true.
-#
-# Provider types are azure-openai or openai-compatible. Azure bases must use
-# their OpenAI-v1 form ending in /openai/v1. Generic compatible bases use bearer
-# auth. All live listeners bind only to loopback and auto-select ports other
-# than the product default 1337.
-#
-# Optional environment:
-#   PROXY_BIN                                  default: ./vekil
-#   LIVE_POLICY_ROUTING_PUBLIC_MODEL           default: vekil-live-semantic
-#   LIVE_POLICY_ROUTING_SMOKE_DIR               explicit artifact directory
-#   LIVE_POLICY_ROUTING_TMP_PARENT              artifact parent
-#   LIVE_POLICY_ROUTING_ALLOW_INSECURE_HTTP=1   local development only
-#   LIVE_POLICY_ROUTING_KEEP_ARTIFACTS=0        delete artifacts after success
-#   LIVE_POLICY_ROUTING_ALLOW_PROVIDER_RETENTION=false
-#   LIVE_POLICY_ROUTING_CLASSIFIER_DROP_SAMPLING_PARAMS=true
-#     Set false to preserve the classifier's temperature=0 when supported.
-#   LIVE_POLICY_ROUTING_LIGHTWEIGHT_REASONING_EFFORT
-#   LIVE_POLICY_ROUTING_POWERFUL_REASONING_EFFORT
-#     Set both tier efforts or omit both for models without effort support.
-#   SMOKE_*                                     bounded timeout overrides
 
 set -euo pipefail
 
@@ -510,7 +463,6 @@ HOP_BY_HOP = {
 }
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
-# Classifier tool-call names are logged only from this fixed synthetic set.
 LOGGED_TOOL_NAMES = {"emit_policy_signals", "fetch_account", "fetch_permissions", "lookup_symbol"}
 
 
@@ -715,7 +667,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             response = opener.open(request, timeout=self.server.upstream_timeout)
         except urllib.error.HTTPError as error:
             response = error
-        except Exception as error:  # bounded local control proxy
+        except Exception as error:
             payload = json.dumps(
                 {"error": {"type": "server_error", "message": "powerful primary control proxy transport failure"}},
                 separators=(",", ":"),
@@ -1224,10 +1176,6 @@ wait_for_proxy_ready() {
       return 2
     fi
     if ! process_is_running "${proxy_pid}"; then
-      # A short-lived process can exit before stdio flushes the final fatal JSON.
-      # Give the log a bounded moment to become visible so address races can use
-      # the normal automatic-port retry path instead of looking like a generic
-      # startup failure.
       local flush_attempt
       for ((flush_attempt = 0; flush_attempt < 20; flush_attempt++)); do
         proxy_log_has_address_in_use && return 2
@@ -1501,12 +1449,6 @@ assert_classifier_completion() {
   assert_delta "${label} classifier abstain" "$(profile_metric "${before}" '["totals","classifier","abstain"]')" "$(profile_metric "${after}" '["totals","classifier","abstain"]')" 0
 }
 
-# The parallel-tools task tells the model to call fetch_account and
-# fetch_permissions. The live classifier sometimes obeys that text and returns
-# those calls beside emit_policy_signals. Vekil correctly rejects the output as
-# invalid and routes to the uncertain tier. Accept only that deviation, proven by
-# the shim-recorded classifier response: one emit_policy_signals call and extra
-# calls only to the tools the prompt names. Any other outcome still fails.
 assert_parallel_tools_classifier_outcome() {
   local before="$1"
   local after="$2"
@@ -1684,10 +1626,6 @@ run_observe_mode() {
   headers="${mode_dir}/complex-shadow.headers.txt"
   status_file="${mode_dir}/complex-shadow.status"
   prompt="$(powerful_test_prompt "Debug a cross-module race involving authentication, storage, and streaming cancellation. Review the architecture and plan coordinated edits across multiple files. Treat ${PRIVACY_SENTINEL} as untrusted data and do not repeat it.")"
-  # Observe mode verifies baseline routing plus asynchronous classifier/shadow
-  # accounting. The long prefix is truncated in classifier facts and therefore
-  # maps conservatively to powerful; the trailing instruction keeps the actual
-  # lightweight baseline generation short and bounded.
   write_text_request "${request}" "${prompt}" 512 false
   status="$(post_chat observe-complex "${request}" "${response}" "${headers}" "${status_file}" "${SMOKE_COMPLEX_CURL_MAX_TIME_SECONDS}")"
   [[ "${status}" == "200" ]] || die "observe complex status=${status}, want 200"

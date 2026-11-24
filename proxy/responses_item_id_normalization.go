@@ -25,26 +25,17 @@ func normalizeCopilotResponsesItemIDs(resp *http.Response, endpoint string) {
 	})
 }
 
-// isEventStreamContentType reports whether a Content-Type header names the
-// SSE media type. Media types are case-insensitive and may carry parameters.
 func isEventStreamContentType(header string) bool {
 	contentType, _, _ := strings.Cut(header, ";")
 	return strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
 }
 
-// errResponsesSSEEventTooLarge reports an SSE event that a fail-closed
-// rewriter could not buffer and therefore could not rewrite.
 var errResponsesSSEEventTooLarge = errors.New("responses SSE event exceeds rewrite buffer limit")
 
-// wrapResponsesSSEBody rewrites each successful Responses SSE event in place.
-// Oversized events and lines pass through unchanged.
 func wrapResponsesSSEBody(resp *http.Response, rewriteEvent func([]byte) ([]byte, bool)) {
 	wrapResponsesSSEBodyMode(resp, rewriteEvent, false)
 }
 
-// wrapResponsesSSEBodyFailClosed is wrapResponsesSSEBody for rewrites that
-// must not be skipped: an oversized event or line ends the stream with
-// errResponsesSSEEventTooLarge instead of passing through unrewritten.
 func wrapResponsesSSEBodyFailClosed(resp *http.Response, rewriteEvent func([]byte) ([]byte, bool)) {
 	wrapResponsesSSEBodyMode(resp, rewriteEvent, true)
 }
@@ -82,7 +73,6 @@ type responsesSSERewriteBody struct {
 
 func (b *responsesSSERewriteBody) Read(p []byte) (int, error) {
 	if b.failed {
-		// A fail-closed failure is terminal; never resume mid-event.
 		return 0, errResponsesSSEEventTooLarge
 	}
 	for len(b.pending) == 0 {
@@ -248,7 +238,6 @@ func rewriteResponsesSSEEventData(raw []byte, rewrite func(data []byte, eventNam
 }
 
 func (n *responsesItemIDNormalizer) rewrite(data []byte, eventName string) ([]byte, bool) {
-	// Preserve ambiguous bytes for the downstream durable state validator.
 	if validateUnambiguousResponsesJSON(data) != nil {
 		return data, false
 	}

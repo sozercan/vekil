@@ -62,12 +62,6 @@ func rewriteSyntheticCompactionRequest(body []byte) ([]byte, int) {
 	return rewrittenBody, rewriteCount
 }
 
-// resetSyntheticCompactionResponseLineage removes server-side continuation
-// state that points at a proxy-generated compaction response. Those synthetic
-// response IDs exist only at Vekil's public surface and can never be resolved
-// by the upstream Responses API. The reset is intentionally narrow: an ID with
-// the proxy prefix is removed only when the same request also carries a
-// proxy-owned compaction checkpoint that Vekil can expand into normal context.
 func resetSyntheticCompactionResponseLineage(body []byte) ([]byte, bool) {
 	if !bytes.Contains(body, []byte(syntheticCompactionResponseIDPrefix)) || !responsesBodyMayContainSyntheticCompaction(body) {
 		return body, false
@@ -113,9 +107,6 @@ func responsesBodyMayContainContextCompaction(body []byte) bool {
 }
 
 func responsesBodyMayContainCompactionToken(body []byte) bool {
-	// Fast-path ordinary requests that cannot contain proxy-owned compaction
-	// items. If the body contains any JSON unicode escapes, fall back to the
-	// legacy parser so escaped marker strings keep their previous behavior.
 	return bytes.Contains(body, []byte("compaction")) || bytes.Contains(body, []byte(`\u`))
 }
 
@@ -215,9 +206,6 @@ func sanitizeContextCompactionRequestFields(requestFields map[string]json.RawMes
 	return sanitizedFields, sanitizeCount
 }
 
-// When a compacted checkpoint is restored without a remaining user turn, add a
-// small synthetic user prompt so the upstream model resumes the interrupted
-// task instead of replying with a generic "what should I work on next?".
 func injectSyntheticCompactionResumePrompt(body []byte) ([]byte, bool) {
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -435,7 +423,6 @@ func messageHasRole(v interface{}, role string) bool {
 	if !ok {
 		return false
 	}
-	// Responses input messages may omit type when role and content identify them.
 	if rawType, hasType := typed["type"]; hasType {
 		if itemType, _ := rawType.(string); itemType != "message" {
 			return false

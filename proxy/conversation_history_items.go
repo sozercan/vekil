@@ -66,8 +66,6 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 			if err := validateConversationTools(item["tools"], 0); err != nil {
 				return conversationInput{}, err
 			}
-			// Responses Lite catalogs are request-scoped definitions. Their IDs
-			// and contents do not establish or extend conversation lineage.
 			delete(item, "id")
 			normalized, _ := json.Marshal(item)
 			result.additionalTools = append(result.additionalTools, normalized)
@@ -78,14 +76,10 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 		}
 		if status := rawJSONString(item["status"]); status != "" && status != "completed" {
 			if kind == "web_search_call" {
-				// A failed or in-progress hosted search is upstream state, not
-				// an incomplete client turn.
 				return conversationInput{}, errConversationHostedState
 			}
 			return conversationInput{}, errConversationIncomplete
 		}
-		// Azure/Codex turn attribution is not visible conversation content.
-		// Clients may omit it on replay, and it must not follow a region switch.
 		delete(item, "metadata")
 		delete(item, responsesInternalChatMessageMetadataPassthroughField)
 		switch kind {
@@ -140,8 +134,6 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 			if rawJSONString(item["call_id"]) == "" {
 				return conversationInput{}, errConversationPendingTool
 			}
-			// Keep results as tool outputs. Never convert them into user,
-			// developer, or system messages, even when they contain instructions.
 			var text string
 			if json.Unmarshal(item["output"], &text) != nil {
 				content, err := canonicalConversationContent(item["output"], "user")
@@ -172,9 +164,6 @@ func canonicalConversationInput(raw json.RawMessage, output bool) (conversationI
 	return result, nil
 }
 
-// readableConversationHistory canonicalizes full input that history cannot
-// save. It returns the canonical items before the first unsupported item and
-// the anchors of every supported item, which still locate the saved lineage.
 func readableConversationHistory(raw json.RawMessage) conversationInput {
 	var rawItems []json.RawMessage
 	if json.Unmarshal(raw, &rawItems) != nil || len(rawItems) > maxConversationHistoryItems {
@@ -228,10 +217,6 @@ func canonicalConversationContent(raw json.RawMessage, role string) (json.RawMes
 			if err := conversationItemFields(part, "type", "text", "annotations", "logprobs"); err != nil {
 				return nil, err
 			}
-			// Azure emits empty annotations and token logprobs on ordinary text.
-			// Web search citations are dropped: Codex does not retain them, so
-			// its replayed history must match the saved text without them. File
-			// and container references are provider state this history cannot replay.
 			if raw, present := part["annotations"]; present {
 				if err := validateConversationAnnotations(raw, role); err != nil {
 					return nil, err
@@ -286,18 +271,12 @@ func validateConversationAnnotations(raw json.RawMessage, role string) error {
 	return nil
 }
 
-// Codex parses each web search action variant into a fixed field set and
-// keeps only prefixed item IDs on replay.
 var conversationWebSearchActionFields = map[string][]string{
 	"search":       {"query", "queries"},
 	"open_page":    {"url"},
 	"find_in_page": {"url", "pattern"},
 }
 
-// Codex replays a web search call with its status, the action fields it parsed
-// and its ID only when prefixed. Copilot issues opaque IDs that Codex drops, so
-// a call without a prefixed ID is saved without one; Azure and Copilot accept
-// an ID-less call. Keep exactly those fields so saved history matches the replay.
 func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.RawMessage, error) {
 	if err := conversationItemFields(item, "type", "id", "status", "action"); err != nil {
 		return nil, err
@@ -318,7 +297,6 @@ func canonicalConversationWebSearchCall(item map[string]json.RawMessage) (json.R
 		if !present || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 			continue
 		}
-		// Codex parses queries as a string list and every other field as a string.
 		var typed any
 		if field == "queries" {
 			typed = new([]string)
@@ -361,9 +339,6 @@ func validateConversationTools(raw json.RawMessage, depth int) error {
 				return errConversationHostedState
 			}
 		case "web_search", "web_search_preview":
-			// Web search executes upstream, but its definition and completed
-			// call items are visible history. Migration targets must declare
-			// hosted_tools support before they receive them.
 		case "namespace":
 			if err := validateConversationTools(tool["tools"], depth+1); err != nil {
 				return err
@@ -376,8 +351,6 @@ func validateConversationTools(raw json.RawMessage, depth int) error {
 }
 
 func validateConversationRequestFields(fields map[string]json.RawMessage) error {
-	// Unknown fields can carry provider-owned references. Opted-in routes use
-	// this explicit request contract instead of guessing which values to drop.
 	allowed := map[string]bool{
 		"model": true, "input": true, "instructions": true, "tools": true, "tool_choice": true,
 		"previous_response_id": true, "conversation": true, "prompt": true, "background": true,

@@ -11,7 +11,6 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// TestBugReport_AnthropicSingleTool verifies single tool call works (Anthropic path).
 func TestBugReport_AnthropicSingleTool(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -51,8 +50,6 @@ func TestBugReport_AnthropicSingleTool(t *testing.T) {
 	}
 }
 
-// TestBugReport_AnthropicParallelTools verifies parallel tool calls work (Anthropic path).
-// This was the primary bug: parallel tool calls were dropped in non-streaming mode.
 func TestBugReport_AnthropicParallelTools(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -104,7 +101,6 @@ func TestBugReport_AnthropicParallelTools(t *testing.T) {
 	}
 }
 
-// TestBugReport_OpenAISingleTool verifies single tool call works (OpenAI path with forced streaming).
 func TestBugReport_OpenAISingleTool(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -140,7 +136,6 @@ func TestBugReport_OpenAISingleTool(t *testing.T) {
 	}
 }
 
-// TestBugReport_OpenAIParallelTools verifies parallel tool calls via OpenAI path with forced streaming.
 func TestBugReport_OpenAIParallelTools(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)

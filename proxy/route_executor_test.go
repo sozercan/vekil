@@ -812,8 +812,6 @@ func TestExplicitRouteExhaustionAccountingRequiresBudgetOrNoTarget(t *testing.T)
 			if got := h.stats.snapshot().RouteExhaustions; got != tc.wantExhaustions {
 				t.Fatalf("route exhaustions after execute = %d, want %d", got, tc.wantExhaustions)
 			}
-			// Re-evaluating the terminal operation must neither invent an exhaustion
-			// nor double-count a real one.
 			h.recordExplicitRouteExhaustion(operation, tc.endpoint)
 			h.recordExplicitRouteExhaustion(operation, tc.endpoint)
 			if got := h.stats.snapshot().RouteExhaustions; got != tc.wantExhaustions {

@@ -146,7 +146,6 @@ func TestPhysicalAttemptLedgerPrimaryFailureSecondarySuccess(t *testing.T) {
 	if first.RetryAfterSeconds == nil {
 		t.Fatal("primary retry-after is missing")
 	}
-	// The oversized header saturates time.Duration, then rounds up to seconds.
 	if *first.RetryAfterSeconds != 9223372037 {
 		t.Fatalf("primary retry-after = %d, want 9223372037", *first.RetryAfterSeconds)
 	}
@@ -327,7 +326,7 @@ func TestPhysicalAttemptLedgerWebSocketStyleContextWithoutSummary(t *testing.T) 
 	operation.mu.Lock()
 	operation.id = "vekil-ws-test:1"
 	operation.mu.Unlock()
-	ctx := withRouteOperation(context.Background(), operation) // deliberately no RequestSummary
+	ctx := withRouteOperation(context.Background(), operation)
 
 	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
 	if err != nil {
@@ -356,7 +355,6 @@ func TestPhysicalAttemptLedgerWebSocketStyleContextWithoutSummary(t *testing.T) 
 		t.Fatalf("websocket-style attempt diagnostics = %+v", attempt)
 	}
 
-	// The websocket turn ledger remains a separate one-per-create record.
 	usage := responsesUsage{InputTokens: 7, OutputTokens: 2, TotalTokens: 9}
 	h.RecordResponsesTurn("public-model", "primary", "azure", "Codex CLI", http.StatusOK, usage)
 	after := h.stats.snapshot()
@@ -1502,7 +1500,7 @@ func TestPhysicalAttemptLedgerWebSocketFailureDoesNotDoubleCountUsage(t *testing
 	operation.mu.Lock()
 	operation.id = "vekil-ws-test:failed"
 	operation.mu.Unlock()
-	ctx := withRouteOperation(context.Background(), operation) // deliberately no RequestSummary
+	ctx := withRouteOperation(context.Background(), operation)
 
 	resp, err := h.executeExplicitRouteRequest(ctx, route, providerEndpointResponses, []byte(`{"model":"public-model","stream":true}`), nil, "public-model", true)
 	if resp != nil {
@@ -1567,8 +1565,6 @@ func TestLateRouteAttemptReclassificationUpdatesWastedUsageAfterRingEvictionWith
 		ReportedUsage:        &usage,
 	})
 
-	// Do not call snapshot before reclassification. Overwrite the recent-attempt
-	// ring so correctness cannot depend on polling or retention of the row.
 	for i := 0; i < statsRecentRouteAttempts; i++ {
 		filler := h.RecordUpstreamAttempt(context.Background(), RouteAttemptObservation{
 			OperationID:  "operation-filler",
@@ -1622,9 +1618,6 @@ func TestLateRouteAttemptReclassificationUpdatesWastedUsageAfterRingEvictionWith
 		t.Fatalf("no-poll target wasted usage = %+v, want 10 tokens", targetWasted)
 	}
 
-	// A terminal observer can publish its previously accepted success after the
-	// surface has already reclassified the attempt. It may add usage, but must not
-	// weaken the failure status or double-account wasted spend.
 	record.complete(routeAttemptCompletion{
 		StatusCode:           http.StatusOK,
 		Outcome:              routeAttemptOutcomeSucceeded,

@@ -17,8 +17,6 @@ var copilotRequestMetadataHeaderNames = []string{
 
 const diagnosticHeaderValueLimit = 1024
 
-// Caller attribution is optional. Replace destination attribution with only
-// explicit, unambiguous values; provider credentials remain server-owned.
 func copyCopilotRequestMetadata(dst, src http.Header) {
 	if dst == nil {
 		return
@@ -97,8 +95,6 @@ func boundedSingleHeaderValue(headers http.Header, name string) string {
 	return value
 }
 
-// Preserve bounded operational response metadata through protocol translation.
-// This is a response-only allowlist; it never feeds request headers or logs.
 func copyCopilotDiagnosticHeaders(dst, src http.Header) {
 	if dst == nil || len(src) == 0 {
 		return

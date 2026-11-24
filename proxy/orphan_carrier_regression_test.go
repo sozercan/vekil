@@ -12,18 +12,6 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// The live soapbox shape: a parallel tool group whose tool_use blocks and trailing carrier
-// land in DIFFERENT assistant wire messages. extractCarriedReasoning indexes a carrier by
-// its OWN call mapping, so the carrier IS found here even though no tool_use sits beside it
-// -- requiring co-location is the behaviour this branch removed. What refuses it is the next
-// guard along: splitting the turn across wire messages changes the assistant projection, so
-// carriedRestoredCalls answers "projection", not "absent". Probed, not assumed.
-//
-// Either way a client cannot repair a transcript it already sent, so the turn must continue
-// WITHOUT the reasoning rather than 400. That is the whole assertion, and status alone
-// cannot see it: a restored carrier and a degraded turn both return 200 under the same
-// upstream call_id, because the minted ID is self-describing. The reasoning ciphertext is
-// the only thing that tells them apart, which is why this uses the reasoning fixture.
 func TestOrphanedCarrierTurnDegradesInsteadOfWedging(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_reasoning_tool_call.sse")
 	if err != nil {
@@ -65,14 +53,10 @@ func TestOrphanedCarrierTurnDegradesInsteadOfWedging(t *testing.T) {
 		t.Fatalf("fixture turn lacks carrier or tool_use: %s", first.Body.String())
 	}
 
-	// What TTL, eviction and restart leave behind.
 	h.responsesChatReplayMu.Lock()
 	h.responsesChatReplay = nil
 	h.responsesChatReplayMu.Unlock()
 
-	// The same blocks, split across wire messages the way a client splits a parallel
-	// group whose results interleave: tool_use in its own assistant message, and the
-	// carrier trailing alone in an assistant message that holds no tool_use at all.
 	continuation, err := json.Marshal(map[string]any{
 		"model": "gpt-public", "max_tokens": 128,
 		"messages": []any{
@@ -98,8 +82,6 @@ func TestOrphanedCarrierTurnDegradesInsteadOfWedging(t *testing.T) {
 	if len(upstreamBodies) != 2 {
 		t.Fatalf("upstream saw %d requests, want 2", len(upstreamBodies))
 	}
-	// Without this the negative assertion below is vacuous: a fixture carrying no reasoning
-	// would satisfy it no matter which path ran.
 	if !strings.Contains(string(fixture), orphanFixtureCiphertext) {
 		t.Fatalf("fixture carries no reasoning ciphertext; the assertion below would prove nothing")
 	}
@@ -109,7 +91,6 @@ func TestOrphanedCarrierTurnDegradesInsteadOfWedging(t *testing.T) {
 	if strings.Contains(upstreamBodies[1], orphanFixtureCiphertext) {
 		t.Fatalf("a carrier refused as drifted still put its reasoning upstream: %s", upstreamBodies[1])
 	}
-	// Degraded, not wedged: the call mapping still came back, so the turn continues.
 	if !strings.Contains(upstreamBodies[1], toolUseID) && !strings.Contains(upstreamBodies[1], "call_synth_lookup_stream_001") {
 		t.Fatalf("continuation lost its call mapping entirely: %s", upstreamBodies[1])
 	}

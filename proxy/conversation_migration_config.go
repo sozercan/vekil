@@ -17,9 +17,6 @@ const (
 	maxConversationMigrationSnapshots          = 1_000_000
 )
 
-// ConversationMigrationConfig opts selected operational routes into durable
-// Responses conversation migration between Azure and Copilot targets. Limits
-// bound complete snapshots, total stored bytes, and count without reserving storage.
 type ConversationMigrationConfig struct {
 	Routes          []string `json:"routes" yaml:"routes"`
 	MaxHistoryBytes int      `json:"max_history_bytes,omitempty" yaml:"max_history_bytes,omitempty"`
@@ -45,8 +42,6 @@ func (config ConversationMigrationConfig) withDefaults() ConversationMigrationCo
 }
 
 func validateYAMLConversationMigrationFieldTypes(node *yaml.Node) error {
-	// yaml.v3 converts floating-point scalars to integers during struct decoding.
-	// Require integer limits before that conversion loses the fractional part.
 	for _, field := range []string{"max_history_bytes", "max_total_bytes", "max_snapshots"} {
 		value := yamlDereferenceAlias(yamlMappingValue(node, field))
 		if value != nil && value.Tag != "!!int" && value.Tag != "!!null" {

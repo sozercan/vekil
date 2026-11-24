@@ -5,8 +5,6 @@ import (
 	"strings"
 )
 
-// Only effort changes on one physical upstream can reuse completed tool history.
-// Provider/model changes and routes with failover retain the exact replay binding.
 func policyCompletedReplayRoutes(profile *compiledPolicyProfile, routes policyTierRoutes) []responsesChatReplayRoute {
 	if profile == nil || profile.entry == nil || !policyProfileControlsReasoning(profile.config) {
 		return nil
@@ -49,9 +47,6 @@ func sameResponsesChatReplayUpstream(left, right responsesChatReplayRoute) bool 
 		left.ProviderID == right.ProviderID && left.PublicModel == right.PublicModel && left.UpstreamModel == right.UpstreamModel
 }
 
-// A fully completed prefix ends before a new user task. Every tool call in it
-// must have a result before an assistant reply with no tools. A later unfinished
-// turn keeps its exact binding without undoing an earlier completed prefix.
 func completedResponsesChatPolicyReplayEnd(messages []json.RawMessage, resultIndices map[string]int) int {
 	type historyMessage struct {
 		Role      string          `json:"role"`
@@ -132,8 +127,6 @@ func chatRequestHasActiveResponsesPolicyReplay(body []byte) bool {
 }
 
 func restoreCompletedResponsesChatPolicyCalls(options responsesChatRequestOptions, projected []responsesChatReplayProjectedCall, content []map[string]any, tally *responsesChatRestoreTally) (responsesChatRestoredCalls, error) {
-	// A completed-history exception still needs authoritative replay state. Probe
-	// silently and never recover it from IDs or a degraded visible transcript.
 	probe := options
 	probe.Log = nil
 	probe.DegradeUnrestorableReplay = false

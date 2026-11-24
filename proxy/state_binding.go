@@ -13,38 +13,22 @@ import (
 )
 
 const (
-	// defaultStateBindingMaxEntries bounds process-local provider state while
-	// leaving room for many concurrent Codex sessions that replay their full
-	// encrypted reasoning history when resumed. Capacity eviction intentionally
-	// degrades a binding to unknown, so keep enough headroom for same-day idle
-	// sessions on busy local agent hosts.
 	defaultStateBindingMaxEntries = 256 * 1024
-	// defaultStateBindingTTL is an absolute lifetime. Lookups update recency but
-	// never extend this window; only observing the same token from the same owner
-	// again refreshes it.
-	defaultStateBindingTTL    = 24 * time.Hour
-	stateBindingDigestKeySize = sha256.Size
+	defaultStateBindingTTL        = 24 * time.Hour
+	stateBindingDigestKeySize     = sha256.Size
 )
 
 type stateBindingType string
 
 const (
-	// stateBindingTypeResponseID binds response IDs later supplied through
-	// previous_response_id.
-	stateBindingTypeResponseID stateBindingType = "response_id"
-	// stateBindingTypeTurnState binds trusted server-issued X-Codex-Turn-State
-	// values.
-	stateBindingTypeTurnState stateBindingType = "codex_turn_state"
-	// stateBindingTypeEncryptedContent binds non-proxy opaque encrypted_content
-	// artifacts.
+	stateBindingTypeResponseID       stateBindingType = "response_id"
+	stateBindingTypeTurnState        stateBindingType = "codex_turn_state"
 	stateBindingTypeEncryptedContent stateBindingType = "encrypted_content"
 )
 
 type stateBindingOwner struct {
-	routeID  string
-	targetID string
-	// Durable records contain keyed routing labels and exact request identity,
-	// never configuration labels or credentials. Memory-only owners keep these zero.
+	routeID   string
+	targetID  string
 	routeKey  [32]byte
 	targetKey [32]byte
 	identity  [32]byte
@@ -88,8 +72,6 @@ func (r stateBindingLookupResult) knownOwner() (stateBindingOwner, bool) {
 	return r.owner, true
 }
 
-// stateBindingToken is a transient lookup input. Stores retain only its keyed
-// digest, never value itself.
 type stateBindingToken struct {
 	stateType stateBindingType
 	value     string
@@ -100,8 +82,6 @@ type stateBindingStoreConfig struct {
 	ttl        time.Duration
 	now        func() time.Time
 
-	// digestKey is test-injectable. Production callers should leave it empty so
-	// every process gets an independent random key.
 	digestKey []byte
 }
 
@@ -192,10 +172,6 @@ func newStateBindingStore(config stateBindingStoreConfig) (*stateBindingStore, e
 	return store, nil
 }
 
-// bind records an exact owner immediately before a provider state token is
-// exposed. Re-observing the token from the same owner refreshes its TTL. A
-// different owner replaces the binding with an ownerless conflict tombstone;
-// no later bind can clear that tombstone before it expires.
 func (s *stateBindingStore) bind(stateType stateBindingType, token string, owner stateBindingOwner) stateBindingLookupResult {
 	if s != nil && s.durable != nil {
 		return s.durable.bind([]stateBindingToken{{stateType: stateType, value: token}}, owner, false)
@@ -250,9 +226,6 @@ func (s *stateBindingStore) bind(stateType stateBindingType, token string, owner
 	return stateBindingLookupResult{outcome: stateBindingLookupKnown, owner: owner}
 }
 
-// lookup returns known only for one live exact binding. Unknown includes a
-// never-seen, expired, or capacity-evicted token. Conflict identifies a live
-// ambiguity tombstone. No result contains the raw token or its digest.
 func (s *stateBindingStore) lookup(stateType stateBindingType, token string) stateBindingLookupResult {
 	if s != nil && s.durable != nil {
 		return s.durable.resolve([]stateBindingToken{{stateType: stateType, value: token}})
@@ -272,16 +245,10 @@ func (s *stateBindingStore) lookup(stateType stateBindingType, token string) sta
 	return s.lookupKeyLocked(key, now)
 }
 
-// resolve requires all supplied state tokens to be known and owned by exactly
-// the same route and target. Missing bindings resolve unknown unless a live
-// tombstone, malformed input, or differing known owners establishes conflict.
-// Neither unknown nor conflict permits an upstream call.
 func (s *stateBindingStore) resolve(tokens []stateBindingToken) stateBindingLookupResult {
 	return s.resolveWithRoute(tokens, "", "")
 }
 
-// A non-empty routeID or pinnedTargetID also rejects known owners outside that
-// route or target, even when another token is unknown.
 func (s *stateBindingStore) resolveWithRoute(tokens []stateBindingToken, routeID, pinnedTargetID string) stateBindingLookupResult {
 	if s != nil && s.durable != nil {
 		return s.durable.resolveWithRoute(tokens, routeID, pinnedTargetID)
@@ -336,9 +303,6 @@ func (s *stateBindingStore) resolveWithRoute(tokens []stateBindingToken, routeID
 	return stateBindingLookupResult{outcome: stateBindingLookupUnknown}
 }
 
-// resolveForRoute additionally rejects a token known to another public route
-// or a different target when the operation is already pinned. A known result's
-// targetID is the only target eligible for the operation.
 func (s *stateBindingStore) resolveForRoute(routeID, pinnedTargetID string, tokens []stateBindingToken) stateBindingLookupResult {
 	result := s.resolveWithRoute(tokens, routeID, pinnedTargetID)
 	if result.outcome != stateBindingLookupKnown {
@@ -439,19 +403,11 @@ func (r *stateBindingRecord) expired(now time.Time) bool {
 	return !now.Before(r.expiresAt)
 }
 
-// bindAll atomically validates and binds every token to one owner. If any live
-// token is already conflicted or owned elsewhere, conflicting records become
-// tombstones and no previously-unseen token from the batch is inserted. This
-// prevents state from an unexposed response from being partially published.
 func (s *stateBindingStore) bindAll(tokens []stateBindingToken, owner stateBindingOwner) stateBindingLookupResult {
 	result, _ := s.bindAllWithEvictionDelta(tokens, owner)
 	return result
 }
 
-// bindAllWithEvictionDelta applies one atomic batch and returns only the
-// capacity evictions caused by that batch. The delta is captured while the
-// store mutex is still held so concurrent binders cannot attribute each
-// other's evictions to themselves.
 func (s *stateBindingStore) bindAllWithEvictionDelta(tokens []stateBindingToken, owner stateBindingOwner) (stateBindingLookupResult, uint64) {
 	if s != nil && s.durable != nil {
 		return s.durable.bind(tokens, owner, false), 0

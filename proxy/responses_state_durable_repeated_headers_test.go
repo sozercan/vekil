@@ -143,8 +143,6 @@ func TestDurableRepeatedFinalHeaders(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer closeDurableStoreFixture(t, reopened)
-					// Accepted streams bind their HTTP headers before semantic data.
-					// Withholding a later error must not remove that earlier proof.
 					wantKnown := !reject || surface == "websocket-progress"
 					original := token
 					if len(values) == 1 {

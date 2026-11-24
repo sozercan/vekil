@@ -169,9 +169,6 @@ func (h *ProxyHandler) withToolOptimizerStageContext(parent context.Context, man
 	}
 }
 
-// withTurnBudget installs one deadline and provider-call budget for all items in
-// a request/response optimizer stage. Direct manager calls intentionally do not
-// install this state, preserving their historical per-call timeout behavior.
 func (m *ToolOptimizerManager) withTurnBudget(parent context.Context, stage string) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()

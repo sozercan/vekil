@@ -102,8 +102,6 @@ func runOptimizerProcessDescendant() int {
 		time.Sleep(delay)
 		_, _ = io.WriteString(os.Stdout, optimizerHelperSuccessfulOutput())
 		_, _ = io.WriteString(os.Stderr, "optimizer descendant still owns stderr\n")
-		// Hold the inherited pipes far past the test's return and exit windows,
-		// so an adapter that waits for them cannot pass inside those windows.
 		time.Sleep(lateInheritedHold)
 		return 0
 	}
@@ -111,8 +109,6 @@ func runOptimizerProcessDescendant() int {
 	return 0
 }
 
-// lateInheritedHold is how long a late-inherited descendant keeps its pipes
-// after writing its late output.
 const lateInheritedHold = 5 * time.Second
 
 func waitForOptimizerHelperFile(path string, timeout time.Duration) bool {
@@ -142,13 +138,10 @@ func optimizerHelperSuccessfulOutput() string {
 
 func TestOptimizerAdaptersRejectLateDescendantOutputWithinDeadline(t *testing.T) {
 	const (
-		timeoutMS       = 2000
-		releaseLead     = 50 * time.Millisecond
-		lateOutputDelay = 150 * time.Millisecond
-		startupGrace    = 1500 * time.Millisecond
-		// Killing and reaping the process tree can take several hundred
-		// milliseconds on a loaded machine. The descendant holds its pipes for
-		// lateInheritedHold, so waiting for them still overruns this window.
+		timeoutMS        = 2000
+		releaseLead      = 50 * time.Millisecond
+		lateOutputDelay  = 150 * time.Millisecond
+		startupGrace     = 1500 * time.Millisecond
 		returnGrace      = time.Second
 		exitGrace        = 2 * time.Second
 		minimumRunWindow = 1700 * time.Millisecond

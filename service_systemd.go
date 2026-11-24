@@ -28,7 +28,6 @@ func (b *systemdServiceBackend) registerFlags(fs *flag.FlagSet) {
 
 func (b *systemdServiceBackend) preflight(serviceDeps) error { return nil }
 
-// defaultLogFile is empty because journald captures the service's stderr.
 func (b *systemdServiceBackend) defaultLogFile(serviceDeps) (string, error) { return "", nil }
 
 func (b *systemdServiceBackend) location(deps serviceDeps) (string, error) {
@@ -70,7 +69,6 @@ func (b *systemdServiceBackend) register(deps serviceDeps, spec serviceSpec) err
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 
-	// Enable lingering first: it starts the user manager when no session has.
 	if b.noLinger == nil || !*b.noLinger {
 		if err := deps.run(io.Discard, io.Discard, "loginctl", "enable-linger"); err != nil {
 			_, _ = fmt.Fprintln(deps.stderr, "warning: could not enable lingering, so Vekil will stop when you log out; ask an administrator to run: sudo loginctl enable-linger $USER")
@@ -148,8 +146,6 @@ func renderSystemdUnit(command []string, path string) (string, error) {
 	return b.String(), nil
 }
 
-// systemdQuoteExecArg quotes one ExecStart argument so systemd passes it
-// verbatim, without specifier or environment-variable expansion.
 func systemdQuoteExecArg(arg string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`, `$`, `$$`).Replace(arg) + `"`
 }

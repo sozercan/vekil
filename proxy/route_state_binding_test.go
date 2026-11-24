@@ -933,8 +933,6 @@ func TestApplyExplicitRequestStateBindingConversationSubsequentExactPinning(t *t
 		t.Fatalf("bootstrap pinned target = %q, want target-a", got)
 	}
 
-	// Reverse the route order and enable failover to prove the stored owner, not
-	// the current primary, controls every subsequent request.
 	followupRoute := newRouteStateBindingTestRoute("route-a", routeModePriorityFailover, "target-b", "target-a")
 	followupOperation := newRouteOperation(followupRoute, context.Background())
 	if err := h.applyExplicitRequestStateBinding(followupOperation, requestBody, nil); err != nil {

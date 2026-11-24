@@ -589,8 +589,6 @@ func TestDrainingPublicationCancelsNewContextsBeforeLifecycleRoot(t *testing.T) 
 		t.Fatalf("lifecycle root error before draining publication = %v", err)
 	}
 
-	// Publish admission closure without canceling the lifecycle root. This is
-	// the narrow ordering window that new child contexts must close themselves.
 	handler.draining.Store(true)
 	if err := handler.lifecycleCtx.Err(); err != nil {
 		t.Fatalf("lifecycle root error after draining publication = %v, want live root", err)

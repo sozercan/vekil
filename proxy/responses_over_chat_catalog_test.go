@@ -130,8 +130,6 @@ func TestClassifyResponsesCompatibilityTable(t *testing.T) {
 }
 
 func TestResponsesOverChatCatalogStripsUpstreamMarkers(t *testing.T) {
-	// A chained or misconfigured upstream may already carry the marker. Only
-	// this proxy's own eligible opt-ins may keep it.
 	body := []byte(`{"object":"list","etag":"kept","data":[
 		{"id":"gpt-native","supported_endpoints":["/chat/completions","/responses"],"vekil_responses_compatibility":"responses_over_chat"},
 		{"id":"not-opted","supported_endpoints":["/chat/completions"],"VEKIL_RESPONSES_COMPATIBILITY":"responses_over_chat"},
@@ -250,8 +248,6 @@ func TestResponsesOverChatCatalogETagDescribesServedRepresentation(t *testing.T)
 		t.Fatalf("plain ETag = %q, compatible ETag = %q", plain.Header().Get("ETag"), compatible.Header().Get("ETag"))
 	}
 
-	// Expire the canonical entry so the next request revalidates upstream
-	// instead of being served from the cache.
 	on.models.mu.Lock()
 	entry := on.models.entries[""]
 	entry.expiry = time.Now().Add(-time.Minute)

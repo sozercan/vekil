@@ -47,7 +47,6 @@ func TestRouteObservabilitySeparatesClientAndPhysicalLedgers(t *testing.T) {
 	})
 	summary.setFinalRouteAttribution("secondary", "azure-secondary", "azure")
 
-	// Physical ledger updates are independent from the one-per-client ledger.
 	before := h.stats.snapshot()
 	if before.UpstreamAttempts != 2 || before.TargetSwitches != 1 {
 		t.Fatalf("physical counters before client record = attempts:%d switches:%d, want 2/1", before.UpstreamAttempts, before.TargetSwitches)
@@ -105,7 +104,7 @@ func TestRouteObservabilityFailedFailoverAndExhaustion(t *testing.T) {
 	h.RecordUpstreamAttempt(ctx, RouteAttemptObservation{OperationID: "op-fail", RouteID: "route-gpt", TargetID: "secondary", ProviderID: "azure-b"})
 	summary.setFinalRouteAttribution("secondary", "azure-b", "")
 	h.RecordRouteExhaustion(ctx)
-	h.RecordRouteExhaustion(ctx) // one logical operation, not two exhaustion events
+	h.RecordRouteExhaustion(ctx)
 	h.RecordRequest(summary, http.StatusServiceUnavailable, "curl/8", time.Millisecond)
 
 	snap := h.stats.snapshot()

@@ -2,9 +2,6 @@ package proxy
 
 import bolt "go.etcd.io/bbolt"
 
-// stateBindingStatsSnapshot contains only storage gauges. Unavailable values
-// stay null rather than suggesting an empty database after a read or close.
-// Entries counts all retained logical records, including conflict tombstones.
 type stateBindingStatsSnapshot struct {
 	Mode                 string   `json:"mode"`
 	Status               string   `json:"status"`
@@ -52,8 +49,6 @@ func (d *durableStateBindings) dashboardStats() stateBindingStatsSnapshot {
 	if d.failed != nil {
 		snapshot.Status = "frozen"
 	}
-	// The bucket sequence is the committed logical record count. Polling must
-	// not walk records or hold up writers in proportion to database occupancy.
 	err := d.db.View(func(tx *bolt.Tx) error {
 		records := tx.Bucket(durableStateRecords)
 		if records == nil {
@@ -70,8 +65,6 @@ func (d *durableStateBindings) dashboardStats() stateBindingStatsSnapshot {
 		return snapshot
 	}
 	snapshot.setCapacity()
-	// Tx.Size reports used pages, not the file's current length. Stat the same
-	// descriptor bbolt uses so a renamed or replaced path cannot change gauges.
 	info, err := d.file.Stat()
 	if err != nil {
 		if snapshot.Status != "frozen" {

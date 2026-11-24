@@ -374,8 +374,8 @@
 
   var POLL_MS = 1000;
   var lastStamp = 0;
-  var staticNarrative = "";  // last templated narrative (live banner + sent to model)
-  var lastSnapshot = null;   // last /stats.json payload, for instant re-sort/filter
+  var staticNarrative = "";
+  var lastSnapshot = null;
 
   function fmt(n) {
     n = n || 0;
@@ -392,11 +392,9 @@
     return sec + "s";
   }
 
-  // Average over the most recent `n` complete seconds, skipping the current
-  // (still-filling) second so headline rates do not dip every tick.
   function recentRate(series, key, n) {
     if (!series || series.length < 2) return 0;
-    var end = series.length - 1; // exclude current second
+    var end = series.length - 1;
     var start = Math.max(0, end - n);
     var sum = 0, count = 0;
     for (var i = start; i < end; i++) { sum += series[i][key] || 0; count++; }
@@ -442,7 +440,6 @@
   window.addEventListener("resize", resizeCharts);
 
   var DISPLAY_ROWS = 10;
-  // metricOf returns the value a breakdown row contributes for the active sort.
   function metricOf(r, sort) {
     if (sort === "tokens") return r.tokens || 0;
     if (sort === "errors") return r.errors || 0;
@@ -456,7 +453,6 @@
     var filter = document.getElementById("filterText").value.trim().toLowerCase();
 
     var list = (rows || []).slice();
-    // Filter by label substring (and kind, e.g. "azure" for providers).
     if (filter) {
       list = list.filter(function (r) {
         var label = (r[labelKey] || "").toLowerCase();
@@ -464,8 +460,6 @@
         return label.indexOf(filter) !== -1 || kind.indexOf(filter) !== -1;
       });
     }
-    // When sorting by errors or latency, drop rows with none — the list becomes
-    // "models with errors" / "models with latency", which is the point.
     if (sort === "errors" || sort === "avg_ms") {
       list = list.filter(function (r) { return metricOf(r, sort) > 0; });
     }
@@ -485,7 +479,6 @@
       var label = r[labelKey] || "unknown";
       var w = Math.max(2, Math.round((metricOf(r, sort) / top) * 100));
       var kind = r.kind ? '<span class="bar-kind">' + escapeHtml(r.kind) + '</span>' : "";
-      // Emphasize the active metric in the value column.
       var parts = [
         seg(fmt(r.requests) + " req", sort === "requests"),
         seg(fmt(r.tokens) + " tok", sort === "tokens"),
@@ -501,8 +494,6 @@
   }
   function seg(text, active) { return active ? "<b>" + text + "</b>" : text; }
 
-  // renderErrorBars draws the error-by-status-code and error-by-target lists,
-  // which carry {label, count} rows rather than request/token breakdowns.
   function renderErrorBars(elId, rows, emptyText) {
     var el = document.getElementById(elId);
     if (!rows || !rows.length) { el.innerHTML = '<div class="empty">' + (emptyText || "None") + '</div>'; return; }
@@ -637,7 +628,6 @@
       ' <small>' + fmt(t.prompt_tokens) + " in / " + fmt(t.completion_tokens) + " out</small>";
     document.getElementById("uptime").textContent = "up " + fmtUptime(s.uptime_seconds);
 
-    // Total usage panel.
     var cachePct = t.prompt_tokens ? (t.cached_tokens / t.prompt_tokens) * 100 : 0;
     var avg = t.requests ? t.total_tokens / t.requests : 0;
     document.getElementById("uReq").textContent = fmt(t.requests);
@@ -659,20 +649,14 @@
     renderErrorBars("errTargets", s.errors, "No errors");
     applyCharts(series);
 
-    // Show the insight button only when the proxy has a model configured.
     var btn = document.getElementById("insightBtn");
     btn.hidden = !s.insights_enabled;
 
-    // The templated narrative always refreshes (the AI insight lives in its own
-    // block below and never overrides it). We keep the latest text so it can be
-    // sent to the model as "already shown".
     staticNarrative = buildNarrative(s, reqps, tokps, errRate, cachePct);
     var n = document.getElementById("narrative");
     n.innerHTML = staticNarrative;
   }
 
-  // buildNarrative synthesizes the current snapshot into a plain-language summary
-  // so a first-time viewer understands what the dashboard is showing at a glance.
   function buildNarrative(s, reqps, tokps, errRate, cachePct) {
     var t = s.totals || {};
     if (!t.requests) return "No traffic yet. Send a request through the proxy and this will come alive.";
@@ -711,10 +695,6 @@
       .catch(function () { setDot("stale"); });
   }
 
-  // generateInsight asks the proxy to summarize current traffic with the
-  // configured model, telling it what the static banner already shows so it adds
-  // rather than repeats. The result renders in its own block below the live
-  // narrative; on any failure that block is hidden and the static line stays.
   function generateInsight() {
     var btn = document.getElementById("insightBtn");
     var box = document.getElementById("aiInsight");
@@ -739,7 +719,7 @@
           box.className = "ai-insight";
           box.innerHTML = '<span class="ai-label">✨ ' + escapeHtml(d.model || "insight") + ':</span> ' + escapeHtml(d.insight);
         } else {
-          fail(); // soft failure → static narrative (still live above) is enough
+          fail();
         }
       })
       .catch(fail)
@@ -755,9 +735,6 @@
   }
   document.getElementById("insightBtn").addEventListener("click", generateInsight);
 
-  // applyBreakdowns re-renders the model/agent/provider panels from the last
-  // snapshot using the current sort + filter controls. Called on every poll and
-  // immediately when a control changes (no waiting for the next tick).
   function applyBreakdowns() {
     if (!lastSnapshot) return;
     renderBars("byModel", lastSnapshot.by_model, "model");
@@ -766,9 +743,6 @@
     renderRecent();
   }
 
-  // renderRecent draws the recent-requests drill-down table. It honors the
-  // shared filter box (matched against model/agent/provider/endpoint) and the
-  // errors-only toggle.
   function renderRecent() {
     var el = document.getElementById("recentTable");
     if (!lastSnapshot) return;
@@ -810,7 +784,6 @@
     el.innerHTML = html;
   }
   function shortId(id) { return id.length > 18 ? id.slice(0, 15) + "…" : id; }
-  // Copy the full request id when a row's id is clicked.
   document.getElementById("recentTable").addEventListener("click", function (e) {
     var t = e.target;
     if (t && t.classList.contains("rid") && t.dataset.rid && navigator.clipboard) {
@@ -833,7 +806,6 @@
   makeCharts();
   tick();
   setInterval(tick, POLL_MS);
-  // Mark stale if a poll has not landed in 3s.
   setInterval(function () {
     if (lastStamp && Date.now() - lastStamp > 3000) setDot("stale");
   }, 1000);

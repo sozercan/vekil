@@ -6,8 +6,6 @@ import (
 	"net/http"
 )
 
-// A retry stopped before dispatch has no new upstream result. Keep the last
-// rejection and its correlation ID, while recording why recovery stopped.
 func suppressPendingRouteRetry(operation *routeOperation, failures []routeAttemptFailure, decision routeRetryDecision, blocked *http.Response) {
 	if len(failures) == 0 {
 		return
@@ -41,9 +39,6 @@ func suppressPendingRouteRetry(operation *routeOperation, failures []routeAttemp
 	}
 }
 
-// Target ownership restricts migration, not replay of a request that was
-// authoritatively rejected before execution. A websocket's prior protocol
-// frames also retain the owner without making a new, rejected turn unsafe.
 func (o *routeOperation) sameTargetRetryDecision(ctx context.Context, kind routeAttemptKind, shuttingDown bool) routeRetryDecision {
 	if shuttingDown || ctx.Err() != nil {
 		return routeRetrySuppressedLifecycle
@@ -71,8 +66,6 @@ func routeCanSwitchAfterAttempt(ctx context.Context, operation *routeOperation, 
 		len(orderedRouteTargets(operation.route, operation, endpoint)) > 0
 }
 
-// Only failures acquiring this provider's credentials are eligible here. Request
-// validation and configuration failures must not turn into cross-provider retries.
 func (h *ProxyHandler) explicitRouteCredentialFailureDecision(ctx context.Context, operation *routeOperation, endpoint string, kind routeAttemptKind, err error) routeRetryDecision {
 	if providerRequestErrorCode(err) != upstreamAuthUnavailableCode {
 		return routeRetrySuppressedNonretryable
@@ -113,8 +106,6 @@ func (h *ProxyHandler) explicitRouteRejectionDecision(ctx context.Context, opera
 		decision = routeRetrySuppressedState
 	}
 	if operation.route.policy.mode == routeModePriorityFailover && operation.allowsAutomaticTargetSwitch(kind) && operation.retryAdmissionOpen(ctx, h.ShuttingDown()) {
-		// Preserve legacy explicit-route exhaustion accounting. Azure can use
-		// spare sends on the last eligible target after other targets reject.
 		if !azureRecovery || len(orderedRouteTargets(operation.route, operation, endpoint)) > 0 {
 			return routeRetrySwitchTarget
 		}
@@ -125,14 +116,11 @@ func (h *ProxyHandler) explicitRouteRejectionDecision(ctx context.Context, opera
 		return decision
 	}
 	if _, ready := h.conversationMigrationTarget(ctx, operation, endpoint, kind); ready && safeConversationMigrationFailure(failure) {
-		// The executor reconstructs on the backup using the remaining budget.
 		return routeRetrySuppressedState
 	}
 	if next := operation.sameTargetRetryDecision(ctx, kind, h.ShuttingDown()); next != routeRetrySameTarget {
 		return next
 	}
-	// A valid provider reset is required. Do not add an unbounded or immediate
-	// same-target loop when Azure supplies no usable recovery timing.
 	if delay > maxAzureTrafficWait || !retryDelayFitsBudget(ctx, delay) {
 		return decision
 	}

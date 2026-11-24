@@ -615,14 +615,12 @@ func TestHandleReadyz(t *testing.T) {
 
 func TestHandleAnthropicMessages(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		// Verify headers are set
 		if r.Header.Get("Authorization") != "Bearer test-token" {
 			t.Errorf("expected Bearer test-token, got %q", r.Header.Get("Authorization"))
 		}
 		if r.Header.Get("Content-Type") != "application/json" {
 			t.Errorf("expected application/json content-type, got %q", r.Header.Get("Content-Type"))
 		}
-		// Verify the request was translated to OpenAI format with forced streaming
 		var oaiReq models.OpenAIRequest
 		body, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(body, &oaiReq); err != nil {
@@ -636,7 +634,6 @@ func TestHandleAnthropicMessages(t *testing.T) {
 			t.Error("expected stream=true in upstream request (forced streaming)")
 		}
 
-		// Return SSE streaming response (since handler forces streaming)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello from the backend!\"},\"finish_reason\":null}]}\n\n"))
@@ -892,8 +889,6 @@ func TestHandleAnthropicMessagesCountTokens_DirectGenericAnthropicCompatibleProv
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	w := httptest.NewRecorder()
 
-	// A valid carrier reaches the per-process key during decode. Direct passthrough must
-	// strip it without entering that path, which also avoids attacker-controlled inflate.
 	var carrierDecoded atomic.Bool
 	restoredCarrierKey := reasoningCarrierKey
 	reasoningCarrierKey = func() []byte {
@@ -1457,7 +1452,6 @@ func TestHandleOpenAIChatCompletions(t *testing.T) {
 			t.Errorf("expected Bearer test-token, got %q", r.Header.Get("Authorization"))
 		}
 
-		// Echo back the request body as a mock response
 		body, _ := io.ReadAll(r.Body)
 		var oaiReq models.OpenAIRequest
 		if err := json.Unmarshal(body, &oaiReq); err != nil {
@@ -1602,9 +1596,6 @@ func TestHandleResponsesDetachesBorrowedBodyBeforeUpstream(t *testing.T) {
 	}
 }
 
-// TestHandleResponsesRecordsUsage verifies the non-streaming POST /v1/responses
-// path observes token usage into the per-request RequestSummary (so the traffic
-// dashboard records Codex /responses traffic instead of zeros).
 func TestHandleResponsesRecordsUsage(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1632,7 +1623,6 @@ func TestHandleResponsesRecordsUsage(t *testing.T) {
 	if d.cached != 90 || d.reasoning != 40 {
 		t.Fatalf("detail usage not recorded: cached=%d reasoning=%d", d.cached, d.reasoning)
 	}
-	// The response body must still carry the upstream usage block unchanged.
 	body, _ := io.ReadAll(w.Result().Body)
 	if !strings.Contains(string(body), `"input_tokens":300`) {
 		t.Fatalf("response body altered: %s", body)
@@ -2003,7 +1993,6 @@ func TestHandleCompact(t *testing.T) {
 			t.Errorf("expected compacted context in rewritten input, got %q", contextText)
 		}
 
-		// Return a standard /responses response — the handler should transform it
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"compacted summary of conversation"}]}]}`))
 	})
@@ -2059,7 +2048,6 @@ func TestHandleCompact(t *testing.T) {
 	if len(result.Output) != 2 {
 		t.Fatalf("expected retained message plus compaction item, got %d output items", len(result.Output))
 	}
-	// First item: retained original user message.
 	if result.Output[0].Type != "message" {
 		t.Errorf("expected first item type message, got %q", result.Output[0].Type)
 	}
@@ -2069,7 +2057,6 @@ func TestHandleCompact(t *testing.T) {
 	if len(result.Output[0].Content) == 0 || result.Output[0].Content[0].Text != "Hello" {
 		t.Errorf("expected retained user text in message content, got %+v", result.Output[0].Content)
 	}
-	// Second item: compaction with encrypted_content.
 	if result.Output[1].Type != "compaction" {
 		t.Errorf("expected second item type compaction, got %q", result.Output[1].Type)
 	}
@@ -2652,13 +2639,6 @@ func TestCompactResponsesRequestInChunks_CancelsFanoutOnFirstError(t *testing.T)
 		call := chunkCalls.Add(1)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			// The second request is the asserted failure source and must remain
-			// active long enough to receive its complete request body. Once it
-			// publishes the 500, compact fanout intentionally cancels in-flight
-			// siblings; net/http may surface those aborted uploads as
-			// context.Canceled, io.ErrUnexpectedEOF, or an opaque closed-transport
-			// error. Only tolerate them after the asserted failure was published and
-			// this specific sibling's request context has actually been canceled.
 			if call != 2 && failurePublished.Load() {
 				select {
 				case <-r.Context().Done():
@@ -3556,10 +3536,6 @@ func TestHandleCompact_UsesPartialSummariesWhenChunkedMerge413s(t *testing.T) {
 			t.Fatalf("unexpected /responses request count %d", call)
 		}
 	})
-	// Allow the initial request, two successful chunk requests, and the first
-	// merge attempt. If that merge 413s, the proxy should synthesize a local
-	// merged summary from the already-successful chunks instead of retrying until
-	// it ultimately replays the initial 413 to the client.
 	handler.compactMaxAttempts = 4
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(reqBody))
@@ -3778,10 +3754,6 @@ func TestSplitCompactInputByBodySizeUsesEncodedItemSizes(t *testing.T) {
 }
 
 func TestHandleCompact_HalvesChunkTargetOnRecursive413(t *testing.T) {
-	// Three roughly half-target items: with the initial default target each
-	// chunk holds 1 item (3 chunks total). Upstream rejects them at the default
-	// target but accepts them at <=half target, forcing the recursive halving
-	// path to engage.
 	itemText := strings.Repeat("a", compactUpstreamChunkBodySize/2-2048)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
@@ -3816,7 +3788,6 @@ func TestHandleCompact_HalvesChunkTargetOnRecursive413(t *testing.T) {
 		bodySizes = append(bodySizes, len(body))
 		mu.Unlock()
 
-		// Reject anything above the halved cap with 413; succeed otherwise.
 		if len(body) > halvedCap {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
@@ -3859,10 +3830,6 @@ func TestHandleCompact_HalvesChunkTargetOnRecursive413(t *testing.T) {
 }
 
 func TestCompactResponsesRequestDepth_AllowsConfiguredTargetToReachFloor(t *testing.T) {
-	// A large operator-configured initial target can require more than the old
-	// fixed depth guard before the fallback reaches the documented 64 KiB floor.
-	// Depth by itself must not stop a floor-sized logical compaction call; the
-	// floor and shared attempt budget are the terminating guards.
 	message, err := compactTextInputRawMessage("small floor-sized retry")
 	if err != nil {
 		t.Fatalf("build input message: %v", err)
@@ -3906,12 +3873,7 @@ func TestCompactResponsesRequestDepth_AllowsConfiguredTargetToReachFloor(t *test
 }
 
 func TestHandleCompact_HalvesEagerlyWhenSubTargetRequest413s(t *testing.T) {
-	// Single small item: the initial compact body fits inside the configured
-	// target, but upstream still 413s because its real cap is lower (300 KiB
-	// here). The fix is for the depth=0 path to halve the target instead of
-	// bailing on a single chunk; we expect at least one upstream retry below the
-	// original body size, ending in 200.
-	itemText := strings.Repeat("a", 400*1024) // ~400 KiB content; total body ~410 KiB < default target
+	itemText := strings.Repeat("a", 400*1024)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
 		"input": []interface{}{
@@ -3969,10 +3931,6 @@ func TestHandleCompact_HalvesEagerlyWhenSubTargetRequest413s(t *testing.T) {
 }
 
 func TestHandleCompact_BoundsUpstreamFanoutByMaxAttempts(t *testing.T) {
-	// Multiple half-target items + tiny upstream cap = unbounded fanout
-	// without the budget. Set a deliberately low max-attempts and verify the
-	// proxy bails instead of fanning out further. The original 413 should be
-	// surfaced because the chunked merge ultimately failed.
 	itemText := strings.Repeat("a", compactUpstreamChunkBodySize/2-2048)
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
@@ -4028,16 +3986,10 @@ func TestHandleCompact_BoundsUpstreamFanoutByMaxAttempts(t *testing.T) {
 }
 
 func TestHandleCompact_PropagatesLearnedTargetAcrossSiblings(t *testing.T) {
-	// Build many small siblings against an upstream cap that's ~half the
-	// configured test target. Without learned-target propagation, each sibling
-	// would burn one discovery 413 at the larger target before recursing,
-	// quickly exhausting the attempt budget. With propagation, only the FIRST
-	// sibling pays the discovery cost; the rest plan at the learned smaller
-	// size from the start.
 	const (
 		siblings           = 10
-		configuredTarget   = 1 << 20              // 1 MiB
-		upstreamCap        = configuredTarget / 2 // 512 KiB
+		configuredTarget   = 1 << 20
+		upstreamCap        = configuredTarget / 2
 		itemBodyTargetSize = (configuredTarget * 6) / 10
 	)
 	itemText := strings.Repeat("a", itemBodyTargetSize-2048)
@@ -4095,19 +4047,14 @@ func TestHandleCompact_PropagatesLearnedTargetAcrossSiblings(t *testing.T) {
 			rejects++
 		}
 	}
-	// One initial 413 at full size + at most one chunk-level discovery 413
-	// before the learned target propagates. Without the fix, every sibling
-	// burns its own discovery 413 (>= siblings rejects).
 	if rejects > 3 {
 		t.Fatalf("expected at most 3 over-cap upstream POSTs once the learned target propagates; saw %d (sizes=%v)", rejects, bodySizes)
 	}
 }
 
 func TestHandleCompact_LargeMultiMiBSucceedsUnderDefaults(t *testing.T) {
-	// Codex-style large session: ~24 MiB of input that should chunk happily
-	// under the default attempt budget and inbound request limit.
 	const items = 8
-	itemText := strings.Repeat("x", (compactUpstreamChunkBodySize*3)/4) // ~3 MiB content
+	itemText := strings.Repeat("x", (compactUpstreamChunkBodySize*3)/4)
 	inputs := make([]interface{}, 0, items)
 	for i := 0; i < items; i++ {
 		inputs = append(inputs, map[string]interface{}{
@@ -4120,7 +4067,7 @@ func TestHandleCompact_LargeMultiMiBSucceedsUnderDefaults(t *testing.T) {
 		t.Fatalf("marshal request: %v", err)
 	}
 
-	const upstreamCap = compactUpstreamChunkBodySize // upstream accepts up to the default 4 MiB target
+	const upstreamCap = compactUpstreamChunkBodySize
 	var mu sync.Mutex
 	var calls int
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -4158,12 +4105,6 @@ func TestHandleCompact_LargeMultiMiBSucceedsUnderDefaults(t *testing.T) {
 }
 
 func TestHandleCompact_EmptyInputAfter413SurfacesOriginal413(t *testing.T) {
-	// Pathological client request: input:[] arrives, upstream 413s anyway
-	// (e.g. a tools/text/instructions field is huge so the request is over
-	// cap even with no input items). Without explicit handling, the chunker
-	// would skip the empty fanout and return 200 with an empty compaction
-	// summary; the client would then think it has a valid checkpoint when
-	// no upstream success ever occurred.
 	hugeText := strings.Repeat("a", compactUpstreamChunkBodySize+(8*1024))
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
@@ -4195,11 +4136,6 @@ func TestHandleCompact_EmptyInputAfter413SurfacesOriginal413(t *testing.T) {
 }
 
 func TestHandleCompact_EmptyInputNoStripFieldsAfter413SurfacesOriginal413(t *testing.T) {
-	// Even more degenerate: input:[] with no oversized fixed fields. The
-	// fallback splitter returns zero chunks and there's nothing to strip, so
-	// historically the loop would no-op and the merge would emit an empty
-	// summary as a 200. The new len(chunks)==0 guard refuses to fabricate
-	// success and surfaces the upstream 413 verbatim.
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model": "gpt-5.4",
 		"input": []interface{}{},
@@ -4229,13 +4165,8 @@ func TestHandleCompact_EmptyInputNoStripFieldsAfter413SurfacesOriginal413(t *tes
 }
 
 func TestHandleCompact_MemoizesModelFallbackAcrossSiblings(t *testing.T) {
-	// Configure a request whose model is rejected as unsupported by upstream.
-	// Without memoization, the model-fallback probe would fire on every chunk
-	// (each logical compaction call doubles to 2 real POSTs). With B applied,
-	// the probe fires once on the first chunk and the resolved fallback model
-	// is memoized on the budget, so siblings 2..N skip the probe entirely.
 	const siblings = 5
-	itemText := strings.Repeat("a", 32*1024) // ~32 KiB per item; well under upstream cap
+	itemText := strings.Repeat("a", 32*1024)
 	inputs := make([]interface{}, 0, siblings)
 	for i := 0; i < siblings; i++ {
 		inputs = append(inputs, map[string]interface{}{
@@ -4248,7 +4179,7 @@ func TestHandleCompact_MemoizesModelFallbackAcrossSiblings(t *testing.T) {
 		t.Fatalf("marshal request: %v", err)
 	}
 
-	const upstreamCap = 128 * 1024 // forces chunk fanout while allowing historical-text chunks
+	const upstreamCap = 128 * 1024
 	var mu sync.Mutex
 	var requestedModels []string
 	var fallbackProbes int
@@ -4257,15 +4188,12 @@ func TestHandleCompact_MemoizesModelFallbackAcrossSiblings(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read upstream body: %v", err)
 		}
-		// /models probes are part of the fallback lookup; track them but don't
-		// route through the compact body sniffing below.
 		if r.URL.Path == "/models" {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.4","object":"model","capabilities":{"supports":{"streaming":true,"tool_calls":true}}}]}`))
 			return
 		}
 
-		// Trip the small upstream cap so we engage the chunk fanout first.
 		if len(body) > upstreamCap {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
@@ -4353,7 +4281,6 @@ func TestHandleCompact_ReplacesInstructions(t *testing.T) {
 		if !ok {
 			t.Fatal("expected instructions to be a string")
 		}
-		// Instructions should be replaced with compaction prompt, not appended
 		if strings.Contains(instructions, "custom prompt") {
 			t.Errorf("expected original instructions to be replaced, but they were preserved: %q", instructions)
 		}
@@ -5767,7 +5694,6 @@ func TestHandleMemorySummarize(t *testing.T) {
 		}
 		assertOnlySubagentHeaderForwarded(t, r, "memory_consolidation")
 
-		// Return a response with the model's JSON summary
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[{\"trace_summary\":\"User asked to fix a bug in auth module\",\"memory_summary\":\"Fixed auth bug\"}]"}]}]}`))
 	})
@@ -6471,7 +6397,6 @@ func TestExtractSyntheticOrLegacyCompactionSummary(t *testing.T) {
 
 func TestHandleMemorySummarize_FallbackOnInvalidJSON(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		// Model returns plain text instead of JSON
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp-1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"This is a plain text summary, not JSON"}]}]}`))
 	})
@@ -6502,7 +6427,6 @@ func TestHandleMemorySummarize_FallbackOnInvalidJSON(t *testing.T) {
 	if len(result.Output) != 1 {
 		t.Fatalf("expected 1 output, got %d", len(result.Output))
 	}
-	// Fallback: raw text used for both fields
 	if result.Output[0].TraceSummary == "" {
 		t.Error("expected fallback trace_summary")
 	}
@@ -6533,7 +6457,6 @@ func TestSetCopilotHeaders(t *testing.T) {
 		}
 	}
 
-	// x-request-id should be set but is a UUID, just check it's non-empty
 	if req.Header.Get("x-request-id") == "" {
 		t.Error("expected x-request-id to be set")
 	}
@@ -11561,7 +11484,6 @@ func TestHandleModels(t *testing.T) {
 		if result.Data[0].ID != "gpt-5.4" {
 			t.Errorf("expected first model gpt-5.4, got %q", result.Data[0].ID)
 		}
-		// Verify Codex-compatible models field
 		if len(result.Models) != 2 {
 			t.Fatalf("expected 2 models entries, got %d", len(result.Models))
 		}
@@ -11586,7 +11508,6 @@ func TestHandleModels(t *testing.T) {
 		if result.Models[0].ShellType != "shell_command" {
 			t.Errorf("expected shell_type shell_command, got %q", result.Models[0].ShellType)
 		}
-		// Second model should have visibility "hide" (model_picker_enabled not set)
 		if result.Models[1].Visibility != "hide" {
 			t.Errorf("expected second model visibility hide, got %q", result.Models[1].Visibility)
 		}
@@ -12697,8 +12618,6 @@ func TestHandleModels_UsesCachedEntryOnNotModified(t *testing.T) {
 	}
 }
 
-// TestOpenAIErrorResponseShape validates error responses match the OpenAI spec:
-// {"error": {"message": "...", "type": "...", "param": null, "code": null}}
 func TestOpenAIErrorResponseShape(t *testing.T) {
 	w := httptest.NewRecorder()
 	writeOpenAIError(w, http.StatusBadRequest, "test error message", "invalid_request_error")
@@ -12712,7 +12631,6 @@ func TestOpenAIErrorResponseShape(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	// Must have top-level "error" key
 	if _, ok := raw["error"]; !ok {
 		t.Fatal("missing top-level 'error' key")
 	}
@@ -12722,7 +12640,6 @@ func TestOpenAIErrorResponseShape(t *testing.T) {
 		t.Fatalf("unmarshal error object: %v", err)
 	}
 
-	// Check all required fields exist
 	requiredFields := []string{"message", "type", "param", "code"}
 	for _, f := range requiredFields {
 		if _, ok := errObj[f]; !ok {
@@ -12730,7 +12647,6 @@ func TestOpenAIErrorResponseShape(t *testing.T) {
 		}
 	}
 
-	// Check values
 	var msg string
 	if err := json.Unmarshal(errObj["message"], &msg); err != nil {
 		t.Fatalf("json.Unmarshal(message) error = %v", err)
@@ -12747,7 +12663,6 @@ func TestOpenAIErrorResponseShape(t *testing.T) {
 		t.Errorf("type = %q, want %q", errType, "invalid_request_error")
 	}
 
-	// param and code should be null
 	if string(errObj["param"]) != "null" {
 		t.Errorf("param = %s, want null", errObj["param"])
 	}
@@ -12756,13 +12671,10 @@ func TestOpenAIErrorResponseShape(t *testing.T) {
 	}
 }
 
-// TestOpenAIChatCompletionsStreaming validates that streaming responses are
-// forwarded with proper SSE headers.
 func TestOpenAIChatCompletionsStreaming(t *testing.T) {
 	sseBody := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\ndata: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\ndata: [DONE]\n\n"
 
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		// Verify streaming detection
 		var partial struct {
 			Stream *bool `json:"stream"`
 		}
@@ -12791,13 +12703,11 @@ func TestOpenAIChatCompletionsStreaming(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	// Verify SSE headers
 	ct := resp.Header.Get("Content-Type")
 	if ct != "text/event-stream" {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
 
-	// Verify SSE body is forwarded
 	body, _ := io.ReadAll(resp.Body)
 	bodyStr := string(body)
 	if !strings.Contains(bodyStr, "data: {") {
@@ -12808,7 +12718,6 @@ func TestOpenAIChatCompletionsStreaming(t *testing.T) {
 	}
 }
 
-// TestOpenAIResponsesStreaming validates streaming passthrough for the Responses API.
 func TestOpenAIResponsesStreaming(t *testing.T) {
 	sseBody := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"object\":\"response\",\"created_at\":1700000000,\"status\":\"in_progress\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"object\":\"response\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n"
 
@@ -13154,8 +13063,6 @@ func TestOpenAIChatCompletionsStreamingErrorEventNotNormalized(t *testing.T) {
 	}
 }
 
-// TestOpenAIChatCompletionsUpstreamErrorPassthrough validates that upstream error
-// responses are forwarded with correct status and content-type.
 func TestOpenAIChatCompletionsUpstreamErrorPassthrough(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -13175,7 +13082,6 @@ func TestOpenAIChatCompletionsUpstreamErrorPassthrough(t *testing.T) {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
 
-	// Verify the error body is passed through unchanged
 	body, _ := io.ReadAll(resp.Body)
 	var errResp map[string]map[string]interface{}
 	if err := json.Unmarshal(body, &errResp); err != nil {
@@ -13767,8 +13673,6 @@ func TestOpenAIChatCompletionsRetryableUpstreamErrorIncludesDetail(t *testing.T)
 	}
 }
 
-// TestOpenAIChatCompletionsResponseShape validates a non-streaming response
-// has the correct OpenAI Chat Completions response structure.
 func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -13797,7 +13701,6 @@ func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 	resp := w.Result()
 	body, _ := io.ReadAll(resp.Body)
 
-	// Verify passthrough preserved all OpenAI response fields
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -13810,7 +13713,6 @@ func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 		}
 	}
 
-	// Verify object is "chat.completion"
 	var obj string
 	if err := json.Unmarshal(raw["object"], &obj); err != nil {
 		t.Fatalf("json.Unmarshal(object) error = %v", err)
@@ -13819,7 +13721,6 @@ func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 		t.Errorf("object = %q, want chat.completion", obj)
 	}
 
-	// Verify choices structure
 	var choices []map[string]json.RawMessage
 	if err := json.Unmarshal(raw["choices"], &choices); err != nil {
 		t.Fatalf("json.Unmarshal(choices) error = %v", err)
@@ -13833,14 +13734,11 @@ func TestOpenAIChatCompletionsResponseShape(t *testing.T) {
 		}
 	}
 
-	// Verify system_fingerprint is preserved
 	if _, ok := raw["system_fingerprint"]; !ok {
 		t.Error("response missing system_fingerprint (should be preserved in passthrough)")
 	}
 }
 
-// TestOpenAIResponsesResponseShape validates the Responses API non-streaming
-// passthrough preserves the response structure.
 func TestOpenAIResponsesResponseShape(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -13871,7 +13769,6 @@ func TestOpenAIResponsesResponseShape(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	// Verify key Responses API fields are preserved in passthrough
 	for _, f := range []string{"id", "object", "created_at", "status", "model", "output", "usage"} {
 		if _, ok := raw[f]; !ok {
 			t.Errorf("response missing field %q", f)
@@ -13918,8 +13815,6 @@ func TestHandleResponses_NonStreamingPreservesUpstreamHeaders(t *testing.T) {
 	}
 }
 
-// TestHandleAnthropicMessages_ParallelToolCalls verifies that parallel tool
-// calls are preserved through the forced-streaming aggregation path.
 func TestHandleAnthropicMessages_ParallelToolCalls(t *testing.T) {
 	idx0, idx1 := 0, 1
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
@@ -13935,7 +13830,6 @@ func TestHandleAnthropicMessages_ParallelToolCalls(t *testing.T) {
 			t.Error("expected parallel_tool_calls=true")
 		}
 
-		// Return SSE with text + 2 parallel tool calls (interleaved by index)
 		chunks := []models.OpenAIStreamChunk{
 			{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{Content: json.RawMessage(`"I'll delegate both tasks"`)}}}},
 			{ID: "c1", Model: "gpt-4", Choices: []models.OpenAIStreamChoice{{Index: 0, Delta: models.OpenAIMessage{ToolCalls: []models.OpenAIToolCall{{ID: "call_1", Index: &idx0, Type: "function", Function: models.OpenAIFunctionCall{Name: "delegate_task", Arguments: ""}}}}}}},
@@ -13997,7 +13891,6 @@ func TestHandleAnthropicMessages_ParallelToolCalls(t *testing.T) {
 	}
 }
 
-// TestInjectParallelToolCalls validates the parallel_tool_calls injection for OpenAI passthrough.
 func TestInjectParallelToolCalls(t *testing.T) {
 	t.Run("injects when tools present", func(t *testing.T) {
 		input := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}`
@@ -14048,8 +13941,6 @@ func TestInjectParallelToolCalls(t *testing.T) {
 	})
 }
 
-// TestOpenAIChatCompletions_InjectsParallelToolCalls verifies parallel_tool_calls
-// is injected and forced streaming is used when tools are present.
 func TestOpenAIChatCompletions_InjectsParallelToolCalls(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		var oaiReq models.OpenAIRequest
@@ -14064,7 +13955,6 @@ func TestOpenAIChatCompletions_InjectsParallelToolCalls(t *testing.T) {
 			t.Error("expected stream=true forced by proxy when tools present")
 		}
 
-		// Return SSE since proxy forced streaming
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"))
@@ -14229,7 +14119,6 @@ func TestOpenAIChatCompletions_ForcedStreamingPreservesMultipleChoices(t *testin
 
 func TestHandleResponses_GzipBody(t *testing.T) {
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-		// The upstream should receive the decompressed body
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("failed to read upstream body: %v", err)
@@ -14249,7 +14138,6 @@ func TestHandleResponses_GzipBody(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"resp-gz","object":"response","status":"completed"}`))
 	})
 
-	// Gzip-compress the request body
 	responsesReq := `{"model":"gpt-4","input":"Hello"}`
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
@@ -14285,7 +14173,6 @@ func TestHandleAnthropicMessages_GzipBody(t *testing.T) {
 		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\ndata: [DONE]\n\n"))
 	})
 
-	// Gzip-compress an Anthropic request
 	anthropicReq := `{"model":"claude-sonnet-4","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}`
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
@@ -14324,7 +14211,6 @@ func TestHandleResponses_ZstdBody(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"resp-zstd","object":"response","status":"completed"}`))
 	})
 
-	// Zstd-compress the request body
 	responsesReq := `{"model":"gpt-5.4","input":"Hello"}`
 	var buf bytes.Buffer
 	zw, err := zstd.NewWriter(&buf)

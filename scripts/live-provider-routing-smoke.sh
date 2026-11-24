@@ -1,27 +1,5 @@
 #!/usr/bin/env bash
 
-# Live schema-v2 model-route smoke against two controlled Responses-capable
-# OpenAI-compatible/Azure targets.
-#
-# The primary is reached through a loopback control proxy. The control proxy
-# first forwards to the real primary, then injects an authoritative HTTP 429 so
-# Vekil can safely exercise ordered failover to the real secondary. The smoke
-# also verifies public model identity, exact response-state target pinning,
-# unknown-state fail-closed behavior, and /stats.json attempt accounting.
-#
-# Required environment:
-#   LIVE_PROVIDER_ROUTING_PRIMARY_TYPE       azure-openai|openai-compatible
-#   LIVE_PROVIDER_ROUTING_PRIMARY_BASE_URL   API base ending before /responses
-#   LIVE_PROVIDER_ROUTING_PRIMARY_API_KEY
-#   LIVE_PROVIDER_ROUTING_PRIMARY_MODEL      physical model/deployment name
-#   LIVE_PROVIDER_ROUTING_SECONDARY_TYPE
-#   LIVE_PROVIDER_ROUTING_SECONDARY_BASE_URL
-#   LIVE_PROVIDER_ROUTING_SECONDARY_API_KEY
-#   LIVE_PROVIDER_ROUTING_SECONDARY_MODEL
-#
-# Both targets must implement the same native /responses contract. Azure base
-# URLs must use API-key auth and the OpenAI v1 form ending in /openai/v1;
-# generic OpenAI-compatible targets use bearer auth.
 
 set -euo pipefail
 
@@ -588,7 +566,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             response = opener.open(request, timeout=self.server.upstream_timeout)
         except urllib.error.HTTPError as error:
             response = error
-        except Exception as error:  # noqa: BLE001 - bounded local smoke proxy
+        except Exception as error:
             body = json.dumps(
                 {"error": {"message": f"primary control proxy upstream transport failure: {type(error).__name__}"}},
                 separators=(",", ":"),
@@ -858,8 +836,6 @@ wait_for_ready() {
       return 3
     fi
     if proxy_log_has_fatal; then
-      # The fatal line can arrive after the first collision check above.
-      # Reclassify the now-observed failure before deciding not to retry.
       if proxy_log_has_address_in_use; then
         return 2
       fi

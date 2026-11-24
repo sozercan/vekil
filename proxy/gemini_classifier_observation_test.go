@@ -10,15 +10,6 @@ import (
 	"testing"
 )
 
-// Copilot's finding was not "this branch is wrong" but "you wired the OpenAI and
-// Anthropic stream paths and missed Gemini's" -- the third instance of the same
-// omission in this PR. Fixing the two branches by hand invites a fourth, so this
-// asserts the rule instead: any branch that binds a *chatExecutionError from a
-// stream failure must record its classifiers.
-//
-// Scope is the error-observing handlers. A branch that only inspects an
-// execution error for control flow (status mapping, shutdown checks) is exempt
-// via the allowlist below, which must stay short enough to read.
 func TestStreamErrorBranchesRecordClassifiers(t *testing.T) {
 	files, err := filepath.Glob("*_handler*.go")
 	if err != nil {
@@ -105,8 +96,6 @@ func streamErrorObservationBranch(fset *token.FileSet, src []byte, stmt *ast.IfS
 	if stmt == nil {
 		return false, false
 	}
-	// Only branches that observe something -- a pure control-flow check
-	// (status mapping, shutdown) is not an observation site.
 	body := nodeText(fset, src, stmt.Body)
 	if !strings.Contains(body, "observe") {
 		return false, false

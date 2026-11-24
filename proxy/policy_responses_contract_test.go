@@ -103,8 +103,6 @@ func TestPolicyResponsesTranslationContractKeepsPolicyLimits(t *testing.T) {
 func TestResponsesChatTranslationContractOwnsLimitsAndMessages(t *testing.T) {
 	contract := testResponsesChatTranslationContract()
 
-	// A body larger than the policy ceiling is accepted by a broader contract
-	// without truncating its text.
 	large := strings.Repeat("b", policyResponsesMaxRequestBytes+1024)
 	translated, err := translateResponsesRequestToChat([]byte(`{"model":"m","input":"`+large+`"}`), contract)
 	if err != nil {

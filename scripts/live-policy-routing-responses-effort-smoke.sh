@@ -1,25 +1,5 @@
 #!/usr/bin/env bash
 
-# Focused live semantic-policy smoke for Responses effort overrides.
-#
-# The caller supplies an already-authenticated loopback Vekil bridge. This
-# harness inserts a metadata-only capture shim, runs one policy proxy whose two
-# terminal tiers both target GPT-5.6 Luna utility, and proves prompt-selected low/high
-# effort overrides conflicting public Responses values. Haiku classifies each
-# prompt through native Chat without reasoning effort or a no-store guarantee.
-# Request content is never logged.
-#
-# Required environment:
-#   LIVE_POLICY_ROUTING_RESPONSES_BRIDGE_BASE_URL   loopback bridge root, e.g. http://127.0.0.1:12345
-#
-# Optional environment:
-#   PROXY_BIN                                 default: ./vekil
-#   LIVE_POLICY_ROUTING_RESPONSES_MODEL             default: gpt-5.6-luna-utility
-#   LIVE_POLICY_ROUTING_RESPONSES_CLASSIFIER_MODEL  default: claude-haiku-4.5
-#   LIVE_POLICY_ROUTING_RESPONSES_PUBLIC_MODEL      default: vekil-live-semantic-effort
-#   LIVE_POLICY_ROUTING_RESPONSES_SMOKE_DIR         explicit artifact directory
-#   LIVE_POLICY_ROUTING_RESPONSES_KEEP_ARTIFACTS=0  delete artifacts after success
-#   SMOKE_*                                    bounded timeout overrides
 
 set -euo pipefail
 
@@ -231,8 +211,6 @@ fetch_and_validate_bridge_models() {
   jq -e --arg model "${CLASSIFIER_MODEL}" '
     [.data[]?
       | select(.id == $model)
-      # Legacy Copilot Chat models list no endpoints; Vekil treats them as
-      # supporting every endpoint.
       | select((.supported_endpoints // []) | length == 0 or index("/chat/completions") != null)
     ] | length == 1
   ' "${MODELS_JSON}" >/dev/null || die "bridge must advertise ${CLASSIFIER_MODEL} with native /chat/completions"

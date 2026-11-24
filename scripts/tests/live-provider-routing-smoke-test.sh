@@ -574,7 +574,6 @@ PY_REDACTION
 }
 
 assert_readiness_collision_interleaving() (
-  # Load only the real readiness/log functions, never the credentialed main.
   trap - EXIT INT TERM
   local name scenario expected status
   for name in proxy_log_has_address_in_use proxy_log_has_fatal wait_for_ready; do
@@ -586,8 +585,6 @@ assert_readiness_collision_interleaving() (
   proxy_pid=0
   for scenario in collision fatal; do
     : > "${PROXY_LOG}"
-    # The initial collision check sees no log. The fatal line appears while
-    # checking process liveness, before the next real log read.
     process_is_running() {
       if [[ "${scenario}" == collision ]]; then
         printf '%s\n' '{"level":"fatal","error":"listen: bind: address already in use"}' >> "${PROXY_LOG}"

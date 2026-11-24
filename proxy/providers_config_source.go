@@ -91,9 +91,6 @@ func parseProvidersConfigURL(source string) (*url.URL, bool, error) {
 	return parsed, true, nil
 }
 
-// ProvidersConfigSourceDisplay returns a source suitable for user-visible
-// output. Local paths are unchanged; URL credentials, queries, and fragments
-// are omitted so signed URLs and userinfo are not exposed in logs or errors.
 func ProvidersConfigSourceDisplay(source string) string {
 	source = strings.TrimSpace(source)
 	scheme, remote := providersConfigSourceScheme(source)

@@ -6,11 +6,6 @@ import (
 	"testing"
 )
 
-// A JSON escape is decoded by the parse but invisible to a byte scan, so the
-// `bytes.Contains` fast path this function used to open with let a carrier
-// through: the raw body held no literal `vekil1.`, the helper returned early,
-// and vekil's own Copilot reasoning was forwarded to Anthropic. The escape can
-// sit on any character, so no pre-check over unparsed bytes can be sound.
 func TestStripVekilCarrierBlocksSeesEscapedPrefix(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -34,8 +29,6 @@ func TestStripVekilCarrierBlocksSeesEscapedPrefix(t *testing.T) {
 			if stripped != 1 {
 				t.Fatalf("stripped = %d, want 1 -- the carrier reached Anthropic", stripped)
 			}
-			// The decoded prefix must be gone from the OUTPUT in decoded form, not
-			// merely absent as literal bytes.
 			var root struct {
 				Messages []struct {
 					Content json.RawMessage `json:"content"`
@@ -64,8 +57,6 @@ func TestStripVekilCarrierBlocksSeesEscapedPrefix(t *testing.T) {
 	}
 }
 
-// A body with no carrier at all must come back untouched, or the fast path's
-// removal would have turned every direct-Anthropic request into a rewrite.
 func TestStripVekilCarrierBlocksLeavesCleanBodyAlone(t *testing.T) {
 	body := []byte(`{"model":"claude-x","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"anthropic-native-sig"}]}]}`)
 	sanitized, stripped := stripVekilCarrierBlocks(body)

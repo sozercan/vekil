@@ -160,11 +160,6 @@ type routeOperationAttemptUpdate struct {
 	version uint64
 }
 
-// routeOperationMutex publishes trace mutations to the physical-attempt record
-// after releasing the operation lock. Several route-surface helpers live outside
-// this file and mutate accepted traces directly while holding o.mu; keeping the
-// notification at the lock boundary makes those late reclassifications part of
-// the operation lifecycle without coupling them to stats polling.
 type routeOperationMutex struct {
 	sync.Mutex
 	owner atomic.Pointer[routeOperation]
@@ -198,13 +193,11 @@ func (m *routeOperationMutex) Unlock() {
 type routeOperation struct {
 	mu routeOperationMutex
 
-	id           string
-	route        *modelRoute
-	inbound      context.Context
-	chatPlan     *chatOperationPlan
-	conversation *conversationTurn
-	// clientUserAgent identifies the client for conversation recovery rules
-	// that depend on its verified behavior.
+	id              string
+	route           *modelRoute
+	inbound         context.Context
+	chatPlan        *chatOperationPlan
+	conversation    *conversationTurn
 	clientUserAgent string
 
 	remainingTargetAttempts int
@@ -382,9 +375,6 @@ func (o *routeOperation) registerAttemptRecord(sequence int, record *routeAttemp
 	o.mu.Unlock()
 }
 
-// attemptUpdatesLocked returns the newest retained trace for every registered
-// physical attempt. The caller holds o.mu; the returned records are reconciled
-// only after the lock is released by routeOperationMutex.Unlock.
 func (o *routeOperation) attemptUpdatesLocked() []routeOperationAttemptUpdate {
 	if o == nil || len(o.attemptRecords) == 0 || len(o.trace) == 0 {
 		return nil
@@ -512,9 +502,6 @@ func (o *routeOperation) reserveSendAtDispatch(ctx context.Context, shuttingDown
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	// This lock-protected check is the dispatch linearization point. Cancellation
-	// observed before it closes admission; cancellation after it races the active
-	// detached attempt rather than authorizing another attempt.
 	if shuttingDown || (ctx != nil && ctx.Err() != nil) {
 		return false, routeRetrySuppressedLifecycle
 	}
@@ -993,10 +980,9 @@ func (b *explicitRoutePreparedBody) cancelRouteAttempt() {
 }
 
 type capturedRouteResponse struct {
-	statusCode int
-	header     http.Header
-	body       []byte
-	// An incomplete capture cannot establish that no work was performed.
+	statusCode     int
+	header         http.Header
+	body           []byte
 	bodyIncomplete bool
 	request        *http.Request
 	upstreamID     string
@@ -1008,9 +994,6 @@ func captureRouteResponse(resp *http.Response) (*capturedRouteResponse, bool) {
 	if resp == nil {
 		return nil, true
 	}
-	// Preserve only a recognized upstream correlation ID before sanitizing the
-	// captured response. The proxy-owned X-Vekil-Request-ID is deliberately not
-	// eligible, so an upstream cannot spoof the logical operation ID in traces.
 	upstreamID := responsesUpstreamRequestID(resp.Header)
 	header := resp.Header.Clone()
 	sanitizeExplicitRouteResponseHeaders(header)
@@ -1063,9 +1046,6 @@ func captureRouteResponse(resp *http.Response) (*capturedRouteResponse, bool) {
 		return captured, true
 	case <-timer.C:
 		captured.bodyIncomplete = true
-		// The read goroutine remains the sole response-body owner. Canceling the
-		// dedicated request context unblocks a conforming net/http response body;
-		// that same owner then performs the only Close.
 		cancelRouteAttemptBody(resp.Body)
 		return captured, false
 	}
@@ -1079,8 +1059,6 @@ func (c *capturedRouteResponse) response() *http.Response {
 	header.Del("Content-Length")
 	request := c.request
 	if c.bodyIncomplete && request != nil {
-		// Chat's outer adapter may capture this response again. Truncation or
-		// a failed read must not become a certified rejection on that pass.
 		request = request.WithContext(context.WithValue(request.Context(), incompleteRouteCaptureContextKey{}, true))
 	}
 	return &http.Response{
@@ -1111,10 +1089,6 @@ const (
 	routeAttemptObservationJSONDepthMax = 128
 )
 
-// routeAttemptTailBuffer retains only the most recent diagnostic bytes. It
-// grows geometrically up to the fixed bound, then becomes a ring so post-cap
-// reads overwrite in place instead of allocating and copying a fresh 64 KiB
-// suffix for every chunk.
 type routeAttemptTailBuffer struct {
 	buf      []byte
 	start    int
@@ -1151,8 +1125,6 @@ func (b *routeAttemptTailBuffer) append(p []byte) {
 		b.start = 0
 	}
 
-	// Once full, appending k bytes drops the oldest k bytes. Writing at start
-	// performs both operations without moving the retained suffix.
 	written := copy(b.buf[b.start:], p)
 	copy(b.buf, p[written:])
 	b.start = (b.start + len(p)) % routeAttemptObservationTail
@@ -1252,10 +1224,6 @@ const (
 	routeAttemptJSONNumberExponentDigits
 )
 
-// routeAttemptJSONValidator validates one JSON object without retaining its
-// values. The envelope extractor intentionally skips large unselected fields;
-// this parallel parser prevents balanced-but-malformed composites or scalars
-// from being mistaken for a valid completed response.
 type routeAttemptJSONValidator struct {
 	stack [routeAttemptObservationJSONDepthMax]routeAttemptJSONContainer
 	depth int
@@ -1494,9 +1462,6 @@ func (v *routeAttemptJSONValidator) startLiteral(literal string) {
 	v.literalIndex = 1
 }
 
-// observeNumberByte returns true when c was consumed as part of the number.
-// A false return with a valid terminal number asks the caller to finish the
-// value and reprocess c as structural JSON.
 func (v *routeAttemptJSONValidator) observeNumberByte(c byte) bool {
 	switch v.number {
 	case routeAttemptJSONNumberMinus:
@@ -1669,9 +1634,6 @@ type routeAttemptJSONField struct {
 	overflow bool
 }
 
-// routeAttemptEnvelopeExtractor incrementally captures only selected top-level
-// JSON fields. Large output/content values are scanned but never retained, so a
-// complete non-streaming envelope can be classified without buffering its body.
 type routeAttemptEnvelopeExtractor struct {
 	state     routeAttemptJSONState
 	validator routeAttemptJSONValidator
@@ -2173,7 +2135,6 @@ func (o *routeAttemptResponseObserver) observe(p []byte) {
 		return
 	}
 	o.mu.Lock()
-	// Messages accounting reads parsed events and never uses the diagnostic tail.
 	if !o.usageOnly || !o.streaming || o.endpoint != providerEndpointMessages {
 		o.tail.append(p)
 	}
@@ -2885,8 +2846,6 @@ func (b *routeAttemptObservedBody) Read(p []byte) (int, error) {
 		}
 		b.observer.finish(errors.Is(err, io.EOF), err)
 		if errors.Is(err, io.EOF) && b.observer.trace.Decision == routeRetryAccepted {
-			// Accepted EOF proves completion after final throttle accounting.
-			// Abandoned attempts retain ownership until transport cleanup ends.
 			b.observer.azureTraffic.permit.completeResponseBody()
 		}
 		b.observer.azureTraffic.permit.release()
@@ -3235,8 +3194,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		var permit *copilotInferencePermit
 		var blocked *http.Response
 		var admissionErr error
-		// Either provider's local cooldown can reject before dispatch. Verify
-		// the original authenticated owner before that rejection can migrate.
 		if migrationReady {
 			_, admissionErr = h.validateDurableRequestOwner(req, route, target, operation)
 		}
@@ -3247,8 +3204,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		if blocked == nil && admissionErr == nil {
 			azurePermit, blocked, admissionErr = h.acquireAzureRouteInference(req, routeCanSwitchAfterAttempt(ctx, operation, endpoint, kind, h.ShuttingDown()) || migrationReady)
 			if blocked == nil && admissionErr == nil && azurePermit != nil && target.provider.azureAuthMode() == providerAuthModeAzureIdentity {
-				// A recovery queue can outlive the token attached during request
-				// construction. Refresh before reserving a physical send.
 				refreshCtx, cancelRefresh := copilotInferenceAdmissionContext(req)
 				admissionErr = h.applyProviderHeaders(req.WithContext(refreshCtx), target.provider, dispatchPath)
 				cancelRefresh()
@@ -3292,8 +3247,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			}
 			break
 		}
-		// Admission may refresh Azure credentials. Capture the final authenticated
-		// request before any ownership claim or physical send on every endpoint.
 		stateIdentity, stateErr := h.validateDurableRequestOwner(req, route, target, operation)
 		if stateErr != nil {
 			permit.release()
@@ -3431,9 +3384,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		}
 
 		if stream && resp.StatusCode == http.StatusOK {
-			// A client that owns retries must see the provider's 200, even
-			// when the very first SSE event reports a rate limit. Leave state
-			// binding, attempt observation and the ordinary SSE relay in place.
 			accepted := resp
 			var streamFailure *routeAttemptFailure
 			if !preserveStream {
@@ -3493,10 +3443,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 			if err := h.bindExplicitResponseHeaders(info, accepted.Header); err != nil {
 				failure := routeAttemptFailure{err: err, attribution: attribution, delivery: requestDeliveredOrAmbiguous, progress: upstreamProgressAllowedPreamble, commitment: downstreamCommitmentNone, decision: routeRetrySuppressedState, statusCode: accepted.StatusCode, upstreamID: responsesUpstreamRequestID(accepted.Header), outcome: routeAttemptOutcomeFailed}
 				trace := routeAttemptTrace{Sequence: sequence, TargetID: target.id, ProviderID: target.provider.id, Kind: attemptKind, StatusCode: accepted.StatusCode, Delivery: failure.delivery, Progress: failure.progress, Commitment: failure.commitment, Decision: failure.decision, UpstreamID: failure.upstreamID}
-				// The prepared stream can already contain a terminal usage event even
-				// though its response-header state is invalid. Observe and drain it
-				// internally before discarding the response so physical and wasted
-				// spend is retained without exposing any prepared bytes downstream.
 				accepted = observeRouteAttemptResponse(accepted, attemptRecord, operation, trace, observation, endpoint, true)
 				cleanupDone := drainRouteAttemptBodyWithTimeout(accepted.Body, upstreamErrorDetailDrainTimeout)
 				azurePermit.release()
@@ -3541,8 +3487,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				}
 				exposed := captured
 				if opaque429 {
-					// The adapter certified this complete raw plaintext rejection.
-					// Don't hand the opaque body to the durable JSON/state writer.
 					exposed = captured.safePlaintextRateLimit(retryAfter)
 				} else if retryAfter != "" {
 					if _, valid := retryAfterHeaderSeconds(headerGetCI(captured.header, "Retry-After")); !valid {
@@ -3564,8 +3508,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				}
 				break
 			}
-			// The status was potentially retryable but the adapter could not prove
-			// pre-execution rejection. Return it as an ambiguous terminal response.
 			captured.recordFinalUpstreamID(operation.inbound)
 			capturedObservation = captured
 			unsafeRejection = captured.bodyIncomplete || !routeHTTPRejectionBodyAllowsReplay(captured) || opaque429
@@ -3581,11 +3523,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 				if capturedObservation != nil {
 					cleanupDone = true
 				} else {
-					// A 2xx Chat/Messages response can report usage even when its
-					// response-header state is invalid. Observe and drain through the
-					// bounded attempt body before discarding it so that provider spend is
-					// retained as physical and wasted usage. The drain is time-bounded;
-					// a stalled body is closed asynchronously and cannot authorize failover.
 					resp = observeRouteAttemptResponse(resp, attemptRecord, operation, trace, observation, endpoint, stream)
 					cleanupDone = drainRouteAttemptBodyWithTimeout(resp.Body, upstreamErrorDetailDrainTimeout)
 				}
@@ -3620,9 +3557,6 @@ func (h *ProxyHandler) executeExplicitRouteRequestPath(ctx context.Context, rout
 		}
 		attribution.recordFinal(operation.inbound)
 		if operation.conversation != nil && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
-			// A non-success response without the adapter's non-execution proof
-			// cannot be replayed. This includes redirects: clients must not follow
-			// Location and repeat a protected turn outside this route.
 			_ = drainRouteAttemptBodyWithTimeout(resp.Body, upstreamErrorDetailDrainTimeout)
 			h.logConversationRecovery(operation, "blocked", target.id, "execution_uncertain")
 			operation.conversation.mu.Lock()
@@ -3697,8 +3631,6 @@ func (h *ProxyHandler) singleInferenceSend(req *http.Request, observation *route
 	azurePermit.holdResponseBody()
 	var upstreamEnd *upstreamBodyEnd
 	if !handled {
-		// The native WebSocket body reports the same close when Vekil rejects a
-		// frame as when the peer disconnects, so its ends stay uncertain.
 		info, _ := req.Context().Value(explicitRouteResponseContextKey{}).(explicitRouteResponseInfo)
 		upstreamEnd = info.upstreamEnd
 	}
@@ -3741,9 +3673,6 @@ func prepareRouteTargetBody(body []byte, requestedModel, endpoint string, route 
 		requestedModel = route.public.id
 	}
 
-	// Every target attempt starts from its own copy of the immutable logical
-	// request. Provider-specific Responses policy runs only after route/target
-	// selection so one attempt cannot mutate failover.
 	prepared := append([]byte(nil), body...)
 	if endpoint == providerEndpointResponses {
 		prepared, _ = stripUnsupportedResponsesRequestFields(prepared, target.provider)
@@ -3894,9 +3823,6 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 		h.observeCopilotResponseFailure(resp.Request, *result.failure, responsesFailureHeaders(*result.failure, resp.Header))
 	}
 	if err == nil && operation.inbound != nil && operation.inbound.Err() != nil {
-		// Inbound cancellation owns the downstream response even if the peek
-		// pump publishes a simultaneous decision. Do not commit a target or a
-		// 200 header for a client that has already gone away.
 		result, hasResult, awaitSource, err = peekResult{}, false, responsesPreparedAwaitInbound, operation.inbound.Err()
 	}
 	if err != nil {
@@ -3965,10 +3891,6 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 		}
 	}
 	if hasResult && result.decision == responsesPeekDecisionTranslate && result.failure != nil {
-		// This terminal failure is intentionally not replay-safe (for example, it
-		// carries partial usage), so the route must not switch targets. Preserve the
-		// existing client failure-turn accounting while also recording the same
-		// reported spend in the physical/wasted ledger.
 		observeResponsesUsage(operation.inbound, result.failure.Response.Usage)
 		cleanupDone := prepared.abortAndWait(upstreamErrorDetailDrainTimeout)
 		failureHeaders := responsesFailureHeaders(*result.failure, resp.Header)
@@ -4003,14 +3925,7 @@ func (h *ProxyHandler) prepareExplicitResponsesStream(ctx context.Context, opera
 	return accepted, nil
 }
 
-// newResponsesPreparedStreamWithPolicy is the route-aware variant. Legacy
-// callers retain their current header-sensitive preamble behavior; explicit
-// priority routes always hold response.created/response.in_progress until a
-// semantic event, terminal event, timeout, or byte bound makes the target
-// irrevocable.
 func newResponsesPreparedStreamWithPolicy(resp *http.Response, maxPeekBytes int, observeTerminal, holdPreamble bool) *responsesPreparedStream {
-	// Explicit priority routes commit at the configured peek byte bound unless
-	// quota evidence extends the hold to the larger compatibility cap.
 	heldPreambleMaxBytes := maxPeekBytes
 	if _, quotaBytes, ok := explicitResponsesQuotaHold(resp.Header); ok {
 		heldPreambleMaxBytes = quotaBytes
@@ -4018,13 +3933,6 @@ func newResponsesPreparedStreamWithPolicy(resp *http.Response, maxPeekBytes int,
 	return newResponsesPreparedStreamConfigured(resp, maxPeekBytes, observeTerminal, holdPreamble, heldPreambleMaxBytes)
 }
 
-// explicitResponsesQuotaHold extends precommit bounds for an explicit route
-// whose upstream headers already report exhausted quota. Azure can admit such a
-// stream, emit its preamble after prefill of a large prompt, and only then fail
-// with a 429 that the next target could serve. Echoed instructions and tools
-// can also push that preamble past the ordinary byte bound. Semantic output
-// still commits immediately, so healthy streams only wait for their first
-// output event.
 func explicitResponsesQuotaHold(headers http.Header) (time.Duration, int, bool) {
 	if !responsesQuotaEvidence(headers) {
 		return 0, 0, false
@@ -4160,9 +4068,6 @@ func drainRouteAttemptBodyWithTimeout(body io.ReadCloser, timeout time.Duration)
 
 	var timer *time.Timer
 	if timeout > 0 {
-		// Start the bound before scheduling the owner so cleanup admission can never
-		// add unbounded backpressure. The owner is the only goroutine that reads or
-		// closes this response body.
 		timer = time.NewTimer(timeout)
 		defer timer.Stop()
 	}
@@ -4182,9 +4087,6 @@ func drainRouteAttemptBodyWithTimeout(body io.ReadCloser, timeout time.Duration)
 		return true
 	case <-timer.C:
 		publishRouteAttemptBodyCleanupTimeout(body)
-		// Request-context cancellation interrupts Read for conforming net/http
-		// transports. Ownership stays with the drain goroutine, which performs the
-		// sole Close after Read returns.
 		cancelRouteAttemptBody(body)
 		return false
 	}

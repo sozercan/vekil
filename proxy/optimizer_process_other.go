@@ -8,9 +8,6 @@ import (
 	"os/exec"
 )
 
-// Unsupported targets use direct-process termination plus Cmd.WaitDelay's
-// bounded pipe cleanup. Unix and Windows builds use real process-tree
-// containment instead; this fallback exists only so non-server targets compile.
 type fallbackOptimizerProcessController struct {
 	cmd *exec.Cmd
 }

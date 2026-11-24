@@ -1,4 +1,3 @@
-// Package logger provides structured JSON logging with level filtering.
 package logger
 
 import (
@@ -10,7 +9,6 @@ import (
 	"time"
 )
 
-// Level represents the severity of a log message.
 type Level int
 
 const (
@@ -29,7 +27,6 @@ var levelNames = map[Level]string{
 	LevelFatal: "fatal",
 }
 
-// ParseLevel parses a log level string. Defaults to info for unknown values.
 func ParseLevel(s string) Level {
 	switch s {
 	case "debug":
@@ -43,19 +40,16 @@ func ParseLevel(s string) Level {
 	}
 }
 
-// Logger writes structured JSON log entries to stderr.
 type Logger struct {
 	level  Level
 	writer io.Writer
 	mu     sync.Mutex
 }
 
-// New creates a Logger that emits messages at or above the given level.
 func New(level Level) *Logger {
 	return NewWithWriter(level, os.Stderr)
 }
 
-// NewWithWriter creates a Logger that writes to w. A nil writer falls back to stderr.
 func NewWithWriter(level Level, w io.Writer) *Logger {
 	if w == nil {
 		w = os.Stderr
@@ -63,7 +57,6 @@ func NewWithWriter(level Level, w io.Writer) *Logger {
 	return &Logger{level: level, writer: w}
 }
 
-// Enabled reports whether a message at level would be emitted.
 func (l *Logger) Enabled(level Level) bool {
 	return l != nil && level >= l.level
 }
@@ -86,7 +79,6 @@ func (l *Logger) log(level Level, msg string, fields map[string]interface{}) {
 	_ = json.NewEncoder(l.writer).Encode(e)
 }
 
-// Debug logs a message at debug level.
 func (l *Logger) Debug(msg string, fields ...Field) {
 	if !l.Enabled(LevelDebug) {
 		return
@@ -94,7 +86,6 @@ func (l *Logger) Debug(msg string, fields ...Field) {
 	l.log(LevelDebug, msg, toMap(fields))
 }
 
-// Info logs a message at info level.
 func (l *Logger) Info(msg string, fields ...Field) {
 	if !l.Enabled(LevelInfo) {
 		return
@@ -102,7 +93,6 @@ func (l *Logger) Info(msg string, fields ...Field) {
 	l.log(LevelInfo, msg, toMap(fields))
 }
 
-// Warn logs a message at warn level.
 func (l *Logger) Warn(msg string, fields ...Field) {
 	if !l.Enabled(LevelWarn) {
 		return
@@ -110,7 +100,6 @@ func (l *Logger) Warn(msg string, fields ...Field) {
 	l.log(LevelWarn, msg, toMap(fields))
 }
 
-// Error logs a message at error level.
 func (l *Logger) Error(msg string, fields ...Field) {
 	if !l.Enabled(LevelError) {
 		return
@@ -118,24 +107,20 @@ func (l *Logger) Error(msg string, fields ...Field) {
 	l.log(LevelError, msg, toMap(fields))
 }
 
-// Fatal logs a message at fatal level and exits with code 1.
 func (l *Logger) Fatal(msg string, fields ...Field) {
 	l.log(LevelFatal, msg, toMap(fields))
 	os.Exit(1)
 }
 
-// Field is a key-value pair for structured log context.
 type Field struct {
 	Key   string
 	Value interface{}
 }
 
-// F creates a log field.
 func F(key string, value interface{}) Field {
 	return Field{Key: key, Value: value}
 }
 
-// Err creates an error log field.
 func Err(err error) Field {
 	return Field{Key: "error", Value: fmt.Sprintf("%v", err)}
 }

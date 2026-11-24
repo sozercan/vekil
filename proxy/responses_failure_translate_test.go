@@ -1498,9 +1498,6 @@ func (r *blockingReadCloser) Close() error {
 	return nil
 }
 
-// TestStreamResponsesPipeRecordsUsage verifies the streaming POST /v1/responses
-// path observes token usage from the response.completed SSE event into the
-// per-request RequestSummary, while forwarding the stream bytes unchanged.
 func TestStreamResponsesPipeRecordsUsage(t *testing.T) {
 	sse := "event: response.created\n" +
 		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n" +
@@ -1523,7 +1520,6 @@ func TestStreamResponsesPipeRecordsUsage(t *testing.T) {
 	if d.cached != 40 || d.reasoning != 18 {
 		t.Fatalf("streamed detail usage not recorded: cached=%d reasoning=%d", d.cached, d.reasoning)
 	}
-	// The stream bytes must be forwarded to the client unchanged.
 	if got := rec.Body.String(); got != sse {
 		t.Fatalf("stream body altered.\n got: %q\nwant: %q", got, sse)
 	}
@@ -1844,8 +1840,6 @@ func TestPeekAndForwardResponses_LifecycleCancellationWakesPrecommitAwait(t *tes
 				responsesPrecommitMaxPeekBytes,
 				"",
 				streamLifecycleHooks{
-					// Deliberately false: the HTTP path must wake from upstreamCtx and
-					// must not depend on a later reader-side cancellation sample.
 					transportCanceled: func() bool { return false },
 					suppressStats:     func() { suppressRequestStats(ctx) },
 					writePrecommitShutdown: func() {
@@ -1998,16 +1992,11 @@ func TestPeekAndForwardResponses_PrecommitAwaitTerminationOverHTTP(t *testing.T)
 		clientFinished := false
 		switch mode {
 		case "deadline":
-			// The lifecycle-rooted upstream timeout fires on its own.
 		case "upstream_cancel":
 			control.cancel()
 		case "shutdown":
 			h.BeginShutdown()
 		case "client_cancel":
-			// First wait for the actual HTTP client to observe its cancellation,
-			// then release the server-side derivative. Returning the handler before
-			// Client.Do has processed cancellation can race net/http's implicit empty
-			// 200 response and make this transport assertion flaky.
 			cancelRequest()
 			select {
 			case client = <-clientDone:

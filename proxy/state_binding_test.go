@@ -175,8 +175,6 @@ func TestStateBindingStoreCollisionCreatesTombstoneUntilCollisionExpiry(t *testi
 		t.Fatalf("stats after collision = %#v, want one tombstone and one collision", stats)
 	}
 
-	// The collision starts a fresh fail-closed TTL, so the tombstone survives
-	// beyond the original owner's expiry.
 	clock.Advance(2 * time.Minute)
 	requireStateBindingResult(t, store.lookup(stateBindingTypeResponseID, "resp-collision"), stateBindingLookupConflict, stateBindingOwner{})
 	requireStateBindingResult(t, store.bind(stateBindingTypeResponseID, "resp-collision", ownerA), stateBindingLookupConflict, stateBindingOwner{})
@@ -197,7 +195,7 @@ func TestStateBindingStoreEvictsLeastRecentlyUsedEntry(t *testing.T) {
 
 	store.bind(stateBindingTypeResponseID, "resp-1", owner)
 	store.bind(stateBindingTypeResponseID, "resp-2", owner)
-	store.lookup(stateBindingTypeResponseID, "resp-1") // resp-1 becomes most recent.
+	store.lookup(stateBindingTypeResponseID, "resp-1")
 	store.bind(stateBindingTypeResponseID, "resp-3", owner)
 
 	requireStateBindingResult(t, store.lookup(stateBindingTypeResponseID, "resp-1"), stateBindingLookupKnown, owner)
@@ -528,7 +526,7 @@ func TestStateBindingStoreResolveMissingProofPrecedence(t *testing.T) {
 		requireStateBindingResult(t, store.resolveForRoute("route-a", "", tokens), stateBindingLookupConflict, stateBindingOwner{})
 	}
 
-	store.bind(a.stateType, a.value, ownerB) // A live conflict tombstone.
+	store.bind(a.stateType, a.value, ownerB)
 	for _, tokens := range [][]stateBindingToken{{a, missing}, {missing, a}, {{}, missing}, {missing, {}}} {
 		requireStateBindingResult(t, store.resolve(tokens), stateBindingLookupConflict, stateBindingOwner{})
 	}

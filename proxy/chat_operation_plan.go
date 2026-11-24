@@ -2,9 +2,6 @@ package proxy
 
 import "strings"
 
-// policyDecisionRecord is the bounded, content-free provenance retained for a
-// policy decision. It deliberately excludes request text, tool arguments,
-// classifier output, rationale, credentials, and physical deployment names.
 type policyDecisionRecord struct {
 	DownstreamReplayPassthrough bool
 	Category                    string
@@ -18,9 +15,6 @@ type policyDecisionRecord struct {
 	Truncated                   bool
 }
 
-// chatOperationPlan is the sealed logical execution snapshot produced before
-// the first terminal send. Candidate and metadata slices are defensively copied
-// so later catalog refreshes or caller mutation cannot change the operation.
 type chatOperationPlan struct {
 	operationID string
 
@@ -48,17 +42,13 @@ type chatOperationPlan struct {
 }
 
 type chatOperationPlanOptions struct {
-	OperationID string
-	EntryID     string
-	PublicID    string
-	RouteID     string
-	Route       *modelRoute
-	Contract    publicModelContract
-	// SelectedReasoningEffort is the policy-owned canonical Chat value sealed
-	// for the selected tier. Empty preserves ordinary non-managed behavior.
-	SelectedReasoningEffort string
-	// CompletedPolicyReplayRoutes allows only completed history to restore under
-	// another tier's exact binding on the same provider and upstream model.
+	OperationID                 string
+	EntryID                     string
+	PublicID                    string
+	RouteID                     string
+	Route                       *modelRoute
+	Contract                    publicModelContract
+	SelectedReasoningEffort     string
 	CompletedPolicyReplayRoutes []responsesChatReplayRoute
 
 	PolicyID             string
@@ -136,10 +126,6 @@ func clonePolicyOperationRoute(route *modelRoute, contract publicModelContract, 
 	cloned := *route
 	physicalEndpoints := append([]string(nil), route.public.endpoints...)
 	cloned.public = clonePublicModelContract(contract)
-	// The policy contract remains the client-visible Chat identity, while the
-	// sealed operation must retain the selected terminal route's physical wire
-	// endpoints so a Responses-backed target can execute Chat compatibility in
-	// process.
 	cloned.public.endpoints = physicalEndpoints
 	cloned.targets = cloneTargetBindings(candidates)
 	cloned.legacy = false
@@ -150,13 +136,6 @@ func (p chatOperationPlan) valid() bool {
 	return p.operationRoute != nil && p.publicID != "" && p.routeID != "" && len(p.candidates) > 0
 }
 
-// allowsResponsesReplayPassthrough reports whether a policy-planned Chat
-// continuation can safely preserve replay state owned by a downstream bridge.
-// Off and observe always select the baseline tier; requiring one sealed target
-// keeps that continuation pinned to the same deterministic route destination.
-// Target determinism does not create replica affinity: deployments that accept
-// downstream process-local replay IDs must use one bridge process or sticky
-// ingress to the replay-owning bridge, as documented for replay state.
 func (p chatOperationPlan) allowsResponsesReplayPassthrough() bool {
 	if !p.valid() || len(p.candidates) != 1 {
 		return false

@@ -28,14 +28,7 @@ const (
 	responsesChatReplayIDLength      = len(responsesChatReplayCallIDPrefix) + 22
 	responsesChatReplayMaxIDAttempts = 1024
 
-	// Anthropic caps tool_use IDs at 64 characters and clients echo minted IDs
-	// verbatim, so an ID that embeds its upstream ID must fit the same limit.
-	responsesChatReplayMaxIDLength = 64
-	// Copilot issues function-call IDs as "call_<opaque>". The marker and version
-	// keep the self-describing namespace narrow. The 88-bit per-group nonce keeps
-	// an upstream ID reused after eviction or restart from matching a newer group.
-	// The checksum provides public integrity, not authority. Route and projection
-	// authority remain in the replay store and signed carrier bindings.
+	responsesChatReplayMaxIDLength          = 64
 	responsesChatReplayUpstreamIDMarker     = "call_"
 	responsesChatReplaySelfIDVersion        = "v1_"
 	responsesChatReplaySelfIDNonceBytes     = 11
@@ -55,8 +48,6 @@ func responsesChatReplaySelfDescribingID(upstreamCallID string) (string, bool) {
 }
 
 func responsesChatReplaySelfDescribingIDWithNonce(upstreamCallID, nonce string) (string, bool) {
-	// Do not trim. A padded ID must fall back to the opaque form rather than mint
-	// an ID that resolves to a different value than the store and carrier bind.
 	if len(upstreamCallID) <= len(responsesChatReplayUpstreamIDMarker) ||
 		!strings.HasPrefix(upstreamCallID, responsesChatReplayUpstreamIDMarker) {
 		return "", false
@@ -72,8 +63,6 @@ func responsesChatReplaySelfDescribingIDWithNonce(upstreamCallID, nonce string) 
 	return proxyCallID, true
 }
 
-// responsesChatReplayUpstreamCallID is the inverse of the self-describing
-// minter. It reads only the ID, so it still works after store expiry or restart.
 func responsesChatReplayUpstreamCallID(proxyCallID string) (string, bool) {
 	proxyCallID = strings.TrimSpace(proxyCallID)
 	prefix := responsesChatReplayCallIDPrefix + responsesChatReplaySelfIDVersion
@@ -93,8 +82,6 @@ func responsesChatReplayUpstreamCallID(proxyCallID string) (string, bool) {
 	return upstreamCallID, true
 }
 
-// preparePublish accounts before the locked minter can detect a collision and
-// choose the opaque fallback. Charge whichever possible form is larger.
 func responsesChatReplayMintedIDSize(upstreamCallID string) int {
 	if proxyCallID, ok := responsesChatReplaySelfDescribingID(upstreamCallID); ok {
 		return max(len(proxyCallID), responsesChatReplayIDLength)
@@ -102,7 +89,6 @@ func responsesChatReplayMintedIDSize(upstreamCallID string) int {
 	return responsesChatReplayIDLength
 }
 
-// Anthropic's tool_use id charset, shared by both minted shapes.
 func isResponsesChatReplayIDCharset(value string) bool {
 	if value == "" {
 		return false
@@ -887,7 +873,6 @@ func (r responsesChatReplayRoute) equal(other responsesChatReplayRoute) bool {
 	return r.ProviderID == other.ProviderID && r.PublicModel == other.PublicModel && r.UpstreamModel == other.UpstreamModel && r.RouteID == other.RouteID && r.PolicyTier == other.PolicyTier
 }
 
-// Reports which side moved, so a degrade names it from the store, not from the client.
 func (g *responsesChatReplayGroup) matchesProjection(content []byte, projected []responsesChatReplayProjectedCall, original bool) (bool, string) {
 	if !bytes.Equal(g.assistantContent, content) {
 		return false, "content"
@@ -962,7 +947,7 @@ func replayGroupByteSize(route responsesChatReplayRoute, content []byte, outputI
 		size += sha256.Size * 2
 		size += replayOptionalDefaultsByteSize(call.visibleOptionalDefaults)
 		size += replayOptionalDefaultsByteSize(call.originalOptionalDefaults)
-		size += 8 // output item index accounting
+		size += 8
 	}
 	return size
 }

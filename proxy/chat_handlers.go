@@ -23,15 +23,8 @@ type chatCompletionsMode struct {
 	clientRequestedStreamUsage bool
 	forceUpstreamStream        bool
 	requestHasTools            bool
-	// injectedStreamUsage is true when the proxy added stream_options.include_usage
-	// to a streamed upstream request. If a strict OpenAI-compatible provider rejects
-	// that optional field with 400, the request can be retried once without it.
-	injectedStreamUsage bool
-	// injectedClientStreamUsage is true when the proxy added
-	// stream_options.include_usage to a client-requested stream that did not opt
-	// in. On the verbatim OpenAI passthrough the resulting upstream usage-only
-	// chunk must be dropped from the client stream (it never requested it).
-	injectedClientStreamUsage bool
+	injectedStreamUsage        bool
+	injectedClientStreamUsage  bool
 }
 
 type openAIChatRequestInspection struct {
@@ -265,8 +258,6 @@ func inspectPolicyOpenAIStreamChunk(eventType, data string) (*policyOpenAIStream
 			return nil, false
 		}
 		if len(choices) > 0 {
-			// Anthropic ingress represents one assistant message and never requests
-			// multiple Chat choices, so only a single choice at index zero is safe.
 			if len(choices) != 1 {
 				return nil, false
 			}
@@ -550,8 +541,6 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 		if resp == nil {
 			return nil, fmt.Errorf("upstream response is unavailable")
 		}
-		// The proxy-owned operation ID is authoritative. Never let a same-named
-		// upstream header overwrite the value installed on the client response.
 		sanitizeExplicitRouteResponseHeaders(resp.Header)
 
 		info, target, ok := explicitRouteTargetForResponse(operation, resp)
@@ -571,8 +560,6 @@ func (h *ProxyHandler) executeExplicitRouteSurfaceRequest(ctx context.Context, e
 				return resp, nil
 			}
 			if !explicitRouteSurfaceCertifiesHTTPRejection(target, endpoint, captured) {
-				// A bare/gateway 503 remains ambiguous. Return the bounded captured
-				// response and never release the target for another generation.
 				if accepted {
 					operation.reclassifyAcceptedRouteAttempt(info.targetID, statusCode, requestDeliveredOrAmbiguous, upstreamProgressUnknown, downstreamCommitmentNone, routeRetrySuppressedDelivery, upstreamID, false, true)
 				}
@@ -800,8 +787,6 @@ func explicitRouteSurfaceMayExplicitlyReject(target targetBinding, endpoint stri
 	if target.provider == nil || (statusCode != http.StatusServiceUnavailable && statusCode != 529) {
 		return false
 	}
-	// Phase 6 reuses the same provider overload envelope classifier as Responses,
-	// but still requires bounded body capture and code/type certification below.
 	if routeAdapterMayExplicitlyReject(target, providerEndpointResponses, statusCode) {
 		return true
 	}
@@ -1026,17 +1011,12 @@ func explicitRouteHasChatBackend(route *modelRoute, endpoint string) bool {
 	return false
 }
 
-// explicitChatExecutionEndpoint pins replay IDs to Responses, the only backend through which
-// this process can restore the hidden output behind them. A route with no Responses backend at
-// all, such as after a model switch onto a Chat-only target, cannot restore it here; with
-// degradeReplay the IDs then continue verbatim on native Chat and degraded reports that.
 func explicitChatExecutionEndpoint(route *modelRoute, body []byte, degradeReplay bool) (endpoint string, degraded bool, err error) {
 	if route == nil || route.legacy {
 		return "", false, nil
 	}
 	replay := chatRequestContainsResponsesReplayID(body)
 	hasResponses := explicitRouteHasChatBackend(route, providerEndpointResponses)
-	// One backend covers the ordered targets, including a Copilot failover target.
 	preferResponses := false
 	maxTargets := route.policy.maxTargetAttempts
 	if maxTargets <= 0 {
@@ -1085,8 +1065,6 @@ func policyAwareChatExecutionEndpoint(operation *routeOperation, body []byte, de
 		plan.allowsResponsesReplayPassthrough() && explicitRouteHasChatBackend(operation.route, providerEndpointChatCompletions) {
 		return providerEndpointChatCompletions, nil
 	}
-	// The planner already bound or refused this replay by its recorded tier; a policy
-	// operation keeps that fail-closed binding rather than continuing without it.
 	endpoint, _, err := explicitChatExecutionEndpoint(operation.route, body, degradeReplay && !planned)
 	return endpoint, err
 }
@@ -1130,12 +1108,6 @@ func attachExplicitChatExecutionErrorRoute(err error, route *modelRoute, target 
 	attachChatExecutionErrorRoute(err, explicitResolvedChatRouteForTarget(route, target, endpoint, backend))
 }
 
-// withAdmittedExplicitRouteOperation establishes an explicit-route operation as
-// soon as the HTTP surface can resolve the requested model. Admission does not
-// require the surface endpoint to be supported: endpoint eligibility and strict
-// request validation must still return the proxy-owned operation ID. Later
-// execution attaches this operation to its upstream context and reuses it via
-// withExplicitRouteOperation.
 func (h *ProxyHandler) withAdmittedExplicitRouteOperation(ctx, inbound context.Context, model, endpoint string) (context.Context, *routeOperation, *modelRoute, error) {
 	model = strings.TrimSpace(model)
 	if model != "" && !h.modelAllowedForRequest(model, endpoint) {
@@ -1183,9 +1155,6 @@ func withPlannedChatOperation(ctx, inbound context.Context, plan chatOperationPl
 	return withRouteOperation(ctx, operation), operation, nil
 }
 
-// anthropicDegradesUnrestorableReplay is Anthropic ingress's replay fallback switch, shared
-// by its Messages and count-token paths. Endpoint admission and execution must read the same
-// value, or one refuses a turn the other would have continued.
 const anthropicDegradesUnrestorableReplay = true
 
 func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, model string, body []byte, degradeReplay bool) (context.Context, *routeOperation, *modelRoute, error) {
@@ -1224,8 +1193,6 @@ func (h *ProxyHandler) withChatExecutionRoute(ctx, inbound context.Context, mode
 	}
 	ctx, operation, admitted, err := h.withExplicitRouteOperation(ctx, inbound, model, endpoint)
 	if err == nil && degraded {
-		// Logged once per admitted request: execution can re-enter endpoint selection,
-		// as the count-token probe's protocol-recovery retry does.
 		h.logNativeChatReplayDegrade("", route.public.id, route.public.routeID)
 	}
 	return ctx, operation, admitted, err
@@ -1332,15 +1299,10 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 		}
 		return responsesChatRequestPlan{}, targetBinding{}, missing
 	}
-	// Candidate selection deliberately expects missing replay state. Keep those probes
-	// silent; the terminal degrade pass below emits the one request-level outcome.
 	plan, target, err := restoring(false, nil)
 	if err == nil || !options.DegradeUnrestorableReplay {
 		return plan, target, err
 	}
-	// A projection mismatch proves this target owns the live replay group, even though the
-	// client's visible turn drifted. Retry that exact target so the route cannot jump to an
-	// earlier candidate whose store-missing self-ID fallback would also accept the turn.
 	if isResponsesChatReplayProjectionError(err) {
 		if degraded, degradeErr := translateForTarget(target, true, log); degradeErr == nil {
 			if operation != nil {
@@ -1355,9 +1317,6 @@ func (h *ProxyHandler) prepareExplicitResponsesChatRequest(operation *routeOpera
 	if !isMissingResponsesChatReplayError(err) {
 		return plan, target, err
 	}
-	// Every candidate refused the same transcript, so the refusal has stopped telling
-	// them apart and the probe is spent. Retry once, letting the turn come back from
-	// the transcript: on Anthropic the alternative is a conversation nobody can repair.
 	if degraded, degradedTarget, degradeErr := restoring(true, log); degradeErr == nil {
 		return degraded, degradedTarget, nil
 	}
@@ -1516,10 +1475,6 @@ func (h *ProxyHandler) executeRoutedChatCompletions(ctx context.Context, body []
 	return result, nil
 }
 
-// forcePolicyOpenAIChatReasoningEffort applies the policy-selected tier value
-// to canonical Chat before native-Chat versus Responses-backed execution is
-// chosen. Replacing an incoming value is deliberate: policy profiles that set
-// tier reasoning_effort, rather than the client harness, owns reasoning policy.
 func forcePolicyOpenAIChatReasoningEffort(body []byte, effort string) ([]byte, error) {
 	effort = strings.TrimSpace(effort)
 	if effort == "" {
@@ -1593,8 +1548,6 @@ func (h *ProxyHandler) aggregateExplicitRoutedChatExecution(ctx context.Context,
 	result.Completion = response
 	result.Usage = response.Usage
 	result.Headers = convertedChatSafeHeaders(successfulHeaders)
-	// routeChatExecutionResult treats a native backend as an HTTP response.
-	// Aggregation has already converted this result to a canonical completion.
 	result.Backend = 0
 	if pinned := operation.pinnedTarget(); pinned != "" {
 		if target, ok := operation.route.targetByID(pinned); ok {
@@ -1624,9 +1577,6 @@ func parseOpenAIChatCompletionsModeWithJSON(body []byte) chatCompletionsMode {
 		StreamOptions *models.StreamOptions `json:"stream_options,omitempty"`
 		Tools         json.RawMessage       `json:"tools,omitempty"`
 	}
-	// Best-effort mode detection only: malformed JSON should still fall through
-	// to the real request validation path instead of making this helper another
-	// source of hard failures.
 	_ = json.Unmarshal(body, &partial)
 
 	clientRequestedStream := partial.Stream != nil && *partial.Stream
@@ -1681,8 +1631,6 @@ func parseOpenAIChatCompletionsModeFastValidated(body []byte) (chatCompletionsMo
 			toolsSeen = true
 			tools = body[start:end]
 		default:
-			// encoding/json struct fields match case-insensitively. Preserve that
-			// uncommon compatibility behavior through the existing decoder path.
 			if rawJSONKeyEqualFold(key, "stream") || rawJSONKeyEqualFold(key, "stream_options") || rawJSONKeyEqualFold(key, "tools") {
 				return chatCompletionsMode{}, false
 			}
@@ -1947,11 +1895,6 @@ func prepareOpenAIChatCompletionsRequestWithMode(body []byte, preparation chatPa
 		body = injectForceStream(body)
 		mode.injectedStreamUsage = true
 	} else if mode.clientRequestedStream {
-		// Ask upstream for a usage chunk so streamed traffic records tokens.
-		// Record whether we actually injected it (the client supplied no
-		// stream_options): if so, the resulting upstream usage-only chunk is
-		// dropped from the verbatim passthrough so the client does not receive a
-		// terminal chunk it never opted into.
 		var injected bool
 		body, injected = ensureStreamUsage(body)
 		mode.injectedStreamUsage = injected
@@ -1960,9 +1903,6 @@ func prepareOpenAIChatCompletionsRequestWithMode(body []byte, preparation chatPa
 	return body, mode
 }
 
-// extractOpenAIChatCompletionsRequestModel follows the encoding/json decode
-// semantics used by chat preparation: when a request contains duplicate model
-// keys, the last occurrence is the decoded value.
 func extractOpenAIChatCompletionsRequestModel(body []byte) string {
 	if model, _, ok := extractTopLevelJSONStringFast(body, "model", true); ok {
 		return model
@@ -2010,11 +1950,6 @@ func prepareAnthropicChatCompletionsRequestWithModelOverride(req *models.Anthrop
 		forceUpstreamStream:   !req.Stream && !prewarm,
 	}
 	if mode.forceUpstreamStream || mode.clientRequestedStream {
-		// Force-streamed or client-streamed: ask upstream for a usage chunk so
-		// the request records tokens. For force-stream we also set stream:true;
-		// for a client stream the request already streams, we only add the
-		// usage option. A strict OpenAI-compatible provider may reject
-		// stream_options; callers retry once without it when that happens.
 		if mode.forceUpstreamStream {
 			stream := true
 			oaiReq.Stream = &stream
@@ -2126,9 +2061,6 @@ func shouldForwardAnthropicMessagesDirectResolved(provider *providerRuntime, own
 	if provider.kind == providerTypeAnthropicCompatible {
 		return true
 	}
-	// Copilot's Claude models natively serve Anthropic Messages. Forward directly
-	// only when the catalog explicitly advertises /v1/messages so unknown models
-	// (empty endpoint list = "supports everything") still translate through Chat.
 	if provider.kind == providerTypeCopilot && known && supportsEndpoint(owner.supportedEndpoints, providerEndpointMessages) {
 		return true
 	}
@@ -2432,8 +2364,6 @@ func translateOpenAIToAnthropicForRequest(resp *models.OpenAIResponse, req *mode
 	return translated
 }
 
-// HandleAnthropicMessages handles POST /v1/messages by translating the Anthropic
-// request to OpenAI format, forwarding to Copilot, and translating the response back.
 func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
 	body, pooledBody, err := readBodyBorrowed(r)
@@ -2454,8 +2384,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	decodeErr := json.Unmarshal(body, &req)
 	admissionModel := req.Model
 	if decodeErr != nil {
-		// Preserve early explicit-route admission and error precedence for typed
-		// decode failures without making successful requests scan the body twice.
 		admissionModel = extractOpenAIChatCompletionsRequestModel(body)
 	}
 	h.observePolicyRequestSummary(r.Context(), "anthropic", admissionModel, false)
@@ -2480,9 +2408,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		publicModel = canonicalPolicyID
 		ensurePolicyLocalRequestIdentity(w, r, publicModel)
 	}
-	// Route-aware duplicate-key validation must use the same selected model as
-	// handler forwarding. encoding/json resolves duplicate struct fields with the
-	// last occurrence, so validate only after decoding req.Model.
 	if err := h.validateRouteAwareRequestJSON(body, req.Model, providerEndpointMessages); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -2529,8 +2454,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic", req.Model, providerModel, req.Stream, providerEndpoint)
 
 	if directAnthropic {
-		// Anthropic is a different provider, so vekil's own carrier must not travel there.
-		// Extraction below this return never runs on this path, which is how ours got out.
 		if sanitized, stripped := stripVekilCarrierBlocks(body); stripped > 0 {
 			h.log.Warn("stripped vekil reasoning carriers before direct Anthropic forwarding",
 				logger.F("endpoint", "anthropic"), logger.F("model", req.Model), logger.F("carriers", stripped))
@@ -2586,11 +2509,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			return
 		}
 
-		// The translated Anthropic request has already established whether the
-		// client asked for streaming and whether Vekil must force-stream upstream.
-		// Apply only the policy request contract from the returned body; the mode
-		// parsed by the OpenAI helper would misclassify an injected stream as a
-		// client-requested stream and leak SSE to a non-streaming Anthropic client.
 		oaiBody = applyPolicyOpenAIChatParallelToolCalls(oaiBody, policyPlan.contract, cloneBoolPtr(policyPlan.terminalParallelToolCalls))
 	}
 	oaiBody = h.rewriteOpenAIChatRequestBodyWithToolOptimizers(r.Context(), oaiBody, h.toolContexts, scope)
@@ -2692,9 +2610,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			status = chatStreamErrorStatus(executionErr)
-			// The OpenAI aggregation branch already does this. Anthropic force-streams its
-			// non-streaming turns, so this is where its typed failure surfaces; without it the
-			// warn carries a stats_status and no reason.
 			observeChatExecutionError(r.Context(), executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
 			if policyPlan.valid() {
@@ -2739,9 +2654,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		defer func() { _ = resp.Body.Close() }()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		detail := formatUpstreamErrorMessage(resp.StatusCode, errBody)
-		// A non-200 arrives as a successful result here, so no execution error is built and
-		// nothing records WHY the turn failed. Classify off the body; the message stays out,
-		// because an upstream 400 quotes the rejected value and that is request content.
 		observeUpstreamErrorDetail(r.Context(), resp.StatusCode, errBody)
 		h.log.Error("upstream error",
 			logger.F("endpoint", "anthropic"),
@@ -2790,9 +2702,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 			var streamErr *chatExecutionError
 			if errors.As(err, &streamErr) {
 				observeOpenAIUsage(r.Context(), streamErr.Usage)
-				// A post-commit stream failure never reaches the execution-error path, so this
-				// is the only place the typed error is seen. Without it the warn carries a
-				// stats_status and no reason at all.
 				observeChatExecutionError(r.Context(), streamErr)
 				observeResponseFailureStatus(r.Context(), chatStreamErrorStatus(streamErr))
 			} else if terminalErr := chatExecutionErrorFromStreamTermination(err); terminalErr != nil {
@@ -2839,9 +2748,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 		var executionErr *chatExecutionError
 		if errors.As(err, &executionErr) {
 			status = chatStreamErrorStatus(executionErr)
-			// The OpenAI aggregation branch already does this. Anthropic force-streams its
-			// non-streaming turns, so this is where its typed failure surfaces; without it the
-			// warn carries a stats_status and no reason.
 			observeChatExecutionError(r.Context(), executionErr)
 			observeOpenAIUsage(r.Context(), executionErr.Usage)
 			if policyPlan.valid() {
@@ -2869,9 +2775,6 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	}
 }
 
-// HandleAnthropicMessagesCountTokens handles POST /v1/messages/count_tokens.
-// Native Messages providers use their count endpoint. Other providers use a
-// minimal Chat probe and return its prompt token count in Anthropic's shape.
 func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
 	r = r.WithContext(withTaskInferenceKind(r.Context(), taskTokenCount))
@@ -2911,9 +2814,6 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		publicModel = canonicalPolicyID
 		ensurePolicyLocalRequestIdentity(w, r, publicModel)
 	}
-	// Route-aware duplicate-key validation must use the same selected model as
-	// handler forwarding. encoding/json resolves duplicate struct fields with the
-	// last occurrence, so validate only after decoding req.Model.
 	if err := h.validateRouteAwareRequestJSON(body, req.Model, providerEndpointMessages); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -2946,7 +2846,6 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic_count_tokens", req.Model, providerModel, false, providerEndpoint)
 
 	if directAnthropic {
-		// Same reason as the messages path: a count-token probe carries the same transcript.
 		if sanitized, stripped := stripVekilCarrierBlocks(body); stripped > 0 {
 			h.log.Warn("stripped vekil reasoning carriers before direct Anthropic forwarding",
 				logger.F("endpoint", "anthropic_count_tokens"), logger.F("model", req.Model), logger.F("carriers", stripped))
@@ -2964,9 +2863,6 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 		return
 	}
 	if _, policyModel := h.policyPublicModelID(req.Model); policyModel {
-		// A native-Chat policy terminal may itself be a Vekil-compatible bridge
-		// backed by Responses. Use the known Responses minimum up front so a
-		// one-send terminal budget does not require protocol recovery.
 		minimum := responsesChatMinimumOutputTokens
 		oaiReq.MaxCompletionTokens = &minimum
 	}
@@ -3406,8 +3302,6 @@ func writePolicyChatTerminalError(w http.ResponseWriter, resp *http.Response, pu
 	return nil
 }
 
-// HandleOpenAIChatCompletions handles POST /v1/chat/completions by forwarding the
-// request to Copilot with only auth headers injected (near zero-copy passthrough).
 func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(withCopilotRequestMetadata(r.Context(), r.Header))
 	bodyBytes, pooledBody, err := readBodyBorrowed(r)
@@ -3492,8 +3386,6 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 		}
 		r = r.WithContext(plannedCtx)
 		w.Header().Set("X-Vekil-Request-ID", plannedOperation.operationID())
-		// Preserve the actual body model for provider rewrite. Public metrics and
-		// response identity use the canonical policy profile ID separately.
 		publicModel = policyPlan.publicID
 		bodyBytes, err = forcePolicyOpenAIChatReasoningEffort(bodyBytes, policyPlan.selectedReasoningEffort)
 		if err != nil {
@@ -3555,9 +3447,6 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	}
 
 	responseModel := explicitRoutePublicModel(route, publicModel)
-	// RoundTripper may finish closing or reading a request body asynchronously
-	// after RoundTrip returns. Detach a borrowed inbound buffer before handing it
-	// to upstream code so the handler can safely return that buffer to its pool.
 	bodyBytes = detachBorrowedRequestBody(bodyBytes, pooledBody)
 	result, err := h.executeRoutedChatCompletions(upstreamCtx, bodyBytes, mode, chatExecutionOptions{}, requestedModel)
 	if err != nil {
@@ -3600,10 +3489,6 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 	result.observeUpstreamError(r.Context())
 	observeUpstreamHeaders(r.Context(), chatExecutionUpstreamHeaders(result))
 	if policyPlan.valid() && result.Backend == chatBackendResponses && len(result.Headers) > 0 {
-		// routeChatExecutionResult merges Responses-backed headers before its
-		// protocol-specific callbacks run. Replace them with the policy allowlist
-		// first so request/provider identifiers cannot escape through Chat JSON or
-		// the canonical streamEvents path.
 		result.Headers = policyChatSafeHeaders(result.Headers, responseModel)
 	}
 
@@ -3681,12 +3566,7 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			body := newLifecycleAwareReadCloser(resp.Body, upstreamCtx)
 			finalResponse := h.openAIChatStreamFinalResponseCallback(r.Context(), h.toolContexts, scope)
 			usage := openAIChatStreamUsageCallback(r.Context())
-			// A post-commit upstream stream error (the 200 header is already sent)
-			// should be recorded as a failed request with its classified status
-			// (e.g. 429 for a rate limit), not a 2xx success.
 			onError := func(status int) { observeResponseFailureStatus(r.Context(), status) }
-			// dropInjectedUsage drops the upstream usage-only chunk the proxy asked
-			// for when the client did not opt into stream_options.include_usage.
 			lifecycle := h.lifecycleStreamHooks(r.Context(), body.canceledAtFailure, func() { h.WriteShutdownServiceUnavailable(w, r) })
 			if routeOperation != nil {
 				streamExplicitRouteOpenAIChatPassthroughWithLifecycle(w, body, responseModel, policyPlan.valid(), mode.injectedClientStreamUsage, onError, finalResponse, lifecycle, usage)
@@ -3716,9 +3596,6 @@ func (h *ProxyHandler) HandleOpenAIChatCompletions(w http.ResponseWriter, r *htt
 			var streamErr *chatExecutionError
 			if errors.As(err, &streamErr) {
 				observeOpenAIUsage(r.Context(), streamErr.Usage)
-				// A post-commit stream failure never reaches the execution-error path, so this
-				// is the only place the typed error is seen. Without it the warn carries a
-				// stats_status and no reason at all.
 				observeChatExecutionError(r.Context(), streamErr)
 				observeResponseFailureStatus(r.Context(), chatStreamErrorStatus(streamErr))
 			} else if terminalErr := chatExecutionErrorFromStreamTermination(err); terminalErr != nil {
@@ -3934,8 +3811,6 @@ func hasNonEmptyTools(raw json.RawMessage) bool {
 	return len(tools) > 0
 }
 
-// injectParallelToolCalls adds parallel_tool_calls: true to an OpenAI request
-// body when tools are present but the flag is not already set.
 func injectParallelToolCalls(body []byte) []byte {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -3959,9 +3834,6 @@ func injectParallelToolCalls(body []byte) []byte {
 	return result
 }
 
-// enforceParallelToolCallsFalse preserves an explicit false value and adds it
-// when tools are present so a capable terminal cannot fall back to parallel
-// execution under a false public policy contract.
 func enforceParallelToolCallsFalse(body []byte) []byte {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -3983,8 +3855,6 @@ func enforceParallelToolCallsFalse(body []byte) []byte {
 	return result
 }
 
-// omitParallelToolCalls removes the field for terminals that do not support
-// it, including when a policy client explicitly supplied false.
 func omitParallelToolCalls(body []byte) []byte {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -4015,8 +3885,6 @@ func openAIToolChoiceIsNone(raw json.RawMessage) bool {
 	return false
 }
 
-// injectForceStream adds stream: true and stream_options to a request body
-// for forced streaming to the upstream.
 func injectForceStream(body []byte) []byte {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -4031,15 +3899,6 @@ func injectForceStream(body []byte) []byte {
 	return result
 }
 
-// ensureStreamUsage asks the upstream to emit a final usage chunk on a
-// client-requested stream by setting stream_options.include_usage. Without it,
-// many upstreams omit token usage from streamed responses and the proxy records
-// zero tokens. It is merge-safe: if the client already supplied stream_options,
-// their choice is left untouched (they may have deliberately set include_usage
-// false or other options). The bool result reports whether include_usage was
-// actually injected (true only when the client supplied no stream_options), so
-// the caller can drop the resulting upstream usage-only chunk from a verbatim
-// passthrough the client never opted into.
 func ensureStreamUsage(body []byte) ([]byte, bool) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {

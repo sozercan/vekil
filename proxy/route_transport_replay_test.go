@@ -79,10 +79,6 @@ func TestRouteInferenceTransportHTTP1StaleReusedConnectionResetIsNotReplayedOrFa
 		}
 	}
 
-	// Warm one keep-alive connection, then reset that reused connection after
-	// accepting the inference body but before returning response bytes. With the
-	// Idempotency-Key below and NewRequest's normal GetBody, net/http replays
-	// this failure on a fresh connection; the explicit-route send must not.
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/warmup" {
 			_, _ = io.WriteString(w, "warm")
@@ -95,8 +91,6 @@ func TestRouteInferenceTransportHTTP1StaleReusedConnectionResetIsNotReplayedOrFa
 			return
 		}
 		if requestNumber > 1 {
-			// A transparent same-target replay would land here and turn the
-			// ambiguous first dispatch into an apparently successful request.
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"id":"unexpected-replay","status":"completed","output":[]}`)
 			return
@@ -218,13 +212,6 @@ func TestRouteInferenceTransportHTTP1StaleReusedConnectionResetIsNotReplayedOrFa
 }
 
 func TestRouteInferenceTransportHTTP2RetrySignalIsNotReplayedOrFailedOver(t *testing.T) {
-	// net/http does not expose a supported server API for emitting a peer
-	// REFUSED_STREAM, and its bundled HTTP/2 retry errors are internal details.
-	// Inject the equivalent exported x/net/http2 error at the RoundTripper
-	// boundary and drive httptrace's write signal instead. This proves the
-	// contract visible to Vekil without coupling the test to Go's private HTTP/2
-	// implementation: the request is non-rewindable, its sole dispatch already
-	// owns one send reservation, and ambiguous delivery cannot retry or fail over.
 	var dispatches routeReplayDispatchLog
 	var primaryDispatches atomic.Int32
 	var secondaryDispatches atomic.Int32
@@ -294,8 +281,6 @@ func TestRouteInferenceTransportPrewriteFailureBudgetsSecondaryDispatch(t *testi
 		dispatches.record(req)
 		switch req.URL.Hostname() {
 		case "primary.example":
-			// No write-related httptrace callback: the failure is definitely
-			// prewrite and may safely admit the next configured target.
 			return nil, errors.New("dial tcp: injected prewrite failure")
 		case "secondary.example":
 			return routeExecutorTestResponse(req, http.StatusOK, nil, `{"id":"secondary","status":"completed","output":[]}`), nil

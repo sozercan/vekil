@@ -289,8 +289,6 @@ func TestPolicyCopilotDualEndpointLocalReplayStaysOnResponses(t *testing.T) {
 			if err := h.WaitLifecycleWorkers(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			// A refreshed catalog can prefer native Chat for new work while this
-			// in-flight tool turn still requires the locally saved Responses items.
 			setup := h.providerSetup()
 			catalog, err := decodeProviderModelsFromBody(setup.providerByID("copilot"), []byte(`{"data":[
 				{"id":"gpt-5.6-luna","vendor":"OpenAI","supported_endpoints":["/chat/completions","/responses"]},
@@ -325,7 +323,6 @@ func TestPolicyCopilotDualEndpointLocalReplayStaysOnResponses(t *testing.T) {
 			}
 			var restored replayRequest
 			var replayBody string
-			// Observe-mode classifier traffic can arrive asynchronously.
 			for _, body := range bodies {
 				var request replayRequest
 				if err := json.Unmarshal([]byte(body), &request); err != nil {

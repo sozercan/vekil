@@ -33,8 +33,6 @@ func publishCarrierParityTurn(t *testing.T, upstreamCallIDs ...string) (*respons
 	return store, route, items, published
 }
 
-// order picks which projected calls the assistant message replays and in what order;
-// results names the calls that get a tool result, each tagged so misbinding shows up.
 func carrierParityBody(t *testing.T, published responsesChatReplayPublished, order, results []int) []byte {
 	t.Helper()
 	toolCalls := make([]any, 0, len(order))
@@ -92,8 +90,6 @@ func upstreamInputJSON(t *testing.T, plan responsesChatRequestPlan) string {
 	return string(upstream.Input)
 }
 
-// What upstream is told, with the decoration the carrier path cannot reproduce removed:
-// a rebuilt call carries no item id or status, and rebuilt text is the shorthand form.
 func upstreamTurnShape(t *testing.T, plan responsesChatRequestPlan) string {
 	t.Helper()
 	var items []map[string]any
@@ -146,9 +142,6 @@ func assistantItemText(t *testing.T, item map[string]any) string {
 	return ""
 }
 
-// The carrier changes WHERE the resolution comes from, and rebuilds the calls it
-// restores from the visible transcript. The carrier run passes no store at all --
-// what a TTL expiry, eviction or restart leaves behind.
 func TestCarriedTurnTranslatesEquivalentlyToTheStore(t *testing.T) {
 	store, route, items, published := publishCarrierParityTurn(t, "upstream-call-1")
 	body := carrierParityBody(t, published, inOrder(1), inOrder(1))
@@ -180,7 +173,6 @@ func TestCarriedTurnTranslatesEquivalentlyToTheStore(t *testing.T) {
 	}
 }
 
-// Live gpt-5.6-sol rejects a complete parallel group when only a subset has outputs.
 func TestCarriedPartialParallelTurnMatchesTheStore(t *testing.T) {
 	store, route, items, published := publishCarrierParityTurn(t, "upstream-call-1", "upstream-call-2")
 	body := carrierParityBody(t, published, inOrder(2), inOrder(1))
@@ -209,8 +201,6 @@ func TestCarriedPartialParallelTurnMatchesTheStore(t *testing.T) {
 	}
 }
 
-// Clients do not promise to return results in call order, and positional binding
-// would attach each to the wrong upstream call without erroring.
 func TestCarriedParallelResultsBindByIDNotPosition(t *testing.T) {
 	_, route, items, published := publishCarrierParityTurn(t, "upstream-call-1", "upstream-call-2")
 	body := carrierParityBody(t, published, inOrder(2), []int{1, 0})
@@ -240,9 +230,6 @@ func TestCarriedParallelResultsBindByIDNotPosition(t *testing.T) {
 	}
 }
 
-// The store validates the assistant projection, so the carrier must too: neither may
-// hand a drifted transcript the reasoning that was minted for a different one. Against a
-// live store that degrades; without one it still fails closed.
 func TestCarrierAndStoreAgreeOnAssistantProjectionDrift(t *testing.T) {
 	cases := map[string]func(*testing.T, responsesChatReplayPublished) []byte{
 		"reordered tool-call group": func(t *testing.T, published responsesChatReplayPublished) []byte {
@@ -284,8 +271,6 @@ func TestCarrierAndStoreAgreeOnAssistantProjectionDrift(t *testing.T) {
 	}
 }
 
-// A carrier lifted from another turn must not resolve this one: binding through its
-// minted ids is what makes the mismatch visible.
 func TestCarrierFromAnotherTurnDoesNotResolve(t *testing.T) {
 	_, route, staleItems, stalePublished := publishCarrierParityTurn(t, "upstream-call-1")
 	_, _, _, current := publishCarrierParityTurn(t, "upstream-call-2")
@@ -304,7 +289,6 @@ func TestCarrierFromAnotherTurnDoesNotResolve(t *testing.T) {
 	}
 }
 
-// Copilot's reasoning is model-bound: a /model switch must not replay it elsewhere.
 func TestCarrierDoesNotCrossRoutes(t *testing.T) {
 	_, route, items, published := publishCarrierParityTurn(t, "upstream-call-1")
 	other := route
@@ -322,8 +306,6 @@ func TestCarrierDoesNotCrossRoutes(t *testing.T) {
 	}
 }
 
-// The carrier mirrors the replay store's argument binding. A rewrite must not recover either
-// stored reasoning or a client-supplied carrier under the original opaque call binding.
 func TestRewrittenArgumentsAreRejectedByCarrier(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string
@@ -364,7 +346,6 @@ func TestRewrittenArgumentsAreRejectedByCarrier(t *testing.T) {
 	}
 }
 
-// Without a carrier there is nothing the client already holds, so a rewrite must degrade.
 func TestRewrittenArgumentsWithoutACarrierDegrade(t *testing.T) {
 	store, route, _, published := publishCarrierParityTurn(t, "upstream-call-1")
 	body := carrierParityBody(t, published, inOrder(1), inOrder(1))
@@ -390,7 +371,6 @@ func reasoningCiphertext(items []json.RawMessage, value string) []json.RawMessag
 	return replaced
 }
 
-// The guards live below the restore, so the carrier path must hit the right one.
 func TestCarriedTurnStillRequiresAToolResult(t *testing.T) {
 	_, route, items, published := publishCarrierParityTurn(t, "upstream-call-1")
 

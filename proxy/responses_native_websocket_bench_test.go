@@ -9,8 +9,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Compare warm downstream websocket turns using the same fixed 400-message
-// history. Empty continuation input and output keep replay size constant.
 func BenchmarkResponsesTransportNativeUpstream(b *testing.B) {
 	for _, native := range []bool{false, true} {
 		name := "HTTPBridge"

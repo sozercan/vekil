@@ -18,10 +18,6 @@ const (
 	defaultToolOptimizerStreamingModeDisabled   = "disabled"
 )
 
-// ToolOptimizersConfig configures optional command/output optimization for
-// tool calls flowing through supported API surfaces. The feature is
-// intentionally disabled by default; zero values preserve the legacy passthrough
-// behavior.
 type ToolOptimizersConfig struct {
 	Enabled        bool                          `json:"enabled" yaml:"enabled"`
 	Tools          ToolOptimizerToolsConfig      `json:"tools,omitempty" yaml:"tools,omitempty"`

@@ -23,10 +23,6 @@ const (
 	proxyStartupSuperseded
 )
 
-// menubarProxyLifecycle serializes the published server and cancellable startup
-// attempt. Slow authentication or policy preflight work runs outside this lock.
-// A canceled attempt remains in flight until its worker has stopped any listener,
-// which prevents a replacement startup from racing the old listener for the port.
 type menubarProxyLifecycle struct {
 	mu sync.Mutex
 

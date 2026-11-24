@@ -30,7 +30,6 @@ var loadTrayTemplates = sync.OnceValues(func() (trayTemplateImages, error) {
 })
 
 func makeTrayTemplate(source image.Image, opacity uint8) ([]byte, error) {
-	// preserve the original pixel artwork at twice its source resolution.
 	size := source.Bounds().Dx() * 2
 	mask := image.NewNRGBA(image.Rect(0, 0, size, size))
 	for y := 0; y < size; y++ {

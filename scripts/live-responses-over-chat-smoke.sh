@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# Live smoke for opt-in Responses-over-Chat against a real provider.
-#
-# Requires an explicit Chat-only model; there is no default so a run never
-# silently selects (or bills) a different model:
-#
-#   RESPONSES_OVER_CHAT_SMOKE_MODEL=gemini-3.8-flash scripts/live-responses-over-chat-smoke.sh
-#
-# Starts a private proxy on a free loopback port with only that model opted
-# in, runs bounded JSON, SSE, forced namespaced tool, tool-result continuation
-# and parallel-call turns, and prints a redacted summary. Prompts are
-# synthetic; responses are reduced to shapes and counts.
 
 set -euo pipefail
 
@@ -64,7 +53,7 @@ until proxy_curl -fsS -m 5 "${BASE}/readyz" >/dev/null 2>&1; do
   sleep 1
 done
 
-post() { # name body
+post() {
   proxy_curl -sS -m "${MAX_TIME}" -o "${WORK_DIR}/$1.out" -D "${WORK_DIR}/$1.headers" -w '%{http_code}' \
     -H 'Content-Type: application/json' --data-binary "$2" "${BASE}/v1/responses"
 }
@@ -167,7 +156,7 @@ if len(summary["parallel"]["function_calls"]) < 2:
     failures.append("parallel turn returned fewer than two calls (model choice; informational)")
 
 for name in ["sse", "tool", "continuation", "parallel"]:
-    summary[name].pop("text", None)  # keep model output out of the printed summary
+    summary[name].pop("text", None)
 print(json.dumps({"model": model, "summary": summary, "failures": failures}, indent=2))
 hard = [f for f in failures if "informational" not in f]
 sys.exit(1 if hard else 0)

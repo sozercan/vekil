@@ -7,11 +7,8 @@ import (
 	"sync"
 )
 
-// DefaultRotatingFileMaxBytes bounds each rotating log file.
 const DefaultRotatingFileMaxBytes = 16 << 20
 
-// RotatingFile appends to a private log file and moves it to a ".1" backup
-// before a write would grow it past maxBytes, so at most two files are kept.
 type RotatingFile struct {
 	mu       sync.Mutex
 	path     string
@@ -20,8 +17,6 @@ type RotatingFile struct {
 	size     int64
 }
 
-// OpenRotatingFile opens path for appending, creating private parent
-// directories and the file as needed.
 func OpenRotatingFile(path string, maxBytes int64) (*RotatingFile, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -38,7 +33,6 @@ func (w *RotatingFile) open() error {
 	if err != nil {
 		return err
 	}
-	// The create mode does not apply to an existing file; keep it private.
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
 		return err
@@ -60,8 +54,6 @@ func (w *RotatingFile) Write(p []byte) (int, error) {
 	}
 	written := len(p)
 	if int64(len(p)) > w.maxBytes {
-		// Keep the start of an entry larger than the cap, so the file never
-		// exceeds it. Callers see the whole entry written.
 		p = append(p[:w.maxBytes-1:w.maxBytes-1], '\n')
 	}
 	if w.size > 0 && w.size+int64(len(p)) > w.maxBytes {

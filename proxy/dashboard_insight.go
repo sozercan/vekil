@@ -15,20 +15,11 @@ import (
 )
 
 const (
-	// insightUpstreamTimeout bounds the on-demand insight generation call.
 	insightUpstreamTimeout = 30 * time.Second
-	// insightMaxTokens caps the insight reply — it is a short paragraph.
-	insightMaxTokens = 320
-	// insightCooldown is the minimum spacing between insight generations. It
-	// bounds how fast a client can make the proxy spend tokens, independent of
-	// the front-end's button-disable.
-	insightCooldown = 5 * time.Second
+	insightMaxTokens       = 320
+	insightCooldown        = 5 * time.Second
 )
 
-// insightGate rate-limits the billable insight endpoint: it serializes calls
-// (single-flight — at most one in progress) and enforces a cooldown between
-// completed calls, so repeat or concurrent clicks cannot fan out model calls.
-// The clock is injectable for deterministic tests.
 type insightGate struct {
 	mu       sync.Mutex
 	active   bool
@@ -40,9 +31,6 @@ func newInsightGate() *insightGate {
 	return &insightGate{now: time.Now}
 }
 
-// tryAcquire returns ok=true if the caller may proceed. Otherwise reason names
-// why it was rejected ("in progress" or "cooling down"). On success the caller
-// must call release exactly once.
 func (g *insightGate) tryAcquire() (ok bool, reason string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -65,22 +53,17 @@ func (g *insightGate) release() {
 	g.mu.Unlock()
 }
 
-// insightGateFor lazily returns the handler's insight gate so test handlers
-// constructed without the full constructor still work.
 func (h *ProxyHandler) insightGateFor() *insightGate {
 	h.insightGateOnce.Do(func() { h.insightGate = newInsightGate() })
 	return h.insightGate
 }
 
-// insightResponse is the JSON returned by GET/POST /dashboard/insight.
 type insightResponse struct {
 	Insight string `json:"insight,omitempty"`
 	Model   string `json:"model,omitempty"`
 	Error   string `json:"error,omitempty"`
 }
 
-// captureResponseWriter is a minimal in-memory http.ResponseWriter used to call
-// the proxy's own chat-completions handler without a network round trip.
 type captureResponseWriter struct {
 	header http.Header
 	body   bytes.Buffer
@@ -103,7 +86,6 @@ func dashboardInsightRequestAllowed(r *http.Request) bool {
 	}
 	switch r.Header.Get("Sec-Fetch-Site") {
 	case "", "same-origin", "none":
-		// allowed by Fetch Metadata; Origin is checked below when present.
 	case "same-site", "cross-site", "cross-origin":
 		return false
 	default:
@@ -128,10 +110,6 @@ func requestOriginMatchesHost(originOrReferer, host string) bool {
 	return strings.EqualFold(parsed.Host, host)
 }
 
-// HandleDashboardInsight generates a short natural-language summary of the
-// current traffic by calling the proxy's own chat-completions endpoint with the
-// configured insight model. It fails open: any error returns a 200 with an
-// "error" field so the dashboard can fall back to its templated narrative.
 func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -146,29 +124,17 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// CSRF guard: this endpoint spends tokens, so reject browser requests unless
-	// they are same-origin with this dashboard. Same-site is deliberately rejected:
-	// a sibling origin on the same registrable site is still cross-origin and should
-	// not be allowed to spend tokens. Absent Fetch Metadata is allowed for
-	// non-browser tools, but a present Origin header must still match Host.
 	if !dashboardInsightRequestAllowed(r) {
 		writeInsightError(w, "cross-site insight requests are not allowed")
 		return
 	}
 
-	// Rate-limit: at most one generation in progress, and a cooldown between
-	// completed generations. This bounds token spend even against direct or
-	// scripted POSTs, independent of the front-end's button-disable. The gate is
-	// released by the worker goroutine below when the call actually finishes, not
-	// on the timeout path — so a slow model can't be bypassed by a second click.
 	gate := h.insightGateFor()
 	if ok, reason := gate.tryAcquire(); !ok {
 		writeInsightError(w, reason)
 		return
 	}
 
-	// The dashboard posts the narrative it is already showing so the model can
-	// avoid repeating it. Body is optional; ignore parse errors.
 	var reqIn struct {
 		Shown string `json:"shown"`
 	}
@@ -205,13 +171,6 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 	innerReq.Header.Set("Content-Type", "application/json")
 	innerReq.Header.Set("User-Agent", "vekil-dashboard-insight")
 
-	// Run the in-process chat call on its own goroutine and bound the wait with
-	// insightUpstreamTimeout. The inner handler builds its own upstream context
-	// (it does not honor the dashboard client's request cancellation), so a select
-	// here enforces the client-visible deadline. The inner upstream call is still
-	// rooted in the proxy lifecycle and is canceled during server shutdown. The
-	// gate is released when the worker completes,
-	// whether or not we have already returned a timeout to the client.
 	type insightResult struct {
 		text   string
 		status int
@@ -242,7 +201,6 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 		}
 		_ = json.NewEncoder(w).Encode(insightResponse{Insight: res.text, Model: model})
 	case <-time.After(insightUpstreamTimeout):
-		// The worker keeps running and will release the gate when it finishes.
 		writeInsightError(w, "insight timed out")
 	case <-r.Context().Done():
 		writeInsightError(w, "request cancelled")
@@ -250,8 +208,6 @@ func (h *ProxyHandler) HandleDashboardInsight(w http.ResponseWriter, r *http.Req
 }
 
 func writeInsightError(w http.ResponseWriter, msg string) {
-	// Always 200 so the front-end treats this as a soft failure and keeps its
-	// templated narrative rather than surfacing a hard error.
 	_ = json.NewEncoder(w).Encode(insightResponse{Error: msg})
 }
 
@@ -260,8 +216,6 @@ func jsonString(s string) json.RawMessage {
 	return b
 }
 
-// extractOpenAIReplyText pulls the assistant text from a chat-completion body,
-// tolerating both plain-string and structured content shapes.
 func extractOpenAIReplyText(body []byte) string {
 	var resp models.OpenAIResponse
 	if err := json.Unmarshal(body, &resp); err != nil || len(resp.Choices) == 0 {
@@ -271,12 +225,10 @@ func extractOpenAIReplyText(body []byte) string {
 	if len(content) == 0 {
 		return ""
 	}
-	// Most replies are a plain JSON string.
 	var s string
 	if err := json.Unmarshal(content, &s); err == nil {
 		return strings.TrimSpace(s)
 	}
-	// Fall back to multimodal content parts ([{type:text,text:...}]).
 	var parts []models.OpenAIContentPart
 	if err := json.Unmarshal(content, &parts); err == nil {
 		var b strings.Builder
@@ -298,11 +250,6 @@ const insightSystemPrompt = "You are an observability analyst embedded in a loca
 	"End with one concrete, specific thing the operator should check or do. " +
 	"Write 2-4 sentences of plain prose. Be specific with numbers, but only numbers that ADD information. No preamble, no markdown, no bullet lists, no headings."
 
-// buildInsightPrompt renders a compact, analysis-oriented view of the snapshot.
-// It includes derived signals the dashboard cards do not show (per-model share
-// and error rate, output:input ratio, reasoning share, request-rate trend) so
-// the model has material to go beyond the static narrative. `shown` is the
-// dashboard's current one-line summary, passed so the model avoids repeating it.
 func buildInsightPrompt(snap statsSnapshot, shown string) string {
 	t := snap.Totals
 	var b strings.Builder
@@ -319,7 +266,6 @@ func buildInsightPrompt(snap statsSnapshot, shown string) string {
 		t.Requests, t.Errors, t.PromptTokens, t.CompletionTokens, t.TotalTokens, t.CachedTokens, t.ReasoningTokens)
 	fmt.Fprintf(&b, "latency_ms: p50=%d p95=%d p99=%d\n", t.LatencyP50, t.LatencyP95, t.LatencyP99)
 
-	// Derived cost/usage signals the cards don't surface.
 	b.WriteString("derived:\n")
 	if t.Requests > 0 {
 		fmt.Fprintf(&b, "  error_rate_pct: %.1f\n", pct(t.Errors, t.Requests))
@@ -336,10 +282,6 @@ func buildInsightPrompt(snap statsSnapshot, shown string) string {
 		fmt.Fprintf(&b, "  request_rate_trend: %s\n", trend)
 	}
 
-	// Per-model share and error rate — where concentration actually lives.
-	// Labels (model/agent/provider) can derive from client-controlled input
-	// (request `model` field, User-Agent), so sanitize them before they enter
-	// the prompt to prevent newline/control-char prompt injection.
 	b.WriteString("top_models (share_pct = % of all requests):\n")
 	for _, m := range topN(snap.ByModel, 5) {
 		fmt.Fprintf(&b, "  - %s: requests=%d share_pct=%.0f tokens=%d errors=%d error_rate_pct=%.1f avg_ms=%d\n",
@@ -369,12 +311,6 @@ func buildInsightPrompt(snap statsSnapshot, shown string) string {
 	return b.String()
 }
 
-// sanitizeLabel strips newlines and other control characters from a label and
-// caps its length, so client-controlled values (model names, User-Agent-derived
-// agent labels, the client-posted `shown` narrative) folded into the insight
-// prompt cannot inject new lines or instructions into it. The length cap is
-// measured and applied in runes so a multi-byte UTF-8 sequence is never split
-// mid-rune (which would emit invalid UTF-8 before the ellipsis).
 func sanitizeLabel(s string) string {
 	const maxLen = 80
 	s = strings.Map(func(r rune) rune {
@@ -407,9 +343,6 @@ func ratio(a, b int64) float64 {
 	return float64(a) / float64(b)
 }
 
-// requestTrend compares request volume in the first vs second half of the live
-// series window and reports a coarse direction, so the model can speak to trend
-// without seeing every per-second bucket.
 func requestTrend(series []statsSeriesPoint) string {
 	if len(series) < 4 {
 		return ""

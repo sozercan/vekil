@@ -205,11 +205,6 @@ func TestRunPortalRequestRetainsResponseEmittedOnPredictedPathBeforeMethodReturn
 	}
 }
 
-// TestRunPortalRequestReturnsQueuedResponseWhenContextEndsSimultaneously
-// exercises the ctx.Done()-vs-buffered-response race. The request call queues
-// the matching response and cancels ctx before returning, so both select cases
-// are ready when runPortalRequest begins waiting. The completed response must
-// always win and Request.Close must not run.
 func TestRunPortalRequestReturnsQueuedResponseWhenContextEndsSimultaneously(t *testing.T) {
 	const iterations = 30
 	for i := 0; i < iterations; i++ {
@@ -301,10 +296,6 @@ func TestRunPortalRequestCancellationClosesRequestAndCleansUp(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 
 	call := func() (dbus.ObjectPath, error) {
-		// No response is ever emitted, simulating an outstanding request.
-		// Cancellation happens only here, after subscribe+call setup has
-		// already completed successfully, to genuinely exercise wait-phase
-		// cancellation rather than a setup-time failure.
 		cancel()
 		return predicted, nil
 	}
@@ -404,9 +395,6 @@ func TestRunPortalRequestScopesMatchToOwnRequestPathNamespace(t *testing.T) {
 	}
 }
 
-// TestPortalErrorProvesNotShownClassifiesDBusErrorsByAllowlist exercises the
-// classifier directly against the exact allowlist from its doc comment, plus
-// every kind of error the design explicitly calls out as ambiguous.
 func TestPortalErrorProvesNotShownClassifiesDBusErrorsByAllowlist(t *testing.T) {
 	t.Run("safe: dbus.ErrClosed proves not shown", func(t *testing.T) {
 		if !portalErrorProvesNotShown(dbus.ErrClosed) {
@@ -484,9 +472,6 @@ func TestWaitForPortalActionWrapsAllowlistedAddNotificationFailureAsNotShown(t *
 	if !errors.Is(err, errPortalNotificationNotShown) {
 		t.Fatalf("waitForPortalAction() error = %v, want errors.Is(err, errPortalNotificationNotShown)", err)
 	}
-	// dbus.Error's Body field is a slice, so it is not comparable and cannot
-	// be used as an errors.Is target; use errors.As to confirm the
-	// underlying D-Bus error survived the wrap instead.
 	var gotDBusErr dbus.Error
 	if !errors.As(err, &gotDBusErr) || gotDBusErr.Name != addNotificationErr.Name {
 		t.Fatalf("waitForPortalAction() error = %v, want the underlying D-Bus error %v preserved", err, addNotificationErr)
@@ -515,9 +500,6 @@ func TestWaitForPortalActionDoesNotWrapWaitPhaseCancellationAsNotShown(t *testin
 	ctx, cancel := context.WithCancel(t.Context())
 
 	_, err := waitForPortalAction(ctx, conn, "id", func() error {
-		// AddNotification succeeds (the notification was shown), and only
-		// then does the caller's context end while still waiting for an
-		// action.
 		cancel()
 		return nil
 	})
@@ -530,14 +512,6 @@ func TestWaitForPortalActionDoesNotWrapWaitPhaseCancellationAsNotShown(t *testin
 	}
 }
 
-// TestWaitForPortalActionReturnsQueuedActionEvenWhenContextEndsSimultaneously
-// exercises the ctx.Done()-vs-buffered-signal race described in
-// waitForPortalAction's doc comment: the addNotification closure both emits
-// the matching action signal and cancels ctx before returning, so by the
-// time the select runs, both cases are ready and Go's pseudo-random choice
-// must never lose the already-queued answer. Looping drives both branches of
-// the race across ordinary (non -race) runs; `go test -race -count=10` adds
-// further assurance.
 func TestWaitForPortalActionReturnsQueuedActionEvenWhenContextEndsSimultaneously(t *testing.T) {
 	const iterations = 30
 	for i := 0; i < iterations; i++ {
@@ -564,12 +538,6 @@ func TestWaitForPortalActionReturnsQueuedActionEvenWhenContextEndsSimultaneously
 	}
 }
 
-// TestWaitForPortalActionReturnsBufferedActionBeforeObservingChannelClose
-// confirms that when the signal channel is buffered with a matching action
-// and then closed (e.g. the underlying connection is torn down right after
-// delivering it), the ordinary Go receive semantics that drain a closed
-// channel's remaining buffered values before reporting ok == false are relied
-// on rather than any extra drain logic.
 func TestWaitForPortalActionReturnsBufferedActionBeforeObservingChannelClose(t *testing.T) {
 	conn := newFakePortalConn(":1.31")
 
@@ -592,11 +560,6 @@ func TestWaitForPortalActionReturnsBufferedActionBeforeObservingChannelClose(t *
 	}
 }
 
-// TestWaitForPortalActionClosedChannelWithNoBufferedActionIsAmbiguous covers
-// the case where the connection is torn down after AddNotification succeeded
-// (the notification may already be displayed) but before any action ever
-// arrives: this must be an ordinary ambiguous decline, never
-// errPortalNotificationNotShown.
 func TestWaitForPortalActionClosedChannelWithNoBufferedActionIsAmbiguous(t *testing.T) {
 	conn := newFakePortalConn(":1.32")
 
@@ -613,7 +576,6 @@ func TestWaitForPortalActionClosedChannelWithNoBufferedActionIsAmbiguous(t *test
 	}
 }
 
-// fakePortalCall records one Call() invocation against a fakePortalConn.
 type fakePortalCall struct {
 	Dest   string
 	Path   dbus.ObjectPath
@@ -621,13 +583,6 @@ type fakePortalCall struct {
 	Args   []any
 }
 
-// fakePortalConn is a deterministic, in-memory portalConn used to drive the
-// request lifecycle, race, and cancellation tests above (and the dialog
-// policy tests in dialog_linux_test.go) without a live session bus. It
-// supports multiple concurrently registered signal channels (broadcasting
-// every emitted signal to all of them, matching godbus's own per-connection
-// fan-out) so it can model the shared Notification connection's concurrency
-// behavior, not just the one-registration-at-a-time per-call connections.
 type fakePortalConn struct {
 	unique string
 
@@ -694,9 +649,6 @@ func (f *fakePortalConn) Signal(ch chan<- *dbus.Signal) {
 	f.mu.Unlock()
 }
 
-// RemoveSignal removes ch by channel identity, leaving any other
-// concurrently registered channels (e.g. from a second in-flight operation
-// sharing this connection) untouched.
 func (f *fakePortalConn) RemoveSignal(ch chan<- *dbus.Signal) {
 	f.mu.Lock()
 	delete(f.sigs, ch)
@@ -709,10 +661,6 @@ func (f *fakePortalConn) Connected() bool {
 	return !f.closed
 }
 
-// Close idempotently closes every currently registered signal channel, then
-// marks the connection closed/disconnected. It holds the same mutex emit
-// sends under, so a send can never race a concurrent Close and panic on a
-// closed channel.
 func (f *fakePortalConn) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -727,11 +675,6 @@ func (f *fakePortalConn) Close() error {
 	return nil
 }
 
-// emit delivers sig to every currently registered signal channel, if any,
-// mimicking a signal arriving from the bus (whether before or after the
-// triggering method call returns to the caller). It holds the same mutex
-// Close uses so it can never send on a channel Close is concurrently
-// closing.
 func (f *fakePortalConn) emit(sig *dbus.Signal) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -755,8 +698,6 @@ func (f *fakePortalConn) removeMatchCalls() int {
 	return f.removeMatch
 }
 
-// signalRegistered reports whether any signal channel is currently
-// registered.
 func (f *fakePortalConn) signalRegistered() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -781,7 +722,6 @@ func (f *fakePortalConn) isClosed() bool {
 	return f.closed
 }
 
-// lastMatchRule returns the options passed to the most recent AddMatch call.
 func (f *fakePortalConn) lastMatchRule() []dbus.MatchOption {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -791,9 +731,6 @@ func (f *fakePortalConn) lastMatchRule() []dbus.MatchOption {
 	return f.matchRules[len(f.matchRules)-1]
 }
 
-// matchRuleContains reports whether opts contains want. dbus.MatchOption's
-// fields are unexported but comparable, so two options built from the same
-// constructor and arguments compare equal with ==.
 func matchRuleContains(opts []dbus.MatchOption, want dbus.MatchOption) bool {
 	for _, opt := range opts {
 		if opt == want {
@@ -803,8 +740,6 @@ func matchRuleContains(opts []dbus.MatchOption, want dbus.MatchOption) bool {
 	return false
 }
 
-// withPortalTestTimeout bounds a test context so a defect that hangs forever
-// fails the test instead of the suite.
 func withPortalTestTimeout(t *testing.T) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -812,15 +747,6 @@ func withPortalTestTimeout(t *testing.T) context.Context {
 	return ctx
 }
 
-// resetSharedPortalNotificationConnForTest clears the shared
-// Notification-interface connection holder between test cases so one test's
-// cached fake connection is never observed by another. Test-only: production
-// code never resets or closes this holder (portalNotificationConn.get() only
-// redials once godbus itself reports the cached peer disconnected). Callers
-// must ensure every goroutine spawned by the previous test case (e.g. an
-// emit(...) goroutine simulating a signal arriving after AddNotification
-// returns) has already joined before calling this: it is only safe to close
-// the evicted fake once nothing can still be sending on its channels.
 func resetSharedPortalNotificationConnForTest() {
 	sharedPortalNotificationConn.mu.Lock()
 	conn := sharedPortalNotificationConn.conn

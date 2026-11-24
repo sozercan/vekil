@@ -206,7 +206,6 @@ func TestResponsesOverChatDeliversFirstDeltaBeforeUpstreamCompletes(t *testing.T
 		}
 	}
 	deadline.Stop()
-	// The upstream is still blocked: the delta was delivered incrementally.
 	close(release)
 	rest, err := io.ReadAll(reader)
 	if err != nil {
@@ -255,7 +254,6 @@ func TestResponsesOverChatStreamsInterleavedNamespacedParallelToolCalls(t *testi
 	var aliasRead, aliasWrite string
 	upstream := newROCUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		// Names and arguments arrive in separate, interleaved chunks.
 		writeROCChunk(t, w, fmt.Sprintf(`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":%q,"arguments":""}}]}}]}`, aliasRead))
 		writeROCChunk(t, w, `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}`)
 		writeROCChunk(t, w, fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":%q}}]}}]}`, aliasWrite))
@@ -381,8 +379,6 @@ func TestResponsesOverChatReplaysToolResultsAndReturnsJSON(t *testing.T) {
 
 func TestResponsesOverChatNonStreamingToolCallsUseSameValidation(t *testing.T) {
 	upstream := newROCUpstream(t, rocSSE(t,
-		// Copilot's Gemini stream shape: complete call in one chunk, an opaque
-		// vendor field, per-chunk usage, and finish_reason "stop".
 		`{"choices":[{"index":0,"delta":{"content":null,"role":"assistant","tool_calls":[{"function":{"arguments":"{\"city\":\"Paris\"}","name":"get_time"},"id":"call_x","index":0,"type":"function"}],"reasoning_opaque":"c3ludGhldGlj"}}],"copilot_usage":{"total_nano_aiu":0},"usage":{"completion_tokens":0,"prompt_tokens":0,"total_tokens":0}}`,
 		`{"choices":[{"finish_reason":"stop","index":0,"delta":{"content":null,"role":"assistant"}}],"usage":{"completion_tokens":60,"prompt_tokens":33,"total_tokens":93,"reasoning_tokens":28}}`,
 		"[DONE]"))
@@ -680,7 +676,6 @@ func TestResponsesOverChatValidatedReasoningIsForwarded(t *testing.T) {
 
 func TestResponsesOverChatSelectionKeepsNativeAndDisabledModelsUnchanged(t *testing.T) {
 	upstream := newROCUpstream(t, rocSSE(t, rocStop, "[DONE]"))
-	// gpt-native is opted in but has native /responses support.
 	h := newROCHandler(t, upstream.server.URL)
 	if recorder := postROC(t, h, `{"model":"gpt-native","input":"hi"}`); recorder.Code != http.StatusOK {
 		t.Fatalf("native status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -689,7 +684,6 @@ func TestResponsesOverChatSelectionKeepsNativeAndDisabledModelsUnchanged(t *test
 		t.Fatalf("native model hits chat=%d responses=%d", upstream.chatHits.Load(), upstream.responsesHits.Load())
 	}
 
-	// Without opt-in, a Chat-only model keeps the existing native passthrough.
 	disabled, err := NewProxyHandler(auth.NewTestAuthenticator("fixture"), logger.NewWithWriter(logger.LevelError, io.Discard), WithCopilotBaseURL(upstream.server.URL))
 	if err != nil {
 		t.Fatal(err)
@@ -949,13 +943,9 @@ func TestResponsesOverChatWebSocketTurnIsRejectedWithoutUpstreamSends(t *testing
 
 func TestResponsesOverChatAcceptsFragmentedToolNames(t *testing.T) {
 	upstream := newROCUpstream(t, rocSSE(t,
-		// The first call's name arrives in two fragments before its arguments.
 		`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_","arguments":""}}]}}]}`,
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"time"}}]}}]}`,
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]}}]}`,
-		// The second call's name is fragmented and it never streams arguments.
-		// Another call starting says nothing about its name, so it is exposed
-		// only at the successful finish, after the third call.
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"get_"}}]}}]}`,
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"name":"weather"}}]}}]}`,
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"id":"call_c","type":"function","function":{"name":"get_time","arguments":"{}"}}]}}]}`,
@@ -999,7 +989,6 @@ func TestResponsesOverChatAcceptsFragmentedToolNames(t *testing.T) {
 	}
 }
 
-// rocDoneItems returns the items carried by output_item.done events.
 func rocDoneItems(t *testing.T, events []rocEvent) []map[string]any {
 	t.Helper()
 	var done []map[string]any
@@ -1182,7 +1171,6 @@ func TestResponsesOverChatStreamedItemsReplayVerbatim(t *testing.T) {
 		t.Fatalf("final output = %v", final)
 	}
 
-	// A full-history client replays the streamed items as input.
 	input := []any{map[string]any{"type": "message", "role": "user", "content": "time?"}}
 	for _, item := range done {
 		input = append(input, item)
@@ -1212,8 +1200,6 @@ func TestResponsesOverChatRejectsInternalRouteOptIn(t *testing.T) {
 }
 
 func TestResponsesOverChatRequireNativeChatRefusesResponsesBackendBeforeDispatch(t *testing.T) {
-	// Admission saw a native Chat model; by execution the catalog lists it as
-	// Responses-only. The guard must refuse without any upstream send.
 	var chatSends, responsesSends atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1248,7 +1234,6 @@ func TestResponsesOverChatConcatenatesRepeatedNameFragments(t *testing.T) {
 		`{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get"}}]}}]}`,
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"get"}}]}}]}`,
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}`,
-		// A repeat of the complete name after announcement is tolerated.
 		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"getget"}}]}}]}`,
 		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 		"[DONE]"))
@@ -1435,8 +1420,6 @@ func TestResponsesOverChatClientCancelRecords499(t *testing.T) {
 			h.HandleResponses(recorder, request)
 		}()
 		<-started
-		// Let the adapter reach the stream read; an earlier cancel takes the
-		// pre-response path, which also answers 499.
 		time.Sleep(50 * time.Millisecond)
 		cancel()
 		select {
@@ -1518,8 +1501,6 @@ func TestResponsesOverChatClientWriteFailureRecords499(t *testing.T) {
 }
 
 func TestResponsesOverChatOmitsToolChoiceWithoutTools(t *testing.T) {
-	// Codex's local compaction turn sends tool_choice with no tools; Copilot
-	// Chat rejects any tool_choice that has no tools beside it.
 	for _, tc := range []struct{ name, fields string }{
 		{"auto with empty tools", `"tools":[],"tool_choice":"auto"`},
 		{"none with empty tools", `"tools":[],"tool_choice":"none"`},

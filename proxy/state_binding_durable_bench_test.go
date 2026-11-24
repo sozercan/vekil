@@ -76,8 +76,6 @@ func stateExposureBenchmarkBody(batch, group int) []byte {
 	return body
 }
 
-// This is the real JSON/SSE binding-before-exposure seam with synchronous disk
-// commits enabled. It excludes provider/network latency and process startup.
 func BenchmarkStateBindingExposure(b *testing.B) {
 	for _, durable := range []bool{false, true} {
 		for _, occupancy := range []int{0, 8192} {
@@ -175,9 +173,6 @@ func BenchmarkDurableStateLookupAndOpen(b *testing.B) {
 	}
 }
 
-// Measure the complete writers, not just the duplicate-key scanner. Existing
-// proof avoids fsync variability so allocation growth in nested extensions is
-// visible. JSON diagnostic paths must not make that growth quadratic.
 func BenchmarkDurableNestedResponseValidation(b *testing.B) {
 	for _, depth := range []int{1000, 2000, 4000} {
 		for _, stream := range []bool{false, true} {

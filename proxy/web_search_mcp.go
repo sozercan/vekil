@@ -17,9 +17,6 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-// Vekil serves a single-tool MCP endpoint backed by the web_search tool on
-// GitHub's MCP server. The endpoint is a tool server, not a relay: clients can
-// only list and call web_search, and the GitHub credential never leaves Vekil.
 const (
 	webSearchMCPToolName              = "web_search"
 	webSearchMCPLatestProtocolVersion = "2025-11-25"
@@ -58,14 +55,7 @@ type mcpError struct {
 
 func (e *mcpError) Error() string { return fmt.Sprintf("JSON-RPC error %d: %s", e.Code, e.Message) }
 
-// HandleWebSearchMCP serves POST /mcp/web-search as a stateless MCP server
-// whose only tool is Copilot's web search. It is available only while Vekil
-// uses a Copilot provider, because the search authenticates with that
-// provider's GitHub credential.
 func (h *ProxyHandler) HandleWebSearchMCP(w http.ResponseWriter, r *http.Request) {
-	// MCP clients such as Claude Code send no Origin; browsers always do.
-	// Rejecting it keeps web pages, including DNS-rebinding ones, from
-	// spending the user's GitHub search through a local Vekil.
 	if r.Header.Get("Origin") != "" {
 		writeMCPJSON(w, http.StatusForbidden, mcpMessage{JSONRPC: "2.0", Error: &mcpError{Code: jsonRPCInvalidRequest, Message: "browser origins are not allowed"}})
 		return
@@ -85,7 +75,6 @@ func (h *ProxyHandler) HandleWebSearchMCP(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if len(request.ID) == 0 {
-		// Notifications such as notifications/initialized need no state here.
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -173,9 +162,6 @@ func writeMCPJSON(w http.ResponseWriter, status int, message mcpMessage) {
 	_ = json.NewEncoder(w).Encode(message)
 }
 
-// webSearchUpstreamAvailable reports whether GitHub's MCP server currently
-// offers web_search to this credential; account plans and organization
-// policy can withhold it even when the credential authenticates.
 func (h *ProxyHandler) webSearchUpstreamAvailable(ctx context.Context) (bool, error) {
 	ctx, cancel := h.webSearchMCPContext(ctx)
 	defer cancel()
@@ -226,8 +212,6 @@ func (h *ProxyHandler) callWebSearchUpstream(ctx context.Context, query string) 
 	return raw, nil
 }
 
-// webSearchMCPContext ends upstream calls when the client goes away, the
-// upstream timeout passes, or the proxy begins shutdown, whichever is first.
 func (h *ProxyHandler) webSearchMCPContext(inbound context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(inbound, webSearchMCPUpstreamTimeout)
 	stop := context.AfterFunc(h.lifecycleContext(), cancel)
@@ -237,9 +221,6 @@ func (h *ProxyHandler) webSearchMCPContext(inbound context.Context) (context.Con
 	}
 }
 
-// webSearchUpstreamSession is one short-lived MCP session with GitHub's
-// server. Each tool request opens its own session, which keeps Vekil free of
-// session expiry handling at the cost of two small handshake requests.
 type webSearchUpstreamSession struct {
 	h               *ProxyHandler
 	url             string
@@ -330,7 +311,6 @@ func (s *webSearchUpstreamSession) send(ctx context.Context, method string, id j
 	req.Header.Set("Authorization", "Bearer "+s.token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	// GitHub's MCP server exposes only the named tools, read-only.
 	req.Header.Set("X-MCP-Tools", webSearchMCPToolName)
 	req.Header.Set("X-MCP-Readonly", "true")
 	if s.sessionID != "" {
@@ -346,8 +326,6 @@ func (s *webSearchUpstreamSession) send(ctx context.Context, method string, id j
 	return resp, nil
 }
 
-// readMCPResponse returns the JSON-RPC response with the given id from either
-// a JSON body or a Streamable HTTP SSE stream.
 func readMCPResponse(resp *http.Response, id json.RawMessage) (mcpMessage, error) {
 	body := io.LimitReader(resp.Body, webSearchMCPUpstreamBodyLimit)
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))

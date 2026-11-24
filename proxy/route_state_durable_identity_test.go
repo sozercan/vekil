@@ -67,8 +67,6 @@ func TestDurableResponsesAzureAdmissionRefresh(t *testing.T) {
 			result := make(chan *httptest.ResponseRecorder, 1)
 			go func() { result <- durableWireRequest(h, tc.request, false, false) }()
 			waitForAzureTrafficWaiters(t, h, 1)
-			// Change the actual credential source while the authenticated request
-			// waits. The dispatch refresh must precede ownership validation/claim.
 			source.token.Store(refreshedToken)
 			advance(time.Second)
 			select {
@@ -86,8 +84,6 @@ func TestDurableResponsesAzureAdmissionRefresh(t *testing.T) {
 					t.Error("bound state was dispatched with a different principal")
 				}
 				source.token.Store(oldToken)
-				// A rejected refresh must release its admission permit so the
-				// original owner can continue without another shutdown or reset.
 				if retry := durableWireRequest(h, continuation, false, false); retry.Code != http.StatusOK {
 					t.Fatalf("original owner retry = %d %s", retry.Code, retry.Body.String())
 				}
@@ -178,8 +174,6 @@ func TestDurableResponsesActualCredentialSnapshot(t *testing.T) {
 				close(release)
 				t.Fatal("request did not reach fixture")
 			}
-			// Switch the real credential source while the authenticated request
-			// is in flight. Response ownership must remain principal A's snapshot.
 			setCredential("principal-b", "replacement")
 			close(release)
 			select {

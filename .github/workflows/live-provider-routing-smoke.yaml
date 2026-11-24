@@ -1,15 +1,5 @@
 name: Live Provider Routing Smoke
 
-# Credentialed end-to-end coverage for schema-v2 provider-agnostic model
-# routes. The primary and secondary are controlled Responses-capable Azure
-# OpenAI or generic OpenAI-compatible targets. The harness forwards one request
-# to the real primary, injects a safe primary 429, observes ordered failover to
-# the real secondary, then verifies state pinning and fail-closed behavior.
-#
-# Required repository variables and secrets are documented in
-# docs/development.md. Fork and Dependabot pull requests neutral-skip because
-# GitHub does not expose repository secrets to them. Once credentials are
-# available, target or routing failures are hard failures.
 
 on:
   workflow_dispatch:

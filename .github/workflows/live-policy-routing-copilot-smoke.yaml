@@ -1,11 +1,5 @@
 name: Live Copilot Semantic Policy Routing Smoke
 
-# PR, weekly, and manual credentialed coverage for schema-v2 semantic routing.
-# The wrapper starts a private zero-config Vekil bridge using the repository's
-# existing Copilot token, discovers native-Chat models for the broad policy
-# matrix, and presents them as controllable static loopback targets. It then
-# runs a focused GPT-5.6 Luna utility Responses check proving prompt-selected low/high
-# effort overrides conflicting client values, with Haiku handling classification.
 
 on:
   workflow_dispatch:

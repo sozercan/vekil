@@ -1,0 +1,2 @@
+Pygments==2.19.2
+PyYAML==6.0.3

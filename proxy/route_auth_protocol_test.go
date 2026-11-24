@@ -205,7 +205,6 @@ func TestOpenAICodexCredentialFailureProtocol(t *testing.T) {
 				codexHome := t.TempDir()
 				t.Setenv("CODEX_HOME", codexHome)
 				if !missing {
-					// No refresh token: stale credentials fail without an OAuth call.
 					writeTestOpenAICodexAuth(t, codexHome, testOpenAICodexTokens(t, time.Now().Add(-time.Hour), "test-account", false, ""))
 				}
 				var sends atomic.Int32

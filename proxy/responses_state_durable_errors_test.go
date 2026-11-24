@@ -15,8 +15,6 @@ import (
 
 const durableErrorFixture = `{"error":{"code":"fixture_error","message":"upstream fixture failure"},"id":"resp-error-fixture","conversation":"conv-error-fixture","output":[{"type":"reasoning","encrypted_content":"reasoning-error-fixture","summary":[]}]}`
 
-// Failover requires an error without generated output. Keep state identifiers
-// so discarded and final admission responses still exercise exact ownership.
 const durableAdmissionErrorFixture = `{"error":{"code":"fixture_error","message":"upstream fixture failure"},"id":"resp-error-fixture","conversation":"conv-error-fixture","output":[]}`
 
 func invokeDurableErrorSurface(h *ProxyHandler, surface string, w http.ResponseWriter) {
@@ -68,7 +66,6 @@ func TestDurableResponsesFinalErrorFailoverOwnership(t *testing.T) {
 				invokeDurableErrorSurface(h, surface, w)
 				wantStatus, wantSecondSends := secondStatus, int32(1)
 				if surface == "compact" || surface == "trigger" || surface == "trigger-stream" {
-					// Compaction attempts cannot switch targets, even on 429.
 					wantStatus, wantSecondSends = http.StatusTooManyRequests, 0
 				}
 				if w.Code != wantStatus || firstSends.Load() != 1 || secondSends.Load() != wantSecondSends {
@@ -76,8 +73,6 @@ func TestDurableResponsesFinalErrorFailoverOwnership(t *testing.T) {
 				}
 				selected, abandoned, target := "resp-error-fixture", "resp-first-error-fixture", route.targets[1].id
 				if wantStatus == http.StatusTooManyRequests {
-					// Equal exhausted failures preserve the first error, not the last
-					// attempt. Its captured response retains the original issuer.
 					selected, abandoned, target = abandoned, selected, route.targets[0].id
 				}
 				if !strings.Contains(w.Body.String(), selected) {
@@ -148,7 +143,6 @@ func TestDurableResponsesCompactionTriggerSyntheticSuccess(t *testing.T) {
 				var s *stateBindingStore
 				if durable {
 					s, _ = newDurableStoreFixture(t, 1)
-					// Synthetic success must not need a durable write at all.
 					s.durable.beforeCommit = func() error { return syscall.EIO }
 				} else {
 					var err error
@@ -234,7 +228,7 @@ func TestDurableResponsesErrorWriterKeepsSuccessSideEffectsSeparate(t *testing.T
 			}
 			wantTotal, wantRewrites := 0, 0
 			if status == http.StatusOK {
-				wantTotal, wantRewrites = 9, 1 // positive control proves both hooks are wired
+				wantTotal, wantRewrites = 9, 1
 			}
 			if got := readSummaryForStats(summary); got.total != wantTotal || len(optimizer.snapshotRewriteRequests()) != wantRewrites {
 				t.Fatalf("success-only hooks: usage=%d rewrites=%d", got.total, len(optimizer.snapshotRewriteRequests()))

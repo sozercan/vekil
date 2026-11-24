@@ -15,9 +15,6 @@ const (
 	serveLogFileFlag = "log-file"
 )
 
-// serveEarlyFileArgs finds --env-file and --log-file before normal flag
-// parsing, because the env file must be loaded before flag defaults read the
-// environment, and the log file must be open to report env-file errors.
 func serveEarlyFileArgs(args []string) (envFile, logFile string) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -44,9 +41,6 @@ func serveEarlyFileArgs(args []string) (envFile, logFile string) {
 	return envFile, logFile
 }
 
-// loadServeEnvFile sets each KEY=value from path in the process environment.
-// Values in the file override existing variables, matching systemd's
-// EnvironmentFile precedence.
 func loadServeEnvFile(path string) error {
 	file, err := os.Open(path)
 	if err != nil {
@@ -65,9 +59,6 @@ func loadServeEnvFile(path string) error {
 	return nil
 }
 
-// parseServeEnvFile reads KEY=value lines. Blank lines and lines starting with
-// # are ignored, an optional "export " prefix is accepted, and one pair of
-// matching surrounding single or double quotes is removed from the value.
 func parseServeEnvFile(r io.Reader) ([][2]string, error) {
 	var vars [][2]string
 	scanner := bufio.NewScanner(r)
@@ -107,8 +98,6 @@ func validServeEnvKey(key string) bool {
 	return true
 }
 
-// prepareServeFiles opens --log-file and loads --env-file. It returns the log
-// writer, which is nil when logs should go to stderr.
 func prepareServeFiles(args []string) (io.Writer, error) {
 	envFile, logFile := serveEarlyFileArgs(args)
 	var writer io.Writer
@@ -118,8 +107,6 @@ func prepareServeFiles(args []string) (io.Writer, error) {
 			return nil, fmt.Errorf("open log file: %w", err)
 		}
 		writer = file
-		// Logs now go to the file, so a console created only for this
-		// process (for example by a Windows logon task) is not needed.
 		detachOwnedConsole()
 	}
 	if envFile != "" {

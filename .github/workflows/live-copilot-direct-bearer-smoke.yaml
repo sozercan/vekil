@@ -1,11 +1,5 @@
 name: Live Copilot Direct Bearer Smoke
 
-# Credentialed live coverage for direct GitHub credential authentication. The
-# test verifies that Vekil returns the fine-grained PAT without calling the
-# legacy GitHub auth endpoints, then proves the credential reaches Copilot's
-# /models and /responses endpoints successfully. It deliberately runs only
-# from the trusted default branch so the repository PAT is never exposed to
-# pull-request-controlled code.
 
 on:
   schedule:

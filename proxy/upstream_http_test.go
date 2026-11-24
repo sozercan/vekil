@@ -1446,8 +1446,6 @@ func TestPostChatCompletions_UsesAzureClassicDeploymentURLAndKeepsPublicBodyMode
 	}
 }
 
-// fakeBodyResponse builds a minimal 200 *http.Response whose body is the given
-// bytes, for exercising the passthrough/usage-sniff helpers directly.
 func fakeBodyResponse(body string) *http.Response {
 	return &http.Response{
 		StatusCode:    http.StatusOK,
@@ -1658,8 +1656,6 @@ func TestWriteOpenAIPassthroughObservingUsage_SniffsWithinCap(t *testing.T) {
 func TestWriteOpenAIPassthroughObservingUsage_OversizedStreamsThroughIntact(t *testing.T) {
 	h := &ProxyHandler{}
 	ctx, summary := WithRequestSummary(context.Background())
-	// A body larger than the sniff cap: usage is skipped (fail-open) but every
-	// byte must still reach the client unchanged.
 	filler := strings.Repeat("x", usageSniffMaxBuffer+1024)
 	body := `{"padding":"` + filler + `","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
 
@@ -1671,7 +1667,6 @@ func TestWriteOpenAIPassthroughObservingUsage_OversizedStreamsThroughIntact(t *t
 	if got := w.Body.String(); got != body {
 		t.Fatalf("oversized body not streamed through intact: got %d bytes, want %d", len(got), len(body))
 	}
-	// Usage parse is skipped for oversized bodies.
 	if summary.totalTokens != nil {
 		t.Fatalf("totalTokens = %v, want nil (usage skipped for oversized body)", *summary.totalTokens)
 	}
@@ -1700,7 +1695,6 @@ func chatImagePart(n int) string {
 	return fmt.Sprintf(`{"type":"image_url","image_url":{"url":"data:image/png;base64,IMG%d"}}`, n)
 }
 
-// chatContentSummary flattens each message's content into its image URLs and text, in order.
 func chatContentSummary(t *testing.T, body []byte) [][]string {
 	t.Helper()
 	var payload struct {
@@ -1749,8 +1743,6 @@ func TestOmitChatImagesBeyondOwnerLimit_KeepsNewestImages(t *testing.T) {
 	if summary := chatContentSummary(t, got); omitted != 1 || !reflect.DeepEqual(summary, want) {
 		t.Fatalf("content = %q omitted = %d, want the oldest image omitted and the newest two kept in order: %q", summary, omitted, want)
 	}
-	// Only the omitted part changes: key order, unescaped text and the rest of the body
-	// reach the upstream exactly as the client sent them.
 	if wantBytes := strings.Replace(string(body), chatImagePart(1), placeholder, 1); string(got) != wantBytes {
 		t.Fatalf("body = %s, want only the oldest image part replaced: %s", got, wantBytes)
 	}
@@ -1908,8 +1900,6 @@ func TestProviderModelMaxPromptImagesFromRawHonorsOnlyGoogle(t *testing.T) {
 	}
 }
 
-// A catalog may list one ID more than once. The limit follows the entry whose metadata is
-// published, and still applies when only another entry for that ID declares it.
 func TestDecodeProviderModelsDuplicateGoogleEntriesKeepImageLimit(t *testing.T) {
 	provider := &providerRuntime{id: "copilot", kind: providerTypeCopilot, paths: providerEndpointPolicyFor(providerTypeCopilot).defaultEndpointPaths()}
 	entry := func(state string, limit string) json.RawMessage {
@@ -1945,7 +1935,6 @@ func TestDecodeProviderModelsDuplicateGoogleEntriesKeepImageLimit(t *testing.T) 
 	}
 }
 
-// A static metadata overlay for a discovered model keeps the catalog's image limit.
 func TestMergeDiscoveredProviderModelsWithStaticConfigKeepsImageLimit(t *testing.T) {
 	provider := &providerRuntime{
 		id:            "relay",
@@ -1964,11 +1953,6 @@ func TestMergeDiscoveredProviderModelsWithStaticConfigKeepsImageLimit(t *testing
 	}
 }
 
-// From the live catalog to the wire: a Google model's declared limit trims an Anthropic
-// transcript's oldest image, while another vendor's declared limit is ignored.
-// Claude Code marks cache breakpoints, and the one on the first user turn splits the message
-// that holds the omitted image, so the trim must run after the cache mapping: the mapping
-// projects the client's original content and refuses to split a message that has changed.
 func TestHandleAnthropicMessagesHonorsGoogleCatalogImageLimit(t *testing.T) {
 	var mu sync.Mutex
 	sent := map[string][]byte{}

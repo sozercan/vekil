@@ -707,17 +707,12 @@ func TestTranslateChatRequestToResponsesIgnoresContinuationOnlyDefaultsForReplay
 			}},
 		}}},
 	})
-	// Native Chat stays loud: it owns its history and can repair it, so a drifted
-	// projection is an error here rather than a silent rebuild. This is upstream's
-	// contract and the option's documented one; only surfaces that opt in degrade.
 	_, err = translateChatRequestToResponses(body, responsesChatRequestOptions{ReplayStore: store, ReplayRoute: route})
 	var executionErr *chatExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != responsesChatReplayProjectionCode {
 		t.Fatalf("error = %#v, want replay projection mismatch", err)
 	}
 
-	// When a surface DOES opt in, the guard that matters is what upstream is told: the
-	// stored call must not be reused to launder arguments the store never saw.
 	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
 		ReplayStore: store, ReplayRoute: route, DegradeUnrestorableReplay: true,
 	})

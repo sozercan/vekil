@@ -9,8 +9,6 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// What vekil emits on turn N must preserve the opaque reasoning fields and ordering
-// placeholders needed on turn N+1 while stripping every field the transcript rebuilds.
 func TestCarrierSurvivesAFullTurnRoundTrip(t *testing.T) {
 	outputItems := []json.RawMessage{
 		json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"CIPHERTEXT","content":[],"summary":[]}`),
@@ -50,8 +48,6 @@ func TestCarrierSurvivesAFullTurnRoundTrip(t *testing.T) {
 	}
 }
 
-// The carrier keys on whatever vekil put on the tool_use block -- the MINTED id,
-// not Copilot's. Both mechanisms hang off that one id, so either can answer.
 func TestCarrierKeysOnTheMintedToolUseID(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	defer func() { _ = store.Close() }()
@@ -92,7 +88,6 @@ func TestPrependCarriedReasoningIsNoOpWithoutItems(t *testing.T) {
 	}
 }
 
-// Clients build a thinking block from its deltas: a signature on the start frame is lost.
 func TestCarriedReasoningStreamsSignatureAsDelta(t *testing.T) {
 	rec := httptest.NewRecorder()
 	state := newAnthropicStreamState(rec, "gpt-public", "msg_test")

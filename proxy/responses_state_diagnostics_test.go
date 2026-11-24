@@ -43,9 +43,6 @@ func responsesStateDiagnosticCases() []responsesStateDiagnosticCase {
 	}
 }
 
-// Provider configuration, request handling, transport and serialization are
-// real. Only prior ownership observations are seeded directly: these tests
-// exercise the diagnostic after proof is missing, not persistence or exposure.
 func newResponsesStateDiagnosticHandler(t *testing.T) (*ProxyHandler, *explicitResponsesStateTarget, *explicitResponsesStateTarget) {
 	t.Helper()
 	primary, secondary := &explicitResponsesStateTarget{}, &explicitResponsesStateTarget{}
@@ -238,8 +235,6 @@ func TestExplicitResponsesStateDiagnosticsPinnedWebSocket(t *testing.T) {
 			for _, token := range tc.tokens {
 				input = append(input, map[string]any{"type": "reasoning", "encrypted_content": token})
 			}
-			// Omitting previous_response_id resets replay history, but the
-			// established WebSocket session remains pinned to primary.
 			second := newResponsesWebSocketCreateRequest(input)
 			second["model"] = "public-ws-model"
 			if err := conn.WriteJSON(second); err != nil {
@@ -259,8 +254,6 @@ func TestExplicitResponsesStateDiagnosticsPinnedWebSocket(t *testing.T) {
 }
 
 func TestExplicitResponsesStateDiagnosticsMemory(t *testing.T) {
-	// Traces are rendered as text by the shim. Only the trusted turn-state
-	// header reaches state extraction, so there is no mixed-token memory case.
 	for _, tc := range []responsesStateDiagnosticCase{
 		{"missing header", []string{"opaque-missing"}, "provider_state_unavailable", "one or more state values have no live binding in this Vekil process"},
 		{"tombstone header", []string{"opaque-tombstone"}, "", "conflicting provider-bound state"},

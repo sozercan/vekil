@@ -14,5 +14,5 @@ func optimizerTestProcessAlive(pid int) bool {
 	if err := windows.GetExitCodeProcess(handle, &exitCode); err != nil {
 		return false
 	}
-	return exitCode == 259 // STILL_ACTIVE
+	return exitCode == 259
 }

@@ -104,11 +104,6 @@ func rewriteOpenAIChatCompletionModelIdentity(payload map[string]json.RawMessage
 }
 
 func (n *openAIChatCompletionChunkNormalizer) normalize(eventType, data string) (string, bool) {
-	// OpenAI chat completion streams usually use unnamed SSE events. Also accept
-	// explicit event names that are equivalent to the default SSE "message" event
-	// or that directly label a chat chunk. Leave other side-band events
-	// (event: ping, event: metadata, event: error, etc.) untouched so provider
-	// metadata is not converted into a synthetic chat chunk.
 	if n == nil || !openAIChatStreamEventMayCarryChunk(eventType) {
 		return data, false
 	}
@@ -281,10 +276,6 @@ func firstProviderChoiceStringField(choice map[string]json.RawMessage, key strin
 	return nil, false
 }
 
-// normalizeOpenAIChatCompletionResponse fills in OpenAI Chat Completions fields
-// that strict SDK clients require while preserving upstream/vendor-specific
-// fields. It is intentionally map-based instead of models.OpenAIResponse-based
-// so unknown top-level and nested fields survive unchanged.
 func normalizeOpenAIChatCompletionResponse(body []byte, requestedModel string, now time.Time) ([]byte, bool, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -352,11 +343,6 @@ func normalizeOpenAIChatCompletionResponse(body []byte, requestedModel string, n
 	return out, true, nil
 }
 
-// inspectCanonicalOpenAIChatCompletionResponse recognizes the common case where
-// an upstream already returned a complete Chat Completions response. It uses an
-// exact-key token walk so it preserves the map-based normalizer's casing and
-// duplicate-key semantics while avoiding nested map allocations. Any ambiguous
-// or provider-specific shape falls back to the full normalizer.
 func inspectCanonicalOpenAIChatCompletionResponse(body []byte, requestedModel string) (models.OpenAIUsage, bool) {
 	if usage, ok := inspectCanonicalOpenAIChatCompletionResponseFast(body, requestedModel); ok {
 		return usage, true
@@ -400,8 +386,6 @@ func inspectCanonicalOpenAIChatCompletionResponseWithDecoder(body []byte, reques
 
 		switch key {
 		case "error":
-			// Successful 2xx error envelopes deliberately bypass normalization.
-			// They are uncommon and retain the existing map-based path.
 			return nil, false
 		case "id":
 			idOK = decodeCanonicalNonEmptyString(decoder)
@@ -835,7 +819,6 @@ func normalizeOpenAIChatCompletionMessage(choice map[string]json.RawMessage) (js
 	changed := false
 	if raw, ok := choice["message"]; ok && len(bytes.TrimSpace(raw)) > 0 && string(bytes.TrimSpace(raw)) != "null" {
 		if err := json.Unmarshal(raw, &message); err == nil && message != nil {
-			// Preserve existing message object fields below.
 		} else {
 			message = make(map[string]json.RawMessage)
 			changed = true

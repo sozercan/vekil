@@ -1,9 +1,3 @@
-# Schema-v2 ordered failover for two semantically equivalent Responses targets.
-# Set both environment variables before validating or starting Vekil:
-#   export AZURE_PRIMARY_API_KEY=...
-#   export AZURE_SECONDARY_API_KEY=...
-# Validate without serving:
-#   vekil config validate --providers-config examples/provider-routing-failover.yaml
 
 schema_version: 2
 

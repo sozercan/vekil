@@ -27,10 +27,6 @@ func (h *ProxyHandler) newLifecycleUpstreamContextFrom(lifecycle context.Context
 	}
 	if !h.ShuttingDown() {
 		ctx, cancel := context.WithTimeout(lifecycle, timeout)
-		// BeginShutdown publishes draining before canceling the lifecycle root.
-		// Keep the ordinary path to one child context, but recheck after creating
-		// it so a context installed in that ordering window still returns with the
-		// proxy-shutdown cause below.
 		if !h.ShuttingDown() || lifecycle.Err() != nil {
 			return ctx, cancel
 		}
@@ -39,17 +35,10 @@ func (h *ProxyHandler) newLifecycleUpstreamContextFrom(lifecycle context.Context
 
 	causeCtx, cancelCause := context.WithCancelCause(lifecycle)
 	ctx, cancelTimeout := context.WithTimeout(causeCtx, timeout)
-	// BeginShutdown publishes draining before canceling the lifecycle root so
-	// admission closes first. Close that tiny ordering window for children
-	// derived from the still-live root; the parent cancellation covers the
-	// opposite ordering where it wins before this recheck.
 	if h.ShuttingDown() {
 		cancelCause(errProxyLifecycleShutdown)
 	}
 	return ctx, func() {
-		// Preserve the historical caller-cancel semantics: an explicit returned
-		// cancel is ordinary context cancellation, while timeout and lifecycle
-		// shutdown retain their own causes.
 		cancelTimeout()
 		cancelCause(context.Canceled)
 	}
@@ -59,16 +48,6 @@ func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Cont
 	return h.newInferenceUpstreamContextFrom(context.Background(), streaming)
 }
 
-// newInferenceUpstreamContextFrom builds a lifecycle-rooted upstream request
-// context with its own timeout. It deliberately does not inherit cancellation
-// or arbitrary values from the inbound request, so an ordinary client disconnect
-// does not cancel upstream inference. BeginShutdown cancels the lifecycle root,
-// which promptly stops both existing work and contexts created after draining
-// begins.
-//
-// The retry-stats tracked marker is copied explicitly when present. A context
-// without the marker (for example context.Background()) yields an untracked
-// upstream context for internal insight, catalog, count-token, and shim work.
 func (h *ProxyHandler) newInferenceUpstreamContextFrom(inbound context.Context, streaming bool) (context.Context, context.CancelFunc) {
 	timeout := upstreamTimeout
 	if streaming {
@@ -267,7 +246,6 @@ func prepareResolvedProviderRequestBodyWithValidation(
 }
 
 func applyProviderModelRequestPolicy(body []byte, endpoint string, owner providerModel) []byte {
-	// Decisions is a passthrough: the client's fields reach upstream as sent.
 	if endpoint == copilotEndpointDecisions {
 		return body
 	}
@@ -321,17 +299,11 @@ func applyProviderModelRequestPolicy(body []byte, endpoint string, owner provide
 	return rewritten
 }
 
-// omitChatImagesBeyondOwnerLimit enforces the owner's per-request image limit on a native
-// Chat body that is otherwise final. The oldest image parts beyond the limit become a text
-// placeholder; only those parts are spliced, so every other byte is forwarded as it was. It
-// returns the body and the number of omitted images.
 func omitChatImagesBeyondOwnerLimit(body []byte, path string, owners []providerModel) ([]byte, int) {
 	if path != providerEndpointChatCompletions || len(owners) == 0 {
 		return body, 0
 	}
 	limit := owners[0].maxPromptImages
-	// A plainly spelled image part contains image_url twice, as its type and as its key.
-	// Unicode escapes can hide either occurrence, so only use the literal count without them.
 	if limit <= 0 || (bytes.Count(body, []byte("image_url")) <= 2*limit && !bytes.Contains(body, []byte(`\u`))) {
 		return body, 0
 	}
@@ -356,10 +328,6 @@ type chatImagePartRange struct {
 	end   int
 }
 
-// chatImagePartRanges returns the byte ranges of a Chat body's image_url content parts in
-// message order. Keys match exactly after decoding JSON escapes. A body that repeats
-// messages, a message that repeats content or a part that repeats type is ambiguous to
-// upstream parsers, so it is reported unparsed rather than guessed at.
 func chatImagePartRanges(body []byte) ([]chatImagePartRange, bool) {
 	messagesStart, messagesEnd, found, ok := uniqueRawJSONObjectField(body, 0, len(body), "messages")
 	if !ok || !found {
@@ -388,7 +356,7 @@ func chatImagePartRanges(body []byte) ([]chatImagePartRange, bool) {
 		}
 		parts, ok := newRawJSONArrayScanner(body[contentStart:contentEnd])
 		if !ok {
-			continue // string or null content carries no image parts
+			continue
 		}
 		for {
 			partStart, partEnd, done, ok := parts.next()
@@ -410,9 +378,6 @@ func chatImagePartRanges(body []byte) ([]chatImagePartRange, bool) {
 	}
 }
 
-// uniqueRawJSONObjectField returns the absolute value range of key in the JSON object at
-// body[start:end]. found is false when the key is absent; ok is false when the value is not
-// an object or repeats the key.
 func uniqueRawJSONObjectField(body []byte, start, end int, key string) (valueStart, valueEnd int, found, ok bool) {
 	object, ok := newRawJSONObjectScanner(body[start:end])
 	if !ok {
@@ -435,8 +400,6 @@ func uniqueRawJSONObjectField(body []byte, start, end int, key string) (valueSta
 	}
 }
 
-// uniqueRawJSONObjectFieldWithEscapes is the semantic fallback for escaped object keys.
-// Decoder offsets retain the original value ranges without re-encoding the request.
 func uniqueRawJSONObjectFieldWithEscapes(body []byte, start, end int, key string) (valueStart, valueEnd int, found, ok bool) {
 	decoder := json.NewDecoder(bytes.NewReader(body[start:end]))
 	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
@@ -469,8 +432,6 @@ func uniqueRawJSONObjectFieldWithEscapes(body []byte, start, end int, key string
 	return valueStart, valueEnd, found, true
 }
 
-// rawJSONStringIs reports whether raw is a JSON string equal to want, decoding escapes only
-// when they are present.
 func rawJSONStringIs(raw []byte, want string) bool {
 	if len(raw) == len(want)+2 && raw[0] == '"' && raw[len(raw)-1] == '"' && string(raw[1:len(raw)-1]) == want {
 		return true
@@ -519,11 +480,6 @@ func (h *ProxyHandler) postResolvedProviderRequestForModel(
 	})
 }
 
-// maybeRetryResolvedResponsesWithoutUnverifiableEncryptedContent mirrors the
-// native Responses retry contract while retaining an already-resolved provider,
-// model owner, and endpoint. Re-resolving from requestBody would route on the
-// already-rewritten upstream model instead of the public model that selected the
-// original route.
 func (h *ProxyHandler) maybeRetryResolvedResponsesWithoutUnverifiableEncryptedContent(
 	ctx context.Context,
 	provider *providerRuntime,
@@ -624,14 +580,9 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModelValidation(ctx context
 			resolvedAlias := false
 			if plan, planned := operation.policyPlan(); planned {
 				if entry, known := h.providerSetup().lookupPublicModelEntry(requestedModel); known && entry != nil && entry.kind == publicEntryPolicy && entry.id == plan.publicID {
-					// Keep the request alias as the rewrite source while authorizing it
-					// against the sealed policy public identity.
 					resolvedAlias = true
 				}
 			} else if resolved, known := h.resolveModelRouteForRequest(requestedModel, path); known && sameLogicalExplicitRoute(resolved, route) {
-				// Keep the actual alias as the rewrite source. Using the canonical
-				// public ID here can leave the alias in the immutable request body
-				// when the target upstream model is already canonical.
 				resolvedAlias = true
 			}
 			attemptKind := routeAttemptKindFromContext(ctx)
@@ -650,10 +601,6 @@ func (h *ProxyHandler) postJSONEndpointWithHeadersForModelValidation(ctx context
 						}
 					}
 				}
-				// Keep requestedModel as the model present in the immutable fallback
-				// body. The override carries only the physical model selected for the
-				// pinned target, so prepareRouteTargetBody can still rewrite from the
-				// actual fallback model to that upstream model.
 				ctx = withRouteUpstreamModelOverride(ctx, upstreamModel)
 			}
 		}
@@ -834,11 +781,6 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) error {
 	return newResponseBodyWriteError(resp, err, true, tracked.writeErr == nil, body.canceledAtFailure())
 }
 
-// writeOpenAIChatCompletionResponse writes a non-streaming OpenAI chat response,
-// normalizing missing required Chat Completions fields for strict SDK clients
-// while preserving vendor-specific fields. It only rewrites successful JSON
-// responses that fit in usageSniffMaxBuffer; errors, invalid JSON, and oversized
-// responses fail open to passthrough behavior.
 func (h *ProxyHandler) writeOpenAIChatCompletionResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, requestedModel string) error {
 	if err := h.prepareDurableFinalResponseHeaders(resp); err != nil {
 		return err
@@ -867,13 +809,7 @@ func (h *ProxyHandler) writeOpenAIPassthroughObservingUsage(ctx context.Context,
 	})
 }
 
-// usageSniffMaxBuffer bounds how much of a non-streaming upstream response the
-// proxy buffers in memory solely to parse its usage block for traffic stats.
-// Real LLM JSON responses — even very large completions — sit well under this,
-// so usage is captured for all realistic traffic; the cap only prevents a
-// single pathological multi-megabyte body (or many concurrent ones) from being
-// buffered whole. Oversized bodies stream through with usage stats skipped.
-const usageSniffMaxBuffer = 4 << 20 // 4 MiB
+const usageSniffMaxBuffer = 4 << 20
 
 const (
 	usageSniffTinyBufferSize  = 512
@@ -890,13 +826,6 @@ var usageSniffSmallBufferPool = sync.Pool{New: func() any {
 	return &buffer
 }}
 
-// writePassthroughSniffingUsage writes a non-streaming upstream response to the
-// client while buffering at most usageSniffMaxBuffer bytes so the supplied
-// transform can sniff usage and optionally rewrite the complete body. A 2xx body
-// that fits the cap is buffered and passed to transform; if transform reports a
-// rewrite, Content-Length is adjusted. Oversized bodies stream through without a
-// transform so proxy memory stays bounded. Non-2xx responses and read errors
-// fall back to a plain copy.
 func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, transform func([]byte) ([]byte, bool)) error {
 	if resp == nil || resp.Body == nil {
 		return &responseBodyWriteError{err: fmt.Errorf("upstream response body is unavailable"), upstream: true}
@@ -923,9 +852,6 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 		return nil
 	}
 
-	// Read one byte past the cap so we can tell a full body from an oversized one.
-	// Known small Content-Length responses use one exact allocation instead of
-	// constructing a limiter and growing io.ReadAll's default buffer.
 	prefix, pooledBuffer, err := readUsageSniffPrefix(body, resp.ContentLength)
 	if pooledBuffer != nil {
 		defer releaseUsageSniffBuffer(pooledBuffer)
@@ -942,7 +868,6 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 	}
 
 	if len(prefix) <= usageSniffMaxBuffer {
-		// Whole body fits: parse/transform it, then write the result.
 		out := prefix
 		changed := false
 		if transform != nil {
@@ -959,9 +884,6 @@ func writePassthroughSniffingUsage(w http.ResponseWriter, resp *http.Response, t
 		return nil
 	}
 
-	// Oversized: skip the usage parse and stream prefix + remainder so memory
-	// stays bounded. A proven length mismatch above removes the stale advertised
-	// length before the larger body is written.
 	w.WriteHeader(resp.StatusCode)
 	if _, err := w.Write(prefix); err != nil {
 		return newResponseBodyWriteError(resp, err, true, false, false)
@@ -992,8 +914,6 @@ func writeSmallKnownLengthPassthroughSniffingUsage(w http.ResponseWriter, resp *
 	switch err {
 	case nil:
 		longerThanAdvertised = true
-		// The body exceeded its advertised length. Continue to the normal cap so
-		// a malformed Content-Length cannot truncate the downstream response.
 		body := newLifecycleAwareReadCloser(resp.Body, ctx)
 		rest, readErr := io.ReadAll(io.LimitReader(body, int64(usageSniffMaxBuffer+1-len(prefix))))
 		prefix = append(prefix, rest...)
@@ -1084,8 +1004,6 @@ func readUsageSniffPrefix(body io.Reader, contentLength int64) ([]byte, *[]byte,
 	n, err := io.ReadFull(body, prefix)
 	switch err {
 	case nil:
-		// The body exceeded its advertised length. Continue to the normal cap so
-		// a malformed Content-Length cannot truncate the downstream response.
 		if len(prefix) >= limit {
 			return prefix, pooledBuffer, nil
 		}
@@ -1122,10 +1040,6 @@ func releaseUsageSniffBuffer(buffer *[]byte) {
 	}
 }
 
-// sniffOpenAIUsage extracts the usage block from a non-streaming OpenAI chat
-// completion body without disturbing the rest of the payload. It returns nil
-// when the body is not valid JSON or carries no usage, so callers can pass the
-// result straight to observeOpenAIUsage.
 func sniffOpenAIUsage(body []byte) *models.OpenAIUsage {
 	var parsed struct {
 		Usage *models.OpenAIUsage `json:"usage"`
@@ -1183,7 +1097,6 @@ func writeDirectAnthropicJSONResponse(ctx, upstreamCtx context.Context, w http.R
 				fastUsage = inspection.usage
 				fastUsageParsed = inspection.usageParsed
 				if resp.StatusCode == http.StatusOK && fastUsageParsed {
-					// Observe before an in-place model rewrite can move the billing bytes.
 					observeCopilotUsage(ctx, inspection.copilotUsage)
 				}
 				rewritten, changed, err = rewriteAnthropicResponseModelJSONInPlaceInspected(body, publicModel, upstreamModel, inspection)
@@ -1254,9 +1167,6 @@ func readDirectAnthropicJSONBodyKnownLength(body io.Reader, contentLength, maxBo
 	}
 }
 
-// readDirectAnthropicJSONBody keeps the historical unbounded legacy read when
-// maxBodySize is zero. Explicit routes pass a positive bound so a successful
-// response cannot bypass public-model normalization by exceeding the buffer.
 func readDirectAnthropicJSONBody(body io.Reader, maxBodySize int64) ([]byte, error) {
 	if maxBodySize <= 0 {
 		return io.ReadAll(body)
@@ -1272,9 +1182,6 @@ func readDirectAnthropicJSONBody(body io.Reader, maxBodySize int64) ([]byte, err
 	return data, nil
 }
 
-// normalizeExplicitAnthropicResponseModelJSON is the fail-closed counterpart
-// to rewriteAnthropicResponseModelJSON. Explicit routes must not forward a
-// successful body unless it is a complete JSON object that can be normalized.
 func normalizeExplicitAnthropicResponseModelJSON(body []byte, publicModel string) ([]byte, bool, error) {
 	publicModel = strings.TrimSpace(publicModel)
 	if publicModel == "" {
@@ -1382,10 +1289,6 @@ func rewriteAnthropicResponseModelJSONInPlaceInspected(body []byte, publicModel,
 	return rewritten, true, nil
 }
 
-// rewriteAnthropicResponseModelJSONFast handles the ordinary Messages response
-// without rebuilding the complete JSON object. It declines ambiguous shapes so
-// the map-based path above retains duplicate-key, escaped-key, and nested
-// message.model behavior.
 func rewriteAnthropicResponseModelJSONFast(body []byte, rawPublicModel json.RawMessage) ([]byte, bool, bool) {
 	if !json.Valid(rawPublicModel) {
 		return body, false, false

@@ -11,13 +11,8 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// copilotEndpointDecisions is Copilot's native Decisions API endpoint.
 const copilotEndpointDecisions = "/v1/decisions"
 
-// HandleDecisions serves POST /v1/decisions as a passthrough to the upstream
-// endpoint of the same path, without translation. Only models whose catalog
-// entry lists /v1/decisions in supported_endpoints are accepted, so the
-// endpoint never reaches models or providers that did not advertise it.
 func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 	const endpoint, summaryEndpoint = copilotEndpointDecisions, "decisions"
 	body, err := readBodyWithLimit(r, maxRequestBodySize)
@@ -34,8 +29,6 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body", "invalid_request_error")
 		return
 	}
-	// Decode exact keys: a struct field would also match "Model", letting the
-	// gate check one key while upstream reads another.
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil || fields == nil {
 		writeOpenAIError(w, http.StatusBadRequest, "request body must be a JSON object", "invalid_request_error")
@@ -53,8 +46,6 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIErrorWithDetails(w, http.StatusBadRequest, "model is required", "invalid_request_error", "model", "")
 		return
 	}
-	// The body is forwarded unchanged, so the gated ID must be the exact one
-	// upstream will see.
 	if model != strings.TrimSpace(model) {
 		writeOpenAIErrorWithDetails(w, http.StatusBadRequest, "model must not have surrounding whitespace", "invalid_request_error", "model", "")
 		return
@@ -73,7 +64,6 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.Context().Err() != nil {
-			// Record a client-first abort as 499, as Responses does.
 			w.WriteHeader(499)
 			return
 		}
@@ -93,8 +83,6 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.postJSONEndpointWithHeadersForModel(upstreamCtx, endpoint, body, nil, model)
 	if err != nil {
-		// Shared with Responses: a shutdown 503, a client-first 499 during
-		// admission, and the standard upstream failure shapes.
 		h.writeResponsesUpstreamRequestFailure(w, r, upstreamCtx, summaryEndpoint, err)
 		return
 	}
@@ -111,8 +99,6 @@ func (h *ProxyHandler) HandleDecisions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// observeDecisionUsage records the input/output token usage that decision
-// responses report, when present.
 func observeDecisionUsage(ctx context.Context, body []byte) {
 	var response struct {
 		Usage *struct {
@@ -133,8 +119,6 @@ func observeDecisionUsage(ctx context.Context, body []byte) {
 	})
 }
 
-// catalogModelSupportsEndpoint reports whether the merged /models catalog
-// lists model with endpoint in its supported_endpoints.
 func (h *ProxyHandler) catalogModelSupportsEndpoint(ctx, waitCtx context.Context, model, endpoint string) (bool, error) {
 	entry, ok, err := h.ensureCanonicalModelsCacheEntry(ctx, waitCtx)
 	if err != nil && !ok {

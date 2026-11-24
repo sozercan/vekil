@@ -153,7 +153,6 @@ func TestResponsesCancelledWithoutID(t *testing.T) {
 	if frame := mustReadWebSocketJSONSkipMetadata(t, conn); frame["type"] != "response.cancelled" {
 		t.Fatalf("cancelled response without ID = %#v", frame)
 	}
-	// A local warmup synchronizes with completion of cancellation accounting.
 	request := newResponsesWebSocketCreateRequest(nil)
 	request["generate"] = false
 	if err := conn.WriteJSON(request); err != nil {

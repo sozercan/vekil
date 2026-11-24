@@ -2,7 +2,6 @@
 
 set -euo pipefail
 
-# Mock upstream usage must not appear as real live usage in the CI summary.
 unset GITHUB_STEP_SUMMARY
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -163,7 +162,6 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
     sock.listen()
     while True:
         conn, _ = sock.accept()
-        # Hold the connection open forever without returning an HTTP response.
         time.sleep(300)
         conn.close()
 PY
@@ -531,8 +529,6 @@ except OSError:
 PY_PORT_CHECK
 }
 
-# Copilot-mode harness run with Gemini enabled (the mock lists gpt-4.1) and a
-# fake Gemini CLI emitting <gemini_mode>-shaped output for the file fixture.
 run_gemini_case() {
   local expectation="$1"
   local name="$2"
@@ -666,8 +662,6 @@ else
     "timeout=${startup_timeout:-<missing>} period=${startup_period:-<missing>} failures=${startup_failures:-<missing>} budget=${startup_budget}s"
 fi
 
-# A stale healthy process must not satisfy readiness after the spawned proxy loses
-# the bind race and exits.
 case_dir="${TMP_ROOT}/setup/stale-listener"
 start_mock_server "${case_dir}/server"
 port="${MOCK_SERVER_PORT}"
@@ -681,8 +675,6 @@ expect_hard_failure "stale healthy listener while spawned proxy bind fails" 6 \
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=1 SMOKE_CLI_TIMEOUT_SECONDS=2 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
-# The compact smoke script enforces the same spawned-PID ownership rule rather
-# than trusting the stale server.
 expect_hard_failure "compact smoke rejects stale healthy listener" 6 \
   env START_PROXY=1 PROXY_HOST=127.0.0.1 PROXY_PORT="${port}" \
     PROXY_BIN="${case_dir}/bind-fail-proxy" LIVE_COMPACT_SMOKE_DIR="${case_dir}/compact" \
@@ -690,8 +682,6 @@ expect_hard_failure "compact smoke rejects stale healthy listener" 6 \
     SMOKE_CURL_CONNECT_TIMEOUT_SECONDS=1 SMOKE_CURL_MAX_TIME_SECONDS=1 \
     "${REPO_ROOT}/scripts/live-compact-smoke.sh"
 
-# With no caller-supplied port, a successfully spawned proxy gets an isolated
-# non-default port and cleanup releases it.
 auto_dir="${TMP_ROOT}/setup/auto-port"
 write_fake_default_smoke_clients "${auto_dir}/bin"
 write_healthy_proxy "${auto_dir}/healthy-proxy"
@@ -776,8 +766,6 @@ run_gemini_case accept "Gemini strict JSON wrapper around complete result normal
 run_gemini_case accept "Gemini strict JSON wrapper sequence normalizes to exact text" json-wrapped
 run_gemini_case reject "Gemini dangling JSON wrapper separator is rejected" json-wrapped-trailing-separator
 run_gemini_case reject "Gemini three-wrapper sequence is rejected" json-wrapped-three
-# A listener that accepts TCP but never answers HTTP must hit the script's own
-# bounded startup deadline, not the outer test watchdog.
 case_dir="${TMP_ROOT}/setup/never-responds"
 write_fake_default_smoke_clients "${case_dir}/bin"
 write_hanging_proxy "${case_dir}/hanging-proxy"
@@ -789,7 +777,6 @@ expect_hard_failure "accepts TCP but never responds exits within deadline" 7 \
     SMOKE_CURL_MAX_TIME_SECONDS=1 SMOKE_CLI_TIMEOUT_SECONDS=1 \
     "${REPO_ROOT}/scripts/live-cli-smoke.sh"
 
-# A failed CLI may fork; the smoke harness must reap the entire process group.
 case_dir="${TMP_ROOT}/setup/fork-sleeper"
 start_mock_server "${case_dir}/server"
 port="${MOCK_SERVER_PORT}"

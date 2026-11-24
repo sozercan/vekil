@@ -300,11 +300,43 @@ After the release gate passes, require at least 5,000 completed observations per
 ## Lint
 
 ```bash
-go vet ./...
-make lint
+python3 -m venv .build/comment-lint
+.build/comment-lint/bin/python -m pip install -r scripts/comment-lint-requirements.txt
+make lint PYTHON=.build/comment-lint/bin/python
+make lint-comments PYTHON=.build/comment-lint/bin/python
 ```
 
+The comment ratchet reached zero. Lint now checks the full first-party source
+tree, including unchanged tracked files and non-ignored untracked files, for
+prose comments. Use clear names, tests, or an [ADR](adr/README.md) instead.
+
+For an older branch with a legacy backlog, pass `COMMENT_BASE=<revision>` to
+compare each file's exact comment-line counts against that Git revision. This
+allows deletions but not replacements or copies. CI always uses the full-tree
+check, not a legacy allowance.
+
+The lexer covers Go (including tests and `go.mod`), shell, Python, Objective-C/C
+headers, HTML with inline JavaScript/CSS, standalone JS/CSS, YAML/JSON/TOML,
+Makefiles with tab-prefixed recipes, Dockerfiles, `.gitignore`, and jq. It also
+checks GitHub Actions `run` scripts, literal jq filters in shell commands, and
+shell heredocs identifiable as Python or shell. Arbitrary string
+literals, data fixtures, docs, and the vendored uPlot assets are not prose
+source. Keep machine-consumed syntax such as Go build tags/embeds, the cgo
+preamble, shebangs, and bare named `//nolint:` directives intact. Prose after a
+named `//nolint:` directive still counts.
+
+For SHA-pinned GitHub Actions `uses:` entries, keep the matching release tag as
+an inline `# vX.Y.Z` label when one exists. The linter permits the version alone,
+not additional prose; the SHA remains the executable pin.
+
+Use `.build/comment-lint/bin/python scripts/comment-lint.py --inventory` to
+list any prose comments with source locations and count comment-only versus
+inline lines. Use `$delete-comment` in Codex or `/delete-comment` in Claude Code
+to repeat the review workflow in this repository.
+
 ## CI
+
+Go lint on pull requests compares the checked-out test merge commit against its first parent (`HEAD^1`, the exact base GitHub used). This keeps changed-line filtering even when GitHub's pull request diff API rejects a large PR. Pushes to `main` keep the lint action's push comparison. The full-tree prose check runs even if Go lint fails.
 
 GitHub Actions in [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) runs on pushes to `main` and pull requests targeting `main`. Its jobs cover lint, tests, the full race detector, the `windows-launch` and `darwin-launch` launcher lifecycle checks, build, vet, a Kubernetes/kind operational smoke, and e2e validation. Every job has a job-level deadline. The test job runs [`scripts/tests/live-smoke-reliability-test.sh`](../scripts/tests/live-smoke-reliability-test.sh) with local mock servers and fake CLIs so stale-listener, timeout, per-client, and descendant-cleanup failures are deterministic, plus real-binary process harnesses: [`scripts/tests/live-provider-routing-smoke-test.sh`](../scripts/tests/live-provider-routing-smoke-test.sh) exercises schema-v2 two-target failover against controlled loopback Responses servers; [`scripts/tests/live-policy-routing-smoke-test.sh`](../scripts/tests/live-policy-routing-smoke-test.sh) exercises semantic-policy modes with and without tier effort, classifier/terminal accounting, controlled failover, automatic non-default port selection, redaction, and process-group cleanup against local Chat-compatible shims; [`scripts/tests/live-policy-routing-copilot-smoke-test.sh`](../scripts/tests/live-policy-routing-copilot-smoke-test.sh) verifies Copilot bridge catalog selection, secret isolation, non-default ports, and descendant cleanup without contacting Copilot; and [`scripts/tests/live-policy-routing-responses-effort-smoke-test.sh`](../scripts/tests/live-policy-routing-responses-effort-smoke-test.sh) proves conflicting public Responses effort is replaced with prompt-selected GPT-5.6 Luna utility `low`/`high` effort while GPT-4.1 classifier requests remain effort-free.
 

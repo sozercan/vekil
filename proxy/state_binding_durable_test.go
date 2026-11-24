@@ -397,8 +397,6 @@ func TestDurableStateStorePruningPreservesFirstConflictTime(t *testing.T) {
 			t.Fatalf("repeated conflict = %+v", r)
 		}
 	}
-	// A mixed batch must preserve the old tombstone, timestamp a newly detected
-	// collision now, and withhold the previously unknown member atomically.
 	if r := reopened.bindAll([]stateBindingToken{old, late, newToken}, other); r.err != nil || r.outcome != stateBindingLookupConflict {
 		t.Fatalf("mixed collision batch = %+v", r)
 	}
@@ -503,7 +501,6 @@ func TestDurableStateStoreMalformedPagesPreserved(t *testing.T) {
 						return err
 					}
 					if page != nil && page.Type == pageType {
-						// bbolt page flags follow the eight-byte page ID.
 						offset = id*pageSize + 8
 						break
 					}

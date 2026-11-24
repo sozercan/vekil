@@ -15,45 +15,25 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-// Responses-over-Chat serves a public /v1/responses request for a model whose
-// provider exposes only native /chat/completions. It is the opposite direction
-// of Chat-over-Responses (chat_over_responses_*.go / responses_chat_*.go) and
-// shares only the bounded Responses-to-Chat translator with the policy ingress.
-//
-// The mode is opt-in per public model ID. Native endpoint metadata is never
-// changed: a Chat-only model keeps supported_endpoints=["/chat/completions"]
-// while Vekil advertises its own compatibility separately.
-
 const (
-	// responsesOverChatMaxRequestBytes matches the ordinary Chat request ceiling.
-	// Full Codex tool catalogs plus long histories exceed the 1 MiB policy limit;
-	// the translated Chat body may then grow by wrappers and tool aliases.
 	responsesOverChatMaxRequestBytes    = maxRequestBodySize
 	responsesOverChatMaxTranslatedBytes = maxRequestBodySize + (maxRequestBodySize / 2)
 	responsesOverChatMaxInputItems      = 16384
 	responsesOverChatMaxOutputItems     = responsesOverChatMaxInputItems
-	// responsesOverChatMaxOutputBytes bounds text plus tool arguments accepted
-	// from one upstream turn before the response is failed.
-	responsesOverChatMaxOutputBytes = maxLargeRequestBodySize
+	responsesOverChatMaxOutputBytes     = maxLargeRequestBodySize
 )
 
 var responsesOverChatTranslationContract = responsesChatTranslationContract{
-	label:              "Responses-over-Chat",
-	subject:            "Responses-over-Chat models",
-	maxRequestBytes:    responsesOverChatMaxRequestBytes,
-	maxTranslatedBytes: responsesOverChatMaxTranslatedBytes,
-	maxInputItems:      responsesOverChatMaxInputItems,
-	useLegacyMaxTokens: true,
-	// The adapter streams text after an announced call as a later message
-	// item, so its own completed output must replay as input.
+	label:                      "Responses-over-Chat",
+	subject:                    "Responses-over-Chat models",
+	maxRequestBytes:            responsesOverChatMaxRequestBytes,
+	maxTranslatedBytes:         responsesOverChatMaxTranslatedBytes,
+	maxInputItems:              responsesOverChatMaxInputItems,
+	useLegacyMaxTokens:         true,
 	coalesceAssistantToolTurns: true,
 	omitToolChoiceWithoutTools: true,
 }
 
-// WithResponsesOverChatModels opts the listed public model IDs into
-// Responses-over-Chat compatibility. A listed model is served through its
-// native Chat backend only when it has no native Responses endpoint; models
-// with native Responses support keep the native path.
 func WithResponsesOverChatModels(models ...string) Option {
 	return func(h *ProxyHandler) {
 		for _, model := range models {
@@ -69,7 +49,6 @@ func WithResponsesOverChatModels(models ...string) Option {
 	}
 }
 
-// ResponsesOverChatModels returns the configured opt-in model IDs, sorted.
 func (h *ProxyHandler) ResponsesOverChatModels() []string {
 	if h == nil || len(h.responsesOverChatModels) == 0 {
 		return nil
@@ -82,9 +61,6 @@ func (h *ProxyHandler) ResponsesOverChatModels() []string {
 	return models
 }
 
-// validateResponsesOverChatModels rejects contradictory configuration at
-// startup. Policy public IDs already own a Responses compatibility adapter and
-// must keep their classifier-backed semantics.
 func (h *ProxyHandler) validateResponsesOverChatModels() error {
 	for _, model := range h.ResponsesOverChatModels() {
 		if _, policy := h.policyPublicModelID(model); policy {
@@ -92,8 +68,6 @@ func (h *ProxyHandler) validateResponsesOverChatModels() error {
 		}
 		route, known := h.resolveModelRouteForRequest(model, providerEndpointChatCompletions)
 		if !known {
-			// Public resolution never returns internal routes, so check the
-			// operational route IDs only after public IDs and aliases miss.
 			if internal, ok := h.providerSetup().lookupTerminalRoute(model); ok && internal != nil && !internal.isPublic() {
 				return fmt.Errorf("responses-over-chat model %q names an internal route", model)
 			}
@@ -118,9 +92,6 @@ func (h *ProxyHandler) responsesOverChatOptedIn(model string) bool {
 	return ok
 }
 
-// responsesExecutionMode is the shared, route-bound decision for how Vekil
-// serves a public Responses request. Request admission, launchers and the
-// Codex catalog projection must all derive from the same decision.
 type responsesExecutionMode uint8
 
 const (
@@ -140,16 +111,11 @@ func (m responsesExecutionMode) String() string {
 	}
 }
 
-// responsesCompatibility describes the resolved execution mode for one public
-// model plus the adapter-relevant capabilities read from verified provider
-// metadata.
 type responsesCompatibility struct {
-	mode        responsesExecutionMode
-	publicModel string
-	nativeChat  *resolvedChatRoute
-	// reason explains an unsupported decision without naming provider internals.
-	reason string
-	// reasoningEfforts are the provider-advertised Chat reasoning_effort values.
+	mode             responsesExecutionMode
+	publicModel      string
+	nativeChat       *resolvedChatRoute
+	reason           string
 	reasoningEfforts []string
 }
 
@@ -182,10 +148,6 @@ func responsesOverChatCapabilitiesFromRaw(raw json.RawMessage) responsesOverChat
 	}
 }
 
-// classifyResponsesCompatibility is the single decision table shared by
-// request admission (resolveResponsesCompatibility) and catalog projection
-// (annotateResponsesOverChatCatalog). allowsChat/allowsResponses describe the
-// native endpoints of the resolved provider model or explicit route contract.
 func classifyResponsesCompatibility(allowsChat, allowsResponses bool, caps responsesOverChatCapabilities) (responsesExecutionMode, string) {
 	switch {
 	case allowsResponses:
@@ -199,9 +161,6 @@ func classifyResponsesCompatibility(allowsChat, allowsResponses bool, caps respo
 	}
 }
 
-// resolveResponsesCompatibility decides how a public Responses request for
-// model is executed. Models that are not opted in always resolve native so the
-// existing passthrough path, including its error behavior, is unchanged.
 func (h *ProxyHandler) resolveResponsesCompatibility(ctx context.Context, model string) responsesCompatibility {
 	model = strings.TrimSpace(model)
 	compat := responsesCompatibility{mode: responsesExecutionNative, publicModel: model}
@@ -218,8 +177,6 @@ func (h *ProxyHandler) resolveResponsesCompatibility(ctx context.Context, model 
 			return compat
 		}
 		compat.publicModel = route.public.id
-		// Explicit route endpoints are the validated public contract shared by
-		// every target, so one decision covers the whole failover chain.
 		caps := responsesOverChatCapabilitiesFromRaw(route.public.raw)
 		compat.mode, compat.reason = classifyResponsesCompatibility(
 			route.supportsEndpoint(providerEndpointChatCompletions), route.supportsEndpoint(providerEndpointResponses), caps)
@@ -246,21 +203,12 @@ func (h *ProxyHandler) resolveResponsesCompatibility(ctx context.Context, model 
 	return compat
 }
 
-// responsesCompatibilityCatalogField marks a /v1/models entry that Vekil
-// serves on /v1/responses through Responses-over-Chat. It is deliberately
-// separate from supported_endpoints, which keeps listing only native routes.
 const responsesCompatibilityCatalogField = "vekil_responses_compatibility"
 
-// annotateResponsesOverChatCatalog adds responsesCompatibilityCatalogField to
-// opted-in catalog entries that classify as Responses-over-Chat and returns
-// the set of annotated IDs for the Codex projection. The opt-in list is fixed
-// for the process lifetime, so the annotated body can share the normal
-// /v1/models cache and refresh cycle.
 func (h *ProxyHandler) annotateResponsesOverChatCatalog(body []byte) ([]byte, map[string]struct{}) {
 	if h == nil {
 		return body, nil
 	}
-	// Keep every other top-level catalog field intact.
 	var catalog map[string]json.RawMessage
 	if json.Unmarshal(body, &catalog) != nil {
 		return body, nil
@@ -276,9 +224,6 @@ func (h *ProxyHandler) annotateResponsesOverChatCatalog(body []byte) ([]byte, ma
 		if json.Unmarshal(raw, &fields) != nil {
 			continue
 		}
-		// The marker is this proxy's own decision. Merged upstream metadata may
-		// carry one (for example from a chained Vekil), so strip it from every
-		// entry and add it back only for an eligible local opt-in.
 		hadMarker := false
 		for key := range fields {
 			if strings.EqualFold(key, responsesCompatibilityCatalogField) {
@@ -296,7 +241,6 @@ func (h *ProxyHandler) annotateResponsesOverChatCatalog(body []byte) ([]byte, ma
 		_ = json.Unmarshal(raw, &entry)
 		eligible := false
 		if h.responsesOverChatOptedIn(entry.ID) && len(entry.SupportedEndpoints) > 0 {
-			// An entry without endpoint metadata is treated as native everywhere.
 			if _, policy := h.policyPublicModelID(entry.ID); !policy {
 				mode, _ := classifyResponsesCompatibility(
 					supportsEndpoint(entry.SupportedEndpoints, providerEndpointChatCompletions),
@@ -339,10 +283,6 @@ func (h *ProxyHandler) annotateResponsesOverChatCatalog(body []byte) ([]byte, ma
 	return rewritten, annotated
 }
 
-// applyResponsesOverChatReasoning validates the translated reasoning_effort
-// against the provider-advertised values. Unsupported levels are rejected
-// rather than mapped; an explicit "none" on a model without reasoning controls
-// is the absence of an override and is removed.
 func applyResponsesOverChatReasoning(body []byte, compat responsesCompatibility) ([]byte, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -383,9 +323,6 @@ func writeResponsesOverChatInvalidRequest(w http.ResponseWriter, err error) {
 	writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 }
 
-// handleResponsesOverChat executes one opted-in Responses request through the
-// canonical Chat execution seam pinned to a native Chat backend and translates
-// the upstream Chat stream into Responses events incrementally.
 func (h *ProxyHandler) handleResponsesOverChat(w http.ResponseWriter, r *http.Request, body []byte, compat responsesCompatibility) {
 	requestedModel := extractResponsesRequestModel(body)
 	translated, err := translateResponsesRequestToChat(body, responsesOverChatTranslationContract)
@@ -400,18 +337,12 @@ func (h *ProxyHandler) handleResponsesOverChat(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if chatRequestContainsResponsesReplayID(chatBody) {
-		// Those IDs can only be restored through a Responses backend. Sending them
-		// to native Chat would silently lose hidden state, and switching backends
-		// would create a Responses-to-Chat-to-Responses loop.
 		writeOpenAIError(w, http.StatusBadRequest,
 			"input contains tool calls minted by a Responses-backed Chat model; they cannot be replayed to a Responses-over-Chat model. Start a new conversation for this model.",
 			"invalid_request_error")
 		return
 	}
 
-	// Always stream upstream. Streaming clients receive incremental Responses
-	// events; non-streaming clients receive the same state machine's final
-	// object, which keeps validation identical and parallel tool calls reliable.
 	chatBody = injectForceStream(chatBody)
 	mode := parseOpenAIChatCompletionsMode(chatBody)
 	chatBody, mode = prepareOpenAIChatCompletionsRequestWithMode(chatBody, chatParallelToolCallsDefault, mode)
@@ -421,8 +352,6 @@ func (h *ProxyHandler) handleResponsesOverChat(w http.ResponseWriter, r *http.Re
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), true)
 	defer upstreamCancel()
-	// The upstream context is lifecycle-rooted. Stop generation as soon as the
-	// client leaves instead of waiting for the next write to fail.
 	stopClientCancellation := context.AfterFunc(r.Context(), upstreamCancel)
 	defer stopClientCancellation()
 	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
@@ -452,8 +381,6 @@ func (h *ProxyHandler) handleResponsesOverChat(w http.ResponseWriter, r *http.Re
 	observeUpstreamHeaders(r.Context(), chatExecutionUpstreamHeaders(result))
 
 	if result.Backend != chatBackendNativeChat || result.Response == nil {
-		// The resolver only admits native Chat backends. Anything else would mean a
-		// Responses-to-Chat-to-Responses cycle; fail closed.
 		closeChatExecutionResult(result)
 		writeOpenAIError(w, http.StatusBadGateway, "Responses-over-Chat requires a native Chat Completions backend", "server_error")
 		return

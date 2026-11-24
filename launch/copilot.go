@@ -27,7 +27,6 @@ var copilotCredentialEnvironment = []string{
 	"OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
 }
 
-// CopilotAdapter prepares GitHub Copilot CLI to use Vekil as a BYOK provider.
 type CopilotAdapter struct{}
 
 func (CopilotAdapter) Name() string { return "copilot" }

@@ -70,7 +70,6 @@ func TestDurableStateLifecycleRetainsLockUntilDrain(t *testing.T) {
 		t.Fatalf("timed-out drain released lock: %v", err)
 	}
 	h.endLifecycleWorker()
-	// An expired context is not proof that all HTTP handlers have drained.
 	if err := h.WaitLifecycleWorkers(ctx); err != nil {
 		t.Fatal(err)
 	}

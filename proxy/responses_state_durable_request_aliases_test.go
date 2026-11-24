@@ -84,7 +84,6 @@ func TestDurableResponsesRequestStateAliasesBeforeDispatch(t *testing.T) {
 			for _, fixture := range durableRequestStateAliasFixtures() {
 				t.Run(fixture.name, func(t *testing.T) {
 					before, entries := sends.Load(), reopened.stats().entries
-					// Keep the original bytes: map decoding would erase duplicate keys.
 					w := request(`{"model":"public-model",` + fixture.fields + `}`)
 					if w.Code != http.StatusBadRequest || sends.Load() != before {
 						t.Errorf("ambiguous request reached provider: status=%d sends=%d body=%s", w.Code, sends.Load()-before, w.Body.String())
@@ -94,8 +93,6 @@ func TestDurableResponsesRequestStateAliasesBeforeDispatch(t *testing.T) {
 					}
 				})
 			}
-			// Schema-owned state fields are strict; vendor metadata and message
-			// text keep their original interpretation, including nested aliases.
 			before := sends.Load()
 			w := request(`{"model":"public-model","previous_response_id":"resp-durable-fixture","metadata":{"previous_response_id":"first","Previous_Response_ID":"last"},"input":[{"type":"message","role":"user","content":"continue","encrypted_content":"first","Encrypted_Content":"last"}]}`)
 			if w.Code != http.StatusOK || sends.Load() != before+1 {

@@ -17,8 +17,6 @@ var requestSummaryPool = sync.Pool{New: func() any {
 	return &RequestSummary{}
 }}
 
-// RequestSummary is a mutable per-request summary populated by handlers and
-// emitted by the server-level request logging middleware.
 type RequestSummary struct {
 	mu sync.Mutex
 
@@ -68,30 +66,13 @@ type RequestSummary struct {
 	cachedTokensValue         int
 	reasoningTokensValue      int
 	copilotUsage              copilotUsageTotals
-	// extraPromptTokens / extraCompletionTokens accumulate out-of-band token
-	// spend that is separate from the turn's own reported usage — e.g. an
-	// internal /responses compaction call made while serving a 413 oversized-
-	// replay fallback. The turn usage (setOpenAIUsage) overwrites, so this extra
-	// spend is kept additively and folded into the totals by readSummaryForStats
-	// rather than being clobbered by the final turn's usage.
-	extraPromptTokens     int
-	extraCompletionTokens int
-	// failureStatus, when non-zero, is an error status the handler observed
-	// out-of-band after the HTTP response status was already committed — e.g. a
-	// streaming /responses turn that emits response.failed/incomplete after the
-	// 200 header was sent. The stats middleware prefers it over the recorded HTTP
-	// status so post-commit failures are not counted as successes.
-	failureStatus int
-	// statsSuppressed excludes local shutdown rejections and lifecycle-canceled
-	// in-flight work from provider traffic accounting. A semantic provider failure
-	// already recorded in failureStatus wins and cannot be suppressed afterward.
-	statsSuppressed   bool
-	retryStatsTracked atomic.Bool
+	extraPromptTokens         int
+	extraCompletionTokens     int
+	failureStatus             int
+	statsSuppressed           bool
+	retryStatsTracked         atomic.Bool
 }
 
-// WithRequestSummary attaches a mutable request summary to ctx and returns both
-// the derived context and the summary pointer. Handlers mutate the pointer in
-// place so middleware can observe the final values after the handler returns.
 func WithRequestSummary(ctx context.Context) (context.Context, *RequestSummary) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -103,9 +84,6 @@ func WithRequestSummary(ctx context.Context) (context.Context, *RequestSummary) 
 	return context.WithValue(ctx, requestSummaryContextKey{}, summary), summary
 }
 
-// AcquireRequestSummary attaches a pooled summary when ctx does not already
-// carry one. Server middleware must call ReleaseRequestSummary only when owned
-// is true and only after handler, stats, and logging work has completed.
 func AcquireRequestSummary(ctx context.Context) (context.Context, *RequestSummary, bool) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -118,7 +96,6 @@ func AcquireRequestSummary(ctx context.Context) (context.Context, *RequestSummar
 	return context.WithValue(ctx, requestSummaryContextKey{}, summary), summary, true
 }
 
-// ReleaseRequestSummary returns a server-owned summary to the pool.
 func ReleaseRequestSummary(summary *RequestSummary) {
 	if summary == nil {
 		return
@@ -127,8 +104,6 @@ func ReleaseRequestSummary(summary *RequestSummary) {
 	requestSummaryPool.Put(summary)
 }
 
-// RequestSummaryFromContext returns the mutable request summary attached to ctx,
-// if any.
 func RequestSummaryFromContext(ctx context.Context) *RequestSummary {
 	if ctx == nil {
 		return nil
@@ -137,9 +112,6 @@ func RequestSummaryFromContext(ctx context.Context) *RequestSummary {
 	return summary
 }
 
-// SetOperationID records the stable proxy-owned logical operation ID. The
-// first non-empty value wins so retries and target switches cannot replace the
-// identity established at admission.
 func (s *RequestSummary) SetOperationID(operationID string) {
 	if s == nil {
 		return
@@ -155,7 +127,6 @@ func (s *RequestSummary) SetOperationID(operationID string) {
 	}
 }
 
-// OperationID returns the stable logical operation ID, if one was recorded.
 func (s *RequestSummary) OperationID() string {
 	if s == nil {
 		return ""
@@ -165,8 +136,6 @@ func (s *RequestSummary) OperationID() string {
 	return s.operationID
 }
 
-// SetRouteID records the logical model-route ID. The first non-empty value wins
-// because one client request must not move between public model routes.
 func (s *RequestSummary) SetRouteID(routeID string) {
 	if s == nil {
 		return
@@ -182,7 +151,6 @@ func (s *RequestSummary) SetRouteID(routeID string) {
 	}
 }
 
-// RouteID returns the logical model-route ID, if one was recorded.
 func (s *RequestSummary) RouteID() string {
 	if s == nil {
 		return ""
@@ -192,10 +160,6 @@ func (s *RequestSummary) RouteID() string {
 	return s.routeID
 }
 
-// SetPolicyIdentity records the canonical public identity of a policy model
-// before a classifier decision exists. Unsupported protocol surfaces use this
-// path so request logging and traffic statistics stay attributed to the public
-// policy model without resolving or retaining terminal-provider topology.
 func (s *RequestSummary) SetPolicyIdentity(publicID string) {
 	if s == nil {
 		return
@@ -219,9 +183,6 @@ func (s *RequestSummary) SetPolicyIdentity(publicID string) {
 	s.upstreamRequestID = ""
 }
 
-// SetPolicyDecision records bounded, content-free routing provenance for a
-// policy-selected request. Generation values are hashes and never include
-// secrets or request content.
 func (s *RequestSummary) SetPolicyDecision(plan chatOperationPlan) {
 	if s == nil || strings.TrimSpace(plan.policyID) == "" {
 		return
@@ -272,10 +233,6 @@ func (s *RequestSummary) policyPublicIDForStatsLocked() string {
 	return strings.TrimSpace(s.model)
 }
 
-// SetFinalTarget records the final/canonical physical target selected for the
-// logical operation. Unlike operation and route IDs, the target is intentionally
-// replaceable because a later result-selection step can supersede an earlier
-// provisional result.
 func (s *RequestSummary) SetFinalTarget(targetID string) {
 	if s == nil {
 		return
@@ -293,10 +250,6 @@ func (s *RequestSummary) SetFinalTarget(targetID string) {
 	s.finalTarget = targetID
 }
 
-// setFinalRouteAttribution atomically records the target/provider attribution
-// for the response or error the route executor actually returns. A result with
-// no physical target leaves canonical attribution unchanged rather than
-// promoting the most recently dispatched attempt.
 func (s *RequestSummary) setFinalRouteAttribution(targetID, provider, kind string) {
 	if s == nil {
 		return
@@ -321,10 +274,6 @@ func (s *RequestSummary) setFinalRouteAttribution(targetID, provider, kind strin
 	s.providerKind = kind
 }
 
-// setFinalRouteResult atomically restores the complete attribution for the
-// response or error selected for return. Unlike setUpstreamRequestID, an empty
-// upstream request ID is meaningful here: it clears correlation metadata left
-// by a later attempt when an earlier canonical result wins precedence.
 func (s *RequestSummary) setFinalRouteResult(targetID, provider, kind, upstreamRequestID string) {
 	if s == nil {
 		return
@@ -349,7 +298,6 @@ func (s *RequestSummary) setFinalRouteResult(targetID, provider, kind, upstreamR
 	s.upstreamRequestID = strings.TrimSpace(upstreamRequestID)
 }
 
-// FinalTarget returns the final/canonical physical target ID, if known.
 func (s *RequestSummary) FinalTarget() string {
 	if s == nil {
 		return ""
@@ -359,8 +307,6 @@ func (s *RequestSummary) FinalTarget() string {
 	return s.finalTarget
 }
 
-// RecordUpstreamSend records one actual physical upstream dispatch. Target
-// attempts that fail before network dispatch must not call this method.
 func (s *RequestSummary) RecordUpstreamSend() {
 	if s == nil {
 		return
@@ -370,10 +316,6 @@ func (s *RequestSummary) RecordUpstreamSend() {
 	s.upstreamSendCount++
 }
 
-// recordUpstreamAttempt applies one physical-send observation atomically. The
-// latest dispatched target/provider is kept separate from final attribution so
-// a later prewrite failure cannot overwrite an earlier response selected for
-// return by the route executor.
 func (s *RequestSummary) recordUpstreamAttempt(operationID, routeID, targetID, provider, kind string) {
 	if s == nil {
 		return
@@ -419,8 +361,6 @@ func (s *RequestSummary) lastUpstreamAttempt() (targetID, provider, kind string)
 	return s.lastTarget, s.lastProvider, s.lastProviderKind
 }
 
-// UpstreamSendCount returns the number of physical upstream dispatches made for
-// this client request or turn.
 func (s *RequestSummary) UpstreamSendCount() int64 {
 	if s == nil {
 		return 0
@@ -430,8 +370,6 @@ func (s *RequestSummary) UpstreamSendCount() int64 {
 	return s.upstreamSendCount
 }
 
-// RecordTargetSwitch records one selection of a distinct target in the same
-// logical model route. Same-target protocol recovery is not a target switch.
 func (s *RequestSummary) RecordTargetSwitch() {
 	if s == nil {
 		return
@@ -441,8 +379,6 @@ func (s *RequestSummary) RecordTargetSwitch() {
 	s.targetSwitchCount++
 }
 
-// TargetSwitchCount returns the number of distinct-target switches made for
-// this client request or turn.
 func (s *RequestSummary) TargetSwitchCount() int64 {
 	if s == nil {
 		return 0
@@ -452,9 +388,6 @@ func (s *RequestSummary) TargetSwitchCount() int64 {
 	return s.targetSwitchCount
 }
 
-// MarkRouteExhausted marks this logical operation as having exhausted its
-// eligible route targets. It returns true only for the first call so aggregate
-// accounting can remain one-per-operation.
 func (s *RequestSummary) MarkRouteExhausted() bool {
 	if s == nil {
 		return false
@@ -468,8 +401,6 @@ func (s *RequestSummary) MarkRouteExhausted() bool {
 	return true
 }
 
-// RouteExhausted reports whether the logical operation exhausted its eligible
-// route targets.
 func (s *RequestSummary) RouteExhausted() bool {
 	if s == nil {
 		return false
@@ -567,8 +498,6 @@ func (s *RequestSummary) setErrorDetail(errType, code, param, message string) {
 	s.errorType, s.errorCode, s.errorParam, s.errorMessage = errType, code, param, message
 }
 
-// setFailureStatus records an out-of-band failure status (first one wins) for a
-// request whose HTTP status was already committed before the failure was known.
 func (s *RequestSummary) setFailureStatus(status int) {
 	if s == nil || status == 0 {
 		return
@@ -578,13 +507,9 @@ func (s *RequestSummary) setFailureStatus(status int) {
 	if s.failureStatus == 0 {
 		s.failureStatus = status
 	}
-	// A semantic provider failure is authoritative even if lifecycle transport
-	// cancellation raced ahead and tentatively suppressed the request.
 	s.statsSuppressed = false
 }
 
-// FailureStatus returns the out-of-band failure status, or 0 if none. The stats
-// middleware prefers a non-zero value over the committed HTTP status.
 func (s *RequestSummary) FailureStatus() int {
 	if s == nil {
 		return 0
@@ -594,8 +519,6 @@ func (s *RequestSummary) FailureStatus() int {
 	return s.failureStatus
 }
 
-// SuppressStats excludes this request from provider traffic accounting unless a
-// semantic provider failure was already observed.
 func (s *RequestSummary) SuppressStats() {
 	if s == nil {
 		return
@@ -607,7 +530,6 @@ func (s *RequestSummary) SuppressStats() {
 	}
 }
 
-// StatsSuppressed reports whether provider traffic accounting should omit this request.
 func (s *RequestSummary) StatsSuppressed() bool {
 	if s == nil {
 		return false
@@ -623,9 +545,6 @@ func suppressRequestStats(ctx context.Context) {
 	}
 }
 
-// addInternalUsage accumulates out-of-band token spend (e.g. an internal
-// compaction call) that is separate from the turn's own reported usage, so it is
-// not clobbered when setOpenAIUsage overwrites the turn usage. It is additive.
 func (s *RequestSummary) addInternalUsage(promptTokens, completionTokens int) {
 	if s == nil || (promptTokens == 0 && completionTokens == 0) {
 		return
@@ -636,17 +555,12 @@ func (s *RequestSummary) addInternalUsage(promptTokens, completionTokens int) {
 	s.extraCompletionTokens += completionTokens
 }
 
-// observeResponseFailureStatus records an out-of-band failure status onto the
-// request summary attached to ctx, if any.
 func observeResponseFailureStatus(ctx context.Context, status int) {
 	if summary := RequestSummaryFromContext(ctx); summary != nil {
 		summary.setFailureStatus(status)
 	}
 }
 
-// observeInternalResponsesUsage accumulates out-of-band /responses token spend
-// (e.g. an internal compaction call) onto the request summary attached to ctx,
-// if any, so it is counted in addition to the turn's own usage.
 func observeInternalResponsesUsage(ctx context.Context, usage responsesUsage) {
 	if usage.isZero() {
 		return
@@ -656,7 +570,6 @@ func observeInternalResponsesUsage(ctx context.Context, usage responsesUsage) {
 	}
 }
 
-// LoggerFields returns the structured fields populated for this request.
 func (s *RequestSummary) LoggerFields() []logger.Field {
 	if s == nil {
 		return nil
@@ -772,10 +685,6 @@ func (h *ProxyHandler) policyPublicModelID(model string) (string, bool) {
 	return publicID, publicID != ""
 }
 
-// observePolicyRequestSummary establishes canonical policy ownership as soon as
-// a protocol surface can identify the requested model. This must happen before
-// body-shape or endpoint validation so local rejections cannot fall through to
-// default-provider or unrouted statistics.
 func (h *ProxyHandler) observePolicyRequestSummary(ctx context.Context, endpoint, model string, stream bool) bool {
 	publicID, ok := h.policyPublicModelID(model)
 	if !ok {
@@ -804,9 +713,6 @@ func (h *ProxyHandler) observeRequestSummaryWithProviderModel(ctx context.Contex
 	if providerModel == "" {
 		return
 	}
-	// Operational IDs for internal terminal/classifier routes are never public
-	// model identities. If a client guesses one, reject it without confirming
-	// the owning provider through logs or traffic statistics.
 	if route, known := h.providerSetup().lookupTerminalRoute(strings.TrimSpace(model)); known && route != nil && !route.isPublic() {
 		return
 	}
@@ -832,9 +738,6 @@ func observeUpstreamHeaders(ctx context.Context, headers http.Header) {
 	}
 }
 
-// observeResponseProvider attributes the summary to the provider that served
-// resp. It can differ from the owner resolved before dispatch when a catalog
-// refresh discovers the model on another provider.
 func observeResponseProvider(ctx context.Context, resp *http.Response) {
 	route, ok := providerRouteFromResponse(resp)
 	if !ok {
@@ -864,42 +767,28 @@ func observeChatExecutionError(ctx context.Context, executionErr *chatExecutionE
 		if len(executionErr.Headers) > 0 {
 			summary.setUpstreamRequestID(UpstreamRequestID(executionErr.Headers))
 		}
-		// Closed by default. Only a message a constructor declared constant is vekil's own
-		// words; anything else either quotes the request back or interpolates a client value
-		// into vekil's prose, and both are request content.
 		message := ""
 		if executionErr.staticMessage {
 			message = executionErr.Message
 		}
 		errorType, code, param := executionErr.Type, executionErr.Code, executionErr.Param
 		if !executionErr.upstreamAuthored {
-			// Local paths are gated too. They are vekil's prose, but not every segment in
-			// them is vekil's: the JSON walker reports the client's own key.
 			param = safeLocalClassifierParam(param)
 		}
 		if executionErr.upstreamAuthored {
-			// Same grammar gate as observeUpstreamErrorDetail. Hardening one of the two
-			// paths and not the other is how the prose gets in.
 			errorType = safeUpstreamClassifierCode(errorType)
 			code = safeUpstreamClassifierCode(code)
 			param = safeUpstreamClassifierParam(param)
 		}
 		if executionErr.clientDerived {
-			// Record only the parent path vekil built -- never a substring of the joined one,
-			// because the client's field name may contain dots and would survive the split.
 			param = safeLocalClassifierParam(executionErr.safeParam)
 		}
 		summary.setErrorDetail(errorType, code, param, message)
 	}
 }
 
-// Classifiers only. The parsed message is deliberately dropped: upstream 400s quote the
-// rejected value back, so the prose is request content and the summary is not the place.
 const maxUpstreamClassifierBytes = 128
 
-// upstreamErrorClassifiers is an upstream error envelope reduced to the fields that match
-// their grammar. The message is deliberately absent: an upstream 400 quotes the rejected
-// value back, so it is client content and must neither travel nor be logged.
 type upstreamErrorClassifiers struct {
 	errorType string
 	code      string
@@ -910,8 +799,6 @@ func (c upstreamErrorClassifiers) empty() bool {
 	return c.errorType == "" && c.code == "" && c.param == ""
 }
 
-// safeUpstreamErrorClassifiers reduces the body at the boundary that reads it, so the prose
-// is dropped there rather than carried further and trimmed later.
 func safeUpstreamErrorClassifiers(status int, body []byte) upstreamErrorClassifiers {
 	if len(body) == 0 {
 		return upstreamErrorClassifiers{}
@@ -930,9 +817,6 @@ func observeUpstreamErrorDetail(ctx context.Context, status int, body []byte) {
 	observeUpstreamErrorClassifiers(ctx, safeUpstreamErrorClassifiers(status, body))
 }
 
-// observeUpstreamErrorClassifiers records classifiers already reduced elsewhere. The Chat
-// surfaces need the split because the boundary that reads the body runs on the
-// lifecycle-rooted upstream context, which carries no request summary by design.
 func observeUpstreamErrorClassifiers(ctx context.Context, classifiers upstreamErrorClassifiers) {
 	summary := RequestSummaryFromContext(ctx)
 	if summary == nil || classifiers.empty() {
@@ -941,9 +825,6 @@ func observeUpstreamErrorClassifiers(ctx context.Context, classifiers upstreamEr
 	summary.setErrorDetail(classifiers.errorType, classifiers.code, classifiers.param, "")
 }
 
-// An upstream classifier is a lowercase identifier (`invalid_request_body`) and a param is
-// a JSON path (`tools[0].input_schema`). Character shape alone is not proof -- `SSN_123-45`
-// is all "safe" characters -- so these match the grammars, and anything else is dropped.
 func safeUpstreamClassifierCode(value string) string {
 	if value == "" || len(value) > maxUpstreamClassifierBytes {
 		return ""
@@ -962,9 +843,6 @@ func safeUpstreamClassifierCode(value string) string {
 	return value
 }
 
-// Top-level request fields across the Chat, Responses and Anthropic shapes vekil sends. A
-// closed set on purpose: it is what makes an upstream param safe to log, and it changes only
-// when an API grows a top-level field.
 var upstreamClassifierParamRoots = map[string]struct{}{
 	"audio": {}, "background": {}, "conversation": {}, "frequency_penalty": {},
 	"include": {}, "input": {}, "instructions": {}, "logit_bias": {}, "logprobs": {},
@@ -978,18 +856,6 @@ var upstreamClassifierParamRoots = map[string]struct{}{
 	"top_p": {}, "truncation": {}, "user": {},
 }
 
-// safeUpstreamClassifierParam keeps an upstream param's ROOT segment and nothing below it.
-//
-// Grammar alone does not make an upstream param safe: upstream quotes the request back, and
-// a client-chosen key is often a plain lower-snake identifier. "metadata.customer_ssn" and a
-// bare "customer_ssn" both pass an identifier check untouched, and the local-error path in
-// this same file goes to the trouble of stripping exactly that. Client-chosen names only
-// ever appear below the root -- map keys under metadata, property names under a tool's JSON
-// schema -- or as a root that is not a request field at all, so keeping a recognised root
-// and dropping the rest admits neither.
-//
-// The cost is precision: "tools[0].input_schema" logs as "tools". An unrecognised root
-// drops the param entirely rather than logging a name vekil cannot vouch for.
 func safeUpstreamClassifierParam(value string) string {
 	if value == "" || len(value) > maxUpstreamClassifierBytes {
 		return ""
@@ -1014,10 +880,6 @@ func safeUpstreamClassifierParam(value string) string {
 	return name
 }
 
-// Nested field names vekil's own request validators enumerate, derived from the field lists
-// passed to validateChatRawObjectFields and validatePolicyResponsesObjectFields. With
-// upstreamClassifierParamRoots these are the segments vekil OWNS; a segment outside both sets
-// came from the request, whatever built the path.
 var localClassifierParamSegments = map[string]struct{}{
 	"arguments": {}, "call_id": {}, "content": {}, "custom": {}, "defer_loading": {},
 	"description": {}, "detail": {}, "effort": {}, "format": {}, "function": {}, "id": {},
@@ -1028,8 +890,6 @@ var localClassifierParamSegments = map[string]struct{}{
 	"tools": {}, "type": {}, "url": {},
 }
 
-// ownedParamSegment reports whether one path segment is a name vekil owns, with an optional
-// numeric index. Indices are vekil's own; a quoted or non-numeric subscript is not.
 func ownedParamSegment(segment string) bool {
 	name, index, bracketed := strings.Cut(segment, "[")
 	if name == "" || !isLowerSnakeIdentifier(name) {
@@ -1055,15 +915,6 @@ func ownedParamSegment(segment string) bool {
 	return true
 }
 
-// safeLocalClassifierParam keeps a param path only as far as vekil can vouch for it, cutting
-// at the first segment that is not a name it owns.
-//
-// Closed by construction rather than by discipline. newChatInvalidRequest takes its param as
-// an argument, so it cannot vouch for what it was handed, and a generic path builder joins
-// the CLIENT's object keys into the path it reports: walkPolicyResponsesJSON put
-// "metadata.customer_ssn.value" one call away from the request log. Cutting on an unknown
-// segment covers every such builder, including ones not written yet, without asking 194 call
-// sites to stay careful. An unrecognised schema field costs precision, never correctness.
 func safeLocalClassifierParam(value string) string {
 	if value == "" || len(value) > maxUpstreamClassifierBytes {
 		return ""

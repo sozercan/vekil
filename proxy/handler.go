@@ -1,6 +1,3 @@
-// Package proxy implements HTTP handlers that forward requests to GitHub
-// Copilot's backend. It provides Anthropic-to-OpenAI translation for the
-// /v1/messages endpoint and near zero-copy passthrough for OpenAI endpoints.
 package proxy
 
 import (
@@ -29,34 +26,16 @@ import (
 )
 
 const (
-	// maxRequestBodySize is the maximum allowed request body size (10MB).
-	maxRequestBodySize = 10 << 20
-	// maxLargeRequestBodySize gives proxy-owned summarization endpoints a higher
-	// ceiling because they can legitimately contain full session histories or
-	// trace bundles that need to be summarized.
-	maxLargeRequestBodySize = 64 << 20
-	// upstreamTimeout is the timeout for non-streaming LLM inference requests.
-	upstreamTimeout = 5 * time.Minute
-	// streamingUpstreamTimeout gives streaming inference enough time to finish.
-	streamingUpstreamTimeout = 60 * time.Minute
-	// readyzUpstreamTimeout bounds readiness probes that validate upstream reachability.
-	readyzUpstreamTimeout = 10 * time.Second
-	// modelsUpstreamTimeout is the timeout for the /models metadata request.
-	modelsUpstreamTimeout = 30 * time.Second
-	// modelsCacheTTL is how long the /models response is cached.
-	modelsCacheTTL = 5 * time.Minute
-	// modelsCacheMaxEntries bounds caller-specific /models query variants while
-	// retaining enough room for common client-version and feature queries.
-	modelsCacheMaxEntries = 64
-	// modelsCacheFailureBackoff prevents an expired canonical catalog from
-	// stampeding an unavailable provider. Stale canonical data remains usable,
-	// and one retry is allowed after this short fixed interval.
-	modelsCacheFailureBackoff = time.Second
-	// syntheticCompactionPrefix marks proxy-owned compaction payloads so they
-	// can be expanded back into normal context on subsequent /responses calls.
-	syntheticCompactionPrefix = "vekil.compaction.v1:"
-	// legacySyntheticCompactionPrefix keeps older compacted histories readable
-	// after the project rename.
+	maxRequestBodySize                = 10 << 20
+	maxLargeRequestBodySize           = 64 << 20
+	upstreamTimeout                   = 5 * time.Minute
+	streamingUpstreamTimeout          = 60 * time.Minute
+	readyzUpstreamTimeout             = 10 * time.Second
+	modelsUpstreamTimeout             = 30 * time.Second
+	modelsCacheTTL                    = 5 * time.Minute
+	modelsCacheMaxEntries             = 64
+	modelsCacheFailureBackoff         = time.Second
+	syntheticCompactionPrefix         = "vekil.compaction.v1:"
 	legacySyntheticCompactionPrefix   = "copilot-proxy.compaction.v1:"
 	defaultCopilotEditorVersion       = "vscode/1.95.0"
 	defaultCopilotEditorPluginVersion = "copilot-chat/0.26.7"
@@ -83,7 +62,6 @@ var preferredResponsesFallbackModels = []string{
 	"gpt-5-mini",
 }
 
-// modelsCache holds a cached /models response to avoid repeated upstream calls.
 type modelsCache struct {
 	mu                    sync.RWMutex
 	entries               map[string]cachedModelsResponse
@@ -115,8 +93,6 @@ func (e *requestBodyError) Unwrap() error {
 	return e.err
 }
 
-// CopilotHeaderConfig controls the synthetic editor-identifying headers sent to
-// the upstream Copilot backend. Empty fields fall back to project defaults.
 type CopilotHeaderConfig struct {
 	EditorVersion       string `json:"editor_version,omitempty" yaml:"editor_version,omitempty"`
 	EditorPluginVersion string `json:"editor_plugin_version,omitempty" yaml:"editor_plugin_version,omitempty"`
@@ -126,17 +102,12 @@ type CopilotHeaderConfig struct {
 	OpenAIIntent        string `json:"openai_intent,omitempty" yaml:"openai_intent,omitempty"`
 }
 
-// CopilotHeaderProfilesConfig allows provider config to override Copilot header
-// profiles globally for the provider or for a specific upstream endpoint. Empty
-// fields inherit from the provider default profile and then the project defaults.
 type CopilotHeaderProfilesConfig struct {
 	Default         CopilotHeaderConfig `json:"default,omitempty" yaml:"default,omitempty"`
 	ChatCompletions CopilotHeaderConfig `json:"chat_completions,omitempty" yaml:"chat_completions,omitempty"`
 	Responses       CopilotHeaderConfig `json:"responses,omitempty" yaml:"responses,omitempty"`
 }
 
-// ResponsesWebSocketConfig controls websocket-session state management for
-// Codex-style GET /v1/responses clients.
 type ResponsesWebSocketConfig struct {
 	Enabled             bool
 	NativeUpstream      bool
@@ -247,7 +218,6 @@ func (c ResponsesWebSocketConfig) autoCompactEnabled() bool {
 		(c.AutoCompactMaxItems > 0 || c.AutoCompactMaxBytes > 0)
 }
 
-// ProxyHandler holds dependencies for all HTTP handlers.
 type ProxyHandler struct {
 	auth                             *auth.Authenticator
 	client                           *http.Client
@@ -318,9 +288,6 @@ type ProxyHandler struct {
 	insightGateOnce                  sync.Once
 }
 
-// initializeLifecycle installs the proxy-owned cancellation root used by
-// detached upstream work. sync.Once keeps zero-value handlers used by focused
-// tests safe while NewProxyHandler initializes the lifecycle eagerly.
 func (h *ProxyHandler) initializeLifecycle() {
 	if h == nil {
 		return
@@ -359,10 +326,6 @@ func (h *ProxyHandler) responsesChatReplayStore() *responsesChatReplayStore {
 	return h.responsesChatReplay
 }
 
-// closeResponsesChatReplayStore clears process-local tool replay only after
-// graceful HTTP shutdown has drained request handlers. Closing it in
-// BeginShutdown would race in-flight Responses-backed streams publishing their
-// terminal tool calls and misclassify local shutdown as a provider failure.
 func (h *ProxyHandler) closeResponsesChatReplayStore() {
 	if h == nil {
 		return
@@ -374,10 +337,6 @@ func (h *ProxyHandler) closeResponsesChatReplayStore() {
 	}
 }
 
-// BeginShutdown idempotently cancels proxy-owned upstream work. Existing and
-// future lifecycle-rooted contexts observe cancellation immediately, while
-// ordinary inference remains detached from inbound client disconnects before
-// shutdown begins.
 func (h *ProxyHandler) BeginShutdown() {
 	if h == nil {
 		return
@@ -396,8 +355,6 @@ func (h *ProxyHandler) BeginShutdown() {
 	}
 }
 
-// ShuttingDown reports whether admission has closed and lifecycle cancellation
-// has begun. It becomes true before BeginShutdown cancels upstream contexts.
 func (h *ProxyHandler) ShuttingDown() bool {
 	return h != nil && h.draining.Load()
 }
@@ -414,10 +371,6 @@ func recycleLifecycleRequestBody(body *lifecycleRequestBody) {
 	lifecycleRequestBodyPool.Put(body)
 }
 
-// BindRequestBodyToLifecycle makes a request body read interruptible by proxy
-// shutdown without changing the inbound request context. A small atomic cause
-// state preserves whether client cancellation or lifecycle shutdown happened
-// first, so a client disconnect racing shutdown is not rewritten as a local 503.
 func (h *ProxyHandler) BindRequestBodyToLifecycle(r *http.Request, forceClose io.Closer) RequestBodyLifecycleBinding {
 	if h == nil || r == nil || r.Body == nil || r.Body == http.NoBody {
 		return RequestBodyLifecycleBinding{}
@@ -432,25 +385,17 @@ func (h *ProxyHandler) BindRequestBodyToLifecycle(r *http.Request, forceClose io
 	return RequestBodyLifecycleBinding{body: body, lease: lease}
 }
 
-// RequestBodyLifecycleBinding releases a request body from shutdown tracking.
-// The value handle avoids allocating a closure on every admitted HTTP request.
 type RequestBodyLifecycleBinding struct {
 	body  *lifecycleRequestBody
 	lease uint64
 }
 
-// Release stops lifecycle tracking without closing the underlying request body.
 func (b RequestBodyLifecycleBinding) Release() {
 	if b.body != nil {
 		b.body.releaseLease(b.lease)
 	}
 }
 
-// ReleaseAndRecycle finishes server-owned request-body tracking after the
-// handler has returned. It restores the original body on the request before
-// pooling the wrapper so net/http can retain its ordinary body-close behavior.
-// A wrapper captured by the shutdown cancellation snapshot is deliberately not
-// pooled because that snapshot may still call cancelForShutdown asynchronously.
 func (b RequestBodyLifecycleBinding) ReleaseAndRecycle(r *http.Request) {
 	b.releaseAndRecycle(r, recycleLifecycleRequestBody)
 }
@@ -677,18 +622,10 @@ func (h *ProxyHandler) endLifecycleWorker() {
 	h.lifecycleWorkersMu.Unlock()
 }
 
-// WaitLifecycleWorkers waits for proxy-owned detached workers after admission
-// has closed. The mutex pairs worker registration with the transition to Wait,
-// preventing a WaitGroup Add/Wait race while shutdown starts. Already-complete
-// work wins over an expired shutdown context so repeated Stop calls do not add
-// a duplicate deadline error.
 func (h *ProxyHandler) WaitLifecycleWorkers(ctx context.Context) (err error) {
 	if h == nil {
 		return nil
 	}
-	// Server.stop calls this after actual HTTP handler return, even when its
-	// caller timed out. Other callers must likewise establish handler drain;
-	// an expired context alone is not proof that handlers have finished.
 	defer func() {
 		if err == nil && h.ShuttingDown() && (ctx == nil || ctx.Err() == nil) {
 			h.closeResponsesChatReplayStore()
@@ -769,8 +706,6 @@ func (h *ProxyHandler) handleResponseBodyWriteError(w http.ResponseWriter, r *ht
 	}
 	durable := h.stateBindings != nil && h.stateBindings.durable != nil
 	if (bodyErr.statusCode < http.StatusOK || bodyErr.statusCode >= http.StatusMultipleChoices) && (bodyErr.committed || !durable) {
-		// Durable final-error writers validate before exposing headers. A local
-		// validation/read failure there still needs a visible terminal error.
 		return true
 	}
 	if bodyErr.cancellationAtFailure && h.ShuttingDown() && upstreamCtx != nil && errors.Is(context.Cause(upstreamCtx), errProxyLifecycleShutdown) {
@@ -810,9 +745,6 @@ func (h *ProxyHandler) handleShutdownError(w http.ResponseWriter, r *http.Reques
 	return true
 }
 
-// WriteShutdownServiceUnavailable marks the request as locally suppressed from
-// provider stats and writes a protocol-appropriate 503 response. Callers must
-// use it only before committing a streaming response.
 func (h *ProxyHandler) WriteShutdownServiceUnavailable(w http.ResponseWriter, r *http.Request) {
 	if r != nil {
 		suppressRequestStats(r.Context())
@@ -916,21 +848,14 @@ func (h *ProxyHandler) recordLearnedCompactTarget(key compactLearnedTargetKey, t
 	return true
 }
 
-// Option customizes ProxyHandler behavior.
 type Option func(*ProxyHandler)
 
-// WithCopilotHeaderConfig overrides the synthetic Copilot-identifying headers
-// used for upstream requests. The raw override values are retained so endpoint-
-// scoped header logic can distinguish an explicitly configured OpenAI intent
-// from the built-in chat/responses default.
 func WithCopilotHeaderConfig(cfg CopilotHeaderConfig) Option {
 	return func(h *ProxyHandler) {
 		h.copilotHeaders = cfg
 	}
 }
 
-// WithAllowedModels restricts request routing to the listed public model IDs.
-// Empty keeps the normal global model namespace available.
 func WithAllowedModels(models ...string) Option {
 	return func(h *ProxyHandler) {
 		if h.allowedModels == nil {
@@ -944,10 +869,6 @@ func WithAllowedModels(models ...string) Option {
 	}
 }
 
-// WithAuxiliaryModels admits models an agent needs beside the allowed ones,
-// such as Claude Code's auto-mode classifier. Each is admitted only when a
-// provider already serving an allowed model owns it, so auxiliary models never
-// widen provider discovery or credentials.
 func WithAuxiliaryModels(models ...string) Option {
 	return func(h *ProxyHandler) {
 		if h.auxiliaryModels == nil {
@@ -961,43 +882,30 @@ func WithAuxiliaryModels(models ...string) Option {
 	}
 }
 
-// WithProvidersConfig enables multi-provider model routing. When unset, the
-// proxy keeps its legacy single-upstream Copilot behavior.
 func WithProvidersConfig(cfg ProvidersConfig) Option {
 	return func(h *ProxyHandler) {
 		h.providersConfig = cfg
 	}
 }
 
-// WithPolicyRoutingMode sets the process-wide policy safety ceiling. New
-// handlers follow configured profile modes by default; an explicit off (or
-// zero) value preserves the rollback ceiling.
 func WithPolicyRoutingMode(mode PolicyRoutingMode) Option {
 	return func(h *ProxyHandler) {
 		h.policyRoutingMode = mode
 	}
 }
 
-// WithChatPolicyPlanner installs a planner seam for focused tests. Production
-// policy configuration replaces this with the compiled planner during handler
-// initialization.
 func WithChatPolicyPlanner(planner chatPolicyPlanner) Option {
 	return func(h *ProxyHandler) {
 		h.chatPolicyPlanner = planner
 	}
 }
 
-// WithDeferredDynamicProviderModelValidation skips startup-time dynamic model
-// discovery. Call ValidateDynamicProviderModels after any required interactive
-// auth has completed to preserve collision checks without blocking liveness.
 func WithDeferredDynamicProviderModelValidation(deferValidation bool) Option {
 	return func(h *ProxyHandler) {
 		h.deferDynamicProviderModelRefresh = deferValidation
 	}
 }
 
-// WithCopilotBaseURL overrides the legacy single-upstream Copilot base URL.
-// It is primarily useful for local contract tests and diagnostic harnesses.
 func WithCopilotBaseURL(baseURL string) Option {
 	return func(h *ProxyHandler) {
 		h.copilotURL = strings.TrimRight(baseURL, "/")
@@ -1008,8 +916,6 @@ func withCopilotBaseURLForTest(baseURL string) Option {
 	return WithCopilotBaseURL(baseURL)
 }
 
-// WithResponsesWebSocketConfig overrides websocket-session state behavior for
-// GET /v1/responses Codex clients.
 func WithResponsesWebSocketConfig(cfg ResponsesWebSocketConfig) Option {
 	return func(h *ProxyHandler) {
 		h.responsesWS = cfg.withDefaults()
@@ -1023,24 +929,16 @@ func normalizeStreamingUpstreamTimeout(timeout time.Duration) time.Duration {
 	return timeout
 }
 
-// DefaultStreamingUpstreamTimeout returns the default timeout used for
-// streaming upstream inference requests.
 func DefaultStreamingUpstreamTimeout() time.Duration {
 	return streamingUpstreamTimeout
 }
 
-// WithStreamingUpstreamTimeout overrides the timeout used for streaming
-// upstream inference requests. Non-positive values fall back to the default.
 func WithStreamingUpstreamTimeout(timeout time.Duration) Option {
 	return func(h *ProxyHandler) {
 		h.streamingUpstreamTimeout = normalizeStreamingUpstreamTimeout(timeout)
 	}
 }
 
-// WithCompactUpstreamChunkBytes overrides the initial target body size used
-// when retrying /v1/responses/compact requests after the upstream returns
-// 413. Non-positive values fall back to the default. The chunker still
-// halves the target down to compactUpstreamChunkBodyFloor on recursive 413s.
 func WithCompactUpstreamChunkBytes(bytes int) Option {
 	return func(h *ProxyHandler) {
 		if bytes > 0 {
@@ -1050,9 +948,6 @@ func WithCompactUpstreamChunkBytes(bytes int) Option {
 	}
 }
 
-// WithCompactUpstreamChunkConcurrency overrides the maximum number of sibling
-// compact chunks sent concurrently after the first chunk succeeds at the current
-// target. Non-positive values fall back to the default.
 func WithCompactUpstreamChunkConcurrency(concurrency int) Option {
 	return func(h *ProxyHandler) {
 		if concurrency > 0 {
@@ -1061,11 +956,6 @@ func WithCompactUpstreamChunkConcurrency(concurrency int) Option {
 	}
 }
 
-// WithCompactUpstreamMaxAttempts caps the total number of logical compaction
-// calls the /v1/responses/compact 413 fallback may make for a single inbound
-// request. Each logical call may produce extra real upstream POSTs through model
-// fallback or the shared transport-retry policy. Non-positive values fall back
-// to the default.
 func WithCompactUpstreamMaxAttempts(max int) Option {
 	return func(h *ProxyHandler) {
 		if max > 0 {
@@ -1101,17 +991,13 @@ func newInferenceTransport() *http.Transport {
 	return transport
 }
 
-// NewProxyHandler creates a ProxyHandler with connection pooling and HTTP/2.
 func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) (*ProxyHandler, error) {
 	h := &ProxyHandler{
 		auth: a,
 		client: &http.Client{
 			Transport: newInferenceTransport(),
 		},
-		copilotURL: "https://api.githubcopilot.com",
-		// Keep global Copilot header overrides empty by default. Header application
-		// fills built-in defaults per endpoint, and /models must not inherit the
-		// built-in openai-intent value.
+		copilotURL:                      "https://api.githubcopilot.com",
 		copilotHeaders:                  CopilotHeaderConfig{},
 		azureIdentityTokenSourceFactory: newDefaultAzureIdentityTokenSource,
 		responsesWS:                     DefaultResponsesWebSocketConfig(),
@@ -1170,10 +1056,6 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 	return h, nil
 }
 
-// validateInsightModel logs a non-fatal warning when the configured dashboard
-// insight model cannot be served through Vekil's Chat compatibility route. The
-// route may use native /chat/completions or the Chat-over-Responses adapter; only
-// models that support neither native endpoint are startup misconfigurations.
 func (h *ProxyHandler) validateInsightModel() {
 	model := strings.TrimSpace(h.providersConfig.InsightModel)
 	if model == "" || h.log == nil || h.DynamicProviderValidationPending() {
@@ -1205,9 +1087,6 @@ func (h *ProxyHandler) effectiveStreamingUpstreamTimeout() time.Duration {
 	return normalizeStreamingUpstreamTimeout(h.streamingUpstreamTimeout)
 }
 
-// DefaultCompactUpstreamChunkBytes is the default target body size for chunked
-// /v1/responses/compact retries. Exposed so callers can show the default value
-// in flag/env help text.
 func DefaultCompactUpstreamChunkBytes() int {
 	return compactUpstreamChunkBodySize
 }
@@ -1223,8 +1102,6 @@ func (h *ProxyHandler) compactProactiveChunkingEnabled() bool {
 	return h != nil && h.compactChunkConfigured && h.effectiveCompactChunkBodyBytes() < compactUpstreamChunkBodySize
 }
 
-// DefaultCompactUpstreamChunkConcurrency returns the default max parallelism for
-// sibling chunk compaction calls after the first chunk succeeds.
 func DefaultCompactUpstreamChunkConcurrency() int {
 	return compactUpstreamChunkConcurrency
 }
@@ -1236,8 +1113,6 @@ func (h *ProxyHandler) effectiveCompactChunkConcurrency() int {
 	return h.compactChunkConcurrency
 }
 
-// DefaultCompactUpstreamMaxAttempts returns the default upstream attempt cap
-// for chunked /v1/responses/compact 413 fallback retries.
 func DefaultCompactUpstreamMaxAttempts() int {
 	return compactUpstreamMaxAttempts
 }
@@ -1249,8 +1124,6 @@ func (h *ProxyHandler) effectiveCompactMaxAttempts() int {
 	return h.compactMaxAttempts
 }
 
-// ServerWriteTimeout returns the HTTP server write timeout derived from the
-// configured streaming upstream timeout plus the non-streaming request budget.
 func (h *ProxyHandler) ServerWriteTimeout() time.Duration {
 	return h.effectiveStreamingUpstreamTimeout() + upstreamTimeout
 }
@@ -1340,9 +1213,6 @@ var hopByHopHeaders = map[string]struct{}{
 	"Upgrade":             {},
 }
 
-// Strip inline render markers that some upstream clients inject into plain text,
-// such as citation tokens like "citeturn5view1". These are useful only to
-// richer UIs, so proxy-owned summary surfaces should store clean text instead.
 var inlineRenderMarkerRegexp = regexp.MustCompile(`[^]*`)
 
 func sanitizeProxySummaryText(text string) string {
@@ -1379,9 +1249,6 @@ func copyPassthroughHeaders(dst, src http.Header) {
 			delete(dst, canonicalKey)
 			continue
 		}
-		// Upstream response headers are immutable after receipt. Borrow their
-		// value slices with capped capacity so a later Header.Add allocates instead
-		// of modifying the upstream slice in place.
 		dst[canonicalKey] = values[:len(values):len(values)]
 	}
 }
@@ -1537,14 +1404,11 @@ func (h *ProxyHandler) clearCanonicalModelsRefreshFailure() {
 	h.models.mu.Unlock()
 }
 
-// HandleHealthz handles GET /healthz and returns {"status":"ok"}.
 func (h *ProxyHandler) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
-// HandleReadyz validates that the proxy can obtain an auth token and reach the
-// configured upstream providers.
 func (h *ProxyHandler) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), readyzUpstreamTimeout)
 	defer cancel()
@@ -1623,7 +1487,6 @@ func providerSkipsReadyzProbe(provider *providerRuntime) bool {
 	case providerTypeAzureOpenAI:
 		return true
 	case providerTypeTypeSafeCompatible:
-		// Policy preflight gates readiness; classifiers have no model catalog.
 		return true
 	case providerTypeOpenAICompatible, providerTypeAnthropicCompatible:
 		return provider.modelDiscovery == providerModelDiscoveryStatic
@@ -1683,8 +1546,6 @@ func shouldSuppressReadyzResponse(parent context.Context, err error) bool {
 		return false
 	}
 
-	// Only suppress deadline errors when the caller's context already timed out.
-	// The proxy's own readiness timeout should still surface as not_ready.
 	return parent.Err() != nil
 }
 
@@ -1713,9 +1574,6 @@ func writeReadyzStatus(w http.ResponseWriter, statusCode int, status string, err
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-// HandleModels handles GET /v1/models by building a merged model catalog across
-// the configured providers. Responses are cached for modelsCacheTTL to avoid
-// repeated upstream calls.
 func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	cacheKey := r.URL.RawQuery
 	canonicalQuery := isCanonicalModelsQuery(cacheKey)
@@ -1762,7 +1620,6 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	h.models.mu.RUnlock()
 
-	// Without an ETag we cannot safely revalidate, so honor the TTL-based cache.
 	if hasCachedEntry && cachedEntry.etag == "" && h.models.nowTime().Before(cachedEntry.expiry) {
 		writeCachedModelsResponse(w, cachedEntry)
 		return
@@ -1800,9 +1657,6 @@ func (h *ProxyHandler) refreshModelsCacheVariant(waitCtx context.Context, cacheK
 		cachedEntry, hasCachedEntry := h.models.entries[cacheKey]
 		h.models.mu.RUnlock()
 
-		// Query variants intentionally do not send conditional ETags because a
-		// provider-local 304 cannot safely reconstruct a merged multi-provider
-		// variant. Entries without ETags remain ordinary TTL caches.
 		if hasCachedEntry && cachedEntry.etag == "" && now.Before(cachedEntry.expiry) {
 			return modelsCacheFlightResult{entry: cachedEntry, hasEntry: true}
 		}
@@ -1959,11 +1813,6 @@ type mergedModelReservation struct {
 	ownerType   mergedModelOwnerType
 }
 
-// reserveMergedModelOwner reserves both the raw public ID and every normalized
-// request alias before a provider model is exposed in any /models response.
-// Exact duplicates from the same provider retain the historical first-entry
-// behavior; distinct IDs that share an alias are collisions even within one
-// provider, matching the strict version-2 route registry.
 func reserveMergedModelOwner(owners map[string]mergedModelReservation, model providerModel) (bool, error) {
 	publicID := strings.TrimSpace(model.publicID)
 	reservation := mergedModelReservation{
@@ -1995,17 +1844,10 @@ func reserveMergedModelOwner(owners map[string]mergedModelReservation, model pro
 	return true, nil
 }
 
-// transformModelsResponse adds a Codex-compatible "models" field to the
-// upstream Copilot /models response. The original "data" and "object" fields
-// are preserved for standard OpenAI SDK compatibility.
 func transformModelsResponse(body []byte) []byte {
 	return transformModelsResponseWithCompatibility(body, nil)
 }
 
-// transformModelsResponseWithCompatibility builds the Codex projection.
-// responsesOverChat names opted-in Chat-only entries that Vekil serves on
-// /v1/responses; they are listed with the bounded adapter's restrictions
-// while their native data entries keep their original supported_endpoints.
 func transformModelsResponseWithCompatibility(body []byte, responsesOverChat map[string]struct{}) []byte {
 	var upstream struct {
 		Data   []json.RawMessage `json:"data"`
@@ -2045,10 +1887,8 @@ func transformModelsResponseWithCompatibility(body []byte, responsesOverChat map
 		EffectiveContextWindowPct   int64             `json:"effective_context_window_percent"`
 		ExperimentalSupportedTools  []string          `json:"experimental_supported_tools"`
 		InputModalities             []string          `json:"input_modalities"`
-		// Set only for Responses-over-Chat entries: the adapter carries
-		// neither Responses Lite request items nor hosted search.
-		UseResponsesLite   *bool `json:"use_responses_lite,omitempty"`
-		SupportsSearchTool *bool `json:"supports_search_tool,omitempty"`
+		UseResponsesLite            *bool             `json:"use_responses_lite,omitempty"`
+		SupportsSearchTool          *bool             `json:"supports_search_tool,omitempty"`
 	}
 
 	positivePtr := func(value int64) *int64 {
@@ -2204,7 +2044,6 @@ func transformModelsResponseWithCompatibility(body []byte, responsesOverChat map
 		codexModels = append(codexModels, cm)
 	}
 
-	// Build combined response with both "data" (OpenAI) and "models" (Codex).
 	result := struct {
 		Data   []json.RawMessage `json:"data"`
 		Object string            `json:"object"`
@@ -2248,7 +2087,6 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 
 var upstreamRequestIDHeaderNames = []string{"X-Request-Id", "X-Copilot-Service-Request-Id", "X-Github-Request-Id", "X-Azure-Request-Id", "Openai-Request-Id"}
 
-// UpstreamRequestID returns the first recognized upstream request id from headers.
 func UpstreamRequestID(headers http.Header) string {
 	for _, name := range upstreamRequestIDHeaderNames {
 		if value := boundedSingleHeaderValue(headers, name); value != "" {
@@ -2313,8 +2151,6 @@ func writeOpenAIErrorWithDetails(w http.ResponseWriter, status int, message, err
 	writeOpenAIErrorWithRetryAfterDetails(w, status, message, errType, "", nil, param, code)
 }
 
-// readBody reads the request body up to maxRequestBodySize. If the body exceeds
-// the limit, it returns an error so callers can return HTTP 413.
 func readBody(r *http.Request) ([]byte, error) {
 	return readBodyWithLimit(r, maxRequestBodySize)
 }
@@ -2334,17 +2170,10 @@ var smallRequestBodyBufferPool = sync.Pool{New: func() any {
 	return &buffer
 }}
 
-// readBodyBorrowed reads an ordinary small request into a pooled buffer. The
-// caller must release a non-nil pooled buffer only after it has finished using
-// body. Unknown-length, compressed, and larger requests retain the general
-// bounded reader below.
 func readBodyBorrowed(r *http.Request) ([]byte, *[]byte, error) {
 	return readBodyBorrowedWithLimit(r, maxRequestBodySize)
 }
 
-// readBodyBorrowedWithLimit applies the small known-length fast path while
-// preserving the caller's endpoint-specific body limit for every fallback and
-// mismatched Content-Length case.
 func readBodyBorrowedWithLimit(r *http.Request, limit int64) ([]byte, *[]byte, error) {
 	if r == nil || r.Body == nil || r.Header.Get("Content-Encoding") != "" ||
 		r.ContentLength < 0 || r.ContentLength >= smallRequestBodyBufferSize ||
@@ -2363,8 +2192,6 @@ func readBodyBorrowedWithLimit(r *http.Request, limit int64) ([]byte, *[]byte, e
 	n, err := io.ReadFull(r.Body, buffer)
 	switch err {
 	case nil:
-		// The body exceeded its advertised length. Continue through the normal
-		// request cap so a mismatched Content-Length cannot truncate it.
 		remaining := limit + 1 - int64(len(buffer))
 		rest, readErr := io.ReadAll(io.LimitReader(r.Body, remaining))
 		body := append(buffer, rest...)
@@ -2413,14 +2240,9 @@ func releaseSmallRequestBodyBuffer(buffer *[]byte) {
 	}
 }
 
-// readBodyWithLimit reads and transparently decompresses the request body up to
-// the provided limit. If the body exceeds the limit, it returns an error so
-// callers can return HTTP 413.
 func readBodyWithLimit(r *http.Request, limit int64) ([]byte, error) {
 	var reader io.Reader = r.Body
 
-	// Decompress request body if Content-Encoding is set.
-	// Some clients (e.g., Codex CLI) send compressed request bodies.
 	switch strings.ToLower(r.Header.Get("Content-Encoding")) {
 	case "gzip":
 		gr, err := gzip.NewReader(r.Body)

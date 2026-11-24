@@ -34,7 +34,6 @@ var (
 	authenticator  *auth.Authenticator
 	sessionUIMu    sync.Mutex
 
-	// Menu items kept at package level so helpers can update them.
 	mAuthMenu        *systray.MenuItem
 	mToggle          *systray.MenuItem
 	mDashboard       *systray.MenuItem
@@ -45,12 +44,9 @@ var (
 	mProvidersChoose *systray.MenuItem
 	mProvidersClear  *systray.MenuItem
 
-	// signInMu guards signInCancel to prevent concurrent sign-in flows.
 	signInMu     sync.Mutex
 	signInCancel context.CancelFunc
 
-	// providersStateMu guards the saved providers selection and its most recent
-	// load. Each start reloads them from its worker while the menu loop reads them.
 	providersStateMu   sync.Mutex
 	menubarCfg         menubarConfig
 	providersCfg       proxy.ProvidersConfig
@@ -58,14 +54,11 @@ var (
 )
 
 func main() {
-	// A menubar app's stderr goes nowhere, so keep its logs in a file too.
 	if path, err := menubarLogPath(); err != nil {
 		log.Warn("could not locate menubar log file", logger.Err(err))
 	} else if file, err := logger.OpenRotatingFile(path, menubarLogMaxBytes); err != nil {
 		log.Warn("could not open menubar log file", logger.Err(err))
 	} else {
-		// MultiWriter stops at the first failing writer, so a closed stderr
-		// must come after the file.
 		log = logger.NewWithWriter(logger.ParseLevel("info"), io.MultiWriter(file, os.Stderr))
 	}
 	if err := initializeMenubarPATH(); err != nil {
@@ -213,16 +206,11 @@ func startProxy() {
 	refreshSessionUI()
 	authn := authenticator
 	go func() {
-		// Reload on every start so edits to the saved providers config apply
-		// after Stop and Start without relaunching the app.
 		cfg, configErr := reloadProvidersState(ctx)
 		completeProxyStartup(generation, runProxyStartup(ctx, authn, cfg, configErr))
 	}()
 }
 
-// reloadProvidersState re-reads the saved menubar config and the providers
-// config it selects, then publishes the result for the menu. A canceled reload
-// says nothing about the file, so it leaves the published state unchanged.
 func reloadProvidersState(ctx context.Context) (proxy.ProvidersConfig, error) {
 	cfg, loadedProvidersCfg, err := loadProvidersConfigForMenubar(ctx)
 	if ctx.Err() == nil {
@@ -245,8 +233,6 @@ func setProvidersState(cfg menubarConfig, loadedProvidersCfg proxy.ProvidersConf
 	providersConfigErr = err
 }
 
-// menubarPolicyRoutingMode follows the providers YAML unless a non-empty
-// process override was explicitly supplied.
 func menubarPolicyRoutingMode() (proxy.PolicyRoutingMode, error) {
 	value, ok := os.LookupEnv("POLICY_ROUTING_MODE")
 	if !ok || strings.TrimSpace(value) == "" {
@@ -354,9 +340,6 @@ func runProxyStartupAt(ctx context.Context, authn *auth.Authenticator, cfg proxy
 		)
 	}
 
-	// Each classifier route already has its own configured timeout. The startup
-	// worker keeps the aggregate operation cancellable without imposing a second,
-	// shorter deadline over a sequence of otherwise healthy routes.
 	if err := initializeProxyPolicyRouting(ctx, nextSrv); err != nil {
 		if ctx.Err() != nil {
 			return proxyStartResult{err: ctx.Err()}
@@ -466,12 +449,6 @@ func stopMenubarProxyServer(current menubarProxyServer, timeout time.Duration) e
 	return current.Stop(ctx)
 }
 
-// openDashboard opens the live traffic dashboard in the default browser. It is a
-// convenience shortcut; the dashboard is served by the proxy itself and is also
-// reachable directly at the dashboard URL. On Linux this waits on the portal's
-// bounded, asynchronous OpenURI response (see portalOpenURITimeout), so it is
-// expected to be called on its own goroutine rather than the tray's single
-// menu-dispatch loop, the same as GitHub sign-in.
 func openDashboard() {
 	if !proxyLifecycle.isRunning() {
 		showErrorDialog("Vekil Not Running", "Start Vekil before opening the dashboard.")
@@ -480,11 +457,7 @@ func openDashboard() {
 	openURL(dashboardURL())
 }
 
-// signInWithGitHub drives the interactive GitHub device-code flow via the
-// platform's native confirmation prompt. It is expected to be called in its
-// own goroutine.
 func signInWithGitHub() {
-	// Guard against double sign-in.
 	signInMu.Lock()
 	if signInCancel != nil {
 		signInMu.Unlock()
@@ -514,10 +487,6 @@ func signInWithGitHub() {
 
 	copyToClipboard(dcResp.UserCode)
 
-	// The menu title shows the device code only while confirmation is
-	// awaited: refreshSessionUI (called on every exit path below, including
-	// a decline) immediately overwrites it. Only the clipboard copy survives
-	// a decline or refresh; retrying sign-in requests a fresh code.
 	mAuthMenu.SetTitle(fmt.Sprintf("GitHub Auth: Confirm code %s to continue", dcResp.UserCode))
 
 	approved := confirmAction(ctx, confirmationPrompt{
@@ -540,7 +509,6 @@ func signInWithGitHub() {
 	if err := authenticator.PollForAuthorization(ctx, dcResp); err != nil {
 		log.Error("authorization failed", logger.Err(err))
 		if ctx.Err() == nil {
-			// Only show error dialog if we weren't cancelled.
 			showErrorDialog("Sign In Failed", fmt.Sprintf("Authorization failed: %v", err))
 		}
 		refreshSessionUI()
@@ -553,10 +521,7 @@ func signInWithGitHub() {
 	log.Info("sign-in complete")
 }
 
-// signInWithGitHubCLI signs in using the currently authenticated GitHub CLI account.
-// It is expected to be called in its own goroutine.
 func signInWithGitHubCLI() {
-	// Guard against double sign-in.
 	signInMu.Lock()
 	if signInCancel != nil {
 		signInMu.Unlock()
@@ -590,10 +555,7 @@ func signInWithGitHubCLI() {
 	log.Info("github cli sign-in complete")
 }
 
-// signOut clears Vekil credentials and stops the proxy only when active
-// providers require GitHub Copilot authentication.
 func signOut() {
-	// Cancel any in-progress sign-in.
 	signInMu.Lock()
 	if signInCancel != nil {
 		signInCancel()
@@ -707,8 +669,6 @@ func refreshSessionUI() {
 			mDashboard.Disable()
 		}
 	}
-	// Start stays available with an invalid config because it reloads the
-	// config, so fixing the file and starting again recovers.
 	mToggle.Enable()
 	if running {
 		mToggle.SetTitle("Stop Vekil")

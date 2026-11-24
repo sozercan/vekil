@@ -14,8 +14,10 @@ SPARKLE_FRAMEWORK := $(SPARKLE_UNPACK_DIR)/Sparkle.framework
 SPARKLE_DOWNLOAD_URL := https://github.com/sparkle-project/Sparkle/releases/download/$(SPARKLE_VERSION)/Sparkle-$(SPARKLE_VERSION).tar.xz
 SPARKLE_FEED_URL ?= https://github.com/sozercan/vekil/releases/latest/download/appcast.xml
 SPARKLE_PUBLIC_ED_KEY ?=
+PYTHON ?= python3
+COMMENT_BASE ?=
 
-.PHONY: build build-app build-tray-linux test-app test compaction-lab vet lint clean docker-build docker-build-rtk docker-rtk-e2e
+.PHONY: build build-app build-tray-linux test-app test compaction-lab vet lint lint-comments clean docker-build docker-build-rtk docker-rtk-e2e
 
 build:
 	go build -ldflags="$(LDFLAGS)" -o $(BINARY) .
@@ -105,7 +107,10 @@ compaction-lab:
 vet:
 	go vet ./...
 
-lint: vet
+lint: vet lint-comments
+
+lint-comments:
+	"$(PYTHON)" scripts/comment-lint.py $(if $(COMMENT_BASE),--base "$(COMMENT_BASE)")
 
 clean:
 	rm -f $(BINARY) $(TRAY_LINUX_BINARY)

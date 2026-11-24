@@ -17,18 +17,16 @@ import (
 )
 
 const (
-	maxAzureTrafficEntries      = 256
-	maxAzureTrafficWaiters      = 64
-	maxAzureTrafficWaitingBytes = 64 << 20
-	maxAzureTrafficWait         = 5 * time.Minute
-	// Keep one deployment from consuming all shared recovery capacity.
+	maxAzureTrafficEntries         = 256
+	maxAzureTrafficWaiters         = 64
+	maxAzureTrafficWaitingBytes    = 64 << 20
+	maxAzureTrafficWait            = 5 * time.Minute
 	maxAzureDeploymentWaiters      = 16
 	maxAzureDeploymentWaitingBytes = 16 << 20
 )
 
 type azureDeploymentKey [sha256.Size]byte
 
-// A nonzero size gives FIFO waiters distinct pointer identities.
 type azureTrafficWaiter struct{ _ byte }
 
 type azureCooldown struct {
@@ -44,9 +42,6 @@ func (e *azureCooldown) notify() {
 	e.changed = make(chan struct{})
 }
 
-// Azure quotas belong to the physical resource/deployment, not to a public
-// route, reasoning tier, or access token. Only explicit Azure routes use this
-// controller; legacy retries and classifier admission retain their contracts.
 type azureTrafficController struct {
 	mu           sync.Mutex
 	cooldowns    map[azureDeploymentKey]*azureCooldown
@@ -109,9 +104,6 @@ func azureRouteTrafficFromRequest(req *http.Request) azureRouteTraffic {
 	return metadata
 }
 
-// Preparation and body accounting may inspect the same JSON failure. Share
-// one observation across request copies so later reads cannot restart its reset.
-// New physical sends and streamed failure events retain independent resets.
 func (a azureRouteTraffic) observeJSONFailure(status int, headers http.Header) {
 	if a.jsonFailureObserved != nil && !a.jsonFailureObserved.CompareAndSwap(false, true) {
 		return
@@ -124,8 +116,6 @@ func azureRetryAfter(headers http.Header) string {
 	if source == "Retry-After" || source == "retry-after-ms" {
 		return retryAfter
 	}
-	// Azure negative balances are exhausted, including -1. Other providers
-	// may use -1 for unlimited quota, so keep this policy out of the shared parser.
 	for _, dimension := range []string{"tokens", "requests"} {
 		if _, exhausted := responsesQuotaRemaining(headers, dimension); !exhausted {
 			continue
@@ -185,12 +175,9 @@ func (a azureRouteTraffic) observe(status int, headers http.Header) bool {
 }
 
 type azureTrafficPermit struct {
-	controller *azureTrafficController
-	key        azureDeploymentKey
-	entry      *azureCooldown
-	// Protected by controller.mu. Unless streamed output resolved the probe,
-	// requesting release does not end ownership while an abandoned transport
-	// body is still being read or closed.
+	controller       *azureTrafficController
+	key              azureDeploymentKey
+	entry            *azureCooldown
 	bodyPending      bool
 	activeReads      int
 	closing          bool
@@ -259,9 +246,6 @@ func (p *azureTrafficPermit) release() {
 	p.releaseIfCompleteLocked()
 }
 
-// Streamed output proves the deployment admitted the probe, so hand recovery to
-// the next queued caller instead of holding it for the whole generation. Header
-// exhaustion and later streamed throttles still renew the shared cooldown.
 func (p *azureTrafficPermit) resolveProbe() {
 	if p == nil || p.controller == nil {
 		return
@@ -278,8 +262,6 @@ func (p *azureTrafficPermit) releaseIfCompleteLocked() {
 	p.releaseProbeLocked()
 }
 
-// Release at most once: a resolved permit's later cleanup must not end the
-// probe that the next caller now owns on the same entry.
 func (p *azureTrafficPermit) releaseProbeLocked() {
 	if p.released {
 		return
@@ -287,9 +269,6 @@ func (p *azureTrafficPermit) releaseProbeLocked() {
 	p.released = true
 	c := p.controller
 	p.entry.probe = false
-	// While a recovery queue exists, release one caller per admitted or
-	// completed attempt. Deleting the entry and waking everyone would recreate
-	// the burst that exhausted the token quota.
 	if len(p.entry.queue) == 0 && !p.entry.until.After(c.timeNow()) && c.cooldowns[p.key] == p.entry {
 		delete(c.cooldowns, p.key)
 	}
@@ -313,10 +292,6 @@ func azureCooldownResponse(req *http.Request, delay time.Duration) *http.Respons
 	}
 }
 
-// A known cooldown may reject a fresh operation locally so priority failover
-// can use another target. Pinned/single-target operations wait without spending
-// a send. The queue and the total wait are bounded independently of the usually
-// much longer streaming-inference deadline.
 func (h *ProxyHandler) acquireAzureRouteInference(req *http.Request, canSwitch bool) (*azureTrafficPermit, *http.Response, error) {
 	metadata := azureRouteTrafficFromRequest(req)
 	if metadata.controller == nil {

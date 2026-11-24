@@ -194,7 +194,6 @@ func TestCarrierRouteTagBindsTheReplayPayload(t *testing.T) {
 	}
 }
 
-// A shape we did not mint, or that the transcript cannot rebuild, must not restore a turn.
 func TestCarrierRejectsItemShapesTheStoreWouldNotPublish(t *testing.T) {
 	projected := []responsesChatReplayProjectedCall{{ID: "call_vekil_x", Name: "lookup", Arguments: "{}"}}
 	content := json.RawMessage(`"checking"`)
@@ -225,7 +224,6 @@ func TestCarrierRejectsItemShapesTheStoreWouldNotPublish(t *testing.T) {
 	}
 }
 
-// A reconstruction that walked unchecked indices would drop items or reorder them.
 func TestCarrierRejectsItemIndexesTheStoreWouldNotPublish(t *testing.T) {
 	projected := []responsesChatReplayProjectedCall{
 		{ID: "call_vekil_x", Name: "lookup", Arguments: "{}"},
@@ -276,7 +274,6 @@ func TestCarrierRejectsItemIndexesTheStoreWouldNotPublish(t *testing.T) {
 	}
 }
 
-// Copilot places each reasoning item relative to its call, so a rebuilt turn lands slot for slot.
 func publishInterleavedCarrierTurn(t *testing.T) (*responsesChatReplayStore, responsesChatReplayRoute, []json.RawMessage, responsesChatReplayPublished) {
 	t.Helper()
 	store, route := newCarrierReplayFixture(t)
@@ -310,8 +307,6 @@ func carriedUpstreamInputResult(t *testing.T, route responsesChatReplayRoute, pu
 	t.Helper()
 	body := carrierParityBody(t, published, inOrder(2), results)
 	if store != nil {
-		// Keep a non-nil store in the matrix, but model expiry/eviction rather than
-		// corrupting the projection merely to force the carrier path.
 		store = newResponsesChatReplayStore()
 		t.Cleanup(func() { _ = store.Close() })
 	}
@@ -334,8 +329,6 @@ func carriedUpstreamInput(t *testing.T, route responsesChatReplayRoute, publishe
 	return input
 }
 
-// The client holds its carrier, and the policy classifier reads the chat body, so
-// anything a carried item says that the transcript does not must not reach upstream.
 func TestCarriedItemsCannotSmuggleContentPastThePolicyClassifier(t *testing.T) {
 	cases := map[string]func([]json.RawMessage) []json.RawMessage{
 		"rewritten assistant text": func(items []json.RawMessage) []json.RawMessage {
@@ -359,9 +352,6 @@ func TestCarriedItemsCannotSmuggleContentPastThePolicyClassifier(t *testing.T) {
 				json.RawMessage(`{"type":"reasoning","id":"rs_evil","encrypted_content":"","summary":[{"type":"summary_text","text":"SMUGGLED"}]}`))
 		},
 	}
-	// Answering every call splices the whole turn; answering one takes the subset branch.
-	// Both store states reach carriedRestoredCalls: no store, and a non-nil store that no
-	// longer holds the group after expiry, eviction, or restart.
 	for _, results := range [][]int{inOrder(2), {0}} {
 		for _, withStore := range []bool{false, true} {
 			for name, tamper := range cases {
@@ -393,7 +383,6 @@ func TestCarriedItemsCannotSmuggleContentPastThePolicyClassifier(t *testing.T) {
 	}
 }
 
-// The ciphertext is why the carrier exists, so it replays in its own slot around the calls.
 func TestCarriedReasoningCiphertextReplaysAroundRebuiltCalls(t *testing.T) {
 	_, route, items, published := publishInterleavedCarrierTurn(t)
 	var input []json.RawMessage
@@ -417,7 +406,6 @@ func TestCarriedReasoningCiphertextReplaysAroundRebuiltCalls(t *testing.T) {
 	}
 }
 
-// Text the classifier read replays whether or not the message item it sat in came back.
 func TestCarriedTurnReplaysTranscriptTextWithoutItsMessageItem(t *testing.T) {
 	_, route, items, published := publishInterleavedCarrierTurn(t)
 	stripped := rewrittenCarrierItems(items, 1, `{"type":"reasoning","id":"rs_pad","encrypted_content":"PAD","content":[],"summary":[]}`)
@@ -430,8 +418,6 @@ func TestCarriedTurnReplaysTranscriptTextWithoutItsMessageItem(t *testing.T) {
 	}
 }
 
-// Store items came from upstream, so they keep replaying verbatim; while the store
-// holds the group a carrier answers nothing, tampered or not.
 func TestStoreSourcedReplayStillSplicesItsOwnItems(t *testing.T) {
 	store, route, items, published := publishInterleavedCarrierTurn(t)
 	tampered := rewrittenCarrierItems(items, 2, `{"type":"function_call","id":"fc0","call_id":"upstream-call-1","name":"lookup","arguments":"{\"q\":\"SMUGGLED\"}","status":"completed"}`)
@@ -454,7 +440,6 @@ func TestStoreSourcedReplayStillSplicesItsOwnItems(t *testing.T) {
 	}
 }
 
-// The per-carrier cap is per-signature; a body full of carriers multiplies it.
 func TestCarrierDecodeBudgetBoundsTheWholeRequest(t *testing.T) {
 	filler := strings.Repeat("A", 8192)
 	items := make([]json.RawMessage, 0, 96)
@@ -539,7 +524,6 @@ func TestAnthropicStreamingToolTurnEmitsACarrier(t *testing.T) {
 	}
 }
 
-// Same, non-streaming: these still force-stream upstream and return via aggregate.
 func TestAnthropicNonStreamingToolTurnEmitsACarrier(t *testing.T) {
 	h := newCarrierRoutePolicyHandler(t)
 	recorder := httptest.NewRecorder()
@@ -576,15 +560,10 @@ func TestAnthropicNonStreamingToolTurnEmitsACarrier(t *testing.T) {
 	}
 }
 
-// The whole point, on the policy path: a continuation whose store TTL'd or evicted
-// must still resolve from the client's own carrier.
 func TestAnthropicPolicyContinuationSurvivesAnEmptyStore(t *testing.T) {
 	runCarrierContinuation(t, newCarrierRoutePolicyHandler(t), nil)
 }
 
-// The tier rides in the carrier's tagged route digest, so an emptied store must not
-// hand the turn back to the classifier: it would answer LIGHTWEIGHT and send the
-// continuation to the other terminal, which holds none of its reasoning.
 func TestAnthropicPolicyContinuationKeepsItsTierWhenTheClassifierDisagrees(t *testing.T) {
 	h, upstream := newCarrierPolicyFixture(t, policyClassifierSignals{
 		TurnType:                policyTurnTypePlanning,
@@ -616,9 +595,6 @@ func TestAnthropicPolicyContinuationKeepsItsTierWhenTheClassifierDisagrees(t *te
 	}
 }
 
-// With the process-local mapping gone, the carrier restores reasoning while rebuilding the
-// function call and its output under the same opaque fallback ID. The client-held carrier
-// contains no separate provider ID.
 func TestAnthropicPolicyContinuationUsesOpaqueIDsAfterStoreLoss(t *testing.T) {
 	h, upstream := newCarrierPolicyFixture(t, policyClassifierSignals{
 		TurnType:  policyTurnTypeLookup,
@@ -627,7 +603,6 @@ func TestAnthropicPolicyContinuationUsesOpaqueIDsAfterStoreLoss(t *testing.T) {
 	})
 	turn, toolUseID := carrierFirstToolTurn(t, h)
 
-	// Vacuity guards: the carrier must remain usable, but its binding is opaque-only.
 	var signature string
 	for _, block := range turn.Content {
 		if block.Type == "thinking" && strings.HasPrefix(block.Signature, reasoningCarrierPrefix) {
@@ -646,7 +621,6 @@ func TestAnthropicPolicyContinuationUsesOpaqueIDsAfterStoreLoss(t *testing.T) {
 		t.Fatalf("fixture tool ID %q should exercise the opaque fallback", toolUseID)
 	}
 
-	// What TTL and eviction leave behind: minted ids in the transcript, nothing server-side.
 	h.responsesChatReplayMu.Lock()
 	h.responsesChatReplay = nil
 	h.responsesChatReplayMu.Unlock()
@@ -673,7 +647,6 @@ func runCarrierContinuation(t *testing.T, h *ProxyHandler, beforeContinuation fu
 	t.Helper()
 	turn, toolUseID := carrierFirstToolTurn(t, h)
 
-	// What TTL and eviction leave behind: minted ids in the transcript, nothing server-side.
 	h.responsesChatReplayMu.Lock()
 	h.responsesChatReplay = nil
 	h.responsesChatReplayMu.Unlock()
@@ -718,7 +691,6 @@ func carrierContinuationBody(t *testing.T, content []models.ContentBlock, toolUs
 	return carrierTurnBody(t, content, toolUseID, []any{carrierToolSchema()})
 }
 
-// No tool schema: this pins the replay path, not the fixture's tool branch.
 func carrierCountTokensBody(t *testing.T, content []models.ContentBlock, toolUseID string) string {
 	t.Helper()
 	return carrierTurnBody(t, content, toolUseID, nil)
@@ -747,8 +719,6 @@ func carrierTurnBody(t *testing.T, content []models.ContentBlock, toolUseID stri
 	return string(body)
 }
 
-// A client holds its own carrier, so it can re-stamp the route digest that picks the
-// tier. Only the tag this process minted releases one; otherwise the turn fails closed.
 func TestForgedCarrierCannotChooseATerminalRoute(t *testing.T) {
 	h, upstream := newCarrierPolicyFixture(t, policyClassifierSignals{
 		TurnType:  policyTurnTypeLookup,
@@ -787,7 +757,6 @@ func TestForgedCarrierCannotChooseATerminalRoute(t *testing.T) {
 	}
 }
 
-// A restart mints a new key, so a carrier from before it may no longer pick a tier.
 func TestCarrierFromAnotherProcessCannotPickATier(t *testing.T) {
 	h, upstream := newCarrierPolicyFixture(t, policyClassifierSignals{
 		TurnType:                policyTurnTypePlanning,
@@ -815,7 +784,6 @@ func TestCarrierFromAnotherProcessCannotPickATier(t *testing.T) {
 	}
 }
 
-// Claude Code calls count_tokens nearly every turn, so it must read the carrier too.
 func TestAnthropicCountTokensContinuationSurvivesAnEmptyStore(t *testing.T) {
 	h := newCarrierRoutePolicyHandler(t)
 	turn, toolUseID := carrierFirstToolTurn(t, h)
@@ -833,7 +801,6 @@ func TestAnthropicCountTokensContinuationSurvivesAnEmptyStore(t *testing.T) {
 	}
 }
 
-// The store dedupes by group identity, so byte-identical items must not collide.
 func TestCarrierRestoreKeyDistinguishesGroupsWithIdenticalItems(t *testing.T) {
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public"}
 	items := []json.RawMessage{
@@ -860,7 +827,6 @@ func TestCarrierRestoreKeyDistinguishesGroupsWithIdenticalItems(t *testing.T) {
 	}
 }
 
-// Unbounded lifetime is the point: the store's TTL is the bug this carrier removes.
 func TestCarrierHasNoLifetime(t *testing.T) {
 	signature, err := encodeReasoningCarrier(carriedTurn{
 		Items: []json.RawMessage{json.RawMessage(`{"type":"reasoning","encrypted_content":"x"}`)},
@@ -890,7 +856,6 @@ func TestCarrierHasNoLifetime(t *testing.T) {
 	}
 }
 
-// Decode, rewrite, and re-encode without the process key: all of it client-side.
 func rewriteCarrierPayload(t *testing.T, signature string, mutate func(*reasoningCarrierPayload)) string {
 	t.Helper()
 	compressed, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(signature, reasoningCarrierPrefix))
@@ -926,7 +891,6 @@ func rewriteCarrierPayload(t *testing.T, signature string, mutate func(*reasonin
 	return reasoningCarrierPrefix + base64.RawURLEncoding.EncodeToString(out.Bytes())
 }
 
-// Decode, rewrite only the route digest, re-encode: all of it client-side.
 func restampCarrierRoute(t *testing.T, signature, digest string) string {
 	t.Helper()
 	return rewriteCarrierPayload(t, signature, func(payload *reasoningCarrierPayload) {
@@ -934,7 +898,6 @@ func restampCarrierRoute(t *testing.T, signature, digest string) string {
 	})
 }
 
-// A separate execution path, and the only one a pre-restart carrier still completes.
 func TestAnthropicNonPolicyContinuationSurvivesAnEmptyStore(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_one_tool_call.sse")
 	if err != nil {
@@ -974,7 +937,6 @@ func TestAnthropicNonPolicyContinuationSurvivesAnEmptyStore(t *testing.T) {
 	h.responsesChatReplayMu.Lock()
 	h.responsesChatReplay = nil
 	h.responsesChatReplayMu.Unlock()
-	// The route is not in question here, so a restart's new key must not cost the items.
 	restored := reasoningCarrierKey
 	reasoningCarrierKey = func() []byte { return bytes.Repeat([]byte{0x37}, sha256.Size) }
 	t.Cleanup(func() { reasoningCarrierKey = restored })

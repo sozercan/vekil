@@ -77,7 +77,6 @@ func TestExplicitRouteCredentialFailureGuards(t *testing.T) {
 				tc.configure(op)
 			}
 			if tc.noBackup {
-				// This provider has no native Responses endpoint.
 				secondary.kind = providerTypeAnthropicCompatible
 			}
 			ctx = withRouteOperation(ctx, op)

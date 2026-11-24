@@ -29,10 +29,6 @@ var responsesLifecycleOrder = struct {
 	sequence uint64
 }{}
 
-// publishResponsesLifecycleSequence assigns and publishes one globally ordered
-// lifecycle event while holding the order lock. Keeping allocation and
-// publication in the same critical section prevents a later client-close event
-// from becoming visible before an earlier shutdown sequence is published.
 func publishResponsesLifecycleSequence(publish func(uint64)) {
 	responsesLifecycleOrder.Lock()
 	defer responsesLifecycleOrder.Unlock()
@@ -85,17 +81,8 @@ func isResponsesWebSocketClientDisconnect(ctx context.Context, err error) bool {
 	return ctx != nil && ctx.Err() != nil
 }
 
-// errStreamFailedUpstream is a sentinel error indicating the upstream stream
-// ended with response.failed or a top-level error event
-// after forwarding the upstream failure event. This path also emits the standard
-// websocket error payload so clients can surface the upstream error details.
 var errStreamFailedUpstream = errors.New("upstream stream ended with response.failed or error")
 
-// streamFailedUpstreamError carries the HTTP status that an upstream
-// failure terminal event was classified to (e.g. 429 for a rate limit, 503 for
-// an overload), so the turn is recorded in stats with its exact semantic status
-// rather than a generic 502. It unwraps to errStreamFailedUpstream so existing
-// errors.Is checks keep working.
 type streamFailedUpstreamError struct {
 	status int
 }
@@ -103,8 +90,6 @@ type streamFailedUpstreamError struct {
 func (e *streamFailedUpstreamError) Error() string { return errStreamFailedUpstream.Error() }
 func (e *streamFailedUpstreamError) Unwrap() error { return errStreamFailedUpstream }
 
-// streamFailureStatus returns the classified status carried by a stream-failure
-// error, or http.StatusBadGateway when none was attached.
 func streamFailureStatus(err error) int {
 	var sf *streamFailedUpstreamError
 	if errors.As(err, &sf) && sf.status != 0 {
@@ -235,31 +220,26 @@ type responsesWebSocketSession struct {
 	historyItems               []json.RawMessage
 	historyBytes               int
 	nativeUpstream             *responsesNativeUpstream
-	// nativeBase is how many leading historyItems the conversation on
-	// nativeBaseUpstream already holds, ending at that connection's last
-	// response. It stays valid only while that connection is open and the
-	// history is only appended to.
-	nativeBase         int
-	nativeBaseUpstream *responsesNativeUpstream
-	// nativeTurn is the native marker of the current attempt, if one was built.
-	nativeTurn              *responsesNativeRequest
-	toolContexts            *ToolExecutionContextStore
-	toolScope               string
-	handlerDone             chan struct{}
-	handlerDoneOnce         sync.Once
-	writeWait               time.Duration
-	pingPeriod              time.Duration
-	pongWait                time.Duration
-	terminalObservationWait time.Duration
-	inflightMu              sync.Mutex
-	inflightCancel          context.CancelFunc
-	inflightGen             uint64
-	inflightCancelHolds     int
-	closing                 bool
-	closeCause              responsesWebSocketCloseCause
-	closeSequence           uint64
-	closeBarrier            *responsesWebSocketCloseBarrier
-	socketClosed            bool
+	nativeBase                 int
+	nativeBaseUpstream         *responsesNativeUpstream
+	nativeTurn                 *responsesNativeRequest
+	toolContexts               *ToolExecutionContextStore
+	toolScope                  string
+	handlerDone                chan struct{}
+	handlerDoneOnce            sync.Once
+	writeWait                  time.Duration
+	pingPeriod                 time.Duration
+	pongWait                   time.Duration
+	terminalObservationWait    time.Duration
+	inflightMu                 sync.Mutex
+	inflightCancel             context.CancelFunc
+	inflightGen                uint64
+	inflightCancelHolds        int
+	closing                    bool
+	closeCause                 responsesWebSocketCloseCause
+	closeSequence              uint64
+	closeBarrier               *responsesWebSocketCloseBarrier
+	socketClosed               bool
 }
 
 type responsesWebSocketRequestPlan struct {
@@ -272,12 +252,9 @@ type responsesWebSocketRequestPlan struct {
 	compactionTrigger    bool
 	conversationSourceID string
 	conversationComplete bool
-	// nativeDelta continues the live native conversation from nativePreviousID
-	// with only nativeDeltaSegments. Any other turn carries the full history,
-	// which is valid on either transport.
-	nativeDelta         bool
-	nativePreviousID    string
-	nativeDeltaSegments [][]json.RawMessage
+	nativeDelta          bool
+	nativePreviousID     string
+	nativeDeltaSegments  [][]json.RawMessage
 }
 
 type responsesWebSocketRequestMetrics struct {
@@ -376,10 +353,6 @@ func responsesInputContainsCompactionTrigger(input []json.RawMessage) bool {
 	return false
 }
 
-// HandleResponsesWebSocket handles GET /v1/responses websocket upgrades used
-// by Codex. Each websocket request is translated into a normal upstream
-// streaming /responses HTTP request and the SSE data payloads are forwarded back
-// as websocket text frames.
 func (h *ProxyHandler) HandleResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
 	if !h.responsesWebSocketConfig().Enabled {
 		w.Header().Set("Connection", "Upgrade")
@@ -496,8 +469,6 @@ func (s *responsesWebSocketSession) readPump(frames chan<- responsesWebSocketFra
 			return
 		}
 
-		// response.processed is an advisory acknowledgement and does not consume
-		// the single queued-turn slot while inference is active.
 		if messageType == websocket.TextMessage {
 			if frameType, parseErr := parseResponsesWebSocketFrameType(payload); parseErr == nil && frameType == "response.processed" {
 				continue
@@ -507,9 +478,6 @@ func (s *responsesWebSocketSession) readPump(frames chan<- responsesWebSocketFra
 		select {
 		case outstanding <- struct{}{}:
 		default:
-			// The two outstanding slots are exactly one active request plus one
-			// queued request. They are held until serialized processing finishes,
-			// so acceptance is independent of handler scheduling.
 			s.closeWithControl(websocket.ClosePolicyViolation, "only one responses request may be queued", time.Now().Add(s.effectiveWriteWait()))
 			return
 		}
@@ -570,10 +538,6 @@ func (h *ProxyHandler) ShutdownWebSocketSessions(ctx context.Context) error {
 	}
 	h.responsesWSSessionsMu.Unlock()
 
-	// Phase one marks every session closing before any handler can start new
-	// turn or compaction work. A per-session barrier prevents handler teardown,
-	// read failures, or ping failures from hard-closing the socket before its
-	// graceful close attempt gets a bounded opportunity to run.
 	closeDeadline := responsesWebSocketShutdownCloseDeadline(ctx)
 	attempts := make([]<-chan struct{}, 0, len(sessions))
 	barriers := make([]*responsesWebSocketCloseBarrier, 0, len(sessions))
@@ -597,9 +561,6 @@ func (h *ProxyHandler) ShutdownWebSocketSessions(ctx context.Context) error {
 	}
 	waitForResponsesWebSocketCloseAttempts(ctx, closeDeadline, attempts)
 
-	// Phase two is unconditional, including when ctx was already canceled: lift
-	// every close barrier, cancel active inference/compaction and the session
-	// context, then hard-close every hijacked socket.
 	for _, barrier := range barriers {
 		barrier.release()
 	}
@@ -610,8 +571,6 @@ func (h *ProxyHandler) ShutdownWebSocketSessions(ctx context.Context) error {
 		session.hardClose()
 	}
 
-	// Phase three waits only for real handler teardown. handlerDone is closed
-	// after unregistration, never merely because shutdown requested a close.
 	waitDeadline := responsesWebSocketShutdownWaitDeadline(ctx)
 	for _, session := range sessions {
 		if !session.waitForHandlerDone(ctx, waitDeadline) {
@@ -936,14 +895,6 @@ func (s *responsesWebSocketSession) clientClosePrecedesShutdown(h *ProxyHandler)
 	return shutdownSequence == 0 || (closeSequence != 0 && closeSequence < shutdownSequence)
 }
 
-// setInflightCancel records the cancel func for the current in-flight upstream
-// call and returns a generation token. The token must be passed to
-// clearInflightCancel so that only the matching cancel is cleared: nested or
-// subsequent in-flight calls (e.g. auto-compaction inside a create request)
-// bump the generation, and a stale clear is then a no-op rather than nilling
-// out a newer cancel. (context.CancelFunc values are not comparable, so the
-// generation token stands in for identity.) Work installed after closing starts
-// is canceled immediately and is never published as active.
 func (s *responsesWebSocketSession) setInflightCancel(cancel context.CancelFunc) uint64 {
 	if s == nil || cancel == nil {
 		return 0
@@ -964,11 +915,6 @@ func (s *responsesWebSocketSession) setInflightCancel(cancel context.CancelFunc)
 	return gen
 }
 
-// beginClosingForStreamWriteFailure marks a client-side socket failure while
-// holding the active upstream cancellation just long enough for the prepared
-// stream observer to drain an already-produced terminal event. Ordinary client
-// close, pong timeout, and policy-close paths still cancel stalled upstream work
-// immediately.
 func (s *responsesWebSocketSession) beginClosingForStreamWriteFailure() {
 	if s == nil {
 		return
@@ -1069,9 +1015,6 @@ func newResponsesWebSocketSession(conn *websocket.Conn, r *http.Request) *respon
 		cancel:       cancel,
 		baseHeaders:  baseHeaders,
 		userAgent:    r.Header.Get("User-Agent"),
-		// Codex treats X-Codex-Turn-State as server-issued, turn-scoped
-		// sticky-routing state. This bridge only trusts state it received from
-		// upstream during this proxy-owned websocket session.
 		toolContexts: NewToolExecutionContextStore(),
 		toolScope:    "responses-ws:" + uuid.NewString(),
 		handlerDone:  make(chan struct{}),
@@ -1253,8 +1196,6 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 		summary.SetRouteID(route.public.routeID)
 	}
 	if h.conversationMigrationEnabled(route) {
-		// Saved per-response history chooses the owner, including after a
-		// reconnect or when a client explicitly resumes an older branch.
 		return routedCtx, operation, route, nil
 	}
 
@@ -1276,9 +1217,6 @@ func (s *responsesWebSocketSession) prepareExplicitRouteOperation(h *ProxyHandle
 	if err := operation.forcePinnedTarget(s.explicitTargetID); err != nil {
 		return routedCtx, operation, route, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
 	}
-	// Prior websocket frames commit the session to this exact target. Mark the
-	// per-turn operation committed before dispatch to prohibit target switching.
-	// A clean Azure admission rejection may still retry this turn on its owner.
 	operation.setCommitment(downstreamCommitmentProtocolFrame)
 	return routedCtx, operation, route, nil
 }
@@ -1306,7 +1244,6 @@ func (s *responsesWebSocketSession) pinExplicitRouteTarget(route *modelRoute, op
 		}
 	}
 	if operation.conversation != nil {
-		// Publish the new session owner only after the completed turn is saved.
 		return nil
 	}
 	operation.pinTarget(targetID)
@@ -1433,11 +1370,6 @@ func (s *responsesWebSocketSession) prepareExplicitRouteSuccessResponse(h *Proxy
 	if resp == nil || operation == nil || resp.StatusCode != http.StatusOK {
 		return nil
 	}
-	// An identical compaction trigger can join another request's in-flight compact
-	// call and build its synthetic success entirely in-process. That operation did
-	// not select a provider target and therefore has no provider response ownership
-	// to validate or pin onto the websocket session. A compaction operation that
-	// actually sent upstream has a send/target and still follows the normal path.
 	if isLocalResponsesWebSocketCompactionResponse(plan, operation) {
 		return nil
 	}
@@ -1577,7 +1509,7 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			if !allowFallback {
 				return
 			}
-			status = 499 // client closed request before a terminal provider outcome
+			status = 499
 		}
 		recordTurn(status, usage)
 	}
@@ -1605,11 +1537,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 
 	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(s.ctx, true)
 	upstreamCtx = withCopilotRequestMetadata(upstreamCtx, s.requestHeaders(request, false))
-	// The websocket bridge records each turn as tracked traffic (recordTurnStats),
-	// so mark the per-turn upstream context as retry-trackable too — otherwise a
-	// retryable 429/503 on a turn would be invisible in the dashboard retry
-	// counters. GET /v1/responses is not an inference route, so the middleware
-	// never marks it; do it explicitly here.
 	upstreamCtx = markRetryStatsTracked(upstreamCtx)
 	upstreamCtx, routeObserver := withProviderRouteObserver(upstreamCtx)
 	upstreamCtx, routeOperation, explicitRoute, err = s.prepareExplicitRouteOperation(h, upstreamCtx, request.Model)
@@ -1649,8 +1576,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	var preparedPeek *peekResult
 	var translatedHeaders http.Header
 	var responseInfo explicitRouteResponseInfo
-	// The preparation layer can reduce the final response to translated error
-	// details. Keep its actual request identity, not a reconstructed target.
 	sendResponseError := func(status int, message, errType, code, param string, headers http.Header, usage responsesUsage) error {
 		if routeOperation != nil {
 			if stateErr := h.bindDurableFinalWebSocketHeaders(responseInfo, headers); stateErr != nil {
@@ -1734,8 +1659,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			code = strings.TrimSpace(streamErr.Code)
 			param = strings.TrimSpace(streamErr.Param)
 		}
-		// Record the classified failure before delivering the client error frame;
-		// a disconnected client must not erase dashboard/provider accounting.
 		usage := responsesUsage{}
 		if peek.failure != nil {
 			usage = peek.failure.Response.Usage
@@ -1751,9 +1674,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 	if resp == nil {
 		if terminalStatus, terminalUsage, ok := observedTerminalOutcome(); ok {
-			// A nil prepared response is reserved for inbound cancellation. Retain
-			// the authoritative provider accounting, but never fabricate a lossy
-			// terminal frame or commit replay state without the original stream.
 			recordTurn(terminalStatus, terminalUsage)
 			if s.isClosing() || h.upstreamShutdownStarted() {
 				return context.Canceled
@@ -1796,8 +1716,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	if routeOperation == nil {
 		s.updateTurnState(resp.Header)
 	} else if resp.StatusCode == http.StatusOK {
-		// Keep server-issued turn state attempt-local until the selected target
-		// reaches terminal success. A failed stream must not poison the next turn.
 		pendingExplicitTurnState = strings.TrimSpace(resp.Header.Get("X-Codex-Turn-State"))
 	}
 
@@ -1808,8 +1726,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 		}
 		message, code := extractResponsesWebSocketError(resp.StatusCode, respBody)
 		if routeOperation != nil && h.stateBindings != nil && h.stateBindings.durable != nil {
-			// Errors expose only structured message/code and bound headers. Never
-			// embed an unvalidated raw body (possibly opaque state) as a message.
 			message, code = extractDurableResponsesWebSocketError(resp.StatusCode, respBody)
 		}
 		if s.isClosing() || h.upstreamShutdownStarted() {
@@ -1827,13 +1743,9 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	}
 	streamResult, err := s.streamUpstreamResponseWithRequest(h, resp.Body, resp.Header, resp.Request, recordTurn)
 	if routeOperation != nil && !errors.Is(err, errResponsesWebSocketClientWrite) && (s.ctx == nil || s.ctx.Err() == nil) {
-		// The bridge wrote every output event it read, through the stream's end.
 		routeOperation.conversation.streamDelivered()
 	}
 	if err != nil {
-		// The native reader recognizes terminal framing before the shared parser
-		// validates its contents. An invalid terminal must retire the session even
-		// when closing its body would otherwise preserve the connection.
 		if s.nativeUpstream.started() {
 			s.nativeUpstream.close()
 		}
@@ -1843,8 +1755,6 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 			return err
 		}
 		if errors.Is(err, errStreamFailedUpstream) {
-			// Parsed response.failed and top-level error events account themselves before
-			// client delivery, so the outer handler must not record them again.
 			return nil
 		}
 		if message, code, ok := durableStateFailureDetails(err); ok {
@@ -1885,16 +1795,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	bodyClosed = true
 	finishUpstream()
 	if streamResult.cancelled {
-		// Cancellation has billable usage but does not publish resumable history.
 		s.turnState = ""
 		recordTurn(http.StatusOK, streamResult.usage)
 		return nil
 	}
 	if native := s.dispatchedNativeTurn(); native != nil {
-		// The proxy keeps the full history although the upstream connection also
-		// holds it, so a closed connection, a compaction or a model switch can
-		// continue by replaying it. Native turns skip the HTTP bridge's
-		// auto-compaction and turn state.
 		s.rememberPlannedResponse(plan, streamResult.responseID, streamResult.outputItems)
 		s.nativeBase = len(s.historyItems)
 		s.nativeBaseUpstream = native.upstream
@@ -1922,19 +1827,11 @@ func (s *responsesWebSocketSession) handleCreateRequest(h *ProxyHandler, request
 	metrics, autoCompactionUsage = s.maybeAutoCompactHistory(h, request, metrics, routeOperation)
 	h.AddResponsesTurnUsage(turnStatsRecord, autoCompactionUsage)
 
-	// streamUpstreamResponse records a structurally valid completion before
-	// client delivery. This is a fallback for implementations that return a
-	// completed result without invoking the callback; the exactly-once guard keeps
-	// it from incrementing request counts twice. Auto-compaction usage was amended
-	// onto the existing record above rather than emitted as a synthetic request.
 	recordTurn(http.StatusOK, streamResult.usage)
 	s.logRequestMetrics(h, request, streamResult.responseID, metrics)
 	return nil
 }
 
-// recordTurnStats records one websocket-bridge turn into traffic stats. Callers
-// provide provider attribution only after an actual routed attempt; local
-// pre-routing rejections must not infer a default or internal-route provider.
 func (s *responsesWebSocketSession) recordTurnStats(h *ProxyHandler, model, providerID, providerKind string, status int, usage responsesUsage, operation *routeOperation) responsesTurnStatsRecord {
 	if h == nil {
 		return responsesTurnStatsRecord{}
@@ -1953,7 +1850,6 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 		compactionChecked: true,
 		compactionTrigger: responsesInputContainsCompactionTrigger(request.Input),
 	}
-	// Each plan starts a new attempt with a usable native connection slot.
 	s.nativeTurn = nil
 	s.renewNativeUpstream(request.Model)
 	route, known := h.resolveModelRouteForRequest(request.Model, providerEndpointResponses)
@@ -1996,8 +1892,6 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 		if current, _ := partitionResponsesAdditionalToolsInputItems(request.Input); len(current) > 0 {
 			catalogs = nil
 		}
-		// Staging retains only the latest request-scoped catalogs. Repeated
-		// generate:false frames must not accumulate obsolete definitions.
 		plan.resetHistory = true
 		plan.currentInput = append(cloneRawMessages(catalogs), history...)
 		plan.currentInput = append(plan.currentInput, request.Input...)
@@ -2011,8 +1905,6 @@ func (s *responsesWebSocketSession) planRequest(h *ProxyHandler, request *respon
 	return plan, nil
 }
 
-// planNativeDelta continues the live native conversation with only the history
-// it lacks plus the new input. Every other turn carries the full history.
 func (s *responsesWebSocketSession) planNativeDelta(plan *responsesWebSocketRequestPlan, request *responsesWebSocketCreateRequest) bool {
 	u := s.nativeUpstream
 	if u == nil || u != s.nativeBaseUpstream || plan.resetHistory || plan.hasCompactionTrigger() || s.nativeBase > len(s.historyItems) {
@@ -2024,7 +1916,6 @@ func (s *responsesWebSocketSession) planNativeDelta(plan *responsesWebSocketRequ
 	}
 	missing := s.historyItems[s.nativeBase:]
 	if len(missing)+len(request.Input) > responsesNativeMaxPendingItems || rawMessageSegmentsSize(missing, request.Input) > maxRequestBodySize {
-		// Too large for one native frame. The full history then uses HTTP.
 		return false
 	}
 	plan.nativeDelta = true
@@ -2033,9 +1924,6 @@ func (s *responsesWebSocketSession) planNativeDelta(plan *responsesWebSocketRequ
 	return true
 }
 
-// renewNativeUpstream replaces a closed native connection, or one opened for
-// another model, so an eligible turn can open a new one. The turn then carries
-// the full history from the proxy's copy.
 func (s *responsesWebSocketSession) renewNativeUpstream(model string) {
 	u := s.nativeUpstream
 	if u == nil || u.ctx.Err() != nil {
@@ -2049,8 +1937,6 @@ func (s *responsesWebSocketSession) renewNativeUpstream(model string) {
 	}
 }
 
-// dispatchedNativeTurn returns the current attempt's marker when it was sent
-// on the native connection.
 func (s *responsesWebSocketSession) dispatchedNativeTurn() *responsesNativeRequest {
 	if s.nativeTurn != nil && s.nativeTurn.dispatched.Load() {
 		return s.nativeTurn
@@ -2065,14 +1951,10 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 	}
 	native := &plan
 	if plan.useTurnStateDelta {
-		// A turn-state delta holds only the new input and depends on HTTP
-		// continuation state, so it has no native form.
 		native = nil
 	}
 	resp, err := s.postCreateRequestSegments(h, ctx, request, plan.upstreamSegments(), plan.useTurnStateDelta, native)
 	if plan.nativeDelta || s.dispatchedNativeTurn() != nil {
-		// Native turns never take the HTTP bridge's turn-state or compaction
-		// retries; a native delta has no HTTP form.
 		return resp, plan.nativeDelta, false, err
 	}
 	if err != nil || resp == nil {
@@ -2093,10 +1975,6 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 		resp.Body = io.NopCloser(bytes.NewReader(respBody))
 		return resp, true, false, nil
 	}
-	// The provider has authoritatively rejected this opaque continuation state.
-	// Clear it before the full-replay fallback so a failed fallback cannot leave
-	// the websocket session primed to resend the same invalid state on the next
-	// client retry. A successful fallback may install a fresh state later.
 	hadTurnState := s.turnState != ""
 	s.turnState = ""
 	h.log.Debug("responses websocket delta replay failed; retrying full history",
@@ -2114,8 +1992,6 @@ func (s *responsesWebSocketSession) postCreateRequest(h *ProxyHandler, ctx conte
 	return resp, true, true, err
 }
 
-// postCreateRequestSegments sends one upstream attempt. A non-nil native plan
-// lets the attempt use the native connection; HTTP bridge retries pass nil.
 func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, ctx context.Context, request *responsesWebSocketCreateRequest, inputSegments [][]json.RawMessage, includeTurnState bool, native *responsesWebSocketRequestPlan) (*http.Response, error) {
 	bodyBytes, err := request.upstreamBody(inputSegments...)
 	if err != nil {
@@ -2124,10 +2000,6 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 	headers := s.requestHeaders(request, includeTurnState)
 	operation := routeOperationFromContext(ctx)
 	if operation != nil {
-		// Preserve the logical request before compatibility rewrites sanitize
-		// provider-issued compaction state. The validation helper adds only
-		// provider-visible response lineage; websocket-local and proxy-generated
-		// synthetic response IDs intentionally remain local.
 		stateBindingBody := append([]byte(nil), bodyBytes...)
 		stateBindingBody, err = responsesWebSocketStateValidationBody(stateBindingBody, request.PreviousResponseID)
 		if err != nil {
@@ -2137,16 +2009,10 @@ func (s *responsesWebSocketSession) postCreateRequestSegments(h *ProxyHandler, c
 			return nil, err
 		}
 		if operation.pinnedTarget() != "" {
-			// A state-bound or session-pinned request cannot retry onto another
-			// target. The executor still permits explicitly requested same-target
-			// child sends within this operation budget.
 			operation.setCommitment(downstreamCommitmentProtocolFrame)
 		}
 	}
 	bodyBytes = h.rewriteResponsesRequestBodyWithToolOptimizersForModel(ctx, bodyBytes, request.Model, "responses/websocket", true, s.toolContexts, s.toolScope)
-	// The websocket bridge records each turn's usage downstream from the streamed
-	// response body (recordTurnStats), so the per-turn usage total returned here
-	// is not observed separately — discard it.
 	if compactionResp, handled, _, err := h.maybeBuildResponsesCompactionTriggerResponse(ctx, bodyBytes, headers, true); handled || err != nil {
 		attachResponsesWebSocketOperationID(compactionResp, operation)
 		if operation != nil && operation.pinnedTarget() != "" {
@@ -2203,8 +2069,6 @@ func (s *responsesWebSocketSession) requestHeaders(request *responsesWebSocketCr
 			headers.Set(name, strings.TrimSpace(value))
 		}
 	}
-	// Both HTTP requests and native create frames use these headers. Validate
-	// attribution after all per-turn overrides and before either transport.
 	copyCopilotRequestMetadata(headers, headers)
 
 	if includeTurnState && s.turnState != "" {
@@ -2237,8 +2101,6 @@ func responsesWebSocketTurnMetadataKey(turnMetadata string) string {
 		var turnID string
 		if rawTurnID, ok := metadata["turn_id"]; ok && json.Unmarshal(rawTurnID, &turnID) == nil {
 			if turnID = strings.TrimSpace(turnID); turnID != "" {
-				// Codex can enrich turn metadata during a turn while keeping
-				// the turn_id stable; only a different turn_id resets state.
 				return "turn_id:" + turnID
 			}
 		}
@@ -2318,8 +2180,6 @@ func (s *responsesWebSocketSession) maybeAutoCompactHistory(h *ProxyHandler, req
 		return metrics, responsesUsage{}
 	}
 	ctx, cancel := h.newInferenceUpstreamContext(false)
-	// Mark the compaction upstream context as retry-trackable, like the turn
-	// itself, so retries during auto-compaction are counted in retry stats.
 	ctx = markRetryStatsTracked(ctx)
 	if operation != nil {
 		if s.explicitTargetID != "" {
@@ -2408,9 +2268,6 @@ func (s *responsesWebSocketSession) maybeRetryCompactedCreateRequest(h *ProxyHan
 	}
 
 	budget := newCompactBudget(h.effectiveCompactMaxAttempts())
-	// The 413 oversized-replay fallback spends upstream /responses tokens before
-	// the retried client turn completes. Preserve that spend on every exit path,
-	// but fold it into the one client-turn stats record in handleCreateRequest.
 	defer func() {
 		metrics.addInternalUsage(budget.usageTotals())
 	}()
@@ -2573,9 +2430,6 @@ func (s *responsesWebSocketSession) compactHistoryItemsWithKeepTail(h *ProxyHand
 		return nil, result, false, err
 	}
 
-	// additional_tools items are request-scoped catalogs rather than
-	// conversation history. Keep them out of prefix selection and internal
-	// summarization, then restore them on the actual inference replay.
 	compacted := make([]json.RawMessage, 0, len(history))
 	compacted = append(compacted, additionalTools...)
 	compacted = append(compacted, checkpoint)
@@ -2642,9 +2496,6 @@ func (s *responsesWebSocketSession) streamUpstreamResponse(h *ProxyHandler, body
 func (s *responsesWebSocketSession) streamUpstreamResponseWithRequest(h *ProxyHandler, body io.Reader, headers http.Header, upstreamRequest *http.Request, recordTerminal func(int, responsesUsage)) (responsesWebSocketStreamResult, error) {
 	var result responsesWebSocketStreamResult
 
-	// Emit a synthetic metadata event so WebSocket clients can discover the
-	// actual model used. The Codex CLI parses openai-model from
-	// codex.response.metadata frames via response_model().
 	if mappedHeaders := responsesWebSocketMetadataHeaders(headers); len(mappedHeaders) > 0 {
 		if err := s.writeStreamJSON(map[string]interface{}{
 			"type":    "codex.response.metadata",
@@ -2682,8 +2533,6 @@ func (s *responsesWebSocketSession) streamUpstreamResponseWithRequest(h *ProxyHa
 		failureStatus := 0
 		if parsedEvent && (event.Type == "response.failed" || event.Type == "error") {
 			if h != nil && h.stateBindings != nil && h.stateBindings.durable != nil && upstreamRequest != nil && routeOperationFromContext(upstreamRequest.Context()) != nil {
-				// The event body has already passed durable validation, but its
-				// projected error can also inherit raw HTTP response headers.
 				if err := validateResponsesWebSocketTurnStateHeaders(responsesFailureHeaders(event, headers)); err != nil {
 					return err
 				}
@@ -2694,8 +2543,6 @@ func (s *responsesWebSocketSession) streamUpstreamResponseWithRequest(h *ProxyHa
 			failureStatus, _, _, _ = responsesWebSocketStreamFailureDetails(event, headers)
 			if failureStatus != 0 {
 				result.usage = event.Response.Usage
-				// Account before forwarding either the upstream failure event or the
-				// standard error payload. Both writes may fail after client disconnect.
 				if recordTerminal != nil {
 					recordTerminal(failureStatus, result.usage)
 				}
@@ -2726,16 +2573,10 @@ func (s *responsesWebSocketSession) streamUpstreamResponseWithRequest(h *ProxyHa
 			if !event.Response.Usage.isZero() {
 				result.usage = event.Response.Usage
 			}
-			// The terminal snapshot is authoritative and may include partial items
-			// that never received response.output_item.done. A present empty array also
-			// clears incremental items; an absent or invalid field preserves them.
 			if terminalItems, present := s.terminalResponseOutputItems(h, data); present {
 				result.outputItems = terminalItems
 			}
 			if validIncompleteEvent && recordTerminal != nil {
-				// An incomplete provider response is still an authoritative terminal
-				// result with a resumable ID. Account before client delivery so a
-				// disconnect cannot rewrite it as a client-aborted turn.
 				recordTerminal(http.StatusOK, result.usage)
 			}
 		}
@@ -2756,8 +2597,6 @@ func (s *responsesWebSocketSession) streamUpstreamResponseWithRequest(h *ProxyHa
 				result.outputItems = terminalItems
 			}
 			if validCompletedEvent && recordTerminal != nil {
-				// A structurally valid provider completion is authoritative before
-				// client delivery or post-terminal auto-compaction can fail or stall.
 				recordTerminal(http.StatusOK, result.usage)
 			}
 		}
@@ -2795,12 +2634,6 @@ func (s *responsesWebSocketSession) streamUpstreamResponseWithRequest(h *ProxyHa
 			if writeErr := s.sendUpstreamStreamFailure(event, headers); writeErr != nil {
 				return writeErr
 			}
-			// Return the sentinel immediately to break out of the SSE
-			// scanner loop. The failure event has already been forwarded to
-			// the client above, and we also emit a standard error payload so
-			// websocket clients can surface the upstream error details. Carry the
-			// classified status so the turn is recorded with its exact semantic
-			// status (e.g. 429/503) rather than a generic 502.
 			return &streamFailedUpstreamError{status: failureStatus}
 		}
 
@@ -3084,7 +2917,6 @@ func responsesWebSocketErrorHeaders(status int, headers http.Header) http.Header
 	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable && status != http.StatusGatewayTimeout {
 		return headers
 	}
-	// selectResponsesRetryAfter normalizes provider retry metadata without applying the internal retry-sleep cap.
 	retryAfter, _ := selectResponsesRetryAfter(headers)
 	if retryAfter == "" {
 		return headers
@@ -3122,19 +2954,12 @@ func flattenResponsesWebSocketHeaders(headers http.Header) map[string]interface{
 	return result
 }
 
-// responsesWebSocketMetadataHeaders extracts headers that are meaningful to
-// Codex CLI WebSocket clients via the codex.response.metadata frame. The CLI
-// parses openai-model from metadata frames using case-insensitive comparison
-// (eq_ignore_ascii_case in response_model()); we use lowercase keys to match
-// the wire format the real OpenAI backend uses.
 func responsesWebSocketMetadataHeaders(headers http.Header) map[string]interface{} {
 	if len(headers) == 0 {
 		return nil
 	}
 
 	result := make(map[string]interface{}, 3)
-	// Go's Header.Get is case-insensitive, but we store the JSON key in
-	// lowercase to match what the real OpenAI backend sends.
 	if value := headers.Get("Openai-Model"); value != "" {
 		result["openai-model"] = value
 	}

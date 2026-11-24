@@ -751,9 +751,6 @@ func TestAggregatePolicyChatStreamEventsEnforcesCumulativeResponseLimit(t *testi
 	}
 }
 
-// A failed carrier write must end the stream, not be swallowed. Swallowing it lets `finish`
-// report success while the client stores a transcript with no signature -- and the next
-// request cannot resolve its own minted ids, which is the wedge this carrier prevents.
 func TestCarrierWriteFailureEndsTheStream(t *testing.T) {
 	writer, stream := newChatStreamEventPipe(context.Background())
 	go func() {

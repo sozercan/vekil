@@ -82,11 +82,6 @@ func parseSSEEventLine(line string) (string, bool) {
 	return strings.TrimSpace(eventType), true
 }
 
-// errOpenAISSELineTooLong is returned by readOpenAISSELine when a single SSE
-// line exceeds openAIStreamScannerMaxBuffer. The accumulated bytes read so far
-// are returned alongside the error so a forwarding caller can write them to the
-// client and fall back to raw passthrough of the remainder (the bytes are valid,
-// just too large to buffer for parsing) rather than treating it as a failure.
 var errOpenAISSELineTooLong = errors.New("SSE line exceeds maximum buffer")
 var errOpenAISSEEventTooLong = errors.New("SSE event exceeds maximum buffer")
 
@@ -96,9 +91,6 @@ func readOpenAISSELine(reader *bufio.Reader) (string, error) {
 		fragment, err := reader.ReadSlice('\n')
 		if len(fragment) > 0 {
 			if line.Len()+len(fragment) > openAIStreamScannerMaxBuffer {
-				// Return what we have so the caller can still forward it; the rest of
-				// this line remains in the reader and is drained by the caller's raw
-				// fallback copy.
 				line.Write(fragment)
 				return line.String(), errOpenAISSELineTooLong
 			}
@@ -118,14 +110,9 @@ type openAIStreamError struct {
 	Type    string
 	Code    string
 	Message string
-	// Safe metadata belongs to the response that produced this error, including
-	// when route failover later selects it as the canonical failure.
 	headers http.Header
 }
 
-// httpStatus maps an OpenAI-style stream error to an HTTP status so a
-// post-commit stream failure is recorded with its real semantic status (e.g.
-// 429 for a rate limit, 503 for an overload) rather than a generic bad gateway.
 func (e *openAIStreamError) httpStatus() int {
 	if e == nil {
 		return http.StatusBadGateway
@@ -167,9 +154,6 @@ func (e *openAIStreamError) Error() string {
 	return "upstream stream error"
 }
 
-// shouldParseOpenAIStreamError is a cheap guard for the hot path: ordinary
-// chat-completion chunks should not pay a second JSON unmarshal just to discover
-// they are not post-commit error events.
 func shouldParseOpenAIStreamError(eventType, data string) bool {
 	if strings.EqualFold(strings.TrimSpace(eventType), "error") {
 		return true
@@ -218,23 +202,12 @@ func parseOpenAIStreamError(eventType, data string) (*openAIStreamError, bool) {
 	return nil, false
 }
 
-// consumeOpenAIStreamChunks scans an upstream OpenAI SSE stream, ignores
-// malformed JSON chunks, and reports whether the stream terminated with the
-// expected [DONE] sentinel. Multi-line SSE data fields are joined according to
-// the SSE event model before JSON decoding.
 func consumeOpenAIStreamChunks(r io.Reader, onChunk func(models.OpenAIStreamChunk) bool) (bool, error) {
 	return consumeOpenAIStreamChunksWithDecodeMode(r, onChunk, false)
 }
 
-// errOpenAIStreamMalformedChunk reports an SSE data payload that is not a
-// decodable OpenAI Chat stream chunk.
 var errOpenAIStreamMalformedChunk = errors.New("upstream sent a malformed Chat stream chunk")
 
-// consumeOpenAIStreamChunksStrict is consumeOpenAIStreamChunks for adapters
-// that must not act on a partial view of the stream: a data payload that fails
-// to decode, including a wrongly typed field, stops the scan with
-// errOpenAIStreamMalformedChunk instead of being skipped. Blank payloads are
-// still ignored.
 func consumeOpenAIStreamChunksStrict(r io.Reader, onChunk func(models.OpenAIStreamChunk) bool) (bool, error) {
 	return consumeOpenAIStreamChunksWithDecodeMode(r, onChunk, true)
 }

@@ -111,9 +111,6 @@ func (h *ProxyHandler) applyExplicitRequestStateBinding(operation *routeOperatio
 	}
 }
 
-// resolveOrBindConversationForRoute atomically resolves an existing conversation
-// owner or claims an unknown conversation for bootstrapOwner. Competing callers
-// therefore observe one exact owner instead of racing a separate lookup and bind.
 func (s *stateBindingStore) resolveOrBindConversationForRoute(routeID string, token stateBindingToken, bootstrapOwner stateBindingOwner) (stateBindingLookupResult, bool, uint64) {
 	if s == nil || token.stateType != stateBindingTypeConversationID || token.value == "" {
 		return stateBindingLookupResult{outcome: stateBindingLookupConflict}, false, 0
@@ -166,10 +163,6 @@ func explicitConversationBootstrapTarget(route *modelRoute) (targetBinding, bool
 		return targetBinding{}, false
 	}
 
-	// orderedRouteTargets applies the same provider endpoint eligibility and
-	// primary_only boundary as dispatch. A priority_failover route is safe only
-	// when that leaves one exact eligible target; primary_only is deterministic
-	// because only its configured primary can be selected.
 	targets := orderedRouteTargets(route, nil, providerEndpointResponses)
 	if len(targets) != 1 {
 		return targetBinding{}, false
@@ -207,9 +200,6 @@ func extractResponsesRequestState(body []byte, headers http.Header, durable bool
 
 	if object, ok := payload.(map[string]any); ok {
 		if durable {
-			// Reject aliases rather than normalizing only this inspection copy:
-			// compatibility rewrites and upstream decoders must see the same
-			// state fields that ownership validation inspects.
 			if err := rejectResponsesStateFieldAliases(object, "previous_response_id", "conversation", "input"); err != nil {
 				return nil, err
 			}
@@ -352,10 +342,6 @@ func visitExplicitResponsesItems(value any, rejectMalformed bool, visit func(sta
 	return nil
 }
 
-// visitExplicitResponsesItem inspects only reasoning and compaction item
-// shapes, which own opaque continuation state. A same-named field on another
-// item or in request, response, item, or content metadata is ordinary user data
-// and must not pin a provider target.
 func visitExplicitResponsesItem(value any, rejectMalformed bool, visit func(stateBindingType, string)) error {
 	item, ok := value.(map[string]any)
 	if !ok {
@@ -390,9 +376,6 @@ func explicitResponsesItemOwnsEncryptedContent(item map[string]any) bool {
 }
 
 func isProxyOwnedEncryptedContent(value string) bool {
-	// A recognized prefix is not sufficient proof of proxy ownership. If the
-	// checkpoint cannot be decoded, preserve it as provider state so explicit
-	// routes fail closed instead of forwarding opaque content unbound.
 	if !strings.HasPrefix(value, syntheticCompactionPrefix) &&
 		!strings.HasPrefix(value, legacySyntheticCompactionPrefix) {
 		return false
@@ -406,8 +389,6 @@ func extractExplicitResponsesOutputState(body []byte) ([]stateBindingToken, erro
 }
 
 func extractDurableResponsesOutputState(body []byte) ([]stateBindingToken, error) {
-	// Validate the original bytes before map decoding or model rewriting can
-	// collapse duplicate values that remain visible in a raw representation.
 	if err := validateUnambiguousResponsesJSON(body); err != nil {
 		return nil, fmt.Errorf("ambiguous explicit route responses JSON")
 	}
@@ -487,9 +468,6 @@ func extractResponsesOutputState(body []byte, foldedAliases bool) ([]stateBindin
 		return nil
 	}
 
-	// A non-streaming response is the root object. Streaming lifecycle events
-	// put the response under response, while output-item events put the exposed
-	// state-bearing artifact under item.
 	eventType, _ := object["type"].(string)
 	if strings.TrimSpace(eventType) == "" {
 		if err := visitResponse(object); err != nil {
@@ -509,11 +487,6 @@ func extractResponsesOutputState(body []byte, foldedAliases bool) ([]stateBindin
 	return tokens, nil
 }
 
-// Struct decoders used by websocket clients accept folded JSON field names.
-// Inspect those same names for durable proof, rejecting competing spellings
-// that decoding or model rewriting might merge differently. Normalize only the
-// parsed inspection copy, and only schema-owned state paths. Vendor metadata,
-// message text, and the original bytes forwarded to clients remain untouched.
 func normalizeResponsesStateObjectFields(object map[string]any, fields ...string) error {
 	for _, field := range fields {
 		matched := ""

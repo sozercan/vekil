@@ -13,8 +13,6 @@ import (
 	"time"
 )
 
-// initializeMenubarPATH runs before authentication or background workers start.
-// Launch Services does not inherit the PATH configured by a terminal's shell.
 func initializeMenubarPATH() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -31,8 +29,6 @@ func initializeMenubarPATHWithContext(ctx context.Context) error {
 		shellPath = "/opt/homebrew/bin:/usr/local/bin"
 	}
 
-	// Keep inherited command precedence. Only append missing absolute directories;
-	// empty and relative entries must not add searches under the app's cwd.
 	paths := filepath.SplitList(os.Getenv("PATH"))
 	seen := make(map[string]bool, len(paths))
 	for _, path := range paths {
@@ -44,7 +40,6 @@ func initializeMenubarPATHWithContext(ctx context.Context) error {
 			seen[path] = true
 		}
 	}
-	// Report lookup failures even when the fallback PATH was installed.
 	return errors.Join(lookupErr, os.Setenv("PATH", strings.Join(paths, string(os.PathListSeparator))))
 }
 
@@ -52,8 +47,6 @@ func loginShellPATH(ctx context.Context, shell string) (string, error) {
 	if !filepath.IsAbs(shell) {
 		return "", fmt.Errorf("login shell must be an absolute path")
 	}
-	// A NUL separates startup banners from printenv's output. Read only PATH,
-	// using absolute system commands so even an empty inherited PATH works.
 	cmd := exec.CommandContext(ctx, shell, "-ilc", `/usr/bin/printf '\000'; exec /usr/bin/printenv PATH`)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
@@ -84,8 +77,6 @@ func loginShellPATH(ctx context.Context, shell string) (string, error) {
 	return path, nil
 }
 
-// Bound startup chatter as well as PATH without retaining other environment
-// variables or shell stderr, which can contain credentials.
 type shellPATHOutput struct {
 	data []byte
 }

@@ -45,8 +45,6 @@ func parsePolicyMode(value string) (policyMode, error) {
 	}
 }
 
-// effectivePolicyMode applies the process-wide mode as a safety ceiling over a
-// profile mode. Invalid enum values fail closed to off.
 func effectivePolicyMode(global, profile policyMode) policyMode {
 	if !global.valid() || !profile.valid() || global == policyModeOff || profile == policyModeOff {
 		return policyModeOff
@@ -296,9 +294,6 @@ func validatePolicyClassifierSignals(signals policyClassifierSignals) error {
 	return nil
 }
 
-// mapPolicySignals is the pure coding_agent_v1 mapper. Callers handle
-// unavailable/uncertain fallbacks before invoking it. Invalid or abstaining
-// values conservatively return powerful.
 func mapPolicySignals(signals policyClassifierSignals, facts policyClassifierFacts) policyTier {
 	if signals.Abstain || validatePolicyClassifierSignals(signals) != nil {
 		return policyTierPowerful
@@ -320,9 +315,6 @@ func mapPolicySignals(signals policyClassifierSignals, facts policyClassifierFac
 	return policyTierLightweight
 }
 
-// mapPolicyClassifierResult applies fallback precedence before the pure signal
-// mapper. ok=false means root cancellation/lifecycle shutdown must be propagated
-// and no terminal route is authorized.
 func mapPolicyClassifierResult(result policyClassifierResult, facts policyClassifierFacts, unavailableTier, uncertainTier policyTier) (tier policyTier, ok bool) {
 	switch result.Category {
 	case policyClassifierResultCanceled:
@@ -821,9 +813,6 @@ func buildPolicyClassifierHTTPRequest(options policyHTTPClassifierOptions, facts
 	if err != nil {
 		return nil, err
 	}
-	// The configured limit applies to canonical facts. Bound the fixed Chat
-	// envelope plus worst-case JSON-string escaping independently so the actual
-	// classifier request remains allocation-safe without redefining that limit.
 	if maxWireBytes := options.MaxFactsBytes*2 + 4096; len(body) > maxWireBytes {
 		return nil, fmt.Errorf("serialized policy classifier request exceeds wire bound")
 	}

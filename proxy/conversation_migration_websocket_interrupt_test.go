@@ -14,8 +14,6 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-// conversationWebSocketResume sends a continuation on a fresh connection,
-// retrying while the interrupted turn still holds the conversation admission.
 func conversationWebSocketResume(t *testing.T, server *httptest.Server, headers http.Header, fields map[string]any) map[string]any {
 	t.Helper()
 	fields["type"], fields["model"], fields["store"] = "response.create", "coding", false
@@ -90,10 +88,6 @@ func TestConversationMigrationWebSocketClientInterruptKeepsConversationUsable(t 
 				return conversationResponse(t, req, "resumed", conversationText("Resumed.")), nil
 			})
 			logs := &conversationLogBuffer{}
-			// Only the client's close may end the held upstream. With the
-			// harness's 3s streaming deadline, a machine that stalls before the
-			// server reads the close lets that deadline end the attempt first,
-			// which Vekil records as failed (proxy_ended), not interrupted.
 			h, _ := newConversationAPIHandler(t, transport, nil, func(h *ProxyHandler) {
 				h.log = logger.NewWithWriter(logger.LevelInfo, logs)
 			}, WithStreamingUpstreamTimeout(time.Hour))
@@ -102,8 +96,6 @@ func TestConversationMigrationWebSocketClientInterruptKeepsConversationUsable(t 
 			conn := mustDialResponsesWebSocket(t, server, session)
 			conversationWebSocketTurn(t, conn, map[string]any{"input": []any{map[string]any{"role": "user", "content": "Seed."}}})
 
-			// Interrupt the next turn by dropping the socket once the scenario's
-			// point has been reached.
 			if err := conn.WriteJSON(map[string]any{"type": "response.create", "model": "coding", "store": false, "previous_response_id": "seed", "input": []any{map[string]any{"role": "user", "content": "Next."}}}); err != nil {
 				t.Fatal(err)
 			}
@@ -134,8 +126,6 @@ func TestConversationMigrationWebSocketClientInterruptKeepsConversationUsable(t 
 
 			var resumed map[string]any
 			if scenario == "after items" {
-				// A full-history client keeps the completed items it received and
-				// returns an aborted result for the interrupted tool call.
 				input := append(append([]any{}, history...),
 					map[string]any{"type": "reasoning", "encrypted_content": "interrupted-encrypted", "summary": []any{}},
 					conversationText("Partial answer."),
@@ -154,9 +144,6 @@ func TestConversationMigrationWebSocketClientInterruptKeepsConversationUsable(t 
 				t.Fatalf("interrupt recovery logs: %s", recovery)
 			}
 			for _, line := range strings.Split(recovery, "\n") {
-				// The resume can arrive before the socket close finishes the
-				// interrupted turn. conversationWebSocketResume retries that
-				// concurrent_turn refusal; any other block is a failure.
 				if strings.Contains(line, `"outcome":"blocked"`) && !strings.Contains(line, `"reason":"concurrent_turn"`) {
 					t.Fatalf("interrupt recovery logs: %s", recovery)
 				}

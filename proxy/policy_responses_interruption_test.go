@@ -154,9 +154,6 @@ func TestPolicyResponsesIngressCompleteResultsWithUserInterruptionRetainMax(t *t
 	}
 }
 
-// Public policy requests require every parallel result before the next message
-// or request end, even though the underlying Chat-over-Responses seam accepts
-// partial results for non-policy callers.
 func TestPolicyResponsesIngressPartialResultsFailBeforeDispatch(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		for _, interrupt := range []bool{false, true} {

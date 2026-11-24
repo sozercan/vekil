@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-// Hosted tools execute upstream. Conversation migration replays their visible
-// call items only to targets whose provider declares the same hosted tool.
 const hostedToolWebSearch = "web_search"
 
 var providerHostedToolTypes = map[string]bool{hostedToolWebSearch: true}
@@ -60,7 +58,6 @@ func (p *providerRuntime) supportsHostedTools(required map[string]bool) bool {
 	return true
 }
 
-// Tool definitions and replayed call items map to one hosted capability each.
 func conversationHostedToolFromDefinition(kind string) string {
 	switch kind {
 	case "web_search", "web_search_preview":
@@ -95,8 +92,6 @@ func conversationHostedToolsInDefinitions(raw json.RawMessage, into map[string]b
 	}
 }
 
-// conversationHostedTools reports which hosted capabilities a turn's tool
-// definitions, additional-tool catalogs, and visible history depend on.
 func conversationHostedTools(tools json.RawMessage, additionalTools, items []json.RawMessage) map[string]bool {
 	required := make(map[string]bool)
 	conversationHostedToolsInDefinitions(tools, required, 0)

@@ -27,8 +27,6 @@ type durableProcessFixture struct {
 }
 
 func durableProcessEnvironment() []string {
-	// Do not inherit provider credentials, proxy settings, or the user's model
-	// configuration. All providers and token storage are isolated fixtures.
 	return []string{"PATH=" + os.Getenv("PATH"), "GOMAXPROCS=2", "LIVE_COPILOT_DIRECT_BEARER_TEST=0"}
 }
 
@@ -228,8 +226,6 @@ func TestDurableStateProcessCrashReopen(t *testing.T) {
 			if !strings.Contains(initial, "encrypted-process-fixture") || !strings.Contains(initial, "resp-process-fixture") {
 				t.Fatal("provider state not observed by client")
 			}
-			// A real second process must refuse the live database, not wait or
-			// start an independent store. It contacts no provider.
 			lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			second := exec.CommandContext(lockCtx, binary, "--host", "127.0.0.1", "--port", "0", "--providers-config", config, "--token-dir", tokenDir)
 			second.Env = durableProcessEnvironment()

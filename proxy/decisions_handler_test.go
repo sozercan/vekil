@@ -61,7 +61,6 @@ func newDecisionsTestHandler(t *testing.T, upstream *decisionsTestUpstream, opts
 			w.Header().Set("Retry-After", retryAfter)
 		}
 		if truncate {
-			// Promise more bytes than are sent so the client's body read fails.
 			w.Header().Set("Content-Length", strconv.Itoa(len(response)+16))
 		}
 		w.WriteHeader(status)
@@ -148,8 +147,6 @@ func TestDecisionsRejectsModelsWithoutAdvertisedEndpoint(t *testing.T) {
 	}
 }
 
-// The catalog marks example-decisions-model as not supporting parallel tool
-// calls, which would make Chat-style model policy drop the field and reserialize.
 func TestDecisionsForwardsRequestBodyUnchanged(t *testing.T) {
 	const request = `{ "model": "example-decisions-model", "input": "x", "parallel_tool_calls": true, "temperature": 0 }`
 	upstream := &decisionsTestUpstream{response: `{}`}
@@ -166,8 +163,6 @@ func TestDecisionsForwardsRequestBodyUnchanged(t *testing.T) {
 	}
 }
 
-// When retries run out, Decisions returns the shared upstream error shape used
-// by Chat and Responses, keeping the upstream status and message.
 func TestDecisionsExhaustedRetriesKeepUpstreamStatusAndMessage(t *testing.T) {
 	upstream := &decisionsTestUpstream{status: http.StatusServiceUnavailable, response: `{"error":{"message":"decisions overloaded","code":"overloaded"}}`}
 	h := newDecisionsTestHandler(t, upstream)
@@ -184,8 +179,6 @@ func TestDecisionsExhaustedRetriesKeepUpstreamStatusAndMessage(t *testing.T) {
 	}
 }
 
-// The catalog fetch runs on the proxy lifecycle, so it can fail after the
-// client has left; that client-first abort is recorded as 499.
 func TestDecisionsClientCancelDuringCatalogRecords499(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
@@ -226,8 +219,6 @@ func TestDecisionsTruncatedUpstreamBodyReturnsBadGateway(t *testing.T) {
 	}
 }
 
-// Shutdown that cancels the catalog fetch wins over a client that has also
-// left, so both cases return the stats-suppressed 503 rather than 499.
 func TestDecisionsCatalogShutdownReturnsShutdown503(t *testing.T) {
 	for _, clientLeft := range []bool{false, true} {
 		t.Run(fmt.Sprintf("client left %v", clientLeft), func(t *testing.T) {
@@ -273,8 +264,6 @@ func TestDecisionsCatalogShutdownReturnsShutdown503(t *testing.T) {
 	}
 }
 
-// An openai-compatible catalog can advertise /v1/decisions, but that provider
-// type routes only Chat and Responses paths under its base URL.
 func TestDecisionsRejectsOpenAICompatibleProvider(t *testing.T) {
 	var mu sync.Mutex
 	var inference []string
@@ -300,7 +289,6 @@ func TestDecisionsRejectsOpenAICompatibleProvider(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.HandleDecisions(rec, httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{"model":"example-decisions-model","input":"x"}`)))
-	// The provider-level message shows the catalog gate passed and dispatch refused.
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `provider \"compatible\" does not support /v1/decisions`) {
 		t.Fatalf("status/body = %d %s", rec.Code, rec.Body.String())
 	}
@@ -357,9 +345,6 @@ func TestDecisionsFailsClosedWithoutCatalog(t *testing.T) {
 	}
 }
 
-// decisionsTestChatRequest builds a Chat request the way the proxy sends one,
-// so it carries the same Copilot account and integration identity as a
-// Decisions request from the same handler.
 func decisionsTestChatRequest(t *testing.T, h *ProxyHandler) *http.Request {
 	t.Helper()
 	body := []byte(`{"model":"example-chat-model","messages":[{"role":"user","content":"hi"}]}`)

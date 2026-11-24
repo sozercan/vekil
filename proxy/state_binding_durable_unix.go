@@ -17,8 +17,6 @@ func openDurableStateDatabase(path string, allowCreate bool) (*bolt.DB, *os.File
 	return openDurableStateDatabaseWithFilesystemCheck(path, allowCreate, checkDurableStateFilesystem)
 }
 
-// Only the filesystem primitive is substituted in tests; descriptor opening,
-// identity checks, bbolt validation/locking and cleanup remain real.
 func openDurableStateDatabaseWithFilesystemCheck(path string, allowCreate bool, checkFilesystem func(int) error) (*bolt.DB, *os.File, bool, func() error, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, nil, false, nil, errDurableStatePath
@@ -84,9 +82,6 @@ func openDurableStateDatabaseWithFilesystemCheck(path string, allowCreate bool, 
 			_ = file.Close()
 			return nil, err
 		}
-		// A regular file can be bind-mounted from a different filesystem than
-		// its containing directory. Validate each actual descriptor before bbolt
-		// can read pages or acquire a writable handle on unsupported storage.
 		if err := checkFilesystem(int(file.Fd())); err != nil {
 			_ = file.Close()
 			return nil, err
@@ -102,9 +97,6 @@ func openDurableStateDatabaseWithFilesystemCheck(path string, allowCreate bool, 
 		return file, nil
 	}
 	if !created {
-		// Writable bbolt Open preloads (and for some formats writes) freelist
-		// state. Validate existing pages read-only first, with no freelist
-		// preload; Check contains malformed-page panics in its checking goroutine.
 		probe, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: 100 * time.Millisecond, OpenFile: openFile})
 		if err != nil {
 			return nil, nil, false, nil, durableDatabaseOpenError(err)
@@ -118,16 +110,11 @@ func openDurableStateDatabaseWithFilesystemCheck(path string, allowCreate bool, 
 		if closeErr != nil {
 			return nil, nil, false, nil, errDurableStateIO
 		}
-		// The final exclusive open verifies the same inode again. Another
-		// legitimate writer can only change it while we have no lock; full
-		// record/integrity validation runs again under the exclusive lock.
 	}
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 100 * time.Millisecond, OpenFile: openFile})
 	if err != nil {
 		return nil, nil, false, nil, durableDatabaseOpenError(err)
 	}
-	// The directory fd must remain open through metadata initialization. Dup it
-	// without reopening a potentially replaced path, and close after the barrier.
 	fd, err := unix.FcntlInt(directory.Fd(), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
 		_ = db.Close()
@@ -137,8 +124,6 @@ func openDurableStateDatabaseWithFilesystemCheck(path string, allowCreate bool, 
 		syncErr := syncDurableStateDirectory(fd)
 		return errors.Join(syncErr, unix.Close(fd))
 	}
-	// The final successful OpenFile belongs to the writable DB. bbolt remains
-	// its sole owner; callers must not close or duplicate this descriptor.
 	return db, databaseFile, created, syncDirectory, nil
 }
 

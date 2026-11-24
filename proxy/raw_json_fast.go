@@ -18,10 +18,6 @@ type rawJSONObjectScanner struct {
 	strict bool
 }
 
-// rawJSONObjectCursor exposes each value start without first walking to its
-// end. Specialized inspectors can consume known nested values directly and
-// then advance the cursor, avoiding the generic skip-then-rescan pattern used
-// by rawJSONObjectScanner.
 type rawJSONObjectCursor struct {
 	data   []byte
 	pos    int
@@ -367,10 +363,6 @@ func isRawJSONHex(value byte) bool {
 	return value >= '0' && value <= '9' || value >= 'a' && value <= 'f' || value >= 'A' && value <= 'F'
 }
 
-// scanStrictRawJSONValue validates one JSON value without allocating. It is
-// deliberately bounded more tightly than encoding/json: unusually deep valid
-// inputs fall back to the standard decoder instead of growing the Go stack on
-// the request hot path.
 func scanStrictRawJSONValue(data []byte, pos, depth int) (int, bool) {
 	pos = skipRawJSONSpace(data, pos)
 	if pos >= len(data) {
@@ -647,12 +639,6 @@ func rawJSONCreatedUnchangedByNormalizer(raw []byte) bool {
 	return err != nil || value != 0
 }
 
-// extractTopLevelJSONStringFast returns an exact top-level string field without
-// allocating a map for the entire object. lastMatch mirrors encoding/json's
-// duplicate-key behavior when true; false preserves the generic request
-// extractor's historical first-match behavior. ok is false when the fast
-// scanner cannot safely preserve encoding/json semantics, so callers can fall
-// back to their existing decoder.
 func extractTopLevelJSONStringFast(body []byte, field string, lastMatch bool) (value string, found, ok bool) {
 	if !json.Valid(body) {
 		return "", false, false

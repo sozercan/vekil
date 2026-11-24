@@ -70,9 +70,6 @@ func TestDurableAnthropicStorageFailureEnvelope(t *testing.T) {
 						t.Fatal("uncommitted provider state escaped or was recorded")
 					}
 					if failure == "io" {
-						// The first real request froze the store at the commit seam.
-						// Subsequent requests fail before dispatch, with the same
-						// bounded native envelope, including after the store closes.
 						for _, phase := range []string{"frozen", "closed"} {
 							if phase == "closed" {
 								closeDurableStoreFixture(t, s)

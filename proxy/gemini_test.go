@@ -1222,9 +1222,6 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantMsg:    `contents[0].parts[0].functionResponse: functionResponse for "search" does not match any prior functionCall`,
 		},
 		{
-			// call A, call B, response A, call C, response B, response C would
-			// otherwise translate to assistant(A,B), tool(A), assistant(C),
-			// tool(B), tool(C), leaving B unanswered before the next assistant turn.
 			name: "overlapping tool-call batches in one model content",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{{
@@ -3703,9 +3700,6 @@ func TestHandleGeminiModelsCountTokensDoesNotEstimatePermanentUpstreamErrors(t *
 			var calls atomic.Int32
 			handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 				call := calls.Add(1)
-				// The first 400 probes max_completion_tokens compatibility and may fall back
-				// to max_tokens. Keep returning 400 to verify the final client/config error
-				// is surfaced rather than converted into an estimate.
 				_ = call
 				w.WriteHeader(tt.status)
 				_, _ = w.Write([]byte(`{"error":{"message":"permanent"}}`))

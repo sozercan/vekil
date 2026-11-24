@@ -14,9 +14,6 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// chatStreamEventBufferSize bounds producer lead without buffering an entire
-// provider response. Chunks are passed by value; producers must treat nested
-// slices and RawMessage values as immutable after sendChunk returns.
 const chatStreamEventBufferSize = 16
 
 var (
@@ -32,7 +29,6 @@ const (
 	chatStreamEventChunk chatStreamEventKind = iota + 1
 	chatStreamEventSuccess
 	chatStreamEventError
-	// A distinct kind, not a chunk field, so it can never reach a surface.
 	chatStreamEventCarriedReasoning
 )
 
@@ -43,9 +39,6 @@ type chatStreamEvent struct {
 	carriedReasoning carriedTurn
 }
 
-// chatStreamError names the execution error carried by a terminal stream event.
-// It is an alias so pre-stream and post-commit Chat failures retain one typed
-// classification across the execution module and public-protocol adapters.
 type chatStreamError = chatExecutionError
 
 func chatStreamErrorStatus(streamErr *chatStreamError) int {
@@ -71,9 +64,6 @@ func chatStreamErrorMessage(streamErr *chatStreamError) string {
 	return "upstream stream error"
 }
 
-// chatStreamEventWriter is the producer side of the bounded canonical Chat
-// event transport. A writer has one logical producer; calls are serialized so
-// a terminal event cannot overtake an in-flight chunk.
 type chatStreamEventWriter struct {
 	ctx    context.Context
 	events chan chatStreamEvent
@@ -82,8 +72,6 @@ type chatStreamEventWriter struct {
 	terminated bool
 }
 
-// chatStreamEventStream is the consumer side of the canonical Chat event
-// transport. Canceling it releases a producer blocked by the bounded buffer.
 type chatStreamEventStream struct {
 	ctx              context.Context
 	cancel           context.CancelCauseFunc
@@ -161,9 +149,6 @@ func (s *chatStreamEventStream) next() (chatStreamEvent, error) {
 	if s == nil {
 		return chatStreamEvent{}, errChatStreamMissingTermination
 	}
-	// A provider terminal event that was already queued before cancellation wins.
-	// Drain buffered chunks/terminal state deterministically before observing the
-	// context so shutdown cannot rewrite a completed provider turn.
 	select {
 	case event, ok := <-s.events:
 		if !ok {
@@ -224,9 +209,6 @@ func consumeChatStreamEvents(stream *chatStreamEventStream, onChunk func(models.
 				stream.carriedReasoning = event.carriedReasoning
 			}
 			if onCarriedReasoning != nil {
-				// A dropped carrier is a silent wedge: the turn completes, the client
-				// stores a transcript with no signature, and the next request cannot
-				// resolve its own minted ids.
 				if err := onCarriedReasoning(event.carriedReasoning); err != nil {
 					return err
 				}

@@ -493,9 +493,6 @@ func TestAnthropicToolImageCacheRejectsCrossedAndConflictingBoundaries(t *testin
 	}
 }
 
-// Identity whitespace the translation forwards verbatim, and equal hints written with
-// different spacing, are not changes the cache mapping may refuse. Raw request bytes keep
-// the spacing that json.Marshal would compact away.
 func TestAnthropicChatCacheMappingToleratesVerbatimWhitespace(t *testing.T) {
 	for _, test := range []struct {
 		name string

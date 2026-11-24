@@ -236,7 +236,7 @@ func TestDurableResponsesStorageErrors(t *testing.T) {
 				result := durableWireRequest(h, `{"model":"public-model","input":"start"}`, stage == "sse", false)
 				wantStatus := http.StatusServiceUnavailable
 				if stage == "sse" {
-					wantStatus = http.StatusOK // already committed; terminal SSE error
+					wantStatus = http.StatusOK
 					if !strings.Contains(result.Body.String(), "event: error\n") || !strings.Contains(result.Body.String(), "visible text") {
 						t.Fatalf("missing stream prefix/error: %s", result.Body.String())
 					}

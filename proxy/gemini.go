@@ -16,9 +16,6 @@ import (
 
 const geminiFunctionCallIDPrefix = "gemini-fc"
 
-// geminiModelAliases maps Gemini CLI internal utility aliases and unsupported
-// Gemini utility model names to concrete Gemini model IDs that Copilot accepts
-// upstream.
 var geminiModelAliases = map[string]string{
 	"chat-compression-3-pro":             "gemini-3-pro-preview",
 	"chat-compression-3-flash":           "gemini-3-flash-preview",
@@ -48,19 +45,11 @@ type geminiExplicitToolCall struct {
 	batch      int
 }
 
-// geminiPendingToolCalls tracks functionCalls that still await a
-// functionResponse. Each call records the tool-call batch that issued it.
-// Chat Completions requires every call to be answered before the next
-// assistant tool-call turn, so a response to a call from an earlier batch than
-// the latest one cannot be translated into a valid history.
 type geminiPendingToolCalls struct {
 	byName       map[string][]geminiPendingToolCall
 	byExplicitID map[string]geminiExplicitToolCall
 	batch        int
-	// answered reports whether any functionResponse was consumed since the
-	// current batch started. Calls split across consecutive model contents
-	// with no response in between stay in one batch.
-	answered bool
+	answered     bool
 }
 
 func (b *openAIContentBuilder) appendText(text string) {
@@ -104,9 +93,6 @@ func newGeminiPendingToolCalls() *geminiPendingToolCalls {
 	}
 }
 
-// beginBatch is called before the first functionCall of an assistant message.
-// It starts a new batch only when the current one has already received a
-// functionResponse.
 func (p *geminiPendingToolCalls) beginBatch() {
 	if p.batch == 0 || p.answered {
 		p.batch++
@@ -637,7 +623,6 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionCall", contentIdx, partIdx)
 					}
 					if len(toolCalls) == 0 {
-						// First call of a new assistant tool-call message.
 						pendingToolCalls.beginBatch()
 					}
 					toolCalls = append(toolCalls, toolCall)
@@ -645,9 +630,6 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionCall", contentIdx, partIdx)
 					}
 				case "functionResponse":
-					// Some clients (for example Antigravity) send tool results
-					// in a model-role content. Translate them exactly as a
-					// user-role functionResponse, after any preceding calls.
 					if err := flushAssistantContent(); err != nil {
 						return nil, err
 					}
@@ -674,14 +656,6 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 	return groupGeminiToolResults(messages), nil
 }
 
-// groupGeminiToolResults moves each tool result up to sit directly after the
-// assistant message that issued its call. Chat Completions requires an
-// assistant tool-call message to be followed by its tool results without any
-// other message in between, while Gemini contents may interleave text with
-// functionResponse parts. Text that was interleaved keeps its relative order
-// and follows the grouped results. Results only move past text messages: they
-// are never pulled across another tool result or a later assistant tool-call
-// message, so histories without interleaved text are left unchanged.
 func groupGeminiToolResults(messages []models.OpenAIMessage) []models.OpenAIMessage {
 	grouped := make([]models.OpenAIMessage, 0, len(messages))
 	moved := make([]bool, len(messages))
@@ -1154,11 +1128,6 @@ func normalizeGeminiFunctionResponse(raw json.RawMessage, unwrapCLITextOutput bo
 		return asString, nil
 	}
 
-	// Gemini CLI wraps text-only shell results as {"output":"..."}. OpenAI
-	// tool messages carry the textual result directly; preserving the wrapper
-	// makes models echo JSON instead of the command output. Unwrap only the exact
-	// single-field string shape so structured or metadata-bearing responses keep
-	// their full JSON semantics.
 	var object map[string]json.RawMessage
 	if unwrapCLITextOutput {
 		if err := json.Unmarshal(raw, &object); err == nil && len(object) == 1 {

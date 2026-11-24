@@ -58,19 +58,15 @@ func TestCopilotNativeWebSocketCatalogPartialFetchMerges(t *testing.T) {
 	}
 }
 
-// nativeGateTestUpstream is a fake Copilot upstream that counts websocket
-// upgrades, HTTP /responses posts, and /models fetches.
 type nativeGateTestUpstream struct {
 	upgrades, posts, catalogs atomic.Int32
 	catalog                   string
 	catalogStatus             int
 	postInputItems            chan int
 	nativeFrames              chan nativeGateFrame
-	// turnState, when set, is returned as X-Codex-Turn-State on HTTP turns.
-	turnState string
+	turnState                 string
 }
 
-// nativeGateFrame is what one native response.create carried.
 type nativeGateFrame struct {
 	inputItems int
 	previousID string
@@ -159,7 +155,6 @@ func TestResponsesNativeWebSocketUsesHTTPForUnadvertisedModel(t *testing.T) {
 	if upstream.upgrades.Load() != 0 || upstream.posts.Load() != 2 {
 		t.Fatalf("transport: upgrades=%d posts=%d, want HTTP only", upstream.upgrades.Load(), upstream.posts.Load())
 	}
-	// The HTTP bridge keeps session history, so the second turn replays it.
 	if first, second := <-upstream.postInputItems, <-upstream.postInputItems; first != 1 || second != 3 {
 		t.Fatalf("HTTP input items = %d then %d, want 1 then 3", first, second)
 	}
@@ -203,8 +198,6 @@ func TestResponsesNativeWebSocketExplicitRouteUsesTargetUpstreamModel(t *testing
 		wantUpgrades int32
 		wantPosts    int32
 	}{
-		// The public route ID is not the capability key; the target's
-		// upstream model is.
 		{name: "target advertised", advertised: "deployment-a", wantUpgrades: 1},
 		{name: "only public ID advertised", advertised: "public-model", wantPosts: 2},
 	} {
@@ -241,7 +234,6 @@ func TestResponsesNativeWebSocketHTTPStartedSessionSwitchesWithFullHistory(t *te
 	request["model"] = "gpt-5.4"
 	for turn := 1; turn <= 3; turn++ {
 		if turn == 2 {
-			// A later catalog refresh advertises the model mid-session.
 			h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", true)}, true)
 		}
 		if err := conn.WriteJSON(request); err != nil {
@@ -261,8 +253,6 @@ func TestResponsesNativeWebSocketHTTPStartedSessionSwitchesWithFullHistory(t *te
 	if got := <-upstream.postInputItems; got != 1 {
 		t.Fatalf("HTTP turn input items = %d, want 1", got)
 	}
-	// The first native turn replays the proxy's history (user, assistant,
-	// user); the next continues the connection with only the new input.
 	if got := <-upstream.nativeFrames; got != (nativeGateFrame{inputItems: 3}) {
 		t.Fatalf("first native turn = %+v, want full history without a previous response", got)
 	}
@@ -306,8 +296,6 @@ func TestResponsesNativeWebSocketTurnStateDeltaStaysOnHTTP(t *testing.T) {
 	request["model"] = "gpt-5.4"
 	for turn := 1; turn <= 2; turn++ {
 		if turn == 2 {
-			// The model becomes native-eligible while the session holds HTTP
-			// turn state.
 			h.copilotNativeWS.record("copilot", []providerModel{nativeWebSocketTestModel("gpt-5.4", true)}, true)
 		}
 		if err := conn.WriteJSON(request); err != nil {
@@ -320,8 +308,6 @@ func TestResponsesNativeWebSocketTurnStateDeltaStaysOnHTTP(t *testing.T) {
 		request["previous_response_id"] = websocketResponseID(t, frame)
 		request["input"] = []any{map[string]string{"role": "user", "content": "next"}}
 	}
-	// The second body is a one-item turn-state delta: it must stay on HTTP,
-	// where the turn state carries the earlier context.
 	if upstream.upgrades.Load() != 0 || upstream.posts.Load() != 2 {
 		t.Fatalf("transport: upgrades=%d posts=%d, want the turn-state delta on HTTP", upstream.upgrades.Load(), upstream.posts.Load())
 	}

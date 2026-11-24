@@ -126,8 +126,6 @@ func TestConversationMigrationHostedCatalogsAndInvalidMetadata(t *testing.T) {
 				}
 				return
 			}
-			// Unsupported hosted state and unusable attribution run unprotected:
-			// the request is forwarded once and nothing is saved.
 			result := conversationPOST(t, h, fields, nil)
 			body := result.Body.String()
 			if result.Code != http.StatusOK || strings.Contains(body, `"history":"saved"`) || sends.Load() != before+1 {

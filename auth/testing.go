@@ -2,7 +2,6 @@ package auth
 
 import "time"
 
-// NewTestAuthenticator creates an Authenticator pre-loaded with a token for testing.
 func NewTestAuthenticator(token string) *Authenticator {
 	return &Authenticator{
 		copilotToken: token,
@@ -10,8 +9,6 @@ func NewTestAuthenticator(token string) *Authenticator {
 	}
 }
 
-// NewTestAuthenticatorWithResponsesToken creates an Authenticator with a
-// direct token plus a preloaded endpoint-compatible Responses token.
 func NewTestAuthenticatorWithResponsesToken(token, responsesToken string) *Authenticator {
 	return &Authenticator{
 		copilotToken:         token,

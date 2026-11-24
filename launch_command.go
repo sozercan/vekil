@@ -53,15 +53,11 @@ type launchCopilotScopeChecker interface {
 }
 
 type launchTargetSpec struct {
-	name          string
-	displayName   string
-	installHelp   string
-	requiresModel bool
-	adapter       launch.Adapter
-	// responsesClient marks agents that speak /v1/responses. With
-	// Responses-over-Chat opt-ins they must pin --model: the adapter's
-	// restrictions are derived from the pinned model's metadata, and an
-	// agent-chosen model would skip them.
+	name            string
+	displayName     string
+	installHelp     string
+	requiresModel   bool
+	adapter         launch.Adapter
 	responsesClient bool
 }
 
@@ -370,8 +366,6 @@ func launchUsesCopilot(cfg proxy.ProvidersConfig, model string, checker launchCo
 	return checker.ModelUsesCopilot(model)
 }
 
-// launchResponsesOverChatOptedIn mirrors the server's catalog decision for a
-// statically configured model during a dry run, where no proxy is running.
 func launchResponsesOverChatOptedIn(optIn string, model launch.ModelInfo) bool {
 	if strings.TrimSpace(model.OwnedBy) == launch.PolicyModelOwner || len(model.SupportedEndpoints) == 0 {
 		return false
@@ -392,9 +386,6 @@ func launchResponsesOverChatOptedIn(optIn string, model launch.ModelInfo) bool {
 	return slices.Contains(model.SupportedEndpoints, "/chat/completions")
 }
 
-// validateLaunchDryRunResponsesOverChatModels statically mirrors the proxy's
-// startup rejection of policy IDs in the opt-in list, so a dry run does not
-// print a plan that the real launch would refuse.
 func validateLaunchDryRunResponsesOverChatModels(cfg proxy.ProvidersConfig, optIn string) error {
 	for _, candidate := range strings.Split(optIn, ",") {
 		candidate = strings.TrimSpace(candidate)
@@ -514,8 +505,6 @@ func (p *agentLaunchProxy) Done() <-chan error { return p.srv.Done() }
 
 func (p *agentLaunchProxy) Stop(ctx context.Context) error { return p.srv.Stop(ctx) }
 
-// MessagesAliasResolvesTo lets the launcher confirm an agent-facing spelling
-// of the pinned model before handing it to the agent.
 func (p *agentLaunchProxy) MessagesAliasResolvesTo(ctx context.Context, alias, model string) bool {
 	resolver, ok := p.srv.(interface {
 		MessagesAliasResolvesTo(context.Context, string, string) bool

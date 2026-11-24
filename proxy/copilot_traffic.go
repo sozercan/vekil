@@ -37,18 +37,13 @@ type copilotCooldownKey struct {
 type copilotInferenceRequest struct {
 	keys     [3]copilotCooldownKey
 	endpoint string
-	// model is the upstream model of the prepared body, after route rewrites.
-	model string
+	model    string
 }
 
 type copilotInferenceRequestContextKey struct{}
 type copilotAdmissionInboundContextKey struct{}
 type copilotSourceFingerprintContextKey struct{}
 
-// Only fixed-size fingerprints enter shared state. Including provider and
-// origin prevents credentials reused by different providers from sharing a
-// cooldown. Integration limits intentionally cover credentials within that
-// provider only.
 func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, endpoint string, body []byte, owners ...providerModel) *http.Request {
 	if req == nil || req.URL == nil || provider == nil || provider.kind != providerTypeCopilot {
 		return req
@@ -60,8 +55,6 @@ func withCopilotInferenceRequest(req *http.Request, provider *providerRuntime, e
 	}
 	model := ""
 	if len(owners) > 0 {
-		// Inference callers prepare the body for this resolved owner before
-		// constructing the request, including target and fallback rewrites.
 		model = strings.TrimSpace(owners[0].upstreamModel)
 	}
 	if model == "" {
@@ -170,10 +163,6 @@ func copilotInferenceAdmissionContext(req *http.Request) (context.Context, conte
 	return admissionCtx, func() { stop(); cancel() }
 }
 
-// acquireCopilotInference runs before send reservation or physical-attempt
-// accounting. Active cooldowns return a 429 without issuing an upstream request.
-// One request probes an expired cooldown; concurrent callers wait until the
-// probe has either been accepted or supplied another reset.
 func (h *ProxyHandler) acquireCopilotInference(req *http.Request) (*copilotInferencePermit, *http.Response, error) {
 	metadata, ok := req.Context().Value(copilotInferenceRequestContextKey{}).(copilotInferenceRequest)
 	if h == nil || !ok {
@@ -372,8 +361,6 @@ func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Resp
 	}
 	retryAfter, _ := selectResponsesRetryAfter(resp.Header)
 	contentType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
-	// Responses passthrough and WebSockets already observe failures in their
-	// prepared stream. The typed Chat adapter needs observation at body reads.
 	responsesChat, _ := req.Context().Value(responsesChatStreamContextKey{}).(bool)
 	if !responsesChat {
 		normalizeCopilotResponsesItemIDs(resp, metadata.endpoint)
@@ -389,9 +376,6 @@ func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Resp
 		}
 		permit = &copilotInferencePermit{controller: &h.copilotTraffic, metadata: metadata}
 	}
-	// A successful HTTP status can still carry a streamed rate-limit failure.
-	// Keep recovery probes reserved until the consumer observes the outcome and
-	// closes the body, installing any renewed cooldown before waking waiters.
 	body := &copilotTrafficBody{
 		ReadCloser: resp.Body, permit: permit, status: resp.StatusCode,
 		retryAfter: retryAfter,
@@ -399,8 +383,6 @@ func (h *ProxyHandler) finishCopilotInference(req *http.Request, resp *http.Resp
 	if observeStream {
 		body.stream = &copilotThrottleStreamObserver{maxBytes: maxCopilotThrottleEvidenceBytes}
 		if metadata.endpoint == providerEndpointResponses {
-			// Failed Responses can include output before the error. Match the
-			// accepted event limit so that output cannot hide a valid reset.
 			body.stream.maxBytes = openAIStreamScannerMaxBuffer
 			body.headers = resp.Header.Clone()
 		}
@@ -438,8 +420,6 @@ func (b *copilotTrafficBody) observe() {
 
 func (b *copilotTrafficBody) Read(p []byte) (int, error) {
 	if b.stream != nil {
-		// Close first cancels the inner read, then takes this mutex in observe.
-		// Finish inspecting any returned frame before it can release the probe.
 		b.mu.Lock()
 		n, err := b.ReadCloser.Read(p)
 		b.stream.observe(p[:n], err == io.EOF, b.observeStreamEvent)
@@ -496,8 +476,6 @@ func (b *copilotTrafficBody) observeStreamEvent(eventType, data string) bool {
 		if anthropicStreamDataIsMessageStop(body) && rejectDuplicateJSONMappingKeys(body) == nil {
 			return false
 		}
-		// Content-block endings are not message endings: a later native
-		// Messages error can still renew this request's cooldown.
 		failure := inspectAnthropicStreamEvent(eventType, data, false).failure
 		if failure == nil {
 			return true
@@ -513,9 +491,6 @@ func (b *copilotTrafficBody) observeStreamEvent(eventType, data string) bool {
 		}
 		failureCode = streamErr.Code
 	}
-	// The shared validator requires a complete, bounded JSON object with a
-	// recognized code. Generated text and malformed error events cannot set
-	// shared cooldowns, even when their text mentions a rate-limit code.
 	body := []byte(data)
 	if code, scope := copilotThrottleCode(body); scope != copilotThrottleUnknown && code == failureCode {
 		b.permit.controller.observeThrottle(b.permit.metadata, http.StatusTooManyRequests, b.retryAfter, body)
@@ -523,8 +498,6 @@ func (b *copilotTrafficBody) observeStreamEvent(eventType, data string) bool {
 	return false
 }
 
-// Retain at most one bounded SSE event. Observation does not read ahead or
-// rewrite bytes, covering native Messages, Responses, and Chat aggregation.
 type copilotThrottleStreamObserver struct {
 	frame        []byte
 	maxBytes     int

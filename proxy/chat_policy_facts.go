@@ -26,15 +26,10 @@ const (
 	policyFactMaxArrayItems      = 1024
 )
 
-// policyFactOptions contains only the request-local limits needed by the facts
-// builder. It intentionally does not depend on the concurrently compiled policy
-// configuration types.
 type policyFactOptions struct {
 	RecentTurns     int
 	MaxRequestBytes int
-	// MaxSourceBytes is an internal ceiling for already-validated canonical
-	// request bodies. Zero preserves the 1 MiB public policy request limit.
-	MaxSourceBytes int
+	MaxSourceBytes  int
 }
 
 func (o policyFactOptions) normalized() (policyFactOptions, error) {
@@ -79,9 +74,6 @@ type policyFactTool struct {
 	Truncated     bool   `json:"truncated"`
 }
 
-// policyFactCounts keeps original-shape counts separate from the bounded
-// projections. This lets metrics and deterministic mapping observe omission
-// without retaining any omitted content.
 type policyFactCounts struct {
 	RequestOriginalBytes int `json:"request_original_bytes"`
 	Messages             int `json:"messages"`
@@ -115,9 +107,6 @@ type policyFactTruncation struct {
 	SerializedBudget bool `json:"serialized_budget"`
 }
 
-// policyClassifierFacts is the only user-content-bearing value passed to the
-// classifier seam. It contains bounded text and function names, never schemas,
-// arguments, IDs, provider state, or routing metadata.
 type policyClassifierFacts struct {
 	SchemaVersion   string               `json:"schema_version"`
 	Anchors         []policyFactMessage  `json:"anchors,omitempty"`
@@ -129,10 +118,6 @@ type policyClassifierFacts struct {
 }
 
 func (f policyClassifierFacts) taskTruncated() bool {
-	// Setup instructions and older history routinely exceed their context
-	// budgets. Only losing part of the current task forces a powerful route.
-	// Without a user task, retain the conservative rule for the context that
-	// must carry the request instead.
 	return f.Truncation.CurrentUserTask || (f.CurrentUserTask == nil &&
 		(f.Truncation.Anchors || f.Truncation.RecentMessages))
 }
@@ -176,8 +161,6 @@ type parsedPolicyFactMessage struct {
 	toolCallID  string
 }
 
-// buildPolicyClassifierFacts validates the supported first-release Chat shape
-// and builds a deterministic, bounded facts snapshot from the original body.
 func buildPolicyClassifierFacts(body []byte, opts policyFactOptions) (policyClassifierFacts, error) {
 	normalized, err := opts.normalized()
 	if err != nil {
@@ -511,9 +494,6 @@ func validatePolicyFactToolHistory(messages []parsedPolicyFactMessage) error {
 			return newPolicyFactBuildError(call.param, "tool call is missing tool result before the next non-tool message")
 		}
 
-		// Tool-call IDs correlate one completed assistant/tool round. Providers
-		// may reuse turn-local IDs in a later completed round, so reset the prior
-		// round before accepting another non-tool message.
 		clear(completed)
 		clear(pending)
 		pendingOrder = pendingOrder[:0]
@@ -738,8 +718,6 @@ func fitPolicyFactsToSerializedBudget(facts *policyClassifierFacts, maxBytes int
 	}
 	facts.Truncation.SerializedBudget = true
 
-	// Tool names are useful but lower priority than task and conversational
-	// context. Drop them from the tail first while preserving original counts.
 	for len(facts.FunctionTools) > 0 && len(encoded) > maxBytes {
 		last := len(facts.FunctionTools) - 1
 		facts.FunctionTools[last] = policyFactTool{}
@@ -752,8 +730,6 @@ func fitPolicyFactsToSerializedBudget(facts *policyClassifierFacts, maxBytes int
 		}
 	}
 
-	// Preserve the earliest anchors and newest recent messages. Keep clipping
-	// visible to the classifier, but retain the current task ahead of context.
 	for len(facts.Anchors) > 0 && len(encoded) > maxBytes {
 		last := len(facts.Anchors) - 1
 		facts.Anchors[last] = policyFactMessage{}

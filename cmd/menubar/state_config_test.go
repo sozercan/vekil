@@ -110,7 +110,6 @@ func TestDurableStateMenubarSharesProviderConfigAndStore(t *testing.T) {
 	}
 	post(tray, `{"model":"public","input":"first"}`)
 	stats(tray, "durable", 1)
-	// A second proxy can opt out explicitly without touching the locked store.
 	t.Setenv("STATE_BINDINGS_MODE", "memory")
 	memoryResult := runProxyStartupAt(t.Context(), auth.NewTestAuthenticator("synthetic-token"), loaded, nil, "127.0.0.1", "0")
 	if memoryResult.err != nil {
@@ -122,8 +121,6 @@ func TestDurableStateMenubarSharesProviderConfigAndStore(t *testing.T) {
 	stop(memory)
 	t.Setenv("STATE_BINDINGS_MODE", "")
 	stop(tray)
-	// The CLI uses this same constructor and provider config. It resumes proof
-	// issued by the tray without a state flag, environment variable or menu setting.
 	cli, err := server.New(auth.NewTestAuthenticator("synthetic-token"), log, "127.0.0.1", "0", server.WithProxyOptions(proxy.WithProvidersConfig(loaded)))
 	if err != nil {
 		t.Fatal(err)

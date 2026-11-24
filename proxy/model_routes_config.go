@@ -23,8 +23,6 @@ const (
 	maxModelRouteOperationalIDBytes = 128
 )
 
-// ModelRouteConfig maps one public model contract to an ordered set of
-// semantically equivalent provider targets.
 type ModelRouteConfig struct {
 	ID                  string                   `json:"id" yaml:"id"`
 	Exposure            string                   `json:"exposure,omitempty" yaml:"exposure,omitempty"`
@@ -52,8 +50,6 @@ type ModelRouteConfig struct {
 	modelPickerCategorySet bool
 }
 
-// ModelRouteTargetConfig binds one ordered route target to a provider and its
-// physical upstream model or deployment name.
 type ModelRouteTargetConfig struct {
 	ID                     string `json:"id" yaml:"id"`
 	Provider               string `json:"provider" yaml:"provider"`
@@ -61,8 +57,6 @@ type ModelRouteTargetConfig struct {
 	UseMaxCompletionTokens *bool  `json:"use_max_completion_tokens,omitempty" yaml:"use_max_completion_tokens,omitempty"`
 }
 
-// ModelRouteRoutingConfig bounds target selection and physical inference sends
-// for one logical operation.
 type ModelRouteRoutingConfig struct {
 	Mode              string `json:"mode,omitempty" yaml:"mode,omitempty"`
 	MaxTargetAttempts int    `json:"max_target_attempts,omitempty" yaml:"max_target_attempts,omitempty"`
@@ -155,8 +149,6 @@ type providerConfigDescriptor struct {
 	modelFilter                normalizedProviderModelFilter
 }
 
-// EffectiveSchemaVersion returns the public configuration version. Omitting
-// schema_version intentionally retains version-1 provider-only semantics.
 func (c ProvidersConfig) EffectiveSchemaVersion() int {
 	if c.SchemaVersion == 0 {
 		return ProvidersConfigSchemaVersion1
@@ -164,8 +156,6 @@ func (c ProvidersConfig) EffectiveSchemaVersion() int {
 	return c.SchemaVersion
 }
 
-// ValidateProvidersConfig validates a decoded provider configuration without
-// contacting provider model or inference endpoints.
 func ValidateProvidersConfig(cfg ProvidersConfig) error {
 	validated, err := validateAndNormalizeProvidersConfig(cfg)
 	if err != nil {
@@ -180,9 +170,6 @@ func ValidateProvidersConfig(cfg ProvidersConfig) error {
 	return err
 }
 
-// ValidateProvidersConfigFile strictly decodes and validates a local or remote
-// provider configuration without starting the server or contacting provider
-// discovery or inference endpoints.
 func ValidateProvidersConfigFile(source string) error {
 	source = strings.TrimSpace(source)
 	if source == "" {
@@ -234,7 +221,6 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 		return validated, nil
 	case ProvidersConfigSchemaVersion2:
 	case 0:
-		// EffectiveSchemaVersion maps zero to version 1, so this is unreachable.
 		return validatedProvidersConfig{}, configPathError("schema_version", "must be 1 or 2")
 	default:
 		return validatedProvidersConfig{}, configPathError("schema_version", "unsupported schema version %d; supported versions are 1 and 2", cfg.SchemaVersion)
@@ -442,9 +428,6 @@ func validateAndNormalizeProvidersConfig(cfg ProvidersConfig) (validatedProvider
 	}
 
 	if insightModel := strings.TrimSpace(validated.config.InsightModel); insightModel != "" {
-		// Insight models resolve only through the public model namespace.
-		// Operational route/profile IDs are intentionally separate and may equal
-		// an unrelated direct public model ID.
 		for profileIndex, profile := range validated.config.PolicyProfiles {
 			for _, alias := range configuredPublicModelAliases(profile.PublicID) {
 				if insightModel == alias {
@@ -1915,16 +1898,8 @@ func rejectDuplicateJSONMappingKeys(body []byte) error {
 	return nil
 }
 
-// maxJSONDuplicateKeyScanDepth matches the nesting limit encoding/json
-// enforces in Valid and Unmarshal. Decoder.Token does not enforce it in the
-// legacy decoder (GOEXPERIMENT=nojsonv2), so the scan bounds itself.
 const maxJSONDuplicateKeyScanDepth = 10000
 
-// scanJSONValueForDuplicateKeys rejects duplicate object keys in the next JSON
-// value read from decoder. It runs on client- and upstream-controlled bytes, so
-// its cost must stay linear in the input: with reportPaths, it tracks path
-// segments on a stack and formats the path only when reporting an error,
-// rather than building and retaining a string for every nesting level.
 func scanJSONValueForDuplicateKeys(decoder *json.Decoder, reportPaths bool) error {
 	scanner := jsonDuplicateKeyScanner{decoder: decoder, reportPaths: reportPaths}
 	return scanner.scanValue(0)
@@ -1936,7 +1911,6 @@ type jsonDuplicateKeyScanner struct {
 	path        []jsonPathSegment
 }
 
-// jsonPathSegment is an object key, or an array index when isIndex is set.
 type jsonPathSegment struct {
 	key     string
 	index   int
@@ -2009,8 +1983,6 @@ func (s *jsonDuplicateKeyScanner) pop() {
 	}
 }
 
-// pathString formats the current path exactly as repeated
-// appendConfigObjectPath and "%s[%d]" calls would, in one linear pass.
 func (s *jsonDuplicateKeyScanner) pathString() string {
 	var path strings.Builder
 	for _, segment := range s.path {

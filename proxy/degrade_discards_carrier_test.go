@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// The degrade must DISCARD a refused carrier, never splice it. With the degrade off
-// (native Chat, and every candidate probe) the refusal is unchanged and loud.
 func TestDegradeLeaksNothingFromARefusedCarrier(t *testing.T) {
 	_, staleRoute, staleItems, stalePublished := publishCarrierParityTurn(t, "upstream-call-1")
 	_, currentRoute, currentItems, current := publishCarrierParityTurn(t, "upstream-call-2")
@@ -55,8 +53,6 @@ func TestDegradeLeaksNothingFromARefusedCarrier(t *testing.T) {
 	}
 }
 
-// A carrier that decodes but claims a shape the store never publishes is discarded
-// whole, not partially spliced.
 func TestDegradeDiscardsForgedItemShapes(t *testing.T) {
 	proxyID := mintedCallID(t)
 	projected := []responsesChatReplayProjectedCall{{ID: proxyID, Name: "lookup", Arguments: "{}"}}
@@ -100,8 +96,6 @@ func TestDegradeDiscardsForgedItemShapes(t *testing.T) {
 	assertPairedUnderClientIDs(t, input)
 }
 
-// A degraded turn must be internally consistent for a stateless upstream: every
-// function_call paired with its output, under ids the client already holds.
 func assertPairedUnderClientIDs(t *testing.T, input string) {
 	t.Helper()
 	var items []map[string]any
@@ -131,14 +125,6 @@ func assertPairedUnderClientIDs(t *testing.T, input string) {
 	}
 }
 
-// Both publish paths flatten every upstream message item into ONE assistant string
-// (responses_chat_stream.go accumulates into a strings.Builder; chat_over_responses_response.go
-// does the same), so a client can only ever return one assistant text. reconstructCarriedRestore
-// is built on that: it drops message items and re-inserts a single flattened text at
-// carriedTextSlot. A carrier claiming two message slots therefore cannot round-trip -- there is
-// no second text to put back -- so the guard refuses it whole rather than replaying a turn whose
-// second message silently vanishes. Relaxing `messages > 1` without teaching the reconstructor
-// about multiple texts would trade lost reasoning for a reordered turn, which is worse.
 func TestCarrierWithTwoMessageItemsIsRefusedNotCollapsed(t *testing.T) {
 	proxyID := mintedCallID(t)
 	projected := []responsesChatReplayProjectedCall{{ID: proxyID, Name: "lookup", Arguments: "{}"}}
@@ -156,8 +142,6 @@ func TestCarrierWithTwoMessageItemsIsRefusedNotCollapsed(t *testing.T) {
 		}}
 	}
 
-	// The one-message carrier restores, so the refusal below is specifically the second
-	// message and not something else in the fixture.
 	if _, reason := carriedRestoredCalls(carrierFor([]json.RawMessage{assistantMessage, functionCall}), projected, route, content); reason != "" {
 		t.Fatalf("one message: guard = %q, want it to restore", reason)
 	}

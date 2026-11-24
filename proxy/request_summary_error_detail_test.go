@@ -17,8 +17,6 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-// Upstream error prose quotes the offending request value back, so it must not
-// reach the log even though the enumerated type, code and param may.
 func TestUpstreamAuthoredErrorMessageStaysOutOfTheLog(t *testing.T) {
 	const secret = "SSN 123-45-6789 and the user's prompt"
 	upstreamBody := []byte(`{"error":{"type":"invalid_request_error","code":"bad_value","param":"messages","message":"Invalid value for 'messages[0].content': ` + secret + `"}}`)
@@ -83,16 +81,11 @@ func TestUpstreamAuthoredErrorMessageStaysOutOfTheLog(t *testing.T) {
 	}
 }
 
-// The wiring, not the helper. A non-200 upstream reply arrives as a SUCCESSFUL result, so
-// the execution-error path that fills these fields never runs and the boundary has to do
-// it. Probed against Copilot before this existed: a real 400 logged the prose and recorded
-// no classifier at all.
 func TestAnthropicUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T) {
 	const secret = "not-a-real-type"
 	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		// The envelope Copilot actually returned for an invalid tool schema.
 		_, _ = w.Write([]byte(`{"error":{"message":"Invalid schema for function 't': ` +
 			`'not-a-real-type' is not valid","code":"invalid_value",` +
 			`"param":"tools[0].input_schema","type":"invalid_request_error"}}`))
@@ -369,8 +362,6 @@ func TestAnthropicCountTokensErrorLogsOnlySafeClassifiers(t *testing.T) {
 	}
 }
 
-// Character shape is not proof: every rune in `SSN_123-45-6789` is one a classifier may
-// contain. These match the grammars instead -- a lowercase identifier, a JSON path.
 func TestUpstreamClassifiersMatchTheirGrammarNotJustTheirCharacters(t *testing.T) {
 	for _, tc := range []struct {
 		name, code, param string
@@ -379,8 +370,6 @@ func TestUpstreamClassifiersMatchTheirGrammarNotJustTheirCharacters(t *testing.T
 	}{
 		{name: "copilot top-level code", code: "invalid_request_body", param: "", wantCode: "invalid_request_body"},
 		{name: "json path keeps only its root", code: "invalid_value", param: "tools[0].input_schema", wantCode: "invalid_value", wantParam: "tools"},
-		// The whole reason the root is not enough on its own: a client-chosen key is a
-		// perfectly ordinary lower-snake identifier, so the grammar cannot tell it apart.
 		{name: "a client's metadata key is not part of the path", code: "", param: "metadata.customer_ssn", wantParam: "metadata"},
 		{name: "a client key under a tool schema is not part of the path", code: "", param: "tools[0].input_schema.properties.customer_ssn", wantParam: "tools"},
 		{name: "a client-controlled numeric suffix is not logged", code: "", param: "user[123456789]", wantParam: "user"},
@@ -403,8 +392,6 @@ func TestUpstreamClassifiersMatchTheirGrammarNotJustTheirCharacters(t *testing.T
 	}
 }
 
-// The envelope Copilot actually returns from /v1/responses: classifiers at the TOP level,
-// no `error` wrapper. Captured by probing the live API.
 func TestCopilotTopLevelErrorEnvelopeYieldsItsCode(t *testing.T) {
 	body := []byte(`{"code":"invalid_request_body","message":"Invalid value: 'not-a-real-effort'."}`)
 
@@ -427,14 +414,7 @@ func TestCopilotTopLevelErrorEnvelopeYieldsItsCode(t *testing.T) {
 	}
 }
 
-// Pins behaviour this change relies on rather than adds: the canonical Responses stream
-// already records the upstream classifier and already withholds the prose. A review claimed
-// otherwise; a correct fixture showed it does. Without this test the next reader re-adds the
-// redundant observe call, as I did.
 func TestStreamingResponsesFailureRecordsAClassifier(t *testing.T) {
-	// Reuse the real fixture's prelude: a lone response.failed is rejected as
-	// invalid_responses_stream, which is vekil's OWN error and records classifiers of
-	// its own, hiding what is under test.
 	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_one_tool_call.sse")
 	if err != nil {
 		t.Fatal(err)
@@ -478,10 +458,6 @@ func TestStreamingResponsesFailureRecordsAClassifier(t *testing.T) {
 	}
 }
 
-// vekil authors these, but interpolates the client's own text into them: an unknown field's
-// NAME becomes the param, and an unsupported value is echoed into the message. Neither is
-// ours to log. The grammar gate alone does not catch it -- a key like "customer_ssn" is a
-// perfectly well-formed lower-snake segment.
 func TestClientDerivedErrorFieldsStayOutOfTheLog(t *testing.T) {
 	const clientKey = "customer_ssn"
 
@@ -501,32 +477,22 @@ func TestClientDerivedErrorFieldsStayOutOfTheLog(t *testing.T) {
 			want: map[string]string{"error_type": "invalid_request_error"},
 		},
 		{
-			// A JSON key may contain dots. Trimming the joined path at its last dot leaves
-			// half the key behind, and the remainder still passes the grammar filter.
 			name: "a client key containing dots leaves nothing of itself behind",
 			err:  newChatInvalidRequestClientField("metadata", clientKey+".value", "unsupported JSON field"),
 			want: map[string]string{"error_type": "invalid_request_error", "error_param": "metadata"},
 		},
 		{
-			// The param vekil built is kept. The message is not, even though this one happens
-			// to be a literal: newChatInvalidRequest is also called with a client value
-			// quoted into the message, so the constructor cannot vouch for what it was given.
 			name: "vekil's own static param survives, its message does not",
 			err:  newChatInvalidRequest("messages[0].content", "message content is required"),
 			want: map[string]string{"error_type": "invalid_request_error", "error_param": "messages[0].content"},
 		},
 		{
-			// The shape that made the default matter, from policy_responses_translate.go:
-			// vekil's own prose with a client value quoted into it. Logging local messages by
-			// default put arbitrary request content in the logs.
 			name: "a client value quoted into vekil's prose goes with the message",
 			err: newChatInvalidRequest("input[0].type",
 				fmt.Sprintf("Responses input item type %q is not supported for policy models", clientKey)),
 			want: map[string]string{"error_type": "invalid_request_error", "error_param": "input[0].type"},
 		},
 		{
-			// Opting in is what makes the field useful: this is the diagnosis the carrier
-			// work exists to surface, and its constructor owns the whole string.
 			name: "a constructor that declares its message constant still logs it",
 			err:  missingResponsesChatReplayError(),
 			want: map[string]string{
@@ -538,7 +504,6 @@ func TestClientDerivedErrorFieldsStayOutOfTheLog(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// Guard: a fixture that never carries the key would pass for the wrong reason.
 			if tc.err.clientDerived && !strings.Contains(tc.err.Param, clientKey) {
 				t.Fatalf("fixture param %q does not carry the client key; this proves nothing", tc.err.Param)
 			}
@@ -568,9 +533,6 @@ func TestClientDerivedErrorFieldsStayOutOfTheLog(t *testing.T) {
 	}
 }
 
-// The same wiring on the Chat surface, which had it only on the Anthropic one. A
-// Responses-backed non-2xx is canonicalized into a SUCCESSFUL chatExecutionResult, so no
-// execution error is built here either -- and this path logged a warn with no reason at all.
 func TestChatUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -778,9 +740,6 @@ func TestExplicitForcedStreamFailoverRecapturesFinalResponseClassifiers(t *testi
 	}
 }
 
-// Gemini's non-200 branches read the body to build their detail line in addition to the shared
-// execution-boundary classification. Keep both route shapes covered so refactoring either
-// translation branch cannot silently drop the safe classifiers again.
 func TestGeminiUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T) {
 	upstreamFail := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -848,16 +807,10 @@ func TestGeminiUpstreamErrorRecordsClassifiersThroughTheHandler(t *testing.T) {
 	}
 }
 
-// The leak this closes came in through a path no constructor could vouch for:
-// walkPolicyResponsesJSON joins the CLIENT's object keys into the path it reports, then hands
-// it to newChatInvalidRequest, which takes its param as an argument. Gating only the
-// constructor that knows it was given a client field name left this one wide open, so the gate
-// is on the segments instead -- a name vekil does not own ends the path, whatever built it.
 func TestLocalParamsKeepOnlyTheSegmentsVekilOwns(t *testing.T) {
 	const clientKey = "customer_ssn"
 
 	t.Run("through the real JSON walker", func(t *testing.T) {
-		// A duplicate key nested under metadata: the walker reports the full path it built.
 		body := []byte(`{"metadata":{"` + clientKey + `.value":1,"` + clientKey + `.value":2}}`)
 		err := validatePolicyResponsesJSON(body)
 		if err == nil {
@@ -885,17 +838,11 @@ func TestLocalParamsKeepOnlyTheSegmentsVekilOwns(t *testing.T) {
 				got[field.Key], _ = field.Value.(string)
 			}
 		}
-		// Nothing, not a prefix: this walker traverses the CLIENT's JSON, so no segment of
-		// the path it built is vekil's to log.
 		if got["error_param"] != "" {
 			t.Fatalf("error_param = %q, want nothing from a wholly client-authored path", got["error_param"])
 		}
 	})
 
-	// A key that SPELLS an owned root with a numeric subscript defeats a segment allowlist on
-	// looks alone -- "user[123456789]" passes ownedParamSegment and carried nine client-chosen
-	// digits into the log. The walker no longer offers the path for logging at all, which is
-	// what actually closes this; the allowlist below is the second line, not the first.
 	t.Run("a client key that spells an owned segment", func(t *testing.T) {
 		body := []byte(`{"metadata":{"user[123456789]":1,"user[123456789]":2}}`)
 		err := validatePolicyResponsesJSON(body)
@@ -918,9 +865,6 @@ func TestLocalParamsKeepOnlyTheSegmentsVekilOwns(t *testing.T) {
 		}
 	})
 
-	// The same bypass, reached through the Chat validators rather than the policy walker: an
-	// unknown top-level key and an unknown stream option are both the client's spelling, and
-	// "user[123456789]" spells an owned root with a numeric subscript.
 	for _, tc := range []struct {
 		name string
 		run  func(map[string]json.RawMessage) error
@@ -971,10 +915,6 @@ func TestLocalParamsKeepOnlyTheSegmentsVekilOwns(t *testing.T) {
 	}
 }
 
-// A stream that fails AFTER committing bytes never reaches the execution-error path: the
-// handler is already past it, and the stream callbacks recorded usage and a failure status but
-// not the typed error. So the warn this branch added carried a stats_status and no reason,
-// even though responses_chat_stream.go had just finished classifying the failure.
 func TestPostCommitStreamFailureRecordsClassifiers(t *testing.T) {
 	text, err := os.ReadFile("testdata/chat_over_responses/stream_text.sse")
 	if err != nil {
@@ -984,8 +924,6 @@ func TestPostCommitStreamFailureRecordsClassifiers(t *testing.T) {
 	if cut < 0 {
 		t.Fatal("fixture no longer ends with response.completed; cannot build a post-commit failure")
 	}
-	// Same stream, but the terminal event fails instead of completing: the text deltas above
-	// have already been written downstream by then, which is what makes it post-commit.
 	sse := string(text)[:cut] + "event: response.failed\n" +
 		`data: {"type":"response.failed","sequence_number":9,"response":` +
 		`{"id":"resp_synth_text_stream_001","object":"response","created_at":1700000000,` +

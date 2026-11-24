@@ -232,8 +232,6 @@ func TestDurableResponsesRejectAmbiguousStream(t *testing.T) {
 							if err != nil {
 								t.Fatal(err)
 							}
-							// Assert the actual frame bytes: decoding into a test map
-							// would hide the same duplicate-key bug as production.
 							exposed += string(raw)
 							var envelope struct {
 								Type string `json:"type"`

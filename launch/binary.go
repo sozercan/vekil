@@ -9,7 +9,6 @@ import (
 	"strings"
 )
 
-// ErrBinaryNotFound marks an agent executable lookup failure.
 var ErrBinaryNotFound = errors.New("agent binary not found")
 
 type resolvedExecutable struct {

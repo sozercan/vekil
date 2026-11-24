@@ -18,8 +18,6 @@ import (
 	"github.com/sozercan/vekil/logger"
 )
 
-// degradeFixture publishes one stored turn and returns the request body that
-// replays it, plus a copy whose assistant text has drifted from what was stored.
 func degradeFixture(t *testing.T, store *responsesChatReplayStore, route responsesChatReplayRoute) (matching, drifted []byte, callID string) {
 	t.Helper()
 	published, err := store.Publish(responsesChatReplayPublishRequest{
@@ -56,8 +54,6 @@ func degradeFixture(t *testing.T, store *responsesChatReplayStore, route respons
 	return matching, drifted, callID
 }
 
-// With no carrier to fall back on, a drifted projection reaches upstream rebuilt
-// from the visible messages, carrying no reasoning.
 func TestProjectionMismatchDegradesToTheVisibleTranscript(t *testing.T) {
 	store, route := newCarrierReplayFixture(t)
 	_, drifted, callID := degradeFixture(t, store, route)
@@ -70,8 +66,6 @@ func TestProjectionMismatchDegradesToTheVisibleTranscript(t *testing.T) {
 		t.Fatalf("a projection mismatch must not fail the request: %v", err)
 	}
 
-	// Assert on the bytes that go on the wire: a decoded struct cannot see a field
-	// omitempty dropped on the way out, and the reasoning item is exactly a field.
 	input := upstreamInputJSON(t, plan)
 	for _, forbidden := range []string{`"reasoning"`, "OPAQUE", "encrypted_content", "upstream-call-1"} {
 		if strings.Contains(input, forbidden) {
@@ -105,8 +99,6 @@ func TestProjectionMismatchDegradesToTheVisibleTranscript(t *testing.T) {
 	}
 }
 
-// TestMatchingProjectionStillRestoresStoredState pins the other half of the deal:
-// where the store is live and matching, nothing about the restore changes.
 func TestMatchingProjectionStillRestoresStoredState(t *testing.T) {
 	store, route := newCarrierReplayFixture(t)
 	matching, _, _ := degradeFixture(t, store, route)
@@ -125,8 +117,6 @@ func TestMatchingProjectionStillRestoresStoredState(t *testing.T) {
 	}
 }
 
-// TestProjectionMismatchDegradeIsLogged: a degrade is a quality loss, so it must be
-// distinguishable from a clean turn in the log rather than being silent.
 func TestProjectionMismatchDegradeIsLogged(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
@@ -169,10 +159,6 @@ func TestProjectionMismatchDegradeIsLogged(t *testing.T) {
 	}
 }
 
-// Through the whole ingress: native Chat stays loud. It owns its history and can repair it,
-// so a drifted projection is reported rather than silently rebuilt -- and upstream is never
-// called, because a degrade here would send a turn the client never sanctioned. The Anthropic
-// surface opts into the other behaviour via DegradeUnrestorableReplay.
 func TestHandleOpenAIChatCompletionsProjectionMismatchIsRejected(t *testing.T) {
 	var upstreamBodies [][]byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -197,17 +183,6 @@ func TestHandleOpenAIChatCompletionsProjectionMismatchIsRejected(t *testing.T) {
 	}
 }
 
-// An opaque ID carries no upstream mapping, so when the store is gone and no carrier answers
-// there is nothing to recover it from. The degrade still applies -- a client cannot repair a
-// transcript it already sent -- so the turn continues with the PROXY id forwarded upstream as
-// the call_id. That is safe only because the whole turn is rebuilt from the transcript in the
-// same request, where call_id needs to be internally consistent and nothing more; vekil sends
-// `store: false` and replays the history every turn, so there is no server-side registry of
-// call ids to contradict. scripts/live-claude-reasoning-carrier-smoke.sh asserts this against
-// live Copilot after an actual proxy restart.
-//
-// The alternative -- refusing to degrade an opaque id -- reinstates the permanent wedge this
-// branch exists to remove, so this is deliberate and the contract says so.
 func TestAnthropicOpaqueIDDegradesWhileNativeChatStillRefuses(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/chat_over_responses/stream_reasoning_tool_call.sse")
 	if err != nil {
@@ -249,7 +224,6 @@ func TestAnthropicOpaqueIDDegradesWhileNativeChatStillRefuses(t *testing.T) {
 		t.Fatalf("an opaque id recovered reasoning it never had a mapping for: %s", upstreamBodies[0])
 	}
 
-	// Same lost state, native Chat: it owns its history and can repair it, so it stays loud.
 	chat := `{"model":"gpt-public","messages":[
 		{"role":"assistant","tool_calls":[{"id":"` + opaqueID + `","type":"function","function":{"name":"lookup_synthetic_widget","arguments":"{}"}}]},
 		{"role":"tool","tool_call_id":"` + opaqueID + `","content":"ok"}]}`
@@ -266,9 +240,6 @@ func TestAnthropicOpaqueIDDegradesWhileNativeChatStillRefuses(t *testing.T) {
 	}
 }
 
-// Claude Code may retain a newer carrier while dropping one from an older tool turn. After a
-// restart the newer turn must still recover its reasoning under the opaque public call ID, while
-// the older turn independently falls back to its visible transcript instead of wedging the request.
 func TestDroppedOlderCarrierDegradesAlongsideNewerCarrierAfterRestart(t *testing.T) {
 	_, route, items, published := publishCarrierParityTurn(t, "upstream-recent")
 	recent := published.Projection.Calls[0]
@@ -293,10 +264,8 @@ func TestDroppedOlderCarrierDegradesAlongsideNewerCarrierAfterRestart(t *testing
 
 	var logs bytes.Buffer
 	plan, err := translateChatRequestToResponses(body, responsesChatRequestOptions{
-		UpstreamModel: "gpt-upstream",
-		ReplayRoute:   route,
-		// No ReplayStore models expiry, eviction, or restart. Only the newer turn's
-		// carrier survived in the client transcript.
+		UpstreamModel:             "gpt-upstream",
+		ReplayRoute:               route,
 		CarriedReasoning:          carriedForEveryCall(t, route, published, items),
 		DegradeUnrestorableReplay: true,
 		Log:                       logger.NewWithWriter(logger.LevelInfo, &logs),
@@ -358,10 +327,6 @@ func TestDroppedOlderCarrierDegradesAlongsideNewerCarrierAfterRestart(t *testing
 
 const nativeChatReplayDegradeMessage = "forwarding responses replay IDs to native Chat without restoring their reasoning"
 
-// chatOnlyReplayTranscript is what Claude Code sends after a session switches from a
-// Responses-backed model to one that serves only native Chat: the earlier parallel turn left a
-// self-describing ID, an opaque ID, and a reasoning carrier in a transcript the client cannot
-// repair.
 func chatOnlyReplayTranscript(t *testing.T, model string) (anthropic string, ids []string) {
 	t.Helper()
 	selfID, ok := responsesChatReplaySelfDescribingID("call_upstream_lookup")
@@ -397,20 +362,14 @@ func chatOnlyReplayChatRequest(model string, ids []string) string {
 		{"role":"tool","tool_call_id":"` + ids[1] + `","content":"second"}]}`
 }
 
-// chatOnlyUpstream serves native Chat only, answering a forced stream with SSE and anything
-// else with JSON, and records every request it receives.
 type chatOnlyUpstream struct {
 	*httptest.Server
-	mu     sync.Mutex
-	paths  []string
-	bodies []string
-	// rejectMaxCompletionTokens answers max_completion_tokens with the 400 that sends the
-	// count-token probe through its max_tokens protocol-recovery retry.
+	mu                        sync.Mutex
+	paths                     []string
+	bodies                    []string
 	rejectMaxCompletionTokens bool
-	// catalogStatus, once set, answers /models: 200 serves catalogBody, anything else fails
-	// discovery.
-	catalogStatus int
-	catalogBody   string
+	catalogStatus             int
+	catalogBody               string
 }
 
 func newChatOnlyUpstream(t *testing.T, upstreamModel string) *chatOnlyUpstream {
@@ -496,8 +455,6 @@ func (u *chatOnlyUpstream) requests() (paths, bodies []string) {
 	return append([]string(nil), u.paths...), append([]string(nil), u.bodies...)
 }
 
-// assertReplayIDsForwardedVerbatim requires the native Chat request to carry every replay ID,
-// in order, on both the assistant calls and their results -- and no reasoning carrier.
 func assertReplayIDsForwardedVerbatim(t *testing.T, body string, ids []string) {
 	t.Helper()
 	var sent struct {
@@ -541,8 +498,6 @@ func nativeChatReplayDegradeEntries(t *testing.T, logs string) []map[string]any 
 	return entries
 }
 
-// assertNativeChatReplayDegradeEntry pins the whole entry, so a call ID or any content added
-// to the line fails here rather than reaching operator logs.
 func assertNativeChatReplayDegradeEntry(t *testing.T, entry map[string]any, route map[string]any) {
 	t.Helper()
 	want := map[string]any{"level": "info", "msg": nativeChatReplayDegradeMessage}
@@ -562,10 +517,6 @@ func assertNativeChatReplayDegradeEntry(t *testing.T, entry map[string]any, rout
 	}
 }
 
-// A model switch onto a target with no Responses backend leaves replay IDs this process cannot
-// restore there. Anthropic ingress and its count-token probe continue on native Chat with the
-// IDs unchanged and no reasoning restored, which is the visible-transcript degrade with nothing
-// left to restore. Native Chat stays strict: it owns its history and can restart the turn.
 func TestResponsesChatReplayContinuesOnChatOnlyModelWhileNativeChatRefuses(t *testing.T) {
 	upstream := newChatOnlyUpstream(t, "gpt-upstream")
 	h := newChatExecutionTestHandler(t, upstream.URL, []string{providerEndpointChatCompletions})
@@ -616,10 +567,6 @@ func TestResponsesChatReplayContinuesOnChatOnlyModelWhileNativeChatRefuses(t *te
 	}
 }
 
-// An unknown model on a dynamic provider may still serve Responses once its catalog answers, so
-// a failed discovery proves nothing about restoring its replay: the turn is refused as before
-// rather than continued without its reasoning. Once the catalog lists the model as Chat-only,
-// the same transcript continues.
 func TestResponsesChatReplayChatOnlyDegradeRequiresCatalogedModel(t *testing.T) {
 	upstream := newChatOnlyUpstream(t, "dyn-model")
 	upstream.serveCatalog(http.StatusServiceUnavailable, "")
@@ -679,8 +626,6 @@ func TestResponsesChatReplayChatOnlyDegradeRequiresCatalogedModel(t *testing.T) 
 	assertNativeChatReplayDegradeEntry(t, entries[0], map[string]any{"provider": "dynamic", "model": "dyn-model"})
 }
 
-// The schema-v2 route takes the same decision in its own endpoint selection, before a route
-// operation is admitted, and the log names the route rather than one of its targets.
 func TestResponsesChatReplayContinuesOnChatOnlyExplicitRouteWhileNativeChatRefuses(t *testing.T) {
 	primary := newChatOnlyUpstream(t, "physical-primary")
 	secondary := newChatOnlyUpstream(t, "physical-secondary")
@@ -708,8 +653,6 @@ func TestResponsesChatReplayContinuesOnChatOnlyExplicitRouteWhileNativeChatRefus
 	}
 	assertNativeChatReplayDegradeEntry(t, entries[0], map[string]any{"model": "public-model", "route_id": "route-public"})
 
-	// The count-token probe continues the same way. Its max_tokens protocol-recovery retry
-	// re-enters endpoint selection, yet it is still one request and one log entry.
 	primary.rejectMaxCompletionTokensParam()
 	countRec := httptest.NewRecorder()
 	h.HandleAnthropicMessagesCountTokens(countRec, httptest.NewRequest(http.MethodPost, providerEndpointMessages+"/count_tokens", strings.NewReader(anthropic)))
@@ -739,8 +682,6 @@ func TestResponsesChatReplayContinuesOnChatOnlyExplicitRouteWhileNativeChatRefus
 	}
 }
 
-// A policy plan already resolved or refused its replay against the tier that recorded it, so
-// it keeps failing closed on a Chat-only terminal even where a direct route would degrade.
 func TestResponsesChatReplayChatOnlyDegradeExcludesPolicyPlans(t *testing.T) {
 	h := newExplicitRouteSurfaceHandler(t, providerTypeOpenAICompatible, providerEndpointChatCompletions, "http://primary.invalid", "http://secondary.invalid")
 	route, known := h.resolveModelRouteForRequest("public-model", providerEndpointChatCompletions)

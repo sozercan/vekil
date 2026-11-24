@@ -14,10 +14,6 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// anthropicBlockFrames returns the ordered content_block_start / content_block_stop frames of
-// an Anthropic SSE body as "start:N" / "stop:N" strings. The assertion has to read the WIRE,
-// not the stream state: every bug in this family is correct in the struct and wrong in the
-// frame order the client actually parses.
 func anthropicBlockFrames(t *testing.T, body string) []string {
 	t.Helper()
 	var frames []string
@@ -46,9 +42,6 @@ func anthropicBlockFrames(t *testing.T, body string) []string {
 	return frames
 }
 
-// Anthropic content blocks are sequential, never nested: a content_block_start must be closed
-// by its own content_block_stop before the next block opens. A client that builds blocks from
-// this stream cannot attribute deltas once the frames interleave.
 func requireSequentialBlocks(t *testing.T, body string) {
 	t.Helper()
 	frames := anthropicBlockFrames(t, body)
@@ -84,16 +77,6 @@ func carrierTestTurn() carriedTurn {
 	}}
 }
 
-// THE INVARIANT, at the level of the state machine: no block opens inside another. emitText
-// closes open tool blocks and startToolCall closes the open text block, so those two can
-// never overlap on their own. The carrier is the one entry point reachable with either kind
-// open, so emitCarriedReasoning closes BOTH before opening its thinking block.
-//
-// It closed only tool blocks when this test was written. With a text block open it nested
-// its thinking block inside, and finish() stopped the outer one afterwards -- [start:0
-// start:1 stop:1 stop:0] on the wire, which is not a valid Anthropic stream. This is the
-// regression guard for that fix, not a description of it: restore the tools-only close and
-// requireSequentialBlocks fails here while the control below still passes.
 func TestCarriedReasoningDoesNotOpenItsBlockInsideAnOpenTextBlock(t *testing.T) {
 	rec := httptest.NewRecorder()
 	state := newAnthropicStreamState(rec, "gpt-public", "msg_order")
@@ -115,8 +98,6 @@ func TestCarriedReasoningDoesNotOpenItsBlockInsideAnOpenTextBlock(t *testing.T) 
 	requireSequentialBlocks(t, rec.Body.String())
 }
 
-// The control: a tool call closes the text block on the way in, so the carrier that follows
-// opens at the top level. This is the ordering the Responses path actually produces.
 func TestCarriedReasoningAfterAToolCallKeepsBlocksSequential(t *testing.T) {
 	rec := httptest.NewRecorder()
 	state := newAnthropicStreamState(rec, "gpt-public", "msg_order")
@@ -145,10 +126,6 @@ func TestCarriedReasoningAfterAToolCallKeepsBlocksSequential(t *testing.T) {
 	requireSequentialBlocks(t, rec.Body.String())
 }
 
-// Copilot's stated precondition, end to end: a Responses turn whose function_call item is
-// followed by a message item carrying text. This is the reachability question -- the
-// translation defers every tool chunk to response.completed while text deltas go out as they
-// arrive, so the question is whether upstream ordering can survive into the Anthropic stream.
 func TestResponsesTurnWithTextAfterItsToolCallKeepsBlocksSequential(t *testing.T) {
 	store := newResponsesChatReplayStore()
 	t.Cleanup(func() { _ = store.Close() })
@@ -170,8 +147,6 @@ func TestResponsesTurnWithTextAfterItsToolCallKeepsBlocksSequential(t *testing.T
 	}
 	body := rec.Body.String()
 
-	// Guard against passing vacuously: the turn must really have carried text, a tool call
-	// and a carrier, or the ordering it claims to exercise never happened.
 	for _, required := range []string{`"type":"text"`, `"type":"tool_use"`, "signature_delta", reasoningCarrierPrefix} {
 		if !strings.Contains(body, required) {
 			t.Fatalf("stream never emitted %s; this test would prove nothing:\n%s", required, body)
@@ -180,8 +155,6 @@ func TestResponsesTurnWithTextAfterItsToolCallKeepsBlocksSequential(t *testing.T
 	requireSequentialBlocks(t, body)
 }
 
-// function_call at output_index 0, then a message with text at output_index 1 -- the exact
-// upstream shape the claim names. Shapes copied from stream_one_tool_call.sse and stream_text.sse.
 const textAfterToolCallSSE = `event: response.created
 data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_order_001","object":"response","created_at":1700000000,"status":"in_progress","error":null,"incomplete_details":null,"model":"gpt-synthetic-responses","output":[],"parallel_tool_calls":true,"usage":null,"metadata":{}}}
 

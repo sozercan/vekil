@@ -29,8 +29,6 @@ func (status trayStatus) tooltip() string {
 	}
 }
 
-// trayStatus takes one lifecycle snapshot; authentication is independent of
-// whether a provider-only proxy is running.
 func (l *menubarProxyLifecycle) trayStatus() trayStatus {
 	l.mu.Lock()
 	defer l.mu.Unlock()

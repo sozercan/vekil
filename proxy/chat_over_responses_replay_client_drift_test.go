@@ -11,8 +11,6 @@ import (
 	"github.com/sozercan/vekil/models"
 )
 
-// clientDriftFixture publishes one turn, hands back the carrier the client would hold,
-// and a Chat body replaying that turn with `returned` as the call's arguments.
 func clientDriftFixture(t *testing.T, store *responsesChatReplayStore, route responsesChatReplayRoute, name, emitted, returned string, optionalDefaults ...responsesChatReplayOptionalDefaults) (map[string]carriedReplay, []byte, string) {
 	t.Helper()
 	items := []json.RawMessage{
@@ -63,8 +61,6 @@ func clientDriftFixture(t *testing.T, store *responsesChatReplayStore, route res
 	return carried, body, callID
 }
 
-// requireStoreRejectsArguments keeps the fixture honest: if the store ever starts
-// accepting the client's rewrite, these tests must fail rather than pass vacuously.
 func requireStoreRejectsArguments(t *testing.T, store *responsesChatReplayStore, route responsesChatReplayRoute, callID, name, returned string) {
 	t.Helper()
 	_, err := resolveResponsesChatReplay(store, route, responsesChatReplayAssistantProjection{
@@ -76,9 +72,6 @@ func requireStoreRejectsArguments(t *testing.T, store *responsesChatReplayStore,
 	}
 }
 
-// A carrier must not restore reasoning or opaque call bindings for arguments the replay
-// store itself rejects. These edits were observed from clients, but they are not equivalent
-// to the call Vekil published unless the publication explicitly recorded a schema default.
 func TestClientRewrittenArgumentsAreRejectedByCarrier(t *testing.T) {
 	for _, testCase := range []struct {
 		name     string
@@ -167,8 +160,6 @@ func restoredFunctionCall(t *testing.T, input string) map[string]any {
 	return nil
 }
 
-// A degrade must name both sides from evidence vekil owns: what the store rejected, and
-// which carrier guard then refused. Neither may be inferred from anything the client sent.
 func TestDegradeLogNamesBothSidesFromVekilsOwnGuards(t *testing.T) {
 	emitted := `{"file_path":"/tmp/a","new_string":"b","old_string":"a"}`
 	returned := `{"file_path":"/tmp/a","new_string":"b","old_string":"a","replace_all":false}`
@@ -241,7 +232,6 @@ func TestDegradeLogNamesBothSidesFromVekilsOwnGuards(t *testing.T) {
 				t.Fatalf("log = diverged %#v carrier %#v, want %q and %q in %#v",
 					entry["diverged"], entry["carrier"], testCase.diverged, testCase.wantCarrier, entry)
 			}
-			// Only an untouched projection reproduces the digest the turn was published under.
 			fingerprint, _ := entry["projection"].(string)
 			published := carriedProjectionDigest(canonicalDriftContent(t), []responsesChatReplayProjectedCall{{ID: callID, Name: "Edit", Arguments: emitted}})
 			if fingerprint == "" || (fingerprint == published) != testCase.published {
@@ -275,7 +265,6 @@ func reroutedCarrier(t *testing.T, carried map[string]carriedReplay, route respo
 	return rerouted
 }
 
-// A digest is client input; one that is not ours must not travel into a restore key.
 func TestCarrierProjectionDigestMustLookLikeADigest(t *testing.T) {
 	route := responsesChatReplayRoute{ProviderID: "provider-a", PublicModel: "gpt-public"}
 	items := []json.RawMessage{json.RawMessage(`{"type":"function_call","call_id":"upstream-call-1","name":"lookup","arguments":"{}"}`)}

@@ -248,7 +248,6 @@ main() {
   SMOKE_CURL_MAX_TIME_SECONDS=20 \
   "${SMOKE_SCRIPT}" > "${STDOUT_FILE}" 2> "${STDERR_FILE}"
 
-  # Startup preflight plus one classifier request for each terminal request.
   jq -e '
     (.errors | length) == 0
     and ([.requests[] | select(.kind == "classifier" and .effort != null)] | length) == 0

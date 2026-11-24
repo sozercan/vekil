@@ -131,8 +131,6 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 		messageContent = append(messageContent, map[string]any{"type": "output_text", "text": text, "annotations": []any{}})
 	}
 	if refusalPresent {
-		// Codex CLI's Responses decoder accepts output_text but not the newer
-		// refusal content variant. Preserve the refusal text in the portable shape.
 		messageContent = append(messageContent, map[string]any{"type": "output_text", "text": refusal, "annotations": []any{}})
 	}
 	if len(messageContent) > 0 {
@@ -144,9 +142,6 @@ func buildPolicyResponsesResponse(completion *models.OpenAIResponse, publicModel
 			"content": messageContent,
 		})
 	}
-	// Never expose a function call as executable when Chat terminated before a
-	// complete answer. Codex consumes output_item.done calls before the terminal
-	// event, so a length/content-filter truncation must not dispatch partial JSON.
 	if executableToolCalls {
 		seenCallIDs := make(map[string]struct{}, len(choice.Message.ToolCalls))
 		for _, call := range choice.Message.ToolCalls {

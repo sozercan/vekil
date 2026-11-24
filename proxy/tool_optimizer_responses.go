@@ -157,9 +157,6 @@ func replaceTopLevelRawJSONField(bodyBytes []byte, field string, replacement jso
 		if key != field {
 			continue
 		}
-		// Duplicate top-level keys are not a valid Responses shape, but if
-		// one appears, rewrite every occurrence so downstream first-key/last-key
-		// parser differences cannot observe a stale value.
 		out.Write(bodyBytes[lastCopyOffset:valueStart])
 		out.Write(replacement)
 		lastCopyOffset = valueEnd
@@ -307,9 +304,6 @@ var (
 	responsesJSONUnicodeEscapeMarker = []byte(`\u`)
 )
 
-// responsesPayloadMayContainOptimizableToolItems avoids decoding replay items
-// that cannot be tool calls or tool outputs. Unicode escapes force inspection to
-// avoid missing an escaped type value.
 func responsesPayloadMayContainOptimizableToolItems(payload []byte) bool {
 	return bytes.Contains(payload, responsesFunctionCallMarker) ||
 		bytes.Contains(payload, responsesLocalShellCallMarker) ||

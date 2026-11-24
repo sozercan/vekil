@@ -195,7 +195,6 @@ func TestConversationMigrationPreservesToolsBranchesAndRestart(t *testing.T) {
 			if rawJSONString(first["id"]) != "east-1" {
 				t.Fatal("initial turn did not use east")
 			}
-			// The client performs a local side effect once and supplies its result.
 			sideEffect := filepath.Join(t.TempDir(), "side-effect.txt")
 			if err := os.WriteFile(sideEffect, []byte("cedar\n"), 0o600); err != nil {
 				t.Fatal(err)
@@ -298,8 +297,6 @@ func TestConversationMigrationBlocksUnsafeRequestsAndRetries(t *testing.T) {
 						}
 						return nil, io.ErrUnexpectedEOF
 					case "partial stream":
-						// Complete arguments may already be running on the client,
-						// but without the finished item Vekil cannot save them.
 						return routeExecutorTestResponse(req, 200, http.Header{"Content-Type": {"text/event-stream"}}, "data: "+`{"type":"response.function_call_arguments.done","item_id":"fc-1","output_index":0,"arguments":"{}"}`+"\n\n"), nil
 					case "encrypted rejection":
 						return routeExecutorTestResponse(req, 400, nil, `{"error":{"message":"encrypted content could not be verified"},"usage":{"output_tokens":1}}`), nil
@@ -450,12 +447,9 @@ func TestConversationMigrationBranchesCodexSideThread(t *testing.T) {
 		}
 	}()
 	<-mainTurn.entered
-	// The main thread's own retry, and another thread of a client that may not
-	// resend what it received, still wait for the active turn.
 	for name, headers := range map[string]http.Header{"same thread": codex("main"), "unrecognized client": {"Session-Id": {"other"}, "Thread-Id": {"other"}}} {
 		inProgress(name, conversationPOST(t, h, map[string]any{"input": append(append([]any{}, seeded...), user("Meanwhile."))}, headers))
 	}
-	// A Codex side conversation forked from the working thread proceeds.
 	sideHistory := append(append([]any{}, seeded...), user("Side question."))
 	go func() {
 		defer wg.Done()
@@ -465,12 +459,8 @@ func TestConversationMigrationBranchesCodexSideThread(t *testing.T) {
 		}
 	}()
 	<-sideTurn.entered
-	// Its retry resolves to the main conversation again, and waits for the side
-	// turn rather than branching once more.
 	inProgress("side retry", conversationPOST(t, h, map[string]any{"input": sideHistory}, codex("side")))
 	close(sideTurn.release)
-	// The side conversation continues from its own saved history once its turn
-	// settles.
 	sideHistory = append(sideHistory, answer("thread-3"), user("Side follow-up."))
 	for deadline := time.Now().Add(5 * time.Second); ; {
 		result := conversationPOST(t, h, map[string]any{"input": sideHistory}, codex("side"))

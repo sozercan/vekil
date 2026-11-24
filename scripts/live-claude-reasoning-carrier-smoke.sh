@@ -108,7 +108,6 @@ fi
 [[ "${PROXY_PORT}" =~ ^[0-9]+$ ]] || die "PROXY_PORT must be numeric: ${PROXY_PORT}"
 [[ "${PROXY_PORT}" != "1337" ]] || die "Claude carrier smoke must not use the default port 1337"
 
-# Vekil joins host and port itself, so its bind host must carry IPv6 brackets too.
 PROXY_HOST="$(url_host)"
 PROXY_BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}"
 TMP_PARENT="${LIVE_CLAUDE_REASONING_CARRIER_SMOKE_TMP_PARENT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
@@ -144,7 +143,6 @@ MISSING_CARRIER_COMPLEX_MARKER="VEKIL_MISSING_CARRIER_COMPLEX_OK"
 OPAQUE_CALL_OLD="call_vekil_DDDDDDDDDDDDDDDDDDDDDD"
 OPAQUE_CALL_PARALLEL_ONE="call_vekil_EEEEEEEEEEEEEEEEEEEEEE"
 OPAQUE_CALL_PARALLEL_TWO="call_vekil_FFFFFFFFFFFFFFFFFFFFFF"
-# Expanded by the Bash tool inside Claude, not by this harness.
 # shellcheck disable=SC2016
 EXPECTED_TOOL_COMMAND='test -z "${COPILOT_GITHUB_TOKEN+x}" && printf started > .vekil-carrier-tool-started; while [ ! -f .vekil-carrier-proxy-ready ]; do sleep 0.1; done; printf VEKIL_CARRIER_TOOL_RESULT'
 CLAUDE_BASH_ALLOW_RULE="Bash(${EXPECTED_TOOL_COMMAND})"
@@ -462,8 +460,6 @@ fetch_models() {
 }
 
 pick_responses_only_gpt_model() {
-  # Luna utility must satisfy the same native endpoint and tool contract as the old
-  # Sol preference. Never fall back to another catalog entry.
   jq -e '
     .data[]?
     | select(.id == "gpt-5.6-luna-utility")
@@ -740,10 +736,6 @@ post_anthropic_request() {
   chmod 600 "${response_path}"
 }
 
-# Reproduce the review's three-way-empty case against the restarted live proxy: the replay
-# store is gone, the client sends no carrier for the old turn, and an opaque ID remains in
-# the transcript. The second request adds two old tool turns, parallel calls, and reversed
-# result order so the check is not limited to the smallest internally-consistent pair.
 assert_missing_carrier_falls_back_live() {
   log "Validating carrier-absent opaque-ID fallback against live Copilot"
 

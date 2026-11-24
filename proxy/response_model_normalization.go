@@ -21,9 +21,7 @@ type explicitRouteResponseInfo struct {
 	providerID    string
 	stateIdentity [32]byte
 	conversation  *conversationTurn
-	// upstreamEnd is set for conversation turns and shared by every copy of
-	// one attempt's info, so the attempt's transport body can record it.
-	upstreamEnd *upstreamBodyEnd
+	upstreamEnd   *upstreamBodyEnd
 }
 
 type explicitRouteResponseContextKey struct{}
@@ -56,14 +54,8 @@ func rewriteResponsesResponseModelJSON(body []byte, publicModel string) ([]byte,
 	var changed bool
 	eventTypeRaw, hasEventType := payload["type"]
 	if !hasEventType {
-		// Non-streaming Responses payloads expose the Response object at the
-		// root, so the configured public model must be present regardless of
-		// what the upstream returned in model.
 		changed = rewriteResponsesModelObject(payload, publicModel)
 	} else if responsesLifecycleEventHasResponse(rawJSONString(eventTypeRaw)) {
-		// Streaming lifecycle envelopes expose the actual Response object under
-		// response. Other event kinds, including output-item and vendor events,
-		// do not own a response model and must remain transparent.
 		nested, ok := payload["response"]
 		if !ok {
 			return body, false
@@ -108,15 +100,11 @@ func responsesLifecycleEventHasResponse(eventType string) bool {
 }
 
 func validateUnambiguousResponsesJSON(data []byte) error {
-	// Token does not enforce the nesting limit in the legacy JSON decoder.
-	// Validate first so the recursive duplicate-key scan has the same bound as
-	// Unmarshal, including when built with GOEXPERIMENT=nojsonv2.
 	if !json.Valid(data) {
 		return errors.New("expected one complete JSON response within the nesting limit")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	// Responses validation reports no paths, so it skips segment tracking.
 	if err := scanJSONValueForDuplicateKeys(decoder, false); err != nil {
 		return err
 	}
@@ -153,8 +141,6 @@ func writeExplicitResponsesResponse(ctx context.Context, h *ProxyHandler, w http
 		observeResponsesUsage(ctx, sniffResponsesUsageBody(data))
 	}
 	if success || durable {
-		// A final error is still an exposure boundary. Bind its structured state
-		// and headers atomically too; abandoned attempts never reach this writer.
 		var bodyTokens []stateBindingToken
 		var tokenErr error
 		emptyAllowed := durable && (!success || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusResetContent)
@@ -236,9 +222,6 @@ func (b *normalizedResponsesStreamBody) Close() error {
 	return err
 }
 
-// normalizeResponsesStreamBody rewrites each event's model and writes the event
-// to the returned body in one pipe write. written, when set, receives the size of
-// each write after the reader has consumed it.
 func normalizeResponsesStreamBody(source io.ReadCloser, publicModel string, onEvent func([]byte) error, written func(int), transforms ...func([]byte) ([]byte, error)) io.ReadCloser {
 	if source == nil || strings.TrimSpace(publicModel) == "" {
 		return source
@@ -409,13 +392,8 @@ func normalizeResponsesStreamBodyWithBinding(h *ProxyHandler, source io.ReadClos
 		}
 		if err != nil {
 			if durable {
-				// A malformed state-bearing event cannot establish durable proof.
-				// Keep memory-only compatibility, but never expose it in this mode.
 				return fmt.Errorf("malformed explicit route responses state")
 			}
-			// Streaming headers are already committed. Vendor extensions and
-			// malformed events must remain transparent instead of terminating the
-			// downstream pipe; only successfully extracted state is bindable.
 			return nil
 		}
 		if durable {

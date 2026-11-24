@@ -17,10 +17,6 @@ const (
 
 var benchmarkRouteExecutorByteSink byte
 
-// BenchmarkExplicitRoutePreparedStreamTTFT measures the explicit-route
-// precommit path through the point where the committed prepared body hands its
-// first byte to the downstream reader. The standard ns/op includes cleanup;
-// ttft-ns/op stops at the first downstream byte.
 func BenchmarkExplicitRoutePreparedStreamTTFT(b *testing.B) {
 	first, _, err := benchmarkPreparedStreamFirstByte()
 	if err != nil {
@@ -81,10 +77,6 @@ func benchmarkPreparedStreamFirstByte() (byte, time.Duration, error) {
 	return first[0], ttft, nil
 }
 
-// BenchmarkRouteAttemptStatsConcurrentContention models concurrent successful
-// failovers against the one process-wide stats collector. Each benchmark op is
-// exactly two physical attempts and one target switch; assertions stay outside
-// the timed parallel loop.
 func BenchmarkRouteAttemptStatsConcurrentContention(b *testing.B) {
 	h := &ProxyHandler{stats: newStatsCollector()}
 	ctx := context.Background()
@@ -133,10 +125,6 @@ func BenchmarkRouteAttemptStatsConcurrentContention(b *testing.B) {
 	b.ReportMetric(1, "switches/op")
 }
 
-// BenchmarkExplicitRouteTwoTargetFailover64MiB exercises the worst-case request
-// body size through an authoritative primary rejection and one secondary send.
-// Run with -benchmem to capture allocation pressure; sends/op and the exact
-// per-target/body-byte totals are checked after the timed loop.
 func BenchmarkExplicitRouteTwoTargetFailover64MiB(b *testing.B) {
 	const requestSize = 64 << 20
 	requestBody := makeBenchmarkRouteRequestBody(requestSize)
