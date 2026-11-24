@@ -74,7 +74,7 @@ When adding `proxy/*.go`, follow the nearest existing responsibility and naming 
 
 ## CI
 
-[`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) is the deterministic core CI workflow; `golangci-lint` runs with `only-new-issues: true`. Live provider smokes remain separate so the core workflow does not depend on provider credentials or availability.
+[`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) is the deterministic core CI workflow; `golangci-lint` reports findings on changed lines. Live provider smokes remain separate so the core workflow does not depend on provider credentials or availability.
 
 Never switch a live smoke workflow to `pull_request_target`. Credentialed smokes must never execute pull-request-controlled code or data in a privileged context, and credential-free smokes do not need the privileged base-repository context.
 
