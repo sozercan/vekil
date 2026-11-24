@@ -46,7 +46,7 @@ Supported subset:
 - `contents[].parts[].text`
 - `contents[].parts[].inlineData` for `image/*`
 - `contents[].parts[].functionCall`
-- `contents[].parts[].functionResponse`
+- `contents[].parts[].functionResponse`, in `user` or `model` contents (some clients, such as Antigravity, send tool results under `model`); each must match a prior `functionCall`. Results are grouped directly after the assistant turn that issued their calls, so text interleaved between results follows them
 - `tools[].functionDeclarations` with `parameters` or `parametersJsonSchema`
 - `toolConfig.functionCallingConfig`
 - `generationConfig.temperature`, `topP`, `maxOutputTokens`, `stopSequences`
@@ -73,7 +73,7 @@ Explicit `501 UNIMPLEMENTED` cases include:
 - Gemini built-in tools such as `googleSearch`, `urlContext`, `codeExecution`, `googleMaps`, `computerUse`, and `enterpriseWebSearch`
 - non-image `inlineData`, `fileData`, and other non-text/media parts
 
-Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches, explicit content roles other than `user` or `model`, malformed content parts, invalid function-call history, and unmatched `functionResponse` parts.
+Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches, explicit content roles other than `user` or `model`, malformed content parts, invalid function-call history, unmatched `functionResponse` parts, and `functionResponse` parts that answer a call from an earlier tool-call batch after a newer batch has started (for example `call A, call B, response A, call C, response B`), which cannot be represented as valid Chat Completions history.
 
 `functionResponse.response` objects retain their JSON structure when translated for generic Gemini clients. For Gemini CLI requests, an exact one-field `{"output":"<text>"}` response is unwrapped to the text value; responses with metadata or non-string `output` values remain structured JSON.
 

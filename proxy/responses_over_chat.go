@@ -148,6 +148,19 @@ func responsesOverChatCapabilitiesFromRaw(raw json.RawMessage) responsesOverChat
 	}
 }
 
+func classifyResponsesCompatibility(allowsChat, allowsResponses bool, caps responsesOverChatCapabilities) (responsesExecutionMode, string) {
+	switch {
+	case allowsResponses:
+		return responsesExecutionNative, ""
+	case !allowsChat:
+		return responsesExecutionUnsupported, "model has no native Chat Completions endpoint"
+	case caps.toolCalls != nil && !*caps.toolCalls:
+		return responsesExecutionUnsupported, "model does not advertise function-tool support"
+	default:
+		return responsesExecutionOverChat, ""
+	}
+}
+
 func (h *ProxyHandler) resolveResponsesCompatibility(ctx context.Context, model string) responsesCompatibility {
 	model = strings.TrimSpace(model)
 	compat := responsesCompatibility{mode: responsesExecutionNative, publicModel: model}
@@ -164,19 +177,9 @@ func (h *ProxyHandler) resolveResponsesCompatibility(ctx context.Context, model 
 			return compat
 		}
 		compat.publicModel = route.public.id
-		if route.supportsEndpoint(providerEndpointResponses) {
-			return compat
-		}
-		if !route.supportsEndpoint(providerEndpointChatCompletions) {
-			compat.mode, compat.reason = responsesExecutionUnsupported, "model has no native Chat Completions endpoint"
-			return compat
-		}
 		caps := responsesOverChatCapabilitiesFromRaw(route.public.raw)
-		if caps.toolCalls != nil && !*caps.toolCalls {
-			compat.mode, compat.reason = responsesExecutionUnsupported, "model does not advertise function-tool support"
-			return compat
-		}
-		compat.mode = responsesExecutionOverChat
+		compat.mode, compat.reason = classifyResponsesCompatibility(
+			route.supportsEndpoint(providerEndpointChatCompletions), route.supportsEndpoint(providerEndpointResponses), caps)
 		compat.reasoningEfforts = caps.reasoningEfforts
 		return compat
 	}
@@ -190,22 +193,94 @@ func (h *ProxyHandler) resolveResponsesCompatibility(ctx context.Context, model 
 		compat.mode, compat.reason = responsesExecutionUnsupported, "model is not in the provider model catalog"
 		return compat
 	}
-	if chatRouteAllowsEndpoint(route.provider, route.owner, route.known, providerEndpointResponses) {
-		return compat
-	}
-	if route.backend != chatBackendNativeChat {
-		compat.mode, compat.reason = responsesExecutionUnsupported, "model has no native Chat Completions endpoint"
-		return compat
-	}
 	caps := responsesOverChatCapabilitiesFromRaw(route.owner.raw)
-	if caps.toolCalls != nil && !*caps.toolCalls {
-		compat.mode, compat.reason = responsesExecutionUnsupported, "model does not advertise function-tool support"
-		return compat
-	}
-	compat.mode = responsesExecutionOverChat
+	compat.mode, compat.reason = classifyResponsesCompatibility(
+		route.backend == chatBackendNativeChat,
+		chatRouteAllowsEndpoint(route.provider, route.owner, route.known, providerEndpointResponses),
+		caps)
 	compat.reasoningEfforts = caps.reasoningEfforts
 	compat.nativeChat = &route
 	return compat
+}
+
+const responsesCompatibilityCatalogField = "vekil_responses_compatibility"
+
+func (h *ProxyHandler) annotateResponsesOverChatCatalog(body []byte) ([]byte, map[string]struct{}) {
+	if h == nil {
+		return body, nil
+	}
+	var catalog map[string]json.RawMessage
+	if json.Unmarshal(body, &catalog) != nil {
+		return body, nil
+	}
+	var data []json.RawMessage
+	if json.Unmarshal(catalog["data"], &data) != nil {
+		return body, nil
+	}
+	changed := false
+	annotated := make(map[string]struct{})
+	for index, raw := range data {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) != nil {
+			continue
+		}
+		hadMarker := false
+		for key := range fields {
+			if strings.EqualFold(key, responsesCompatibilityCatalogField) {
+				delete(fields, key)
+				hadMarker = true
+			}
+		}
+		if !hadMarker && len(h.responsesOverChatModels) == 0 {
+			continue
+		}
+		var entry struct {
+			ID                 string   `json:"id"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+		}
+		_ = json.Unmarshal(raw, &entry)
+		eligible := false
+		if h.responsesOverChatOptedIn(entry.ID) && len(entry.SupportedEndpoints) > 0 {
+			if _, policy := h.policyPublicModelID(entry.ID); !policy {
+				mode, _ := classifyResponsesCompatibility(
+					supportsEndpoint(entry.SupportedEndpoints, providerEndpointChatCompletions),
+					supportsEndpoint(entry.SupportedEndpoints, providerEndpointResponses),
+					responsesOverChatCapabilitiesFromRaw(raw))
+				eligible = mode == responsesExecutionOverChat
+			}
+		}
+		if eligible {
+			fields[responsesCompatibilityCatalogField] = json.RawMessage(`"` + responsesExecutionOverChat.String() + `"`)
+		}
+		if !eligible && !hadMarker {
+			continue
+		}
+		rewritten, err := json.Marshal(fields)
+		if err != nil {
+			continue
+		}
+		data[index] = rewritten
+		changed = true
+		if eligible {
+			annotated[strings.TrimSpace(entry.ID)] = struct{}{}
+		}
+	}
+	if !changed {
+		return body, nil
+	}
+	rawData, err := json.Marshal(data)
+	if err != nil {
+		return body, nil
+	}
+	catalog["data"] = rawData
+	rewritten, err := json.Marshal(catalog)
+	if err != nil {
+		return body, nil
+	}
+	if len(annotated) == 0 {
+		annotated = nil
+	}
+	return rewritten, annotated
 }
 
 func applyResponsesOverChatReasoning(body []byte, compat responsesCompatibility) ([]byte, error) {

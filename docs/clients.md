@@ -76,6 +76,49 @@ Codex resolves the built-in `openai` provider's endpoint from the `openai_base_u
 
 For this manual configuration, Codex's built-in `openai` provider probes the [Responses WebSocket bridge](responses-websocket.md) before falling back to HTTP streaming. When the bridge is disabled — the default — that probe logs a single `426 Upgrade Required` at startup and the session proceeds normally over HTTP. The managed launcher disables this WebSocket probe.
 
+## Chat-only models in Codex (Responses-over-Chat)
+
+Codex can use a Chat-only model, such as a Copilot Gemini model, only when the proxy opts it in: start Vekil with `--responses-over-chat-models gemini-3.8-flash` (or `RESPONSES_OVER_CHAT_MODELS`, which the tray app also reads). [`vekil launch codex --model gemini-3.8-flash --responses-over-chat-models gemini-3.8-flash`](agent-launchers.md#chat-only-models-in-codex-responses-over-chat) does this and applies every client restriction automatically. See [Responses-over-Chat](responses.md#responses-compatibility-over-a-native-chat-model-responses-over-chat) for the supported contract.
+
+For a manually configured Codex, keep these models on a separate provider and profile so their restrictions do not change your normal OpenAI configuration. Codex does not fetch a model catalog from a custom provider, so save Vekil's Codex catalog entry for the model to a file and point the profile at it; without it, Codex runs the model with fallback metadata and none of the adapter's restrictions.
+
+```toml
+# ~/.codex/config.toml: the provider is inert until a profile selects it
+[model_providers.vekil-chat]
+name = "Vekil (Responses-over-Chat)"
+base_url = "http://127.0.0.1:1337/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+```
+
+```bash
+curl -s http://127.0.0.1:1337/v1/models \
+  | jq '{models: [.models[] | select(.slug == "gemini-3.8-flash")]}' \
+  > ~/.codex/vekil-gemini-models.json
+```
+
+```toml
+# ~/.codex/vekil-gemini.config.toml: current Codex releases read each profile from its own file
+model_provider = "vekil-chat"
+model = "gemini-3.8-flash"
+model_catalog_json = "/absolute/path/to/.codex/vekil-gemini-models.json"
+web_search = "disabled"
+
+[features]
+remote_compaction_v2 = false
+code_mode = false
+code_mode_only = false
+```
+
+```bash
+codex -p vekil-gemini
+```
+
+The saved entry comes from the provider's `/v1/models` `models` array, where an opted-in model is listed with Responses Lite, hosted search, and reasoning summaries disabled, no freeform `apply_patch` tool, text-only input, and reasoning levels from the provider's metadata. Its `data` entry carries `vekil_responses_compatibility: "responses_over_chat"` and keeps the native `supported_endpoints`. `model_catalog_json` replaces Codex's catalog only for this profile; save the entry again after upgrading Vekil. Codex binds each session to its provider ID, so keep `vekil-chat` stable to resume sessions. Settings Codex applies to every model of a provider, rather than per model, must be set on this separate provider.
+
+The Codex desktop app has been verified with this adapter: model selection, tool round trips, follow-up turns, resume after relaunch, and local compaction. In that run the profile's settings were placed at the top level of `config.toml` in a separate Codex home, and the app was started with `open -n -a ChatGPT --env CODEX_HOME=<dir>`, so the normal Codex setup was untouched. Selecting a profile from within the desktop app was not tested.
+
 ## GitHub Copilot CLI
 
 Use [`vekil launch copilot`](agent-launchers.md) for an ephemeral offline/BYOK session, or configure an already-running proxy manually. The manual example below sets `COPILOT_PROVIDER_WIRE_API=responses`, so select a direct Responses-capable model. A v1 policy profile instead requires the completions wire API and a request within the v1 text/function-tool Chat contract:

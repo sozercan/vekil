@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,6 +36,7 @@ type launchAgentOptions struct {
 	startupTimeout           time.Duration
 	streamingUpstreamTimeout time.Duration
 	policyRoutingMode        proxy.PolicyRoutingMode
+	responsesOverChatModels  string
 	dryRun                   bool
 	noSummary                bool
 	forwardedArgs            []string
@@ -51,11 +53,12 @@ type launchCopilotScopeChecker interface {
 }
 
 type launchTargetSpec struct {
-	name          string
-	displayName   string
-	installHelp   string
-	requiresModel bool
-	adapter       launch.Adapter
+	name            string
+	displayName     string
+	installHelp     string
+	requiresModel   bool
+	adapter         launch.Adapter
+	responsesClient bool
 }
 
 func launchTarget(name string) (launchTargetSpec, bool) {
@@ -69,10 +72,11 @@ func launchTarget(name string) (launchTargetSpec, bool) {
 		}, true
 	case "codex":
 		return launchTargetSpec{
-			name:        "codex",
-			displayName: "Codex CLI",
-			installHelp: "install Codex CLI",
-			adapter:     launch.CodexAdapter{},
+			name:            "codex",
+			displayName:     "Codex CLI",
+			installHelp:     "install Codex CLI",
+			adapter:         launch.CodexAdapter{},
+			responsesClient: true,
 		}, true
 	case "copilot":
 		return launchTargetSpec{
@@ -152,6 +156,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	startupTimeout := fs.Duration("startup-timeout", getEnvDuration("LAUNCH_STARTUP_TIMEOUT", 2*time.Minute), "Maximum time to authenticate and become ready")
 	streamingTimeout := fs.Duration("streaming-upstream-timeout", getEnvDuration("STREAMING_UPSTREAM_TIMEOUT", proxy.DefaultStreamingUpstreamTimeout()), "Timeout for streaming upstream inference requests")
 	policyRoutingMode := fs.String("policy-routing", getPolicyRoutingModeEnv(), "Policy routing mode: config (follow providers YAML), off, observe, or enforce")
+	responsesOverChatModels := fs.String("responses-over-chat-models", getEnv("RESPONSES_OVER_CHAT_MODELS", ""), "Comma-separated public model IDs to serve on /v1/responses through their native Chat Completions endpoint (needed to launch Codex with a Chat-only model)")
 	dryRun := fs.Bool("dry-run", false, "Print the child-process plan without starting a proxy; dynamic model metadata remains unresolved")
 	noSummary := fs.Bool("no-summary", false, "Do not print an end-of-session usage summary")
 
@@ -169,6 +174,9 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 	}
 	if target.requiresModel && strings.TrimSpace(*model) == "" {
 		return opts, fmt.Errorf("--model is required")
+	}
+	if target.responsesClient && strings.TrimSpace(*responsesOverChatModels) != "" && strings.TrimSpace(*model) == "" {
+		return opts, fmt.Errorf("--model is required with --responses-over-chat-models (or RESPONSES_OVER_CHAT_MODELS) so %s runs with the adapter's restrictions; pass --model with an opted-in model, or clear the opt-in list", target.displayName)
 	}
 	portNumber, err := strconv.Atoi(strings.TrimSpace(*port))
 	if err != nil || portNumber < 0 || portNumber > 65535 {
@@ -195,6 +203,7 @@ func parseLaunchAgentOptions(target launchTargetSpec, args []string, stderr io.W
 		startupTimeout:           *startupTimeout,
 		streamingUpstreamTimeout: *streamingTimeout,
 		policyRoutingMode:        parsedPolicyRoutingMode,
+		responsesOverChatModels:  strings.TrimSpace(*responsesOverChatModels),
 		dryRun:                   *dryRun,
 		noSummary:                *noSummary,
 		forwardedArgs:            append([]string(nil), fs.Args()...),
@@ -255,6 +264,10 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		NoSummary:      opts.noSummary,
 	}
 	if opts.dryRun {
+		if err := validateLaunchDryRunResponsesOverChatModels(providersCfg, opts.responsesOverChatModels); err != nil {
+			_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
 		if opts.model != "" {
 			model, found, resolveErr := resolveLaunchDryRunModelInfo(providersCfg, opts.model)
 			if resolveErr != nil {
@@ -262,6 +275,9 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 				return 1
 			}
 			if found {
+				if launchResponsesOverChatOptedIn(opts.responsesOverChatModels, model) {
+					model.ResponsesCompatibility = launch.ResponsesOverChatCompatibility
+				}
 				launchOpts.DryRunModel = &model
 			}
 		}
@@ -304,6 +320,7 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 			proxy.WithAllowedModels(opts.model),
 			proxy.WithAuxiliaryModels(launch.AuxiliaryModels(target.adapter)...),
 			proxy.WithPolicyRoutingMode(opts.policyRoutingMode),
+			proxy.WithResponsesOverChatModels(opts.responsesOverChatModels),
 			proxy.WithDeferredDynamicProviderModelValidation(true),
 		),
 	)
@@ -347,6 +364,43 @@ func launchUsesCopilot(cfg proxy.ProvidersConfig, model string, checker launchCo
 		return cfg.UsesCopilot()
 	}
 	return checker.ModelUsesCopilot(model)
+}
+
+func launchResponsesOverChatOptedIn(optIn string, model launch.ModelInfo) bool {
+	if strings.TrimSpace(model.OwnedBy) == launch.PolicyModelOwner || len(model.SupportedEndpoints) == 0 {
+		return false
+	}
+	if supported := model.Capabilities.Supports.ToolCalls; supported != nil && !*supported {
+		return false
+	}
+	listed := false
+	for _, candidate := range strings.Split(optIn, ",") {
+		if strings.TrimSpace(candidate) == strings.TrimSpace(model.ID) {
+			listed = true
+			break
+		}
+	}
+	if !listed || slices.Contains(model.SupportedEndpoints, "/responses") {
+		return false
+	}
+	return slices.Contains(model.SupportedEndpoints, "/chat/completions")
+}
+
+func validateLaunchDryRunResponsesOverChatModels(cfg proxy.ProvidersConfig, optIn string) error {
+	for _, candidate := range strings.Split(optIn, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		model, found, err := resolveLaunchDryRunModelInfo(cfg, candidate)
+		if err != nil {
+			return fmt.Errorf("resolve dry-run model metadata: %w", err)
+		}
+		if found && strings.TrimSpace(model.OwnedBy) == launch.PolicyModelOwner {
+			return fmt.Errorf("responses-over-chat model %q is a policy model; policy models already serve /v1/responses through their own adapter", candidate)
+		}
+	}
+	return nil
 }
 
 func resolveLaunchDryRunModelInfo(cfg proxy.ProvidersConfig, modelID string) (launch.ModelInfo, bool, error) {

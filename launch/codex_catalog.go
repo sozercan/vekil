@@ -125,7 +125,7 @@ func buildCodexModelCatalog(executable resolvedExecutable, environment []string,
 	template["supported_reasoning_levels"] = levels
 	if len(validEfforts) > 0 {
 		template["default_reasoning_level"] = defaultReasoningEffort(validEfforts)
-	} else if strings.TrimSpace(model.OwnedBy) == PolicyModelOwner {
+	} else if chatBackedCodexModel(model) {
 		delete(template, "default_reasoning_level")
 	} else {
 		template["default_reasoning_level"] = "none"
@@ -134,19 +134,23 @@ func buildCodexModelCatalog(executable resolvedExecutable, environment []string,
 	template["support_verbosity"] = false
 	template["supports_search_tool"] = false
 	template["experimental_supported_tools"] = []interface{}{}
-	if strings.TrimSpace(model.OwnedBy) == PolicyModelOwner {
-		applyPolicyCodexCatalogRestrictions(template)
+	if chatBackedCodexModel(model) {
+		applyChatBackedCodexCatalogRestrictions(template)
 	}
 	template["supports_parallel_tool_calls"] = model.Capabilities.Supports.ParallelToolCalls
 	template["supports_image_detail_original"] = false
 	template["input_modalities"] = []string{"text"}
-	if model.Capabilities.Supports.Vision {
+	if model.Capabilities.Supports.Vision && !isResponsesOverChatModel(model) {
 		template["input_modalities"] = []string{"text", "image"}
 	}
 	return json.Marshal(codexCatalog{Models: []map[string]interface{}{template}})
 }
 
-func applyPolicyCodexCatalogRestrictions(template map[string]interface{}) {
+func chatBackedCodexModel(model ModelInfo) bool {
+	return strings.TrimSpace(model.OwnedBy) == PolicyModelOwner || isResponsesOverChatModel(model)
+}
+
+func applyChatBackedCodexCatalogRestrictions(template map[string]interface{}) {
 	template["apply_patch_tool_type"] = nil
 	template["use_responses_lite"] = false
 	delete(template, "tool_mode")

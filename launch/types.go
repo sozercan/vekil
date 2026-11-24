@@ -9,11 +9,14 @@ import (
 
 const PolicyModelOwner = "vekil-policy"
 
+const ResponsesOverChatCompatibility = "responses_over_chat"
+
 type ModelInfo struct {
 	ID                               string            `json:"id"`
 	Name                             string            `json:"name,omitempty"`
 	OwnedBy                          string            `json:"owned_by,omitempty"`
 	SupportedEndpoints               []string          `json:"supported_endpoints,omitempty"`
+	ResponsesCompatibility           string            `json:"vekil_responses_compatibility,omitempty"`
 	Capabilities                     ModelCapabilities `json:"capabilities,omitempty"`
 	ContextWindow                    *int64            `json:"context_window,omitempty"`
 	MaxContextWindow                 *int64            `json:"max_context_window,omitempty"`
@@ -38,6 +41,7 @@ type ModelCapabilityLimits struct {
 
 type ModelCapabilitySupports struct {
 	ReasoningEffort   []string `json:"reasoning_effort,omitempty"`
+	ToolCalls         *bool    `json:"tool_calls,omitempty"`
 	ParallelToolCalls bool     `json:"parallel_tool_calls,omitempty"`
 	Vision            bool     `json:"vision,omitempty"`
 }

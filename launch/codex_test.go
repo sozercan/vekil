@@ -576,11 +576,178 @@ func TestPolicyCodexCatalogRestrictionsClearDonorProtocolModes(t *testing.T) {
 		"use_responses_lite": true,
 		"tool_mode":          "code_mode_only",
 	}
-	applyPolicyCodexCatalogRestrictions(template)
+	applyChatBackedCodexCatalogRestrictions(template)
 	if template["use_responses_lite"] != false {
 		t.Fatalf("use_responses_lite = %#v", template["use_responses_lite"])
 	}
 	if value, exists := template["tool_mode"]; exists {
 		t.Fatalf("tool_mode = %#v, want omitted", value)
+	}
+}
+
+func TestCodexAdapterAcceptsResponsesOverChatModelWithAdapterRestrictions(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolsSupported := true
+	prepared, err := (CodexAdapter{}).Prepare(PrepareInput{
+		BaseURL: "http://127.0.0.1:43210",
+		Model: ModelInfo{
+			ID:                     "gemini-test",
+			Name:                   "Gemini Test",
+			SupportedEndpoints:     []string{"/chat/completions"},
+			ResponsesCompatibility: ResponsesOverChatCompatibility,
+			Capabilities: ModelCapabilities{
+				Limits:   ModelCapabilityLimits{MaxPromptTokens: 983040, MaxContextWindowTokens: 1048576},
+				Supports: ModelCapabilitySupports{ReasoningEffort: []string{"low", "medium", "high"}, ToolCalls: &toolsSupported, ParallelToolCalls: true, Vision: true},
+			},
+		},
+		Binary:        binary,
+		LocalToken:    "token",
+		ForwardedArgs: []string{"exec", "hello"},
+		DryRun:        true,
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.Cleanup != nil {
+		defer func() { _ = prepared.Cleanup() }()
+	}
+	for _, want := range []string{
+		`web_search="disabled"`,
+		`features.remote_compaction_v2=false`,
+		`features.code_mode=false`,
+		`features.code_mode_only=false`,
+	} {
+		if !containsString(prepared.Args, want) {
+			t.Fatalf("Responses-over-Chat Codex args missing %q: %#v", want, prepared.Args)
+		}
+	}
+	if !containsString(prepared.Args, `model_providers.`+codexProviderID+`.supports_websockets=false`) {
+		t.Fatalf("websockets were not disabled: %#v", prepared.Args)
+	}
+	if !containsAdjacent(prepared.Args, "-m", "gemini-test") {
+		t.Fatalf("model was not pinned: %#v", prepared.Args)
+	}
+	if len(prepared.Unresolved) != 0 {
+		t.Fatalf("unresolved = %v", prepared.Unresolved)
+	}
+	body, err := os.ReadFile(codexCatalogPathFromArgs(t, prepared.Args))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog codexCatalog
+	if err := json.Unmarshal(body, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	model := catalog.Models[0]
+	if value, exists := model["apply_patch_tool_type"]; !exists || value != nil {
+		t.Fatalf("apply_patch_tool_type = %#v, want explicit null", value)
+	}
+	if model["use_responses_lite"] != false || model["supports_search_tool"] != false {
+		t.Fatalf("restrictions = %#v", model)
+	}
+	if modalities, _ := model["input_modalities"].([]interface{}); len(modalities) != 1 || modalities[0] != "text" {
+		t.Fatalf("input_modalities = %#v, want text only", model["input_modalities"])
+	}
+	if model["default_reasoning_level"] != "medium" {
+		t.Fatalf("default_reasoning_level = %#v", model["default_reasoning_level"])
+	}
+	if model["context_window"] != float64(983040) {
+		t.Fatalf("context_window = %#v", model["context_window"])
+	}
+}
+
+func TestCodexAdapterResponsesOverChatModelWithoutReasoningLeavesEffortUnset(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := (CodexAdapter{}).Prepare(PrepareInput{
+		BaseURL:    "http://127.0.0.1:43210",
+		Model:      ModelInfo{ID: "chat-plain", SupportedEndpoints: []string{"/chat/completions"}, ResponsesCompatibility: ResponsesOverChatCompatibility},
+		Binary:     binary,
+		LocalToken: "token",
+		DryRun:     true,
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if prepared.Cleanup != nil {
+		defer func() { _ = prepared.Cleanup() }()
+	}
+	if len(prepared.Unresolved) != 1 || !strings.Contains(prepared.Unresolved[0], "function-tool support requires live") {
+		t.Fatalf("dry run should leave missing tool metadata unresolved: %v", prepared.Unresolved)
+	}
+	body, err := os.ReadFile(codexCatalogPathFromArgs(t, prepared.Args))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog codexCatalog
+	if err := json.Unmarshal(body, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if value, exists := catalog.Models[0]["default_reasoning_level"]; exists {
+		t.Fatalf("default_reasoning_level = %#v, want omitted", value)
+	}
+}
+
+func TestCodexAdapterRejectsChatOnlyModelWithoutResponsesOverChat(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (CodexAdapter{}).Prepare(PrepareInput{
+		BaseURL:    "http://127.0.0.1:43210",
+		Model:      ModelInfo{ID: "gemini-test", SupportedEndpoints: []string{"/chat/completions"}},
+		Binary:     binary,
+		LocalToken: "token",
+		DryRun:     true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "--responses-over-chat-models gemini-test") {
+		t.Fatalf("Prepare() error = %v, want opt-in hint", err)
+	}
+}
+
+func TestCodexAdapterExplainsChatOnlyModelWithoutToolCalls(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	noTools := false
+	model := ModelInfo{ID: "gemini-test", SupportedEndpoints: []string{"/chat/completions"}}
+	model.Capabilities.Supports.ToolCalls = &noTools
+	for _, compatibility := range []string{"", ResponsesOverChatCompatibility} {
+		model.ResponsesCompatibility = compatibility
+		_, err = (CodexAdapter{}).Prepare(PrepareInput{
+			BaseURL:    "http://127.0.0.1:43210",
+			Model:      model,
+			Binary:     binary,
+			LocalToken: "token",
+			DryRun:     true,
+		})
+		if err == nil || !strings.Contains(err.Error(), "does not support function tool calls") ||
+			strings.Contains(err.Error(), "pass --responses-over-chat-models") {
+			t.Fatalf("Prepare(compatibility=%q) error = %v, want missing tool-support explanation", compatibility, err)
+		}
+	}
+}
+
+func TestCodexAdapterRejectsResponsesOverChatSearchOverride(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (CodexAdapter{}).Prepare(PrepareInput{
+		BaseURL:       "http://127.0.0.1:43210",
+		Model:         ModelInfo{ID: "gemini-test", SupportedEndpoints: []string{"/chat/completions"}, ResponsesCompatibility: ResponsesOverChatCompatibility},
+		Binary:        binary,
+		LocalToken:    "token",
+		ForwardedArgs: []string{"--enable", "web_search_request", "exec", "hello"},
+		DryRun:        true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "web_search_request") || !strings.Contains(err.Error(), "Responses-over-Chat models") {
+		t.Fatalf("Prepare() error = %v, want rejected search feature", err)
 	}
 }

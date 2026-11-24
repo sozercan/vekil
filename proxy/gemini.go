@@ -36,16 +36,20 @@ type openAIContentBuilder struct {
 type geminiPendingToolCall struct {
 	toolCallID string
 	explicitID string
+	batch      int
 }
 
 type geminiExplicitToolCall struct {
 	name       string
 	toolCallID string
+	batch      int
 }
 
 type geminiPendingToolCalls struct {
 	byName       map[string][]geminiPendingToolCall
 	byExplicitID map[string]geminiExplicitToolCall
+	batch        int
+	answered     bool
 }
 
 func (b *openAIContentBuilder) appendText(text string) {
@@ -89,10 +93,18 @@ func newGeminiPendingToolCalls() *geminiPendingToolCalls {
 	}
 }
 
+func (p *geminiPendingToolCalls) beginBatch() {
+	if p.batch == 0 || p.answered {
+		p.batch++
+		p.answered = false
+	}
+}
+
 func (p *geminiPendingToolCalls) add(name, toolCallID, explicitID string) error {
 	p.byName[name] = append(p.byName[name], geminiPendingToolCall{
 		toolCallID: toolCallID,
 		explicitID: explicitID,
+		batch:      p.batch,
 	})
 
 	if explicitID == "" {
@@ -106,6 +118,7 @@ func (p *geminiPendingToolCalls) add(name, toolCallID, explicitID string) error 
 	p.byExplicitID[explicitID] = geminiExplicitToolCall{
 		name:       name,
 		toolCallID: toolCallID,
+		batch:      p.batch,
 	}
 
 	return nil
@@ -127,6 +140,9 @@ func (p *geminiPendingToolCalls) consumeByExplicitID(name, explicitID string) (s
 	if explicit.name != name {
 		return "", false, invalidGeminiArgument("functionResponse.id %q belongs to functionCall %q, not %q", explicitID, explicit.name, name)
 	}
+	if err := p.markBatchAnswered(name, explicit.batch); err != nil {
+		return "", false, err
+	}
 
 	if err := p.removeByName(name, explicitID); err != nil {
 		return "", false, err
@@ -143,6 +159,9 @@ func (p *geminiPendingToolCalls) consumeNextByName(name string) (string, error) 
 	}
 
 	next := pending[0]
+	if err := p.markBatchAnswered(name, next.batch); err != nil {
+		return "", err
+	}
 	if len(pending) == 1 {
 		delete(p.byName, name)
 	} else {
@@ -154,6 +173,14 @@ func (p *geminiPendingToolCalls) consumeNextByName(name string) (string, error) 
 	}
 
 	return next.toolCallID, nil
+}
+
+func (p *geminiPendingToolCalls) markBatchAnswered(name string, batch int) error {
+	if batch == p.batch {
+		p.answered = true
+		return nil
+	}
+	return invalidGeminiArgument("functionResponse for %q answers a functionCall issued before a later functionCall; respond to every functionCall before issuing new ones", name)
 }
 
 func (p *geminiPendingToolCalls) hasExplicitIDs(name string) bool {
@@ -555,7 +582,27 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 		case "model":
 			var textParts []string
 			var toolCalls []models.OpenAIToolCall
-			var processedPart bool
+			flushAssistantContent := func() error {
+				if len(textParts) == 0 && len(toolCalls) == 0 {
+					return nil
+				}
+
+				message := models.OpenAIMessage{Role: "assistant"}
+				if len(textParts) > 0 {
+					contentJSON, err := json.Marshal(strings.Join(textParts, ""))
+					if err != nil {
+						return err
+					}
+					message.Content = contentJSON
+				}
+				if len(toolCalls) > 0 {
+					message.ToolCalls = toolCalls
+				}
+				messages = append(messages, message)
+				textParts = nil
+				toolCalls = nil
+				return nil
+			}
 
 			for partIdx, part := range content.Parts {
 				if shouldSkipGeminiPart(part) {
@@ -566,7 +613,6 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 				if err != nil {
 					return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d]", contentIdx, partIdx)
 				}
-				processedPart = true
 
 				switch kind {
 				case "text":
@@ -576,43 +622,77 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 					if err != nil {
 						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionCall", contentIdx, partIdx)
 					}
+					if len(toolCalls) == 0 {
+						pendingToolCalls.beginBatch()
+					}
 					toolCalls = append(toolCalls, toolCall)
 					if err := pendingToolCalls.add(toolCall.Function.Name, toolCall.ID, explicitID); err != nil {
 						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionCall", contentIdx, partIdx)
 					}
 				case "functionResponse":
-					return nil, invalidGeminiArgument("contents[%d].parts[%d].functionResponse requires role \"user\"", contentIdx, partIdx)
+					if err := flushAssistantContent(); err != nil {
+						return nil, err
+					}
+
+					message, err := translateGeminiFunctionResponse(part.FunctionResponse, pendingToolCalls, options)
+					if err != nil {
+						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionResponse", contentIdx, partIdx)
+					}
+					messages = append(messages, message)
 				case "inlineData":
 					return nil, invalidGeminiArgument("contents[%d].parts[%d].inlineData requires role \"user\"", contentIdx, partIdx)
 				}
 			}
 
-			if len(textParts) == 0 && len(toolCalls) == 0 {
-				if !processedPart {
-					continue
-				}
-				return nil, invalidGeminiArgument("contents[%d] must include text or functionCall parts", contentIdx)
+			if err := flushAssistantContent(); err != nil {
+				return nil, err
 			}
-
-			message := models.OpenAIMessage{Role: "assistant"}
-			if len(textParts) > 0 {
-				contentJSON, err := json.Marshal(strings.Join(textParts, ""))
-				if err != nil {
-					return nil, err
-				}
-				message.Content = contentJSON
-			}
-			if len(toolCalls) > 0 {
-				message.ToolCalls = toolCalls
-			}
-			messages = append(messages, message)
 
 		default:
 			return nil, invalidGeminiArgument("contents[%d].role must be \"user\" or \"model\"", contentIdx)
 		}
 	}
 
-	return messages, nil
+	return groupGeminiToolResults(messages), nil
+}
+
+func groupGeminiToolResults(messages []models.OpenAIMessage) []models.OpenAIMessage {
+	grouped := make([]models.OpenAIMessage, 0, len(messages))
+	moved := make([]bool, len(messages))
+
+	for i, message := range messages {
+		if moved[i] {
+			continue
+		}
+		grouped = append(grouped, message)
+
+		if message.Role != "assistant" || len(message.ToolCalls) == 0 {
+			continue
+		}
+
+		outstanding := make(map[string]struct{}, len(message.ToolCalls))
+		for _, toolCall := range message.ToolCalls {
+			outstanding[toolCall.ID] = struct{}{}
+		}
+
+		for j := i + 1; j < len(messages) && len(outstanding) > 0; j++ {
+			candidate := messages[j]
+			if candidate.Role == "assistant" && len(candidate.ToolCalls) > 0 {
+				break
+			}
+			if candidate.Role != "tool" {
+				continue
+			}
+			if _, ok := outstanding[candidate.ToolCallID]; !ok {
+				break
+			}
+			grouped = append(grouped, candidate)
+			moved[j] = true
+			delete(outstanding, candidate.ToolCallID)
+		}
+	}
+
+	return grouped
 }
 
 func translateGeminiFunctionCall(functionCall *models.GeminiFunctionCall, contentIdx, partIdx int) (models.OpenAIToolCall, string, error) {
