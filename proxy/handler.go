@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -94,10 +95,11 @@ type modelsCache struct {
 }
 
 type cachedModelsResponse struct {
-	body       []byte
-	statusCode int
-	expiry     time.Time
-	etag       string
+	body         []byte
+	statusCode   int
+	expiry       time.Time
+	etag         string
+	responseETag string
 }
 
 type requestBodyError struct {
@@ -1386,8 +1388,8 @@ func copyPassthroughHeaders(dst, src http.Header) {
 
 func writeCachedModelsResponse(w http.ResponseWriter, entry cachedModelsResponse) {
 	w.Header().Set("Content-Type", "application/json")
-	if entry.etag != "" {
-		w.Header().Set("ETag", entry.etag)
+	if etag := firstNonEmpty(entry.responseETag, entry.etag); etag != "" {
+		w.Header().Set("ETag", etag)
 	}
 	w.WriteHeader(entry.statusCode)
 	_, _ = w.Write(entry.body)
@@ -1785,12 +1787,7 @@ func (h *ProxyHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if etag := entry.etag; etag != "" {
-		w.Header().Set("ETag", etag)
-	}
-	w.WriteHeader(entry.statusCode)
-	_, _ = w.Write(entry.body)
+	writeCachedModelsResponse(w, entry)
 }
 
 func (h *ProxyHandler) refreshModelsCacheVariant(waitCtx context.Context, cacheKey string) modelsCacheFlightResult {
@@ -1934,11 +1931,18 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		return cachedModelsResponse{}, false, err
 	}
 
+	annotated, responsesOverChat := h.annotateResponsesOverChatCatalog(body)
+	representation := transformModelsResponseWithCompatibility(annotated, responsesOverChat)
+	var responseETag string
+	if len(h.responsesOverChatModels) > 0 || !bytes.Equal(body, annotated) {
+		responseETag = fmt.Sprintf(`"vekil-%x"`, sha256.Sum256(representation))
+	}
 	return cachedModelsResponse{
-		body:       transformModelsResponse(body),
-		statusCode: http.StatusOK,
-		expiry:     h.models.nowTime().Add(modelsCacheTTL),
-		etag:       mergedETag,
+		body:         representation,
+		statusCode:   http.StatusOK,
+		expiry:       h.models.nowTime().Add(modelsCacheTTL),
+		etag:         mergedETag,
+		responseETag: responseETag,
 	}, false, nil
 }
 
@@ -1995,6 +1999,14 @@ func reserveMergedModelOwner(owners map[string]mergedModelReservation, model pro
 // upstream Copilot /models response. The original "data" and "object" fields
 // are preserved for standard OpenAI SDK compatibility.
 func transformModelsResponse(body []byte) []byte {
+	return transformModelsResponseWithCompatibility(body, nil)
+}
+
+// transformModelsResponseWithCompatibility builds the Codex projection.
+// responsesOverChat names opted-in Chat-only entries that Vekil serves on
+// /v1/responses; they are listed with the bounded adapter's restrictions
+// while their native data entries keep their original supported_endpoints.
+func transformModelsResponseWithCompatibility(body []byte, responsesOverChat map[string]struct{}) []byte {
 	var upstream struct {
 		Data   []json.RawMessage `json:"data"`
 		Object string            `json:"object"`
@@ -2033,6 +2045,10 @@ func transformModelsResponse(body []byte) []byte {
 		EffectiveContextWindowPct   int64             `json:"effective_context_window_percent"`
 		ExperimentalSupportedTools  []string          `json:"experimental_supported_tools"`
 		InputModalities             []string          `json:"input_modalities"`
+		// Set only for Responses-over-Chat entries: the adapter carries
+		// neither Responses Lite request items nor hosted search.
+		UseResponsesLite   *bool `json:"use_responses_lite,omitempty"`
+		SupportsSearchTool *bool `json:"supports_search_tool,omitempty"`
 	}
 
 	positivePtr := func(value int64) *int64 {
@@ -2084,7 +2100,8 @@ func transformModelsResponse(body []byte) []byte {
 			continue
 		}
 
-		supportsResponses := supportsEndpoint(m.SupportedEndpoints, "/responses")
+		_, overChat := responsesOverChat[strings.TrimSpace(m.ID)]
+		supportsResponses := supportsEndpoint(m.SupportedEndpoints, "/responses") || overChat
 
 		visibility := "hide"
 		if m.ModelPickerEnabled && supportsResponses {
@@ -2141,7 +2158,7 @@ func transformModelsResponse(body []byte) []byte {
 		}
 
 		modalities := []string{"text"}
-		if m.Capabilities.Supports.Vision {
+		if m.Capabilities.Supports.Vision && !overChat {
 			modalities = append(modalities, "image")
 		}
 
@@ -2177,6 +2194,12 @@ func transformModelsResponse(body []byte) []byte {
 			EffectiveContextWindowPct:   effectiveContextWindowPct,
 			ExperimentalSupportedTools:  []string{},
 			InputModalities:             modalities,
+		}
+		if overChat {
+			disabled := false
+			cm.SupportsReasoningSummaries = false
+			cm.UseResponsesLite = &disabled
+			cm.SupportsSearchTool = &disabled
 		}
 		codexModels = append(codexModels, cm)
 	}
