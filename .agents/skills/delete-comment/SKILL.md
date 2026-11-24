@@ -5,7 +5,7 @@ description: Audit and remove prose comments from Vekil. Use for a comment-clean
 
 # Delete Comment
 
-Use the setup in [Development](../../../docs/development.md#lint). Save the output of `scripts/comment-lint.py --inventory` with that Python environment, then review the requested paths or one coherent cluster. Read each comment together with its code, nearby tests, and relevant docs. The inventory is a locator, not a verdict; check lexical boundaries before deleting.
+Treat any invocation arguments as the requested audit scope. Use the setup in [Development](../../../docs/development.md#lint). Save the output of `scripts/comment-lint.py --inventory` with that Python environment, then review the requested paths or one coherent cluster. Read each comment together with its code, nearby tests, and relevant docs. The inventory is a locator, not a verdict; check lexical boundaries before deleting.
 
 | Category | Action |
 | --- | --- |
