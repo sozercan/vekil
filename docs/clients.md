@@ -139,10 +139,11 @@ Use [`vekil launch agy`](agent-launchers.md#antigravity-cli) for an ephemeral su
 ```bash
 env AGY_LLM_GATEWAY_URL=http://localhost:1337 \
   AGY_LLM_GATEWAY_API_KEY=dummy \
-  agy --model gemini-3.8-flash -p "Reply with exactly PROXY_OK"
+  agy --settings '{"modelProvider":""}' --model gemini-3.8-flash \
+  -p "Reply with exactly PROXY_OK"
 ```
 
-If `settings.json` sets `modelProvider`, add `--settings '{"modelProvider":""}'` so the gateway is used for that session. The `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL` mode also reaches Vekil but offers only Antigravity's built-in Gemini model list.
+The session-only `--settings '{"modelProvider":""}'` overlay keeps a saved `modelProvider` in `settings.json` from taking precedence over the gateway variables; it is not written to that file. The `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL` mode also reaches Vekil but offers only Antigravity's built-in Gemini model list.
 
 ## Anthropic Messages API
 

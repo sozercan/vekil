@@ -101,6 +101,7 @@ func (AgyAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 
 func validateAgyForwardedArgs(args []string) error {
 	expectValue := false
+	seenPositional := false
 	for _, arg := range args {
 		if expectValue {
 			expectValue = false
@@ -110,11 +111,14 @@ func validateAgyForwardedArgs(args []string) error {
 			return nil
 		}
 		if !strings.HasPrefix(arg, "-") || arg == "-" {
-			switch arg {
-			case "acp", "changelog", "help", "install", "mcp", "mic-serve", "plugin", "plugins", "remote-control", "update":
-				return fmt.Errorf("agy command %q is not an agent session", arg)
+			if !seenPositional {
+				switch arg {
+				case "acp", "changelog", "help", "install", "mcp", "mic-serve", "plugin", "plugins", "remote-control", "update":
+					return fmt.Errorf("agy command %q is not an agent session", arg)
+				}
 			}
-			return nil
+			seenPositional = true
+			continue
 		}
 		name, _, hasValue := strings.Cut(strings.TrimLeft(arg, "-"), "=")
 		switch name {

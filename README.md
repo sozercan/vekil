@@ -158,5 +158,6 @@ env COPILOT_PROVIDER_BASE_URL=http://localhost:1337/v1 \
 ```bash
 env AGY_LLM_GATEWAY_URL=http://localhost:1337 \
   AGY_LLM_GATEWAY_API_KEY=dummy \
-  agy --model gemini-3.8-flash -p "Reply with exactly PROXY_OK"
+  agy --settings '{"modelProvider":""}' --model gemini-3.8-flash \
+  -p "Reply with exactly PROXY_OK"
 ```

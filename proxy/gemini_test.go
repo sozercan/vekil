@@ -606,6 +606,36 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("tool parameters translate Gemini nullable to JSON schema", func(t *testing.T) {
+		req := &models.GeminiGenerateContentRequest{
+			Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("Use the tool")}}}},
+			Tools: []models.GeminiTool{{
+				FunctionDeclarations: []models.GeminiFunctionDeclaration{{
+					Name: "lookup",
+					Parameters: json.RawMessage(`{
+						"type":"OBJECT",
+						"properties":{
+							"Note":{"type":"STRING","nullable":true},
+							"Mode":{"type":"STRING","enum":["fast","slow"],"nullable":true},
+							"Strict":{"type":"BOOLEAN","nullable":false},
+							"Either":{"anyOf":[{"type":"STRING"},{"type":"INTEGER"}],"nullable":true},
+							"Items":{"type":"ARRAY","items":{"type":"OBJECT","properties":{"Tag":{"type":"STRING","nullable":true}}}}
+						}
+					}`),
+				}},
+			}},
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+		want := `{"properties":{"Either":{"anyOf":[{"type":"string"},{"type":"integer"},{"type":"null"}]},"Items":{"items":{"properties":{"Tag":{"type":["string","null"]}},"type":"object"},"type":"array"},"Mode":{"enum":["fast","slow",null],"type":["string","null"]},"Note":{"type":["string","null"]},"Strict":{"type":"boolean"}},"type":"object"}`
+		if gotParams := string(got.Tools[0].Function.Parameters); gotParams != want {
+			t.Fatalf("converted parameters = %s, want %s", gotParams, want)
+		}
+	})
+
 	t.Run("allowed function names narrow the forwarded tool list", func(t *testing.T) {
 		req := &models.GeminiGenerateContentRequest{
 			Contents: []models.GeminiContent{{

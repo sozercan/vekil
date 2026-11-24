@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -869,6 +870,13 @@ func convertGeminiSchemaNode(node interface{}) bool {
 			}
 		}
 	}
+	if nullable, ok := schema["nullable"].(bool); ok {
+		delete(schema, "nullable")
+		changed = true
+		if nullable {
+			applyGeminiSchemaNullable(schema)
+		}
+	}
 	for _, key := range geminiSchemaInt64Keywords {
 		if text, ok := schema[key].(string); ok {
 			if value, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64); err == nil {
@@ -897,6 +905,26 @@ func convertGeminiSchemaNode(node interface{}) bool {
 		}
 	}
 	return changed
+}
+
+func applyGeminiSchemaNullable(schema map[string]interface{}) {
+	switch typ := schema["type"].(type) {
+	case string:
+		if typ != "null" {
+			schema["type"] = []interface{}{typ, "null"}
+		}
+	case []interface{}:
+		if !slices.Contains(typ, interface{}("null")) {
+			schema["type"] = append(typ, "null")
+		}
+	default:
+		if anyOf, ok := schema["anyOf"].([]interface{}); ok {
+			schema["anyOf"] = append(anyOf, map[string]interface{}{"type": "null"})
+		}
+	}
+	if enum, ok := schema["enum"].([]interface{}); ok && !slices.Contains(enum, nil) {
+		schema["enum"] = append(enum, nil)
+	}
 }
 
 func filterGeminiAllowedTools(tools []models.OpenAITool, config *models.GeminiFunctionCallingConfig) []models.OpenAITool {

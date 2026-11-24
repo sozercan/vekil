@@ -102,6 +102,7 @@ func TestAgyAdapterForwardedArgs(t *testing.T) {
 		{"-p", "install the deps"},
 		{"--mode", "plan", "-i", "start"},
 		{"models"},
+		{"models", "update"},
 		{"--", "--model"},
 	} {
 		if _, err := prepareAgyForTest(t, model, args...); err != nil {
@@ -120,6 +121,9 @@ func TestAgyAdapterForwardedArgs(t *testing.T) {
 		{[]string{"acp"}, `"acp" is not an agent session`},
 		{[]string{"--sandbox", "update"}, `"update" is not an agent session`},
 		{[]string{"-p"}, "missing its value"},
+		{[]string{"models", "--model", "other"}, "model overrides"},
+		{[]string{"models", "--settings", `{"modelProvider":"gemini"}`}, "settings overrides"},
+		{[]string{"agents", "--remote-agent"}, "remote agy sessions"},
 	} {
 		_, err := prepareAgyForTest(t, model, tc.args...)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
