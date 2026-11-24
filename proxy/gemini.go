@@ -629,7 +629,54 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 		}
 	}
 
-	return messages, nil
+	return groupGeminiToolResults(messages), nil
+}
+
+// groupGeminiToolResults moves each tool result up to sit directly after the
+// assistant message that issued its call. Chat Completions requires an
+// assistant tool-call message to be followed by its tool results without any
+// other message in between, while Gemini contents may interleave text with
+// functionResponse parts. Text that was interleaved keeps its relative order
+// and follows the grouped results. Results only move past text messages: they
+// are never pulled across another tool result or a later assistant tool-call
+// message, so histories without interleaved text are left unchanged.
+func groupGeminiToolResults(messages []models.OpenAIMessage) []models.OpenAIMessage {
+	grouped := make([]models.OpenAIMessage, 0, len(messages))
+	moved := make([]bool, len(messages))
+
+	for i, message := range messages {
+		if moved[i] {
+			continue
+		}
+		grouped = append(grouped, message)
+
+		if message.Role != "assistant" || len(message.ToolCalls) == 0 {
+			continue
+		}
+
+		outstanding := make(map[string]struct{}, len(message.ToolCalls))
+		for _, toolCall := range message.ToolCalls {
+			outstanding[toolCall.ID] = struct{}{}
+		}
+
+		for j := i + 1; j < len(messages) && len(outstanding) > 0; j++ {
+			candidate := messages[j]
+			if candidate.Role == "assistant" && len(candidate.ToolCalls) > 0 {
+				break
+			}
+			if candidate.Role != "tool" {
+				continue
+			}
+			if _, ok := outstanding[candidate.ToolCallID]; !ok {
+				break
+			}
+			grouped = append(grouped, candidate)
+			moved[j] = true
+			delete(outstanding, candidate.ToolCallID)
+		}
+	}
+
+	return grouped
 }
 
 func translateGeminiFunctionCall(functionCall *models.GeminiFunctionCall, contentIdx, partIdx int) (models.OpenAIToolCall, string, error) {

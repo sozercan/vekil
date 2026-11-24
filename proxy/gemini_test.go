@@ -303,6 +303,116 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("text interleaved with parallel tool results follows the results", func(t *testing.T) {
+		searchCalls := []models.GeminiPart{
+			{FunctionCall: &models.GeminiFunctionCall{Name: "search", Args: json.RawMessage(`{"q":"a"}`)}},
+			{FunctionCall: &models.GeminiFunctionCall{Name: "search", Args: json.RawMessage(`{"q":"b"}`)}},
+		}
+		interleavedResults := []models.GeminiPart{
+			{FunctionResponse: &models.GeminiFunctionResponse{Name: "search", Response: json.RawMessage(`{"ok":1}`)}},
+			{Text: stringPtr("Halfway.")},
+			{FunctionResponse: &models.GeminiFunctionResponse{Name: "search", Response: json.RawMessage(`{"ok":2}`)}},
+		}
+
+		tests := []struct {
+			name      string
+			contents  []models.GeminiContent
+			wantRoles []string
+			textIdx   int
+		}{
+			{
+				name: "model role",
+				contents: []models.GeminiContent{
+					{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("Search twice")}}},
+					{Role: "model", Parts: append(append([]models.GeminiPart{}, searchCalls...), interleavedResults...)},
+				},
+				wantRoles: []string{"user", "assistant", "tool", "tool", "assistant"},
+				textIdx:   4,
+			},
+			{
+				name: "user role",
+				contents: []models.GeminiContent{
+					{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("Search twice")}}},
+					{Role: "model", Parts: searchCalls},
+					{Role: "user", Parts: interleavedResults},
+				},
+				wantRoles: []string{"user", "assistant", "tool", "tool", "user"},
+				textIdx:   4,
+			},
+			{
+				name: "results split across contents",
+				contents: []models.GeminiContent{
+					{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("Search twice")}}},
+					{Role: "model", Parts: append(append([]models.GeminiPart{}, searchCalls...), interleavedResults[:2]...)},
+					{Role: "user", Parts: interleavedResults[2:]},
+				},
+				wantRoles: []string{"user", "assistant", "tool", "tool", "assistant"},
+				textIdx:   4,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				got, err := TranslateGeminiToOpenAI(&models.GeminiGenerateContentRequest{Contents: tt.contents}, "gemini-2.5-pro", false)
+				if err != nil {
+					t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+				}
+
+				if len(got.Messages) != len(tt.wantRoles) {
+					t.Fatalf("len(Messages) = %d, want %d: %#v", len(got.Messages), len(tt.wantRoles), got.Messages)
+				}
+				for i, role := range tt.wantRoles {
+					if got.Messages[i].Role != role {
+						t.Fatalf("Messages[%d].Role = %q, want %q", i, got.Messages[i].Role, role)
+					}
+				}
+				calls := got.Messages[1].ToolCalls
+				if len(calls) != 2 {
+					t.Fatalf("len(ToolCalls) = %d, want 2", len(calls))
+				}
+				if got.Messages[2].ToolCallID != calls[0].ID || got.Messages[3].ToolCallID != calls[1].ID {
+					t.Errorf("tool result IDs = %q, %q, want %q, %q", got.Messages[2].ToolCallID, got.Messages[3].ToolCallID, calls[0].ID, calls[1].ID)
+				}
+				if string(got.Messages[2].Content) != `"{\"ok\":1}"` || string(got.Messages[3].Content) != `"{\"ok\":2}"` {
+					t.Errorf("tool results = %s, %s", got.Messages[2].Content, got.Messages[3].Content)
+				}
+				if string(got.Messages[tt.textIdx].Content) != `"Halfway."` {
+					t.Errorf("Messages[%d].Content = %s, want \"Halfway.\"", tt.textIdx, got.Messages[tt.textIdx].Content)
+				}
+			})
+		}
+	})
+
+	t.Run("tool results are not pulled across a later tool call", func(t *testing.T) {
+		req := &models.GeminiGenerateContentRequest{
+			Contents: []models.GeminiContent{
+				{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("Go")}}},
+				{Role: "model", Parts: []models.GeminiPart{{FunctionCall: &models.GeminiFunctionCall{ID: "x", Name: "search", Args: json.RawMessage(`{}`)}}}},
+				{Role: "user", Parts: []models.GeminiPart{{FunctionResponse: &models.GeminiFunctionResponse{ID: "x", Name: "search", Response: json.RawMessage(`{"n":1}`)}}}},
+				{Role: "model", Parts: []models.GeminiPart{{FunctionCall: &models.GeminiFunctionCall{ID: "x", Name: "search", Args: json.RawMessage(`{}`)}}}},
+				{Role: "user", Parts: []models.GeminiPart{{FunctionResponse: &models.GeminiFunctionResponse{ID: "x", Name: "search", Response: json.RawMessage(`{"n":2}`)}}}},
+			},
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		wantRoles := []string{"user", "assistant", "tool", "assistant", "tool"}
+		if len(got.Messages) != len(wantRoles) {
+			t.Fatalf("len(Messages) = %d, want %d: %#v", len(got.Messages), len(wantRoles), got.Messages)
+		}
+		for i, role := range wantRoles {
+			if got.Messages[i].Role != role {
+				t.Fatalf("Messages[%d].Role = %q, want %q", i, got.Messages[i].Role, role)
+			}
+		}
+		if string(got.Messages[2].Content) != `"{\"n\":1}"` || string(got.Messages[4].Content) != `"{\"n\":2}"` {
+			t.Errorf("tool results = %s, %s", got.Messages[2].Content, got.Messages[4].Content)
+		}
+	})
+
 	t.Run("user inline image becomes multimodal content array", func(t *testing.T) {
 		req := &models.GeminiGenerateContentRequest{
 			Contents: []models.GeminiContent{{
