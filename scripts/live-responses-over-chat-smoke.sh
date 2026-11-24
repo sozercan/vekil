@@ -109,7 +109,7 @@ log "tool-result continuation turn"
 cont_status="$(post continuation '{"model":"'"${MODEL}"'","store":false,"stream":true,"tools":'"${TOOLS}"',"input":[
   {"type":"message","role":"user","content":"Call the tool with token alpha."},
   {"type":"function_call","call_id":"'"${CALL_ID}"'","namespace":"diag","name":"echo_token","arguments":"{\"token\":\"alpha\"}"},
-  {"type":"function_call_output","call_id":"'"${CALL_ID}"'","output":"alpha-echoed"},
+  {"type":"function_call_output","call_id":"'"${CALL_ID}"'","output":"vekil-receipt-4417"},
   {"type":"message","role":"user","content":"What did the tool return? Answer in one short sentence."}]}')"
 log "parallel tool turn"
 par_status="$(post parallel '{"model":"'"${MODEL}"'","store":false,"stream":true,"parallel_tool_calls":true,"tool_choice":"required","tools":'"${LOOKUP}"',"input":"Look up Paris and Tokyo with two separate tool calls."}')"
@@ -136,6 +136,7 @@ def summarize(name):
     return {
         "status": statuses[name], "events": len(events), "terminal": types[-1] if types else None,
         "text_deltas": types.count("response.output_text.delta"),
+        "text": "".join(e.get("delta") or "" for e in events if e.get("type") == "response.output_text.delta"),
         "function_calls": [{"namespace": c.get("namespace"), "name": c.get("name")} for c in calls],
         "model": response.get("model"), "usage_total": (response.get("usage") or {}).get("total_tokens"),
     }
@@ -160,9 +161,13 @@ if summary["tool"]["function_calls"] != [{"namespace": "diag", "name": "echo_tok
     failures.append("forced tool call did not restore diag/echo_token")
 if summary["continuation"]["text_deltas"] < 1:
     failures.append("continuation produced no text")
+elif "4417" not in summary["continuation"]["text"]:
+    failures.append("continuation reply did not use the tool result (expected 4417)")
 if len(summary["parallel"]["function_calls"]) < 2:
     failures.append("parallel turn returned fewer than two calls (model choice; informational)")
 
+for name in ["sse", "tool", "continuation", "parallel"]:
+    summary[name].pop("text", None)  # keep model output out of the printed summary
 print(json.dumps({"model": model, "summary": summary, "failures": failures}, indent=2))
 hard = [f for f in failures if "informational" not in f]
 sys.exit(1 if hard else 0)

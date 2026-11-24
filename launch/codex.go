@@ -43,6 +43,12 @@ func (CodexAdapter) Prepare(input PrepareInput) (PreparedProcess, error) {
 	endpointMetadataKnown := !input.DryRun || input.Model.SupportedEndpoints != nil
 	if hasModel && !chatBacked && endpointMetadataKnown && !modelSupportsEndpoint(input.Model, "/responses") {
 		if modelSupportsEndpoint(input.Model, "/chat/completions") {
+			if tools := input.Model.Capabilities.Supports.ToolCalls; tools != nil && !*tools {
+				return PreparedProcess{}, fmt.Errorf(
+					"model %q is not Codex-compatible: expected /responses support, and this Chat-only model does not support function tool calls, so Vekil's Responses-over-Chat adapter cannot serve it (--responses-over-chat-models does not change this)",
+					model,
+				)
+			}
 			return PreparedProcess{}, fmt.Errorf(
 				"model %q is not Codex-compatible: expected /responses support; to serve this Chat-only model through Vekil's Responses-over-Chat adapter, pass --responses-over-chat-models %s",
 				model, model,

@@ -1734,6 +1734,22 @@ func TestRunLaunchCommandDryRunUsesPolicyOwnershipMetadata(t *testing.T) {
 		}
 	})
 
+	t.Run("Codex rejects a policy model in the Responses-over-Chat opt-in", func(t *testing.T) {
+		t.Setenv("RESPONSES_OVER_CHAT_MODELS", "")
+		var stderr bytes.Buffer
+		code := runLaunchCommand([]string{
+			"codex",
+			"--providers-config", providersPath,
+			"--model", "policy-launch-test",
+			"--responses-over-chat-models", "policy-launch-test",
+			"--binary", binary,
+			"--dry-run",
+		}, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), `responses-over-chat model "policy-launch-test" is a policy model`) {
+			t.Fatalf("runLaunchCommand() code = %d; stderr=%s; want policy opt-in rejection", code, stderr.String())
+		}
+	})
+
 	t.Run("Copilot resolves policy Chat endpoint", func(t *testing.T) {
 		var stderr bytes.Buffer
 		code := runLaunchCommand([]string{

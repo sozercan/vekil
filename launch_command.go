@@ -268,6 +268,10 @@ func runLaunchAgent(target launchTargetSpec, args []string, stderr io.Writer) in
 		NoSummary:      opts.noSummary,
 	}
 	if opts.dryRun {
+		if err := validateLaunchDryRunResponsesOverChatModels(providersCfg, opts.responsesOverChatModels); err != nil {
+			_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
 		if opts.model != "" {
 			model, found, resolveErr := resolveLaunchDryRunModelInfo(providersCfg, opts.model)
 			if resolveErr != nil {
@@ -386,6 +390,26 @@ func launchResponsesOverChatOptedIn(optIn string, model launch.ModelInfo) bool {
 		return false
 	}
 	return slices.Contains(model.SupportedEndpoints, "/chat/completions")
+}
+
+// validateLaunchDryRunResponsesOverChatModels statically mirrors the proxy's
+// startup rejection of policy IDs in the opt-in list, so a dry run does not
+// print a plan that the real launch would refuse.
+func validateLaunchDryRunResponsesOverChatModels(cfg proxy.ProvidersConfig, optIn string) error {
+	for _, candidate := range strings.Split(optIn, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		model, found, err := resolveLaunchDryRunModelInfo(cfg, candidate)
+		if err != nil {
+			return fmt.Errorf("resolve dry-run model metadata: %w", err)
+		}
+		if found && strings.TrimSpace(model.OwnedBy) == launch.PolicyModelOwner {
+			return fmt.Errorf("responses-over-chat model %q is a policy model; policy models already serve /v1/responses through their own adapter", candidate)
+		}
+	}
+	return nil
 }
 
 func resolveLaunchDryRunModelInfo(cfg proxy.ProvidersConfig, modelID string) (launch.ModelInfo, bool, error) {

@@ -712,6 +712,30 @@ func TestCodexAdapterRejectsChatOnlyModelWithoutResponsesOverChat(t *testing.T) 
 	}
 }
 
+func TestCodexAdapterExplainsChatOnlyModelWithoutToolCalls(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	noTools := false
+	model := ModelInfo{ID: "gemini-test", SupportedEndpoints: []string{"/chat/completions"}}
+	model.Capabilities.Supports.ToolCalls = &noTools
+	for _, compatibility := range []string{"", ResponsesOverChatCompatibility} {
+		model.ResponsesCompatibility = compatibility
+		_, err = (CodexAdapter{}).Prepare(PrepareInput{
+			BaseURL:    "http://127.0.0.1:43210",
+			Model:      model,
+			Binary:     binary,
+			LocalToken: "token",
+			DryRun:     true,
+		})
+		if err == nil || !strings.Contains(err.Error(), "does not support function tool calls") ||
+			strings.Contains(err.Error(), "pass --responses-over-chat-models") {
+			t.Fatalf("Prepare(compatibility=%q) error = %v, want missing tool-support explanation", compatibility, err)
+		}
+	}
+}
+
 func TestCodexAdapterRejectsResponsesOverChatSearchOverride(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
