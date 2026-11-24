@@ -2079,7 +2079,7 @@ func splitOversizedCompactInputItemForHistoricalChunks(requestFields map[string]
 		return nil, fmt.Errorf("compact request contains an empty oversized input item")
 	}
 
-	items := make([]json.RawMessage, 0, (len(rawText)/max(maxBodySize, 1))+1)
+	var items []json.RawMessage
 	remaining := rawText
 	for len(remaining) > 0 {
 		splitChunkIndex := len(items) + 1
@@ -2315,7 +2315,7 @@ func splitOversizedCompactInputItemByBodySize(requestFields map[string]json.RawM
 		return nil, fmt.Errorf("compact request contains an empty oversized input item")
 	}
 
-	items := make([]json.RawMessage, 0, (len(rawText)/max(maxBodySize, 1))+1)
+	var items []json.RawMessage
 	remaining := rawText
 	for len(remaining) > 0 {
 		chunkIndex := len(items) + 1
