@@ -27,6 +27,9 @@ GO_DIRECTIVE = re.compile(
     r'|go:(?:noescape|nosplit|noinline|norace|notinheap|uintptrescapes)'
     r'| \+build\s+\S.*|line \S+:\d+(?::\d+)?|export \w+)'
 )
+GO_NOLINT = re.compile(r'//nolint(?::[\w-]+(?:,[ \t]*[\w-]+)*)?[ \t]*', re.ASCII)
+GO_COMMENT_GAP = re.compile(r'[ \t\r]*(?:\n[ \t\r]*)?')
+GO_CGO_IMPORT = re.compile(r'[ \t\r]*\n[ \t\r]*import[ \t\r\n]+"C"')
 HEREDOC = re.compile(r'''<<-?[ \t]*(?P<quote>['"]?)(?P<label>\w+)(?P=quote)''')
 DOCKER_SHELL = re.compile(
     r'^[ \t]*(?:ONBUILD[ \t]+)?(?:RUN|CMD|ENTRYPOINT|HEALTHCHECK[ \t]+CMD)[ \t]+'
@@ -56,11 +59,28 @@ def lexer(language):
     return get_lexer_by_name(language)
 
 
-def go_directive(source, start, text):
-    if GO_DIRECTIVE.fullmatch(text):
+def go_comments(source, tokens):
+    group = []
+    end = 0
+    for start, kind, value in tokens:
+        if kind not in Comment or kind in Comment.Preproc:
+            continue
+        text = value.rstrip('\r\n')
+        if group and not GO_COMMENT_GAP.fullmatch(source, end, start):
+            if not GO_CGO_IMPORT.match(source, end):
+                yield from group
+            group.clear()
         line_start = source.rfind('\n', 0, start) + 1
-        return not source[line_start:start].strip()
-    return text.startswith('/*') and re.match(r'\s*import\s+"C"', source[start + len(text):])
+        standalone = not source[line_start:start].strip()
+        prose = not GO_NOLINT.fullmatch(text) and not (standalone and GO_DIRECTIVE.fullmatch(text))
+        if group or standalone:
+            if prose:
+                group.append((start, text))
+            end = start + len(text)
+        elif prose:
+            yield start, text
+    if group and not GO_CGO_IMPORT.match(source, end):
+        yield from group
 
 
 def heredoc_language(label, body):
@@ -96,7 +116,11 @@ def lex_comments(language, source):
         return
     if not source.endswith('\n'):
         source += '\n'
-    for start, kind, value in lexer(language).get_tokens_unprocessed(source):
+    tokens = lexer(language).get_tokens_unprocessed(source)
+    if language == 'go':
+        yield from go_comments(source, tokens)
+        return
+    for start, kind, value in tokens:
         if language == 'bash' and kind is String and (match := HEREDOC.match(value)):
             body_start = value.find('\n') + 1
             body_end = value.rfind('\n') + 1
@@ -107,8 +131,6 @@ def lex_comments(language, source):
             continue
         text = value.rstrip('\r\n')
         if start == 0 and text.startswith('#!') and language in {'bash', 'python'}:
-            continue
-        if language == 'go' and go_directive(source, start, text):
             continue
         if language == 'objective-c' and text.startswith('//go:build ') and start == 0:
             continue

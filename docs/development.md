@@ -319,7 +319,8 @@ Makefiles, Dockerfiles, and `.gitignore`. It also checks GitHub Actions `run`
 scripts and shell heredocs identifiable as Python or shell. Arbitrary string
 literals, data fixtures, docs, and the vendored uPlot assets are not prose
 source. Keep machine-consumed syntax such as Go build tags/embeds, the cgo
-preamble, and shebangs intact.
+preamble, and shebangs intact. Bare Go `//nolint` directives are allowed;
+directives with explanatory prose still count toward the ratchet.
 
 Use `.build/comment-lint/bin/python scripts/comment-lint.py --inventory` to
 list the remaining work with source locations and count comment-only versus

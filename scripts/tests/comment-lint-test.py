@@ -38,6 +38,35 @@ var count = 0 // inline
         self.assertEqual(self.texts('main.go', source), ['// inline', '/* block', '* body', '*/', '// end'])
         self.assertEqual(self.texts('go.mod', 'require example.com/a v1.0.0 // indirect\n// text'), ['// text'])
 
+    def test_go_bare_nolint_directives_only(self):
+        source = '''package sample
+
+//nolint
+var first = 0 //nolint:errcheck
+//nolint:staticcheck, govet
+var second = 0 //nolint:errcheck // explanation
+//nolint:staticcheck explanation
+//nolint // explanation
+var third = 0
+'''
+        self.assertEqual(self.texts('main.go', source), [
+            '//nolint:errcheck // explanation', '//nolint:staticcheck explanation', '//nolint // explanation',
+        ])
+
+    def test_go_cgo_preamble_must_be_attached(self):
+        cases = [
+            ('package sample\n\n// Detached prose\n\n// #include <stdio.h>\n// int count;\nimport "C"\n',
+             ['// Detached prose']),
+            ('package sample\n\n/* Detached prose */\n\nimport "C"\n', ['/* Detached prose */']),
+            ('package sample /* Trailing prose */\n// int count;\nimport "C"\n', ['/* Trailing prose */']),
+            ('package sample\n\n/* Same-line prose */ import "C"\n', ['/* Same-line prose */']),
+            ('package sample\n\n/* #include <stdio.h> */\n// int count;\nimport "C"\n', []),
+            ('package sample\n\n// Import prose\nimport "fmt"\n', ['// Import prose']),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.texts('main.go', source), expected)
+
     def test_embedded_javascript_css_and_html(self):
         source = '''<!-- markup -->
 <style>/* style */</style>
