@@ -309,9 +309,10 @@ source; use clear names, tests, or an [ADR](adr/README.md) instead. It compares
 each file's exact comment-line counts by text (ignoring surrounding whitespace)
 against a Git base. A comment can't be replaced with different prose or copied
 to another file under the old allowance. Once its deletion lands, reintroducing
-it fails. CI compares the PR merge result with its base commit, or a push with
-the previous tip. Locally the default base is `HEAD` for uncommitted changes;
-pass `COMMENT_BASE` to review committed changes too.
+it fails. CI compares the checked-out PR merge commit with its first parent
+(the base actually used for that merge), or a push with the previous tip.
+Locally the default base is `HEAD` for uncommitted changes; pass `COMMENT_BASE`
+to review committed changes too.
 
 The lexer covers Go (including tests and `go.mod`), shell, Python, Objective-C/C
 headers, HTML with inline JavaScript/CSS, standalone JS/CSS, YAML/JSON/TOML,

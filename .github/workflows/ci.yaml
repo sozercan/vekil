@@ -30,13 +30,16 @@ jobs:
 
       - name: Comment ratchet
         env:
-          COMMENT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          COMMENT_BASE: ${{ github.event.before }}
         run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            COMMENT_BASE="$(git rev-parse --verify HEAD^1)"
+          fi
           python3 -m venv "$RUNNER_TEMP/comment-lint"
           python="$RUNNER_TEMP/comment-lint/bin/python"
           "$python" -m pip install -r scripts/comment-lint-requirements.txt
           "$python" scripts/tests/comment-lint-test.py
-          make lint-comments PYTHON="$python"
+          make lint-comments PYTHON="$python" COMMENT_BASE="$COMMENT_BASE"
 
   test:
     runs-on: ubuntu-latest
