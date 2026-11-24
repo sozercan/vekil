@@ -323,6 +323,10 @@ source. Keep machine-consumed syntax such as Go build tags/embeds, the cgo
 preamble, shebangs, and bare named `//nolint:` directives intact. Prose after a
 named `//nolint:` directive still counts.
 
+For SHA-pinned GitHub Actions `uses:` entries, keep the matching release tag as
+an inline `# vX.Y.Z` label when one exists. The linter permits the version alone,
+not additional prose; the SHA remains the executable pin.
+
 Use `.build/comment-lint/bin/python scripts/comment-lint.py --inventory` to
 list any prose comments with source locations and count comment-only versus
 inline lines. Use `$delete-comment` in Codex or `/delete-comment` in Claude Code

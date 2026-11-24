@@ -187,6 +187,32 @@ fi
         )
         self.assertEqual(self.texts('ordinary.yaml', source), ['# YAML'])
 
+    def test_workflow_action_version_labels(self):
+        pin = 'a' * 40
+        source = f'''# v1.2.3
+jobs:
+  reuse:
+    uses: org/repo/.github/workflows/test.yaml@{pin} # v1.2.3
+  lint:
+    env:
+      uses: org/action@{pin} # v2.3.4
+    steps:
+      - uses: org/action@{pin} # v1.2.3
+      - uses: 'org/action@{pin}' # 1.2.3
+      - uses: org/action@v1 # v1.2.3
+      - uses: org/action@{pin} # v1.2
+      - uses: org/action@{pin} # v1.2.3 extra prose
+      - uses: ./action@{pin} # v1.2.3
+      - run: |
+          echo ok # v1.2.3
+'''
+        result = list(comment_lines('.github/workflows/ci.yaml', source))
+        self.assertEqual([(line.number, line.text) for line in result], [
+            (1, '# v1.2.3'), (7, '# v2.3.4'), (11, '# v1.2.3'), (12, '# v1.2'),
+            (13, '# v1.2.3 extra prose'), (14, '# v1.2.3'), (16, '# v1.2.3'),
+        ])
+        self.assertIn('# 1.2.3', self.texts('ordinary.yaml', source))
+
     def test_ratchet_is_a_multiset_not_a_line_budget(self):
         before = '// existing\npackage test\n// removable\n'
         self.assertEqual(list(additions('main.go', before, 'package test\n// existing\n')), [])

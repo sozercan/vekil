@@ -47,6 +47,8 @@ DOCKER_SHELL = re.compile(
     r'^[ \t]*(?:ONBUILD[ \t]+)?(?:RUN|CMD|ENTRYPOINT|HEALTHCHECK[ \t]+CMD)[ \t]+'
     r'((?:[^\n]*\\\n)*[^\n]*)', re.I | re.M
 )
+ACTION_PIN = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*/[\w.-]+(?:/[\w.-]+)*@[0-9a-f]{40}', re.ASCII)
+ACTION_VERSION_LABEL = re.compile(r'[ \t]+(#[ \t]+v?[0-9]+\.[0-9]+\.[0-9]+)[ \t]*$', re.M)
 
 
 @dataclass(frozen=True)
@@ -240,11 +242,19 @@ def mapping(node, key):
     return None
 
 
-def workflow_scripts(source):
-    root = yaml.compose(source, Loader=yaml.BaseLoader)
-    jobs = mapping(root, 'jobs')
-    if not isinstance(jobs, MappingNode):
-        return
+def workflow_version_labels(source, jobs):
+    for _, job in jobs.value:
+        steps = mapping(job, 'steps')
+        nodes = [job, *steps.value] if isinstance(steps, SequenceNode) else [job]
+        for node in nodes:
+            uses = mapping(node, 'uses')
+            if not isinstance(uses, ScalarNode) or not ACTION_PIN.fullmatch(uses.value):
+                continue
+            if label := ACTION_VERSION_LABEL.match(source, uses.end_mark.index):
+                yield label.start(1), label[1]
+
+
+def workflow_scripts(source, root, jobs):
     workflow_shell = mapping(mapping(mapping(root, 'defaults'), 'run'), 'shell')
     for _, job in jobs.value:
         steps = mapping(job, 'steps')
@@ -294,7 +304,11 @@ def comment_lines(path, source):
         return
     tokens = set(lex_comments(language, source))
     if path.startswith('.github/workflows/') and language == 'yaml':
-        tokens.update(workflow_scripts(source))
+        root = yaml.compose(source, Loader=yaml.BaseLoader)
+        jobs = mapping(root, 'jobs')
+        if isinstance(jobs, MappingNode):
+            tokens.difference_update(workflow_version_labels(source, jobs))
+            tokens.update(workflow_scripts(source, root, jobs))
     offsets = [0] + [match.end() for match in re.finditer('\n', source)]
     for start, text in sorted(tokens):
         if path == 'go.mod' and text == '// indirect':

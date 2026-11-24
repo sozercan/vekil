@@ -15,7 +15,7 @@ make lint    # vet + prose-comment ban (see docs/development.md)
 
 Other targets are in the `Makefile`. Scoped suites, race matrices, and benchmark baselines are in [`docs/development.md`](docs/development.md) — load it before running anything narrower than `make test`, because the suite-name regexes are not guessable.
 
-Do not add prose comments to first-party source. Use clear code, tests, or an [ADR](docs/adr/README.md). Lint requires zero prose comments and permits required directives. Use the `delete-comment` skill to audit branches that still contain prose comments.
+Do not add prose comments to first-party source. Use clear code, tests, or an [ADR](docs/adr/README.md). Lint permits required directives and exact release labels on SHA-pinned GitHub Actions. Use the `delete-comment` skill to audit branches that still contain prose comments.
 
 ## Documentation
 
