@@ -3,6 +3,7 @@ from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass
 from functools import cache
+from itertools import islice, takewhile
 import os
 from pathlib import Path
 import re
@@ -40,7 +41,7 @@ JQ_FILTER = re.compile(
     re.M | re.X,
 )
 MAKE_LINE = re.compile(r'(?:[^\n]*\\\n)*[^\n]+|(?:[^\n]*\\\n)+')
-MAKE_DIRECTIVE = re.compile(r'(?:(?:override|export|private)\s+)*(define|endef)\b')
+MAKE_DIRECTIVE = re.compile(r'(?:(?:override|export|private)\s+)*(define|endef)(?=[ \t]|$)')
 MAKE_ASSIGNMENT = re.compile(r'(?:[+?!]|:{1,3})?=')
 DOCKER_SHELL = re.compile(
     r'^[ \t]*(?:ONBUILD[ \t]+)?(?:RUN|CMD|ENTRYPOINT|HEALTHCHECK[ \t]+CMD)[ \t]+'
@@ -70,11 +71,42 @@ def lexer(language):
     return get_lexer_by_name(language)
 
 
-def go_directive(source, start, text):
-    if GO_DIRECTIVE.fullmatch(text):
-        line_start = source.rfind('\n', 0, start) + 1
-        return not source[line_start:start].strip()
-    return text.startswith('/*') and re.match(r'\s*import\s+"C"', source[start + len(text):])
+def go_cgo_preambles(source, tokens):
+    leading = {}
+    group = []
+    code = []
+    previous_end = 0
+    for start, kind, value in tokens:
+        if not value.strip():
+            continue
+        gap = source.count('\n', previous_end, start)
+        if kind in Comment:
+            if gap > 1:
+                group.clear()
+            if gap or group:
+                group.append(start)
+        else:
+            if group and gap == 1:
+                leading[start] = tuple(group)
+            group.clear()
+            code.append((start, value))
+        previous_end = start + len(value)
+
+    preambles = set()
+    for index, ((start, value), (_, following)) in enumerate(zip(code, islice(code, 1, None))):
+        if value != 'import':
+            continue
+        if following == '"C"':
+            preambles.update(leading.get(start, ()))
+        elif following == '(':
+            specs = [(offset, token) for offset, token in takewhile(
+                lambda item: item[1] != ')', islice(code, index + 2, None)
+            ) if token != ';']
+            for offset, token in specs:
+                if token == '"C"':
+                    fallback = leading.get(start, ()) if len(specs) == 1 else ()
+                    preambles.update(leading.get(offset, fallback))
+    return preambles
 
 
 def heredoc_language(label, body):
@@ -98,12 +130,15 @@ def make_comments(source):
         if line.startswith('\t') and not define_depth:
             yield from ((logical.start() + offset, text) for offset, text in lex_comments('bash', line))
             continue
-        directive = MAKE_DIRECTIVE.match(line.lstrip(' '))
-        if directive and directive[1] == 'endef' and define_depth:
-            define_depth -= 1
-        if define_depth or (directive and directive[1] == 'define'):
-            define_depth += int(bool(directive and directive[1] == 'define'))
-            continue
+        statement = line.lstrip(' ')
+        directive = MAKE_DIRECTIVE.match(statement)
+        if define_depth:
+            if directive:
+                define_depth += 1 if directive[1] == 'define' else -1
+            if define_depth:
+                continue
+        elif directive and directive[1] == 'define' and not MAKE_ASSIGNMENT.match(statement[directive.end():].lstrip()):
+            define_depth = 1
         references = []
         target = assignment = False
         for token in re.finditer(r'\\[\s\S]|\$[$({]|[(){}#;]|(?:[+?!]|:{1,3})?=|:', line):
@@ -156,7 +191,12 @@ def lex_comments(language, source):
     if not source.endswith('\n'):
         source += '\n'
     jq_filters = {match.start('command'): match for match in JQ_FILTER.finditer(source)} if language == 'bash' else {}
-    for start, kind, value in lexer(language).get_tokens_unprocessed(source):
+    tokens = lexer(language).get_tokens_unprocessed(source)
+    preambles = set()
+    if language == 'go' and '"C"' in source:
+        tokens = list(tokens)
+        preambles = go_cgo_preambles(source, tokens)
+    for start, kind, value in tokens:
         if kind is Text and value == 'jq' and (match := jq_filters.get(start)):
             yield from ((match.start('program') + offset, text)
                         for offset, text in lex_comments('jq', match['program']))
@@ -170,12 +210,16 @@ def lex_comments(language, source):
                             for offset, text in lex_comments(embedded, lex_body))
         if kind not in Comment or kind in Comment.Preproc or kind in Comment.PreprocFile:
             continue
+        if start in preambles:
+            continue
         text = value.strip('\r\n \t')
         start += len(value) - len(value.lstrip(' \t'))
         if start == 0 and text.startswith('#!') and language in {'bash', 'python'}:
             continue
-        if language == 'go' and go_directive(source, start, text):
-            continue
+        if language == 'go' and GO_DIRECTIVE.fullmatch(text):
+            line_start = source.rfind('\n', 0, start) + 1
+            if not source[line_start:start].strip():
+                continue
         if language == 'go' and (directive := GO_NOLINT.match(text)):
             tail = text[directive.end():]
             if not tail or tail.startswith((' ', '\t')):

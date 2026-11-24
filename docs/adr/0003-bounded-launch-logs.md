@@ -1,10 +1,10 @@
-# 0003: Bound local launcher logs per file
+# 0003: Bound menubar and serve logs per file
 
 Status: Accepted
 
 ## Context
 
-An agent launch can generate more log output than should be retained locally. Reopening a session log also has to handle files left by earlier runs, whose permissions aren't changed by a new open call's create mode.
+The menubar and `vekil serve --log-file` can generate more output than should be retained locally. They reopen log files left by earlier runs, whose permissions aren't changed by a new open call's create mode.
 
 ## Decision
 
@@ -13,3 +13,5 @@ Use a private append-only current file and retain at most one `.1` backup. Rotat
 ## Consequences
 
 Only the current file and its immediate predecessor are kept. An oversized entry may be truncated even though the caller receives no error. The file size limit controls disk usage, not the size of accepted messages.
+
+Agent launches use a separate, exclusively created log file per launch. They reject existing paths and have neither rotation nor the per-entry truncation performed by the rotating writer.

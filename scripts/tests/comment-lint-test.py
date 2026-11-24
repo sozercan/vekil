@@ -40,6 +40,40 @@ var two = 2 //nolint:unused // explanatory prose
         self.assertEqual(self.texts('main.go', source), ['// inline', '/* block', '* body', '*/', '// explanatory prose', '// end'])
         self.assertEqual(self.texts('go.mod', 'require example.com/a v1.0.0 // indirect\n// text'), ['// text'])
 
+    def test_go_cgo_preamble_comment_groups(self):
+        source = '''package sample
+
+// detached prose
+
+// #cgo darwin CFLAGS: -fobjc-arc
+/* typedef int custom_int; */
+// #include "bridge.h"
+import "C"
+
+var text = `
+// #include "literal.h"
+import "C"
+`
+// ordinary prose
+var count = 0
+'''
+        self.assertEqual(self.texts('main.go', source), ['// detached prose', '// ordinary prose'])
+        self.assertEqual(self.texts('main.go', 'package p // trailing\nimport "C"\n'), ['// trailing'])
+        self.assertEqual(self.texts('main.go', 'package p\n/* detached */\n\nimport "C"\n'), ['/* detached */'])
+
+    def test_go_cgo_grouped_imports(self):
+        source = '''package sample
+
+// ordinary import documentation
+import (
+    // #include "bridge.h"
+    "C"
+    "fmt"
+)
+'''
+        self.assertEqual(self.texts('main.go', source), ['// ordinary import documentation'])
+        self.assertEqual(self.texts('main.go', 'package p\n// #include "bridge.h"\nimport ("C")\n'), [])
+
     def test_c_preprocessor_comments(self):
         source = '#include <example.h> // note\n#define VALUE 1 /* explanation */\n'
         self.assertEqual(self.texts('bridge.h', source), ['// note', '/* explanation */'])
@@ -57,6 +91,21 @@ recipe:
 '''
         self.assertEqual(self.texts('Makefile', source), ['# assignment', '# include', '# inline recipe', '# recipe'])
         self.assertEqual(self.texts('build/shared.mk', 'VAR := value# assignment'), ['# assignment'])
+
+    def test_make_define_boundaries(self):
+        source = '''define := variable named define # assignment
+override define COMMAND # opening header
+    # literal body
+define NESTED # literal nested header
+    # literal nested body
+endef
+endef # closing header
+VAR := value # after define
+'''
+        for path in ('Makefile', 'build/shared.mk'):
+            with self.subTest(path=path):
+                self.assertEqual(self.texts(path, source),
+                                 ['# assignment', '# opening header', '# closing header', '# after define'])
 
     def test_embedded_javascript_css_and_html(self):
         source = '''<!-- markup -->
