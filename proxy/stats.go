@@ -1467,6 +1467,8 @@ func classifyAgent(userAgent string) string {
 	}
 	lower := strings.ToLower(ua)
 	switch {
+	case strings.Contains(lower, "antigravity"):
+		return "Antigravity CLI"
 	case strings.Contains(lower, "claude"):
 		return "Claude Code"
 	case strings.Contains(lower, "codex"):

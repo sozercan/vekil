@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/sozercan/vekil/models"
@@ -798,6 +799,9 @@ func translateGeminiTools(tools []models.GeminiTool) ([]models.OpenAITool, map[s
 			}
 
 			parameters, err := canonicalizeJSON(schema)
+			if err == nil && schemaField == "parameters" {
+				parameters, err = geminiSchemaToJSONSchema(parameters)
+			}
 			if err != nil {
 				return nil, nil, invalidGeminiArgument("tools[%d].functionDeclarations[%d].%s must be valid JSON schema", toolIdx, declIdx, schemaField)
 			}
@@ -815,6 +819,84 @@ func translateGeminiTools(tools []models.GeminiTool) ([]models.OpenAITool, map[s
 	}
 
 	return translated, declaredNames, nil
+}
+
+var geminiSchemaTypes = map[string]string{
+	"STRING":  "string",
+	"NUMBER":  "number",
+	"INTEGER": "integer",
+	"BOOLEAN": "boolean",
+	"ARRAY":   "array",
+	"OBJECT":  "object",
+	"NULL":    "null",
+}
+
+var geminiSchemaInt64Keywords = []string{"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"}
+
+func geminiSchemaToJSONSchema(raw json.RawMessage) (json.RawMessage, error) {
+	if !hasRawJSON(raw) {
+		return raw, nil
+	}
+	var schema interface{}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		return nil, err
+	}
+	if !convertGeminiSchemaNode(schema) {
+		return raw, nil
+	}
+	return json.Marshal(schema)
+}
+
+func convertGeminiSchemaNode(node interface{}) bool {
+	schema, ok := node.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	changed := false
+	switch typ := schema["type"].(type) {
+	case string:
+		if lowered, ok := geminiSchemaTypes[typ]; ok {
+			schema["type"] = lowered
+			changed = true
+		}
+	case []interface{}:
+		for i, entry := range typ {
+			if name, ok := entry.(string); ok {
+				if lowered, ok := geminiSchemaTypes[name]; ok {
+					typ[i] = lowered
+					changed = true
+				}
+			}
+		}
+	}
+	for _, key := range geminiSchemaInt64Keywords {
+		if text, ok := schema[key].(string); ok {
+			if value, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64); err == nil {
+				schema[key] = value
+				changed = true
+			}
+		}
+	}
+	for _, key := range []string{"items", "additionalProperties", "not"} {
+		if child, ok := schema[key]; ok {
+			changed = convertGeminiSchemaNode(child) || changed
+		}
+	}
+	for _, key := range []string{"anyOf", "oneOf", "allOf", "prefixItems"} {
+		if children, ok := schema[key].([]interface{}); ok {
+			for _, child := range children {
+				changed = convertGeminiSchemaNode(child) || changed
+			}
+		}
+	}
+	for _, key := range []string{"properties", "$defs", "definitions"} {
+		if children, ok := schema[key].(map[string]interface{}); ok {
+			for _, child := range children {
+				changed = convertGeminiSchemaNode(child) || changed
+			}
+		}
+	}
+	return changed
 }
 
 func filterGeminiAllowedTools(tools []models.OpenAITool, config *models.GeminiFunctionCallingConfig) []models.OpenAITool {

@@ -4,7 +4,7 @@ These examples all target the same local proxy. Replace model IDs with public ID
 
 ## Schema-v2 policy profile IDs
 
-A semantic policy profile such as `coding-economy` is a narrower public model contract than a direct model ID. It accepts text/function-tool OpenAI Chat, translated Anthropic Messages and count-token probes, and bounded stateless OpenAI Responses—including structured text output—for Responses-only agents such as Codex. It is not accepted by Gemini routes/CLI, the Responses websocket bridge, compact/memory endpoints, images, hosted/custom tools, or stateful `previous_response_id` requests. Policy destinations may use native Chat or bounded Responses-backed Chat. `call_vekil_*` continuations are still best served by the process that owns their replay state: reasoning continuity lives there, and so does policy-tier pinning, whose route tag is keyed per process. For a policy profile that affinity is a requirement, not a preference, and on every surface: the tier is recovered from a carrier tag keyed per process, so on a replica holding none of that state no tier can be selected and the request fails with `responses_replay_state_missing` — in the planner, before Anthropic ingress could fall back. The ID-only rebuild that does survive a replica is a direct-model-route behaviour over Anthropic Messages, not a policy one. Policy continuations need sticky routing to the owning replica. Direct in-process Copilot targets satisfy the affinity requirement; an external downstream bridge, whose continuation IDs are opaque to Vekil and carry nothing, still requires a single instance or sticky ingress to the owning replica.
+A semantic policy profile such as `coding-economy` is a narrower public model contract than a direct model ID. It accepts text/function-tool OpenAI Chat, translated Anthropic Messages and count-token probes, and bounded stateless OpenAI Responses—including structured text output—for Responses-only agents such as Codex. It is not accepted by Gemini routes (including Antigravity CLI), the Responses websocket bridge, compact/memory endpoints, images, hosted/custom tools, or stateful `previous_response_id` requests. Policy destinations may use native Chat or bounded Responses-backed Chat. `call_vekil_*` continuations are still best served by the process that owns their replay state: reasoning continuity lives there, and so does policy-tier pinning, whose route tag is keyed per process. For a policy profile that affinity is a requirement, not a preference, and on every surface: the tier is recovered from a carrier tag keyed per process, so on a replica holding none of that state no tier can be selected and the request fails with `responses_replay_state_missing` — in the planner, before Anthropic ingress could fall back. The ID-only rebuild that does survive a replica is a direct-model-route behaviour over Anthropic Messages, not a policy one. Policy continuations need sticky routing to the owning replica. Direct in-process Copilot targets satisfy the affinity requirement; an external downstream bridge, whose continuation IDs are opaque to Vekil and carry nothing, still requires a single instance or sticky ingress to the owning replica.
 
 Chat clients and the supported translated agent surfaces may request a policy profile. The returned Chat JSON/SSE model identity remains the policy public ID; internal lightweight/powerful provider and route IDs are not a client contract. Exposed direct terminal routes and other public models remain independently requestable, so use `exposure: internal` when bypass must not be offered.
 
@@ -132,17 +132,17 @@ env COPILOT_PROVIDER_BASE_URL=http://localhost:1337/v1 \
   copilot -p "Reply with exactly PROXY_OK" -s
 ```
 
-## Gemini CLI
+## Antigravity CLI
 
-Gemini endpoints do not accept v1 policy profile IDs; select a direct public model/route.
+Use [`vekil launch agy`](agent-launchers.md#antigravity-cli) for an ephemeral supervised session, or configure an already-running proxy manually. Antigravity CLI's enterprise model gateway mode sends Gemini `streamGenerateContent` requests to Vekil and reads the model picker from `/v1/models`, so any direct public model with `/chat/completions` or `/responses` works, not only Gemini models. Gemini endpoints do not accept v1 policy profile IDs.
 
 ```bash
-env GEMINI_API_KEY=dummy \
-  GOOGLE_GEMINI_BASE_URL=http://localhost:1337 \
-  GOOGLE_GENAI_API_VERSION=v1beta \
-  GEMINI_CLI_NO_RELAUNCH=true \
-  gemini -m gemini-2.5-pro -p "Reply with exactly PROXY_OK" -o json
+env AGY_LLM_GATEWAY_URL=http://localhost:1337 \
+  AGY_LLM_GATEWAY_API_KEY=dummy \
+  agy --model gemini-3.8-flash -p "Reply with exactly PROXY_OK"
 ```
+
+If `settings.json` sets `modelProvider`, add `--settings '{"modelProvider":""}'` so the gateway is used for that session. The `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL` mode also reaches Vekil but offers only Antigravity's built-in Gemini model list.
 
 ## Anthropic Messages API
 

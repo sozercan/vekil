@@ -11,6 +11,7 @@ type GeminiGenerateContentRequest struct {
 	GenerationConfig  *GeminiGenerationConfig `json:"generationConfig,omitempty"`
 	CachedContent     string                  `json:"cachedContent,omitempty"`
 	SafetySettings    json.RawMessage         `json:"safetySettings,omitempty"`
+	Labels            map[string]string       `json:"labels,omitempty"`
 }
 
 type GeminiCountTokensRequest = GeminiGenerateContentRequest

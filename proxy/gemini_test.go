@@ -563,6 +563,49 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("tool parameters convert Gemini schema types to JSON schema", func(t *testing.T) {
+		req := &models.GeminiGenerateContentRequest{
+			Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("Use the tool")}}}},
+			Tools: []models.GeminiTool{{
+				FunctionDeclarations: []models.GeminiFunctionDeclaration{
+					{
+						Name: "read_file",
+						Parameters: json.RawMessage(`{
+							"type":"OBJECT",
+							"properties":{
+								"type":{"type":"STRING","enum":["OBJECT","file"]},
+								"Lines":{"type":"ARRAY","items":{"type":"INTEGER"},"minItems":"1","maxItems":"12"},
+								"Name":{"type":"STRING","minLength":"1","maxLength":"not-a-number"},
+								"Mode":{"anyOf":[{"type":"BOOLEAN"},{"type":["NUMBER","NULL"]}]}
+							},
+							"required":["type"]
+						}`),
+					},
+					{
+						Name:                 "verbatim",
+						ParametersJSONSchema: json.RawMessage(`{"type":"object","properties":{"x":{"type":"STRING"}}}`),
+					},
+				},
+			}},
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+		if len(got.Tools) != 2 {
+			t.Fatalf("len(Tools) = %d, want 2", len(got.Tools))
+		}
+		wantConverted := `{"properties":{"Lines":{"items":{"type":"integer"},"maxItems":12,"minItems":1,"type":"array"},"Mode":{"anyOf":[{"type":"boolean"},{"type":["number","null"]}]},"Name":{"maxLength":"not-a-number","minLength":1,"type":"string"},"type":{"enum":["OBJECT","file"],"type":"string"}},"required":["type"],"type":"object"}`
+		if gotParams := string(got.Tools[0].Function.Parameters); gotParams != wantConverted {
+			t.Fatalf("converted parameters = %s, want %s", gotParams, wantConverted)
+		}
+		wantVerbatim := `{"properties":{"x":{"type":"STRING"}},"type":"object"}`
+		if gotParams := string(got.Tools[1].Function.Parameters); gotParams != wantVerbatim {
+			t.Fatalf("parametersJsonSchema = %s, want unchanged %s", gotParams, wantVerbatim)
+		}
+	})
+
 	t.Run("allowed function names narrow the forwarded tool list", func(t *testing.T) {
 		req := &models.GeminiGenerateContentRequest{
 			Contents: []models.GeminiContent{{
@@ -885,6 +928,14 @@ func TestDecodeGeminiGenerateContentRequestErrors(t *testing.T) {
 				"generation_config": {"thinking_config": {"unexpected_option": true}}
 			}`,
 			wantMsg: "request.generationConfig.thinkingConfig.unexpected_option is not supported or unknown",
+		},
+		{
+			name: "labels must map to strings",
+			body: `{
+				"contents": [{"role":"user","parts":[{"text":"hi"}]}],
+				"labels": {"step": 1}
+			}`,
+			wantMsg: "invalid JSON in request body",
 		},
 		{
 			name: "contents must be an array",
@@ -1693,6 +1744,41 @@ func TestHandleGeminiModelsGenerateContent(t *testing.T) {
 	}
 	if geminiResp.UsageMetadata == nil || geminiResp.UsageMetadata.TotalTokenCount != 13 {
 		t.Errorf("UsageMetadata = %#v, want totalTokenCount=13", geminiResp.UsageMetadata)
+	}
+}
+
+func TestHandleGeminiModelsDropsRequestLabels(t *testing.T) {
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var upstream map[string]json.RawMessage
+		if err := json.Unmarshal(body, &upstream); err != nil {
+			t.Fatalf("unmarshal upstream request: %v", err)
+		}
+		if _, ok := upstream["labels"]; ok {
+			t.Errorf("upstream request carried labels: %s", body)
+		}
+		if strings.Contains(string(body), "antigravity-cli") {
+			t.Errorf("upstream request leaked label values: %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+
+	reqBody := `{
+		"contents": [{"role":"user","parts":[{"text":"Hi"}]}],
+		"labels": {"client": "antigravity-cli", "request_id": "r-1"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler.HandleGeminiModels(w, req)
+
+	if resp := w.Result(); resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, body)
 	}
 }
 
