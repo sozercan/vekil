@@ -46,7 +46,7 @@ Supported subset:
 - `contents[].parts[].text`
 - `contents[].parts[].inlineData` for `image/*`
 - `contents[].parts[].functionCall`
-- `contents[].parts[].functionResponse`
+- `contents[].parts[].functionResponse`, in `user` or `model` contents (some clients, such as Antigravity, send tool results under `model`); each must match a prior `functionCall`. Results are grouped directly after the assistant turn that issued their calls, so text interleaved between results follows them
 - `tools[].functionDeclarations` with `parameters` or `parametersJsonSchema`
 - `toolConfig.functionCallingConfig`
 - `generationConfig.temperature`, `topP`, `maxOutputTokens`, `stopSequences`

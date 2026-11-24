@@ -558,7 +558,27 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 		case "model":
 			var textParts []string
 			var toolCalls []models.OpenAIToolCall
-			var processedPart bool
+			flushAssistantContent := func() error {
+				if len(textParts) == 0 && len(toolCalls) == 0 {
+					return nil
+				}
+
+				message := models.OpenAIMessage{Role: "assistant"}
+				if len(textParts) > 0 {
+					contentJSON, err := json.Marshal(strings.Join(textParts, ""))
+					if err != nil {
+						return err
+					}
+					message.Content = contentJSON
+				}
+				if len(toolCalls) > 0 {
+					message.ToolCalls = toolCalls
+				}
+				messages = append(messages, message)
+				textParts = nil
+				toolCalls = nil
+				return nil
+			}
 
 			for partIdx, part := range content.Parts {
 				if shouldSkipGeminiPart(part) {
@@ -569,7 +589,6 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 				if err != nil {
 					return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d]", contentIdx, partIdx)
 				}
-				processedPart = true
 
 				switch kind {
 				case "text":
@@ -584,38 +603,80 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionCall", contentIdx, partIdx)
 					}
 				case "functionResponse":
-					return nil, invalidGeminiArgument("contents[%d].parts[%d].functionResponse requires role \"user\"", contentIdx, partIdx)
+					// Some clients (for example Antigravity) send tool results
+					// in a model-role content. Translate them exactly as a
+					// user-role functionResponse, after any preceding calls.
+					if err := flushAssistantContent(); err != nil {
+						return nil, err
+					}
+
+					message, err := translateGeminiFunctionResponse(part.FunctionResponse, pendingToolCalls, options)
+					if err != nil {
+						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionResponse", contentIdx, partIdx)
+					}
+					messages = append(messages, message)
 				case "inlineData":
 					return nil, invalidGeminiArgument("contents[%d].parts[%d].inlineData requires role \"user\"", contentIdx, partIdx)
 				}
 			}
 
-			if len(textParts) == 0 && len(toolCalls) == 0 {
-				if !processedPart {
-					continue
-				}
-				return nil, invalidGeminiArgument("contents[%d] must include text or functionCall parts", contentIdx)
+			if err := flushAssistantContent(); err != nil {
+				return nil, err
 			}
-
-			message := models.OpenAIMessage{Role: "assistant"}
-			if len(textParts) > 0 {
-				contentJSON, err := json.Marshal(strings.Join(textParts, ""))
-				if err != nil {
-					return nil, err
-				}
-				message.Content = contentJSON
-			}
-			if len(toolCalls) > 0 {
-				message.ToolCalls = toolCalls
-			}
-			messages = append(messages, message)
 
 		default:
 			return nil, invalidGeminiArgument("contents[%d].role must be \"user\" or \"model\"", contentIdx)
 		}
 	}
 
-	return messages, nil
+	return groupGeminiToolResults(messages), nil
+}
+
+// groupGeminiToolResults moves each tool result up to sit directly after the
+// assistant message that issued its call. Chat Completions requires an
+// assistant tool-call message to be followed by its tool results without any
+// other message in between, while Gemini contents may interleave text with
+// functionResponse parts. Text that was interleaved keeps its relative order
+// and follows the grouped results. Results only move past text messages: they
+// are never pulled across another tool result or a later assistant tool-call
+// message, so histories without interleaved text are left unchanged.
+func groupGeminiToolResults(messages []models.OpenAIMessage) []models.OpenAIMessage {
+	grouped := make([]models.OpenAIMessage, 0, len(messages))
+	moved := make([]bool, len(messages))
+
+	for i, message := range messages {
+		if moved[i] {
+			continue
+		}
+		grouped = append(grouped, message)
+
+		if message.Role != "assistant" || len(message.ToolCalls) == 0 {
+			continue
+		}
+
+		outstanding := make(map[string]struct{}, len(message.ToolCalls))
+		for _, toolCall := range message.ToolCalls {
+			outstanding[toolCall.ID] = struct{}{}
+		}
+
+		for j := i + 1; j < len(messages) && len(outstanding) > 0; j++ {
+			candidate := messages[j]
+			if candidate.Role == "assistant" && len(candidate.ToolCalls) > 0 {
+				break
+			}
+			if candidate.Role != "tool" {
+				continue
+			}
+			if _, ok := outstanding[candidate.ToolCallID]; !ok {
+				break
+			}
+			grouped = append(grouped, candidate)
+			moved[j] = true
+			delete(outstanding, candidate.ToolCallID)
+		}
+	}
+
+	return grouped
 }
 
 func translateGeminiFunctionCall(functionCall *models.GeminiFunctionCall, contentIdx, partIdx int) (models.OpenAIToolCall, string, error) {
