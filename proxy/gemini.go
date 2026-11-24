@@ -39,16 +39,28 @@ type openAIContentBuilder struct {
 type geminiPendingToolCall struct {
 	toolCallID string
 	explicitID string
+	batch      int
 }
 
 type geminiExplicitToolCall struct {
 	name       string
 	toolCallID string
+	batch      int
 }
 
+// geminiPendingToolCalls tracks functionCalls that still await a
+// functionResponse. Each call records the tool-call batch that issued it.
+// Chat Completions requires every call to be answered before the next
+// assistant tool-call turn, so a response to a call from an earlier batch than
+// the latest one cannot be translated into a valid history.
 type geminiPendingToolCalls struct {
 	byName       map[string][]geminiPendingToolCall
 	byExplicitID map[string]geminiExplicitToolCall
+	batch        int
+	// answered reports whether any functionResponse was consumed since the
+	// current batch started. Calls split across consecutive model contents
+	// with no response in between stay in one batch.
+	answered bool
 }
 
 func (b *openAIContentBuilder) appendText(text string) {
@@ -92,10 +104,21 @@ func newGeminiPendingToolCalls() *geminiPendingToolCalls {
 	}
 }
 
+// beginBatch is called before the first functionCall of an assistant message.
+// It starts a new batch only when the current one has already received a
+// functionResponse.
+func (p *geminiPendingToolCalls) beginBatch() {
+	if p.batch == 0 || p.answered {
+		p.batch++
+		p.answered = false
+	}
+}
+
 func (p *geminiPendingToolCalls) add(name, toolCallID, explicitID string) error {
 	p.byName[name] = append(p.byName[name], geminiPendingToolCall{
 		toolCallID: toolCallID,
 		explicitID: explicitID,
+		batch:      p.batch,
 	})
 
 	if explicitID == "" {
@@ -109,6 +132,7 @@ func (p *geminiPendingToolCalls) add(name, toolCallID, explicitID string) error 
 	p.byExplicitID[explicitID] = geminiExplicitToolCall{
 		name:       name,
 		toolCallID: toolCallID,
+		batch:      p.batch,
 	}
 
 	return nil
@@ -130,6 +154,9 @@ func (p *geminiPendingToolCalls) consumeByExplicitID(name, explicitID string) (s
 	if explicit.name != name {
 		return "", false, invalidGeminiArgument("functionResponse.id %q belongs to functionCall %q, not %q", explicitID, explicit.name, name)
 	}
+	if err := p.markBatchAnswered(name, explicit.batch); err != nil {
+		return "", false, err
+	}
 
 	if err := p.removeByName(name, explicitID); err != nil {
 		return "", false, err
@@ -146,6 +173,9 @@ func (p *geminiPendingToolCalls) consumeNextByName(name string) (string, error) 
 	}
 
 	next := pending[0]
+	if err := p.markBatchAnswered(name, next.batch); err != nil {
+		return "", err
+	}
 	if len(pending) == 1 {
 		delete(p.byName, name)
 	} else {
@@ -157,6 +187,14 @@ func (p *geminiPendingToolCalls) consumeNextByName(name string) (string, error) 
 	}
 
 	return next.toolCallID, nil
+}
+
+func (p *geminiPendingToolCalls) markBatchAnswered(name string, batch int) error {
+	if batch == p.batch {
+		p.answered = true
+		return nil
+	}
+	return invalidGeminiArgument("functionResponse for %q answers a functionCall issued before a later functionCall; respond to every functionCall before issuing new ones", name)
 }
 
 func (p *geminiPendingToolCalls) hasExplicitIDs(name string) bool {
@@ -597,6 +635,10 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 					toolCall, explicitID, err := translateGeminiFunctionCall(part.FunctionCall, contentIdx, partIdx)
 					if err != nil {
 						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionCall", contentIdx, partIdx)
+					}
+					if len(toolCalls) == 0 {
+						// First call of a new assistant tool-call message.
+						pendingToolCalls.beginBatch()
 					}
 					toolCalls = append(toolCalls, toolCall)
 					if err := pendingToolCalls.add(toolCall.Function.Name, toolCall.ID, explicitID); err != nil {

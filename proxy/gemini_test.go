@@ -1222,6 +1222,53 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantMsg:    `contents[0].parts[0].functionResponse: functionResponse for "search" does not match any prior functionCall`,
 		},
 		{
+			// call A, call B, response A, call C, response B, response C would
+			// otherwise translate to assistant(A,B), tool(A), assistant(C),
+			// tool(B), tool(C), leaving B unanswered before the next assistant turn.
+			name: "overlapping tool-call batches in one model content",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{
+					Role: "model",
+					Parts: []models.GeminiPart{
+						{FunctionCall: &models.GeminiFunctionCall{ID: "a", Name: "read_file", Args: json.RawMessage(`{}`)}},
+						{FunctionCall: &models.GeminiFunctionCall{ID: "b", Name: "list_dir", Args: json.RawMessage(`{}`)}},
+						{FunctionResponse: &models.GeminiFunctionResponse{ID: "a", Name: "read_file", Response: json.RawMessage(`{"ok":1}`)}},
+						{FunctionCall: &models.GeminiFunctionCall{ID: "c", Name: "search", Args: json.RawMessage(`{}`)}},
+						{FunctionResponse: &models.GeminiFunctionResponse{ID: "b", Name: "list_dir", Response: json.RawMessage(`{"ok":2}`)}},
+						{FunctionResponse: &models.GeminiFunctionResponse{ID: "c", Name: "search", Response: json.RawMessage(`{"ok":3}`)}},
+					},
+				}},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    `contents[0].parts[4].functionResponse: functionResponse for "list_dir" answers a functionCall issued before a later functionCall`,
+		},
+		{
+			name: "overlapping tool-call batches across contents without ids",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{
+					{Role: "model", Parts: []models.GeminiPart{
+						{FunctionCall: &models.GeminiFunctionCall{Name: "search", Args: json.RawMessage(`{"q":"a"}`)}},
+						{FunctionCall: &models.GeminiFunctionCall{Name: "search", Args: json.RawMessage(`{"q":"b"}`)}},
+					}},
+					{Role: "user", Parts: []models.GeminiPart{
+						{FunctionResponse: &models.GeminiFunctionResponse{Name: "search", Response: json.RawMessage(`{"ok":1}`)}},
+					}},
+					{Role: "model", Parts: []models.GeminiPart{
+						{FunctionCall: &models.GeminiFunctionCall{Name: "search", Args: json.RawMessage(`{"q":"c"}`)}},
+					}},
+					{Role: "user", Parts: []models.GeminiPart{
+						{FunctionResponse: &models.GeminiFunctionResponse{Name: "search", Response: json.RawMessage(`{"ok":2}`)}},
+					}},
+				},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    `contents[3].parts[0].functionResponse: functionResponse for "search" answers a functionCall issued before a later functionCall`,
+		},
+		{
 			name: "unknown function response id with explicit history",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{
