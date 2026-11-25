@@ -413,6 +413,142 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("function response parts with text and inline images", func(t *testing.T) {
+		body := `{
+			"contents": [
+				{"role": "user", "parts": [{"text": "Take screenshots"}]},
+				{"role": "model", "parts": [
+					{"function_call": {"id": "call-1", "name": "screenshot", "args": {"page": 1}}},
+					{"function_call": {"id": "call-2", "name": "screenshot", "args": {"page": 2}}}
+				]},
+				{"role": "model", "parts": [
+					{"function_response": {
+						"id": "call-1",
+						"name": "screenshot",
+						"response": {"ok": true},
+						"parts": [
+							{"text": "captured page 1"},
+							{"inline_data": {"mime_type": "image/png", "data": "AQID", "display_name": "page1.png"}}
+						]
+					}},
+					{"function_response": {
+						"id": "call-2",
+						"name": "screenshot",
+						"parts": [
+							{"inlineData": {"mimeType": "image/jpeg", "data": "BAUG"}}
+						]
+					}}
+				]}
+			]
+		}`
+
+		req, err := decodeGeminiGenerateContentRequest([]byte(body))
+		if err != nil {
+			t.Fatalf("decodeGeminiGenerateContentRequest() error = %v", err)
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		wantRoles := []string{"user", "assistant", "tool", "tool", "user", "user"}
+		if len(got.Messages) != len(wantRoles) {
+			t.Fatalf("len(Messages) = %d, want %d: %#v", len(got.Messages), len(wantRoles), got.Messages)
+		}
+		for i, role := range wantRoles {
+			if got.Messages[i].Role != role {
+				t.Fatalf("Messages[%d].Role = %q, want %q", i, got.Messages[i].Role, role)
+			}
+		}
+
+		if got.Messages[2].ToolCallID != "call-1" || got.Messages[3].ToolCallID != "call-2" {
+			t.Fatalf("tool call IDs = %q, %q, want call-1, call-2", got.Messages[2].ToolCallID, got.Messages[3].ToolCallID)
+		}
+
+		var tool1, tool2 string
+		if err := json.Unmarshal(got.Messages[2].Content, &tool1); err != nil {
+			t.Fatalf("decode tool1: %v", err)
+		}
+		if err := json.Unmarshal(got.Messages[3].Content, &tool2); err != nil {
+			t.Fatalf("decode tool2: %v", err)
+		}
+		if tool1 != "{\"ok\":true}\ncaptured page 1\n[Tool result 1 image 1]" {
+			t.Errorf("tool1 = %q", tool1)
+		}
+		if tool2 != "[Tool result 2 image 1]" {
+			t.Errorf("tool2 = %q", tool2)
+		}
+
+		var img1, img2 []models.OpenAIContentPart
+		if err := json.Unmarshal(got.Messages[4].Content, &img1); err != nil {
+			t.Fatalf("decode img1: %v", err)
+		}
+		if err := json.Unmarshal(got.Messages[5].Content, &img2); err != nil {
+			t.Fatalf("decode img2: %v", err)
+		}
+		if len(img1) != 2 || img1[0].Type != "text" || !strings.Contains(derefString(img1[0].Text), "Tool result 1 image 1") || img1[1].Type != "image_url" || img1[1].ImageURL == nil || img1[1].ImageURL.URL != "data:image/png;base64,AQID" {
+			t.Errorf("img1 = %#v", img1)
+		}
+		if len(img2) != 2 || img2[0].Type != "text" || !strings.Contains(derefString(img2[0].Text), "Tool result 2 image 1") || img2[1].Type != "image_url" || img2[1].ImageURL == nil || img2[1].ImageURL.URL != "data:image/jpeg;base64,BAUG" {
+			t.Errorf("img2 = %#v", img2)
+		}
+	})
+
+	t.Run("function response images stay after grouped tool results when text is interleaved", func(t *testing.T) {
+		req := &models.GeminiGenerateContentRequest{
+			Contents: []models.GeminiContent{
+				{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("Go")}}},
+				{
+					Role: "model",
+					Parts: []models.GeminiPart{
+						{FunctionCall: &models.GeminiFunctionCall{ID: "c1", Name: "snap", Args: json.RawMessage(`{}`)}},
+						{FunctionCall: &models.GeminiFunctionCall{ID: "c2", Name: "snap", Args: json.RawMessage(`{}`)}},
+					},
+				},
+				{
+					Role: "user",
+					Parts: []models.GeminiPart{
+						{FunctionResponse: &models.GeminiFunctionResponse{
+							ID:       "c1",
+							Name:     "snap",
+							Response: json.RawMessage(`{"ok":1}`),
+							Parts:    []models.GeminiFunctionResponsePart{{InlineData: json.RawMessage(`{"mimeType":"image/png","data":"AQID"}`)}},
+						}},
+						{Text: stringPtr("Middle note")},
+						{FunctionResponse: &models.GeminiFunctionResponse{
+							ID:       "c2",
+							Name:     "snap",
+							Response: json.RawMessage(`{"ok":2}`),
+							Parts:    []models.GeminiFunctionResponsePart{{InlineData: json.RawMessage(`{"mimeType":"image/png","data":"BAUG"}`)}},
+						}},
+					},
+				},
+			},
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		wantRoles := []string{"user", "assistant", "tool", "tool", "user", "user", "user"}
+		if len(got.Messages) != len(wantRoles) {
+			t.Fatalf("len(Messages) = %d, want %d: %#v", len(got.Messages), len(wantRoles), got.Messages)
+		}
+		for i, role := range wantRoles {
+			if got.Messages[i].Role != role {
+				t.Fatalf("Messages[%d].Role = %q, want %q", i, got.Messages[i].Role, role)
+			}
+		}
+		if got.Messages[2].ToolCallID != "c1" || got.Messages[3].ToolCallID != "c2" {
+			t.Fatalf("tool call IDs = %q, %q, want c1, c2", got.Messages[2].ToolCallID, got.Messages[3].ToolCallID)
+		}
+		if err := validateCompleteImageToolHistory(got.Messages); err != nil {
+			t.Fatalf("validateCompleteImageToolHistory() error = %v", err)
+		}
+	})
+
 	t.Run("user inline image becomes multimodal content array", func(t *testing.T) {
 		req := &models.GeminiGenerateContentRequest{
 			Contents: []models.GeminiContent{{
@@ -1398,7 +1534,7 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantStatus: "INVALID_ARGUMENT",
 		},
 		{
-			name: "multimodal function response unsupported",
+			name: "function response parts fileData unsupported",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{
 					{
@@ -1413,7 +1549,7 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 							FunctionResponse: &models.GeminiFunctionResponse{
 								Name:     "search",
 								Response: json.RawMessage(`{"ok":true}`),
-								Parts:    json.RawMessage(`[{"text":"supplemental"}]`),
+								Parts:    []models.GeminiFunctionResponsePart{{FileData: json.RawMessage(`{"fileUri":"gs://bucket/a.png"}`)}},
 							},
 						}},
 					},
@@ -1422,7 +1558,89 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			pathModel:  "gemini-2.5-pro",
 			wantCode:   http.StatusNotImplemented,
 			wantStatus: "UNIMPLEMENTED",
-			wantMsg:    "functionResponse.parts is not supported",
+			wantMsg:    "contents[1].parts[0].functionResponse: parts[0]: fileData is not supported",
+		},
+		{
+			name: "function response parts non-image inlineData unsupported",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{
+					{
+						Role: "model",
+						Parts: []models.GeminiPart{{
+							FunctionCall: &models.GeminiFunctionCall{Name: "read_pdf", Args: json.RawMessage(`{}`)},
+						}},
+					},
+					{
+						Role: "user",
+						Parts: []models.GeminiPart{{
+							FunctionResponse: &models.GeminiFunctionResponse{
+								Name:     "read_pdf",
+								Response: json.RawMessage(`{"ok":true}`),
+								Parts:    []models.GeminiFunctionResponsePart{{InlineData: json.RawMessage(`{"mimeType":"application/pdf","data":"JVBERi0="}`)}},
+							},
+						}},
+					},
+				},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusNotImplemented,
+			wantStatus: "UNIMPLEMENTED",
+			wantMsg:    "only image/* inlineData can be translated today",
+		},
+		{
+			name: "function response parts mixed fileData and text rejected",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{
+					{
+						Role: "model",
+						Parts: []models.GeminiPart{{
+							FunctionCall: &models.GeminiFunctionCall{Name: "search", Args: json.RawMessage(`{}`)},
+						}},
+					},
+					{
+						Role: "user",
+						Parts: []models.GeminiPart{{
+							FunctionResponse: &models.GeminiFunctionResponse{
+								Name: "search",
+								Parts: []models.GeminiFunctionResponsePart{{
+									Text:     stringPtr("caption"),
+									FileData: json.RawMessage(`{"fileUri":"gs://bucket/a.png"}`),
+								}},
+							},
+						}},
+					},
+				},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "parts[0] must contain exactly one supported field",
+		},
+		{
+			name: "function response parts empty part rejected",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{
+					{
+						Role: "model",
+						Parts: []models.GeminiPart{{
+							FunctionCall: &models.GeminiFunctionCall{Name: "search", Args: json.RawMessage(`{}`)},
+						}},
+					},
+					{
+						Role: "user",
+						Parts: []models.GeminiPart{{
+							FunctionResponse: &models.GeminiFunctionResponse{
+								Name:  "search",
+								Parts: []models.GeminiFunctionResponsePart{{}},
+							},
+						}},
+					},
+				},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "parts[0] must contain text or supported inlineData",
 		},
 		{
 			name: "body model mismatch",

@@ -511,6 +511,15 @@ func translateGeminiSystemInstruction(systemInstruction *models.GeminiContent) (
 func translateGeminiContents(contents []models.GeminiContent, options geminiTranslationOptions) ([]models.OpenAIMessage, error) {
 	pendingToolCalls := newGeminiPendingToolCalls()
 	var messages []models.OpenAIMessage
+	var pendingToolImages []models.OpenAIMessage
+	toolResultIndex := 0
+	flushPendingToolImages := func() {
+		if len(pendingToolImages) == 0 {
+			return
+		}
+		messages = append(messages, pendingToolImages...)
+		pendingToolImages = nil
+	}
 
 	for contentIdx, content := range contents {
 		if len(content.Parts) == 0 {
@@ -535,6 +544,7 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 					return err
 				}
 
+				flushPendingToolImages()
 				messages = append(messages, models.OpenAIMessage{
 					Role:    "user",
 					Content: contentJSON,
@@ -567,11 +577,15 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 						return nil, err
 					}
 
-					message, err := translateGeminiFunctionResponse(part.FunctionResponse, pendingToolCalls, options)
+					toolResultIndex++
+					message, imageMessage, err := translateGeminiFunctionResponse(part.FunctionResponse, pendingToolCalls, options, toolResultIndex)
 					if err != nil {
 						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionResponse", contentIdx, partIdx)
 					}
 					messages = append(messages, message)
+					if imageMessage != nil {
+						pendingToolImages = append(pendingToolImages, *imageMessage)
+					}
 				case "functionCall":
 					return nil, invalidGeminiArgument("contents[%d].parts[%d].functionCall requires role \"model\"", contentIdx, partIdx)
 				}
@@ -600,6 +614,7 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 				if len(toolCalls) > 0 {
 					message.ToolCalls = toolCalls
 				}
+				flushPendingToolImages()
 				messages = append(messages, message)
 				textParts = nil
 				toolCalls = nil
@@ -636,11 +651,15 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 						return nil, err
 					}
 
-					message, err := translateGeminiFunctionResponse(part.FunctionResponse, pendingToolCalls, options)
+					toolResultIndex++
+					message, imageMessage, err := translateGeminiFunctionResponse(part.FunctionResponse, pendingToolCalls, options, toolResultIndex)
 					if err != nil {
 						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].functionResponse", contentIdx, partIdx)
 					}
 					messages = append(messages, message)
+					if imageMessage != nil {
+						pendingToolImages = append(pendingToolImages, *imageMessage)
+					}
 				case "inlineData":
 					return nil, invalidGeminiArgument("contents[%d].parts[%d].inlineData requires role \"user\"", contentIdx, partIdx)
 				}
@@ -655,6 +674,7 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 		}
 	}
 
+	flushPendingToolImages()
 	return groupGeminiToolResults(messages), nil
 }
 
@@ -723,41 +743,115 @@ func translateGeminiFunctionCall(functionCall *models.GeminiFunctionCall, conten
 	}, explicitID, nil
 }
 
-func translateGeminiFunctionResponse(functionResponse *models.GeminiFunctionResponse, pendingToolCalls *geminiPendingToolCalls, options geminiTranslationOptions) (models.OpenAIMessage, error) {
+func translateGeminiFunctionResponse(functionResponse *models.GeminiFunctionResponse, pendingToolCalls *geminiPendingToolCalls, options geminiTranslationOptions, resultIndex int) (models.OpenAIMessage, *models.OpenAIMessage, error) {
 	if functionResponse == nil || strings.TrimSpace(functionResponse.Name) == "" {
-		return models.OpenAIMessage{}, invalidGeminiArgument("functionResponse.name is required")
-	}
-	if hasRawJSON(functionResponse.Parts) {
-		return models.OpenAIMessage{}, unsupportedGemini("functionResponse.parts is not supported; multimodal tool responses cannot be translated today")
+		return models.OpenAIMessage{}, nil, invalidGeminiArgument("functionResponse.name is required")
 	}
 
 	responseID := strings.TrimSpace(functionResponse.ID)
 	toolCallID, matched, err := pendingToolCalls.consumeByExplicitID(functionResponse.Name, responseID)
 	if err != nil {
-		return models.OpenAIMessage{}, err
+		return models.OpenAIMessage{}, nil, err
 	}
 	if !matched {
 		toolCallID, err = pendingToolCalls.consumeNextByName(functionResponse.Name)
 		if err != nil {
-			return models.OpenAIMessage{}, err
+			return models.OpenAIMessage{}, nil, err
 		}
 	}
 
-	responseText, err := normalizeGeminiFunctionResponse(functionResponse.Response, options.unwrapCLITextOutput)
+	partTexts, imageParts, err := translateGeminiFunctionResponseParts(functionResponse.Parts, resultIndex)
 	if err != nil {
-		return models.OpenAIMessage{}, invalidGeminiArgument("functionResponse.response must be valid JSON")
+		return models.OpenAIMessage{}, nil, err
 	}
 
-	contentJSON, err := json.Marshal(responseText)
+	var segments []string
+	if hasRawJSON(functionResponse.Response) || len(partTexts) == 0 {
+		responseText, err := normalizeGeminiFunctionResponse(functionResponse.Response, options.unwrapCLITextOutput)
+		if err != nil {
+			return models.OpenAIMessage{}, nil, invalidGeminiArgument("functionResponse.response must be valid JSON")
+		}
+		segments = append(segments, responseText)
+	}
+	segments = append(segments, partTexts...)
+
+	contentJSON, err := json.Marshal(strings.Join(segments, "\n"))
 	if err != nil {
-		return models.OpenAIMessage{}, err
+		return models.OpenAIMessage{}, nil, err
+	}
+
+	var imageMessage *models.OpenAIMessage
+	if len(imageParts) > 0 {
+		imageJSON, err := json.Marshal(imageParts)
+		if err != nil {
+			return models.OpenAIMessage{}, nil, err
+		}
+		imageMessage = &models.OpenAIMessage{
+			Role:    "user",
+			Content: imageJSON,
+		}
 	}
 
 	return models.OpenAIMessage{
 		Role:       "tool",
 		ToolCallID: toolCallID,
 		Content:    contentJSON,
-	}, nil
+	}, imageMessage, nil
+}
+
+func translateGeminiFunctionResponseParts(parts []models.GeminiFunctionResponsePart, resultIndex int) ([]string, []models.OpenAIContentPart, error) {
+	if len(parts) == 0 {
+		return nil, nil, nil
+	}
+
+	var textSegments []string
+	var images []models.OpenAIContentPart
+	imageIndex := 0
+
+	for partIdx, part := range parts {
+		hasFileData := hasRawJSON(part.FileData)
+		hasInlineData := hasRawJSON(part.InlineData)
+
+		count := 0
+		if part.Text != nil {
+			count++
+		}
+		if hasInlineData {
+			count++
+		}
+		if hasFileData {
+			count++
+		}
+
+		switch count {
+		case 0:
+			return nil, nil, invalidGeminiArgument("parts[%d] must contain text or supported inlineData", partIdx)
+		case 1:
+		default:
+			return nil, nil, invalidGeminiArgument("parts[%d] must contain exactly one supported field", partIdx)
+		}
+
+		if hasFileData {
+			return nil, nil, annotateGeminiProtocolError(unsupportedGemini("fileData is not supported"), "parts[%d]", partIdx)
+		}
+
+		if part.Text != nil {
+			textSegments = append(textSegments, *part.Text)
+			continue
+		}
+
+		imagePart, err := translateGeminiInlineData(part.InlineData)
+		if err != nil {
+			return nil, nil, annotateGeminiProtocolError(err, "parts[%d].inlineData", partIdx)
+		}
+		imageIndex++
+		label := fmt.Sprintf("Tool result %d image %d", resultIndex, imageIndex)
+		textSegments = append(textSegments, fmt.Sprintf("[%s]", label))
+		preamble := label + " (tool results numbered in conversation order; attachment from tool output):"
+		images = append(images, models.OpenAIContentPart{Type: "text", Text: &preamble}, imagePart)
+	}
+
+	return textSegments, images, nil
 }
 
 func translateGeminiTools(tools []models.GeminiTool) ([]models.OpenAITool, map[string]struct{}, error) {

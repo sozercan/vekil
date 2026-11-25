@@ -34,8 +34,9 @@ type GeminiPart struct {
 }
 
 type GeminiInlineData struct {
-	MimeType string `json:"mimeType"`
-	Data     string `json:"data"`
+	MimeType    string `json:"mimeType"`
+	Data        string `json:"data"`
+	DisplayName string `json:"displayName,omitempty"`
 }
 
 type GeminiFunctionCall struct {
@@ -45,10 +46,16 @@ type GeminiFunctionCall struct {
 }
 
 type GeminiFunctionResponse struct {
-	ID       string          `json:"id,omitempty"`
-	Name     string          `json:"name"`
-	Response json.RawMessage `json:"response,omitempty"`
-	Parts    json.RawMessage `json:"parts,omitempty"`
+	ID       string                       `json:"id,omitempty"`
+	Name     string                       `json:"name"`
+	Response json.RawMessage              `json:"response,omitempty"`
+	Parts    []GeminiFunctionResponsePart `json:"parts,omitempty"`
+}
+
+type GeminiFunctionResponsePart struct {
+	Text       *string         `json:"text,omitempty"`
+	InlineData json.RawMessage `json:"inlineData,omitempty"`
+	FileData   json.RawMessage `json:"fileData,omitempty"`
 }
 
 type GeminiTool struct {
