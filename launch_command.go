@@ -63,6 +63,14 @@ type launchTargetSpec struct {
 
 func launchTarget(name string) (launchTargetSpec, bool) {
 	switch name {
+	case "agy":
+		return launchTargetSpec{
+			name:          "agy",
+			displayName:   "Antigravity CLI",
+			installHelp:   "install Antigravity CLI",
+			requiresModel: true,
+			adapter:       launch.AgyAdapter{},
+		}, true
 	case "claude":
 		return launchTargetSpec{
 			name:        "claude",
@@ -118,11 +126,13 @@ func runLaunchCommand(args []string, stderr io.Writer) int {
 
 func printLaunchUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "Usage:")
+	_, _ = fmt.Fprintln(w, "  vekil launch agy --model MODEL [options] -- [agy args...]")
 	_, _ = fmt.Fprintln(w, "  vekil launch claude [--model MODEL] [options] -- [claude args...]")
 	_, _ = fmt.Fprintln(w, "  vekil launch codex [--model MODEL] [options] -- [codex args...]")
 	_, _ = fmt.Fprintln(w, "  vekil launch copilot --model MODEL [options] -- [copilot args...]")
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "Supported launch targets:")
+	_, _ = fmt.Fprintln(w, "  agy        Start an ephemeral local Vekil proxy and run Antigravity CLI")
 	_, _ = fmt.Fprintln(w, "  claude     Start an ephemeral local Vekil proxy and run Claude Code")
 	_, _ = fmt.Fprintln(w, "  codex      Start an ephemeral local Vekil proxy and run Codex CLI")
 	_, _ = fmt.Fprintln(w, "  copilot    Start an ephemeral local Vekil proxy and run GitHub Copilot CLI")

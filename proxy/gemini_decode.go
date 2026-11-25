@@ -215,6 +215,7 @@ var geminiRequestNode = geminiJSONNode{
 		"generationConfig",
 		"cachedContent",
 		"safetySettings",
+		"labels",
 	),
 	objectChildren: map[string]geminiJSONNode{
 		"systemInstruction": geminiContentNode,

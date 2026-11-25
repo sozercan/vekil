@@ -5,8 +5,8 @@ against it in one command. The proxy uses an OS-selected port by default,
 authenticates the child with a random per-launch token, prints a request/token
 summary, and stops when the agent exits. Claude Code and Codex CLI can either
 choose their normal CLI default through the global public model namespace or be
-pinned to one validated model. GitHub Copilot CLI always requires a pinned
-model.
+pinned to one validated model. GitHub Copilot CLI and Antigravity CLI always
+require a pinned model.
 
 ## Supported targets
 
@@ -15,6 +15,7 @@ model.
 | Claude Code | Optional `--model`; otherwise Claude's CLI default | Claude Code 2.1.83+ | `/v1/messages`, `/chat/completions`, or `/responses` |
 | OpenAI Codex CLI | Optional `--model`; otherwise Codex's CLI default | Codex CLI 0.137.0+ | `/responses`; a policy-owned `/chat/completions` model through bounded stateless compatibility; or an opted-in Chat-only model through [Responses-over-Chat](#chat-only-models-in-codex-responses-over-chat) |
 | GitHub Copilot CLI | `--model` required | GitHub Copilot CLI 1.0.0+ | `/responses` or `/chat/completions` |
+| Antigravity CLI (`agy`) | `--model` required | Antigravity CLI 1.5.6+ | `/chat/completions` or `/responses`, through Vekil's Gemini routes |
 
 ```bash
 vekil launch claude
@@ -22,6 +23,7 @@ vekil launch codex
 vekil launch claude --model claude-sonnet-4.5
 vekil launch codex --model gpt-5.4-mini
 vekil launch copilot --model gpt-5.4-mini
+vekil launch agy --model gemini-3.8-flash
 ```
 
 Use the same provider configuration accepted by the normal server:
@@ -41,6 +43,8 @@ vekil launch claude --model claude-opus-5 -- \
 vekil launch codex -- resume --last
 
 vekil launch copilot --model gpt-5.4-mini -- --continue
+
+vekil launch agy --model gemini-3.8-flash -- --continue
 
 vekil launch codex -- \
   exec --ephemeral --skip-git-repo-check "Review this workspace"
@@ -86,7 +90,9 @@ Claude Code and Codex CLI support two launch modes:
 
 GitHub Copilot CLI has no delegated mode. Its custom-provider/BYOK contract
 requires an explicit model, so `vekil launch copilot` rejects startup unless
-`--model` is supplied.
+`--model` is supplied. Antigravity CLI has no delegated mode either: without a
+pin it picks a built-in default or the first catalog entry, which Vekil may not
+serve, so `vekil launch agy` also requires `--model`.
 
 Policy-owned Codex compatibility also requires launcher-level `--model`. A
 delegated Codex session can use normal direct Responses models, but Vekil cannot
@@ -120,7 +126,7 @@ normal global policy-controller startup behavior.
 
 | Flag | Purpose |
 |------|---------|
-| `--model ID` | Public Vekil model ID to validate, scope, and pin. Optional for Claude Code and Codex CLI; required for GitHub Copilot CLI. |
+| `--model ID` | Public Vekil model ID to validate, scope, and pin. Optional for Claude Code and Codex CLI; required for GitHub Copilot CLI and Antigravity CLI. |
 | `--providers-config SOURCE` | Local path or HTTP(S) URL to JSON or YAML provider configuration. |
 | `--state-bindings-mode config\|durable\|memory` | Optional override of the shared providers-file state mode. |
 | `--state-bindings-file PATH` | Optional distinct durable file in an existing private directory. |
@@ -143,7 +149,8 @@ vekil launch codex --model gpt-5.4-mini --dry-run
 
 For Claude Code and Codex CLI without `--model`, dry-run describes model
 selection as `CLI default`. It does not invent a concrete model or perform
-model-specific checks. GitHub Copilot CLI dry-run still requires `--model`.
+model-specific checks. GitHub Copilot CLI and Antigravity CLI dry-runs still
+require `--model`.
 
 Dry-run never contacts provider model catalogs. For a pinned model declared in
 the providers file, Vekil uses its configured endpoint and capability metadata
@@ -417,6 +424,52 @@ Foreground local resume and continue arguments are forwarded. Forwarded model,
 custom-agent, connect/session-ID, remote/export/share, ACP-server, and non-agent
 subcommands remain rejected. Copilot's offline launch mode cannot resume remote
 task IDs even though `--resume` accepts task IDs as well as local session IDs.
+
+## Antigravity CLI
+
+```bash
+vekil launch agy --model gemini-3.8-flash -- --continue
+
+vekil launch agy --model claude-sonnet-5.5 -- \
+  --dangerously-skip-permissions -p "Reply with exactly OK"
+```
+
+The launcher uses Antigravity's enterprise model gateway mode rather than
+Gemini API-key mode, because only the gateway reads its model picker from
+Vekil's `/v1/models` catalog; API-key mode offers only Antigravity's built-in
+Gemini models. The child environment sets:
+
+- `AGY_LLM_GATEWAY_URL` to the ephemeral proxy root;
+- `AGY_LLM_GATEWAY_API_KEY` to the random local token, which Antigravity sends
+  as `Authorization: Bearer`;
+- `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai`, so turns arrive on Vekil's
+  [Gemini routes](gemini.md) as `streamGenerateContent` requests;
+- `AGY_CLI_DISABLE_AUTO_UPDATE=true`.
+
+The command line adds `--model` with the pinned public ID and a session-only
+`--settings '{"modelProvider":""}'` overlay. A saved `modelProvider` in
+`~/.gemini/antigravity-cli/settings.json` would otherwise take precedence over
+the gateway variables; the overlay is never written to that file. Inherited
+`GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GEMINI_BASE_URL`,
+`GOOGLE_VERTEX_BASE_URL`, `GOOGLE_APPLICATION_CREDENTIALS`, `AGY_ADC_AUTH`, and
+other `AGY_LLM_GATEWAY_*` values are removed. An organization's MDM-managed
+`admin_settings.json` still outranks environment variables, and the launcher
+cannot override it.
+
+Any direct public model that Vekil serves through native `/chat/completions` or
+`/responses` works, including Claude and GPT models. Policy profile IDs are
+rejected because Gemini routes do not accept them. As with the other pinned
+launchers, the proxy rejects requests for any other model.
+
+Foreground `--continue` and `--conversation`/`--resume` arguments, print mode,
+and `agy models` are forwarded. Forwarded `--model`, `--settings`,
+`--remote-agent`, `--remote-control`, and non-session commands such as `acp`,
+`install`, `mcp`, `plugin`, and `update` are rejected. Antigravity's
+conversation history stays in its own home directory, so a continued
+conversation uses the new launch's proxy and model pin. Antigravity has no
+subprocess secret scrubbing, so tools it runs can read the local proxy token
+from their environment; the token reaches only the pinned model on the loopback
+proxy.
 
 ## Logs and statistics
 

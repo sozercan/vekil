@@ -10,11 +10,11 @@
 
 ---
 
-Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI, OpenAI Codex, and generic OpenAI-compatible or Anthropic-compatible upstreams. The client-facing API surface stays the same while model ownership is configured behind the proxy. Vekil can also launch Claude Code, Codex CLI, or GitHub Copilot CLI through short-lived proxy sessions, optionally pinned to one model.
+Vekil is a Go reverse proxy that exposes Anthropic, Gemini, and OpenAI-compatible APIs behind one local endpoint. Run it in zero-config mode against GitHub Copilot, or route selected models to providers like Azure OpenAI, OpenAI Codex, and generic OpenAI-compatible or Anthropic-compatible upstreams. The client-facing API surface stays the same while model ownership is configured behind the proxy. Vekil can also launch Claude Code, Codex CLI, GitHub Copilot CLI, or Antigravity CLI through short-lived proxy sessions, optionally pinned to one model.
 
 ## Why Vekil?
 
-Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Azure OpenAI, or send Gemini-CLI traffic through any OpenAI-compatible upstream — all without touching client config. Swap providers behind the proxy; your tools never notice.
+Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Azure OpenAI, or send Antigravity CLI traffic through any OpenAI-compatible upstream — all without touching client config. Swap providers behind the proxy; your tools never notice.
 
 ## Features
 
@@ -25,7 +25,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 - **Optional tool optimizers** for opt-in shell command rewrites and tool-output reduction across supported API surfaces; see [Tool Optimizers](docs/tool-optimizers.md)
 - **Codex compatibility shims** for compaction and memory summarization
 - **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
-- **One-command Claude Code, Codex CLI, and GitHub Copilot CLI launchers** with ephemeral loopback proxies and no persistent client routing changes
+- **One-command Claude Code, Codex CLI, GitHub Copilot CLI, and Antigravity CLI launchers** with ephemeral loopback proxies and no persistent client routing changes
 
 ## Quick Start
 
@@ -153,12 +153,11 @@ env COPILOT_PROVIDER_BASE_URL=http://localhost:1337/v1 \
   copilot -p "Reply with exactly PROXY_OK" -s
 ```
 
-### Gemini CLI
+### Antigravity CLI
 
 ```bash
-env GEMINI_API_KEY=dummy \
-  GOOGLE_GEMINI_BASE_URL=http://localhost:1337 \
-  GOOGLE_GENAI_API_VERSION=v1beta \
-  GEMINI_CLI_NO_RELAUNCH=true \
-  gemini -m gemini-2.5-pro -p "Reply with exactly PROXY_OK" -o json
+env AGY_LLM_GATEWAY_URL=http://localhost:1337 \
+  AGY_LLM_GATEWAY_API_KEY=dummy \
+  agy --settings '{"modelProvider":""}' --model gemini-3.8-flash \
+  -p "Reply with exactly PROXY_OK"
 ```

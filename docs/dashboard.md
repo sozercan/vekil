@@ -23,7 +23,7 @@ The dashboard polls `GET /stats.json` once per second and renders:
 - **Errors** — a status-class distribution (2xx/3xx/4xx/5xx) plus exact error status codes and error-by-provider/model attribution.
 - **Recent requests** — a drill-down log of the most recent logical requests (newest first) with status, model, agent, latency, tokens, and the final/canonical upstream request ID. Has an *errors only* toggle, honors the breakdown filter, and lets you click a request ID to copy it for correlating with upstream logs. Each JSON row also carries `operation_id`, `route_id`, `final_target`, `upstream_sends`, and `target_switches` when route data exists.
 
-**Agents** are classified from the request `User-Agent` (for example Claude Code, Codex CLI, Gemini CLI, GitHub Copilot, curl) so you can see which client is driving traffic. Only the friendly label is retained, never the raw `User-Agent`.
+**Agents** are classified from the request `User-Agent` (for example Claude Code, Codex CLI, Antigravity CLI, Gemini CLI, GitHub Copilot, curl) so you can see which client is driving traffic. Only the friendly label is retained, never the raw `User-Agent`.
 
 **Upstream retries** retain their existing meaning: same-target retries performed by legacy provider routes on transient upstream failures. A version-2 route target switch is counted separately in `target_switches`; it does not redefine or inflate `retries`.
 

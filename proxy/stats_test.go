@@ -460,6 +460,7 @@ func TestClassifyAgent(t *testing.T) {
 		{"claude-cli/1.0.83 (external, cli)", "Claude Code"},
 		{"codex_cli_rs/0.5.0", "Codex CLI"},
 		{"google-genai-sdk/1.2 gemini-cli", "Gemini CLI"},
+		{"antigravity/cli/1.5.16 (aidev_client; os_type=darwin; arch=arm64; auth_method=gateway)", "Antigravity CLI"},
 		{"GitHubCopilotChat/0.26.7", "GitHub Copilot"},
 		{"curl/8.4.0", "curl"},
 		{"python-requests/2.31.0", "python"},

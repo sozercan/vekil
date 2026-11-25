@@ -47,7 +47,7 @@ Supported subset:
 - `contents[].parts[].inlineData` for `image/*`
 - `contents[].parts[].functionCall`
 - `contents[].parts[].functionResponse`, in `user` or `model` contents (some clients, such as Antigravity, send tool results under `model`); each must match a prior `functionCall`. Results are grouped directly after the assistant turn that issued their calls, so text interleaved between results follows them
-- `tools[].functionDeclarations` with `parameters` or `parametersJsonSchema`
+- `tools[].functionDeclarations` with `parameters` or `parametersJsonSchema`; Gemini `Schema` values in `parameters` are converted to JSON Schema by lowercasing OpenAPI types such as `OBJECT`, turning string-encoded integer bounds such as `"minLength": "1"` into numbers, and expressing `nullable: true` as a `null` type, enum value, or `anyOf` branch, while `parametersJsonSchema` is forwarded unchanged
 - `toolConfig.functionCallingConfig`
 - `generationConfig.temperature`, `topP`, `maxOutputTokens`, `stopSequences`
 - `generationConfig.responseMimeType`, `responseSchema`, `responseJsonSchema`
@@ -55,6 +55,7 @@ Supported subset:
 
 Accepted but ignored because upstream has no equivalent:
 
+- `labels`, a string-to-string metadata map that Antigravity CLI sends; it is not forwarded upstream
 - `generationConfig.topK`
 - `generationConfig.thinkingConfig`
 

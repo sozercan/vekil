@@ -7,7 +7,7 @@ Vekil commonly runs in one of two modes:
 
 Schema version 2 is the complete explicit-routing format: it supports public and internal routes, ordered failover, and optional semantic policy profiles. Existing route-only version-2 files remain valid. Policy routing follows each profile's YAML `mode` by default, while an explicit process mode can lower it. Profiles use a text/function-tool canonical Chat contract, support translated Anthropic and bounded stateless Responses ingress, and support one trusted user/tenant per deployment. See [Semantic Policy Routing](policy-routing.md).
 
-With either routing mode, the native binary also supports **managed agent launches**: `vekil launch` starts a short-lived proxy and a supported coding agent together. Claude Code and Codex CLI may delegate model selection to their normal CLI default or be pinned to one public model; GitHub Copilot CLI requires a pinned model.
+With either routing mode, the native binary also supports **managed agent launches**: `vekil launch` starts a short-lived proxy and a supported coding agent together. Claude Code and Codex CLI may delegate model selection to their normal CLI default or be pinned to one public model; GitHub Copilot CLI and Antigravity CLI require a pinned model.
 
 ## Install Or Build
 
@@ -39,6 +39,7 @@ variables:
 vekil launch claude
 vekil launch codex
 vekil launch copilot --model gpt-5.4-mini
+vekil launch agy --model gemini-3.8-flash
 ```
 
 For explicit routing, pass the same provider file used by the server:
