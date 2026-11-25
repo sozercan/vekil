@@ -809,15 +809,17 @@ func translateGeminiFunctionResponseParts(parts []models.GeminiFunctionResponseP
 	imageIndex := 0
 
 	for partIdx, part := range parts {
-		if hasRawJSON(part.FileData) {
-			return nil, nil, annotateGeminiProtocolError(unsupportedGemini("fileData is not supported"), "parts[%d]", partIdx)
-		}
+		hasFileData := hasRawJSON(part.FileData)
+		hasInlineData := hasRawJSON(part.InlineData)
 
 		count := 0
 		if part.Text != nil {
 			count++
 		}
-		if hasRawJSON(part.InlineData) {
+		if hasInlineData {
+			count++
+		}
+		if hasFileData {
 			count++
 		}
 
@@ -827,6 +829,10 @@ func translateGeminiFunctionResponseParts(parts []models.GeminiFunctionResponseP
 		case 1:
 		default:
 			return nil, nil, invalidGeminiArgument("parts[%d] must contain exactly one supported field", partIdx)
+		}
+
+		if hasFileData {
+			return nil, nil, annotateGeminiProtocolError(unsupportedGemini("fileData is not supported"), "parts[%d]", partIdx)
 		}
 
 		if part.Text != nil {

@@ -1588,6 +1588,35 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantMsg:    "only image/* inlineData can be translated today",
 		},
 		{
+			name: "function response parts mixed fileData and text rejected",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{
+					{
+						Role: "model",
+						Parts: []models.GeminiPart{{
+							FunctionCall: &models.GeminiFunctionCall{Name: "search", Args: json.RawMessage(`{}`)},
+						}},
+					},
+					{
+						Role: "user",
+						Parts: []models.GeminiPart{{
+							FunctionResponse: &models.GeminiFunctionResponse{
+								Name: "search",
+								Parts: []models.GeminiFunctionResponsePart{{
+									Text:     stringPtr("caption"),
+									FileData: json.RawMessage(`{"fileUri":"gs://bucket/a.png"}`),
+								}},
+							},
+						}},
+					},
+				},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "parts[0] must contain exactly one supported field",
+		},
+		{
 			name: "function response parts empty part rejected",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{
