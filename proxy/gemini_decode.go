@@ -33,6 +33,33 @@ var geminiFunctionCallNode = geminiJSONNode{
 	),
 }
 
+var geminiFunctionResponseInlineDataNode = geminiJSONNode{
+	aliases: map[string]string{
+		"mime_type":    "mimeType",
+		"display_name": "displayName",
+	},
+	allowed: geminiJSONSet(
+		"mimeType",
+		"data",
+		"displayName",
+	),
+}
+
+var geminiFunctionResponsePartNode = geminiJSONNode{
+	aliases: map[string]string{
+		"inline_data": "inlineData",
+		"file_data":   "fileData",
+	},
+	allowed: geminiJSONSet(
+		"text",
+		"inlineData",
+		"fileData",
+	),
+	objectChildren: map[string]geminiJSONNode{
+		"inlineData": geminiFunctionResponseInlineDataNode,
+	},
+}
+
 var geminiFunctionResponseNode = geminiJSONNode{
 	allowed: geminiJSONSet(
 		"id",
@@ -40,6 +67,9 @@ var geminiFunctionResponseNode = geminiJSONNode{
 		"response",
 		"parts",
 	),
+	arrayChildren: map[string]geminiJSONNode{
+		"parts": geminiFunctionResponsePartNode,
+	},
 }
 
 var geminiPartNode = geminiJSONNode{
