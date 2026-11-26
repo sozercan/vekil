@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1371,43 +1372,20 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantMsg:    "generationConfig.responseSchema and generationConfig.responseJsonSchema cannot differ",
 		},
 		{
-			name: "google search unsupported",
+			name: "native-only tools with function calling config still require declarations",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
 				Tools: []models.GeminiTool{{
 					GoogleSearch: json.RawMessage(`{}`),
 				}},
+				ToolConfig: &models.GeminiToolConfig{
+					FunctionCallingConfig: &models.GeminiFunctionCallingConfig{Mode: "ANY"},
+				},
 			},
 			pathModel:  "gemini-2.5-pro",
-			wantCode:   http.StatusNotImplemented,
-			wantStatus: "UNIMPLEMENTED",
-			wantMsg:    "Gemini native web tools cannot be translated to Copilot function calls",
-		},
-		{
-			name: "google maps unsupported",
-			req: &models.GeminiGenerateContentRequest{
-				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
-				Tools: []models.GeminiTool{{
-					GoogleMaps: json.RawMessage(`{}`),
-				}},
-			},
-			pathModel:  "gemini-2.5-pro",
-			wantCode:   http.StatusNotImplemented,
-			wantStatus: "UNIMPLEMENTED",
-			wantMsg:    "tools[0].googleMaps is not supported",
-		},
-		{
-			name: "enterprise web search unsupported",
-			req: &models.GeminiGenerateContentRequest{
-				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
-				Tools: []models.GeminiTool{{
-					EnterpriseWebSearch: json.RawMessage(`{}`),
-				}},
-			},
-			pathModel:  "gemini-2.5-pro",
-			wantCode:   http.StatusNotImplemented,
-			wantStatus: "UNIMPLEMENTED",
-			wantMsg:    "tools[0].enterpriseWebSearch is not supported",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "toolConfig.functionCallingConfig requires tools.functionDeclarations",
 		},
 		{
 			name: "unmatched function response",
@@ -1727,32 +1705,99 @@ func TestTranslateGeminiToOpenAIAdditionalUnsupportedCases(t *testing.T) {
 			}
 		})
 	}
+}
 
-	toolCases := []struct {
-		name    string
-		tool    models.GeminiTool
-		wantMsg string
+func TestTranslateGeminiToOpenAIDropsNativeTools(t *testing.T) {
+	allNative := models.GeminiTool{
+		GoogleSearch:          json.RawMessage(`{}`),
+		GoogleSearchRetrieval: json.RawMessage(`{"dynamicRetrievalConfig":{"mode":"MODE_DYNAMIC"}}`),
+		URLContext:            json.RawMessage(`{}`),
+		CodeExecution:         json.RawMessage(`{}`),
+		GoogleMaps:            json.RawMessage(`{}`),
+		ComputerUse:           json.RawMessage(`{"environment":"ENVIRONMENT_BROWSER"}`),
+		EnterpriseWebSearch:   json.RawMessage(`{}`),
+	}
+	readFile := models.GeminiFunctionDeclaration{
+		Name:       "read_file",
+		Parameters: json.RawMessage(`{"type":"OBJECT","properties":{"path":{"type":"STRING"}}}`),
+	}
+
+	tests := []struct {
+		name      string
+		tools     []models.GeminiTool
+		wantTools []string
+		wantPaths []string
 	}{
 		{
-			name:    "computer use unsupported",
-			tool:    models.GeminiTool{ComputerUse: json.RawMessage(`{}`)},
-			wantMsg: "tools[0].computerUse is not supported",
+			name:      "only native tools forward no tools",
+			tools:     []models.GeminiTool{allNative},
+			wantPaths: []string{"tools[0].googleSearch", "tools[0].googleSearchRetrieval", "tools[0].urlContext", "tools[0].codeExecution", "tools[0].googleMaps", "tools[0].computerUse", "tools[0].enterpriseWebSearch"},
+		},
+		{
+			name: "native tool entry beside function declarations keeps the declarations",
+			tools: []models.GeminiTool{
+				{GoogleSearch: json.RawMessage(`{}`)},
+				{FunctionDeclarations: []models.GeminiFunctionDeclaration{readFile}},
+			},
+			wantTools: []string{"read_file"},
+			wantPaths: []string{"tools[0].googleSearch"},
+		},
+		{
+			name: "native tool in the same entry as function declarations keeps the declarations",
+			tools: []models.GeminiTool{
+				{FunctionDeclarations: []models.GeminiFunctionDeclaration{readFile}, URLContext: json.RawMessage(`{}`)},
+			},
+			wantTools: []string{"read_file"},
+			wantPaths: []string{"tools[0].urlContext"},
+		},
+		{
+			name: "function declarations without native tools are unchanged",
+			tools: []models.GeminiTool{
+				{FunctionDeclarations: []models.GeminiFunctionDeclaration{readFile}},
+			},
+			wantTools: []string{"read_file"},
+		},
+		{
+			name: "null native tool values are not counted",
+			tools: []models.GeminiTool{
+				{GoogleSearch: json.RawMessage(`null`), FunctionDeclarations: []models.GeminiFunctionDeclaration{readFile}},
+			},
+			wantTools: []string{"read_file"},
 		},
 	}
 
-	for _, tt := range toolCases {
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
-				Tools:    []models.GeminiTool{tt.tool},
+				Tools:    tt.tools,
 			}
 
-			_, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
-			if err == nil {
-				t.Fatal("TranslateGeminiToOpenAI() error = nil, want non-nil")
+			got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+			if err != nil {
+				t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
 			}
-			if !strings.Contains(err.Error(), tt.wantMsg) {
-				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantMsg)
+
+			var gotTools []string
+			for _, tool := range got.Tools {
+				if tool.Type != "function" {
+					t.Errorf("tool type = %q, want function", tool.Type)
+				}
+				gotTools = append(gotTools, tool.Function.Name)
+			}
+			if !reflect.DeepEqual(gotTools, tt.wantTools) {
+				t.Errorf("forwarded tools = %v, want %v", gotTools, tt.wantTools)
+			}
+			wantParallel := len(tt.wantTools) > 0
+			if gotParallel := got.ParallelToolCalls != nil && *got.ParallelToolCalls; gotParallel != wantParallel {
+				t.Errorf("ParallelToolCalls = %v, want %v", got.ParallelToolCalls, wantParallel)
+			}
+			if got.ToolChoice != nil {
+				t.Errorf("ToolChoice = %s, want nil", got.ToolChoice)
+			}
+
+			if gotPaths := geminiNativeToolPaths(tt.tools); !reflect.DeepEqual(gotPaths, tt.wantPaths) {
+				t.Errorf("geminiNativeToolPaths() = %v, want %v", gotPaths, tt.wantPaths)
 			}
 		})
 	}
@@ -2027,6 +2072,147 @@ func TestHandleGeminiModelsDropsRequestLabels(t *testing.T) {
 	if resp := w.Result(); resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, body)
+	}
+}
+
+func TestHandleGeminiModelsDropsNativeTools(t *testing.T) {
+	const dropMessage = "dropped Gemini native tools that cannot be translated to function calls"
+	readFileTool := `{"functionDeclarations":[{"name":"read_file","parameters":{"type":"OBJECT","properties":{"path":{"type":"STRING"}}}}]}`
+
+	tests := []struct {
+		name          string
+		action        string
+		tools         string
+		wantUpstream  []string
+		wantStream    bool
+		wantDropped   []interface{}
+		wantForwarded float64
+	}{
+		{
+			name:         "dropped only streams without tools",
+			action:       "streamGenerateContent?alt=sse",
+			tools:        `[{"googleSearch":{}}]`,
+			wantUpstream: nil,
+			wantStream:   true,
+			wantDropped:  []interface{}{"tools[0].googleSearch"},
+		},
+		{
+			name:          "mixed keeps function declarations",
+			action:        "generateContent",
+			tools:         `[{"googleSearch":{}},` + readFileTool + `]`,
+			wantUpstream:  []string{"read_file"},
+			wantStream:    true,
+			wantDropped:   []interface{}{"tools[0].googleSearch"},
+			wantForwarded: 1,
+		},
+		{
+			name:         "snake case alias is dropped without forcing a stream",
+			action:       "generateContent",
+			tools:        `[{"code_execution":{},"url_context":{}}]`,
+			wantUpstream: nil,
+			wantStream:   false,
+			wantDropped:  []interface{}{"tools[0].urlContext", "tools[0].codeExecution"},
+		},
+		{
+			name:          "none leaves function declarations and logs nothing",
+			action:        "streamGenerateContent?alt=sse",
+			tools:         `[` + readFileTool + `]`,
+			wantUpstream:  []string{"read_file"},
+			wantStream:    true,
+			wantForwarded: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotUpstream []string
+			var gotStream bool
+			var calls int
+			handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var oaiReq models.OpenAIRequest
+				body, _ := io.ReadAll(r.Body)
+				if err := json.Unmarshal(body, &oaiReq); err != nil {
+					t.Fatalf("unmarshal upstream request: %v", err)
+				}
+				for _, tool := range oaiReq.Tools {
+					gotUpstream = append(gotUpstream, tool.Function.Name)
+				}
+				gotStream = oaiReq.Stream != nil && *oaiReq.Stream
+				if gotStream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"))
+					_, _ = w.Write([]byte("data: [DONE]\n\n"))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","model":"gemini-2.5-pro","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+			})
+			var logs strings.Builder
+			handler.log = logger.NewWithWriter(logger.LevelWarn, &logs)
+
+			reqBody := `{"contents":[{"role":"user","parts":[{"text":"Hi"}]}],"tools":` + tt.tools + `}`
+			req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:"+tt.action, strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			handler.HandleGeminiModels(w, req)
+
+			resp := w.Result()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, body)
+			}
+			if !strings.Contains(string(body), `"text":"ok"`) {
+				t.Errorf("response body = %s, want translated text", body)
+			}
+			if calls != 1 {
+				t.Fatalf("upstream calls = %d, want 1", calls)
+			}
+			if !reflect.DeepEqual(gotUpstream, tt.wantUpstream) {
+				t.Errorf("upstream tools = %v, want %v", gotUpstream, tt.wantUpstream)
+			}
+			if gotStream != tt.wantStream {
+				t.Errorf("upstream stream = %v, want %v", gotStream, tt.wantStream)
+			}
+
+			var dropEntries []map[string]interface{}
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				if line == "" {
+					continue
+				}
+				var entry map[string]interface{}
+				if err := json.Unmarshal([]byte(line), &entry); err != nil {
+					t.Fatalf("unmarshal log line %q: %v", line, err)
+				}
+				if entry["msg"] == dropMessage {
+					dropEntries = append(dropEntries, entry)
+				}
+			}
+			if tt.wantDropped == nil {
+				if len(dropEntries) != 0 {
+					t.Fatalf("drop warnings = %v, want none", dropEntries)
+				}
+				return
+			}
+			if len(dropEntries) != 1 {
+				t.Fatalf("drop warnings = %v, want exactly one\nlogs:\n%s", dropEntries, logs.String())
+			}
+			entry := dropEntries[0]
+			if entry["level"] != "warn" {
+				t.Errorf("level = %v, want warn", entry["level"])
+			}
+			if !reflect.DeepEqual(entry["dropped_tools"], tt.wantDropped) {
+				t.Errorf("dropped_tools = %v, want %v", entry["dropped_tools"], tt.wantDropped)
+			}
+			if entry["forwarded_tools"] != tt.wantForwarded {
+				t.Errorf("forwarded_tools = %v, want %v", entry["forwarded_tools"], tt.wantForwarded)
+			}
+			if entry["model"] != "gemini-2.5-pro" {
+				t.Errorf("model = %v, want gemini-2.5-pro", entry["model"])
+			}
+		})
 	}
 }
 
@@ -3777,38 +3963,6 @@ func TestHandleGeminiModelsErrors(t *testing.T) {
 		}
 		if errResp.Error.Status != "UNIMPLEMENTED" {
 			t.Errorf("status = %q, want UNIMPLEMENTED", errResp.Error.Status)
-		}
-	})
-
-	t.Run("snake case code execution tool returns unimplemented", func(t *testing.T) {
-		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
-			t.Fatal("backend should not be called")
-		})
-
-		reqBody := `{
-			"contents": [{"role":"user","parts":[{"text":"hi"}]}],
-			"tools": [{"code_execution": {}}]
-		}`
-		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", strings.NewReader(reqBody))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-
-		handler.HandleGeminiModels(w, req)
-
-		resp := w.Result()
-		if resp.StatusCode != http.StatusNotImplemented {
-			t.Fatalf("StatusCode = %d, want 501", resp.StatusCode)
-		}
-
-		var errResp models.GeminiErrorResponse
-		if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
-			t.Fatalf("decode error response: %v", err)
-		}
-		if errResp.Error.Status != "UNIMPLEMENTED" {
-			t.Errorf("status = %q, want UNIMPLEMENTED", errResp.Error.Status)
-		}
-		if !strings.Contains(errResp.Error.Message, "tools[0].codeExecution is not supported") {
-			t.Errorf("message = %q, want codeExecution unsupported detail", errResp.Error.Message)
 		}
 	})
 

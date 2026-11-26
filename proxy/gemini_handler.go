@@ -117,6 +117,13 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 		h.writeGeminiProtocolError(w, err)
 		return
 	}
+	if dropped := geminiNativeToolPaths(req.Tools); len(dropped) > 0 {
+		h.log.Warn("dropped Gemini native tools that cannot be translated to function calls",
+			logger.F("model", pathModel),
+			logger.F("dropped_tools", dropped),
+			logger.F("forwarded_tools", len(oaiReq.Tools)),
+		)
+	}
 	h.maybeReduceOpenAIChatToolOutputs(r.Context(), oaiReq, h.toolContexts, scope)
 
 	forceStream := !stream && len(oaiReq.Tools) > 0 && !openAIToolChoiceIsNone(oaiReq.ToolChoice)
