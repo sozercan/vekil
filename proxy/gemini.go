@@ -854,33 +854,34 @@ func translateGeminiFunctionResponseParts(parts []models.GeminiFunctionResponseP
 	return textSegments, images, nil
 }
 
+func geminiNativeToolPaths(tools []models.GeminiTool) []string {
+	var paths []string
+	for toolIdx, tool := range tools {
+		for _, native := range []struct {
+			name string
+			raw  json.RawMessage
+		}{
+			{"googleSearch", tool.GoogleSearch},
+			{"googleSearchRetrieval", tool.GoogleSearchRetrieval},
+			{"urlContext", tool.URLContext},
+			{"codeExecution", tool.CodeExecution},
+			{"googleMaps", tool.GoogleMaps},
+			{"computerUse", tool.ComputerUse},
+			{"enterpriseWebSearch", tool.EnterpriseWebSearch},
+		} {
+			if hasRawJSON(native.raw) {
+				paths = append(paths, fmt.Sprintf("tools[%d].%s", toolIdx, native.name))
+			}
+		}
+	}
+	return paths
+}
+
 func translateGeminiTools(tools []models.GeminiTool) ([]models.OpenAITool, map[string]struct{}, error) {
 	var translated []models.OpenAITool
 	declaredNames := make(map[string]struct{})
 
 	for toolIdx, tool := range tools {
-		if hasRawJSON(tool.GoogleSearch) {
-			return nil, nil, unsupportedGemini("tools[%d].googleSearch is not supported; Gemini native web tools cannot be translated to Copilot function calls", toolIdx)
-		}
-		if hasRawJSON(tool.GoogleSearchRetrieval) {
-			return nil, nil, unsupportedGemini("tools[%d].googleSearchRetrieval is not supported; Gemini native web tools cannot be translated to Copilot function calls", toolIdx)
-		}
-		if hasRawJSON(tool.URLContext) {
-			return nil, nil, unsupportedGemini("tools[%d].urlContext is not supported; Gemini native web tools cannot be translated to Copilot function calls", toolIdx)
-		}
-		if hasRawJSON(tool.CodeExecution) {
-			return nil, nil, unsupportedGemini("tools[%d].codeExecution is not supported; Gemini native execution tools cannot be translated to Copilot function calls", toolIdx)
-		}
-		if hasRawJSON(tool.GoogleMaps) {
-			return nil, nil, unsupportedGemini("tools[%d].googleMaps is not supported; Gemini native map tools cannot be translated to Copilot function calls", toolIdx)
-		}
-		if hasRawJSON(tool.ComputerUse) {
-			return nil, nil, unsupportedGemini("tools[%d].computerUse is not supported; Gemini native computer-use tools cannot be translated to Copilot function calls", toolIdx)
-		}
-		if hasRawJSON(tool.EnterpriseWebSearch) {
-			return nil, nil, unsupportedGemini("tools[%d].enterpriseWebSearch is not supported; Gemini native enterprise web search tools cannot be translated to Copilot function calls", toolIdx)
-		}
-
 		for declIdx, decl := range tool.FunctionDeclarations {
 			if strings.TrimSpace(decl.Name) == "" {
 				return nil, nil, invalidGeminiArgument("tools[%d].functionDeclarations[%d].name is required", toolIdx, declIdx)

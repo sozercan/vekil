@@ -28,7 +28,7 @@ The Gemini decoder and translation rules below run first. If the selected model 
 - text, supported image `inlineData`, function declarations/calls/responses, `temperature`, `topP`, `maxOutputTokens`, structured text output, and function-calling modes map through the adapter;
 - non-empty `generationConfig.stopSequences` is rejected because Vekil does not implement local stop matching;
 - `generationConfig.presencePenalty`, `frequencyPenalty`, and `seed` are rejected on this route;
-- only function tools are supported; Gemini built-in/hosted tools remain unsupported; and
+- only function tools are supported, and Gemini translation has already dropped built-in tools as described below; and
 - unknown or unsupported translated fields fail explicitly rather than being dropped.
 
 These extra restrictions do not apply to a model served through native Chat. Native endpoint metadata also remains unchanged: a model can report only `/responses` in `/v1/models` while serving these Gemini compatibility routes through translation.
@@ -58,6 +58,7 @@ Accepted but ignored because upstream has no equivalent:
 - `labels`, a string-to-string metadata map that Antigravity CLI sends; it is not forwarded upstream
 - `generationConfig.topK`
 - `generationConfig.thinkingConfig`
+- Gemini built-in tools `googleSearch`, `googleSearchRetrieval`, `urlContext`, `codeExecution`, `googleMaps`, `computerUse`, and `enterpriseWebSearch`, which have no function-call equivalent; the request continues with the remaining `functionDeclarations`, or with no tools when none remain. `generateContent` and `streamGenerateContent` log a warning naming each dropped `tools[i].<field>`. The model answers without the dropped capability, and the response does not say that a tool was dropped. `toolConfig.functionCallingConfig` still requires at least one function declaration
 
 Explicit `501 UNIMPLEMENTED` cases include:
 
@@ -71,7 +72,6 @@ Explicit `501 UNIMPLEMENTED` cases include:
 - `cachedContent`
 - `safetySettings`
 - `functionResponse.parts[].fileData` and non-image `functionResponse.parts[].inlineData`
-- Gemini built-in tools such as `googleSearch`, `urlContext`, `codeExecution`, `googleMaps`, `computerUse`, and `enterpriseWebSearch`
 - non-image `inlineData`, `fileData`, and other non-text/media parts
 
 Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches, explicit content roles other than `user` or `model`, malformed content parts, invalid function-call history, unmatched `functionResponse` parts, and `functionResponse` parts that answer a call from an earlier tool-call batch after a newer batch has started (for example `call A, call B, response A, call C, response B`), which cannot be represented as valid Chat Completions history.
