@@ -641,7 +641,8 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 				{"role": "model", "parts": [
 					{"text": "Running calculation:"},
 					{"executable_code": {"language": "PYTHON", "code": "print(1+1)"}},
-					{"code_execution_result": {"outcome": "OUTCOME_OK", "output": "2\n"}}
+					{"code_execution_result": {"outcome": "OUTCOME_OK", "output": "2"}},
+					{"text": "The answer is 2."}
 				]}
 			]
 		}`
@@ -684,7 +685,7 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		if err := json.Unmarshal(got.Messages[1].Content, &assistantText); err != nil {
 			t.Fatalf("decode assistantText: %v", err)
 		}
-		wantAssistant := "Running calculation:\n```python\nprint(1+1)\n```\n[code execution result (OUTCOME_OK)]\n2\n"
+		wantAssistant := "Running calculation:\n```python\nprint(1+1)\n```\n\n[code execution result (OUTCOME_OK)]\n2\nThe answer is 2."
 		if assistantText != wantAssistant {
 			t.Errorf("assistantText = %q, want %q", assistantText, wantAssistant)
 		}

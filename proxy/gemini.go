@@ -1519,13 +1519,17 @@ func formatGeminiCodeExecutionResult(raw json.RawMessage) (string, error) {
 		return "", invalidGeminiArgument("codeExecutionResult must be an object")
 	}
 	outcome := strings.TrimSpace(result.Outcome)
-	if outcome != "" && result.Output != "" {
-		return fmt.Sprintf("[code execution result (%s)]\n%s", outcome, result.Output), nil
+	output := strings.TrimSuffix(result.Output, "\n")
+	if outcome != "" && output != "" {
+		return fmt.Sprintf("\n[code execution result (%s)]\n%s\n", outcome, output), nil
 	}
 	if outcome != "" {
-		return fmt.Sprintf("[code execution result (%s)]", outcome), nil
+		return fmt.Sprintf("\n[code execution result (%s)]\n", outcome), nil
 	}
-	return fmt.Sprintf("[code execution result]\n%s", result.Output), nil
+	if output != "" {
+		return fmt.Sprintf("\n[code execution result]\n%s\n", output), nil
+	}
+	return "\n[code execution result]\n", nil
 }
 
 func normalizeGeminiInlineDataBase64(data string) (string, error) {
