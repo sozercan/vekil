@@ -393,11 +393,11 @@ func translateGeminiToOpenAIWithOptions(req *models.GeminiGenerateContentRequest
 	if req.CachedContent != "" {
 		return nil, unsupportedGemini("cachedContent is not supported")
 	}
-	mediaDetail, err := validateGeminiGenerationConfig(req.GenerationConfig)
+	genConfig, err := validateGeminiGenerationConfig(req.GenerationConfig)
 	if err != nil {
 		return nil, err
 	}
-	options.imageDetail = mediaDetail
+	options.imageDetail = genConfig.imageDetail
 
 	oaiReq := &models.OpenAIRequest{Model: model}
 
@@ -455,6 +455,7 @@ func translateGeminiToOpenAIWithOptions(req *models.GeminiGenerateContentRequest
 		oaiReq.PresencePenalty = req.GenerationConfig.PresencePenalty
 		oaiReq.FrequencyPenalty = req.GenerationConfig.FrequencyPenalty
 		oaiReq.Seed = req.GenerationConfig.Seed
+		oaiReq.ReasoningEffort = genConfig.reasoningEffort
 
 		if len(req.GenerationConfig.StopSequences) > 0 {
 			stop, err := json.Marshal(req.GenerationConfig.StopSequences)
@@ -1214,38 +1215,47 @@ func resolveGeminiResponseSchema(config *models.GeminiGenerationConfig) (json.Ra
 	return left, nil
 }
 
-func validateGeminiGenerationConfig(config *models.GeminiGenerationConfig) (string, error) {
+type validatedGeminiGenerationConfig struct {
+	imageDetail     string
+	reasoningEffort string
+}
+
+func validateGeminiGenerationConfig(config *models.GeminiGenerationConfig) (validatedGeminiGenerationConfig, error) {
 	if config == nil {
-		return "", nil
+		return validatedGeminiGenerationConfig{}, nil
 	}
 
 	if config.CandidateCount != nil && *config.CandidateCount != 1 {
-		return "", unsupportedGemini("generationConfig.candidateCount=%d is not supported", *config.CandidateCount)
+		return validatedGeminiGenerationConfig{}, unsupportedGemini("generationConfig.candidateCount=%d is not supported", *config.CandidateCount)
 	}
-	if err := validateGeminiThinkingConfig(config.ThinkingConfig); err != nil {
-		return "", err
+	reasoningEffort, err := translateGeminiThinkingConfig(config.ThinkingConfig)
+	if err != nil {
+		return validatedGeminiGenerationConfig{}, err
 	}
 	if err := validateGeminiResponseModalities(config.ResponseModalities); err != nil {
-		return "", err
+		return validatedGeminiGenerationConfig{}, err
 	}
 	if hasRawJSON(config.SpeechConfig) {
-		return "", unsupportedGemini("generationConfig.speechConfig is not supported; Gemini speech configuration cannot be translated today")
+		return validatedGeminiGenerationConfig{}, unsupportedGemini("generationConfig.speechConfig is not supported; Gemini speech configuration cannot be translated today")
 	}
 	if hasRawJSON(config.ImageConfig) {
-		return "", unsupportedGemini("generationConfig.imageConfig is not supported; Gemini image generation configuration cannot be translated today")
+		return validatedGeminiGenerationConfig{}, unsupportedGemini("generationConfig.imageConfig is not supported; Gemini image generation configuration cannot be translated today")
 	}
 	imageDetail, err := translateGeminiMediaResolution(config.MediaResolution)
 	if err != nil {
-		return "", err
+		return validatedGeminiGenerationConfig{}, err
 	}
 	if err := validateGeminiResponseLogprobs(config.ResponseLogprobs); err != nil {
-		return "", err
+		return validatedGeminiGenerationConfig{}, err
 	}
 	if hasRawJSON(config.Logprobs) {
-		return "", unsupportedGemini("generationConfig.logprobs is not supported")
+		return validatedGeminiGenerationConfig{}, unsupportedGemini("generationConfig.logprobs is not supported")
 	}
 
-	return imageDetail, nil
+	return validatedGeminiGenerationConfig{
+		imageDetail:     imageDetail,
+		reasoningEffort: reasoningEffort,
+	}, nil
 }
 
 func validateGeminiResponseModalities(raw json.RawMessage) error {
@@ -1308,22 +1318,36 @@ type geminiThinkingConfig struct {
 	ThinkingLevel   *string `json:"thinkingLevel,omitempty"`
 }
 
-func validateGeminiThinkingConfig(raw json.RawMessage) error {
+func translateGeminiThinkingConfig(raw json.RawMessage) (string, error) {
 	if !hasRawJSON(raw) {
-		return nil
+		return "", nil
 	}
 
 	normalized, err := normalizeGeminiJSON(raw, geminiThinkingConfigNode, "generationConfig.thinkingConfig", true)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	var config geminiThinkingConfig
 	if err := json.Unmarshal(normalized, &config); err != nil {
-		return invalidGeminiArgument("generationConfig.thinkingConfig has invalid field types")
+		return "", invalidGeminiArgument("generationConfig.thinkingConfig has invalid field types")
 	}
 
-	return nil
+	if config.ThinkingLevel != nil {
+		level := strings.ToLower(strings.TrimSpace(*config.ThinkingLevel))
+		switch level {
+		case "", "thinking_level_unspecified":
+			return "", nil
+		case "minimal":
+			return "low", nil
+		case "low", "medium", "high":
+			return level, nil
+		default:
+			return "", invalidGeminiArgument("generationConfig.thinkingConfig.thinkingLevel %q is invalid", *config.ThinkingLevel)
+		}
+	}
+
+	return "", nil
 }
 
 func geminiPartKind(part models.GeminiPart) (string, error) {

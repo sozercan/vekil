@@ -690,6 +690,34 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("thinkingConfig thinkingLevel maps to reasoning_effort", func(t *testing.T) {
+		cases := []struct {
+			level string
+			want  string
+		}{
+			{level: "MINIMAL", want: "low"},
+			{level: "LOW", want: "low"},
+			{level: "MEDIUM", want: "medium"},
+			{level: "HIGH", want: "high"},
+			{level: "THINKING_LEVEL_UNSPECIFIED", want: ""},
+		}
+		for _, tc := range cases {
+			req := &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				GenerationConfig: &models.GeminiGenerationConfig{
+					ThinkingConfig: json.RawMessage(fmt.Sprintf(`{"thinkingLevel":%q}`, tc.level)),
+				},
+			}
+			got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+			if err != nil {
+				t.Fatalf("level %q: TranslateGeminiToOpenAI() error = %v", tc.level, err)
+			}
+			if got.ReasoningEffort != tc.want {
+				t.Errorf("level %q: ReasoningEffort = %q, want %q", tc.level, got.ReasoningEffort, tc.want)
+			}
+		}
+	})
+
 	t.Run("function response images stay after grouped tool results when text is interleaved", func(t *testing.T) {
 		req := &models.GeminiGenerateContentRequest{
 			Contents: []models.GeminiContent{
@@ -1851,6 +1879,19 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantMsg:    "generationConfig.mediaResolution",
 		},
 		{
+			name: "invalid thinkingLevel rejected",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				GenerationConfig: &models.GeminiGenerationConfig{
+					ThinkingConfig: json.RawMessage(`{"thinkingLevel":"EXTREME"}`),
+				},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "generationConfig.thinkingConfig.thinkingLevel",
+		},
+		{
 			name: "body model mismatch",
 			req: &models.GeminiGenerateContentRequest{
 				Model:    "gemini-1.5-pro",
@@ -2559,6 +2600,9 @@ func TestHandleGeminiModelsGenerateContentIgnoresTopKAndThinkingConfig(t *testin
 		if oaiReq.Model != "gemini-2.5-pro" {
 			t.Errorf("Model = %q, want gemini-2.5-pro", oaiReq.Model)
 		}
+		if oaiReq.ReasoningEffort != "high" {
+			t.Errorf("ReasoningEffort = %q, want high", oaiReq.ReasoningEffort)
+		}
 
 		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
 			ID:      "chatcmpl-topk",
@@ -2623,6 +2667,9 @@ func TestHandleGeminiModelsGenerateContentGeminiCLIDefaults(t *testing.T) {
 
 		if oaiReq.Model != "gemini-2.5-pro" {
 			t.Errorf("Model = %q, want gemini-2.5-pro", oaiReq.Model)
+		}
+		if oaiReq.ReasoningEffort != "high" {
+			t.Errorf("ReasoningEffort = %q, want high", oaiReq.ReasoningEffort)
 		}
 		if oaiReq.Stream == nil || !*oaiReq.Stream {
 			t.Fatalf("Stream = %v, want true", oaiReq.Stream)

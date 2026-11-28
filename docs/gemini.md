@@ -53,6 +53,7 @@ Supported subset:
 - `toolConfig.functionCallingConfig`
 - `generationConfig.temperature`, `topP`, `maxOutputTokens`, `stopSequences`
 - `generationConfig.mediaResolution` (`MEDIA_RESOLUTION_LOW` → `low`, `MEDIA_RESOLUTION_MEDIUM` → `auto`, `MEDIA_RESOLUTION_HIGH` → `high` on translated `image_url.detail`; `MEDIA_RESOLUTION_UNSPECIFIED` is a no-op)
+- `generationConfig.thinkingConfig.thinkingLevel` (`MINIMAL`/`LOW` → `low`, `MEDIUM` → `medium`, `HIGH` → `high` on `reasoning_effort`; `THINKING_LEVEL_UNSPECIFIED`, `includeThoughts`, and `thinkingBudget` are accepted and ignored)
 - `generationConfig.responseMimeType`, `responseSchema`, `responseJsonSchema`
 - `generationConfig.presencePenalty`, `frequencyPenalty`, `seed`
 
@@ -61,7 +62,7 @@ Accepted but ignored because upstream has no equivalent:
 - `labels`, a string-to-string metadata map that Antigravity CLI sends; it is not forwarded upstream
 - `safetySettings`
 - `generationConfig.topK`
-- `generationConfig.thinkingConfig`
+- `generationConfig.thinkingConfig.includeThoughts` and `generationConfig.thinkingConfig.thinkingBudget`
 - `generationConfig.responseModalities` when limited to `TEXT` / `MODALITY_UNSPECIFIED`
 - `generationConfig.responseLogprobs: false`
 
