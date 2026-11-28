@@ -1419,6 +1419,7 @@ func parseGeminiFileData(raw json.RawMessage) (*models.GeminiFileData, error) {
 
 	fileData.MimeType = strings.TrimSpace(fileData.MimeType)
 	fileData.FileURI = strings.TrimSpace(fileData.FileURI)
+	fileData.DisplayName = strings.TrimSpace(fileData.DisplayName)
 	if fileData.FileURI == "" {
 		return nil, invalidGeminiArgument("fileData.fileUri is required")
 	}

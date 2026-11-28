@@ -72,6 +72,19 @@ var geminiFunctionResponseInlineDataNode = geminiJSONNode{
 	),
 }
 
+var geminiFunctionResponseFileDataNode = geminiJSONNode{
+	aliases: map[string]string{
+		"mime_type":    "mimeType",
+		"file_uri":     "fileUri",
+		"display_name": "displayName",
+	},
+	allowed: geminiJSONSet(
+		"mimeType",
+		"fileUri",
+		"displayName",
+	),
+}
+
 var geminiFunctionResponsePartNode = geminiJSONNode{
 	aliases: map[string]string{
 		"inline_data": "inlineData",
@@ -84,7 +97,7 @@ var geminiFunctionResponsePartNode = geminiJSONNode{
 	),
 	objectChildren: map[string]geminiJSONNode{
 		"inlineData": geminiFunctionResponseInlineDataNode,
-		"fileData":   geminiFileDataNode,
+		"fileData":   geminiFunctionResponseFileDataNode,
 	},
 }
 

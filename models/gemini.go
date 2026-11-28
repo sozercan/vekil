@@ -40,8 +40,9 @@ type GeminiInlineData struct {
 }
 
 type GeminiFileData struct {
-	MimeType string `json:"mimeType,omitempty"`
-	FileURI  string `json:"fileUri"`
+	MimeType    string `json:"mimeType,omitempty"`
+	FileURI     string `json:"fileUri"`
+	DisplayName string `json:"displayName,omitempty"`
 }
 
 type GeminiExecutableCode struct {

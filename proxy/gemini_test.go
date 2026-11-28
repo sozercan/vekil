@@ -582,8 +582,8 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 						"id": "call-1",
 						"name": "fetch",
 						"parts": [
-							{"file_data": {"mime_type": "image/png", "file_uri": "https://example.com/a.png"}},
-							{"file_data": {"mime_type": "image/png", "file_uri": "gs://bucket/b.png"}},
+							{"file_data": {"mime_type": "image/png", "file_uri": "https://example.com/a.png", "display_name": "a.png"}},
+							{"file_data": {"mime_type": "image/png", "file_uri": "gs://bucket/b.png", "displayName": "b.png"}},
 							{"file_data": {"mime_type": "video/mp4", "file_uri": "https://example.com/c.mp4"}}
 						]
 					}}
