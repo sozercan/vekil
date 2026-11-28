@@ -509,7 +509,7 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 						"name": "read_file",
 						"response": {"ok": true},
 						"parts": [
-							{"inline_data": {"mime_type": "video/mp4", "data": "AAAA", "display_name": "clip.mp4"}},
+							{"inline_data": {"mime_type": "video/mp4", "data": "***not-base64***", "display_name": "clip.mp4"}},
 							{"inline_data": {"mime_type": "image/png", "data": "AQID"}}
 						]
 					}},
@@ -634,7 +634,7 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 			"contents": [
 				{"role": "user", "parts": [
 					{"text": "Check these"},
-					{"inline_data": {"mime_type": "audio/wav", "data": "AA==", "display_name": "note.wav"}},
+					{"inline_data": {"mime_type": "audio/wav", "data": "***not-base64***", "display_name": "note.wav"}},
 					{"file_data": {"mime_type": "image/jpeg", "file_uri": "https://example.com/photo.jpg"}},
 					{"file_data": {"mime_type": "application/pdf", "file_uri": "gs://bucket/doc.pdf"}}
 				]},
