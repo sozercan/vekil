@@ -495,6 +495,230 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("function response parts degrade non-image inlineData to text placeholders", func(t *testing.T) {
+		body := `{
+			"contents": [
+				{"role": "user", "parts": [{"text": "Inspect the recording"}]},
+				{"role": "model", "parts": [
+					{"function_call": {"id": "call-1", "name": "read_file", "args": {"path": "clip.mp4"}}},
+					{"function_call": {"id": "call-2", "name": "read_file", "args": {"path": "report.pdf"}}}
+				]},
+				{"role": "model", "parts": [
+					{"function_response": {
+						"id": "call-1",
+						"name": "read_file",
+						"response": {"ok": true},
+						"parts": [
+							{"inline_data": {"mime_type": "video/mp4", "data": "***not-base64***", "display_name": "clip.mp4"}},
+							{"inline_data": {"mime_type": "image/png", "data": "AQID"}}
+						]
+					}},
+					{"function_response": {
+						"id": "call-2",
+						"name": "read_file",
+						"parts": [
+							{"inlineData": {"mimeType": "application/pdf", "data": "JVBERi0="}}
+						]
+					}}
+				]}
+			]
+		}`
+
+		req, err := decodeGeminiGenerateContentRequest([]byte(body))
+		if err != nil {
+			t.Fatalf("decodeGeminiGenerateContentRequest() error = %v", err)
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		wantRoles := []string{"user", "assistant", "tool", "tool", "user"}
+		if len(got.Messages) != len(wantRoles) {
+			t.Fatalf("len(Messages) = %d, want %d: %#v", len(got.Messages), len(wantRoles), got.Messages)
+		}
+		for i, role := range wantRoles {
+			if got.Messages[i].Role != role {
+				t.Fatalf("Messages[%d].Role = %q, want %q", i, got.Messages[i].Role, role)
+			}
+		}
+
+		var tool1, tool2 string
+		if err := json.Unmarshal(got.Messages[2].Content, &tool1); err != nil {
+			t.Fatalf("decode tool1: %v", err)
+		}
+		if err := json.Unmarshal(got.Messages[3].Content, &tool2); err != nil {
+			t.Fatalf("decode tool2: %v", err)
+		}
+		wantTool1 := "{\"ok\":true}\n[omitted unsupported video/mp4 attachment \"clip.mp4\" from tool output]\n[Tool result 1 image 1]"
+		if tool1 != wantTool1 {
+			t.Errorf("tool1 = %q, want %q", tool1, wantTool1)
+		}
+		wantTool2 := "[omitted unsupported application/pdf attachment from tool output]"
+		if tool2 != wantTool2 {
+			t.Errorf("tool2 = %q, want %q", tool2, wantTool2)
+		}
+
+		var img1 []models.OpenAIContentPart
+		if err := json.Unmarshal(got.Messages[4].Content, &img1); err != nil {
+			t.Fatalf("decode img1: %v", err)
+		}
+		if len(img1) != 2 || img1[1].Type != "image_url" || img1[1].ImageURL == nil || img1[1].ImageURL.URL != "data:image/png;base64,AQID" {
+			t.Errorf("img1 = %#v", img1)
+		}
+	})
+
+	t.Run("function response parts fileData translates http image and degrades non-http or non-image", func(t *testing.T) {
+		body := `{
+			"generation_config": {"media_resolution": "MEDIA_RESOLUTION_HIGH"},
+			"contents": [
+				{"role": "user", "parts": [{"text": "Fetch artifacts"}]},
+				{"role": "model", "parts": [
+					{"function_call": {"id": "call-1", "name": "fetch", "args": {}}}
+				]},
+				{"role": "user", "parts": [
+					{"function_response": {
+						"id": "call-1",
+						"name": "fetch",
+						"parts": [
+							{"file_data": {"mime_type": "image/png", "file_uri": "https://example.com/a.png", "display_name": "a.png"}},
+							{"file_data": {"mime_type": "image/png", "file_uri": "gs://bucket/b.png", "displayName": "b.png"}},
+							{"file_data": {"mime_type": "video/mp4", "file_uri": "https://example.com/c.mp4"}}
+						]
+					}}
+				]}
+			]
+		}`
+
+		req, err := decodeGeminiGenerateContentRequest([]byte(body))
+		if err != nil {
+			t.Fatalf("decodeGeminiGenerateContentRequest() error = %v", err)
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		wantRoles := []string{"user", "assistant", "tool", "user"}
+		if len(got.Messages) != len(wantRoles) {
+			t.Fatalf("len(Messages) = %d, want %d", len(got.Messages), len(wantRoles))
+		}
+		var toolText string
+		if err := json.Unmarshal(got.Messages[2].Content, &toolText); err != nil {
+			t.Fatalf("decode toolText: %v", err)
+		}
+		wantTool := "[Tool result 1 image 1]\n[omitted unsupported image/png file reference \"gs://bucket/b.png\" from tool output]\n[omitted unsupported video/mp4 file reference \"https://example.com/c.mp4\" from tool output]"
+		if toolText != wantTool {
+			t.Errorf("toolText = %q, want %q", toolText, wantTool)
+		}
+
+		var imgParts []models.OpenAIContentPart
+		if err := json.Unmarshal(got.Messages[3].Content, &imgParts); err != nil {
+			t.Fatalf("decode imgParts: %v", err)
+		}
+		if len(imgParts) != 2 || imgParts[1].ImageURL == nil || imgParts[1].ImageURL.URL != "https://example.com/a.png" || imgParts[1].ImageURL.Detail != "high" {
+			t.Errorf("imgParts = %#v", imgParts)
+		}
+	})
+
+	t.Run("top-level non-image inlineData, fileData, executableCode, codeExecutionResult, and ignored config fields", func(t *testing.T) {
+		body := `{
+			"safety_settings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}],
+			"generation_config": {
+				"response_modalities": ["TEXT"],
+				"response_logprobs": false,
+				"media_resolution": "MEDIA_RESOLUTION_LOW"
+			},
+			"contents": [
+				{"role": "user", "parts": [
+					{"text": "Check these"},
+					{"inline_data": {"mime_type": "audio/wav", "data": "***not-base64***", "display_name": "note.wav"}},
+					{"file_data": {"mime_type": "image/jpeg", "file_uri": "https://example.com/photo.jpg"}},
+					{"file_data": {"mime_type": "application/pdf", "file_uri": "gs://bucket/doc.pdf"}}
+				]},
+				{"role": "model", "parts": [
+					{"text": "Running calculation:"},
+					{"executable_code": {"language": "PYTHON", "code": "print(1+1)"}},
+					{"code_execution_result": {"outcome": "OUTCOME_OK", "output": "2"}},
+					{"text": "The answer is 2."}
+				]}
+			]
+		}`
+
+		req, err := decodeGeminiGenerateContentRequest([]byte(body))
+		if err != nil {
+			t.Fatalf("decodeGeminiGenerateContentRequest() error = %v", err)
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		if len(got.Messages) != 2 {
+			t.Fatalf("len(Messages) = %d, want 2", len(got.Messages))
+		}
+
+		var userParts []models.OpenAIContentPart
+		if err := json.Unmarshal(got.Messages[0].Content, &userParts); err != nil {
+			t.Fatalf("decode userParts: %v", err)
+		}
+		if len(userParts) != 4 {
+			t.Fatalf("len(userParts) = %d, want 4: %#v", len(userParts), userParts)
+		}
+		if gotText := derefString(userParts[0].Text); gotText != "Check these" {
+			t.Errorf("userParts[0].Text = %q", gotText)
+		}
+		if gotText := derefString(userParts[1].Text); gotText != "[omitted unsupported audio/wav attachment \"note.wav\"]" {
+			t.Errorf("userParts[1].Text = %q", gotText)
+		}
+		if userParts[2].Type != "image_url" || userParts[2].ImageURL == nil || userParts[2].ImageURL.URL != "https://example.com/photo.jpg" || userParts[2].ImageURL.Detail != "low" {
+			t.Errorf("userParts[2] = %#v", userParts[2])
+		}
+		if gotText := derefString(userParts[3].Text); gotText != "[omitted unsupported application/pdf file reference \"gs://bucket/doc.pdf\"]" {
+			t.Errorf("userParts[3].Text = %q", gotText)
+		}
+
+		var assistantText string
+		if err := json.Unmarshal(got.Messages[1].Content, &assistantText); err != nil {
+			t.Fatalf("decode assistantText: %v", err)
+		}
+		wantAssistant := "Running calculation:\n```python\nprint(1+1)\n```\n\n[code execution result (OUTCOME_OK)]\n2\nThe answer is 2."
+		if assistantText != wantAssistant {
+			t.Errorf("assistantText = %q, want %q", assistantText, wantAssistant)
+		}
+	})
+
+	t.Run("thinkingConfig thinkingLevel maps to reasoning_effort", func(t *testing.T) {
+		cases := []struct {
+			level string
+			want  string
+		}{
+			{level: "MINIMAL", want: "low"},
+			{level: "LOW", want: "low"},
+			{level: "MEDIUM", want: "medium"},
+			{level: "HIGH", want: "high"},
+			{level: "THINKING_LEVEL_UNSPECIFIED", want: ""},
+		}
+		for _, tc := range cases {
+			req := &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				GenerationConfig: &models.GeminiGenerationConfig{
+					ThinkingConfig: json.RawMessage(fmt.Sprintf(`{"thinkingLevel":%q}`, tc.level)),
+				},
+			}
+			got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+			if err != nil {
+				t.Fatalf("level %q: TranslateGeminiToOpenAI() error = %v", tc.level, err)
+			}
+			if got.ReasoningEffort != tc.want {
+				t.Errorf("level %q: ReasoningEffort = %q, want %q", tc.level, got.ReasoningEffort, tc.want)
+			}
+		}
+	})
+
 	t.Run("function response images stay after grouped tool results when text is interleaved", func(t *testing.T) {
 		req := &models.GeminiGenerateContentRequest{
 			Contents: []models.GeminiContent{
@@ -1505,19 +1729,19 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantStatus: "INVALID_ARGUMENT",
 		},
 		{
-			name: "unsupported inlineData mime type",
+			name: "inlineData missing mimeType rejected",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{{
 					Role: "user",
 					Parts: []models.GeminiPart{{
-						InlineData: json.RawMessage(`{"mimeType":"audio/wav","data":"AA=="}`),
+						InlineData: json.RawMessage(`{"data":"AA=="}`),
 					}},
 				}},
 			},
 			pathModel:  "gemini-2.5-pro",
-			wantCode:   http.StatusNotImplemented,
-			wantStatus: "UNIMPLEMENTED",
-			wantMsg:    "only image/* inlineData can be translated today",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "inlineData.mimeType is required",
 		},
 		{
 			name: "invalid inlineData base64",
@@ -1534,7 +1758,7 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantStatus: "INVALID_ARGUMENT",
 		},
 		{
-			name: "function response parts fileData unsupported",
+			name: "function response parts fileData missing fileUri rejected",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{
 					{
@@ -1549,43 +1773,43 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 							FunctionResponse: &models.GeminiFunctionResponse{
 								Name:     "search",
 								Response: json.RawMessage(`{"ok":true}`),
-								Parts:    []models.GeminiFunctionResponsePart{{FileData: json.RawMessage(`{"fileUri":"gs://bucket/a.png"}`)}},
+								Parts:    []models.GeminiFunctionResponsePart{{FileData: json.RawMessage(`{"mimeType":"image/png"}`)}},
 							},
 						}},
 					},
 				},
 			},
 			pathModel:  "gemini-2.5-pro",
-			wantCode:   http.StatusNotImplemented,
-			wantStatus: "UNIMPLEMENTED",
-			wantMsg:    "contents[1].parts[0].functionResponse: parts[0]: fileData is not supported",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "contents[1].parts[0].functionResponse: parts[0].fileData: fileData.fileUri is required",
 		},
 		{
-			name: "function response parts non-image inlineData unsupported",
+			name: "function response parts non-image inlineData missing data rejected",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{
 					{
 						Role: "model",
 						Parts: []models.GeminiPart{{
-							FunctionCall: &models.GeminiFunctionCall{Name: "read_pdf", Args: json.RawMessage(`{}`)},
+							FunctionCall: &models.GeminiFunctionCall{Name: "read_video", Args: json.RawMessage(`{}`)},
 						}},
 					},
 					{
 						Role: "user",
 						Parts: []models.GeminiPart{{
 							FunctionResponse: &models.GeminiFunctionResponse{
-								Name:     "read_pdf",
+								Name:     "read_video",
 								Response: json.RawMessage(`{"ok":true}`),
-								Parts:    []models.GeminiFunctionResponsePart{{InlineData: json.RawMessage(`{"mimeType":"application/pdf","data":"JVBERi0="}`)}},
+								Parts:    []models.GeminiFunctionResponsePart{{InlineData: json.RawMessage(`{"mimeType":"video/mp4","data":""}`)}},
 							},
 						}},
 					},
 				},
 			},
 			pathModel:  "gemini-2.5-pro",
-			wantCode:   http.StatusNotImplemented,
-			wantStatus: "UNIMPLEMENTED",
-			wantMsg:    "only image/* inlineData can be translated today",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "inlineData.data is required",
 		},
 		{
 			name: "function response parts mixed fileData and text rejected",
@@ -1640,7 +1864,33 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			pathModel:  "gemini-2.5-pro",
 			wantCode:   http.StatusBadRequest,
 			wantStatus: "INVALID_ARGUMENT",
-			wantMsg:    "parts[0] must contain text or supported inlineData",
+			wantMsg:    "parts[0] must contain text, inlineData, or fileData",
+		},
+		{
+			name: "invalid mediaResolution rejected",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				GenerationConfig: &models.GeminiGenerationConfig{
+					MediaResolution: json.RawMessage(`"MEDIA_RESOLUTION_ULTRA"`),
+				},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "generationConfig.mediaResolution",
+		},
+		{
+			name: "invalid thinkingLevel rejected",
+			req: &models.GeminiGenerateContentRequest{
+				Contents: []models.GeminiContent{{Role: "user", Parts: []models.GeminiPart{{Text: stringPtr("hi")}}}},
+				GenerationConfig: &models.GeminiGenerationConfig{
+					ThinkingConfig: json.RawMessage(`{"thinkingLevel":"EXTREME"}`),
+				},
+			},
+			pathModel:  "gemini-2.5-pro",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "generationConfig.thinkingConfig.thinkingLevel",
 		},
 		{
 			name: "body model mismatch",
@@ -1693,11 +1943,6 @@ func TestTranslateGeminiToOpenAIAdditionalUnsupportedCases(t *testing.T) {
 			name:    "image config unsupported",
 			config:  &models.GeminiGenerationConfig{ImageConfig: json.RawMessage(`{"aspectRatio":"1:1"}`)},
 			wantMsg: "generationConfig.imageConfig is not supported",
-		},
-		{
-			name:    "media resolution unsupported",
-			config:  &models.GeminiGenerationConfig{MediaResolution: json.RawMessage(`"MEDIA_RESOLUTION_HIGH"`)},
-			wantMsg: "generationConfig.mediaResolution is not supported",
 		},
 		{
 			name:    "response logprobs unsupported",
@@ -2356,6 +2601,9 @@ func TestHandleGeminiModelsGenerateContentIgnoresTopKAndThinkingConfig(t *testin
 		if oaiReq.Model != "gemini-2.5-pro" {
 			t.Errorf("Model = %q, want gemini-2.5-pro", oaiReq.Model)
 		}
+		if oaiReq.ReasoningEffort != "high" {
+			t.Errorf("ReasoningEffort = %q, want high", oaiReq.ReasoningEffort)
+		}
 
 		_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
 			ID:      "chatcmpl-topk",
@@ -2420,6 +2668,9 @@ func TestHandleGeminiModelsGenerateContentGeminiCLIDefaults(t *testing.T) {
 
 		if oaiReq.Model != "gemini-2.5-pro" {
 			t.Errorf("Model = %q, want gemini-2.5-pro", oaiReq.Model)
+		}
+		if oaiReq.ReasoningEffort != "high" {
+			t.Errorf("ReasoningEffort = %q, want high", oaiReq.ReasoningEffort)
 		}
 		if oaiReq.Stream == nil || !*oaiReq.Stream {
 			t.Fatalf("Stream = %v, want true", oaiReq.Stream)
@@ -3511,6 +3762,99 @@ func TestHandleGeminiModelsCountTokensWithInlineImageOmitsPromptDetails(t *testi
 	if len(countResp.PromptTokensDetails) != 0 {
 		t.Errorf("PromptTokensDetails = %#v, want omitted details for multimodal prompt", countResp.PromptTokensDetails)
 	}
+}
+
+func TestHandleGeminiModelsCountTokensOmitsTextDetailsForFileDataImage(t *testing.T) {
+	reqBody := `{
+		"contents": [{
+			"role": "user",
+			"parts": [
+				{"text": "Count this remote image."},
+				{"fileData": {"mimeType": "image/png", "fileUri": "https://example.com/chart.png"}}
+			]
+		}]
+	}`
+
+	t.Run("probe response", func(t *testing.T) {
+		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+				ID:      "chatcmpl-file-image-count",
+				Object:  "chat.completion",
+				Created: 123,
+				Model:   "gemini-2.5-pro",
+				Choices: []models.OpenAIChoice{{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)},
+					FinishReason: strPtr("stop"),
+				}},
+				Usage: &models.OpenAIUsage{PromptTokens: 29, CompletionTokens: 1, TotalTokens: 30},
+			})
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleGeminiModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+		}
+
+		var countResp models.GeminiCountTokensResponse
+		if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+			t.Fatalf("decode countTokens response: %v", err)
+		}
+		if countResp.TotalTokens != 29 {
+			t.Errorf("TotalTokens = %d, want 29", countResp.TotalTokens)
+		}
+		if len(countResp.PromptTokensDetails) != 0 {
+			t.Errorf("PromptTokensDetails = %#v, want omitted details for fileData image prompt", countResp.PromptTokensDetails)
+		}
+	})
+
+	t.Run("fallback estimate", func(t *testing.T) {
+		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+				ID:      "chatcmpl-file-image-no-usage",
+				Object:  "chat.completion",
+				Created: 123,
+				Model:   "gemini-2.5-pro",
+				Choices: []models.OpenAIChoice{{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)},
+					FinishReason: strPtr("stop"),
+				}},
+			})
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleGeminiModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+		}
+
+		var countResp models.GeminiCountTokensResponse
+		if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+			t.Fatalf("decode countTokens response: %v", err)
+		}
+		if countResp.TotalTokens <= 0 {
+			t.Errorf("TotalTokens = %d, want > 0", countResp.TotalTokens)
+		}
+		if len(countResp.PromptTokensDetails) != 0 {
+			t.Errorf("PromptTokensDetails = %#v, want omitted details for fileData image fallback estimate", countResp.PromptTokensDetails)
+		}
+	})
 }
 
 func TestHandleGeminiModelsCountTokensCacheNormalizesSnakeCase(t *testing.T) {

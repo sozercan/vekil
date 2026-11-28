@@ -44,35 +44,38 @@ Supported subset:
 - `contents[].role`; omitted or empty roles default to `user`, while explicit roles must be `user` or `model`
 - `systemInstruction.parts[].text`
 - `contents[].parts[].text`
-- `contents[].parts[].inlineData` for `image/*`
+- `contents[].parts[].inlineData`: `image/*` translates to an OpenAI `image_url` data URL; non-image `inlineData` (such as `video/*`, `audio/*`, or `application/pdf`) degrades to a text omission placeholder
+- `contents[].parts[].fileData`: `image/*` with an `http://` or `https://` `fileUri` translates to an OpenAI `image_url`; other URIs or non-image MIME types degrade to a text omission placeholder
+- `contents[].parts[].executableCode` and `contents[].parts[].codeExecutionResult`: rendered as text blocks in conversation history
 - `contents[].parts[].functionCall`
-- `contents[].parts[].functionResponse`, in `user` or `model` contents (some clients, such as Antigravity, send tool results under `model`); each must match a prior `functionCall`. Results are grouped directly after the assistant turn that issued their calls, so text interleaved between results follows them. Optional `functionResponse.parts` may carry `text` and `image/*` `inlineData`: text is appended to the `tool` message, while images are lowered to numbered placeholder slots in the `tool` message plus follow-up `user` image attachments emitted after the contiguous tool-result run
+- `contents[].parts[].functionResponse`, in `user` or `model` contents (some clients, such as Antigravity, send tool results under `model`); each must match a prior `functionCall`. Results are grouped directly after the assistant turn that issued their calls, so text interleaved between results follows them. Optional `functionResponse.parts` may carry `text`, `inlineData`, and `fileData`: text is appended to the `tool` message, `image/*` `inlineData` and `http(s)://` `image/*` `fileData` are lowered to numbered placeholder slots in the `tool` message plus follow-up `user` image attachments emitted after the contiguous tool-result run, and non-image `inlineData` or non-image/non-HTTP `fileData` is replaced with a text omission placeholder in the `tool` message so tool outputs do not fail the turn
 - `tools[].functionDeclarations` with `parameters` or `parametersJsonSchema`; Gemini `Schema` values in `parameters` are converted to JSON Schema by lowercasing OpenAPI types such as `OBJECT`, turning string-encoded integer bounds such as `"minLength": "1"` into numbers, and expressing `nullable: true` as a `null` type, enum value, or `anyOf` branch, while `parametersJsonSchema` is forwarded unchanged
 - `toolConfig.functionCallingConfig`
 - `generationConfig.temperature`, `topP`, `maxOutputTokens`, `stopSequences`
+- `generationConfig.mediaResolution` (`MEDIA_RESOLUTION_LOW` → `low`, `MEDIA_RESOLUTION_MEDIUM` → `auto`, `MEDIA_RESOLUTION_HIGH` → `high` on translated `image_url.detail`; `MEDIA_RESOLUTION_UNSPECIFIED` is a no-op)
+- `generationConfig.thinkingConfig.thinkingLevel` (`MINIMAL`/`LOW` → `low`, `MEDIUM` → `medium`, `HIGH` → `high` on `reasoning_effort`; `THINKING_LEVEL_UNSPECIFIED`, `includeThoughts`, and `thinkingBudget` are accepted and ignored)
 - `generationConfig.responseMimeType`, `responseSchema`, `responseJsonSchema`
 - `generationConfig.presencePenalty`, `frequencyPenalty`, `seed`
 
 Accepted but ignored because upstream has no equivalent:
 
 - `labels`, a string-to-string metadata map that Antigravity CLI sends; it is not forwarded upstream
+- `safetySettings`
 - `generationConfig.topK`
-- `generationConfig.thinkingConfig`
+- `generationConfig.thinkingConfig.includeThoughts` and `generationConfig.thinkingConfig.thinkingBudget`
+- `generationConfig.responseModalities` when limited to `TEXT` / `MODALITY_UNSPECIFIED`
+- `generationConfig.responseLogprobs: false`
 
 Explicit `501 UNIMPLEMENTED` cases include:
 
 - `generationConfig.candidateCount != 1`
-- `generationConfig.responseModalities`
+- `generationConfig.responseModalities` containing non-text modalities (such as `AUDIO` or `IMAGE`)
 - `generationConfig.speechConfig`
 - `generationConfig.imageConfig`
-- `generationConfig.mediaResolution`
-- `generationConfig.responseLogprobs`
+- `generationConfig.responseLogprobs: true`
 - `generationConfig.logprobs`
 - `cachedContent`
-- `safetySettings`
-- `functionResponse.parts[].fileData` and non-image `functionResponse.parts[].inlineData`
 - Gemini built-in tools such as `googleSearch`, `urlContext`, `codeExecution`, `googleMaps`, `computerUse`, and `enterpriseWebSearch`
-- non-image `inlineData`, `fileData`, and other non-text/media parts
 
 Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches, explicit content roles other than `user` or `model`, malformed content parts, invalid function-call history, unmatched `functionResponse` parts, and `functionResponse` parts that answer a call from an earlier tool-call batch after a newer batch has started (for example `call A, call B, response A, call C, response B`), which cannot be represented as valid Chat Completions history.
 
