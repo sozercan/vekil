@@ -639,6 +639,7 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 					{"file_data": {"mime_type": "application/pdf", "file_uri": "gs://bucket/doc.pdf"}}
 				]},
 				{"role": "model", "parts": [
+					{"text": "Running calculation:"},
 					{"executable_code": {"language": "PYTHON", "code": "print(1+1)"}},
 					{"code_execution_result": {"outcome": "OUTCOME_OK", "output": "2\n"}}
 				]}
@@ -683,7 +684,7 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		if err := json.Unmarshal(got.Messages[1].Content, &assistantText); err != nil {
 			t.Fatalf("decode assistantText: %v", err)
 		}
-		wantAssistant := "```python\nprint(1+1)\n```[code execution result (OUTCOME_OK)]\n2\n"
+		wantAssistant := "Running calculation:\n```python\nprint(1+1)\n```\n[code execution result (OUTCOME_OK)]\n2\n"
 		if assistantText != wantAssistant {
 			t.Errorf("assistantText = %q, want %q", assistantText, wantAssistant)
 		}
@@ -3713,6 +3714,99 @@ func TestHandleGeminiModelsCountTokensWithInlineImageOmitsPromptDetails(t *testi
 	if len(countResp.PromptTokensDetails) != 0 {
 		t.Errorf("PromptTokensDetails = %#v, want omitted details for multimodal prompt", countResp.PromptTokensDetails)
 	}
+}
+
+func TestHandleGeminiModelsCountTokensOmitsTextDetailsForFileDataImage(t *testing.T) {
+	reqBody := `{
+		"contents": [{
+			"role": "user",
+			"parts": [
+				{"text": "Count this remote image."},
+				{"fileData": {"mimeType": "image/png", "fileUri": "https://example.com/chart.png"}}
+			]
+		}]
+	}`
+
+	t.Run("probe response", func(t *testing.T) {
+		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+				ID:      "chatcmpl-file-image-count",
+				Object:  "chat.completion",
+				Created: 123,
+				Model:   "gemini-2.5-pro",
+				Choices: []models.OpenAIChoice{{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)},
+					FinishReason: strPtr("stop"),
+				}},
+				Usage: &models.OpenAIUsage{PromptTokens: 29, CompletionTokens: 1, TotalTokens: 30},
+			})
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleGeminiModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+		}
+
+		var countResp models.GeminiCountTokensResponse
+		if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+			t.Fatalf("decode countTokens response: %v", err)
+		}
+		if countResp.TotalTokens != 29 {
+			t.Errorf("TotalTokens = %d, want 29", countResp.TotalTokens)
+		}
+		if len(countResp.PromptTokensDetails) != 0 {
+			t.Errorf("PromptTokensDetails = %#v, want omitted details for fileData image prompt", countResp.PromptTokensDetails)
+		}
+	})
+
+	t.Run("fallback estimate", func(t *testing.T) {
+		handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.OpenAIResponse{
+				ID:      "chatcmpl-file-image-no-usage",
+				Object:  "chat.completion",
+				Created: 123,
+				Model:   "gemini-2.5-pro",
+				Choices: []models.OpenAIChoice{{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: json.RawMessage(`"ok"`)},
+					FinishReason: strPtr("stop"),
+				}},
+			})
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:countTokens", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		handler.HandleGeminiModels(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("StatusCode = %d, want 200: %s", resp.StatusCode, string(body))
+		}
+
+		var countResp models.GeminiCountTokensResponse
+		if err := json.NewDecoder(resp.Body).Decode(&countResp); err != nil {
+			t.Fatalf("decode countTokens response: %v", err)
+		}
+		if countResp.TotalTokens <= 0 {
+			t.Errorf("TotalTokens = %d, want > 0", countResp.TotalTokens)
+		}
+		if len(countResp.PromptTokensDetails) != 0 {
+			t.Errorf("PromptTokensDetails = %#v, want omitted details for fileData image fallback estimate", countResp.PromptTokensDetails)
+		}
+	})
 }
 
 func TestHandleGeminiModelsCountTokensCacheNormalizesSnakeCase(t *testing.T) {

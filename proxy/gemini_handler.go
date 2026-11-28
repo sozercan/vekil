@@ -491,7 +491,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		}
 		var estimateErr *geminiCountTokensEstimateError
 		if errors.As(err, &estimateErr) {
-			estimated := buildEstimatedGeminiCountTokensResult(req, estimateOpenAIRequestTokens(oaiReq))
+			estimated := buildEstimatedGeminiCountTokensResult(oaiReq, estimateOpenAIRequestTokens(oaiReq))
 			h.log.Debug("using estimated Gemini token count", logger.F("reason", estimateErr.reason), logger.F("total_tokens", estimated.TotalTokens), logger.Err(estimateErr.Unwrap()))
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(estimated)
@@ -502,7 +502,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	}
 
 	if oaiResp.Usage == nil {
-		estimated := buildEstimatedGeminiCountTokensResult(req, estimateOpenAIRequestTokens(oaiReq))
+		estimated := buildEstimatedGeminiCountTokensResult(oaiReq, estimateOpenAIRequestTokens(oaiReq))
 		h.log.Debug("using estimated Gemini token count", logger.F("reason", "missing_usage"), logger.F("total_tokens", estimated.TotalTokens))
 		h.cacheGeminiCountTokensResult(requestCacheKey, route, routeOperation, estimated)
 		w.Header().Set("Content-Type", "application/json")
@@ -514,7 +514,7 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 	result := models.GeminiCountTokensResponse{
 		TotalTokens: oaiResp.Usage.PromptTokens,
 	}
-	if !geminiRequestHasInlineMedia(req) {
+	if !openAIRequestHasImageMedia(oaiReq) {
 		result.PromptTokensDetails = []models.GeminiTokenCountDetails{{
 			Modality:   "TEXT",
 			TokenCount: oaiResp.Usage.PromptTokens,
@@ -567,12 +567,12 @@ func (h *ProxyHandler) cacheGeminiCountTokensResult(requestKey string, route *mo
 	h.setGeminiCountTokensCache(cacheKey, response)
 }
 
-func buildEstimatedGeminiCountTokensResult(req *models.GeminiGenerateContentRequest, total int) models.GeminiCountTokensResponse {
+func buildEstimatedGeminiCountTokensResult(oaiReq *models.OpenAIRequest, total int) models.GeminiCountTokensResponse {
 	if total <= 0 {
 		total = 1
 	}
 	result := models.GeminiCountTokensResponse{TotalTokens: total}
-	if !geminiRequestHasInlineMedia(req) {
+	if !openAIRequestHasImageMedia(oaiReq) {
 		result.PromptTokensDetails = []models.GeminiTokenCountDetails{{
 			Modality:   "TEXT",
 			TokenCount: total,
@@ -609,35 +609,24 @@ func estimateOpenAIRequestTokens(req *models.OpenAIRequest) int {
 	return estimate
 }
 
-func geminiRequestHasInlineMedia(req *models.GeminiGenerateContentRequest) bool {
+func openAIRequestHasImageMedia(req *models.OpenAIRequest) bool {
 	if req == nil {
 		return false
 	}
-
-	if geminiContentHasInlineMedia(req.SystemInstruction) {
-		return true
-	}
-
-	for idx := range req.Contents {
-		if geminiContentHasInlineMedia(&req.Contents[idx]) {
-			return true
+	for _, msg := range req.Messages {
+		if len(msg.Content) == 0 || msg.Content[0] != '[' {
+			continue
+		}
+		var parts []models.OpenAIContentPart
+		if err := json.Unmarshal(msg.Content, &parts); err != nil {
+			continue
+		}
+		for _, part := range parts {
+			if part.Type == "image_url" && part.ImageURL != nil {
+				return true
+			}
 		}
 	}
-
-	return false
-}
-
-func geminiContentHasInlineMedia(content *models.GeminiContent) bool {
-	if content == nil {
-		return false
-	}
-
-	for _, part := range content.Parts {
-		if hasRawJSON(part.InlineData) {
-			return true
-		}
-	}
-
 	return false
 }
 

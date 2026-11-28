@@ -1482,7 +1482,7 @@ func formatGeminiExecutableCode(raw json.RawMessage) (string, error) {
 	if lang == "language_unspecified" {
 		lang = ""
 	}
-	return fmt.Sprintf("```%s\n%s\n```", lang, execCode.Code), nil
+	return fmt.Sprintf("\n```%s\n%s\n```\n", lang, execCode.Code), nil
 }
 
 func formatGeminiCodeExecutionResult(raw json.RawMessage) (string, error) {
