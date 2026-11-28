@@ -366,6 +366,7 @@ func parseGeminiPath(path string) (string, string, error) {
 
 type geminiTranslationOptions struct {
 	unwrapCLITextOutput bool
+	imageDetail         string
 }
 
 func TranslateGeminiToOpenAI(req *models.GeminiGenerateContentRequest, pathModel string, stream bool) (*models.OpenAIRequest, error) {
@@ -392,12 +393,11 @@ func translateGeminiToOpenAIWithOptions(req *models.GeminiGenerateContentRequest
 	if req.CachedContent != "" {
 		return nil, unsupportedGemini("cachedContent is not supported")
 	}
-	if hasRawJSON(req.SafetySettings) {
-		return nil, unsupportedGemini("safetySettings is not supported")
-	}
-	if err := validateGeminiGenerationConfig(req.GenerationConfig); err != nil {
+	mediaDetail, err := validateGeminiGenerationConfig(req.GenerationConfig)
+	if err != nil {
 		return nil, err
 	}
+	options.imageDetail = mediaDetail
 
 	oaiReq := &models.OpenAIRequest{Model: model}
 
@@ -567,11 +567,41 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 				case "text":
 					contentBuilder.appendText(derefString(part.Text))
 				case "inlineData":
-					imagePart, err := translateGeminiInlineData(part.InlineData)
+					inlineData, err := parseGeminiInlineDataHeader(part.InlineData)
+					if err != nil {
+						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].inlineData", contentIdx, partIdx)
+					}
+					if !isGeminiImageMimeType(inlineData.MimeType) {
+						contentBuilder.appendText(formatOmittedGeminiInlineData(inlineData, false))
+						continue
+					}
+					imagePart, err := buildGeminiImagePart(inlineData, options.imageDetail)
 					if err != nil {
 						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].inlineData", contentIdx, partIdx)
 					}
 					contentBuilder.append(imagePart)
+				case "fileData":
+					fileData, err := parseGeminiFileData(part.FileData)
+					if err != nil {
+						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].fileData", contentIdx, partIdx)
+					}
+					if imagePart, ok := buildGeminiFileImagePart(fileData, options.imageDetail); ok {
+						contentBuilder.append(imagePart)
+					} else {
+						contentBuilder.appendText(formatOmittedGeminiFileData(fileData, false))
+					}
+				case "executableCode":
+					formatted, err := formatGeminiExecutableCode(part.ExecutableCode)
+					if err != nil {
+						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].executableCode", contentIdx, partIdx)
+					}
+					contentBuilder.appendText(formatted)
+				case "codeExecutionResult":
+					formatted, err := formatGeminiCodeExecutionResult(part.CodeExecutionResult)
+					if err != nil {
+						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].codeExecutionResult", contentIdx, partIdx)
+					}
+					contentBuilder.appendText(formatted)
 				case "functionResponse":
 					if err := flushUserContent(); err != nil {
 						return nil, err
@@ -662,6 +692,20 @@ func translateGeminiContents(contents []models.GeminiContent, options geminiTran
 					}
 				case "inlineData":
 					return nil, invalidGeminiArgument("contents[%d].parts[%d].inlineData requires role \"user\"", contentIdx, partIdx)
+				case "fileData":
+					return nil, invalidGeminiArgument("contents[%d].parts[%d].fileData requires role \"user\"", contentIdx, partIdx)
+				case "executableCode":
+					formatted, err := formatGeminiExecutableCode(part.ExecutableCode)
+					if err != nil {
+						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].executableCode", contentIdx, partIdx)
+					}
+					textParts = append(textParts, formatted)
+				case "codeExecutionResult":
+					formatted, err := formatGeminiCodeExecutionResult(part.CodeExecutionResult)
+					if err != nil {
+						return nil, annotateGeminiProtocolError(err, "contents[%d].parts[%d].codeExecutionResult", contentIdx, partIdx)
+					}
+					textParts = append(textParts, formatted)
 				}
 			}
 
@@ -760,7 +804,7 @@ func translateGeminiFunctionResponse(functionResponse *models.GeminiFunctionResp
 		}
 	}
 
-	partTexts, imageParts, err := translateGeminiFunctionResponseParts(functionResponse.Parts, resultIndex)
+	partTexts, imageParts, err := translateGeminiFunctionResponseParts(functionResponse.Parts, resultIndex, options.imageDetail)
 	if err != nil {
 		return models.OpenAIMessage{}, nil, err
 	}
@@ -799,7 +843,7 @@ func translateGeminiFunctionResponse(functionResponse *models.GeminiFunctionResp
 	}, imageMessage, nil
 }
 
-func translateGeminiFunctionResponseParts(parts []models.GeminiFunctionResponsePart, resultIndex int) ([]string, []models.OpenAIContentPart, error) {
+func translateGeminiFunctionResponseParts(parts []models.GeminiFunctionResponsePart, resultIndex int, imageDetail string) ([]string, []models.OpenAIContentPart, error) {
 	if len(parts) == 0 {
 		return nil, nil, nil
 	}
@@ -807,6 +851,14 @@ func translateGeminiFunctionResponseParts(parts []models.GeminiFunctionResponseP
 	var textSegments []string
 	var images []models.OpenAIContentPart
 	imageIndex := 0
+
+	appendToolImage := func(imagePart models.OpenAIContentPart) {
+		imageIndex++
+		label := fmt.Sprintf("Tool result %d image %d", resultIndex, imageIndex)
+		textSegments = append(textSegments, fmt.Sprintf("[%s]", label))
+		preamble := label + " (tool results numbered in conversation order; attachment from tool output):"
+		images = append(images, models.OpenAIContentPart{Type: "text", Text: &preamble}, imagePart)
+	}
 
 	for partIdx, part := range parts {
 		hasFileData := hasRawJSON(part.FileData)
@@ -825,14 +877,23 @@ func translateGeminiFunctionResponseParts(parts []models.GeminiFunctionResponseP
 
 		switch count {
 		case 0:
-			return nil, nil, invalidGeminiArgument("parts[%d] must contain text or supported inlineData", partIdx)
+			return nil, nil, invalidGeminiArgument("parts[%d] must contain text, inlineData, or fileData", partIdx)
 		case 1:
 		default:
 			return nil, nil, invalidGeminiArgument("parts[%d] must contain exactly one supported field", partIdx)
 		}
 
 		if hasFileData {
-			return nil, nil, annotateGeminiProtocolError(unsupportedGemini("fileData is not supported"), "parts[%d]", partIdx)
+			fileData, err := parseGeminiFileData(part.FileData)
+			if err != nil {
+				return nil, nil, annotateGeminiProtocolError(err, "parts[%d].fileData", partIdx)
+			}
+			if imagePart, ok := buildGeminiFileImagePart(fileData, imageDetail); ok {
+				appendToolImage(imagePart)
+			} else {
+				textSegments = append(textSegments, formatOmittedGeminiFileData(fileData, true))
+			}
+			continue
 		}
 
 		if part.Text != nil {
@@ -845,18 +906,14 @@ func translateGeminiFunctionResponseParts(parts []models.GeminiFunctionResponseP
 			return nil, nil, annotateGeminiProtocolError(err, "parts[%d].inlineData", partIdx)
 		}
 		if !isGeminiImageMimeType(inlineData.MimeType) {
-			textSegments = append(textSegments, formatOmittedGeminiToolInlineData(inlineData))
+			textSegments = append(textSegments, formatOmittedGeminiInlineData(inlineData, true))
 			continue
 		}
-		imagePart, err := buildGeminiImagePart(inlineData)
+		imagePart, err := buildGeminiImagePart(inlineData, imageDetail)
 		if err != nil {
 			return nil, nil, annotateGeminiProtocolError(err, "parts[%d].inlineData", partIdx)
 		}
-		imageIndex++
-		label := fmt.Sprintf("Tool result %d image %d", resultIndex, imageIndex)
-		textSegments = append(textSegments, fmt.Sprintf("[%s]", label))
-		preamble := label + " (tool results numbered in conversation order; attachment from tool output):"
-		images = append(images, models.OpenAIContentPart{Type: "text", Text: &preamble}, imagePart)
+		appendToolImage(imagePart)
 	}
 
 	return textSegments, images, nil
@@ -1157,37 +1214,92 @@ func resolveGeminiResponseSchema(config *models.GeminiGenerationConfig) (json.Ra
 	return left, nil
 }
 
-func validateGeminiGenerationConfig(config *models.GeminiGenerationConfig) error {
+func validateGeminiGenerationConfig(config *models.GeminiGenerationConfig) (string, error) {
 	if config == nil {
-		return nil
+		return "", nil
 	}
 
 	if config.CandidateCount != nil && *config.CandidateCount != 1 {
-		return unsupportedGemini("generationConfig.candidateCount=%d is not supported", *config.CandidateCount)
+		return "", unsupportedGemini("generationConfig.candidateCount=%d is not supported", *config.CandidateCount)
 	}
 	if err := validateGeminiThinkingConfig(config.ThinkingConfig); err != nil {
-		return err
+		return "", err
 	}
-	if hasRawJSON(config.ResponseModalities) {
-		return unsupportedGemini("generationConfig.responseModalities is not supported; Gemini audio/image response modes cannot be translated today")
+	if err := validateGeminiResponseModalities(config.ResponseModalities); err != nil {
+		return "", err
 	}
 	if hasRawJSON(config.SpeechConfig) {
-		return unsupportedGemini("generationConfig.speechConfig is not supported; Gemini speech configuration cannot be translated today")
+		return "", unsupportedGemini("generationConfig.speechConfig is not supported; Gemini speech configuration cannot be translated today")
 	}
 	if hasRawJSON(config.ImageConfig) {
-		return unsupportedGemini("generationConfig.imageConfig is not supported; Gemini image generation configuration cannot be translated today")
+		return "", unsupportedGemini("generationConfig.imageConfig is not supported; Gemini image generation configuration cannot be translated today")
 	}
-	if hasRawJSON(config.MediaResolution) {
-		return unsupportedGemini("generationConfig.mediaResolution is not supported")
+	imageDetail, err := translateGeminiMediaResolution(config.MediaResolution)
+	if err != nil {
+		return "", err
 	}
-	if hasRawJSON(config.ResponseLogprobs) {
-		return unsupportedGemini("generationConfig.responseLogprobs is not supported")
+	if err := validateGeminiResponseLogprobs(config.ResponseLogprobs); err != nil {
+		return "", err
 	}
 	if hasRawJSON(config.Logprobs) {
-		return unsupportedGemini("generationConfig.logprobs is not supported")
+		return "", unsupportedGemini("generationConfig.logprobs is not supported")
 	}
 
+	return imageDetail, nil
+}
+
+func validateGeminiResponseModalities(raw json.RawMessage) error {
+	if !hasRawJSON(raw) {
+		return nil
+	}
+	var modalities []string
+	if err := json.Unmarshal(raw, &modalities); err != nil {
+		return invalidGeminiArgument("generationConfig.responseModalities must be an array of strings")
+	}
+	for _, modality := range modalities {
+		switch strings.ToUpper(strings.TrimSpace(modality)) {
+		case "TEXT", "MODALITY_UNSPECIFIED":
+		default:
+			return unsupportedGemini("generationConfig.responseModalities is not supported; Gemini audio/image response modes cannot be translated today")
+		}
+	}
 	return nil
+}
+
+func validateGeminiResponseLogprobs(raw json.RawMessage) error {
+	if !hasRawJSON(raw) {
+		return nil
+	}
+	var enabled bool
+	if err := json.Unmarshal(raw, &enabled); err != nil {
+		return invalidGeminiArgument("generationConfig.responseLogprobs must be a boolean")
+	}
+	if enabled {
+		return unsupportedGemini("generationConfig.responseLogprobs is not supported")
+	}
+	return nil
+}
+
+func translateGeminiMediaResolution(raw json.RawMessage) (string, error) {
+	if !hasRawJSON(raw) {
+		return "", nil
+	}
+	var resolution string
+	if err := json.Unmarshal(raw, &resolution); err != nil {
+		return "", invalidGeminiArgument("generationConfig.mediaResolution must be a string")
+	}
+	switch strings.ToUpper(strings.TrimSpace(resolution)) {
+	case "", "MEDIA_RESOLUTION_UNSPECIFIED":
+		return "", nil
+	case "MEDIA_RESOLUTION_LOW":
+		return "low", nil
+	case "MEDIA_RESOLUTION_MEDIUM":
+		return "auto", nil
+	case "MEDIA_RESOLUTION_HIGH":
+		return "high", nil
+	default:
+		return "", invalidGeminiArgument("generationConfig.mediaResolution %q is invalid", resolution)
+	}
 }
 
 type geminiThinkingConfig struct {
@@ -1215,10 +1327,6 @@ func validateGeminiThinkingConfig(raw json.RawMessage) error {
 }
 
 func geminiPartKind(part models.GeminiPart) (string, error) {
-	if hasRawJSON(part.FileData) || hasRawJSON(part.ExecutableCode) || hasRawJSON(part.CodeExecutionResult) {
-		return "", unsupportedGemini("non-text and media parts are not supported")
-	}
-
 	count := 0
 	kind := ""
 	if part.Text != nil {
@@ -1234,38 +1342,33 @@ func geminiPartKind(part models.GeminiPart) (string, error) {
 		kind = "functionResponse"
 	}
 	if hasRawJSON(part.InlineData) {
-		if _, err := parseGeminiInlineData(part.InlineData); err != nil {
-			return "", err
-		}
 		count++
 		kind = "inlineData"
+	}
+	if hasRawJSON(part.FileData) {
+		count++
+		kind = "fileData"
+	}
+	if hasRawJSON(part.ExecutableCode) {
+		count++
+		kind = "executableCode"
+	}
+	if hasRawJSON(part.CodeExecutionResult) {
+		count++
+		kind = "codeExecutionResult"
 	}
 
 	switch count {
 	case 1:
 		return kind, nil
 	case 0:
-		return "", invalidGeminiArgument("content part must contain text, functionCall, functionResponse, or supported inlineData")
+		return "", invalidGeminiArgument("content part must contain text, functionCall, functionResponse, inlineData, fileData, executableCode, or codeExecutionResult")
 	default:
 		return "", invalidGeminiArgument("content part must contain exactly one supported field")
 	}
 }
 
-func translateGeminiInlineData(raw json.RawMessage) (models.OpenAIContentPart, error) {
-	inlineData, err := parseGeminiInlineData(raw)
-	if err != nil {
-		return models.OpenAIContentPart{}, err
-	}
-
-	return models.OpenAIContentPart{
-		Type: "image_url",
-		ImageURL: &models.OpenAIImageURL{
-			URL: fmt.Sprintf("data:%s;base64,%s", inlineData.MimeType, inlineData.Data),
-		},
-	}, nil
-}
-
-func buildGeminiImagePart(inlineData *models.GeminiInlineData) (models.OpenAIContentPart, error) {
+func buildGeminiImagePart(inlineData *models.GeminiInlineData, detail string) (models.OpenAIContentPart, error) {
 	normalized, err := normalizeGeminiInlineDataBase64(inlineData.Data)
 	if err != nil {
 		return models.OpenAIContentPart{}, invalidGeminiArgument("inlineData.data must be valid base64")
@@ -1274,27 +1377,10 @@ func buildGeminiImagePart(inlineData *models.GeminiInlineData) (models.OpenAICon
 	return models.OpenAIContentPart{
 		Type: "image_url",
 		ImageURL: &models.OpenAIImageURL{
-			URL: fmt.Sprintf("data:%s;base64,%s", inlineData.MimeType, normalized),
+			URL:    fmt.Sprintf("data:%s;base64,%s", inlineData.MimeType, normalized),
+			Detail: detail,
 		},
 	}, nil
-}
-
-func parseGeminiInlineData(raw json.RawMessage) (*models.GeminiInlineData, error) {
-	inlineData, err := parseGeminiInlineDataHeader(raw)
-	if err != nil {
-		return nil, err
-	}
-	if !isGeminiImageMimeType(inlineData.MimeType) {
-		return nil, unsupportedGemini("inlineData mimeType %q is not supported; only image/* inlineData can be translated today, so PDF/audio/video inlineData will fail", inlineData.MimeType)
-	}
-
-	normalized, err := normalizeGeminiInlineDataBase64(inlineData.Data)
-	if err != nil {
-		return nil, invalidGeminiArgument("inlineData.data must be valid base64")
-	}
-	inlineData.Data = normalized
-
-	return inlineData, nil
 }
 
 func parseGeminiInlineDataHeader(raw json.RawMessage) (*models.GeminiInlineData, error) {
@@ -1321,15 +1407,100 @@ func parseGeminiInlineDataHeader(raw json.RawMessage) (*models.GeminiInlineData,
 	return &inlineData, nil
 }
 
+func parseGeminiFileData(raw json.RawMessage) (*models.GeminiFileData, error) {
+	if !hasRawJSON(raw) {
+		return nil, invalidGeminiArgument("fileData must be an object with fileUri")
+	}
+
+	var fileData models.GeminiFileData
+	if err := json.Unmarshal(raw, &fileData); err != nil {
+		return nil, invalidGeminiArgument("fileData must be an object with fileUri")
+	}
+
+	fileData.MimeType = strings.TrimSpace(fileData.MimeType)
+	fileData.FileURI = strings.TrimSpace(fileData.FileURI)
+	if fileData.FileURI == "" {
+		return nil, invalidGeminiArgument("fileData.fileUri is required")
+	}
+
+	return &fileData, nil
+}
+
+func buildGeminiFileImagePart(fileData *models.GeminiFileData, detail string) (models.OpenAIContentPart, bool) {
+	if !isGeminiImageMimeType(fileData.MimeType) || !isHTTPURL(fileData.FileURI) {
+		return models.OpenAIContentPart{}, false
+	}
+	return models.OpenAIContentPart{
+		Type: "image_url",
+		ImageURL: &models.OpenAIImageURL{
+			URL:    fileData.FileURI,
+			Detail: detail,
+		},
+	}, true
+}
+
+func isHTTPURL(raw string) bool {
+	lower := strings.ToLower(raw)
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
 func isGeminiImageMimeType(mimeType string) bool {
 	return strings.HasPrefix(strings.ToLower(mimeType), "image/")
 }
 
-func formatOmittedGeminiToolInlineData(inlineData *models.GeminiInlineData) string {
-	if inlineData.DisplayName != "" {
-		return fmt.Sprintf("[omitted unsupported %s attachment %q from tool output]", inlineData.MimeType, inlineData.DisplayName)
+func formatOmittedGeminiInlineData(inlineData *models.GeminiInlineData, fromTool bool) string {
+	suffix := ""
+	if fromTool {
+		suffix = " from tool output"
 	}
-	return fmt.Sprintf("[omitted unsupported %s attachment from tool output]", inlineData.MimeType)
+	if inlineData.DisplayName != "" {
+		return fmt.Sprintf("[omitted unsupported %s attachment %q%s]", inlineData.MimeType, inlineData.DisplayName, suffix)
+	}
+	return fmt.Sprintf("[omitted unsupported %s attachment%s]", inlineData.MimeType, suffix)
+}
+
+func formatOmittedGeminiFileData(fileData *models.GeminiFileData, fromTool bool) string {
+	suffix := ""
+	if fromTool {
+		suffix = " from tool output"
+	}
+	if fileData.MimeType != "" {
+		return fmt.Sprintf("[omitted unsupported %s file reference %q%s]", fileData.MimeType, fileData.FileURI, suffix)
+	}
+	return fmt.Sprintf("[omitted unsupported file reference %q%s]", fileData.FileURI, suffix)
+}
+
+func formatGeminiExecutableCode(raw json.RawMessage) (string, error) {
+	if !hasRawJSON(raw) {
+		return "", invalidGeminiArgument("executableCode must be an object")
+	}
+	var execCode models.GeminiExecutableCode
+	if err := json.Unmarshal(raw, &execCode); err != nil {
+		return "", invalidGeminiArgument("executableCode must be an object")
+	}
+	lang := strings.ToLower(strings.TrimSpace(execCode.Language))
+	if lang == "language_unspecified" {
+		lang = ""
+	}
+	return fmt.Sprintf("```%s\n%s\n```", lang, execCode.Code), nil
+}
+
+func formatGeminiCodeExecutionResult(raw json.RawMessage) (string, error) {
+	if !hasRawJSON(raw) {
+		return "", invalidGeminiArgument("codeExecutionResult must be an object")
+	}
+	var result models.GeminiCodeExecutionResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", invalidGeminiArgument("codeExecutionResult must be an object")
+	}
+	outcome := strings.TrimSpace(result.Outcome)
+	if outcome != "" && result.Output != "" {
+		return fmt.Sprintf("[code execution result (%s)]\n%s", outcome, result.Output), nil
+	}
+	if outcome != "" {
+		return fmt.Sprintf("[code execution result (%s)]", outcome), nil
+	}
+	return fmt.Sprintf("[code execution result]\n%s", result.Output), nil
 }
 
 func normalizeGeminiInlineDataBase64(data string) (string, error) {

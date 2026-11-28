@@ -17,11 +17,38 @@ type geminiJSONNode struct {
 
 var geminiInlineDataNode = geminiJSONNode{
 	aliases: map[string]string{
-		"mime_type": "mimeType",
+		"mime_type":    "mimeType",
+		"display_name": "displayName",
 	},
 	allowed: geminiJSONSet(
 		"mimeType",
 		"data",
+		"displayName",
+	),
+}
+
+var geminiFileDataNode = geminiJSONNode{
+	aliases: map[string]string{
+		"mime_type": "mimeType",
+		"file_uri":  "fileUri",
+	},
+	allowed: geminiJSONSet(
+		"mimeType",
+		"fileUri",
+	),
+}
+
+var geminiExecutableCodeNode = geminiJSONNode{
+	allowed: geminiJSONSet(
+		"language",
+		"code",
+	),
+}
+
+var geminiCodeExecutionResultNode = geminiJSONNode{
+	allowed: geminiJSONSet(
+		"outcome",
+		"output",
 	),
 }
 
@@ -57,6 +84,7 @@ var geminiFunctionResponsePartNode = geminiJSONNode{
 	),
 	objectChildren: map[string]geminiJSONNode{
 		"inlineData": geminiFunctionResponseInlineDataNode,
+		"fileData":   geminiFileDataNode,
 	},
 }
 
@@ -94,9 +122,12 @@ var geminiPartNode = geminiJSONNode{
 		"codeExecutionResult",
 	),
 	objectChildren: map[string]geminiJSONNode{
-		"functionCall":     geminiFunctionCallNode,
-		"functionResponse": geminiFunctionResponseNode,
-		"inlineData":       geminiInlineDataNode,
+		"functionCall":        geminiFunctionCallNode,
+		"functionResponse":    geminiFunctionResponseNode,
+		"inlineData":          geminiInlineDataNode,
+		"fileData":            geminiFileDataNode,
+		"executableCode":      geminiExecutableCodeNode,
+		"codeExecutionResult": geminiCodeExecutionResultNode,
 	},
 }
 

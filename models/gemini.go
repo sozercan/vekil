@@ -39,6 +39,21 @@ type GeminiInlineData struct {
 	DisplayName string `json:"displayName,omitempty"`
 }
 
+type GeminiFileData struct {
+	MimeType string `json:"mimeType,omitempty"`
+	FileURI  string `json:"fileUri"`
+}
+
+type GeminiExecutableCode struct {
+	Language string `json:"language,omitempty"`
+	Code     string `json:"code"`
+}
+
+type GeminiCodeExecutionResult struct {
+	Outcome string `json:"outcome,omitempty"`
+	Output  string `json:"output,omitempty"`
+}
+
 type GeminiFunctionCall struct {
 	ID   string          `json:"id,omitempty"`
 	Name string          `json:"name"`
