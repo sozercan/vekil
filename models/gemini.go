@@ -113,9 +113,14 @@ type GeminiGenerateContentResponse struct {
 }
 
 type GeminiCandidate struct {
-	Content      *GeminiContent `json:"content,omitempty"`
-	FinishReason string         `json:"finishReason,omitempty"`
-	Index        *int           `json:"index,omitempty"`
+	Content           *GeminiContent           `json:"content,omitempty"`
+	FinishReason      string                   `json:"finishReason,omitempty"`
+	Index             *int                     `json:"index,omitempty"`
+	GroundingMetadata *GeminiGroundingMetadata `json:"groundingMetadata,omitempty"`
+}
+
+type GeminiGroundingMetadata struct {
+	WebSearchQueries []string `json:"webSearchQueries,omitempty"`
 }
 
 type GeminiUsageMetadata struct {

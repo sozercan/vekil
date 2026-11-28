@@ -48,6 +48,7 @@ Supported subset:
 - `contents[].parts[].functionCall`
 - `contents[].parts[].functionResponse`, in `user` or `model` contents (some clients, such as Antigravity, send tool results under `model`); each must match a prior `functionCall`. Results are grouped directly after the assistant turn that issued their calls, so text interleaved between results follows them. Optional `functionResponse.parts` may carry `text` and `image/*` `inlineData`: text is appended to the `tool` message, while images are lowered to numbered placeholder slots in the `tool` message plus follow-up `user` image attachments emitted after the contiguous tool-result run
 - `tools[].functionDeclarations` with `parameters` or `parametersJsonSchema`; Gemini `Schema` values in `parameters` are converted to JSON Schema by lowercasing OpenAPI types such as `OBJECT`, turning string-encoded integer bounds such as `"minLength": "1"` into numbers, and expressing `nullable: true` as a `null` type, enum value, or `anyOf` branch, while `parametersJsonSchema` is forwarded unchanged
+- `tools[].googleSearch` and `tools[].googleSearchRetrieval` when a Copilot provider is configured: Vekil injects an internal web-search function tool, executes up to 3 bounded search rounds against GitHub Copilot's MCP `web_search` backend, and returns the grounded answer with `groundingMetadata.webSearchQueries` (without exposing the internal tool call). When no Copilot provider is configured, these tools return `501 UNIMPLEMENTED`
 - `toolConfig.functionCallingConfig`
 - `generationConfig.temperature`, `topP`, `maxOutputTokens`, `stopSequences`
 - `generationConfig.responseMimeType`, `responseSchema`, `responseJsonSchema`
@@ -71,7 +72,7 @@ Explicit `501 UNIMPLEMENTED` cases include:
 - `cachedContent`
 - `safetySettings`
 - `functionResponse.parts[].fileData` and non-image `functionResponse.parts[].inlineData`
-- Gemini built-in tools such as `googleSearch`, `urlContext`, `codeExecution`, `googleMaps`, `computerUse`, and `enterpriseWebSearch`
+- Gemini built-in tools such as `urlContext`, `codeExecution`, `googleMaps`, `computerUse`, and `enterpriseWebSearch` (plus `googleSearch` and `googleSearchRetrieval` when no Copilot provider is configured)
 - non-image `inlineData`, `fileData`, and other non-text/media parts
 
 Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches, explicit content roles other than `user` or `model`, malformed content parts, invalid function-call history, unmatched `functionResponse` parts, and `functionResponse` parts that answer a call from an earlier tool-call batch after a newer batch has started (for example `call A, call B, response A, call C, response B`), which cannot be represented as valid Chat Completions history.

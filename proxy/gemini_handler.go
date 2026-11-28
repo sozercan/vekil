@@ -112,12 +112,21 @@ func (h *ProxyHandler) handleGeminiGenerateContent(w http.ResponseWriter, r *htt
 	h.observeRequestSummary(r.Context(), "gemini", pathModel, stream, providerEndpointChatCompletions)
 
 	scope := chatToolExecutionScopeFromHeaders(r.Header)
-	oaiReq, err := translateGeminiToOpenAIWithOptions(req, pathModel, stream, geminiTranslationOptions{unwrapCLITextOutput: isGeminiCLIUserAgent(r.UserAgent())})
+	enableGoogleSearch := h.supportsGeminiGoogleSearch()
+	oaiReq, err := translateGeminiToOpenAIWithOptions(req, pathModel, stream, geminiTranslationOptions{
+		unwrapCLITextOutput: isGeminiCLIUserAgent(r.UserAgent()),
+		enableGoogleSearch:  enableGoogleSearch,
+	})
 	if err != nil {
 		h.writeGeminiProtocolError(w, err)
 		return
 	}
 	h.maybeReduceOpenAIChatToolOutputs(r.Context(), oaiReq, h.toolContexts, scope)
+
+	if enableGoogleSearch && geminiRequestHasGoogleSearch(req) {
+		h.handleGeminiGoogleSearchGenerateContent(w, r, oaiReq, stream, scope)
+		return
+	}
 
 	forceStream := !stream && len(oaiReq.Tools) > 0 && !openAIToolChoiceIsNone(oaiReq.ToolChoice)
 	if forceStream {
@@ -445,7 +454,9 @@ func (h *ProxyHandler) handleGeminiCountTokens(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	oaiReq, err := TranslateGeminiCountTokens(req, pathModel)
+	oaiReq, err := translateGeminiToOpenAIWithOptions(req, pathModel, false, geminiTranslationOptions{
+		enableGoogleSearch: h.supportsGeminiGoogleSearch(),
+	})
 	if err != nil {
 		h.writeGeminiProtocolError(w, err)
 		return
