@@ -495,6 +495,80 @@ func TestTranslateGeminiToOpenAI(t *testing.T) {
 		}
 	})
 
+	t.Run("function response parts degrade non-image inlineData to text placeholders", func(t *testing.T) {
+		body := `{
+			"contents": [
+				{"role": "user", "parts": [{"text": "Inspect the recording"}]},
+				{"role": "model", "parts": [
+					{"function_call": {"id": "call-1", "name": "read_file", "args": {"path": "clip.mp4"}}},
+					{"function_call": {"id": "call-2", "name": "read_file", "args": {"path": "report.pdf"}}}
+				]},
+				{"role": "model", "parts": [
+					{"function_response": {
+						"id": "call-1",
+						"name": "read_file",
+						"response": {"ok": true},
+						"parts": [
+							{"inline_data": {"mime_type": "video/mp4", "data": "AAAA", "display_name": "clip.mp4"}},
+							{"inline_data": {"mime_type": "image/png", "data": "AQID"}}
+						]
+					}},
+					{"function_response": {
+						"id": "call-2",
+						"name": "read_file",
+						"parts": [
+							{"inlineData": {"mimeType": "application/pdf", "data": "JVBERi0="}}
+						]
+					}}
+				]}
+			]
+		}`
+
+		req, err := decodeGeminiGenerateContentRequest([]byte(body))
+		if err != nil {
+			t.Fatalf("decodeGeminiGenerateContentRequest() error = %v", err)
+		}
+
+		got, err := TranslateGeminiToOpenAI(req, "gemini-2.5-pro", false)
+		if err != nil {
+			t.Fatalf("TranslateGeminiToOpenAI() error = %v", err)
+		}
+
+		wantRoles := []string{"user", "assistant", "tool", "tool", "user"}
+		if len(got.Messages) != len(wantRoles) {
+			t.Fatalf("len(Messages) = %d, want %d: %#v", len(got.Messages), len(wantRoles), got.Messages)
+		}
+		for i, role := range wantRoles {
+			if got.Messages[i].Role != role {
+				t.Fatalf("Messages[%d].Role = %q, want %q", i, got.Messages[i].Role, role)
+			}
+		}
+
+		var tool1, tool2 string
+		if err := json.Unmarshal(got.Messages[2].Content, &tool1); err != nil {
+			t.Fatalf("decode tool1: %v", err)
+		}
+		if err := json.Unmarshal(got.Messages[3].Content, &tool2); err != nil {
+			t.Fatalf("decode tool2: %v", err)
+		}
+		wantTool1 := "{\"ok\":true}\n[omitted unsupported video/mp4 attachment \"clip.mp4\" from tool output]\n[Tool result 1 image 1]"
+		if tool1 != wantTool1 {
+			t.Errorf("tool1 = %q, want %q", tool1, wantTool1)
+		}
+		wantTool2 := "[omitted unsupported application/pdf attachment from tool output]"
+		if tool2 != wantTool2 {
+			t.Errorf("tool2 = %q, want %q", tool2, wantTool2)
+		}
+
+		var img1 []models.OpenAIContentPart
+		if err := json.Unmarshal(got.Messages[4].Content, &img1); err != nil {
+			t.Fatalf("decode img1: %v", err)
+		}
+		if len(img1) != 2 || img1[1].Type != "image_url" || img1[1].ImageURL == nil || img1[1].ImageURL.URL != "data:image/png;base64,AQID" {
+			t.Errorf("img1 = %#v", img1)
+		}
+	})
+
 	t.Run("function response images stay after grouped tool results when text is interleaved", func(t *testing.T) {
 		req := &models.GeminiGenerateContentRequest{
 			Contents: []models.GeminiContent{
@@ -1561,31 +1635,31 @@ func TestTranslateGeminiToOpenAIErrors(t *testing.T) {
 			wantMsg:    "contents[1].parts[0].functionResponse: parts[0]: fileData is not supported",
 		},
 		{
-			name: "function response parts non-image inlineData unsupported",
+			name: "function response parts non-image inlineData missing data rejected",
 			req: &models.GeminiGenerateContentRequest{
 				Contents: []models.GeminiContent{
 					{
 						Role: "model",
 						Parts: []models.GeminiPart{{
-							FunctionCall: &models.GeminiFunctionCall{Name: "read_pdf", Args: json.RawMessage(`{}`)},
+							FunctionCall: &models.GeminiFunctionCall{Name: "read_video", Args: json.RawMessage(`{}`)},
 						}},
 					},
 					{
 						Role: "user",
 						Parts: []models.GeminiPart{{
 							FunctionResponse: &models.GeminiFunctionResponse{
-								Name:     "read_pdf",
+								Name:     "read_video",
 								Response: json.RawMessage(`{"ok":true}`),
-								Parts:    []models.GeminiFunctionResponsePart{{InlineData: json.RawMessage(`{"mimeType":"application/pdf","data":"JVBERi0="}`)}},
+								Parts:    []models.GeminiFunctionResponsePart{{InlineData: json.RawMessage(`{"mimeType":"video/mp4","data":""}`)}},
 							},
 						}},
 					},
 				},
 			},
 			pathModel:  "gemini-2.5-pro",
-			wantCode:   http.StatusNotImplemented,
-			wantStatus: "UNIMPLEMENTED",
-			wantMsg:    "only image/* inlineData can be translated today",
+			wantCode:   http.StatusBadRequest,
+			wantStatus: "INVALID_ARGUMENT",
+			wantMsg:    "inlineData.data is required",
 		},
 		{
 			name: "function response parts mixed fileData and text rejected",

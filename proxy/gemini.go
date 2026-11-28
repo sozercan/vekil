@@ -840,7 +840,15 @@ func translateGeminiFunctionResponseParts(parts []models.GeminiFunctionResponseP
 			continue
 		}
 
-		imagePart, err := translateGeminiInlineData(part.InlineData)
+		inlineData, err := parseGeminiInlineDataHeader(part.InlineData)
+		if err != nil {
+			return nil, nil, annotateGeminiProtocolError(err, "parts[%d].inlineData", partIdx)
+		}
+		if !isGeminiImageMimeType(inlineData.MimeType) {
+			textSegments = append(textSegments, formatOmittedGeminiToolInlineData(inlineData))
+			continue
+		}
+		imagePart, err := buildGeminiImagePart(inlineData)
 		if err != nil {
 			return nil, nil, annotateGeminiProtocolError(err, "parts[%d].inlineData", partIdx)
 		}
@@ -1257,7 +1265,39 @@ func translateGeminiInlineData(raw json.RawMessage) (models.OpenAIContentPart, e
 	}, nil
 }
 
+func buildGeminiImagePart(inlineData *models.GeminiInlineData) (models.OpenAIContentPart, error) {
+	normalized, err := normalizeGeminiInlineDataBase64(inlineData.Data)
+	if err != nil {
+		return models.OpenAIContentPart{}, invalidGeminiArgument("inlineData.data must be valid base64")
+	}
+
+	return models.OpenAIContentPart{
+		Type: "image_url",
+		ImageURL: &models.OpenAIImageURL{
+			URL: fmt.Sprintf("data:%s;base64,%s", inlineData.MimeType, normalized),
+		},
+	}, nil
+}
+
 func parseGeminiInlineData(raw json.RawMessage) (*models.GeminiInlineData, error) {
+	inlineData, err := parseGeminiInlineDataHeader(raw)
+	if err != nil {
+		return nil, err
+	}
+	if !isGeminiImageMimeType(inlineData.MimeType) {
+		return nil, unsupportedGemini("inlineData mimeType %q is not supported; only image/* inlineData can be translated today, so PDF/audio/video inlineData will fail", inlineData.MimeType)
+	}
+
+	normalized, err := normalizeGeminiInlineDataBase64(inlineData.Data)
+	if err != nil {
+		return nil, invalidGeminiArgument("inlineData.data must be valid base64")
+	}
+	inlineData.Data = normalized
+
+	return inlineData, nil
+}
+
+func parseGeminiInlineDataHeader(raw json.RawMessage) (*models.GeminiInlineData, error) {
 	if !hasRawJSON(raw) {
 		return nil, invalidGeminiArgument("inlineData must be an object with mimeType and data")
 	}
@@ -1269,6 +1309,7 @@ func parseGeminiInlineData(raw json.RawMessage) (*models.GeminiInlineData, error
 
 	inlineData.MimeType = strings.TrimSpace(inlineData.MimeType)
 	inlineData.Data = strings.TrimSpace(inlineData.Data)
+	inlineData.DisplayName = strings.TrimSpace(inlineData.DisplayName)
 
 	if inlineData.MimeType == "" {
 		return nil, invalidGeminiArgument("inlineData.mimeType is required")
@@ -1276,17 +1317,19 @@ func parseGeminiInlineData(raw json.RawMessage) (*models.GeminiInlineData, error
 	if inlineData.Data == "" {
 		return nil, invalidGeminiArgument("inlineData.data is required")
 	}
-	if !strings.HasPrefix(strings.ToLower(inlineData.MimeType), "image/") {
-		return nil, unsupportedGemini("inlineData mimeType %q is not supported; only image/* inlineData can be translated today, so PDF/audio/video inlineData will fail", inlineData.MimeType)
-	}
-
-	normalized, err := normalizeGeminiInlineDataBase64(inlineData.Data)
-	if err != nil {
-		return nil, invalidGeminiArgument("inlineData.data must be valid base64")
-	}
-	inlineData.Data = normalized
 
 	return &inlineData, nil
+}
+
+func isGeminiImageMimeType(mimeType string) bool {
+	return strings.HasPrefix(strings.ToLower(mimeType), "image/")
+}
+
+func formatOmittedGeminiToolInlineData(inlineData *models.GeminiInlineData) string {
+	if inlineData.DisplayName != "" {
+		return fmt.Sprintf("[omitted unsupported %s attachment %q from tool output]", inlineData.MimeType, inlineData.DisplayName)
+	}
+	return fmt.Sprintf("[omitted unsupported %s attachment from tool output]", inlineData.MimeType)
 }
 
 func normalizeGeminiInlineDataBase64(data string) (string, error) {

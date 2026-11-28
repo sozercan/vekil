@@ -46,7 +46,7 @@ Supported subset:
 - `contents[].parts[].text`
 - `contents[].parts[].inlineData` for `image/*`
 - `contents[].parts[].functionCall`
-- `contents[].parts[].functionResponse`, in `user` or `model` contents (some clients, such as Antigravity, send tool results under `model`); each must match a prior `functionCall`. Results are grouped directly after the assistant turn that issued their calls, so text interleaved between results follows them. Optional `functionResponse.parts` may carry `text` and `image/*` `inlineData`: text is appended to the `tool` message, while images are lowered to numbered placeholder slots in the `tool` message plus follow-up `user` image attachments emitted after the contiguous tool-result run
+- `contents[].parts[].functionResponse`, in `user` or `model` contents (some clients, such as Antigravity, send tool results under `model`); each must match a prior `functionCall`. Results are grouped directly after the assistant turn that issued their calls, so text interleaved between results follows them. Optional `functionResponse.parts` may carry `text` and `inlineData`: text is appended to the `tool` message, `image/*` `inlineData` is lowered to numbered placeholder slots in the `tool` message plus follow-up `user` image attachments emitted after the contiguous tool-result run, and non-image `inlineData` (such as `video/*`, `audio/*`, or `application/pdf`) is replaced with a text omission placeholder in the `tool` message so tool outputs do not fail the turn
 - `tools[].functionDeclarations` with `parameters` or `parametersJsonSchema`; Gemini `Schema` values in `parameters` are converted to JSON Schema by lowercasing OpenAPI types such as `OBJECT`, turning string-encoded integer bounds such as `"minLength": "1"` into numbers, and expressing `nullable: true` as a `null` type, enum value, or `anyOf` branch, while `parametersJsonSchema` is forwarded unchanged
 - `toolConfig.functionCallingConfig`
 - `generationConfig.temperature`, `topP`, `maxOutputTokens`, `stopSequences`
@@ -70,9 +70,9 @@ Explicit `501 UNIMPLEMENTED` cases include:
 - `generationConfig.logprobs`
 - `cachedContent`
 - `safetySettings`
-- `functionResponse.parts[].fileData` and non-image `functionResponse.parts[].inlineData`
+- `functionResponse.parts[].fileData`
 - Gemini built-in tools such as `googleSearch`, `urlContext`, `codeExecution`, `googleMaps`, `computerUse`, and `enterpriseWebSearch`
-- non-image `inlineData`, `fileData`, and other non-text/media parts
+- non-image `contents[].parts[].inlineData`, `fileData`, and other non-text/media parts
 
 Validation failures (`400 INVALID_ARGUMENT`) include path/body model mismatches, explicit content roles other than `user` or `model`, malformed content parts, invalid function-call history, unmatched `functionResponse` parts, and `functionResponse` parts that answer a call from an earlier tool-call batch after a newer batch has started (for example `call A, call B, response A, call C, response B`), which cannot be represented as valid Chat Completions history.
 
